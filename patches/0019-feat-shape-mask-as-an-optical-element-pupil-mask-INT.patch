@@ -1,0 +1,661 @@
+From ab390af2ea479cd453d1b0c708a10eea82771630 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Tue, 25 Aug 2026 06:38:57 +0800
+Subject: [PATCH 19/22] feat: shape mask as an optical element - pupil = mask
+ INTERSECT iris, continuous
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The mask and the iris stay two separate mechanisms (mask value field vs blade polygon, each with its own edge ring) but the pupil is their physical intersection at every f-number instead of a hard swap at Mask Aperture: with k = N_mask / N the polygon trims the silhouette's corners for k > 1 and clips it progressively for k < 1, the gather kernel importance-samples the same clipped pupil (rebuilt in quantized iris steps from the kept mask pixels), and the splat energy gain divides by the pupil's measured fill instead of a constant. Depth of field and blur follow the pupil's bounding circle (max(N, N_mask)); light reaching the sensor is area(iris ∩ mask)/area(iris) integrated from the mask on the component side, times the new Mask Open Area (tint of the open parts), through the T-stop term so exposure and grain react like an ND loss. User-verified.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_017nykaDjTHxHDSo11CsYx6M
+---
+ .../GraphicsPipeline/DepthOfField.cpp         | 118 +++++++++++---
+ .../GraphicsPipeline/DepthOfField.h           |  14 +-
+ .../Module/CinematicCameraComponent.cpp       | 145 +++++++++++++++++-
+ .../Module/CinematicCameraComponent.h         |  18 +++
+ Code/CryPlugins/CinematicCamera/README.md     |  38 +++--
+ .../Shaders/HWScripts/CryFX/DepthOfField.cfx  |  78 +++++-----
+ 6 files changed, 334 insertions(+), 77 deletions(-)
+
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DepthOfField.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DepthOfField.cpp
+index 26662afd..866f55ee 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DepthOfField.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DepthOfField.cpp
+@@ -78,13 +78,25 @@ Vec4 CDepthOfFieldStage::ToUnitDisk(Vec4& origin, float blades, float shapeExpon
+ // bokeh masks do - and anything else keeps the polygon kernel and says so once. Taps cluster
+ // in the mask's open regions, which IS the physical energy concentration of a low
+ // transmittance mask; no extra normalization wanted.
+-bool CDepthOfFieldStage::EnsureMaskKernelCDF(const char* szTexName)
++bool CDepthOfFieldStage::EnsureMaskKernelCDF(const char* szTexName, float fIrisRadius)
+ {
++	// Quantized so a smooth aperture pull rebuilds the pupil in steps rather than every frame
++	// (a 64x64 rebuild is cheap, not free). >= 1.5 reaches past the mask's corners: no clipping.
++	const float fIrisQ = min(floorf(clamp_tpl(fIrisRadius, 0.2f, 1.5f) * 20.0f + 0.5f) / 20.0f, 1.5f);
++
+ 	if (m_maskCDFTexName == szTexName)
+-		return m_maskCDFValid;
++	{
++		if (!m_maskPixelsValid)
++			return false;                       // unusable texture, already reported once
++		if (m_maskCDFValid && fabsf(fIrisQ - m_maskCDFIrisRadius) < 1e-4f)
++			return true;
++		return BuildMaskPupilCDF(fIrisQ);
++	}
+ 
+ 	m_maskCDFTexName = szTexName;
+ 	m_maskCDFValid = false;
++	m_maskPixelsValid = false;
++	m_maskCDFIrisRadius = -1.0f;
+ 
+ 	const char* szFail = nullptr;
+ 	std::vector<uint8> data;
+@@ -132,21 +144,59 @@ bool CDepthOfFieldStage::EnsureMaskKernelCDF(const char* szTexName)
+ 		return false;
+ 	}
+ 
+-	// R channel (file byte order is B,G,R,A) -> marginal CDF over rows + conditional per row.
+-	// A half-count floor keeps fully blocked regions measurable so both CDFs stay invertible.
++	// Keep the R channel (file byte order is B,G,R,A): the pupil is rebuilt from it every time
++	// the iris radius steps, without touching the file again.
+ 	const uint8* pPix = data.data() + 128;
+ 	m_maskCDFWidth = w;
+ 	m_maskCDFHeight = h;
++	m_maskPixels.resize((size_t)w * h);
++	float fSum = 0.0f;
++	for (size_t i = 0; i < (size_t)w * h; i++)
++	{
++		m_maskPixels[i] = pPix[i * 4 + 2];
++		fSum += (float)m_maskPixels[i];
++	}
++	m_maskPixelsValid = true;
++	CryLog("[DOF] gather kernel: importance-sampled from '%s' (%dx%d, mean=%.2f)",
++	       szTexName, w, h, fSum / ((float)w * (float)h * 255.0f));
++
++	return BuildMaskPupilCDF(fIrisQ);
++}
++
++// Pupil = mask x iris disc of radius fIrisRadius (mask units, 1 = the mask's bounding circle).
++// Marginal CDF over rows + conditional per row; a half-count floor keeps fully blocked regions
++// measurable so both CDFs stay invertible. Also resolves the pupil's fill fraction of the splat
++// quad (which spans the pupil's bounding square), so the energy gain can divide by it and a thin
++// cut-out deposits as much light as the disc it replaces - exactly, per iris step, instead of
++// the old measured-average constant.
++bool CDepthOfFieldStage::BuildMaskPupilCDF(float fIrisRadius)
++{
++	const int w = m_maskCDFWidth;
++	const int h = m_maskCDFHeight;
++	const float fBound = min(fIrisRadius, 1.0f);
++	const float fIrisSq = fIrisRadius * fIrisRadius;
++
+ 	m_maskRowCDF.resize(h);
+ 	m_maskColCDF.resize((size_t)h * w);
+ 	float fTotal = 0.0f;
++	float fFillSum = 0.0f;
++	int nFillCount = 0;
+ 	for (int y = 0; y < h; y++)
+ 	{
++		const float fy = ((float)y + 0.5f) / (float)h * 2.0f - 1.0f;
+ 		float fRow = 0.0f;
+ 		for (int x = 0; x < w; x++)
+ 		{
+-			fRow += (float)pPix[((size_t)y * w + x) * 4 + 2] + 0.5f;
++			const float fx = ((float)x + 0.5f) / (float)w * 2.0f - 1.0f;
++			const bool bInIris = (fx * fx + fy * fy) <= fIrisSq;
++			const float fPupil = bInIris ? (float)m_maskPixels[(size_t)y * w + x] : 0.0f;
++			fRow += fPupil + 0.5f;
+ 			m_maskColCDF[(size_t)y * w + x] = fRow;
++			if (fabsf(fx) <= fBound && fabsf(fy) <= fBound)
++			{
++				fFillSum += fPupil / 255.0f;
++				nFillCount++;
++			}
+ 		}
+ 		const float fInvRow = 1.0f / fRow;
+ 		for (int x = 0; x < w; x++)
+@@ -158,9 +208,10 @@ bool CDepthOfFieldStage::EnsureMaskKernelCDF(const char* szTexName)
+ 	for (int y = 0; y < h; y++)
+ 		m_maskRowCDF[y] *= fInvTotal;
+ 
++	m_maskBound = fBound;
++	m_maskFill = nFillCount > 0 ? max(fFillSum / (float)nFillCount, 0.02f) : 1.0f;
++	m_maskCDFIrisRadius = fIrisRadius;
+ 	m_maskCDFValid = true;
+-	CryLog("[DOF] gather kernel: importance-sampled from '%s' (%dx%d, mean=%.2f)",
+-	       szTexName, w, h, fTotal / ((float)w * (float)h * 255.0f));
+ 	return true;
+ }
+ 
+@@ -204,7 +255,10 @@ Vec4 CDepthOfFieldStage::SampleMaskKernelTap(float u, float v) const
+ 	// flip - the gather shader's tap offsets are applied in texture space (v down), the
+ 	// same space the mask is authored in, so the halo lines up with the splatted
+ 	// silhouette as-is. (A negation here was verified upside-down in the engine.)
+-	return Vec4(fx * 2.0f - 1.0f, fy * 2.0f - 1.0f, 0.0f, 0.0f);
++	// Taps are relative to the CoC radius, which is the pupil's BOUNDING radius: once the iris
++	// is the smaller hole the mask coordinates are rescaled by it, same as the splat quad.
++	const float fInvBound = 1.0f / max(m_maskBound, 1e-3f);
++	return Vec4((fx * 2.0f - 1.0f) * fInvBound, (fy * 2.0f - 1.0f) * fInvBound, 0.0f, 0.0f);
+ }
+ 
+ void CDepthOfFieldStage::Execute()
+@@ -280,10 +334,14 @@ void CDepthOfFieldStage::Execute()
+ 	// texture's CDF so even the soft halo takes the silhouette. The diagnostic force mode
+ 	// keeps the polygon kernel - diagnostics outrank the mask. The splat pass makes its own
+ 	// (unforced) domain call; the two agree everywhere outside the diagnostic.
+-	const bool bGatherMaskDomain = CRenderer::CV_r_DofBokehQuality < 3 &&
+-	                               CTexture::IsTextureExist(dofParams.pBokehShapeTex) &&
+-	                               dofParams.fApertureFNumber < dofParams.fMaskFNumber;
+-	const bool bMaskKernel = bGatherMaskDomain && EnsureMaskKernelCDF(dofParams.pBokehShapeTex->GetName());
++	// Pupil = mask x iris. fIrisRadius = N_mask / N is the iris radius in mask units: above 1
++	// the mask bounds the pupil and the polygon only trims what pokes past it, below 1 the iris
++	// stops down THROUGH the mask, clipping it corner by corner. Once the iris sits deep inside
++	// the mask's open centre the mask cannot shape anything, so the polygon kernel takes over.
++	const bool  bShapeTexForGather = CRenderer::CV_r_DofBokehQuality < 3 && CTexture::IsTextureExist(dofParams.pBokehShapeTex);
++	const float fIrisRadius = max(dofParams.fMaskFNumber, 0.7f) / max(dofParams.fApertureFNumber, 0.7f);
++	const bool  bGatherMaskDomain = bShapeTexForGather && fIrisRadius > 0.35f;
++	const bool  bMaskKernel = bGatherMaskDomain && EnsureMaskKernelCDF(dofParams.pBokehShapeTex->GetName(), fIrisRadius);
+ 
+ 	// Domain transitions were previously silent, which made mask-kernel dropouts (CDF
+ 	// fallback, texture unbinds, f-number crossing) look like timing bugs. One line per
+@@ -637,18 +695,24 @@ void CDepthOfFieldStage::ExecuteSpriteBokeh(const SDepthOfFieldParams& dofParams
+ 	const Vec4 vAspectRatio(fAspectRatio * (fTargetWidth / 1920.0f), fTargetHeight / 1080.0f, 0.0f, CRenderer::CV_r_dofDilation);
+ 	const Vec4 vBokehShape(fNumApertureSides, fIrisExponent, bShapeTexValid ? 1.0f : 0.0f, dofParams.fBladeRotation);
+ 
+-	// Two clean aperture domains with a HARD crossover (winner takes all, per explicit user
+-	// direction - no blending window). The mask is a light block in FRONT of the lens with
+-	// its own equivalent f-number. Iris opened WIDER than the mask (N < N_mask): the mask is
+-	// the smaller hole, and the splat is the mask silhouette ALONE - no iris polygon, no
+-	// barrel circle, and the edge optics (soap-bubble ring) follow the silhouette itself.
+-	// Stopped down past the crossover: the iris is the smaller hole and the splat is the
+-	// pure blade polygon - the mask's open centre is larger and physically invisible.
+-	const bool bMaskDomain = bShapeTexValid && (dofParams.fApertureFNumber < dofParams.fMaskFNumber);
+-	// .y: CoC at which a splat reaches full strength (fade-in from a third of it) - keeps the
++	// Pupil = mask INTERSECT iris, continuous at every f-number. The mask is a light block in
++	// FRONT of the lens with its own equivalent f-number; fIrisRadius = N_mask / N is the iris
++	// radius in mask units. Iris wider than the mask (> 1): the mask bounds the pupil and the
++	// polygon only trims whatever of the silhouette pokes past it. Iris stopped down past the
++	// mask (< 1): the polygon bounds the pupil and the mask is sampled at that scale, so the
++	// silhouette is clipped corner by corner and rounded off progressively. The two apertures
++	// stay two separate mechanisms (mask value field vs blade polygon); the crossover between
++	// them is a physical intersection, not a swap. The fill STYLE (radial iris look vs mask
++	// value field) follows whichever hole is the smaller one.
++	const float fIrisRadius = bShapeTexValid ? max(dofParams.fMaskFNumber, 0.7f) / max(dofParams.fApertureFNumber, 0.7f) : 1.0f;
++	const float fMaskBound  = min(fIrisRadius, 1.0f);                                  // pupil bounding radius, mask units
++	const float fPolyRadius = bShapeTexValid ? fIrisRadius / fMaskBound : 1.0f;        // polygon radius, quad units
++	const float fMaskLook   = bShapeTexValid ? clamp_tpl((fIrisRadius - 0.7f) / 0.6f, 0.0f, 1.0f) : 0.0f;
++	const bool  bMaskDomain = bShapeTexValid && fIrisRadius > 1.0f;                    // the mask is the smaller hole (logs)
++	// .w: CoC at which a splat reaches full strength (fade-in from a third of it) - keeps the
+ 	// splat's amplitude curve in step with the gather's, which loses energy as a highlight
+ 	// nears focus while an energy-conserving splat only gets brighter.
+-	const Vec4 vBokehMask(bMaskDomain ? 1.0f : 0.0f, max(CRenderer::CV_r_DofSpriteBokehFadeCoC, 0.0f), 0.0f, 0.0f);
++	const Vec4 vBokehMask(fMaskLook, fMaskBound, fPolyRadius, max(CRenderer::CV_r_DofSpriteBokehFadeCoC, 0.0f));
+ 
+ 	// Soft knee spanning +/-50% of the threshold. Wide on purpose: a hard cut makes highlights
+ 	// pop in and out one frame at a time as the aperture or the focus sweeps past them.
+@@ -667,9 +731,15 @@ void CDepthOfFieldStage::ExecuteSpriteBokeh(const SDepthOfFieldParams& dofParams
+ 	// top of the gather disc underneath. A measured per-texture mean would be exact, but the
+ 	// shape texture is a GPU resource with no CPU-side copy, and a readback every time the
+ 	// name changes is not worth it for a constant this forgiving.
++	// Exact whenever the CPU-side pupil is available (the same mask pixels the gather kernel
++	// samples from, clipped by the same iris radius, measured over the quad); the measured
++	// engine-mask average is the fallback for textures the CPU path cannot read.
+ 	const float kShapeMaskTransmittance = 0.35f;
+-	if (bMaskDomain)
+-		fSplatEnergyGain /= kShapeMaskTransmittance;
++	if (bShapeTexValid)
++	{
++		const bool bPupilKnown = EnsureMaskKernelCDF(pShapeTex->GetName(), fIrisRadius);
++		fSplatEnergyGain /= bPupilKnown ? GetMaskPupilFill() : (bMaskDomain ? kShapeMaskTransmittance : 1.0f);
++	}
+ 
+ 	// Energy bookkeeping across grid tiers, one rule: a quad deposits
+ 	// (mean excess) * gain / CoC_grid^2 per layer pixel over a disc of (CoC_grid * scale)^2
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DepthOfField.h b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DepthOfField.h
+index cff05a76..309c27e3 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DepthOfField.h
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DepthOfField.h
+@@ -51,9 +51,14 @@ private:
+ 	void ExecuteSpriteBokeh(const SDepthOfFieldParams& dofParams, const Vec4& vDofParams0, const Vec4& vDofParams1,
+ 	                        float blades, float shapeExponent);
+ 
+-	// Mask-domain gather kernel: CDFs importance-sampling the mask texture, built on demand.
+-	bool EnsureMaskKernelCDF(const char* szTexName);
++	// Mask gather kernel: CDFs importance-sampling the PUPIL (mask x iris disc of radius
++	// fIrisRadius in mask units, 1 = the mask's bounding circle, >= 1.5 = no clipping), built on
++	// demand and rebuilt in quantized iris steps. Also resolves the pupil's fill fraction of the
++	// splat quad for the energy gain.
++	bool EnsureMaskKernelCDF(const char* szTexName, float fIrisRadius);
++	bool BuildMaskPupilCDF(float fIrisRadius);
+ 	Vec4 SampleMaskKernelTap(float u, float v) const;
++	float GetMaskPupilFill() const { return m_maskFill; }
+ 
+ private:
+ 	CStretchRectPass m_passCopySceneTarget;
+@@ -85,9 +90,14 @@ private:
+ 	// (the GPU resource has no CPU-side copy); steady state costs one string compare.
+ 	std::vector<float> m_maskRowCDF;    // marginal CDF over rows
+ 	std::vector<float> m_maskColCDF;    // conditional CDF per row, row-major
++	std::vector<uint8> m_maskPixels;    // R channel of the mask, kept so the pupil rebuilds per iris step
+ 	int                m_maskCDFWidth = 0;
+ 	int                m_maskCDFHeight = 0;
+ 	bool               m_maskCDFValid = false;
++	bool               m_maskPixelsValid = false;
++	float              m_maskCDFIrisRadius = -1.0f; // quantized iris radius the CDF was built for
++	float              m_maskBound = 1.0f;          // pupil bounding radius in mask units (min(iris, 1))
++	float              m_maskFill = 1.0f;           // pupil fill fraction of the splat quad
+ 	std::string        m_maskCDFTexName;
+ 
+ 	bool m_bWroteHDRTarget = false;
+diff --git a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp
+index bd95a1dc..21de46f8 100644
+--- a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp
++++ b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp
+@@ -10,6 +10,8 @@
+ #include <CrySchematyc/Env/IEnvRegistrar.h>
+ #include <CryCore/StaticInstanceList.h>
+ #include <CryMath/Angle.h>
++#include <CrySystem/File/ICryPak.h>
++#include <vector>
+ 
+ #include <algorithm>
+ 
+@@ -485,13 +487,137 @@ float CCinematicCameraComponent::ComputeCoCLimit() const
+ 	return (sqrtf(w * w + h * h) / 1500.0f) * 0.001f;
+ }
+ 
++// ---------------------------------------------------------------------------
++// Mask as an optical element. Past the crossover the mask is the smaller hole, so it - not
++// the iris - decides how large a defocused point spreads (CoC follows Mask Aperture) and how
++// much light gets through (the smaller hole, times the fraction of it that is actually open).
++// The renderer still receives the raw iris f-number: that is what its own domain decision
++// (N < N_mask) is keyed on, and the iris polygon is not drawn in the mask domain anyway.
++// ---------------------------------------------------------------------------
++// CPU copy of the shape mask, so the component can integrate the pupil (mask x iris disc) for
++// any f-number. Same DDS contract as the renderer's gather kernel (uncompressed 32-bit, R
++// channel, power-of-two 4..512); a mask the renderer cannot read falls back to the geometric
++// hole ratio. One table - the shape texture is one per active camera in practice, and a
++// reload on a name change is a 64x64 read.
++namespace
++{
++struct SMaskPupilTable
++{
++	static const int kBins = 64;
++	static constexpr float kMaxRadius = 1.5f;   // past the mask's corners (sqrt 2): everything is inside
++	string name;
++	bool   valid = false;
++	float  openArea[kBins + 1] = {};            // open area (mask units^2, radius 1 = bounding circle) within radius i / kBins * kMaxRadius
++};
++SMaskPupilTable s_maskPupil;
++
++bool LoadMaskPupilTable(const char* szName)
++{
++	if (s_maskPupil.name == szName)
++		return s_maskPupil.valid;
++	s_maskPupil.name = szName;
++	s_maskPupil.valid = false;
++
++	std::vector<uint8> data;
++	if (FILE* pFile = gEnv->pCryPak->FOpen(szName, "rb"))
++	{
++		gEnv->pCryPak->FSeek(pFile, 0, SEEK_END);
++		const size_t nSize = (size_t)gEnv->pCryPak->FTell(pFile);
++		gEnv->pCryPak->FSeek(pFile, 0, SEEK_SET);
++		data.resize(nSize);
++		if (nSize < 128 + 16 || gEnv->pCryPak->FReadRaw(data.data(), 1, nSize, pFile) != nSize)
++			data.clear();
++		gEnv->pCryPak->FClose(pFile);
++	}
++	if (data.empty() || memcmp(data.data(), "DDS ", 4) != 0)
++		return false;
++
++	const uint32* pHdr = (const uint32*)(data.data() + 4);
++	const int h = (int)pHdr[2];
++	const int w = (int)pHdr[3];
++	if ((pHdr[19] & 0x40) == 0 || pHdr[20] != 0 || pHdr[21] != 32)
++		return false;
++	if (w < 4 || h < 4 || w > 512 || h > 512 || (w & (w - 1)) != 0 || (h & (h - 1)) != 0)
++		return false;
++	if (data.size() < 128 + (size_t)w * h * 4)
++		return false;
++
++	const uint8* pPix = data.data() + 128;
++	const float texelArea = (2.0f / (float)w) * (2.0f / (float)h);
++	float bins[SMaskPupilTable::kBins + 1] = {};
++	for (int y = 0; y < h; y++)
++	{
++		const float fy = ((float)y + 0.5f) / (float)h * 2.0f - 1.0f;
++		for (int x = 0; x < w; x++)
++		{
++			const float fx = ((float)x + 0.5f) / (float)w * 2.0f - 1.0f;
++			const float r = sqrtf(fx * fx + fy * fy);
++			const int bin = min((int)(r / SMaskPupilTable::kMaxRadius * SMaskPupilTable::kBins) + 1, SMaskPupilTable::kBins);
++			bins[bin] += (float)pPix[((size_t)y * w + x) * 4 + 2] / 255.0f * texelArea;
++		}
++	}
++	float acc = 0.0f;
++	for (int i = 0; i <= SMaskPupilTable::kBins; i++)
++	{
++		acc += bins[i];
++		s_maskPupil.openArea[i] = acc;
++	}
++	s_maskPupil.valid = true;
++	CryLog("[CinematicCamera] mask pupil table from '%s' (%dx%d, open %.0f%% of the bounding circle)",
++	       szName, w, h, acc / gf_PI * 100.0f);
++	return true;
++}
++} // namespace
++
++bool CCinematicCameraComponent::IsMaskDomain() const
++{
++	return m_lens.bUseSpriteBokeh
++	       && !m_lens.bokehShapeTex.value.empty()
++	       && (float)m_lens.aperture < (float)m_lens.maskAperture;
++}
++
++float CCinematicCameraComponent::GetGeometricAperture() const
++{
++	const bool bMaskInUse = m_lens.bUseSpriteBokeh && !m_lens.bokehShapeTex.value.empty();
++	const float N = bMaskInUse ? max((float)m_lens.aperture, (float)m_lens.maskAperture) : (float)m_lens.aperture;
++	return max(N, 0.7f);
++}
++
++float CCinematicCameraComponent::ComputeMaskTransmission() const
++{
++	if (!m_lens.bUseSpriteBokeh || m_lens.bokehShapeTex.value.empty())
++		return 1.0f;
++
++	const float N  = max((float)m_lens.aperture, 0.7f);
++	const float Nm = max((float)m_lens.maskAperture, 0.7f);
++	const float k  = Nm / N;                                   // iris radius in mask units
++	const float tint = clamp_tpl((float)m_lens.maskOpenArea, 0.01f, 1.0f);
++
++	if (LoadMaskPupilTable(m_lens.bokehShapeTex.value.c_str()))
++	{
++		// area(iris INTERSECT mask) / area(iris): 1 while the iris sits inside the mask's open
++		// centre, then falling continuously as it opens out through the cut-out's edges.
++		const float kc = min(k, SMaskPupilTable::kMaxRadius);
++		const float fBin = kc / SMaskPupilTable::kMaxRadius * SMaskPupilTable::kBins;
++		const int i = min((int)fBin, SMaskPupilTable::kBins - 1);
++		const float t = fBin - (float)i;
++		const float open = s_maskPupil.openArea[i] + (s_maskPupil.openArea[i + 1] - s_maskPupil.openArea[i]) * t;
++		return clamp_tpl(open / (gf_PI * k * k) * tint, 0.01f, 1.0f);
++	}
++
++	// Fallback without the texture: the smaller hole's area ratio past the crossover.
++	if (k <= 1.0f)
++		return tint;
++	return clamp_tpl(tint / (k * k), 0.01f, 1.0f);
++}
++
+ // Thin-lens DOF bounds.
+ //   near = d * f² / (f² + N * c * (d - f))
+ //   far  = d * f² / (f² - N * c * (d - f))
+ void CCinematicCameraComponent::ComputeDOFBounds(float& outNear, float& outFar) const
+ {
+ 	const float f_m = GetEffectiveFocalLength() * 0.001f;
+-	const float N   = max((float)m_lens.aperture, 0.7f);
++	const float N   = GetGeometricAperture();
+ 	const float d   = max((float)m_lens.focusDistance, f_m * 1.01f);
+ 	const float c   = ComputeCoCLimit();
+ 	const float f2  = f_m * f_m;
+@@ -510,7 +636,7 @@ float CCinematicCameraComponent::ComputeMaxBlurAmount() const
+ 	// Experimentally unclamped past 1.0 (engine side has no hard cap; the value scales the
+ 	// CoC). Long lenses wide open now produce genuinely larger discs - watch for gather
+ 	// undersampling (sparse/ringy discs) at the top end, the kernel is still 49 taps.
+-	return clamp_tpl(GetEffectiveFocalLength() / max((float)m_lens.aperture, 0.7f) / 60.0f, 0.0f, 4.0f);
++	return clamp_tpl(GetEffectiveFocalLength() / GetGeometricAperture() / 60.0f, 0.0f, 4.0f);
+ }
+ 
+ // What to feed Dof_User_FocusRange.
+@@ -652,7 +778,8 @@ float CCinematicCameraComponent::ComputeFilmGrain01() const
+ 	const float g = clamp_tpl(gainStops / 8.0f, 0.0f, 1.0f);
+ 	const float base = 0.25f * powf(g, 1.2f) + powf(g, 3.5f);
+ 
+-	const float transmission = clamp_tpl((float)m_lens.transmission, 0.25f, 1.0f);
++	// The mask past its crossover eats light exactly like glass losses do.
++	const float transmission = clamp_tpl((float)m_lens.transmission, 0.25f, 1.0f) * ComputeMaskTransmission();
+ 	const float lightStops = log2f((transmission * t / (N * N)) / ((1.0f / 50.0f) / (5.6f * 5.6f))) - (float)(int)m_lens.ndFilterStops;
+ 	const float lowLightBoost = clamp_tpl(powf(2.0f, -lightStops * 0.35f), 0.6f, 2.2f);
+ 
+@@ -1027,7 +1154,9 @@ float CCinematicCameraComponent::ComputeManualEV100() const
+ 	// Radiometry follows the T-stop, not the f-stop: T^2 = N^2 / transmission, so glass
+ 	// losses darken the image exactly like a real lens while geometry (DOF, bokeh,
+ 	// diffraction) stays on N.
+-	const float transmission = clamp_tpl((float)m_lens.transmission, 0.25f, 1.0f);
++	// A shape mask past its crossover is a smaller hole with part of it blocked off: it darkens
++	// the image through the same term, while N (the iris) keeps driving the renderer's domain call.
++	const float transmission = clamp_tpl((float)m_lens.transmission, 0.25f, 1.0f) * ComputeMaskTransmission();
+ 
+ 	const float ev100 = log2f(N * N / (transmission * t)) - log2f(iso / 100.0f) - (float)m_exposure.evCompensation + (float)(int)m_lens.ndFilterStops;
+ 	return clamp_tpl(ev100, -6.0f, 24.0f);
+@@ -1072,12 +1201,16 @@ void CCinematicCameraComponent::ApplyExposureGlobalParam()
+ 	{
+ 		static float s_lastN = -1.0f, s_lastTrans = -1.0f;
+ 		const float N = max((float)m_lens.aperture, 0.7f);
+-		const float trans = clamp_tpl((float)m_lens.transmission, 0.25f, 1.0f);
++		const float trans = clamp_tpl((float)m_lens.transmission, 0.25f, 1.0f) * ComputeMaskTransmission();
+ 		if (fabs_tpl(N - s_lastN) > 0.05f || fabs_tpl(trans - s_lastTrans) > 0.005f)
+ 		{
+ 			s_lastN = N;
+ 			s_lastTrans = trans;
+-			CryLog("[CinematicCamera] f/%.1f at transmission %.2f -> T%.1f", N, trans, N / sqrtf(trans));
++			if (m_lens.bUseSpriteBokeh && !m_lens.bokehShapeTex.value.empty())
++				CryLog("[CinematicCamera] f/%.1f with mask f/%.1f (iris/mask radius %.2f, tint %.0f%%) -> effective transmission %.2f, T%.1f, CoC from f/%.1f",
++				       N, (float)m_lens.maskAperture, (float)m_lens.maskAperture / N, (float)m_lens.maskOpenArea * 100.0f, trans, N / sqrtf(trans), GetGeometricAperture());
++			else
++				CryLog("[CinematicCamera] f/%.1f at transmission %.2f -> T%.1f", N, trans, N / sqrtf(trans));
+ 		}
+ 	}
+ 
+diff --git a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
+index 65b4742f..84949e71 100644
+--- a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
++++ b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
+@@ -239,6 +239,13 @@ struct SCineLensParams
+ 			"and its shape rules every highlight. F-numbers above it (iris narrower): the "
+ 			"blade polygon rules and the mask is invisible. Only used when a Bokeh Shape "
+ 			"Texture is set.", 2.0f);
++		desc.AddMember(&SCineLensParams::maskOpenArea,
++			'mska', "MaskOpenArea", "Mask Open Area",
++			"Transmittance of the mask's OPEN parts (a tinted gel or scrim in the cut-out; 1 = "
++			"clear). The blocked part is measured from the texture itself: the light reaching the "
++			"sensor is the area of iris-intersect-mask over the iris area, at every f-number, "
++			"times this value - exposure and film grain react like a real neutral density loss, "
++			"and depth of field / bokeh SIZE follow whichever hole is the smaller one.", 1.0f);
+ 	}
+ 
+ 	Schematyc::Range<1, 2400> focalLength = 50.f;
+@@ -258,6 +265,7 @@ struct SCineLensParams
+ 	Schematyc::Range<0, 2, 0, 1> breathingIntensity = 1.0f;
+ 	bool bUseSpriteBokeh = false;
+ 	Schematyc::Range<1, 22, 1, 8> maskAperture = 2.0f;
++	Schematyc::Range<0, 1, 0, 1> maskOpenArea = 1.0f;
+ 	// Keep last: operator== memcmp's the members in front of this one.
+ 	Schematyc::TextureFileName bokehShapeTex;
+ };
+@@ -500,6 +508,16 @@ public:
+ 	static CCinematicCameraComponent* ResolveActive();
+ 	bool IsExposureEnabled() const { return m_exposure.bEnableExposure; }
+ 
++	//! A shape mask is in use and the iris is opened wider than Mask Aperture (the mask is the
++	//! smaller hole). Diagnostic only - every quantity below is continuous across this point.
++	bool IsMaskDomain() const;
++	//! The f-number that sets circle-of-confusion size: the pupil's bounding circle, i.e. the
++	//! larger of the iris f-number and Mask Aperture while a mask is in use.
++	float GetGeometricAperture() const;
++	//! Light reaching the sensor relative to the bare iris: area(iris INTERSECT mask) / area(iris),
++	//! integrated from the mask texture for the current f-number, times Mask Open Area (tint).
++	float ComputeMaskTransmission() const;
++
+ private:
+ 	void UpdateCameraComponentParams();
+ 	//! Puts every effect we touched back the way we found it (the full Restore sweep,
+diff --git a/Code/CryPlugins/CinematicCamera/README.md b/Code/CryPlugins/CinematicCamera/README.md
+index 6cc5ef87..5da50c9b 100644
+--- a/Code/CryPlugins/CinematicCamera/README.md
++++ b/Code/CryPlugins/CinematicCamera/README.md
+@@ -137,7 +137,8 @@ range it is noted in brackets.
+ | Focus Breathing | 0-2 (slider 0-1) | 1.0 | How much the field of view tightens when focusing close. 0 = perfectly corrected cine lens, 1 = typical stills lens, 2 = vintage glass. |
+ | Use Sprite Bokeh | bool | false | Add scattered bokeh sprites for out-of-focus HIGHLIGHTS on top of the normal depth of field blur, the way film builds them up: bright points grow into readable discs with a bright rim instead of being averaged flat. The base blur is unchanged, so scenes without bright highlights look the same either way. Required for Bokeh Shape Texture to have any effect. |
+ | Bokeh Shape Texture | texture | (empty) | Silhouette (red channel) of a physical mask mounted in front of the lens. Empty = procedural disc. Only used when Use Sprite Bokeh is on. See *Shape mask and Mask Aperture*. |
+-| Mask Aperture | 1-22 (slider 1-8) | 2.0 | Equivalent f-number of the shape mask's opening — the crossover point of the two apertures. Only used when a Bokeh Shape Texture is set. |
++| Mask Aperture | 1-22 (slider 1-8) | 2.0 | Equivalent f-number of the shape mask's bounding circle. The pupil is iris ∩ mask at every f-number: iris wider than this and the mask bounds the pupil (its shape rules, the polygon only trims what pokes past it); iris stopped down past it and the polygon bounds the pupil, clipping the silhouette corner by corner. Depth of field and bokeh SIZE follow whichever hole is the smaller one. Only used when a Bokeh Shape Texture is set. |
++| Mask Open Area | 0-1 | 1.0 | Transmittance of the mask's OPEN parts (a tinted gel in the cut-out; 1 = clear). The blocked part is measured from the texture itself: light reaching the sensor = area(iris ∩ mask) / area(iris) × this value, through the same T-stop term as glass transmission, so exposure and film grain react like a neutral density loss - continuously, at every f-number. |
+ 
+ ### Exposure
+ 
+@@ -313,14 +314,33 @@ the lens, pushed to the `Dof_User_BokehShapeTex` post param. It only does anythi
+ hybrid splats are running, and it is rewritten every frame on purpose: the param texture keeps
+ one slot per render command buffer, and a name written once reaches only one of them.
+ 
+-Two clean aperture domains with a **hard crossover** at **Mask Aperture**, winner takes all:
+-
+-- **f-number below Mask Aperture** (iris opened wider): the mask is the smaller hole, so every
+-  out-of-focus highlight is the mask shape alone, edge glow included. The gather taps are
+-  importance-sampled from the mask texture as well, so even the soft halo takes the
+-  silhouette.
+-- **f-number above Mask Aperture** (iris stopped down past it): the iris is the smaller hole,
+-  the blade polygon rules completely and the mask is invisible.
++Two separate aperture mechanisms - the mask's value field and the blade polygon - combined as a
++**physical intersection**: the pupil is `mask ∩ iris` at every f-number, with
++`k = Mask Aperture / f-number` the iris radius in mask units.
++
++- **k > 1** (iris opened wider than the mask): the mask bounds the pupil; the polygon only trims
++  whatever of the silhouette pokes past it (the outermost corners first). The gather taps are
++  importance-sampled from the same clipped pupil, so even the soft halo takes the silhouette.
++- **k < 1** (iris stopped down past the mask): the polygon bounds the pupil and the mask is
++  sampled at that scale, so the silhouette is clipped corner by corner and rounded off
++  progressively until the iris sits inside the cut-out's open centre and the plain polygon
++  remains. The fill style (radial iris look vs mask value field) follows whichever hole is the
++  smaller one.
++
++The pupil is rebuilt on the CPU in quantized iris steps (the same 64x64 mask pixels the gather
++kernel samples), and its fill fraction of the splat quad drives the energy gain exactly - a
++thin cut-out deposits as much light as the disc it replaces at any f-number.
++
++The mask is an optical element, not just a shape. The thin-lens depth of field and the maximum
++blur follow the pupil's bounding circle, `max(f-number, Mask Aperture)`
++(`GetGeometricAperture()`), so a note cut-out at f/2 in front of an f/1.2 iris produces
++f/2-sized discs; and the light reaching the sensor is `area(iris ∩ mask) / area(iris)`,
++integrated from the mask texture for the current f-number, times **Mask Open Area** (tint),
++through the T-stop transmission term - so the exposure modes and the film grain light term
++react to the partly blocked hole exactly like a neutral density loss, continuously. The
++renderer still receives the raw iris f-number. The T-stop log line reports the effective
++numbers: `f/1.2 with mask f/2.0 (iris/mask radius 1.67, tint 100%) -> effective transmission
++0.21, T2.6, CoC from f/2.0`.
+ 
+ The renderer compensates a textured splat for how little of its bounding square a mask passes
+ (~0.35 for the engine's own bokeh masks), so a star reads as present as the circle it
+diff --git a/Engine/Shaders/HWScripts/CryFX/DepthOfField.cfx b/Engine/Shaders/HWScripts/CryFX/DepthOfField.cfx
+index 44723db2..77a0f4f5 100644
+--- a/Engine/Shaders/HWScripts/CryFX/DepthOfField.cfx
++++ b/Engine/Shaders/HWScripts/CryFX/DepthOfField.cfx
+@@ -31,9 +31,12 @@ float4 vDofBokehShape;
+ // y: soft knee half width, z: energy gain of one splat, w: diagnostic flag.
+ float4 vDofBokehHighlight;
+ 
+-// Aperture domain switch. x: 1 = mask domain (iris opened wider than the mask; the splat is
+-// the mask silhouette alone), 0 = iris domain (pure blade polygon; the mask, if bound, is
+-// the larger hole and physically invisible). Hard crossover by design - no blending window.
++// Pupil = shape mask INTERSECT iris polygon, continuous at every f-number.
++// x: mask-look weight (0 = iris fill style, 1 = mask fill style; follows which hole is the
++//    smaller one), y: mask sampling scale = pupil bounding radius in mask units (1 while the
++//    mask is the smaller hole, N_mask/N once the iris is), z: iris polygon radius in quad
++//    units (N_mask/N while the mask bounds the pupil, 1 once the iris does),
++// w: circle of confusion at which a splat reaches full strength (fade-in, VS).
+ float4 vDofBokehMask;
+ 
+ 
+@@ -134,7 +137,7 @@ v2fBokehQuad DofBokehRefVS(uint nVertexID : SV_VertexID)
+ 	// an already-converged light and then vanishes in one frame at the cull below. Fade the
+ 	// splat in over [1/3, 1] x r_DepthOfFieldSpriteBokehFadeCoC instead: below a handful of
+ 	// pixels the shape is unresolvable anyway, and the gather already carries that light.
+-	const half fFadeFull = max(vDofBokehMask.y, 1e-3);
++	const half fFadeFull = max(vDofBokehMask.w, 1e-3);
+ 	const half fSplatFade = smoothstep(fFadeFull * 0.333, fFadeFull, max(fCocFar, fCocNear));
+ 
+ 	// Sub-pixel splats add nothing the gather has not already done, and cost a quad each.
+@@ -233,43 +236,46 @@ pixoutDofMRT DofBokehRefPS(v2fBokehQuad IN)
+ 	// -8 ms for big kernels
+ 	half fLen = (dot(tcQuad, tcQuad));
+ 
+-	// The circular clip is the lens barrel - the iris domain's outer bound. In the mask
+-	// domain the mask itself is the smallest aperture, so the barrel must not eat the
+-	// silhouette's corners: the quad stays square and the texture rules every pixel.
+-	clip( lerp(1 - fLen, 1.0, vDofBokehMask.x) );
++	// Bare iris: the circular clip is the lens barrel. With a shape texture bound the pupil is
++	// the mask x polygon product below, which is zero outside itself - and the mask may own
++	// the quad's corners, so the barrel must not eat them.
++	clip( lerp(1 - fLen, 1.0, vDofBokehShape.z) );
+ 
+ 	//tcQuad*=1.1; // add slight border offset
+ 	fLen = (dot(tcQuad, tcQuad));
+ 
++	// Iris fill style: radial falloff plus the approximate diffusion ring.
+ 	half fShapeBokeh = pow(fLen, ((IN.Color.w))) ;// * fLen;  // ^2
+-	half4 cBokehShape = saturate(1-fShapeBokeh);
+-
+-	// aproximate diffusion ring
+-  cBokehShape += saturate(1-abs(fShapeBokeh*2-1));
+-
+-	// MASK DOMAIN override: the silhouette IS the aperture, so every optical feature is built
+-	// from the mask's own value field rather than from the radial distance - the fill is the
+-	// silhouette, and the soap-bubble diffusion ring rides the bilinear gradient band where
+-	// the value crosses one half, i.e. the silhouette's own outline. A star gets a star-
+-	// shaped ring, not a circular one. The iris polygon takes no part in this domain.
+-	const half fMaskVal = GetTexture2D(texDofBkRef_BokehShape, ssDofBkRef_BokehShape, IN.QuadPos.xy).r;
+-	const half fMaskEdge = 1 - fMaskVal;
+-	const half4 cMaskShape = (half4)fMaskVal + saturate(1 - abs(fMaskEdge * 2 - 1));
+-	cBokehShape = lerp(cBokehShape, cMaskShape, vDofBokehMask.x);
+-
+-	// IRIS DOMAIN: cut to the blade polygon at the curvature-driven sharpening exponent
+-	// (vDofBokehShape.y: 0 = circle, ~1 = the true polygon, 2+ = sharpened, 4 = caricature -
+-	// the same exponent the gather kernel raises its taps by, so both views of the iris
+-	// always agree). Skipped entirely in the mask domain, where the polygon is the larger
+-	// hole and physically invisible.
+-	{
+-		const float fEdgeSoft = 0.06f;      // soft edge width, in quad-local radius
+-		const float fRadius   = sqrt(max(fLen, 1e-6f));
+-		const float fTheta    = atan2(tcQuad.y, tcQuad.x);
+-		const float fPolyRad  = pow(NGon_Rad(fTheta - vDofBokehShape.w, max(vDofBokehShape.x, 3.0f)), vDofBokehShape.y);
+-		const float fPolyMask = saturate((fPolyRad - fRadius) / fEdgeSoft);
+-		cBokehShape *= lerp(fPolyMask, 1.0, vDofBokehMask.x);
+-	}
++	half4 cIris = saturate(1-fShapeBokeh);
++  cIris += saturate(1-abs(fShapeBokeh*2-1));
++
++	// Iris polygon at the curvature-driven sharpening exponent (vDofBokehShape.y: 0 = circle,
++	// ~1 = the true polygon, 2+ = sharpened, 4 = caricature - the same exponent the gather
++	// kernel raises its taps by, so both views of the iris always agree), at radius
++	// vDofBokehMask.z in quad units.
++	const float fEdgeSoft = 0.06f;      // soft edge width, in quad-local radius
++	const float fRadius   = sqrt(max(fLen, 1e-6f));
++	const float fTheta    = atan2(tcQuad.y, tcQuad.x);
++	const float fPolyRad  = pow(NGon_Rad(fTheta - vDofBokehShape.w, max(vDofBokehShape.x, 3.0f)), vDofBokehShape.y) * vDofBokehMask.z;
++	const half  fPolyMask = saturate((fPolyRad - fRadius) / fEdgeSoft);
++
++	// PUPIL = mask INTERSECT iris. The mask (white when none is bound) is sampled at the pupil's
++	// bounding scale (vDofBokehMask.y), the polygon at its own radius; their product is the
++	// physical aperture at every f-number. Stopping the iris down through the mask clips the
++	// silhouette corner by corner and rounds it off progressively - the two apertures are two
++	// separate mechanisms, but the crossover between them is a continuous intersection.
++	const half fMaskVal = GetTexture2D(texDofBkRef_BokehShape, ssDofBkRef_BokehShape, (IN.QuadPos.xy - 0.5) * vDofBokehMask.y + 0.5).r;
++	const half fPupil   = fMaskVal * fPolyMask;
++
++	// Mask fill style: the pupil value field is the fill, and the soap-bubble diffusion ring
++	// rides the bilinear band where it crosses one half - the mask's outline inside the polygon,
++	// the polygon's edge where it clips the mask. A star gets a star-shaped ring.
++	const half4 cMaskLook = (half4)fPupil + saturate(1 - abs((1 - fPupil) * 2 - 1));
++	const half4 cIrisLook = cIris * fPupil;
++
++	// The fill style follows whichever hole is the smaller one (weight resolved on the CPU
++	// from N_mask / N); the geometry above is exact in both.
++	half4 cBokehShape = lerp(cIrisLook, cMaskLook, vDofBokehMask.x);
+ 
+ 	// Energy conserving deposit. QuadPos.w carries the CoC in pixels, so dividing by its area
+ 	// spreads a fixed amount of energy over the disc however large it grows - a highlight
+-- 
+2.47.1.windows.1
+

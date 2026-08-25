@@ -1,0 +1,1378 @@
+From 4e41895085831b3734c214ba1ed5d2bc292f2e90 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Tue, 25 Aug 2026 09:46:40 +0800
+Subject: [PATCH 20/22] feat: anamorphic lens - squeeze (hFOV + gate mask /
+ squeezed frame), oval bokeh, horizontal tinted flare
+
+Squeeze Factor widens the horizontal capture (hFOV from sensorWidth x S, vFOV through the viewport aspect) and masks the frame to the desqueezed format via the new r_LensLetterbox cvar; Show Squeezed Frame stretches the same band to fill the viewport instead (raw negative, negative cvar). Gather taps and splat quads scale x by 1/S for vertical-oval bokeh with energy conserved. The horizontal flare is a separate branch of the HDR streaks pass (own threshold, three-iteration horizontal march, coating tint via StreakParams2), independent of the blade streaks and strongest wide open. Fixes: anamorphic stretch ping-pong hazard; PostAA composite sharpening and lens optics now follow the remapped source coordinate (ghost image under TAA sharpening with squeeze / distortion). User-verified.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_017nykaDjTHxHDSo11CsYx6M
+---
+ .../Common/PostProcess/PostEffects.cpp        |  11 +
+ .../Common/PostProcess/PostEffects.h          |  21 +-
+ .../RenderDll/Common/RendererCVars.cpp        |   7 +
+ .../RenderDll/Common/RendererCVars.h          |   1 +
+ .../XRenderD3D9/GraphicsPipeline/Bloom.cpp    | 167 ++++++++++----
+ .../XRenderD3D9/GraphicsPipeline/Bloom.h      |  11 +
+ .../GraphicsPipeline/DepthOfField.cpp         |  27 ++-
+ .../XRenderD3D9/GraphicsPipeline/PostAA.cpp   |   5 +-
+ .../RenderDll/XRenderD3D9/PostProcessDOF.cpp  |   1 +
+ .../CinematicCamera/AnamorphicSpec.md         | 210 ++++++++++++++++++
+ .../Module/CinematicCameraComponent.cpp       | 141 ++++++++++--
+ .../Module/CinematicCameraComponent.h         |  61 ++++-
+ Code/CryPlugins/CinematicCamera/README.md     |  63 ++++++
+ .../CinematicCamera/docs/ConsoleReference.md  |  25 ++-
+ .../Shaders/HWScripts/CryFX/DepthOfField.cfx  |   7 +-
+ .../HWScripts/CryFX/HDRPostProcess.cfx        |   3 +-
+ Engine/Shaders/HWScripts/CryFX/PostAA.cfx     |  64 +++++-
+ 17 files changed, 736 insertions(+), 89 deletions(-)
+ create mode 100644 Code/CryPlugins/CinematicCamera/AnamorphicSpec.md
+
+diff --git a/Code/CryEngine/RenderDll/Common/PostProcess/PostEffects.cpp b/Code/CryEngine/RenderDll/Common/PostProcess/PostEffects.cpp
+index c5941f5b..cede9e2a 100644
+--- a/Code/CryEngine/RenderDll/Common/PostProcess/PostEffects.cpp
++++ b/Code/CryEngine/RenderDll/Common/PostProcess/PostEffects.cpp
+@@ -109,6 +109,7 @@ void CDepthOfField::Reset(bool bOnSpecChange)
+ 	m_pUserApertureBlades->ResetParam(8.0f);
+ 	m_pUserApertureFNumber->ResetParam(8.0f);
+ 	m_pUserBlurAmount->ResetParam(1.0f);
++	m_pUserAnamorphicSqueeze->ResetParam(1.0f);
+ 
+ 	m_pFocusMinZ->ResetParam(0.0f);
+ 	m_pFocusMinZScale->ResetParam(0.0f);
+@@ -135,6 +136,11 @@ void CHDRStreaks::Reset(bool bOnSpecChange)
+ 	m_pAngle->ResetParam(0.0f);
+ 	m_pThreshold->ResetParam(4.0f);
+ 	m_pLength->ResetParam(0.5f);
++
++	m_pAnamorphicAmount->ResetParam(0.0f);
++	m_pAnamorphicLength->ResetParam(0.7f);
++	m_pAnamorphicThreshold->ResetParam(3.0f);
++	m_pAnamorphicTint->ResetParamVec4(Vec4(0.35f, 0.62f, 1.0f, 0.0f));
+ }
+ 
+ SHDRStreaksParams CHDRStreaks::GetParams() const
+@@ -148,6 +154,11 @@ SHDRStreaksParams CHDRStreaks::GetParams() const
+ 	params.fThreshold = max(m_pThreshold->GetParam(), 0.0f);
+ 	params.fLength = clamp_tpl(m_pLength->GetParam(), 0.0f, 1.0f);
+ 
++	params.fAnamorphicAmount = clamp_tpl(m_pAnamorphicAmount->GetParam(), 0.0f, 3.0f);
++	params.fAnamorphicLength = clamp_tpl(m_pAnamorphicLength->GetParam(), 0.0f, 1.0f);
++	params.fAnamorphicThreshold = max(m_pAnamorphicThreshold->GetParam(), 0.0f);
++	params.vAnamorphicTint = m_pAnamorphicTint->GetParamVec4();
++
+ 	return params;
+ }
+ 
+diff --git a/Code/CryEngine/RenderDll/Common/PostProcess/PostEffects.h b/Code/CryEngine/RenderDll/Common/PostProcess/PostEffects.h
+index cb08d546..6ac8e12b 100644
+--- a/Code/CryEngine/RenderDll/Common/PostProcess/PostEffects.h
++++ b/Code/CryEngine/RenderDll/Common/PostProcess/PostEffects.h
+@@ -143,7 +143,7 @@ private:
+ 
+ struct SDepthOfFieldParams
+ {
+-	SDepthOfFieldParams() : bGameMode(false), pMaskTex(0), pBokehShapeTex(0), fMaskBlendAmount(0.0f), fApertureBlades(8.0f), fApertureFNumber(8.0f), fBladeRotation(0.0f), fBladeCurvature(0.4f), fMaskFNumber(2.0f), fHighlightThreshold(2.0f), fHighlightGain(3.0f)
++	SDepthOfFieldParams() : bGameMode(false), pMaskTex(0), pBokehShapeTex(0), fMaskBlendAmount(0.0f), fApertureBlades(8.0f), fApertureFNumber(8.0f), fBladeRotation(0.0f), fBladeCurvature(0.4f), fMaskFNumber(2.0f), fHighlightThreshold(2.0f), fHighlightGain(3.0f), fAnamorphicSqueeze(1.0f)
+ 	{
+ 	};
+ 
+@@ -157,6 +157,7 @@ struct SDepthOfFieldParams
+ 	float     fMaskFNumber;      //!< Equivalent f-number of the physical shape mask in front of the lens; the iris competes with it for the effective aperture.
+ 	float     fHighlightThreshold; //!< Scene HDR luminance a pixel must exceed before the hybrid path splats a bokeh sprite for it.
+ 	float     fHighlightGain;      //!< Brightness of one bokeh splat, after the energy-conserving divide by disc area.
++	float     fAnamorphicSqueeze;  //!< 1 = spherical. Above 1 the pupil image is compressed horizontally by this factor, so every out-of-focus disc becomes a vertical oval of height : width = S : 1.
+ 
+ 	CTexture* pMaskTex;
+ 	CTexture* pBokehShapeTex;    //!< Optional silhouette for the sprite bokeh splats; null keeps the procedural disc.
+@@ -199,6 +200,7 @@ public:
+ 		AddParamFloatNoTransition("Dof_User_HighlightThreshold", m_pUserHighlightThreshold, 2.0f);
+ 		AddParamFloatNoTransition("Dof_User_HighlightGain", m_pUserHighlightGain, 3.0f);
+ 		AddParamFloatNoTransition("Dof_User_BlurAmount", m_pUserBlurAmount, 1.0f);
++		AddParamFloatNoTransition("Dof_User_AnamorphicSqueeze", m_pUserAnamorphicSqueeze, 1.0f);
+ 		AddParamTex("Dof_User_BokehShapeTex", m_pUserBokehShapeTex, 0);
+ 
+ 		AddParamFloatNoTransition("Dof_Tod_FocusRange", m_pTimeOfDayFocusRange, 1000.0f);
+@@ -252,6 +254,8 @@ private:
+ 	CEffectParam* m_pUserBladeCurvature;
+ 	CEffectParam* m_pUserMaskFNumber;
+ 	CEffectParam* m_pUserHighlightThreshold, * m_pUserHighlightGain;
++	// float: anamorphic horizontal compression of the pupil image (1 = spherical)
++	CEffectParam* m_pUserAnamorphicSqueeze;
+ 	// CTexture: sprite bokeh silhouette
+ 	CEffectParam* m_pUserBokehShapeTex;
+ 	// float, float
+@@ -281,6 +285,7 @@ struct SHDRStreaksParams
+ {
+ 	SHDRStreaksParams()
+ 		: bActive(false), nDirectionCount(8), fAngle(0.0f), fAmount(0.0f), fThreshold(4.0f), fLength(0.5f)
++		, fAnamorphicAmount(0.0f), fAnamorphicLength(0.7f), fAnamorphicThreshold(3.0f), vAnamorphicTint(0.35f, 0.62f, 1.0f, 0.0f)
+ 	{
+ 	};
+ 
+@@ -290,6 +295,13 @@ struct SHDRStreaksParams
+ 	float fAmount;          //!< 0-1 intensity, driven by how far the lens is stopped down.
+ 	float fThreshold;       //!< Scene HDR value a source has to exceed before it grows rays.
+ 	float fLength;          //!< 0-1, scales the stretch stride and therefore the ray length.
++
++	//! Anamorphic horizontal flare: the long tinted line a cylindrical front element throws
++	//! across the frame. Independent of the iris diffraction above - own threshold, own march.
++	float fAnamorphicAmount;    //!< 0-3 strength. 0 = the flare passes do not run at all.
++	float fAnamorphicLength;    //!< 0-1, how far the line reaches across the frame.
++	float fAnamorphicThreshold; //!< Scene HDR value a source has to exceed to throw a flare.
++	Vec4  vAnamorphicTint;      //!< (rgb, unused) colour of the line; classic coatings give cyan-blue.
+ };
+ 
+ //! Parameter container only - the passes live in CBloomStage, which reads these the same way
+@@ -308,6 +320,11 @@ public:
+ 		AddParamFloatNoTransition("HDR_Streaks_Angle", m_pAngle, 0.0f);
+ 		AddParamFloatNoTransition("HDR_Streaks_Threshold", m_pThreshold, 4.0f);
+ 		AddParamFloatNoTransition("HDR_Streaks_Length", m_pLength, 0.5f);
++
++		AddParamFloatNoTransition("HDR_Streaks_AnamorphicAmount", m_pAnamorphicAmount, 0.0f);
++		AddParamFloatNoTransition("HDR_Streaks_AnamorphicLength", m_pAnamorphicLength, 0.7f);
++		AddParamFloatNoTransition("HDR_Streaks_AnamorphicThreshold", m_pAnamorphicThreshold, 3.0f);
++		AddParamVec4NoTransition("HDR_Streaks_AnamorphicTint", m_pAnamorphicTint, Vec4(0.35f, 0.62f, 1.0f, 0.0f));
+ 	}
+ 
+ 	//! Never preprocessed or executed: the effect exists purely to own the parameters.
+@@ -335,6 +352,8 @@ public:
+ 
+ private:
+ 	CEffectParam* m_pAmount, * m_pCount, * m_pAngle, * m_pThreshold, * m_pLength;
++	// Anamorphic horizontal flare: float, float, float, Vec4
++	CEffectParam* m_pAnamorphicAmount, * m_pAnamorphicLength, * m_pAnamorphicThreshold, * m_pAnamorphicTint;
+ };
+ 
+ ////////////////////////////////////////////////////////////////////////////////////////////////////
+diff --git a/Code/CryEngine/RenderDll/Common/RendererCVars.cpp b/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
+index a0f89768..5d97a02b 100644
+--- a/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
++++ b/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
+@@ -330,6 +330,7 @@ int CRendererCVars::CV_r_MaxFrameLatency;
+ float CRendererCVars::CV_r_DofBokehShapeStrength;
+ float CRendererCVars::CV_r_HDRVignetteAmount;
+ float CRendererCVars::CV_r_LensDistortion;
++float CRendererCVars::CV_r_LensLetterbox;
+ float CRendererCVars::CV_r_MotionBlurShutterSpeed;
+ float CRendererCVars::CV_r_MotionBlurCameraMotionScale;
+ float CRendererCVars::CV_r_MotionBlurMaxViewDist;
+@@ -1485,6 +1486,12 @@ void CRendererCVars::InitCVars()
+ 	               "Strength of the tonemap vignette map. 0 = off (default), 1 = the stock map, 2 = deepened.");
+ 	REGISTER_CVAR3("r_LensDistortion", CV_r_LensDistortion, 0.0f, VF_NULL,
+ 	               "Radial lens distortion in the final composite. Positive = barrel, negative = pincushion/wide-angle correction.");
++	REGISTER_CVAR3("r_LensLetterbox", CV_r_LensLetterbox, 0.0f, VF_NULL,
++	               "Aspect ratio to letterbox the final frame to: black bars top and bottom when the "
++	               "frame is wider than the viewport. 0 = off. A NEGATIVE value is the squeezed "
++	               "presentation: the same band is stretched vertically to fill the viewport instead "
++	               "of masked (the raw anamorphic negative). Driven by the Cinematic Camera's "
++	               "anamorphic squeeze; can be set by hand for a plain 2.39:1 mask.");
+ 	REGISTER_CVAR3("r_DepthOfFieldBokehShapeStrength", CV_r_DofBokehShapeStrength, 2.0f, VF_NULL,
+ 	               "Exaggeration exponent for the polygonal bokeh kernel. "
+ 	               "1 = physical radius modulation (subtle for high blade counts), "
+diff --git a/Code/CryEngine/RenderDll/Common/RendererCVars.h b/Code/CryEngine/RenderDll/Common/RendererCVars.h
+index f064d011..903e3205 100644
+--- a/Code/CryEngine/RenderDll/Common/RendererCVars.h
++++ b/Code/CryEngine/RenderDll/Common/RendererCVars.h
+@@ -521,6 +521,7 @@ public:
+ 	static float CV_r_DofBokehShapeStrength;
+ 	static float CV_r_HDRVignetteAmount;
+ 	static float CV_r_LensDistortion;
++	static float CV_r_LensLetterbox;
+ 	static float CV_r_MotionBlurShutterSpeed;
+ 	static float CV_r_MotionBlurCameraMotionScale;
+ 	static float CV_r_MotionBlurMaxViewDist;
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Bloom.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Bloom.cpp
+index e7c5ab8f..1d1af098 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Bloom.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Bloom.cpp
+@@ -137,7 +137,13 @@ void CBloomStage::ExecuteStreaks()
+ 		streakParams.fLength = 0.6f;
+ 	}
+ 
+-	if (!streakParams.bActive || streakParams.fAmount < 0.001f || streakParams.nDirectionCount < 4)
++	// Two independent effects share this pass block: the iris diffraction spikes and the
++	// anamorphic horizontal flare thrown by a cylindrical front element. Either one alone is
++	// enough to run the block; only both being off skips it.
++	const bool bBlade = streakParams.bActive && streakParams.fAmount >= 0.001f && streakParams.nDirectionCount >= 4;
++	const bool bAnamorphic = streakParams.fAnamorphicAmount >= 0.001f;
++
++	if (!bBlade && !bAnamorphic)
+ 		return;
+ 
+ 	PROFILE_LABEL_SCOPE("HDR_STREAKS");
+@@ -146,41 +152,13 @@ void CBloomStage::ExecuteStreaks()
+ 	static CCryNameTSCRC techStreakStretch("HDRStreakStretch");
+ 	static CCryNameR streakParams0Name("StreakParams0");
+ 	static CCryNameR streakParams1Name("StreakParams1");
++	static CCryNameR streakParams2Name("StreakParams2");
+ 
+ 	CTexture* pStreakSource = m_graphicsPipelineResources.m_pTexHDRTargetScaled[1][1];
+ 	CTexture* pStreakPingPong = m_graphicsPipelineResources.m_pTexHDRTargetScaled[1][0];
+ 
+-	// The Count param carries the SPIKE count (even by construction: N for even blade
+-	// counts, 2N for odd). Each pass draws a symmetric line = two opposed spikes, so the
+-	// lines span 180 degrees and there are half as many passes as spikes.
+-	const int nLineCount = clamp_tpl(streakParams.nDirectionCount / 2, 2, kMaxStreakDirections);
+-
+-	// Threshold. The knee is a quarter of the threshold, wide enough to stop the sources
+-	// popping in and out between frames but far too narrow to catch a merely bright sky.
+-	if (m_passStreakThreshold.IsDirty())
+-	{
+-		m_passStreakThreshold.SetPrimitiveFlags(CRenderPrimitive::eFlags_ReflectShaderConstants_PS);
+-		m_passStreakThreshold.SetPrimitiveType(CRenderPrimitive::ePrim_ProceduralTriangle);
+-		m_passStreakThreshold.SetTechnique(CShaderMan::s_shHDRPostProcess, techStreakThreshold, 0);
+-		m_passStreakThreshold.SetRenderTarget(0, pStreakSource);
+-		m_passStreakThreshold.SetState(GS_NODEPTHTEST | GS_NOCOLMASK_A);
+-		m_passStreakThreshold.SetTexture(0, m_graphicsPipelineResources.m_pTexHDRTargetScaled[0][0]);
+-		m_passStreakThreshold.SetSampler(0, EDefaultSamplerStates::LinearClamp);
+-	}
+-
+-	m_passStreakThreshold.BeginConstantUpdate();
+-	m_passStreakThreshold.SetConstant(streakParams1Name, Vec4(streakParams.fThreshold, max(streakParams.fThreshold * 0.25f, 0.01f), 0, 0), eHWSC_Pixel);
+-	m_passStreakThreshold.Execute();
+-
+-	// Directional stretch. The rays are evenly spread over the full circle and rotate with
+-	// the blade phase; each one is grown by a chain of exponentially widening blurs.
+ 	const float fTexelScaleX = 1.0f / (float)pStreakSource->GetWidth();
+ 	const float fTexelScaleY = 1.0f / (float)pStreakSource->GetHeight();
+-	// Perceived spike length is governed by how slowly the tail decays, not just by the
+-	// sampling reach: short stubby spikes at length 0 (decay 0.55 per tap) grow into long
+-	// persistent tails at length 1 (decay 0.95), while the stride widens the footprint.
+-	const float fBaseStride = 0.5f + 2.0f * streakParams.fLength;
+-	const float fLengthDecay = 0.55f + 0.40f * clamp_tpl(streakParams.fLength, 0.0f, 1.0f);
+ 
+ 	// The tone mapper blends the bloom target in with weight bloomAmount * 0.3 / 8 (about
+ 	// 0.004 at the default TOD bloom of 0.1). Anything added to the bloom target inherits
+@@ -189,21 +167,122 @@ void CBloomStage::ExecuteStreaks()
+ 	Vec4 vHDRSetupParams[5];
+ 	gEnv->p3DEngine->GetHDRSetupParams(vHDRSetupParams);
+ 	const float fBloomCompositeWeight = clamp_tpl(vHDRSetupParams[1].x / 8.0f, 0.0005f, 1.0f);
+-	const float fOutputScale = streakParams.fAmount / ((float)nLineCount * fBloomCompositeWeight);
+ 
+-	for (int direction = 0; direction < nLineCount; ++direction)
++	if (bBlade)
+ 	{
+-		const float fAngle = streakParams.fAngle + (float)direction * (PI / (float)nLineCount);
+-		const float fDirX = cosf(fAngle);
+-		const float fDirY = sinf(fAngle);
++		// The Count param carries the SPIKE count (even by construction: N for even blade
++		// counts, 2N for odd). Each pass draws a symmetric line = two opposed spikes, so the
++		// lines span 180 degrees and there are half as many passes as spikes.
++		const int nLineCount = clamp_tpl(streakParams.nDirectionCount / 2, 2, kMaxStreakDirections);
++
++		// Threshold. The knee is a quarter of the threshold, wide enough to stop the sources
++		// popping in and out between frames but far too narrow to catch a merely bright sky.
++		if (m_passStreakThreshold.IsDirty())
++		{
++			m_passStreakThreshold.SetPrimitiveFlags(CRenderPrimitive::eFlags_ReflectShaderConstants_PS);
++			m_passStreakThreshold.SetPrimitiveType(CRenderPrimitive::ePrim_ProceduralTriangle);
++			m_passStreakThreshold.SetTechnique(CShaderMan::s_shHDRPostProcess, techStreakThreshold, 0);
++			m_passStreakThreshold.SetRenderTarget(0, pStreakSource);
++			m_passStreakThreshold.SetState(GS_NODEPTHTEST | GS_NOCOLMASK_A);
++			m_passStreakThreshold.SetTexture(0, m_graphicsPipelineResources.m_pTexHDRTargetScaled[0][0]);
++			m_passStreakThreshold.SetSampler(0, EDefaultSamplerStates::LinearClamp);
++		}
++
++		m_passStreakThreshold.BeginConstantUpdate();
++		m_passStreakThreshold.SetConstant(streakParams1Name, Vec4(streakParams.fThreshold, max(streakParams.fThreshold * 0.25f, 0.01f), 0, 0), eHWSC_Pixel);
++		m_passStreakThreshold.Execute();
+ 
+-		float fStride = fBaseStride;
+-		float fDecay = fLengthDecay;
++		// Directional stretch. The rays are evenly spread over the full circle and rotate with
++		// the blade phase; each one is grown by a chain of exponentially widening blurs.
++		// Perceived spike length is governed by how slowly the tail decays, not just by the
++		// sampling reach: short stubby spikes at length 0 (decay 0.55 per tap) grow into long
++		// persistent tails at length 1 (decay 0.95), while the stride widens the footprint.
++		const float fBaseStride = 0.5f + 2.0f * streakParams.fLength;
++		const float fLengthDecay = 0.55f + 0.40f * clamp_tpl(streakParams.fLength, 0.0f, 1.0f);
+ 
+-		for (int iteration = 0; iteration < kStreakIterations; ++iteration)
++		const float fOutputScale = streakParams.fAmount / ((float)nLineCount * fBloomCompositeWeight);
++
++		for (int direction = 0; direction < nLineCount; ++direction)
+ 		{
+-			const bool bLastIteration = (iteration == kStreakIterations - 1);
+-			CFullscreenPass& pass = m_passStreakStretch[direction][iteration];
++			const float fAngle = streakParams.fAngle + (float)direction * (PI / (float)nLineCount);
++			const float fDirX = cosf(fAngle);
++			const float fDirY = sinf(fAngle);
++
++			float fStride = fBaseStride;
++			float fDecay = fLengthDecay;
++
++			for (int iteration = 0; iteration < kStreakIterations; ++iteration)
++			{
++				const bool bLastIteration = (iteration == kStreakIterations - 1);
++				CFullscreenPass& pass = m_passStreakStretch[direction][iteration];
++
++				if (pass.IsDirty())
++				{
++					const uint64 nBlendState = bLastIteration ? (GS_BLSRC_ONE | GS_BLDST_ONE) : 0;
++
++					pass.SetPrimitiveFlags(CRenderPrimitive::eFlags_ReflectShaderConstants_PS);
++					pass.SetPrimitiveType(CRenderPrimitive::ePrim_ProceduralTriangle);
++					pass.SetTechnique(CShaderMan::s_shHDRPostProcess, techStreakStretch, 0);
++					pass.SetRenderTarget(0, bLastIteration ? m_graphicsPipelineResources.m_pTexHDRFinalBloom : pStreakPingPong);
++					pass.SetState(GS_NODEPTHTEST | GS_NOCOLMASK_A | nBlendState);
++					pass.SetTexture(0, (iteration == 0) ? pStreakSource : pStreakPingPong);
++					pass.SetSampler(0, EDefaultSamplerStates::LinearClamp);
++				}
++
++				pass.BeginConstantUpdate();
++				pass.SetConstant(streakParams0Name, Vec4(fDirX * fTexelScaleX, fDirY * fTexelScaleY, fStride, bLastIteration ? fOutputScale : 1.0f), eHWSC_Pixel);
++				pass.SetConstant(streakParams1Name, Vec4(0, 0, fDecay, 0), eHWSC_Pixel);
++				// Untinted: the diffraction spikes keep the source's own colour.
++				pass.SetConstant(streakParams2Name, Vec4(1.0f, 1.0f, 1.0f, 0.0f), eHWSC_Pixel);
++				pass.Execute();
++
++				fStride *= (float)s_nStreakTapCount;
++				fDecay = powf(fDecay, (float)s_nStreakTapCount);
++			}
++		}
++	}
++
++	// Anamorphic horizontal flare. A cylindrical front element throws one long tinted line
++	// across the frame instead of a star, so this is a single horizontal march - but a much
++	// longer one: three iterations of 8 taps span 8^3 tap distances, the whole frame width.
++	if (bAnamorphic)
++	{
++		PROFILE_LABEL_SCOPE("ANAMORPHIC_FLARE");
++
++		// Own threshold pass into pStreakSource. The blade pass, if it ran at all, has already
++		// consumed its own thresholded copy, so the scratch target is free to be rewritten.
++		if (m_passAnamorphicThreshold.IsDirty())
++		{
++			m_passAnamorphicThreshold.SetPrimitiveFlags(CRenderPrimitive::eFlags_ReflectShaderConstants_PS);
++			m_passAnamorphicThreshold.SetPrimitiveType(CRenderPrimitive::ePrim_ProceduralTriangle);
++			m_passAnamorphicThreshold.SetTechnique(CShaderMan::s_shHDRPostProcess, techStreakThreshold, 0);
++			m_passAnamorphicThreshold.SetRenderTarget(0, pStreakSource);
++			m_passAnamorphicThreshold.SetState(GS_NODEPTHTEST | GS_NOCOLMASK_A);
++			m_passAnamorphicThreshold.SetTexture(0, m_graphicsPipelineResources.m_pTexHDRTargetScaled[0][0]);
++			m_passAnamorphicThreshold.SetSampler(0, EDefaultSamplerStates::LinearClamp);
++		}
++
++		m_passAnamorphicThreshold.BeginConstantUpdate();
++		m_passAnamorphicThreshold.SetConstant(streakParams1Name, Vec4(streakParams.fAnamorphicThreshold, max(streakParams.fAnamorphicThreshold * 0.25f, 0.01f), 0, 0), eHWSC_Pixel);
++		m_passAnamorphicThreshold.Execute();
++
++		const float fFlareLength = clamp_tpl(streakParams.fAnamorphicLength, 0.0f, 1.0f);
++		float fStride = 1.0f + 3.0f * fFlareLength;
++		float fDecay = 0.60f + 0.38f * fFlareLength;
++
++		const float fFlareScale = streakParams.fAnamorphicAmount / fBloomCompositeWeight;
++		const Vec4 vTint(streakParams.vAnamorphicTint.x, streakParams.vAnamorphicTint.y, streakParams.vAnamorphicTint.z, 0.0f);
++
++		for (int iteration = 0; iteration < kAnamorphicIterations; ++iteration)
++		{
++			const bool bLastIteration = (iteration == kAnamorphicIterations - 1);
++			CFullscreenPass& pass = m_passAnamorphicStretch[iteration];
++
++			// Three iterations need a real ping-pong: source -> pingpong -> source -> bloom.
++			// Reading and writing the same scratch target in one pass is undefined.
++			CTexture* pIterSource = (iteration % 2 == 0) ? pStreakSource : pStreakPingPong;
++			CTexture* pIterTarget = bLastIteration ? m_graphicsPipelineResources.m_pTexHDRFinalBloom
++			                                       : ((iteration % 2 == 0) ? pStreakPingPong : pStreakSource);
+ 
+ 			if (pass.IsDirty())
+ 			{
+@@ -212,15 +291,17 @@ void CBloomStage::ExecuteStreaks()
+ 				pass.SetPrimitiveFlags(CRenderPrimitive::eFlags_ReflectShaderConstants_PS);
+ 				pass.SetPrimitiveType(CRenderPrimitive::ePrim_ProceduralTriangle);
+ 				pass.SetTechnique(CShaderMan::s_shHDRPostProcess, techStreakStretch, 0);
+-				pass.SetRenderTarget(0, bLastIteration ? m_graphicsPipelineResources.m_pTexHDRFinalBloom : pStreakPingPong);
++				pass.SetRenderTarget(0, pIterTarget);
+ 				pass.SetState(GS_NODEPTHTEST | GS_NOCOLMASK_A | nBlendState);
+-				pass.SetTexture(0, (iteration == 0) ? pStreakSource : pStreakPingPong);
++				pass.SetTexture(0, pIterSource);
+ 				pass.SetSampler(0, EDefaultSamplerStates::LinearClamp);
+ 			}
+ 
+ 			pass.BeginConstantUpdate();
+-			pass.SetConstant(streakParams0Name, Vec4(fDirX * fTexelScaleX, fDirY * fTexelScaleY, fStride, bLastIteration ? fOutputScale : 1.0f), eHWSC_Pixel);
++			pass.SetConstant(streakParams0Name, Vec4(fTexelScaleX, 0.0f, fStride, bLastIteration ? fFlareScale : 1.0f), eHWSC_Pixel);
+ 			pass.SetConstant(streakParams1Name, Vec4(0, 0, fDecay, 0), eHWSC_Pixel);
++			// The coating's colour is applied once, on the pass that reaches the bloom target.
++			pass.SetConstant(streakParams2Name, bLastIteration ? vTint : Vec4(1.0f, 1.0f, 1.0f, 0.0f), eHWSC_Pixel);
+ 			pass.Execute();
+ 
+ 			fStride *= (float)s_nStreakTapCount;
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Bloom.h b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Bloom.h
+index 960a454f..ca2c2923 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Bloom.h
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Bloom.h
+@@ -15,6 +15,10 @@ public:
+ 	//! Stretch iterations per ray. Each one widens the tap stride by the tap count, so two
+ 	//! iterations of 8 taps already reach 63 tap distances from the source.
+ 	static const int kStreakIterations = 2;
++	//! Stretch iterations for the anamorphic horizontal flare. One more than the blade streaks:
++	//! 8^3 tap distances span the whole frame width, which is what makes the line read as a
++	//! single stroke across the frame instead of a stubby spike.
++	static const int kAnamorphicIterations = 3;
+ 
+ 	CBloomStage(CGraphicsPipeline& graphicsPipeline)
+ 		: CGraphicsPipelineStage(graphicsPipeline)
+@@ -23,12 +27,16 @@ public:
+ 		, m_pass2H(&graphicsPipeline)
+ 		, m_pass2V(&graphicsPipeline)
+ 		, m_passStreakThreshold(&graphicsPipeline)
++		, m_passAnamorphicThreshold(&graphicsPipeline)
+ 	{
+ 		for (int direction = 0; direction < kMaxStreakDirections; ++direction)
+ 		{
+ 			for (int iteration = 0; iteration < kStreakIterations; ++iteration)
+ 				m_passStreakStretch[direction][iteration].SetGraphicsPipeline(&graphicsPipeline);
+ 		}
++
++		for (int iteration = 0; iteration < kAnamorphicIterations; ++iteration)
++			m_passAnamorphicStretch[iteration].SetGraphicsPipeline(&graphicsPipeline);
+ 	}
+ 
+ 	bool IsStageActive(EShaderRenderingFlags flags) const final
+@@ -48,4 +56,7 @@ private:
+ 
+ 	CFullscreenPass m_passStreakThreshold;
+ 	CFullscreenPass m_passStreakStretch[kMaxStreakDirections][kStreakIterations];
++
++	CFullscreenPass m_passAnamorphicThreshold;
++	CFullscreenPass m_passAnamorphicStretch[kAnamorphicIterations];
+ };
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DepthOfField.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DepthOfField.cpp
+index 866f55ee..102e03c1 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DepthOfField.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DepthOfField.cpp
+@@ -330,6 +330,12 @@ void CDepthOfFieldStage::Execute()
+ 	const float fBladeCurvatureEff = (CRenderer::CV_r_DofBokehQuality >= 3) ? 1.0f : dofParams.fBladeCurvature;
+ 	const float fIrisExponent = ComputeIrisShapeExponent(fFNumber, fBladeCurvatureEff);
+ 
++	// Anamorphic squeeze. The cylindrical element compresses the pupil image horizontally, so
++	// the gather kernel's horizontal reach shrinks by the same factor while the vertical reach
++	// stays the spherical CoC: every out-of-focus disc becomes a vertical oval of
++	// height : width = S : 1, which is the desqueezed anamorphic look. 1 = identity.
++	const float fSqueeze = clamp_tpl(dofParams.fAnamorphicSqueeze, 1.0f, 2.0f);
++
+ 	// Mask-domain gather: when the mask is the smaller aperture, the taps come from the mask
+ 	// texture's CDF so even the soft halo takes the silhouette. The diagnostic force mode
+ 	// keeps the polygon kernel - diagnostics outrank the mask. The splat pass makes its own
+@@ -438,6 +444,13 @@ void CDepthOfFieldStage::Execute()
+ 				}
+ 			}
+ 
++			// Applied to the finished tap, so both the polygon and the mask kernel take the oval.
++			if (fSqueeze > 1.001f)
++			{
++				for (int32 i = 0; i < nSquareTapsSide * nSquareTapsSide; ++i)
++					vTaps[i].x /= fSqueeze;
++			}
++
+ 			PROFILE_LABEL_SCOPE("FAR/NEAR LAYER");
+ 
+ 			if (m_passGather0.IsDirty())
+@@ -484,6 +497,13 @@ void CDepthOfFieldStage::Execute()
+ 				}
+ 			}
+ 
++			// Applied to the finished tap, so both the polygon and the mask kernel take the oval.
++			if (fSqueeze > 1.001f)
++			{
++				for (int32 i = 0; i < nSquareTapsSide * nSquareTapsSide; ++i)
++					vTaps[i].x /= fSqueeze;
++			}
++
+ 			PROFILE_LABEL_SCOPE("FAR/NEAR LAYER ITERATION");
+ 
+ 			if (m_passGather1.IsDirty())
+@@ -690,9 +710,10 @@ void CDepthOfFieldStage::ExecuteSpriteBokeh(const SDepthOfFieldParams& dofParams
+ 	const float fTargetWidth = (float)m_graphicsPipelineResources.m_pTexHDRTarget->GetWidth();
+ 	const float fTargetHeight = (float)m_graphicsPipelineResources.m_pTexHDRTarget->GetHeight();
+ 	const float fAspectRatio = (1920.0f / 1080.0f) * (fTargetHeight / fTargetWidth);
+-	// .z was the legacy global range normalization; the hybrid path conserves energy per splat
+-	// instead (see the disc-area divide in the pixel shader), so nothing reads it any more.
+-	const Vec4 vAspectRatio(fAspectRatio * (fTargetWidth / 1920.0f), fTargetHeight / 1080.0f, 0.0f, CRenderer::CV_r_dofDilation);
++	// .z = horizontal splat scale, 1 / anamorphic squeeze. The pupil image is compressed
++	// horizontally by S, so the splat quad (and the mask sampled through it) is too; 1 = spherical.
++	const float fSpriteSqueeze = clamp_tpl(dofParams.fAnamorphicSqueeze, 1.0f, 2.0f);
++	const Vec4 vAspectRatio(fAspectRatio * (fTargetWidth / 1920.0f), fTargetHeight / 1080.0f, 1.0f / fSpriteSqueeze, CRenderer::CV_r_dofDilation);
+ 	const Vec4 vBokehShape(fNumApertureSides, fIrisExponent, bShapeTexValid ? 1.0f : 0.0f, dofParams.fBladeRotation);
+ 
+ 	// Pupil = mask INTERSECT iris, continuous at every f-number. The mask is a light block in
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/PostAA.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/PostAA.cpp
+index c3b3f4e1..14f909c3 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/PostAA.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/PostAA.cpp
+@@ -485,9 +485,10 @@ void CPostAAStage::DoFinalComposition(CTexture*& pCurrRT, CTexture* pDestRT, uin
+ 		m_passComposition.SetConstant(hdrEyeAdaptationName, hdrSetupParams[4], eHWSC_Pixel);
+ 
+ 		{
+-			// Radial lens distortion (r_LensDistortion / lens character): x = k1, y = aspect.
++			// Radial lens distortion (r_LensDistortion / lens character): x = k1, y = aspect,
++			// z = letterbox aspect (r_LensLetterbox; 0 = off, negative = squeezed presentation).
+ 			const float aspect = (float)CRendererResources::s_displayWidth / (float)max(CRendererResources::s_displayHeight, 1);
+-			const Vec4 distortionParams(clamp_tpl(CRenderer::CV_r_LensDistortion, -0.9f, 0.9f), aspect, 0, 0);
++			const Vec4 distortionParams(clamp_tpl(CRenderer::CV_r_LensDistortion, -0.9f, 0.9f), aspect, CRenderer::CV_r_LensLetterbox, 0);
+ 			m_passComposition.SetConstant(lensDistortionName, distortionParams, eHWSC_Pixel);
+ 		}
+ 	}
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/PostProcessDOF.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/PostProcessDOF.cpp
+index e1678936..74650b0a 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/PostProcessDOF.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/PostProcessDOF.cpp
+@@ -113,6 +113,7 @@ SDepthOfFieldParams CDepthOfField::GetParams()
+ 	pParams.fMaskFNumber = m_pUserMaskFNumber->GetParam();
+ 	pParams.fHighlightThreshold = m_pUserHighlightThreshold->GetParam();
+ 	pParams.fHighlightGain = m_pUserHighlightGain->GetParam();
++	pParams.fAnamorphicSqueeze = clamp_tpl(m_pUserAnamorphicSqueeze->GetParam(), 1.0f, 2.0f);
+ 
+ 	pParams.vMinZParams.x = m_pFocusMinZ->GetParam();
+ 	pParams.vMinZParams.y = m_pFocusMinZScale->GetParam();
+diff --git a/Code/CryPlugins/CinematicCamera/AnamorphicSpec.md b/Code/CryPlugins/CinematicCamera/AnamorphicSpec.md
+new file mode 100644
+index 00000000..59aeaa61
+--- /dev/null
++++ b/Code/CryPlugins/CinematicCamera/AnamorphicSpec.md
+@@ -0,0 +1,210 @@
++# Anamorphic Lens Spec
++
++Status: APPROVED FOR IMPLEMENTATION (2026-08-25). Author: main session.
++Scope: three physically distinct effects of an anamorphic lens, each on its own switch:
++1. **Squeeze** - wider horizontal capture for the same focal length, letterboxed to the
++   desqueezed format.
++2. **Oval bokeh** - out-of-focus discs are vertical ovals, height : width = squeeze : 1.
++3. **Horizontal flare** - the long tinted line thrown across the frame by bright sources off
++   the cylindrical front element.
++
++Everything below is a delta on the current tree. Build with the bundled CMake
++(`Tools\CMake\Win32\bin\cmake.exe --build solutions_cmake\win64 --target <T> --config Profile`),
++targets `CinematicCamera` and `CryRenderD3D11`, zero warnings. Do NOT deploy DLLs or shaders.
++All comments and docs in English.
++
++---
++
++## A. Component (`Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h/.cpp`)
++
++### A1. New property group `SCineAnamorphicParams`
++
++Same pattern as `SCineStreaksParams` (memcmp `operator==`, `ReflectType` with a NEW GUID,
++label "Anamorphic"). Member `SCineAnamorphicParams m_anamorphic;` reflected as
++`desc.AddMember(&CCinematicCameraComponent::m_anamorphic, 'gana', "Anamorphic", "Anamorphic", "", SCineAnamorphicParams());`
++placed right after the `m_lens` ('glns') line so it sits under Lens in the inspector.
++
++| member | tag | label | type / range | default | description |
++|---|---|---|---|---|---|
++| `squeeze` | 'sqz_' | Squeeze Factor | Range<1,2,1,2> | 1.0 | 1 = spherical. 1.33 / 1.5 / 1.8 / 2 = anamorphic: the horizontal capture widens by this factor for the same focal length, out-of-focus discs become vertical ovals of this ratio, and (with Letterbox on) the frame is masked to the desqueezed format. |
++| `flareAmount` | 'afla' | Horizontal Flare | Range<0,3,0,2> | 0.0 | Strength of the anamorphic streak: the long horizontal line thrown across the frame by bright sources off the cylindrical front element. 0 = off. Strongest wide open, fading out by f/11. Independent of the diffraction streaks. |
++| `flareLength` | 'afln' | Flare Length | Range<0,1,0,1> | 0.7 | How far the line reaches across the frame. |
++| `flareThreshold` | 'afth' | Flare Threshold | Range<0,50,0,20> | 3.0 | Scene HDR value a source must exceed to throw a flare. |
++| `flareTint` | 'aftn' | Flare Tint | ColorF | (0.35, 0.62, 1.0, 1) | Colour of the flare. Classic anamorphic coatings give the cyan-blue line; a neutral tint gives white. |
++
++`ColorF` is reflected by CrySchematyc (`CrySchematyc/MathTypes.h`); verify it compiles in
++`AddMember` - if it does not, fall back to three `Range<0,1,0,1>` floats `flareTintR/G/B`
++with tags 'aftr','aftg','aftb' and say so in the report.
++
++### A2. Field of view with squeeze (`ComputeVerticalFOV()`)
++
++The engine camera takes a VERTICAL fov and the viewport aspect. Current behaviour (keep it as
++the fallback): `vFOV = 2 atan(sensorHeight / 2f)`.
++
++```
++const float S = clamp(m_anamorphic.squeeze, 1, 2);
++const float w_mm = GetSensorWidth() * S;            // desqueezed horizontal capture
++const float h_mm = GetSensorHeight();
++const float formatAspect = w_mm / h_mm;
++const float viewportAspect = (float)gEnv->pRenderer->GetOverlayWidth() / max(gEnv->pRenderer->GetOverlayHeight(), 1);
++if (S > 1.001f && formatAspect > viewportAspect)
++{
++    // Fit the format's WIDTH into the viewport: horizontal fov from the widened capture,
++    // vertical fov derived through the viewport aspect (the bars take the rest).
++    const float hFOV = 2 atan(w_mm * 0.5 / f_mm);
++    return 2 atan(tan(hFOV * 0.5) / viewportAspect);
++}
++return 2 atan(h_mm * 0.5 / f_mm);                  // fit height (spherical, or format not wider than the viewport)
++```
++Decision (user, 2026-08-25): the projected (desqueezed) frame with bars is THE default and
++the only FOV rule; no crop mode. One presentation switch was kept on request: **Show Squeezed
++Frame** ('asqf', default off) pushes r_LensLetterbox = -formatAspect and the final composite
++stretches the same band vertically to fill the viewport (the raw anamorphic negative) instead
++of masking it. Identical frustum either way.
++`f_mm` is the breathing-adjusted focal length already computed in that function. If
++`GetOverlayWidth/Height` are not available on `IRenderer` in this engine version use
++`GetWidth()/GetHeight()`; verify.
++
++### A3. Letterbox push (`ApplyLensCharacter()`, editor-live like vignette/distortion)
++
++New renderer cvar `r_LensLetterbox` (section C4). Push
++`letterbox = (S > 1.001 && formatAspect > viewportAspect) ? formatAspect : 0`
++every time `ApplyLensCharacter` runs, with the same save/restore discipline as
++`r_LensDistortion` (`m_savedLetterbox`, latched with `m_bLensCharSaved`, restored in
++`RestoreLensCharacter`).
++
++### A4. Oval bokeh push (`ApplyDOF()`)
++
++Push new post param `Dof_User_AnamorphicSqueeze` = `S` (section C2). Add it to the save
++block and to `RestoreDOF()` (`m_savedDofAnamorphicSqueeze`).
++
++### A5. Flare push (`ApplyStreaks()` / `RestoreStreaks()`)
++
++The flare is independent of the diffraction streaks: restructure `ApplyStreaks` so the
++anamorphic params are pushed whenever `CanDriveRenderState()` holds, regardless of
++`m_streaks.bEnableStreaks` (that flag keeps gating ONLY the blade-streak params exactly as
++today - when it is off, the blade params are restored as today and the anamorphic ones are
++still pushed).
++
++```
++const float N = max(aperture, 0.7);
++const float wideOpenness = clamp((11 - N) / (11 - 2), 0, 1);   // 1 at f/2 and wider, 0 at f/11
++HDR_Streaks_AnamorphicAmount    = flareAmount * wideOpenness
++HDR_Streaks_AnamorphicLength    = flareLength
++HDR_Streaks_AnamorphicThreshold = flareThreshold
++HDR_Streaks_AnamorphicTint      = Vec4(tint.r, tint.g, tint.b, 0)   via gEnv->p3DEngine->SetPostEffectParamVec4
++```
++Save with `GetPostEffectParam` / `GetPostEffectParamVec4` under the existing
++`m_bStreakParamsSaved` latch (add `m_savedAnamorphicAmount/Length/Threshold`, `Vec4 m_savedAnamorphicTint`),
++restore in `RestoreStreaks`. `ClearSavedBaselines()` needs no change (it clears the latch).
++
++---
++
++## B. Renderer post-effect params (`Common/PostProcess/PostEffects.h/.cpp`)
++
++### B1. `CDepthOfField`
++- `AddParamFloatNoTransition("Dof_User_AnamorphicSqueeze", m_pUserAnamorphicSqueeze, 1.0f);`
++- `Reset()`: `ResetParam(1.0f)`.
++- `SDepthOfFieldParams::fAnamorphicSqueeze` (default 1), filled in `GetParams()` as
++  `clamp(m_pUserAnamorphicSqueeze->GetParam(), 1, 2)`.
++
++### B2. `CHDRStreaks`
++- Params: `HDR_Streaks_AnamorphicAmount` (float, 0), `HDR_Streaks_AnamorphicLength` (0.7),
++  `HDR_Streaks_AnamorphicThreshold` (3.0), `HDR_Streaks_AnamorphicTint` (Vec4, (0.35,0.62,1,0))
++  - for the Vec4 use the existing `CParamVec4` registration helper (grep `AddParamVec4` /
++  `RegisterParam<CParamVec4` in PostProcess.h; the colour grading effect is a precedent).
++- `SHDRStreaksParams`: `float fAnamorphicAmount, fAnamorphicLength, fAnamorphicThreshold; Vec4 vAnamorphicTint;`
++  filled in `GetParams()` (amount clamped 0..3, length 0..1, threshold >= 0).
++- `Reset()` resets all four.
++
++---
++
++## C. Renderer passes
++
++### C1. Oval bokeh - gather (`GraphicsPipeline/DepthOfField.cpp`, `Execute()`)
++
++After each of the two tap arrays is built (the 7x7 and the 3x3 loops), scale the horizontal
++component: `vTaps[i].x /= fSqueeze` with `const float fSqueeze = clamp(dofParams.fAnamorphicSqueeze, 1, 2)`
++resolved once near `fIrisExponent`. Vertical stays the spherical CoC; the oval is
++height : width = S : 1, matching the desqueezed anamorphic look. Both the polygon and the
++mask kernels go through this (it is applied to the finished tap, whichever path produced it).
++
++### C2. Oval bokeh - splat (`ExecuteSpriteBokeh` + `DepthOfField.cfx` VS)
++
++`vAspectRatio.z` is currently unused (the comment says so). Set `vAspectRatio.z = 1 / fSqueeze`
++and update that comment to "z = horizontal splat scale, 1 / anamorphic squeeze".
++
++- `DofBokehRefVS`: right after `OUT.QuadPos.xy *= vAspectRatio.xy;` add
++  `OUT.QuadPos.x *= vAspectRatio.z;` (comment: the pupil image is squeezed horizontally, so
++  the quad - and the mask sampled through it - is too). Leave `QuadPos.w` (CoC in pixels)
++  alone.
++- `DofBokehRefPS`: the oval covers `CoC^2 * z` pixels instead of `CoC^2`, so the
++  energy-conserving deposit becomes
++  `const half fSplatNorm = vDofBokehHighlight.z / (fCocPixels * fCocPixels * vAspectRatio.z);`
++  with a comment. `vAspectRatio` is already bound to the pixel stage (~line 785).
++
++When S = 1, z = 1 and both lines are identities.
++
++### C3. Horizontal flare (`GraphicsPipeline/Bloom.h/.cpp`, `HDRPostProcess.cfx`)
++
++`Bloom.h`: add `static const int kAnamorphicIterations = 3;`,
++`CFullscreenPass m_passAnamorphicThreshold; CFullscreenPass m_passAnamorphicStretch[kAnamorphicIterations];`
++initialised in the constructor like the others.
++
++`ExecuteStreaks()` restructure (keep every existing line's behaviour for the blade streaks):
++```
++if (!CV_r_HDRStreaks) return;
++params = GetParams(); apply the r_HDRStreaks==2 diagnostic override as today;
++const bool bBlade = params.bActive && params.fAmount >= 0.001f && params.nDirectionCount >= 4;
++const bool bAnamorphic = params.fAnamorphicAmount >= 0.001f;
++if (!bBlade && !bAnamorphic) return;
++PROFILE_LABEL_SCOPE("HDR_STREAKS");
++shared: names, pStreakSource/pStreakPingPong, texel scales, bloom composite weight;
++if (bBlade)      { the existing threshold pass + direction loop, unchanged }
++if (bAnamorphic) {
++    PROFILE_LABEL_SCOPE("ANAMORPHIC_FLARE");
++    // Own threshold pass into pStreakSource (the blade pass, if it ran, has finished with it):
++    m_passAnamorphicThreshold - same setup as m_passStreakThreshold, StreakParams1 = (anamThreshold, max(anamThreshold*0.25, 0.01), 0, 0)
++    // Horizontal march, three widening iterations (8^3 tap distances = the whole frame width):
++    dir = (1, 0); fStride = 1.0 + 3.0 * len; fDecay = 0.60 + 0.38 * clamp(len,0,1);
++    for it in 0..2: pass = m_passAnamorphicStretch[it]; same setup pattern as the blade loop
++        (last iteration: ONE/ONE blend into m_pTexHDRFinalBloom, source = it==0 ? pStreakSource : pStreakPingPong);
++        StreakParams0 = (fTexelScaleX, 0, fStride, last ? fAnamorphicAmount / fBloomCompositeWeight : 1)
++        StreakParams1 = (0, 0, fDecay, 0)
++        StreakParams2 = last ? (tint.rgb, 0) : (1,1,1,0)
++        stride *= 8; decay = decay^8
++}
++```
++For the blade loop also set `StreakParams2 = (1,1,1,0)` on every pass (the shader now
++multiplies by it).
++
++`HDRPostProcess.cfx`: declare `float4 StreakParams2;   // (tint rgb, unused)` next to the
++others, and in `HDRStreakStretchPS` return `cSum * (StreakParams0.w / max(fWeightSum, 0.0001f)) * StreakParams2.rgb;`.
++
++### C4. Letterbox (`Common/RendererCVars.h/.cpp`, `GraphicsPipeline/PostAA.cpp`, `PostAA.cfx`)
++
++- cvar `r_LensLetterbox` (`CV_r_LensLetterbox`, float, default 0, VF_NULL): "Aspect ratio
++  to letterbox the final frame to: black bars top and bottom when the frame is wider than
++  the viewport. 0 = off. Driven by the Cinematic Camera's anamorphic squeeze; can be set by
++  hand for a plain 2.39:1 mask." Register next to `r_LensDistortion`.
++- `PostAA.cpp` (~line 490): `distortionParams.z = max(CV_r_LensLetterbox, 0)` (x = k1,
++  y = viewport aspect already there).
++- `PostAA.cfx` composition PS (the one that calls `LensDistortUV`, ~line 948): after the
++  colour is fetched, `if (vLensDistortionParams.z > 0.01) { const float fVisible = vLensDistortionParams.y / vLensDistortionParams.z; if (abs(IN.baseTC.y - 0.5) > 0.5 * fVisible) OUT.Color = 0; }`
++  Update the `vLensDistortionParams` comment: z = letterbox aspect (0 = off). Bars are
++  hard-edged (a real gate mask is).
++
++---
++
++## D. Docs (English)
++
++- `README.md`: new "Anamorphic" section (the three effects, the FOV/letterbox rule, the
++  oval ratio, the flare's f-number curve) + the property table for the group.
++- `docs/ConsoleReference.md`: `r_LensLetterbox`; post params `Dof_User_AnamorphicSqueeze`,
++  `HDR_Streaks_Anamorphic*` in the params list.
++
++## E. Report back
++
++Per section: files/lines changed; anything you had to deviate on (ColorF, IRenderer size
++accessor, AddParamVec4 helper name); build output for both targets (must be 0 errors 0
++warnings). Do not deploy.
+diff --git a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp
+index 21de46f8..66d24de5 100644
+--- a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp
++++ b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp
+@@ -10,6 +10,7 @@
+ #include <CrySchematyc/Env/IEnvRegistrar.h>
+ #include <CryCore/StaticInstanceList.h>
+ #include <CryMath/Angle.h>
++#include <CryRenderer/IRenderer.h>
+ #include <CrySystem/File/ICryPak.h>
+ #include <vector>
+ 
+@@ -475,10 +476,54 @@ float CCinematicCameraComponent::ComputeVerticalFOV() const
+ 		f_mm *= 1.0f + (float)m_lens.breathingIntensity * magnification;
+ 	}
+ 
++	// Anamorphic squeeze: the cylindrical element compresses a wider horizontal capture onto
++	// the same sensor, so the projected (desqueezed) format is sensorWidth * S by sensorHeight.
++	// Whenever that format is wider than the viewport, the format's WIDTH is what has to fit -
++	// the horizontal field comes from the widened capture and the vertical field follows the
++	// viewport aspect, the bars taking the rest. Otherwise (spherical, or a squeeze small
++	// enough that the format still fits) the height is what fits, as before.
++	const float S = clamp_tpl((float)m_anamorphic.squeeze, 1.0f, 2.0f);
++	const float w_mm = GetSensorWidth() * S;
+ 	const float h_mm = GetSensorHeight();
++
++	if (S > 1.001f)
++	{
++		const float formatAspect = w_mm / max(h_mm, 0.001f);
++		const float viewportAspect = gEnv->pRenderer
++			? (float)gEnv->pRenderer->GetOverlayWidth() / (float)max(gEnv->pRenderer->GetOverlayHeight(), 1)
++			: formatAspect;
++		if (formatAspect > viewportAspect)
++		{
++			const float hFOV = 2.0f * atanf(w_mm * 0.5f / f_mm);
++			return 2.0f * atanf(tanf(hFOV * 0.5f) / max(viewportAspect, 0.001f));
++		}
++	}
++
+ 	return 2.0f * atanf(h_mm * 0.5f / f_mm);
+ }
+ 
++// The mask the desqueezed format needs, or 0 when the picture already fits the viewport.
++// Kept in one place so the frustum (ComputeVerticalFOV) and the bars (r_LensLetterbox) can
++// never disagree about whether the format is the wider one.
++float CCinematicCameraComponent::ComputeLetterboxAspect() const
++{
++	const float S = clamp_tpl((float)m_anamorphic.squeeze, 1.0f, 2.0f);
++	if (S <= 1.001f)
++		return 0.0f;
++
++	const float formatAspect = (GetSensorWidth() * S) / max(GetSensorHeight(), 0.001f);
++	const float viewportAspect = gEnv->pRenderer
++		? (float)gEnv->pRenderer->GetOverlayWidth() / (float)max(gEnv->pRenderer->GetOverlayHeight(), 1)
++		: formatAspect;
++
++	if (formatAspect <= viewportAspect)
++		return 0.0f;
++
++	// Negative = squeezed presentation: the renderer stretches the band to fill the viewport
++	// instead of masking it. Same frustum either way (ComputeVerticalFOV does not look at this).
++	return m_anamorphic.bSqueezedFrame ? -formatAspect : formatAspect;
++}
++
+ // Circle-of-confusion limit in metres (sensorDiagonal_mm / 1500 / 1000).
+ float CCinematicCameraComponent::ComputeCoCLimit() const
+ {
+@@ -690,6 +735,7 @@ void CCinematicCameraComponent::ApplyDOF()
+ 		gEnv->p3DEngine->GetPostEffectParam("Dof_User_HighlightGain", m_savedDofHighlightGain);
+ 		gEnv->p3DEngine->GetPostEffectParam("Dof_User_ApertureBlades", m_savedDofApertureBlades);
+ 		gEnv->p3DEngine->GetPostEffectParam("Dof_User_FNumber", m_savedDofFNumber);
++		gEnv->p3DEngine->GetPostEffectParam("Dof_User_AnamorphicSqueeze", m_savedDofAnamorphicSqueeze);
+ 		m_bDofParamsSaved = true;
+ 	}
+ 
+@@ -707,6 +753,9 @@ void CCinematicCameraComponent::ApplyDOF()
+ 	gEnv->p3DEngine->SetPostEffectParam("Dof_User_BladeRotation",  DEG2RAD((float)m_streaks.bladeRotation));
+ 	gEnv->p3DEngine->SetPostEffectParam("Dof_User_BladeCurvature", (float)m_lens.bladeCurvature);
+ 	gEnv->p3DEngine->SetPostEffectParam("Dof_User_MaskFNumber",    (float)m_lens.maskAperture);
++	// Oval bokeh: the pupil image is squeezed horizontally by the same factor, so every
++	// out-of-focus disc becomes a vertical oval of height : width = S : 1.
++	gEnv->p3DEngine->SetPostEffectParam("Dof_User_AnamorphicSqueeze", clamp_tpl((float)m_anamorphic.squeeze, 1.0f, 2.0f));
+ 
+ 	// Hybrid highlight splat tuning. Harmless in pure gather mode - nothing reads them there.
+ 	gEnv->p3DEngine->SetPostEffectParam("Dof_User_HighlightThreshold", (float)m_dof.highlightThreshold);
+@@ -733,6 +782,7 @@ void CCinematicCameraComponent::RestoreDOF()
+ 	gEnv->p3DEngine->SetPostEffectParam("Dof_Active",              m_savedDofActive);
+ 	gEnv->p3DEngine->SetPostEffectParam("Dof_User_ApertureBlades", m_savedDofApertureBlades);
+ 	gEnv->p3DEngine->SetPostEffectParam("Dof_User_FNumber",        m_savedDofFNumber);
++	gEnv->p3DEngine->SetPostEffectParam("Dof_User_AnamorphicSqueeze", m_savedDofAnamorphicSqueeze);
+ 
+ 	ICVar* pDofCVar = gEnv->pConsole->GetCVar("r_dof");
+ 	if (pDofCVar)
+@@ -942,6 +992,7 @@ void CCinematicCameraComponent::ApplyLensCharacter()
+ 
+ 	ICVar* pVignette = gEnv->pConsole->GetCVar("r_HDRVignetteAmount");
+ 	ICVar* pDistortion = gEnv->pConsole->GetCVar("r_LensDistortion");
++	ICVar* pLetterbox = gEnv->pConsole->GetCVar("r_LensLetterbox");
+ 	if (pVignette == nullptr || pDistortion == nullptr)
+ 		return;
+ 
+@@ -949,6 +1000,7 @@ void CCinematicCameraComponent::ApplyLensCharacter()
+ 	{
+ 		m_savedVignetteAmount = pVignette->GetFVal();
+ 		m_savedLensDistortion = pDistortion->GetFVal();
++		m_savedLetterbox = pLetterbox ? pLetterbox->GetFVal() : 0.0f;
+ 		m_bLensCharSaved = true;
+ 	}
+ 
+@@ -966,6 +1018,14 @@ void CCinematicCameraComponent::ApplyLensCharacter()
+ 		pVignette->Set(vignette);
+ 	if (fabs_tpl(pDistortion->GetFVal() - distortion) > 0.001f)
+ 		pDistortion->Set(distortion);
++
++	// Anamorphic gate mask: bars only when the desqueezed format is wider than the viewport.
++	if (pLetterbox)
++	{
++		const float letterbox = ComputeLetterboxAspect();
++		if (fabs_tpl(pLetterbox->GetFVal() - letterbox) > 0.001f)
++			pLetterbox->Set(letterbox);
++	}
+ }
+ 
+ void CCinematicCameraComponent::RestoreLensCharacter()
+@@ -977,6 +1037,8 @@ void CCinematicCameraComponent::RestoreLensCharacter()
+ 		pVignette->Set(m_savedVignetteAmount);
+ 	if (ICVar* pDistortion = gEnv->pConsole->GetCVar("r_LensDistortion"))
+ 		pDistortion->Set(m_savedLensDistortion);
++	if (ICVar* pLetterbox = gEnv->pConsole->GetCVar("r_LensLetterbox"))
++		pLetterbox->Set(m_savedLetterbox);
+ 	m_bLensCharSaved = false;
+ }
+ 
+@@ -1089,25 +1151,8 @@ void CCinematicCameraComponent::ApplyStreaks()
+ 	if (!CanDriveRenderState())
+ 		return;
+ 
+-	if (!m_streaks.bEnableStreaks)
+-	{
+-		RestoreStreaks();
+-		return;
+-	}
+-
+-	// Diffraction physics: an even blade count folds opposing edges onto the same spikes
+-	// (N spikes); an odd count cannot, giving 2N. The renderer draws them as symmetric
+-	// line pairs, so high counts stay affordable.
+-	const int blades = (int)m_lens.apertureBlades;
+-	const float rayCount = (float)clamp_tpl((blades % 2 == 0) ? blades : blades * 2, 4, 24);
+-
+-	// Brightness saturates early (fully lit by f/11) so that from there on stopping down
+-	// reads as the spikes GROWING, not fading in - the length curve owns f/7 to f/22.
+-	const float N = max((float)m_lens.aperture, 0.7f);
+-	const float amount = powf(clamp_tpl((N - 6.3f) / (11.0f - 6.3f), 0.0f, 1.0f), 1.2f);
+-	const float length = clamp_tpl((N - 7.0f) / (22.0f - 7.0f), 0.0f, 1.0f);
+-	const bool  bActive = amount > 0.001f;
+-
++	// The baseline latch covers BOTH parameter sets: the anamorphic flare is pushed even when
++	// the diffraction streaks are switched off, so it cannot be saved under the blade branch.
+ 	if (!m_bStreakParamsSaved)
+ 	{
+ 		gEnv->p3DEngine->GetPostEffectParam("HDR_Streaks_Active", m_savedStreaksActive);
+@@ -1115,14 +1160,58 @@ void CCinematicCameraComponent::ApplyStreaks()
+ 		gEnv->p3DEngine->GetPostEffectParam("HDR_Streaks_Count", m_savedStreaksCount);
+ 		gEnv->p3DEngine->GetPostEffectParam("HDR_Streaks_Angle", m_savedStreaksAngle);
+ 		gEnv->p3DEngine->GetPostEffectParam("HDR_Streaks_Length", m_savedStreaksLength);
++		gEnv->p3DEngine->GetPostEffectParam("HDR_Streaks_AnamorphicAmount", m_savedAnamorphicAmount);
++		gEnv->p3DEngine->GetPostEffectParam("HDR_Streaks_AnamorphicLength", m_savedAnamorphicLength);
++		gEnv->p3DEngine->GetPostEffectParam("HDR_Streaks_AnamorphicThreshold", m_savedAnamorphicThreshold);
++		gEnv->p3DEngine->GetPostEffectParamVec4("HDR_Streaks_AnamorphicTint", m_savedAnamorphicTint);
+ 		m_bStreakParamsSaved = true;
+ 	}
+ 
+-	gEnv->p3DEngine->SetPostEffectParam("HDR_Streaks_Active", bActive ? 1.0f : 0.0f);
+-	gEnv->p3DEngine->SetPostEffectParam("HDR_Streaks_Amount", amount);
+-	gEnv->p3DEngine->SetPostEffectParam("HDR_Streaks_Count", rayCount);
+-	gEnv->p3DEngine->SetPostEffectParam("HDR_Streaks_Angle", DEG2RAD((float)m_streaks.bladeRotation));
+-	gEnv->p3DEngine->SetPostEffectParam("HDR_Streaks_Length", length);
++	if (m_streaks.bEnableStreaks)
++	{
++		// Diffraction physics: an even blade count folds opposing edges onto the same spikes
++		// (N spikes); an odd count cannot, giving 2N. The renderer draws them as symmetric
++		// line pairs, so high counts stay affordable.
++		const int blades = (int)m_lens.apertureBlades;
++		const float rayCount = (float)clamp_tpl((blades % 2 == 0) ? blades : blades * 2, 4, 24);
++
++		// Brightness saturates early (fully lit by f/11) so that from there on stopping down
++		// reads as the spikes GROWING, not fading in - the length curve owns f/7 to f/22.
++		const float N = max((float)m_lens.aperture, 0.7f);
++		const float amount = powf(clamp_tpl((N - 6.3f) / (11.0f - 6.3f), 0.0f, 1.0f), 1.2f);
++		const float length = clamp_tpl((N - 7.0f) / (22.0f - 7.0f), 0.0f, 1.0f);
++		const bool  bActive = amount > 0.001f;
++
++		gEnv->p3DEngine->SetPostEffectParam("HDR_Streaks_Active", bActive ? 1.0f : 0.0f);
++		gEnv->p3DEngine->SetPostEffectParam("HDR_Streaks_Amount", amount);
++		gEnv->p3DEngine->SetPostEffectParam("HDR_Streaks_Count", rayCount);
++		gEnv->p3DEngine->SetPostEffectParam("HDR_Streaks_Angle", DEG2RAD((float)m_streaks.bladeRotation));
++		gEnv->p3DEngine->SetPostEffectParam("HDR_Streaks_Length", length);
++	}
++	else
++	{
++		// Blade streaks off: hand the diffraction params back exactly as before, and keep going -
++		// the anamorphic flare is a property of the front element, not of the iris.
++		gEnv->p3DEngine->SetPostEffectParam("HDR_Streaks_Active", m_savedStreaksActive);
++		gEnv->p3DEngine->SetPostEffectParam("HDR_Streaks_Amount", m_savedStreaksAmount);
++		gEnv->p3DEngine->SetPostEffectParam("HDR_Streaks_Count", m_savedStreaksCount);
++		gEnv->p3DEngine->SetPostEffectParam("HDR_Streaks_Angle", m_savedStreaksAngle);
++		gEnv->p3DEngine->SetPostEffectParam("HDR_Streaks_Length", m_savedStreaksLength);
++	}
++
++	// Anamorphic horizontal flare. The cylindrical front element throws it hardest when the
++	// whole element is in the light path, so it is strongest wide open and gone by f/11 -
++	// the opposite curve to the iris diffraction above.
++	{
++		const float N = max((float)m_lens.aperture, 0.7f);
++		const float wideOpenness = clamp_tpl((11.0f - N) / (11.0f - 2.0f), 0.0f, 1.0f);
++		const ColorF tint = m_anamorphic.flareTint;
++
++		gEnv->p3DEngine->SetPostEffectParam("HDR_Streaks_AnamorphicAmount", (float)m_anamorphic.flareAmount * wideOpenness);
++		gEnv->p3DEngine->SetPostEffectParam("HDR_Streaks_AnamorphicLength", (float)m_anamorphic.flareLength);
++		gEnv->p3DEngine->SetPostEffectParam("HDR_Streaks_AnamorphicThreshold", (float)m_anamorphic.flareThreshold);
++		gEnv->p3DEngine->SetPostEffectParamVec4("HDR_Streaks_AnamorphicTint", Vec4(tint.r, tint.g, tint.b, 0.0f));
++	}
+ }
+ 
+ void CCinematicCameraComponent::RestoreStreaks()
+@@ -1135,6 +1224,10 @@ void CCinematicCameraComponent::RestoreStreaks()
+ 	gEnv->p3DEngine->SetPostEffectParam("HDR_Streaks_Count", m_savedStreaksCount);
+ 	gEnv->p3DEngine->SetPostEffectParam("HDR_Streaks_Angle", m_savedStreaksAngle);
+ 	gEnv->p3DEngine->SetPostEffectParam("HDR_Streaks_Length", m_savedStreaksLength);
++	gEnv->p3DEngine->SetPostEffectParam("HDR_Streaks_AnamorphicAmount", m_savedAnamorphicAmount);
++	gEnv->p3DEngine->SetPostEffectParam("HDR_Streaks_AnamorphicLength", m_savedAnamorphicLength);
++	gEnv->p3DEngine->SetPostEffectParam("HDR_Streaks_AnamorphicThreshold", m_savedAnamorphicThreshold);
++	gEnv->p3DEngine->SetPostEffectParamVec4("HDR_Streaks_AnamorphicTint", m_savedAnamorphicTint);
+ 	m_bStreakParamsSaved = false;
+ }
+ 
+diff --git a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
+index 84949e71..24d603d7 100644
+--- a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
++++ b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
+@@ -425,6 +425,53 @@ struct SCineStreaksParams
+ 	Schematyc::Range<0, 360, 0, 360> bladeRotation = 0.f;
+ };
+ 
++struct SCineAnamorphicParams
++{
++	inline bool operator==(const SCineAnamorphicParams& rhs) const { return 0 == memcmp(this, &rhs, sizeof(rhs)); }
++
++	static void ReflectType(Schematyc::CTypeDesc<SCineAnamorphicParams>& desc)
++	{
++		desc.SetGUID("{93F6E82C-B5DA-4490-12E7-6A83AC4935F9}"_cry_guid);
++		desc.SetLabel("Anamorphic");
++		desc.AddMember(&SCineAnamorphicParams::squeeze,
++			'sqz_', "Squeeze", "Squeeze Factor",
++			"1 = spherical. 1.33 / 1.5 / 1.8 / 2 = anamorphic: the horizontal capture widens by "
++			"this factor for the same focal length, out-of-focus discs become vertical ovals of "
++			"this ratio, and the frame is masked to the desqueezed format (sensor width x squeeze "
++			"/ sensor height) with black bars whenever that format is wider than the viewport, so "
++			"the full horizontal field of view is kept.", 1.0f);
++		desc.AddMember(&SCineAnamorphicParams::flareAmount,
++			'afla', "FlareAmount", "Horizontal Flare",
++			"Strength of the anamorphic streak: the long horizontal line thrown across the frame "
++			"by bright sources off the cylindrical front element. 0 = off. Strongest wide open, "
++			"fading out by f/11. Independent of the diffraction streaks.", 0.0f);
++		desc.AddMember(&SCineAnamorphicParams::flareLength,
++			'afln', "FlareLength", "Flare Length",
++			"How far the line reaches across the frame.", 0.7f);
++		desc.AddMember(&SCineAnamorphicParams::flareThreshold,
++			'afth', "FlareThreshold", "Flare Threshold",
++			"Scene HDR value a source must exceed to throw a flare.", 3.0f);
++		desc.AddMember(&SCineAnamorphicParams::flareTint,
++			'aftn', "FlareTint", "Flare Tint",
++			"Colour of the flare. Classic anamorphic coatings give the cyan-blue line; a neutral "
++			"tint gives white.", ColorF(0.35f, 0.62f, 1.0f, 1.0f));
++		desc.AddMember(&SCineAnamorphicParams::bSqueezedFrame,
++			'asqf', "SqueezedFrame", "Show Squeezed Frame",
++			"Present the raw anamorphic negative instead of the projected frame: the band the "
++			"gate mask would keep is stretched vertically to fill the viewport, so the whole "
++			"picture carries the squeeze - circles become tall ovals, faces go thin - not just "
++			"the bokeh. The camera frustum is identical to the masked frame; only the final "
++			"presentation differs. Off = the physically projected (desqueezed) frame with bars.", false);
++	}
++
++	Schematyc::Range<1, 2, 1, 2> squeeze = 1.0f;
++	bool bSqueezedFrame = false;
++	Schematyc::Range<0, 3, 0, 2> flareAmount = 0.0f;
++	Schematyc::Range<0, 1, 0, 1> flareLength = 0.7f;
++	Schematyc::Range<0, 50, 0, 20> flareThreshold = 3.0f;
++	ColorF flareTint = ColorF(0.35f, 0.62f, 1.0f, 1.0f);
++};
++
+ class CCinematicCameraComponent final
+ 	: public IEntityComponent
+ 	, public ICinematicCameraOptics
+@@ -449,6 +496,7 @@ public:
+ 
+ 		desc.AddMember(&CCinematicCameraComponent::m_body, 'gbdy', "CameraBody", "Camera Body", "", SCineBodyParams());
+ 		desc.AddMember(&CCinematicCameraComponent::m_lens, 'glns', "Lens", "Lens", "", SCineLensParams());
++		desc.AddMember(&CCinematicCameraComponent::m_anamorphic, 'gana', "Anamorphic", "Anamorphic", "", SCineAnamorphicParams());
+ 		desc.AddMember(&CCinematicCameraComponent::m_exposure, 'gexp', "Exposure", "Exposure", "", SCineExposureParams());
+ 		desc.AddMember(&CCinematicCameraComponent::m_dof, 'gdof', "DepthOfField", "Depth Of Field", "", SCineDofParams());
+ 		desc.AddMember(&CCinematicCameraComponent::m_grain, 'ggrn', "FilmGrain", "Film Grain", "", SCineGrainParams());
+@@ -543,6 +591,9 @@ private:
+ 	float GetSensorWidth()  const;
+ 	float GetSensorHeight() const;
+ 	float ComputeVerticalFOV() const;
++	//! Aspect the desqueezed anamorphic format has to be masked to, or 0 when no bars are
++	//! needed (spherical lens, or a format that is not wider than the viewport).
++	float ComputeLetterboxAspect() const;
+ 	float ComputeCoCLimit() const;
+ 	void  ComputeDOFBounds(float& outNear, float& outFar) const;
+ 	float ComputeMaxBlurAmount() const;
+@@ -569,6 +620,7 @@ private:
+ 	// Reflected property groups
+ 	SCineBodyParams m_body;
+ 	SCineLensParams m_lens;
++	SCineAnamorphicParams m_anamorphic;
+ 	SCineExposureParams m_exposure;
+ 	SCineDofParams m_dof;
+ 	SCineGrainParams m_grain;
+@@ -600,6 +652,7 @@ private:
+ 	float m_savedDofHighlightGain = 2.f;
+ 	float m_savedDofApertureBlades = 6.f;
+ 	float m_savedDofFNumber    = 2.f;
++	float m_savedDofAnamorphicSqueeze = 1.f;
+ 	int   m_savedDofCVar       = 0;
+ 	bool  m_bDofParamsSaved    = false;
+ 
+@@ -622,9 +675,10 @@ private:
+ 	Vec3 m_lastWrittenBalance = Vec3(1.0f);
+ 	bool m_bWBParamsSaved     = false;
+ 
+-	// Lens character saved cvars (r_HDRVignetteAmount / r_LensDistortion)
++	// Lens character saved cvars (r_HDRVignetteAmount / r_LensDistortion / r_LensLetterbox)
+ 	float m_savedVignetteAmount = 0.f;
+ 	float m_savedLensDistortion = 0.f;
++	float m_savedLetterbox      = 0.f;
+ 	bool  m_bLensCharSaved      = false;
+ 
+ 	// Sprite bokeh saved state (r_DepthOfFieldMode cvar + Dof_User_BokehShapeTex post param).
+@@ -646,6 +700,11 @@ private:
+ 	float m_savedStreaksCount     = 8.f;
+ 	float m_savedStreaksAngle     = 0.f;
+ 	float m_savedStreaksLength    = 0.5f;
++	// Anamorphic horizontal flare, pushed alongside the blade streaks but gated separately.
++	float m_savedAnamorphicAmount    = 0.f;
++	float m_savedAnamorphicLength    = 0.7f;
++	float m_savedAnamorphicThreshold = 3.f;
++	Vec4  m_savedAnamorphicTint      = Vec4(0.35f, 0.62f, 1.0f, 0.0f);
+ 	bool  m_bStreakParamsSaved    = false;
+ 
+ 	// Derived cache of the camera manager's answer; written ONLY by ResolveActive().
+diff --git a/Code/CryPlugins/CinematicCamera/README.md b/Code/CryPlugins/CinematicCamera/README.md
+index 5da50c9b..f0d7e560 100644
+--- a/Code/CryPlugins/CinematicCamera/README.md
++++ b/Code/CryPlugins/CinematicCamera/README.md
+@@ -140,6 +140,17 @@ range it is noted in brackets.
+ | Mask Aperture | 1-22 (slider 1-8) | 2.0 | Equivalent f-number of the shape mask's bounding circle. The pupil is iris ∩ mask at every f-number: iris wider than this and the mask bounds the pupil (its shape rules, the polygon only trims what pokes past it); iris stopped down past it and the polygon bounds the pupil, clipping the silhouette corner by corner. Depth of field and bokeh SIZE follow whichever hole is the smaller one. Only used when a Bokeh Shape Texture is set. |
+ | Mask Open Area | 0-1 | 1.0 | Transmittance of the mask's OPEN parts (a tinted gel in the cut-out; 1 = clear). The blocked part is measured from the texture itself: light reaching the sensor = area(iris ∩ mask) / area(iris) × this value, through the same T-stop term as glass transmission, so exposure and film grain react like a neutral density loss - continuously, at every f-number. |
+ 
++### Anamorphic
++
++| Property | Range | Default | Effect |
++| --- | --- | --- | --- |
++| Squeeze Factor | 1-2 | 1.0 | 1 = spherical. 1.33 / 1.5 / 1.8 / 2 = anamorphic: the horizontal capture widens by this factor for the same focal length, out-of-focus discs become vertical ovals of this ratio, and the frame is masked to the desqueezed format whenever that format is wider than the viewport. See *Anamorphic*. |
++| Horizontal Flare | 0-3 (slider 0-2) | 0.0 | Strength of the anamorphic streak: the long horizontal line thrown across the frame by bright sources off the cylindrical front element. 0 = off. Strongest wide open, gone by f/11. Independent of the diffraction streaks. |
++| Flare Length | 0-1 | 0.7 | How far the line reaches across the frame. |
++| Flare Threshold | 0-50 (slider 0-20) | 3.0 | Scene HDR value a source must exceed to throw a flare. |
++| Flare Tint | colour | (0.35, 0.62, 1.0) | Colour of the flare. Classic anamorphic coatings give the cyan-blue line; a neutral tint gives white. |
++| Show Squeezed Frame | bool | false | Present the raw anamorphic negative instead of the projected frame: the letterbox band is stretched vertically to fill the viewport, so the whole picture carries the squeeze, not just the bokeh. Same frustum either way. |
++
+ ### Exposure
+ 
+ | Property | Range | Default | Effect |
+@@ -440,6 +451,58 @@ distortion = clamp(Distortion + DistortionFocalLink * focalTerm * 0.5, -1, 1) *
+ 
+ ---
+ 
++## Anamorphic
++
++An anamorphic lens carries a cylindrical element that compresses a wider horizontal field onto
++the same sensor. One property, `Squeeze Factor` (S), drives three physically distinct
++consequences, each on its own path through the renderer.
++
++**1. Field of view and the gate mask.** The projected (desqueezed) format is
++`sensorWidth * S` by `sensorHeight`, so its aspect is `formatAspect = sensorWidth * S / sensorHeight`
++(36 x 24 mm at S = 2 gives 3.0:1). When that format is wider than the viewport, the format's
++*width* is what has to fit: the horizontal field of view comes from the widened capture and the
++vertical field is derived through the viewport aspect, with black bars taking the rest.
++
++```
++hFOV = 2 atan(sensorWidth * S / 2f)
++vFOV = 2 atan(tan(hFOV / 2) / viewportAspect)      // formatAspect > viewportAspect
++vFOV = 2 atan(sensorHeight / 2f)                   // otherwise (spherical, or the format fits)
++```
++
++The bars are drawn in the final composite from the `r_LensLetterbox` cvar, which the component
++pushes (and restores) exactly like `r_LensDistortion`: `formatAspect` when the mask is needed,
++0 otherwise. They are hard-edged, as a real gate mask is. At S = 1 nothing changes.
++
++**Show Squeezed Frame** swaps the presentation for the raw anamorphic negative: the same band
++the gate mask would keep is stretched vertically to fill the viewport (`r_LensLetterbox` goes
++negative), so the whole picture carries the squeeze - circles become tall ovals, faces go thin -
++not just the bokeh. The camera frustum is identical in both presentations; switching between
++them changes nothing about what is in frame, only how the band is shown.
++
++**2. Oval bokeh.** The pupil image is compressed horizontally by the same factor, so an
++out-of-focus point spreads into a vertical oval of `height : width = S : 1`. The gather kernel
++divides every finished tap's horizontal component by S (both the polygon and the shape-mask
++kernels go through this), and the sprite bokeh splat narrows its quad the same way, dividing
++the energy-conserving deposit by the oval's real area so brightness is unchanged.
++
++**3. Horizontal flare.** The cylindrical front element throws one long tinted line across the
++frame instead of a star. It is a separate effect on its own switch (`Horizontal Flare`), with
++its own threshold and its own single horizontal march of three widening iterations - eight taps
++each, so `8^3` tap distances span the whole frame width. It follows the *opposite* f-number
++curve to the iris diffraction: strongest with the whole element in the light path and gone by
++f/11.
++
++```
++wideOpenness = clamp((11 - N) / (11 - 2), 0, 1)     // 1 at f/2 and wider, 0 at f/11
++amount       = HorizontalFlare * wideOpenness
++```
++
++The flare is pushed whenever the camera drives the render state, regardless of
++`Enable Diffraction Streaks` - one is a property of the iris, the other of the front element.
++Both ride the `HDR_Streaks_*` post effect params into the bloom target.
++
++---
++
+ ## Build and deployment
+ 
+ Both plugins hang off the engine's `Code/CryPlugins/CMakeLists.txt`. The bundled CMake is
+diff --git a/Code/CryPlugins/CinematicCamera/docs/ConsoleReference.md b/Code/CryPlugins/CinematicCamera/docs/ConsoleReference.md
+index 047dc193..88528a49 100644
+--- a/Code/CryPlugins/CinematicCamera/docs/ConsoleReference.md
++++ b/Code/CryPlugins/CinematicCamera/docs/ConsoleReference.md
+@@ -6,8 +6,9 @@ relies on (registered in `Code/CryEngine/RenderDll/Common/RendererCVars.cpp`).
+ The cvars fall into two groups:
+ 
+ - **Live tuning (character)**: values used in normal operation. Note that
+-  `r_HDRVignetteAmount` and `r_LensDistortion` are **overwritten every frame** while a
+-  cinematic camera drives the render state (from its Vignette / Distortion properties), so
++  `r_HDRVignetteAmount`, `r_LensDistortion` and `r_LensLetterbox` are **overwritten every
++  frame** while a cinematic camera drives the render state (from its Vignette / Distortion /
++  Anamorphic Squeeze properties), so
+   setting them by hand only sticks while no cinematic camera is active; the plugin restores
+   the pre-activation values when the camera stops driving.
+ - **Diagnostic**: force modes used to verify that a pipeline stage runs at all, independent of
+@@ -109,6 +110,18 @@ Vignette Aperture Link), in edit mode as well as in game mode.
+ Distortion Focal Link; that result is already multiplied by 0.35, so the written value stays
+ within +/-0.35), in edit mode as well as in game mode.
+ 
++### r_LensLetterbox
++
++| | |
++| --- | --- |
++| Default | 0.0 |
++| Purpose | Aspect ratio to letterbox the final frame to (PostAA): black bars top and bottom when the frame is wider than the viewport. 0 = off. The visible band is `viewportAspect / letterboxAspect` of the frame height, hard-edged like a real gate mask. A **negative** value is the squeezed presentation (Cinematic Camera "Show Squeezed Frame"): the same band is stretched vertically to fill the viewport instead of masked - the raw anamorphic negative, where the whole picture carries the squeeze. |
++
++**Overwritten every frame while a cinematic camera is active**, in edit mode as well as in game
++mode: the desqueezed anamorphic format aspect (`sensorWidth * Squeeze / sensorHeight`) while
++that format is wider than the viewport, 0 otherwise. Setting it by hand for a plain 2.39:1 mask
++therefore only sticks while no cinematic camera is driving the render state.
++
+ ### r_MotionBlurShutterSpeed
+ 
+ | | |
+@@ -162,13 +175,19 @@ Written by the plugin every frame; not cvars, and not meant to be driven by hand
+   `Dof_User_Active`, `Dof_User_FocusDistance`, `Dof_User_FocusRange`, `Dof_User_BlurAmount`,
+   `Dof_User_ApertureBlades`, `Dof_User_FNumber`, `Dof_User_BladeRotation`,
+   `Dof_User_BladeCurvature`, `Dof_User_MaskFNumber`, `Dof_User_HighlightThreshold`,
+-  `Dof_User_HighlightGain`
++  `Dof_User_HighlightGain`, `Dof_User_AnamorphicSqueeze` (1 = spherical; above 1 the gather
++  taps and the splat quads are narrowed horizontally, so bokeh becomes vertical ovals)
+ - `Dof_User_BokehShapeTex` (string param; rewritten every frame so both render command buffer
+   slots converge, unbound on restore)
+ - `FilterGrain_Amount` (combined with the TOD environment grain by `max()`)
+ - `HDR_Streaks_Active` / `HDR_Streaks_Amount` / `HDR_Streaks_Count` / `HDR_Streaks_Angle` /
+   `HDR_Streaks_Length` (unknown to an unmodified renderer: reads return 0, writes are silently
+   dropped)
++- `HDR_Streaks_AnamorphicAmount` / `HDR_Streaks_AnamorphicLength` /
++  `HDR_Streaks_AnamorphicThreshold` / `HDR_Streaks_AnamorphicTint` (Vec4, rgb) — the
++  anamorphic horizontal flare. Pushed whenever the camera drives the render state, including
++  while **Enable Diffraction Streaks** is off: the flare belongs to the front element, not to
++  the iris. `r_HDRStreaks` is still the master switch for both.
+ - `E3DPARAM_HDR_EYEADAPTATION_PARAMS` (exposure) and
+   `E3DPARAM_HDR_COLORGRADING_COLOR_BALANCE` (white balance) are global 3D engine parameters,
+   written from the `UpdateBeforeFinalizeCamera()` hook so the Time of Day system cannot
+diff --git a/Engine/Shaders/HWScripts/CryFX/DepthOfField.cfx b/Engine/Shaders/HWScripts/CryFX/DepthOfField.cfx
+index 77a0f4f5..3665e325 100644
+--- a/Engine/Shaders/HWScripts/CryFX/DepthOfField.cfx
++++ b/Engine/Shaders/HWScripts/CryFX/DepthOfField.cfx
+@@ -156,6 +156,9 @@ v2fBokehQuad DofBokehRefVS(uint nVertexID : SV_VertexID)
+ 	OUT.QuadPos.xy *= g_VS_ScreenSize.zw * 2.0;
+   // Scale by aspect ratio
+   OUT.QuadPos.xy *= vAspectRatio.xy;
++  // Anamorphic squeeze: the pupil image is compressed horizontally, so the quad - and the
++  // shape mask sampled through it - is too. QuadPos.w (the CoC in pixels) is left alone.
++  OUT.QuadPos.x *= vAspectRatio.z;
+ 
+ 	OUT.QuadPos.xy = max(g_VS_ScreenSize.zw * 2.0, OUT.QuadPos.xy);
+ 
+@@ -282,7 +285,9 @@ pixoutDofMRT DofBokehRefPS(v2fBokehQuad IN)
+ 	// going further out of focus widens and dims instead of gaining brightness. The layer is
+ 	// added to the gathered frame, so there is no accumulated-weight average to divide by.
+ 	const half fCocPixels = max(IN.QuadPos.w, 1.0);
+-	const half fSplatNorm = vDofBokehHighlight.z / (fCocPixels * fCocPixels);
++	// The anamorphic oval covers CoC^2 * vAspectRatio.z pixels instead of CoC^2 (the quad was
++	// narrowed by that same factor in the VS), so the deposit is divided by the real area.
++	const half fSplatNorm = vDofBokehHighlight.z / (fCocPixels * fCocPixels * vAspectRatio.z);
+ 
+ 	half4 cScene = half4(IN.Color.rgb, 1);
+ 	cScene *= half4(cBokehShape.rgb, dot(cBokehShape.rgb, 0.333));
+diff --git a/Engine/Shaders/HWScripts/CryFX/HDRPostProcess.cfx b/Engine/Shaders/HWScripts/CryFX/HDRPostProcess.cfx
+index 808cf94b..2e69318c 100644
+--- a/Engine/Shaders/HWScripts/CryFX/HDRPostProcess.cfx
++++ b/Engine/Shaders/HWScripts/CryFX/HDRPostProcess.cfx
+@@ -160,6 +160,7 @@ float3 HDRBloomGaussianPS(vtxOut IN) : SV_Target
+ 
+ float4 StreakParams0;   // (dirX / targetWidth, dirY / targetHeight, tapStride in pixels, output scale)
+ float4 StreakParams1;   // (threshold, soft knee, per tap decay, unused)
++float4 StreakParams2;   // (tint rgb, unused) - white for the iris spikes, the coating colour for the anamorphic flare
+ 
+ Texture2D<float4> HDRStreak_Src        : register(t0);
+ SamplerState HDRStreak_LClampSampler   : register(s0); // LinearClamp
+@@ -207,7 +208,7 @@ float3 HDRStreakStretchPS(vtxOut IN) : SV_Target
+ 	}
+ 
+ 	// Normalised weights keep the total energy independent of the iteration count.
+-	return cSum * (StreakParams0.w / max(fWeightSum, 0.0001f));
++	return cSum * (StreakParams0.w / max(fWeightSum, 0.0001f)) * StreakParams2.rgb;
+ }
+ 
+ ////////////////////////////////////////////////////////////////////////////////////////////////////
+diff --git a/Engine/Shaders/HWScripts/CryFX/PostAA.cfx b/Engine/Shaders/HWScripts/CryFX/PostAA.cfx
+index 55c9c8c1..cec5ebfd 100644
+--- a/Engine/Shaders/HWScripts/CryFX/PostAA.cfx
++++ b/Engine/Shaders/HWScripts/CryFX/PostAA.cfx
+@@ -920,7 +920,7 @@ void ApplyFilmGrain(inout half4 cScene, in half3 cColor, float4 WPos, float4 bas
+ 	cScene.xyz = lerp((cColor.xyz * fFilmGrain * 2.h), (1.h - (2.h * (1.h - cColor.xyz) * (1.h - fFilmGrain))), cScene.xyz);
+ }
+ 
+-float4 vLensDistortionParams;  // x = k1 (positive barrel, negative pincushion), y = aspect
++float4 vLensDistortionParams;  // x = k1 (positive barrel, negative pincushion), y = aspect, z = letterbox aspect (0 = off; negative = squeezed frame: the band is stretched to fill instead of masked)
+ 
+ // Corner anchored radial distortion: corners stay put so neither direction leaves borders,
+ // the interior magnifies (barrel) or shrinks (pincushion) around the centre.
+@@ -947,28 +947,72 @@ pixout PostAAComposites_PS(vtxOut IN)
+ {
+ 	pixout OUT = (pixout) 0;
+ 
++	// Squeezed frame (negative letterbox): the band the gate mask would keep is stretched
++	// vertically to fill the viewport instead - the raw anamorphic negative, where the whole
++	// picture carries the squeeze, not just the bokeh. Same camera frustum as the masked frame.
++	float2 tc = IN.baseTC.xy;
++	const bool bSqueezed = vLensDistortionParams.z < -0.01;
++	if (bSqueezed)
++	{
++		const float fVisible = vLensDistortionParams.y / (-vLensDistortionParams.z);
++		tc.y = 0.5 + (tc.y - 0.5) * fVisible;
++	}
++
++	// tcFinal is THE source coordinate of this output pixel; every later tap that belongs to the
++	// picture (sharpening neighbours, lens optics) has to go through it too, or the unremapped
++	// image bleeds back in as a ghost under distortion / squeeze.
++	float2 tcFinal = tc;
++	const bool bRemapped = bSqueezed || abs(vLensDistortionParams.x) > 0.0005;
+ 	if (abs(vLensDistortionParams.x) > 0.0005)
+-		OUT.Color = GetTexture2D(PAAComp_CurTarg, PAAComp_LLSS, LensDistortUV(IN.baseTC.xy));
++		tcFinal = LensDistortUV(tc);
++
++	if (bRemapped)
++		OUT.Color = GetTexture2D(PAAComp_CurTarg, PAAComp_LLSS, tcFinal);
+ 	else
+ 		OUT.Color = PAAComp_CurTarg.Load(int3(IN.WPos.xy, 0));
+-	
++
++	// Anamorphic gate mask: the frame is composed for a format wider than the viewport, so the
++	// band that fits is kept and the rest is black. A real gate mask has a hard edge.
++	if (vLensDistortionParams.z > 0.01)
++	{
++		const float fVisible = vLensDistortionParams.y / vLensDistortionParams.z;
++		if (abs(IN.baseTC.y - 0.5) > 0.5 * fVisible)
++			OUT.Color = 0;
++	}
++
+ #if %_RT_SAMPLE2	
+-	// Apply sharpening
+-	half3 cTL = PAAComp_CurTarg.Load(int3(IN.WPos.xy, 0), int2(-1, -1));
+-	half3 cTR = PAAComp_CurTarg.Load(int3(IN.WPos.xy, 0), int2( 1, -1));
+-	half3 cBL = PAAComp_CurTarg.Load(int3(IN.WPos.xy, 0), int2(-1,  1));
+-	half3 cBR = PAAComp_CurTarg.Load(int3(IN.WPos.xy, 0), int2( 1,  1));
++	// Apply sharpening. Neighbours follow the remapped source coordinate: sampling them at the
++	// raw pixel position under squeeze / distortion subtracts the UNremapped image and adds it
++	// back as a second, undistorted ghost (seen with SMAA 2TX / TSAA, where sharpening is on).
++	half3 cTL, cTR, cBL, cBR;
++	if (bRemapped)
++	{
++		const float2 vTexel = PS_ScreenSize.zw;
++		cTL = GetTexture2D(PAAComp_CurTarg, PAAComp_LLSS, tcFinal + float2(-1, -1) * vTexel).rgb;
++		cTR = GetTexture2D(PAAComp_CurTarg, PAAComp_LLSS, tcFinal + float2( 1, -1) * vTexel).rgb;
++		cBL = GetTexture2D(PAAComp_CurTarg, PAAComp_LLSS, tcFinal + float2(-1,  1) * vTexel).rgb;
++		cBR = GetTexture2D(PAAComp_CurTarg, PAAComp_LLSS, tcFinal + float2( 1,  1) * vTexel).rgb;
++	}
++	else
++	{
++		cTL = PAAComp_CurTarg.Load(int3(IN.WPos.xy, 0), int2(-1, -1));
++		cTR = PAAComp_CurTarg.Load(int3(IN.WPos.xy, 0), int2( 1, -1));
++		cBL = PAAComp_CurTarg.Load(int3(IN.WPos.xy, 0), int2(-1,  1));
++		cBR = PAAComp_CurTarg.Load(int3(IN.WPos.xy, 0), int2( 1,  1));
++	}
+ 	half3 cFiltered = (sqr(cTL) + sqr(cTR) + sqr(cBL) + sqr(cBR)) * 0.25h;
+ 	OUT.Color.rgb = sqrt( saturate(lerp( cFiltered, OUT.Color.rgb * OUT.Color.rgb, vParams.x )) );
+ #endif
+ 
+ #if %_RT_SAMPLE1
+ 	// Apply lens composite (linear space composition)
+-	half4 cLensOpticsComposite = PAAComp_LensOpt.Load(int3(IN.WPos.xy, 0));
++	// Lens optics (flares) are part of the picture: under squeeze they stretch with it.
++	half4 cLensOpticsComposite = bSqueezed ? GetTexture2D(PAAComp_LensOpt, PAAComp_LLSS, tc)
++	                                       : PAAComp_LensOpt.Load(int3(IN.WPos.xy, 0));
+ 
+ 	#if %_RT_SAMPLE3
+ 		half2 vTexelSize = 2.0h * PS_ScreenSize.zw * vLensOpticsParams.w;
+-		cLensOpticsComposite.r = GetTexture2D(PAAComp_LensOpt, PAAComp_LLSS, (IN.baseTC.xy - 0.5) * (1 + vTexelSize) + 0.5).r;
++		cLensOpticsComposite.r = GetTexture2D(PAAComp_LensOpt, PAAComp_LLSS, (tc - 0.5) * (1 + vTexelSize) + 0.5).r;
+ 	#endif
+ 	
+ 	float3 cLensOptics = cLensOpticsComposite * (1 - OUT.Color.rgb);
+-- 
+2.47.1.windows.1
+

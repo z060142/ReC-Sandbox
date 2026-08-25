@@ -1,0 +1,251 @@
+From d4fce3d2ffbbdd8c57c1ec8ff4c3e7eb7270e11e Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Sun, 23 Aug 2026 09:36:33 +0800
+Subject: [PATCH 10/22] feat: focus breathing and colour-temperature white
+ balance
+
+- Focus breathing: unit-focus lens physics - the effective focal length
+  grows by the magnification f/(d-f) when focusing close, tightening the
+  view during focus racks. Intensity 0 = corrected cine glass, 1 =
+  typical stills lens, 2 = vintage.
+- White balance in Kelvin (Tanner-Helland blackbody fit), camera
+  referred: 3200K under daylight reads blue, 8000K reads warm.
+  Luminance-normalised gains multiplied onto the scene's grading balance
+  with a TOD-aware base tracker so per-frame writes never compound;
+  saved/restored like the other camera overrides.
+
+Second plugin-only freeze commit: still runs on the unmodified engine.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_017nykaDjTHxHDSo11CsYx6M
+---
+ .../Module/CinematicCameraComponent.cpp       | 93 ++++++++++++++++++-
+ .../Module/CinematicCameraComponent.h         | 24 +++++
+ 2 files changed, 115 insertions(+), 2 deletions(-)
+
+diff --git a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp
+index 5b34174e..90968a8e 100644
+--- a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp
++++ b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp
+@@ -145,6 +145,7 @@ void CCinematicCameraComponent::ProcessEvent(const SEntityEvent& event)
+ 		RestoreDOF();
+ 		RestoreFilmGrain();
+ 	RestoreMotionBlur();
++	RestoreWhiteBalance();
+ 		if (m_bExpParamsSaved)
+ 		{
+ 			// Exposure is normally restored in the plugin's UpdateBeforeFinalizeCamera
+@@ -164,6 +165,7 @@ void CCinematicCameraComponent::OnShutDown()
+ 	RestoreDOF();
+ 	RestoreFilmGrain();
+ 	RestoreMotionBlur();
++	RestoreWhiteBalance();
+ 	if (m_bExpParamsSaved)
+ 	{
+ 		RestoreExposure();
+@@ -188,6 +190,8 @@ void CCinematicCameraComponent::Activate()
+ 	{
+ 		s_pActive->RestoreDOF();
+ 		s_pActive->RestoreFilmGrain();
++		s_pActive->RestoreMotionBlur();
++		s_pActive->RestoreWhiteBalance();
+ 		// Exposure of the old camera will be overwritten immediately below.
+ 	}
+ 
+@@ -209,6 +213,7 @@ void CCinematicCameraComponent::Deactivate()
+ 	RestoreDOF();
+ 	RestoreFilmGrain();
+ 	RestoreMotionBlur();
++	RestoreWhiteBalance();
+ 
+ 	// Restore exposure immediately rather than waiting for the plugin hook.
+ 	if (m_bExpParamsSaved)
+@@ -344,7 +349,19 @@ float CCinematicCameraComponent::GetEffectiveFocalLength() const
+ // vFOV = 2 * atan(sensorHeight / (2 * focalLength))
+ float CCinematicCameraComponent::ComputeVerticalFOV() const
+ {
+-	const float f_mm = GetEffectiveFocalLength();
++	float f_mm = GetEffectiveFocalLength();
++
++	// Focus breathing: a unit-focus lens extends to focus close, so the effective focal
++	// length grows by the magnification m = f/(d-f) and the view tightens. Intensity scales
++	// the physical amount (0 = internally corrected cine glass).
++	if ((float)m_breathingIntensity > 0.0f)
++	{
++		const float f_m = f_mm * 0.001f;
++		const float d = max((float)m_focusDistance, f_m * 2.0f);
++		const float magnification = f_m / (d - f_m);
++		f_mm *= 1.0f + (float)m_breathingIntensity * magnification;
++	}
++
+ 	const float h_mm = GetSensorHeight();
+ 	return 2.0f * atanf(h_mm * 0.5f / f_mm);
+ }
+@@ -501,7 +518,6 @@ void CCinematicCameraComponent::ApplyFilmGrain()
+ 	if (!m_bEnableGrain)
+ 	{
+ 		RestoreFilmGrain();
+-	RestoreMotionBlur();
+ 		return;
+ 	}
+ 
+@@ -545,6 +561,78 @@ void CCinematicCameraComponent::ApplyMotionBlur()
+ 		pShutter->Set(shutter);
+ }
+ 
++// Blackbody colour via the Tanner-Helland fit (input Kelvin, output linear-ish 0..1 RGB).
++static Vec3 KelvinToRGB(float kelvin)
++{
++	const float t = clamp_tpl(kelvin, 1000.0f, 15000.0f) / 100.0f;
++	float r, g, b;
++	if (t <= 66.0f)
++	{
++		r = 255.0f;
++		g = 99.4708025861f * logf(t) - 161.1195681661f;
++	}
++	else
++	{
++		r = 329.698727446f * powf(t - 60.0f, -0.1332047592f);
++		g = 288.1221695283f * powf(t - 60.0f, -0.0755148492f);
++	}
++	if (t >= 66.0f)
++		b = 255.0f;
++	else if (t <= 19.0f)
++		b = 0.0f;
++	else
++		b = 138.5177312231f * logf(t - 10.0f) - 305.0447927307f;
++
++	return Vec3(clamp_tpl(r, 0.0f, 255.0f), clamp_tpl(g, 0.0f, 255.0f), clamp_tpl(b, 0.0f, 255.0f)) / 255.0f;
++}
++
++// Camera-referred white balance: gains that make light of the SET temperature render white,
++// so dialing 3200K under (engine-default) daylight reads blue, 8000K reads warm - exactly a
++// stills camera's behaviour. Luminance-normalised so exposure is unaffected; multiplied on
++// top of the scene's grading balance rather than replacing it.
++void CCinematicCameraComponent::ApplyWhiteBalance()
++{
++	if (!m_bEnableWhiteBalance || (int)m_colorTemperature == 6500)
++	{
++		RestoreWhiteBalance();
++		return;
++	}
++
++	Vec3 current;
++	gEnv->p3DEngine->GetGlobalParameter(E3DPARAM_HDR_COLORGRADING_COLOR_BALANCE, current);
++
++	if (!m_bWBParamsSaved)
++	{
++		m_savedColorBalance = current;
++		m_baseColorBalance = current;
++		m_bWBParamsSaved = true;
++	}
++	else if (!current.IsEquivalent(m_lastWrittenBalance, 1e-5f))
++	{
++		// Someone else (TOD curve) refreshed the grading - adopt it as the new base.
++		m_baseColorBalance = current;
++	}
++
++	const Vec3 reference = KelvinToRGB(6500.0f);
++	const Vec3 target = KelvinToRGB((float)(int)m_colorTemperature);
++	Vec3 gains(reference.x / max(target.x, 0.01f), reference.y / max(target.y, 0.01f), reference.z / max(target.z, 0.01f));
++	const float luminance = gains.x * 0.2126f + gains.y * 0.7152f + gains.z * 0.0722f;
++	gains /= max(luminance, 0.01f);
++
++	const Vec3 out(m_baseColorBalance.x * gains.x, m_baseColorBalance.y * gains.y, m_baseColorBalance.z * gains.z);
++	gEnv->p3DEngine->SetGlobalParameter(E3DPARAM_HDR_COLORGRADING_COLOR_BALANCE, out);
++	m_lastWrittenBalance = out;
++}
++
++void CCinematicCameraComponent::RestoreWhiteBalance()
++{
++	if (!m_bWBParamsSaved)
++		return;
++
++	gEnv->p3DEngine->SetGlobalParameter(E3DPARAM_HDR_COLORGRADING_COLOR_BALANCE, m_savedColorBalance);
++	m_bWBParamsSaved = false;
++}
++
+ void CCinematicCameraComponent::RestoreMotionBlur()
+ {
+ 	if (!m_bMBParamsSaved)
+@@ -607,6 +695,7 @@ void CCinematicCameraComponent::FinalizeGameCamera()
+ 
+ 	ApplyFilmGrain();
+ 	ApplyMotionBlur();
++	ApplyWhiteBalance();
+ }
+ 
+ void CCinematicCameraComponent::ApplyExposureGlobalParam()
+diff --git a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
+index 1d65074b..5e9cdc40 100644
+--- a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
++++ b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
+@@ -163,6 +163,11 @@ public:
+ 		desc.AddMember(&CCinematicCameraComponent::m_bEnableDOF,
+ 			'dof_', "EnableDOF", "Enable Depth of Field",
+ 			"Compute and apply DOF blur from aperture + focus distance.", false);
++		desc.AddMember(&CCinematicCameraComponent::m_breathingIntensity,
++			'brth', "BreathingIntensity", "Focus Breathing",
++			"How much the field of view tightens when focusing close (unit-focus lens physics: "
++			"magnification f/(d-f) scales the effective focal length). 0 = perfectly corrected "
++			"cine lens, 1 = typical stills lens, 2 = vintage glass.", 1.0f);
+ 		desc.AddMember(&CCinematicCameraComponent::m_focusFalloff,
+ 			'ffal', "FocusFalloff", "Focus Falloff",
+ 			"How far past the depth of field limits the blur keeps ramping. 1 = fully blurred "
+@@ -190,6 +195,13 @@ public:
+ 		desc.AddMember(&CCinematicCameraComponent::m_neutralEV,
+ 			'nuev', "NeutralEV", "Neutral EV",
+ 			"EV100 that renders as a neutral image; the response compression pivots here.", 9.0f);
++		desc.AddMember(&CCinematicCameraComponent::m_bEnableWhiteBalance,
++			'wbon', "EnableWhiteBalance", "Enable White Balance",
++			"Apply the camera's colour temperature on top of the scene grading. 6500K is neutral; "
++			"lower reads blue (tungsten setting in daylight), higher reads warm.", true);
++		desc.AddMember(&CCinematicCameraComponent::m_colorTemperature,
++			'kelv', "ColorTemperature", "Color Temperature (K)",
++			"White balance in Kelvin. 3200 tungsten, 5600 daylight, 6500 neutral.", 6500);
+ 		desc.AddMember(&CCinematicCameraComponent::m_bEnableMotionBlur,
+ 			'mblr', "EnableMotionBlur", "Enable Motion Blur",
+ 			"Drive the renderer's motion blur shutter from the camera shutter, so 1/50 gives the "
+@@ -272,6 +284,8 @@ private:
+ 	void RestoreFilmGrain();
+ 	void ApplyMotionBlur();
+ 	void RestoreMotionBlur();
++	void ApplyWhiteBalance();
++	void RestoreWhiteBalance();
+ 
+ private:
+ 	// Reflected properties
+@@ -289,6 +303,7 @@ private:
+ 	Schematyc::Range<1, 24, 2, 12, int> m_focalStepsPerDoubling = 6;
+ 	Schematyc::Range<0, 2, 0, 1>     m_focalStepTime        = 0.25f;
+ 	bool                             m_bEnableDOF           = false;
++	Schematyc::Range<0, 2, 0, 1>     m_breathingIntensity   = 1.0f;
+ 	Schematyc::Range<1, 10, 1, 6>    m_focusFalloff         = 3.f;
+ 	bool                             m_bEnableExposure      = false;
+ 	EExposureMode                    m_exposureMode         = EExposureMode::Manual;
+@@ -296,6 +311,8 @@ private:
+ 	Schematyc::Range<25, 25600, 50, 6400, int> m_iso          = 400;
+ 	Schematyc::Range<0, 1, 0, 1>     m_exposureResponse     = 0.6f;
+ 	Schematyc::Range<-6, 24, 4, 14>  m_neutralEV            = 9.0f;
++	bool                             m_bEnableWhiteBalance  = true;
++	Schematyc::Range<1500, 15000, 2500, 10000, int> m_colorTemperature = 6500;
+ 	bool                             m_bEnableMotionBlur    = true;
+ 	bool                             m_bEnableGrain         = true;
+ 	Schematyc::Range<0, 4, 0, 1>     m_grainStrength        = 1.0f;
+@@ -325,6 +342,13 @@ private:
+ 	float m_savedGrainAmount  = 0.f;
+ 	bool  m_bGrainParamSaved  = false;
+ 
++	// White balance saved state (E3DPARAM_HDR_COLORGRADING_COLOR_BALANCE). The base tracks
++	// external (TOD) writes so our per-frame multiply never compounds on itself.
++	Vec3 m_savedColorBalance  = Vec3(1.0f);
++	Vec3 m_baseColorBalance   = Vec3(1.0f);
++	Vec3 m_lastWrittenBalance = Vec3(1.0f);
++	bool m_bWBParamsSaved     = false;
++
+ 	// Motion blur saved cvars (r_MotionBlurShutterSpeed / r_MotionBlur)
+ 	float m_savedMBShutter    = 250.f;
+ 	int   m_savedMBMode       = 0;
+-- 
+2.47.1.windows.1
+

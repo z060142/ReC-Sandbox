@@ -1,0 +1,1952 @@
+From 64c9499fe84d187b0f00003661d1fc69246912c5 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Sat, 22 Aug 2026 18:45:20 +0800
+Subject: [PATCH 05/22] feat: add CryPhoneTracker plugin (ARCore phone 6DoF +
+ lens control)
+
+Entity component receiving pose and lens packets over UDP from the
+Android ARCore tracker app. Drives the entity transform (origin/yaw/
+scale/offset mapping, recenter without teleport) and forwards phone
+fader values (focal length, aperture, focus distance, EV, DOF/exposure
+switches) to a CinematicCamera component on the same entity through the
+runtime-resolved CryGetCinematicCameraOptics entry point - no link
+dependency, works standalone without the camera plugin.
+
+Includes the PoseFilter pipeline (PoseFilterSpec.md): phone-timestamp
+clock rebasing, One Euro adaptive filtering at packet rate, fixed-delay
+Hermite resampling at render rate, and a virtual-tripod state machine
+that freezes the frame bit-exact while composing and blends back out on
+motion. Filter Mode Off preserves the unfiltered legacy path.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_017nykaDjTHxHDSo11CsYx6M
+---
+ Code/CryPlugins/CMakeLists.txt                |   5 +-
+ .../CryPhoneTracker/Module/CMakeLists.txt     |  30 +
+ .../Module/PhoneTrackerComponent.cpp          | 560 ++++++++++++++++++
+ .../Module/PhoneTrackerComponent.h            | 175 ++++++
+ .../Module/PhoneTrackerPlugin.cpp             |  69 +++
+ .../Module/PhoneTrackerPlugin.h               |  33 ++
+ .../Module/PhoneTrackerProtocol.h             | 127 ++++
+ .../CryPhoneTracker/Module/PoseFilter.h       | 547 +++++++++++++++++
+ .../CryPhoneTracker/Module/StdAfx.cpp         |   1 +
+ .../CryPhoneTracker/Module/StdAfx.h           |  11 +
+ .../CryPhoneTracker/Module/resource.h         |  10 +
+ .../CryPhoneTracker/PoseFilterSpec.md         | 151 +++++
+ Code/CryPlugins/CryPhoneTracker/README.md     |  98 +++
+ 13 files changed, 1816 insertions(+), 1 deletion(-)
+ create mode 100644 Code/CryPlugins/CryPhoneTracker/Module/CMakeLists.txt
+ create mode 100644 Code/CryPlugins/CryPhoneTracker/Module/PhoneTrackerComponent.cpp
+ create mode 100644 Code/CryPlugins/CryPhoneTracker/Module/PhoneTrackerComponent.h
+ create mode 100644 Code/CryPlugins/CryPhoneTracker/Module/PhoneTrackerPlugin.cpp
+ create mode 100644 Code/CryPlugins/CryPhoneTracker/Module/PhoneTrackerPlugin.h
+ create mode 100644 Code/CryPlugins/CryPhoneTracker/Module/PhoneTrackerProtocol.h
+ create mode 100644 Code/CryPlugins/CryPhoneTracker/Module/PoseFilter.h
+ create mode 100644 Code/CryPlugins/CryPhoneTracker/Module/StdAfx.cpp
+ create mode 100644 Code/CryPlugins/CryPhoneTracker/Module/StdAfx.h
+ create mode 100644 Code/CryPlugins/CryPhoneTracker/Module/resource.h
+ create mode 100644 Code/CryPlugins/CryPhoneTracker/PoseFilterSpec.md
+ create mode 100644 Code/CryPlugins/CryPhoneTracker/README.md
+
+diff --git a/Code/CryPlugins/CMakeLists.txt b/Code/CryPlugins/CMakeLists.txt
+index f9774c64..1f674445 100644
+--- a/Code/CryPlugins/CMakeLists.txt
++++ b/Code/CryPlugins/CMakeLists.txt
+@@ -32,4 +32,7 @@ add_subdirectory(CryUQS)
+ add_subdirectory(CryHTTP/Module)
+ 
+ # CinematicCamera: physically-based camera plugin (focal length, aperture, DOF, exposure)
+-add_subdirectory(CinematicCamera/Module)
+\ No newline at end of file
++add_subdirectory(CinematicCamera/Module)
++
++# CryPhoneTracker: Android ARCore 6DoF pose + lens control receiver
++add_subdirectory(CryPhoneTracker/Module)
+\ No newline at end of file
+diff --git a/Code/CryPlugins/CryPhoneTracker/Module/CMakeLists.txt b/Code/CryPlugins/CryPhoneTracker/Module/CMakeLists.txt
+new file mode 100644
+index 00000000..0d13187d
+--- /dev/null
++++ b/Code/CryPlugins/CryPhoneTracker/Module/CMakeLists.txt
+@@ -0,0 +1,30 @@
++start_sources()
++
++sources_platform(ALL)
++add_sources("CryPhoneTracker_uber_0.cpp"
++	SOURCE_GROUP "Root"
++		"resource.h"
++		"StdAfx.cpp"
++		"StdAfx.h"
++		"PhoneTrackerPlugin.h"
++		"PhoneTrackerPlugin.cpp"
++	SOURCE_GROUP "Components"
++		"PhoneTrackerProtocol.h"
++		"PoseFilter.h"
++		"PhoneTrackerComponent.h"
++		"PhoneTrackerComponent.cpp"
++)
++
++end_sources()
++
++CryEngineModule(CryPhoneTracker PCH "StdAfx.cpp" SOLUTION_FOLDER "CryPlugins")
++
++target_include_directories(${THIS_PROJECT}
++	PRIVATE
++		"${CRYENGINE_DIR}/Code/CryEngine/CryCommon"
++		"${CRYENGINE_DIR}/Code/CryPlugins/CinematicCamera/Interface"
++)
++
++# CinematicCamera is reached through CryGetCinematicCameraOptics at runtime, so there is
++# deliberately no link dependency here; only ws2_32 for the UDP socket.
++target_link_libraries(${THIS_PROJECT} PRIVATE ws2_32)
+diff --git a/Code/CryPlugins/CryPhoneTracker/Module/PhoneTrackerComponent.cpp b/Code/CryPlugins/CryPhoneTracker/Module/PhoneTrackerComponent.cpp
+new file mode 100644
+index 00000000..4d45860e
+--- /dev/null
++++ b/Code/CryPlugins/CryPhoneTracker/Module/PhoneTrackerComponent.cpp
+@@ -0,0 +1,560 @@
++// CryPhoneTracker - entity component driving an entity transform from the phone 6DoF tracker.
++#include "StdAfx.h"
++#include "PhoneTrackerComponent.h"
++
++#include <CryEntitySystem/IEntity.h>
++#include <CryRenderer/IRenderAuxGeom.h>
++#include <CryCore/Platform/CryLibrary.h>
++
++#include <CrySchematyc/Reflection/TypeDesc.h>
++#include <CrySchematyc/Env/IEnvRegistry.h>
++#include <CrySchematyc/Env/Elements/EnvComponent.h>
++#include <CrySchematyc/Env/Elements/EnvFunction.h>
++#include <CryCore/StaticInstanceList.h>
++
++namespace Cry
++{
++namespace PhoneTracker
++{
++
++//! Engine wall clock in nanoseconds; the pose filter rebases the phone timestamps onto it.
++static int64 GetEngineNowNs()
++{
++	return gEnv->pTimer->GetAsyncTime().GetMicroSecondsAsInt64() * 1000;
++}
++
++CPhoneTrackerComponent::~CPhoneTrackerComponent()
++{
++	CloseSocket();
++}
++
++void CPhoneTrackerComponent::Register(Schematyc::CEnvRegistrationScope& componentScope)
++{
++	{
++		auto pFunction = SCHEMATYC_MAKE_ENV_FUNCTION(&CPhoneTrackerComponent::Recenter, "{2A6C6F13-9F1B-4C33-9E5D-4B7F6D2C8A11}"_cry_guid, "Recenter");
++		pFunction->SetDescription("Uses the next received pose as the new tracker origin and asks the phone to recenter");
++		componentScope.Register(pFunction);
++	}
++	{
++		auto pFunction = SCHEMATYC_MAKE_ENV_FUNCTION(&CPhoneTrackerComponent::SetTrackingEnabled, "{3B7D7024-A02C-4D44-AF6E-5C806E3D9B22}"_cry_guid, "SetTrackingEnabled");
++		pFunction->SetDescription("Opens or closes the tracker socket at runtime");
++		pFunction->BindInput(1, 'enab', "Enabled");
++		componentScope.Register(pFunction);
++	}
++	{
++		auto pFunction = SCHEMATYC_MAKE_ENV_FUNCTION(&CPhoneTrackerComponent::IsTracking, "{4C8E8135-B13D-4E55-B07F-6D917F4EAC33}"_cry_guid, "IsTracking");
++		pFunction->SetDescription("True while valid poses keep arriving from the phone");
++		pFunction->BindOutput(0, 'res', "Result");
++		componentScope.Register(pFunction);
++	}
++}
++
++void CPhoneTrackerComponent::OnShutDown()
++{
++	CloseSocket();
++}
++
++Cry::Entity::EventFlags CPhoneTrackerComponent::GetEventMask() const
++{
++	return EEntityEvent::Update | EEntityEvent::Reset | EEntityEvent::GameplayStarted | EEntityEvent::EditorPropertyChanged;
++}
++
++void CPhoneTrackerComponent::ProcessEvent(const SEntityEvent& event)
++{
++	switch (event.event)
++	{
++	case EEntityEvent::GameplayStarted:
++		{
++			if (m_enabled)
++			{
++				OpenSocket();
++			}
++		}
++		break;
++
++	case EEntityEvent::Reset:
++		{
++			const bool enteringGameMode = event.nParam[0] != 0;
++			if (enteringGameMode && m_enabled)
++			{
++				OpenSocket();
++			}
++			else
++			{
++				CloseSocket();
++			}
++		}
++		break;
++
++	case EEntityEvent::EditorPropertyChanged:
++		{
++			// Re-open on the (possibly) new port, but only while we were already listening.
++			if (m_socket != CRY_INVALID_SOCKET)
++			{
++				CloseSocket();
++				if (m_enabled)
++				{
++					OpenSocket();
++				}
++			}
++		}
++		break;
++
++	case EEntityEvent::Update:
++		{
++			const float frameTime = event.fParam[0];
++			SyncFilterParams();
++			ReceivePackets();
++			ApplyPose(frameTime);
++
++			if (m_debugDraw)
++			{
++				DrawDebug();
++			}
++		}
++		break;
++
++	default:
++		break;
++	}
++}
++
++void CPhoneTrackerComponent::OpenSocket()
++{
++	if (m_socket != CRY_INVALID_SOCKET)
++		return;
++
++#if CRY_PLATFORM_WINAPI
++	if (!m_wsaStarted)
++	{
++		WSADATA wsaData;
++		if (::WSAStartup(MAKEWORD(2, 2), &wsaData) != 0)
++		{
++			CryWarning(VALIDATOR_MODULE_SYSTEM, VALIDATOR_WARNING, "[PhoneTracker] WSAStartup failed");
++			return;
++		}
++		m_wsaStarted = true;
++	}
++#endif
++
++	CRYSOCKET socket = CrySock::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
++	if (socket == CRY_INVALID_SOCKET)
++	{
++		CryWarning(VALIDATOR_MODULE_SYSTEM, VALIDATOR_WARNING, "[PhoneTracker] Could not create UDP socket");
++		return;
++	}
++
++	CRYSOCKADDR_IN address;
++	ZeroStruct(address);
++	address.sin_family = AF_INET;
++	address.sin_addr.s_addr = htonl(INADDR_ANY);
++	address.sin_port = htons(static_cast<uint16>(m_port.value));
++
++	if (CrySock::bind(socket, reinterpret_cast<CRYSOCKADDR*>(&address), sizeof(address)) == CRY_SOCKET_ERROR)
++	{
++		CryWarning(VALIDATOR_MODULE_SYSTEM, VALIDATOR_WARNING, "[PhoneTracker] Could not bind UDP port %d", m_port.value);
++		CrySock::closesocket(socket);
++		return;
++	}
++
++	CrySock::MakeSocketNonBlocking(socket);
++
++	m_socket = socket;
++	m_hasPeer = false;
++	m_hasOrigin = false;
++	m_hasTarget = false;
++	m_isTracking = false;
++	m_timeSinceValidPose = 0.0f;
++	m_packetsReceived = 0;
++	m_packetsLost = 0;
++	m_lastSeq = 0;
++	m_opticsLookedUp = false;
++	m_pOptics = nullptr;
++	m_signalWasLost = false;
++
++	SyncFilterParams();
++	m_poseFilter.Reset();
++
++	// Everything the phone sends is relative to wherever the entity sits right now.
++	m_referenceTransform = QuatT(m_pEntity->GetWorldRotation(), m_pEntity->GetWorldPos());
++	m_currentTransform = m_referenceTransform;
++
++	CryLog("[PhoneTracker] Listening for pose packets on UDP port %d", m_port.value);
++}
++
++void CPhoneTrackerComponent::CloseSocket()
++{
++	if (m_socket != CRY_INVALID_SOCKET)
++	{
++		CrySock::closesocket(m_socket);
++		m_socket = CRY_INVALID_SOCKET;
++		CryLog("[PhoneTracker] Stopped listening");
++	}
++
++#if CRY_PLATFORM_WINAPI
++	if (m_wsaStarted)
++	{
++		::WSACleanup();
++		m_wsaStarted = false;
++	}
++#endif
++
++	m_hasPeer = false;
++	m_isTracking = false;
++}
++
++void CPhoneTrackerComponent::ReceivePackets()
++{
++	if (m_socket == CRY_INVALID_SOCKET)
++		return;
++
++	const int64 engineNowNs = GetEngineNowNs();
++	const bool filtering = m_filterMode != EPoseFilterMode::Off;
++
++	// Drain the socket so the entity always follows the newest pose instead of a backlog.
++	char buffer[256];
++	for (;;)
++	{
++		CRYSOCKADDR_IN from;
++		ZeroStruct(from);
++		CRYSOCKLEN_T fromLength = sizeof(from);
++
++		const int received = CrySock::recvfrom(m_socket, buffer, sizeof(buffer), 0, reinterpret_cast<CRYSOCKADDR*>(&from), &fromLength);
++		if (received <= 0)
++			break;
++
++		m_peer = from;
++		m_hasPeer = true;
++
++		if (received == kLensPacketSize)
++		{
++			SLensPacket lensPacket;
++			memcpy(&lensPacket, buffer, sizeof(lensPacket));
++			if (lensPacket.magic == kLensMagic && lensPacket.version == kProtocolVersion)
++			{
++				ApplyLensPacket(lensPacket);
++			}
++			continue;
++		}
++
++		if (received != kPosePacketSize)
++			continue;
++
++		SPosePacket packet;
++		memcpy(&packet, buffer, sizeof(packet));
++		if (packet.magic != kPoseMagic || packet.version != kProtocolVersion)
++			continue;
++
++		++m_packetsReceived;
++		if (m_packetsReceived > 1 && packet.seq > m_lastSeq + 1)
++		{
++			m_packetsLost += packet.seq - m_lastSeq - 1;
++		}
++		m_lastSeq = packet.seq;
++
++		m_batteryPct = packet.batteryPct;
++		m_appFps = packet.appFps;
++		m_trackingState = packet.trackingState;
++
++		if ((packet.flags & ePoseFlag_Valid) == 0)
++			continue;
++
++		const Vec3 position = ArCoreToCryPosition(packet);
++		const Quat rotation = ArCoreToCryRotation(packet);
++
++		if (filtering && ((packet.flags & ePoseFlag_SessionResumed) != 0 || m_signalWasLost))
++		{
++			// A resumed AR session or a recovered signal invalidates every derivative we hold.
++			m_poseFilter.Reset();
++		}
++		m_signalWasLost = false;
++
++		// The phone bumps originEpoch whenever it recenters; follow it so both ends agree.
++		const bool originChanged = !m_hasOrigin || packet.originEpoch != m_originEpoch || (packet.flags & ePoseFlag_OriginMark) != 0;
++		if (originChanged || m_recenterRequested)
++		{
++			// Capture the filtered pose rather than the raw one, so jitter never gets frozen
++			// into the origin itself.
++			Vec3 originPosition = position;
++			Quat originRotation = rotation;
++			if (filtering && m_poseFilter.HasOutput())
++			{
++				originPosition = m_poseFilter.GetOutput().t;
++				originRotation = m_poseFilter.GetOutput().q;
++			}
++
++			m_trackerOrigin = QuatT(originRotation, originPosition);
++			m_originEpoch = packet.originEpoch;
++			m_hasOrigin = true;
++			m_recenterRequested = false;
++
++			// Re-anchor to wherever the entity currently is, so recentering never teleports it.
++			m_referenceTransform = QuatT(m_pEntity->GetWorldRotation(), m_pEntity->GetWorldPos());
++
++			// Restart the pipeline so the new origin never carries a transient with it.
++			m_poseFilter.Reset();
++		}
++
++		if (filtering)
++		{
++			// The world mapping happens in ApplyPose, once the filter has been resampled.
++			m_poseFilter.Push(packet.frameNs, engineNowNs, position, rotation);
++		}
++		else
++		{
++			m_targetTransform = MapToWorld(position, rotation);
++
++			if (!m_hasTarget)
++			{
++				m_currentTransform = m_targetTransform;
++				m_hasTarget = true;
++			}
++		}
++
++		m_isTracking = true;
++		m_timeSinceValidPose = 0.0f;
++	}
++}
++
++//! Maps a tracker space pose (metres, Cry axes) through origin / yaw / scale / offset into world space.
++QuatT CPhoneTrackerComponent::MapToWorld(const Vec3& trackerPosition, const Quat& trackerRotation) const
++{
++	QuatT delta;
++	if (m_relativeToStartTransform)
++	{
++		const Quat inverseOrigin = m_trackerOrigin.q.GetInverted();
++		delta.q = inverseOrigin * trackerRotation;
++		delta.t = inverseOrigin * (trackerPosition - m_trackerOrigin.t);
++	}
++	else
++	{
++		delta = QuatT(trackerRotation, trackerPosition);
++	}
++
++	const Quat yaw = Quat::CreateRotationZ(DEG2RAD(m_yawOffsetDegrees.value));
++	delta.q = yaw * delta.q;
++	delta.t = yaw * delta.t;
++
++	const QuatT reference = m_relativeToStartTransform ? m_referenceTransform : QuatT(IDENTITY);
++
++	QuatT result;
++	result.q = reference.q * delta.q;
++	result.t = reference.t + reference.q * (delta.t * m_scale.value) + m_positionOffset;
++	result.q.Normalize();
++	return result;
++}
++
++//! Pushes the reflected properties into the filter; cheap enough to do once per frame.
++void CPhoneTrackerComponent::SyncFilterParams()
++{
++	SPoseFilterParams params;
++	params.posMinCutoff = m_posMinCutoff.value;
++	params.posBeta = m_posBeta.value;
++	params.rotMinCutoff = m_rotMinCutoff.value;
++	params.rotBeta = m_rotBeta.value;
++	params.interpDelayFactor = m_interpDelayFactor.value;
++	params.maxExtrapolationMs = m_maxExtrapolationMs.value;
++	params.tripodEnabled = m_tripodEnabled;
++	params.tripodEnterSpeed = m_tripodEnterSpeed.value;
++	params.tripodHoldTime = m_tripodHoldTime.value;
++	params.tripodExitPosition = m_tripodExitPosition.value;
++	params.tripodBlendTime = m_tripodBlendTime.value;
++	m_poseFilter.SetParams(params);
++}
++
++void CPhoneTrackerComponent::ApplyPose(float frameTime)
++{
++	if (m_socket == CRY_INVALID_SOCKET)
++		return;
++
++	if (m_filterMode != EPoseFilterMode::Off)
++	{
++		// Fixed delay resampling plus the virtual tripod, still in tracker space.
++		QuatT filtered = QuatT(IDENTITY);
++		if (m_poseFilter.Sample(GetEngineNowNs(), frameTime, m_filterMode == EPoseFilterMode::Cinematic, filtered))
++		{
++			m_targetTransform = MapToWorld(filtered.t, filtered.q);
++
++			if (!m_hasTarget)
++			{
++				m_currentTransform = m_targetTransform;
++				m_hasTarget = true;
++			}
++		}
++	}
++
++	if (!m_hasTarget)
++		return;
++
++	m_timeSinceValidPose += frameTime;
++	if (m_signalTimeout.value > 0.0f && m_timeSinceValidPose > m_signalTimeout.value)
++	{
++		m_isTracking = false;
++		m_signalWasLost = true;
++	}
++
++	// Framerate independent exponential smoothing; 0 half life means follow the tracker exactly.
++	float blend = 1.0f;
++	if (m_smoothingHalfLife.value > 0.0f)
++	{
++		blend = 1.0f - expf(-gf_ln2 * frameTime / m_smoothingHalfLife.value);
++		blend = clamp_tpl(blend, 0.0f, 1.0f);
++	}
++
++	m_currentTransform.t = Vec3::CreateLerp(m_currentTransform.t, m_targetTransform.t, blend);
++	m_currentTransform.q = Quat::CreateSlerp(m_currentTransform.q, m_targetTransform.q, blend);
++
++	const Vec3 position = m_applyPosition ? m_currentTransform.t : m_pEntity->GetWorldPos();
++	const Quat rotation = m_applyRotation ? m_currentTransform.q : m_pEntity->GetWorldRotation();
++
++	m_pEntity->SetWorldTM(Matrix34::Create(m_pEntity->GetScale(), rotation, position));
++}
++
++ICinematicCameraOptics* CPhoneTrackerComponent::GetOptics()
++{
++	if (!m_driveLens)
++		return nullptr;
++
++	if (!m_opticsLookedUp)
++	{
++		m_opticsLookedUp = true;
++
++		// CinematicCamera.dll is already loaded by the plugin manager when the project uses it;
++		// resolving the entry point by name keeps this plugin usable without it.
++		if (HMODULE hModule = CryLoadLibraryDefName("CinematicCamera"))
++		{
++			if (auto pfn = (TGetCinematicCameraOpticsFn)CryGetProcAddress(hModule, CINEMATIC_CAMERA_OPTICS_ENTRY))
++			{
++				m_pOptics = pfn(m_pEntity);
++			}
++
++			if (m_pOptics == nullptr)
++			{
++				CryWarning(VALIDATOR_MODULE_SYSTEM, VALIDATOR_WARNING, "[PhoneTracker] No Cinematic Camera component on '%s'; lens values from the phone are ignored", m_pEntity->GetName());
++			}
++		}
++		else
++		{
++			CryWarning(VALIDATOR_MODULE_SYSTEM, VALIDATOR_WARNING, "[PhoneTracker] CinematicCamera plugin is not loaded; lens values from the phone are ignored");
++		}
++	}
++
++	return m_pOptics;
++}
++
++void CPhoneTrackerComponent::ApplyLensPacket(const SLensPacket& packet)
++{
++	m_focalLengthMm = packet.focalLengthMm;
++	m_apertureFNumber = packet.apertureFNumber;
++	m_focusDistanceM = packet.focusDistanceM;
++	m_evCompensation = packet.evCompensation;
++
++	ICinematicCameraOptics* pOptics = GetOptics();
++	if (pOptics == nullptr)
++	{
++		m_hasLensState = true;
++		return;
++	}
++
++	if (m_lensArmsEffects)
++	{
++		pOptics->SetDepthOfFieldEnabled((packet.flags & eLensFlag_EnableDepthOfField) != 0);
++		pOptics->SetExposureEnabled((packet.flags & eLensFlag_EnableExposure) != 0);
++	}
++
++	pOptics->SetFocalLength(m_focalLengthMm);
++	pOptics->SetAperture(m_apertureFNumber);
++	pOptics->SetFocusDistance(m_focusDistanceM);
++	pOptics->SetEVCompensation(m_evCompensation);
++
++	m_hasLensState = true;
++}
++
++void CPhoneTrackerComponent::SendControl(EControlCommand cmd, int32 param)
++{
++	if (m_socket == CRY_INVALID_SOCKET || !m_hasPeer)
++		return;
++
++	SControlPacket packet = MakeControlPacket(cmd, ++m_controlSeq, static_cast<int64>(gEnv->pTimer->GetAsyncTime().GetValue()), param);
++	CrySock::sendto(m_socket, reinterpret_cast<char*>(&packet), sizeof(packet), 0, reinterpret_cast<CRYSOCKADDR*>(&m_peer), sizeof(m_peer));
++}
++
++void CPhoneTrackerComponent::Recenter()
++{
++	m_recenterRequested = true;
++	SendControl(eControlCmd_Recenter);
++}
++
++void CPhoneTrackerComponent::SetTrackingEnabled(bool enable)
++{
++	m_enabled = enable;
++	if (enable)
++	{
++		OpenSocket();
++	}
++	else
++	{
++		CloseSocket();
++	}
++}
++
++void CPhoneTrackerComponent::DrawDebug() const
++{
++	const float color[4] = { m_isTracking ? 0.0f : 1.0f, m_isTracking ? 1.0f : 0.3f, 0.3f, 1.0f };
++	const uint32 total = m_packetsReceived + m_packetsLost;
++	const float lossPercent = total > 0 ? 100.0f * m_packetsLost / total : 0.0f;
++
++	IRenderAuxText::Draw2dLabel(20.0f, 20.0f, 1.4f, color, false,
++		"PhoneTracker :%d  %s  packets %u  loss %.2f%%  state %u  battery %u%%  app %u fps",
++		m_port.value, m_isTracking ? "TRACKING" : "NO SIGNAL", m_packetsReceived, lossPercent,
++		m_trackingState, m_batteryPct, m_appFps);
++
++	IRenderAuxText::Draw2dLabel(20.0f, 40.0f, 1.4f, color, false,
++		"pos (%.3f, %.3f, %.3f)", m_currentTransform.t.x, m_currentTransform.t.y, m_currentTransform.t.z);
++
++	if (m_filterMode != EPoseFilterMode::Off)
++	{
++		const SPoseFilterDebug& filterDebug = m_poseFilter.GetDebug();
++
++		const char* szState = "MOVING";
++		switch (filterDebug.state)
++		{
++		case EPoseFilterTripodState::Arming:   szState = "ARMING"; break;
++		case EPoseFilterTripodState::Steady:   szState = "STEADY"; break;
++		case EPoseFilterTripodState::Blending: szState = "BLEND"; break;
++		default: break;
++		}
++
++		const float filterColor[4] = { 0.85f, 0.9f, 0.7f, 1.0f };
++		IRenderAuxText::Draw2dLabel(20.0f, 60.0f, 1.4f, filterColor, false,
++			"filter %s  %s %.0f%%  v %.4f m/s  w %.2f deg/s  fc %.2f/%.2f Hz  buffer %d  delay %.1f ms%s",
++			m_filterMode == EPoseFilterMode::Cinematic ? "Cinematic" : "OneEuro", szState,
++			filterDebug.blendWeight * 100.0f, filterDebug.speed, filterDebug.angularSpeedDeg,
++			filterDebug.posCutoff, filterDebug.rotCutoff, filterDebug.bufferDepth,
++			filterDebug.resampleDelayMs,
++			filterDebug.extrapolationMs > 0.0f ? "  EXTRAPOLATING" : "");
++	}
++
++	if (m_hasLensState)
++	{
++		const float lensColor[4] = { 0.7f, 0.85f, 1.0f, 1.0f };
++		IRenderAuxText::Draw2dLabel(20.0f, 80.0f, 1.4f, lensColor, false,
++			"lens %.0fmm  f/%.1f  focus %.2fm  EV %+.0f%s",
++			m_focalLengthMm, m_apertureFNumber, m_focusDistanceM, m_evCompensation,
++			m_pOptics != nullptr ? "" : "  (no Cinematic Camera)");
++	}
++}
++
++static void RegisterPhoneTrackerComponent(Schematyc::IEnvRegistrar& registrar)
++{
++	Schematyc::CEnvRegistrationScope scope = registrar.Scope(IEntity::GetEntityScopeGUID());
++	{
++		Schematyc::CEnvRegistrationScope componentScope = scope.Register(SCHEMATYC_MAKE_ENV_COMPONENT(CPhoneTrackerComponent));
++		CPhoneTrackerComponent::Register(componentScope);
++	}
++}
++
++CRY_STATIC_AUTO_REGISTER_FUNCTION(&RegisterPhoneTrackerComponent)
++
++} // namespace PhoneTracker
++} // namespace Cry
+diff --git a/Code/CryPlugins/CryPhoneTracker/Module/PhoneTrackerComponent.h b/Code/CryPlugins/CryPhoneTracker/Module/PhoneTrackerComponent.h
+new file mode 100644
+index 00000000..f063fe91
+--- /dev/null
++++ b/Code/CryPlugins/CryPhoneTracker/Module/PhoneTrackerComponent.h
+@@ -0,0 +1,175 @@
++// CryPhoneTracker - entity component driving an entity transform from the phone 6DoF tracker.
++#pragma once
++
++#include <CryEntitySystem/IEntitySystem.h>
++#include <CryEntitySystem/IEntityComponent.h>
++#include <CryNetwork/CrySocks.h>
++
++#include <CrySchematyc/MathTypes.h>
++#include <CrySchematyc/ResourceTypes.h>
++#include <CrySchematyc/Env/IEnvRegistrar.h>
++#include <CrySchematyc/Utils/SharedString.h>
++
++#include "PhoneTrackerProtocol.h"
++#include "PoseFilter.h"
++#include "../../CinematicCamera/Interface/ICinematicCameraOptics.h"
++
++namespace Cry
++{
++namespace PhoneTracker
++{
++
++//! Reflection for the pose filter master switch, so it shows up as a combo box in the panel.
++static void ReflectType(Schematyc::CTypeDesc<EPoseFilterMode>& desc)
++{
++	desc.SetGUID("{9E4F2B07-5D31-4A6C-8B72-1C0D5A93E4F6}"_cry_guid);
++	desc.SetLabel("Filter Mode");
++	desc.SetDefaultValue(EPoseFilterMode::Cinematic);
++	desc.AddConstant(EPoseFilterMode::Off,       "Off",       "Off");
++	desc.AddConstant(EPoseFilterMode::OneEuro,   "OneEuro",   "One Euro");
++	desc.AddConstant(EPoseFilterMode::Cinematic, "Cinematic", "Cinematic");
++}
++
++//! Binds an entity to the Android ARCore tracker: listens for pose packets on a UDP port and
++//! writes the received 6DoF pose into the entity transform every frame.
++class CPhoneTrackerComponent final : public IEntityComponent
++{
++public:
++	CPhoneTrackerComponent() = default;
++	virtual ~CPhoneTrackerComponent();
++
++	static void ReflectType(Schematyc::CTypeDesc<CPhoneTrackerComponent>& desc)
++	{
++		desc.SetGUID("{6D5B1F52-4C2E-47D6-9C2B-2F0C3E77A101}"_cry_guid);
++		desc.SetEditorCategory("Tracking");
++		desc.SetLabel("Phone Tracker");
++		desc.SetDescription("Receives 6DoF poses from the Android phone tracker over UDP and applies them to this entity");
++		desc.SetComponentFlags({ IEntityComponent::EFlags::Singleton });
++
++		desc.AddMember(&CPhoneTrackerComponent::m_enabled, 'enab', "Enabled", "Enabled", "Open the socket and drive the entity while in game/simulation mode", true);
++		desc.AddMember(&CPhoneTrackerComponent::m_port, 'port', "Port", "Listen Port", "UDP port the phone sends pose packets to", 9050);
++
++		desc.AddMember(&CPhoneTrackerComponent::m_applyPosition, 'apos', "ApplyPosition", "Apply Position", "Write the tracked translation into the entity transform", true);
++		desc.AddMember(&CPhoneTrackerComponent::m_applyRotation, 'arot', "ApplyRotation", "Apply Rotation", "Write the tracked rotation into the entity transform", true);
++
++		desc.AddMember(&CPhoneTrackerComponent::m_relativeToStartTransform, 'rel', "Relative", "Relative To Start", "Treat the tracker origin as the entity transform captured when tracking started. Disable to place the entity at raw tracker coordinates", true);
++		desc.AddMember(&CPhoneTrackerComponent::m_scale, 'scal', "Scale", "Metres To Units", "Multiplier applied to the tracked translation (1 = 1 metre per engine unit)", 1.0f);
++		desc.AddMember(&CPhoneTrackerComponent::m_yawOffsetDegrees, 'yaw', "YawOffset", "Yaw Offset", "Rotation around Z applied to the tracked motion, to align the phone heading with the scene", 0.0f);
++		desc.AddMember(&CPhoneTrackerComponent::m_positionOffset, 'poff', "PositionOffset", "Position Offset", "Extra world space offset added after the tracked translation", Vec3(ZERO));
++
++		desc.AddMember(&CPhoneTrackerComponent::m_smoothingHalfLife, 'smoo', "Smoothing", "Smoothing Half Life", "Superseded by the Pose Filter; leave at 0. When above 0 it adds one more exponential smoothing pass after the filter pipeline", 0.0f);
++		desc.AddMember(&CPhoneTrackerComponent::m_signalTimeout, 'tout', "Timeout", "Signal Timeout", "Seconds without a valid pose before tracking is considered lost", 2.0f);
++		desc.AddMember(&CPhoneTrackerComponent::m_driveLens, 'lens', "DriveLens", "Drive Cinematic Camera", "Forward the focal length / aperture / focus distance / EV sent by the phone to a Cinematic Camera component on this entity", true);
++		desc.AddMember(&CPhoneTrackerComponent::m_lensArmsEffects, 'larm', "LensArmsEffects", "Lens Arms DOF And Exposure", "Let the phone switch depth of field and exposure control on when it starts sending lens values", true);
++
++		desc.AddMember(&CPhoneTrackerComponent::m_filterMode, 'fmod', "FilterMode", "Filter Mode", "Off reproduces the unfiltered behaviour exactly. One Euro adds clock rebasing, adaptive smoothing and fixed delay resampling. Cinematic adds the virtual tripod on top", EPoseFilterMode::Cinematic);
++		desc.AddMember(&CPhoneTrackerComponent::m_posMinCutoff, 'pmcu', "PosMinCutoff", "Position Min Cutoff", "Hz. Lower values kill more jitter while the camera is still", 1.0f);
++		desc.AddMember(&CPhoneTrackerComponent::m_posBeta, 'pbet', "PosBeta", "Position Speed Coefficient", "How fast the position cutoff opens up with speed, per m/s. Raise it if fast moves feel laggy", 0.5f);
++		desc.AddMember(&CPhoneTrackerComponent::m_rotMinCutoff, 'rmcu', "RotMinCutoff", "Rotation Min Cutoff", "Hz. Lower values kill more rotational jitter while the camera is still", 1.2f);
++		desc.AddMember(&CPhoneTrackerComponent::m_rotBeta, 'rbet', "RotBeta", "Rotation Speed Coefficient", "How fast the rotation cutoff opens up with angular rate, per rad/s", 0.1f);
++		desc.AddMember(&CPhoneTrackerComponent::m_interpDelayFactor, 'idly', "InterpDelay", "Resample Delay", "Packet intervals of buffering used to hide network jitter. Higher is smoother but adds latency", 1.5f);
++		desc.AddMember(&CPhoneTrackerComponent::m_maxExtrapolationMs, 'xtrp', "MaxExtrapolation", "Max Extrapolation", "Milliseconds the pose may be extrapolated into a signal gap. 0 freezes on the last pose instead", 0.0f);
++
++		desc.AddMember(&CPhoneTrackerComponent::m_tripodEnabled, 'trip', "Tripod", "Virtual Tripod", "Lock the pose completely once the operator holds still, so composing a shot is rock steady", true);
++		desc.AddMember(&CPhoneTrackerComponent::m_tripodEnterSpeed, 'tesp', "TripodEnterSpeed", "Tripod Enter Speed", "Metres per second below which the tripod starts arming", 0.015f);
++		desc.AddMember(&CPhoneTrackerComponent::m_tripodHoldTime, 'thld', "TripodHoldTime", "Tripod Hold Time", "Seconds of stillness required before the pose locks", 0.25f);
++		desc.AddMember(&CPhoneTrackerComponent::m_tripodExitPosition, 'txps', "TripodExitPosition", "Tripod Release Distance", "Metres of movement away from the locked pose that releases the tripod", 0.01f);
++		desc.AddMember(&CPhoneTrackerComponent::m_tripodBlendTime, 'tbld', "TripodBlendTime", "Tripod Release Blend", "Seconds spent blending from the locked pose back to the live pose", 0.15f);
++
++		desc.AddMember(&CPhoneTrackerComponent::m_debugDraw, 'dbg', "DebugDraw", "Debug Draw", "Draw connection and pose statistics on screen", false);
++	}
++
++	static void Register(Schematyc::CEnvRegistrationScope& componentScope);
++
++	// IEntityComponent
++	virtual void OnShutDown() override;
++	virtual Cry::Entity::EventFlags GetEventMask() const override;
++	virtual void ProcessEvent(const SEntityEvent& event) override;
++	// ~IEntityComponent
++
++	//! Re-samples the tracker origin from the next pose and asks the phone to reset its own origin.
++	void Recenter();
++	void SetTrackingEnabled(bool enable);
++	bool IsTracking() const { return m_isTracking; }
++
++protected:
++	void OpenSocket();
++	void ApplyLensPacket(const SLensPacket& packet);
++	ICinematicCameraOptics* GetOptics();
++	void CloseSocket();
++	void ReceivePackets();
++	void ApplyPose(float frameTime);
++	QuatT MapToWorld(const Vec3& trackerPosition, const Quat& trackerRotation) const;
++	void SyncFilterParams();
++	void SendControl(EControlCommand cmd, int32 param = 0);
++	void DrawDebug() const;
++
++	// Reflected properties
++	bool                       m_enabled = true;
++	Schematyc::Range<1, 65535, 1024, 65535, int> m_port = 9050;
++	bool                       m_applyPosition = true;
++	bool                       m_applyRotation = true;
++	bool                       m_relativeToStartTransform = true;
++	Schematyc::Range<0, 1000, 0, 10>  m_scale = 1.0f;
++	Schematyc::Range<-360, 360> m_yawOffsetDegrees = 0.0f;
++	Vec3                       m_positionOffset = ZERO;
++	Schematyc::Range<0, 5, 0, 1>     m_smoothingHalfLife = 0.0f;
++	Schematyc::Range<0, 60, 0, 10>    m_signalTimeout = 2.0f;
++	bool                       m_driveLens = true;
++	bool                       m_lensArmsEffects = true;
++	bool                       m_debugDraw = false;
++
++	EPoseFilterMode            m_filterMode = EPoseFilterMode::Cinematic;
++	Schematyc::Range<0, 10, 0, 5>  m_posMinCutoff = 1.0f;
++	Schematyc::Range<0, 5, 0, 2>   m_posBeta = 0.5f;
++	Schematyc::Range<0, 10, 0, 5>  m_rotMinCutoff = 1.2f;
++	Schematyc::Range<0, 5, 0, 2>   m_rotBeta = 0.1f;
++	Schematyc::Range<1, 4, 1, 4>   m_interpDelayFactor = 1.5f;
++	Schematyc::Range<0, 80, 0, 80> m_maxExtrapolationMs = 0.0f;
++	bool                       m_tripodEnabled = true;
++	Schematyc::Range<0, 1, 0, 1>   m_tripodEnterSpeed = 0.015f;
++	Schematyc::Range<0, 2, 0, 1>   m_tripodHoldTime = 0.25f;
++	Schematyc::Range<0, 1, 0, 1>   m_tripodExitPosition = 0.01f;
++	Schematyc::Range<0, 2, 0, 1>   m_tripodBlendTime = 0.15f;
++
++	// Runtime state
++	CRYSOCKET      m_socket = CRY_INVALID_SOCKET;
++	bool           m_wsaStarted = false;
++	CRYSOCKADDR_IN m_peer;
++	bool           m_hasPeer = false;
++	uint32         m_controlSeq = 0;
++
++	QuatT  m_referenceTransform = QuatT(IDENTITY);  //!< Entity transform captured when tracking started.
++	QuatT  m_trackerOrigin = QuatT(IDENTITY);       //!< Tracker pose treated as the zero point.
++	bool   m_hasOrigin = false;
++	uint32 m_originEpoch = 0;
++	bool   m_recenterRequested = false;
++
++	CPoseFilter m_poseFilter;                       //!< Runs in tracker space, before the world mapping.
++	bool   m_signalWasLost = false;                 //!< Set when Signal Timeout expires, so we can reset the filter on recovery.
++
++	QuatT  m_targetTransform = QuatT(IDENTITY);     //!< Latest pose mapped into world space.
++	QuatT  m_currentTransform = QuatT(IDENTITY);    //!< Smoothed transform actually written to the entity.
++	bool   m_hasTarget = false;
++
++	bool   m_isTracking = false;
++	float  m_timeSinceValidPose = 0.0f;
++	uint32 m_lastSeq = 0;
++	uint32 m_packetsReceived = 0;
++	uint32 m_packetsLost = 0;
++	uint8  m_batteryPct = 0;
++	uint8  m_appFps = 0;
++	uint8  m_trackingState = 0;
++
++	// Lens state mirrored from the phone (only meaningful while m_driveLens is set).
++	ICinematicCameraOptics* m_pOptics = nullptr;
++	bool   m_opticsLookedUp = false;
++	bool   m_hasLensState = false;
++	float  m_focalLengthMm = 0.0f;
++	float  m_apertureFNumber = 0.0f;
++	float  m_focusDistanceM = 0.0f;
++	float  m_evCompensation = 0.0f;
++};
++
++} // namespace PhoneTracker
++} // namespace Cry
+diff --git a/Code/CryPlugins/CryPhoneTracker/Module/PhoneTrackerPlugin.cpp b/Code/CryPlugins/CryPhoneTracker/Module/PhoneTrackerPlugin.cpp
+new file mode 100644
+index 00000000..9dad7e6e
+--- /dev/null
++++ b/Code/CryPlugins/CryPhoneTracker/Module/PhoneTrackerPlugin.cpp
+@@ -0,0 +1,69 @@
++// CryPhoneTracker - engine plugin entry point.
++#include "StdAfx.h"
++#include "PhoneTrackerPlugin.h"
++
++#include <CrySchematyc/Env/IEnvRegistry.h>
++#include <CrySchematyc/Env/EnvPackage.h>
++#include <CrySchematyc/Utils/SharedString.h>
++#include <CryCore/StaticInstanceList.h>
++
++// Included only once per DLL module.
++#include <CryCore/Platform/platform_impl.inl>
++
++namespace Cry
++{
++namespace PhoneTracker
++{
++
++CPhoneTrackerPlugin::~CPhoneTrackerPlugin()
++{
++	if (gEnv->pSystem != nullptr)
++	{
++		gEnv->pSystem->GetISystemEventDispatcher()->RemoveListener(this);
++	}
++
++	if (gEnv->pSchematyc != nullptr)
++	{
++		gEnv->pSchematyc->GetEnvRegistry().DeregisterPackage(CPhoneTrackerPlugin::GetCID());
++	}
++}
++
++bool CPhoneTrackerPlugin::Initialize(SSystemGlobalEnvironment& env, const SSystemInitParams& initParams)
++{
++	gEnv->pSystem->GetISystemEventDispatcher()->RegisterListener(this, "CPhoneTrackerPlugin");
++	return true;
++}
++
++void CPhoneTrackerPlugin::OnSystemEvent(ESystemEvent event, UINT_PTR wparam, UINT_PTR lparam)
++{
++	switch (event)
++	{
++	case ESYSTEM_EVENT_REGISTER_SCHEMATYC_ENV:
++		{
++			auto staticAutoRegisterLambda = [](Schematyc::IEnvRegistrar& registrar)
++			{
++				Detail::CStaticAutoRegistrar<Schematyc::IEnvRegistrar&>::InvokeStaticCallbacks(registrar);
++			};
++
++			if (gEnv->pSchematyc != nullptr)
++			{
++				gEnv->pSchematyc->GetEnvRegistry().RegisterPackage(
++					stl::make_unique<Schematyc::CEnvPackage>(
++						CPhoneTrackerPlugin::GetCID(),
++						"EntityComponents",
++						"Bigspring",
++						"Phone tracker entity components",
++						staticAutoRegisterLambda));
++			}
++		}
++		break;
++
++	default:
++		break;
++	}
++}
++
++CRYREGISTER_SINGLETON_CLASS(CPhoneTrackerPlugin)
++
++} // namespace PhoneTracker
++} // namespace Cry
+diff --git a/Code/CryPlugins/CryPhoneTracker/Module/PhoneTrackerPlugin.h b/Code/CryPlugins/CryPhoneTracker/Module/PhoneTrackerPlugin.h
+new file mode 100644
+index 00000000..9d2f28ec
+--- /dev/null
++++ b/Code/CryPlugins/CryPhoneTracker/Module/PhoneTrackerPlugin.h
+@@ -0,0 +1,33 @@
++// CryPhoneTracker - engine plugin entry point.
++#pragma once
++
++#include <CrySystem/ICryPlugin.h>
++#include <CryEntitySystem/IEntityClass.h>
++
++namespace Cry
++{
++namespace PhoneTracker
++{
++
++class CPhoneTrackerPlugin final
++	: public Cry::IEnginePlugin
++	, public ISystemEventListener
++{
++public:
++	CRYINTERFACE_SIMPLE(Cry::IEnginePlugin)
++	CRYGENERATE_SINGLETONCLASS_GUID(CPhoneTrackerPlugin, "CryPhoneTracker", "7F1E4B08-6D3A-42F1-9D40-C1B7E2A5D330"_cry_guid)
++
++	virtual ~CPhoneTrackerPlugin();
++
++	// Cry::IEnginePlugin
++	virtual const char* GetCategory() const override { return "Tracking"; }
++	virtual bool        Initialize(SSystemGlobalEnvironment& env, const SSystemInitParams& initParams) override;
++	// ~Cry::IEnginePlugin
++
++	// ISystemEventListener
++	virtual void OnSystemEvent(ESystemEvent event, UINT_PTR wparam, UINT_PTR lparam) override;
++	// ~ISystemEventListener
++};
++
++} // namespace PhoneTracker
++} // namespace Cry
+diff --git a/Code/CryPlugins/CryPhoneTracker/Module/PhoneTrackerProtocol.h b/Code/CryPlugins/CryPhoneTracker/Module/PhoneTrackerProtocol.h
+new file mode 100644
+index 00000000..3a71fdc7
+--- /dev/null
++++ b/Code/CryPlugins/CryPhoneTracker/Module/PhoneTrackerProtocol.h
+@@ -0,0 +1,127 @@
++// CryPhoneTracker - wire format shared with the Android "phonetracker" app.
++// Keep in sync with androidtracker/app/src/main/java/tw/bigspring/phonetracker/net/PacketCodec.kt
++// and androidtracker/tools/pose_monitor.py.
++#pragma once
++
++namespace Cry
++{
++namespace PhoneTracker
++{
++
++constexpr uint32 kPoseMagic    = 0x54443350; // 'P3DT' little endian
++constexpr uint32 kControlMagic = 0x54433350; // 'P3CT' little endian
++constexpr uint32 kLensMagic    = 0x534E4C50; // 'PLNS' little endian
++constexpr uint16 kProtocolVersion = 1;
++
++constexpr uint16 kPosePacketSize    = 64;
++constexpr uint16 kControlPacketSize = 28;
++constexpr uint16 kLensPacketSize    = 32;
++
++//! Bits carried in SPosePacket::flags.
++enum EPoseFlags : uint16
++{
++	ePoseFlag_Valid          = 1, //!< ARCore reported TRACKING for this frame.
++	ePoseFlag_SessionResumed = 2, //!< First sample after the AR session resumed.
++	ePoseFlag_OriginMark     = 4, //!< The phone recentered; originEpoch was bumped.
++	ePoseFlag_Heartbeat      = 8, //!< Keep-alive sample sent while tracking is lost.
++};
++
++//! Commands understood by the phone (sent back over the same socket).
++enum EControlCommand : uint16
++{
++	eControlCmd_Ping    = 1,
++	eControlCmd_Pong    = 2,
++	eControlCmd_Recenter = 3,
++	eControlCmd_SetRate = 4,
++	eControlCmd_Pause   = 5,
++	eControlCmd_Resume  = 6,
++};
++
++//! Bits carried in SLensPacket::flags.
++enum ELensFlags : uint16
++{
++	eLensFlag_EnableDepthOfField = 1, //!< The operator armed depth of field on the phone.
++	eLensFlag_EnableExposure     = 2, //!< The operator armed EV compensation on the phone.
++};
++
++#pragma pack(push, 1)
++
++struct SPosePacket
++{
++	uint32 magic;
++	uint16 version;
++	uint16 flags;
++	uint32 seq;
++	uint32 originEpoch;
++	int64  deviceNs;   //!< System.nanoTime() on the phone when the packet was queued.
++	int64  frameNs;    //!< ARCore frame timestamp.
++	float  px, py, pz; //!< Raw ARCore position (right handed, Y up, metres).
++	float  qx, qy, qz, qw;
++	uint8  trackingState;
++	uint8  failureReason;
++	uint8  batteryPct;
++	uint8  appFps;
++};
++
++//! Lens state pushed by the phone whenever a slider moves, plus a low rate keep-alive.
++struct SLensPacket
++{
++	uint32 magic;
++	uint16 version;
++	uint16 flags;
++	uint32 seq;
++	float  focalLengthMm;
++	float  apertureFNumber;
++	float  focusDistanceM;
++	float  evCompensation;
++	uint32 reserved;
++};
++
++struct SControlPacket
++{
++	uint32 magic;
++	uint16 version;
++	uint16 cmd;
++	uint32 seq;
++	int64  pcNs;
++	int32  param;
++	int32  reserved;
++};
++
++#pragma pack(pop)
++
++static_assert(sizeof(SPosePacket) == kPosePacketSize, "Pose packet layout must match the phone");
++static_assert(sizeof(SControlPacket) == kControlPacketSize, "Control packet layout must match the phone");
++static_assert(sizeof(SLensPacket) == kLensPacketSize, "Lens packet layout must match the phone");
++
++//! ARCore is right handed with +Y up and -Z forward; CRYENGINE is right handed with +Z up
++//! and +Y forward. Same handedness, so the axis swap alone is enough (matches pose_monitor.py).
++inline Vec3 ArCoreToCryPosition(const SPosePacket& packet)
++{
++	return Vec3(packet.px, -packet.pz, packet.py);
++}
++
++inline Quat ArCoreToCryRotation(const SPosePacket& packet)
++{
++	Quat rotation;
++	rotation.w = packet.qw;
++	rotation.v = Vec3(packet.qx, -packet.qz, packet.qy);
++	rotation.Normalize();
++	return rotation;
++}
++
++inline SControlPacket MakeControlPacket(EControlCommand cmd, uint32 seq, int64 pcNs, int32 param = 0)
++{
++	SControlPacket packet;
++	ZeroStruct(packet);
++	packet.magic = kControlMagic;
++	packet.version = kProtocolVersion;
++	packet.cmd = static_cast<uint16>(cmd);
++	packet.seq = seq;
++	packet.pcNs = pcNs;
++	packet.param = param;
++	return packet;
++}
++
++} // namespace PhoneTracker
++} // namespace Cry
+diff --git a/Code/CryPlugins/CryPhoneTracker/Module/PoseFilter.h b/Code/CryPlugins/CryPhoneTracker/Module/PoseFilter.h
+new file mode 100644
+index 00000000..0314851a
+--- /dev/null
++++ b/Code/CryPlugins/CryPhoneTracker/Module/PoseFilter.h
+@@ -0,0 +1,547 @@
++// CryPhoneTracker - handheld "virtual camera" pose filtering pipeline.
++//
++// Self contained, header only, no gEnv access and no dynamic allocation, so it can be unit
++// tested outside the engine. The pipeline runs entirely in tracker space (metres, ARCore axes
++// already swapped to Cry), before the component maps the pose into world space, which keeps
++// every threshold in physical units regardless of Metres To Units / Yaw Offset.
++//
++//   Stage A  clock rebasing        - map phone frame timestamps onto the engine clock
++//   Stage B  One Euro filter       - runs once per received packet
++//   Stage B' fixed delay resample  - runs once per rendered frame, from a 16 entry ring buffer
++//   Stage C  virtual tripod        - lock the image completely while the operator composes
++//
++#pragma once
++
++namespace Cry
++{
++namespace PhoneTracker
++{
++
++//! Master switch for the filtering pipeline.
++enum class EPoseFilterMode : uint32
++{
++	Off = 0,   //!< Bypass everything; frame identical to the unfiltered code path.
++	OneEuro,   //!< Stage A + B + B' only.
++	Cinematic, //!< Everything, including the virtual tripod.
++};
++
++//! Virtual tripod state, reported for debug draw.
++enum class EPoseFilterTripodState : uint32
++{
++	Moving = 0,
++	Arming,
++	Steady,
++	Blending,
++};
++
++//! Everything the component exposes to Schematyc, gathered in one plain struct.
++struct SPoseFilterParams
++{
++	float posMinCutoff = 1.0f;  //!< Hz. Static position jitter rejection; lower is steadier.
++	float posBeta = 0.5f;       //!< Per m/s. How quickly the cutoff opens up when moving.
++	float rotMinCutoff = 1.2f;  //!< Hz. Static rotation jitter rejection.
++	float rotBeta = 0.1f;       //!< Per rad/s. Rotation responsiveness.
++
++	float interpDelayFactor = 1.5f;   //!< Resample this many packet intervals behind the engine clock.
++	float maxExtrapolationMs = 0.0f;  //!< 0 disables extrapolation and freezes on the last pose instead.
++
++	bool  tripodEnabled = true;
++	float tripodEnterSpeed = 0.015f;  //!< m/s below which the tripod starts arming.
++	float tripodHoldTime = 0.25f;     //!< Seconds of stillness required before locking.
++	float tripodExitPosition = 0.01f; //!< Metres of drift from the anchor that releases the lock.
++	float tripodBlendTime = 0.15f;    //!< Seconds of smoothstep blend from anchor back to live.
++};
++
++//! Values only used for the debug overlay.
++struct SPoseFilterDebug
++{
++	EPoseFilterTripodState state = EPoseFilterTripodState::Moving;
++	float speed = 0.0f;             //!< m/s, filtered.
++	float angularSpeedDeg = 0.0f;   //!< deg/s, filtered.
++	float posCutoff = 0.0f;         //!< Hz, effective One Euro cutoff for the last packet.
++	float rotCutoff = 0.0f;         //!< Hz.
++	float blendWeight = 0.0f;       //!< 0..1 while leaving the tripod.
++	float resampleDelayMs = 0.0f;   //!< How far behind the engine clock we sample.
++	float extrapolationMs = 0.0f;   //!< How far past the newest sample we had to reach.
++	int   bufferDepth = 0;          //!< Samples currently held in the ring buffer.
++};
++
++//! Fixed pipeline constants; deliberately not exposed, to keep the property panel readable.
++constexpr int64 kDefaultIntervalNs = 33000000;      //!< 33 ms, the phone's nominal 30 Hz.
++constexpr int64 kMinIntervalNs = 4000000;           //!< 4 ms.
++constexpr int64 kMaxIntervalNs = 100000000;         //!< 100 ms.
++constexpr int64 kClockResetNs = 200000000;          //!< Disagreement that means the phone clock jumped.
++constexpr int64 kClockMaxCorrectionNs = 2000000;    //!< Absorb clock drift at most 2 ms per packet.
++constexpr double kClockEmaAlpha = 0.05;
++constexpr double kIntervalEmaAlpha = 0.1;
++
++constexpr float kDerivativeCutoff = 1.0f;           //!< Hz, low pass applied to the estimated derivatives.
++constexpr float kMinCutoff = 0.05f;                 //!< Hz, guards against a zeroed property.
++constexpr float kMinTe = 1.0f / 240.0f;             //!< Seconds, shortest accepted packet interval.
++constexpr float kMaxTe = 0.2f;                      //!< Seconds, longest accepted packet interval.
++constexpr float kEnterAngularDeg = 0.8f;            //!< deg/s below which the tripod may arm.
++constexpr float kExitAngleDeg = 0.5f;               //!< Rotation away from the anchor that releases it.
++constexpr float kExitSpeed = 0.05f;                 //!< m/s that releases the tripod immediately.
++constexpr float kSteadyCutoff = 0.1f;               //!< Hz, how slowly the anchor chases ARCore drift.
++constexpr float kSteadyDeadbandPos = 0.0005f;       //!< Metres of anchor dead band.
++constexpr float kSteadyDeadbandDeg = 0.02f;         //!< Degrees of anchor dead band.
++
++//! Handheld camera pose filter. Main thread only.
++class CPoseFilter
++{
++public:
++	static const int   kRingSize = 16;
++
++	CPoseFilter() { Reset(); }
++
++	void SetParams(const SPoseFilterParams& params) { m_params = params; }
++	const SPoseFilterParams& GetParams() const      { return m_params; }
++	const SPoseFilterDebug&  GetDebug() const       { return m_debug; }
++
++	bool        HasOutput() const     { return m_hasOutput; }
++	const QuatT& GetOutput() const    { return m_output; }
++
++	//! Drops every piece of history. The next pushed sample re-initialises the filter without
++	//! producing a transient, so this is safe to call on recenter / session resume / signal loss.
++	void Reset()
++	{
++		m_hasClock = false;
++		m_offsetNs = 0;
++		m_intervalNs = kDefaultIntervalNs;
++		m_lastFrameNs = 0;
++		m_lastSampleTimeNs = 0;
++
++		m_hasState = false;
++		m_posHat = Vec3(ZERO);
++		m_velHat = Vec3(ZERO);
++		m_rotHat = Quat(IDENTITY);
++		m_angVelHat = 0.0f;
++
++		m_count = 0;
++		m_next = 0;
++
++		m_hasOutput = false;
++		m_output = QuatT(IDENTITY);
++
++		m_tripodState = EPoseFilterTripodState::Moving;
++		m_armTimer = 0.0f;
++		m_blendTimer = 0.0f;
++		m_anchor = QuatT(IDENTITY);
++		m_blendFrom = QuatT(IDENTITY);
++
++		m_debug = SPoseFilterDebug();
++	}
++
++	//! Stage A + Stage B. Called for every valid pose packet, with the phone frame timestamp and
++	//! the engine clock reading taken when the packet was drained (both in nanoseconds).
++	void Push(int64 frameNs, int64 engineNowNs, const Vec3& position, const Quat& rotation)
++	{
++		// ---- Stage A: rebase the phone clock onto the engine clock ----------------------
++		const int64 instantOffset = engineNowNs - frameNs;
++		if (!m_hasClock)
++		{
++			m_offsetNs = instantOffset;
++			m_hasClock = true;
++		}
++		else
++		{
++			const int64 error = instantOffset - m_offsetNs;
++			if (error > kClockResetNs || error < -kClockResetNs)
++			{
++				// Phone clock jumped (new AR session, device sleep); start over cleanly.
++				Reset();
++				m_offsetNs = instantOffset;
++				m_hasClock = true;
++			}
++			else
++			{
++				int64 correction = static_cast<int64>(static_cast<double>(error) * kClockEmaAlpha);
++				correction = clamp_tpl(correction, -kClockMaxCorrectionNs, kClockMaxCorrectionNs);
++				m_offsetNs += correction;
++			}
++		}
++
++		float deltaSeconds = 0.0f;
++		if (m_hasState)
++		{
++			// Reject out of order / stale samples outright.
++			if (frameNs <= m_lastFrameNs)
++				return;
++
++			const int64 deltaNs = frameNs - m_lastFrameNs;
++
++			// Packet interval estimate, used by the fixed delay resampler.
++			const int64 clamped = clamp_tpl(deltaNs, kMinIntervalNs, kMaxIntervalNs);
++			m_intervalNs += static_cast<int64>(static_cast<double>(clamped - m_intervalNs) * kIntervalEmaAlpha);
++
++			deltaSeconds = clamp_tpl(static_cast<float>(static_cast<double>(deltaNs) * 1e-9), kMinTe, kMaxTe);
++		}
++
++		m_lastFrameNs = frameNs;
++
++		// ---- Stage B: One Euro ---------------------------------------------------------
++		Quat target = rotation;
++
++		if (!m_hasState)
++		{
++			m_posHat = position;
++			m_velHat = Vec3(ZERO);
++			m_rotHat = target;
++			m_angVelHat = 0.0f;
++			m_hasState = true;
++			m_debug.posCutoff = GetPosMinCutoff();
++			m_debug.rotCutoff = GetRotMinCutoff();
++		}
++		else
++		{
++			// Position: shared cutoff across all three axes so the axes never blur unevenly.
++			const Vec3 rawVelocity = (position - m_posHat) / deltaSeconds;
++			const float dAlpha = LowPassAlpha(kDerivativeCutoff, deltaSeconds);
++			m_velHat += (rawVelocity - m_velHat) * dAlpha;
++
++			const float speed = m_velHat.GetLength();
++			const float posCutoff = GetPosMinCutoff() + m_params.posBeta * speed;
++			const float posAlpha = LowPassAlpha(posCutoff, deltaSeconds);
++			m_posHat += (position - m_posHat) * posAlpha;
++			m_debug.posCutoff = posCutoff;
++
++			// Rotation: shortest arc, then the same adaptive scheme driven by angular rate.
++			if (m_rotHat.Dot(target) < 0.0f)
++			{
++				target = -target;
++			}
++
++			const Quat delta = m_rotHat.GetInverted() * target;
++			const float angle = 2.0f * acosf(clamp_tpl(delta.w, -1.0f, 1.0f));
++			const float rawAngular = angle / deltaSeconds;
++			m_angVelHat += (rawAngular - m_angVelHat) * dAlpha;
++
++			const float rotCutoff = GetRotMinCutoff() + m_params.rotBeta * m_angVelHat;
++			const float rotAlpha = LowPassAlpha(rotCutoff, deltaSeconds);
++			m_rotHat = Quat::CreateSlerp(m_rotHat, target, rotAlpha);
++			m_rotHat.Normalize();
++			m_debug.rotCutoff = rotCutoff;
++		}
++
++		// ---- Push into the ring buffer -------------------------------------------------
++		int64 sampleTimeNs = frameNs + m_offsetNs;
++		if (m_count > 0 && sampleTimeNs <= m_lastSampleTimeNs)
++		{
++			// The clock estimate moves slowly; make sure the buffer stays strictly monotonic.
++			sampleTimeNs = m_lastSampleTimeNs + 1;
++		}
++		m_lastSampleTimeNs = sampleTimeNs;
++
++		SSample& slot = m_samples[m_next];
++		slot.timeNs = sampleTimeNs;
++		slot.position = m_posHat;
++		slot.velocity = m_velHat;
++		slot.rotation = m_rotHat;
++		slot.angularSpeed = m_angVelHat;
++
++		m_next = (m_next + 1) % kRingSize;
++		if (m_count < kRingSize)
++		{
++			++m_count;
++		}
++	}
++
++	//! Stage B' + Stage C. Called once per rendered frame; returns false until the first sample
++	//! has arrived. \p cinematic enables the virtual tripod, \p frameTime is the engine frame time.
++	bool Sample(int64 engineNowNs, float frameTime, bool cinematic, QuatT& outPose)
++	{
++		m_debug.bufferDepth = m_count;
++		if (m_count == 0)
++			return false;
++
++		QuatT live = QuatT(IDENTITY);
++		Vec3 velocity = Vec3(ZERO);
++		float angularSpeed = 0.0f;
++		Resample(engineNowNs, live, velocity, angularSpeed);
++
++		m_debug.speed = velocity.GetLength();
++		m_debug.angularSpeedDeg = RAD2DEG(angularSpeed);
++
++		if (cinematic && m_params.tripodEnabled)
++		{
++			UpdateTripod(live, frameTime);
++		}
++		else
++		{
++			m_tripodState = EPoseFilterTripodState::Moving;
++			m_armTimer = 0.0f;
++			m_blendTimer = 0.0f;
++			m_debug.blendWeight = 0.0f;
++			m_output = live;
++		}
++
++		m_debug.state = m_tripodState;
++		m_hasOutput = true;
++		outPose = m_output;
++		return true;
++	}
++
++private:
++	struct SSample
++	{
++		int64 timeNs = 0;
++		Vec3  position = Vec3(ZERO);
++		Vec3  velocity = Vec3(ZERO);
++		Quat  rotation = Quat(IDENTITY);
++		float angularSpeed = 0.0f;
++	};
++
++	//! Generic first order low pass coefficient for a cutoff in Hz over an interval in seconds.
++	static float LowPassAlpha(float cutoffHz, float deltaSeconds)
++	{
++		const float safeCutoff = max(cutoffHz, kMinCutoff);
++		const float tau = 1.0f / (2.0f * gf_PI * safeCutoff);
++		return clamp_tpl(1.0f / (1.0f + tau / deltaSeconds), 0.0f, 1.0f);
++	}
++
++	float GetPosMinCutoff() const { return max(m_params.posMinCutoff, kMinCutoff); }
++	float GetRotMinCutoff() const { return max(m_params.rotMinCutoff, kMinCutoff); }
++
++	const SSample& GetSample(int index) const
++	{
++		// index 0 is the oldest entry currently held.
++		const int oldest = (m_next - m_count + 2 * kRingSize) % kRingSize;
++		return m_samples[(oldest + index) % kRingSize];
++	}
++
++	//! Stage B': sample the ring buffer at a fixed delay behind the engine clock.
++	void Resample(int64 engineNowNs, QuatT& outPose, Vec3& outVelocity, float& outAngularSpeed)
++	{
++		const double delayNs = static_cast<double>(m_intervalNs) * static_cast<double>(max(m_params.interpDelayFactor, 1.0f));
++		m_debug.resampleDelayMs = static_cast<float>(delayNs * 1e-6);
++		m_debug.extrapolationMs = 0.0f;
++
++		const int64 queryNs = engineNowNs - static_cast<int64>(delayNs);
++
++		const SSample& newest = GetSample(m_count - 1);
++		if (m_count < 2)
++		{
++			outPose = QuatT(newest.rotation, newest.position);
++			outVelocity = newest.velocity;
++			outAngularSpeed = newest.angularSpeed;
++			return;
++		}
++
++		const SSample& oldest = GetSample(0);
++		if (queryNs <= oldest.timeNs)
++		{
++			outPose = QuatT(oldest.rotation, oldest.position);
++			outVelocity = oldest.velocity;
++			outAngularSpeed = oldest.angularSpeed;
++			return;
++		}
++
++		if (queryNs >= newest.timeNs)
++		{
++			// Signal gap: extrapolate for a while, then hold. Never snap back.
++			outVelocity = newest.velocity;
++			outAngularSpeed = newest.angularSpeed;
++			outPose = QuatT(newest.rotation, newest.position);
++
++			const float maxExtrapolation = max(m_params.maxExtrapolationMs, 0.0f) * 0.001f;
++			const float ahead = static_cast<float>(static_cast<double>(queryNs - newest.timeNs) * 1e-9);
++			m_debug.extrapolationMs = ahead * 1000.0f;
++			if (maxExtrapolation > 0.0f)
++			{
++				// Linear decay of the velocity contribution: integrating v * (1 - t / tMax).
++				const float t = min(ahead, maxExtrapolation);
++				outPose.t += newest.velocity * (t * (1.0f - 0.5f * t / maxExtrapolation));
++			}
++			return;
++		}
++
++		// Find the pair bracketing the query time, newest first (the common case is the last pair).
++		int right = m_count - 1;
++		while (right > 1 && GetSample(right - 1).timeNs > queryNs)
++		{
++			--right;
++		}
++
++		const SSample& a = GetSample(right - 1);
++		const SSample& b = GetSample(right);
++
++		const float span = static_cast<float>(static_cast<double>(b.timeNs - a.timeNs) * 1e-9);
++		const float s = span > 0.0f ? clamp_tpl(static_cast<float>(static_cast<double>(queryNs - a.timeNs) * 1e-9) / span, 0.0f, 1.0f) : 0.0f;
++
++		// Position: cubic Hermite with the filtered velocities as tangents.
++		const float s2 = s * s;
++		const float s3 = s2 * s;
++		const float h00 = 2.0f * s3 - 3.0f * s2 + 1.0f;
++		const float h10 = s3 - 2.0f * s2 + s;
++		const float h01 = -2.0f * s3 + 3.0f * s2;
++		const float h11 = s3 - s2;
++
++		outPose.t = a.position * h00 + a.velocity * (h10 * span) + b.position * h01 + b.velocity * (h11 * span);
++
++		// Rotation: the One Euro stage already removed the jitter, so a slerp is plenty.
++		outPose.q = Quat::CreateSlerp(a.rotation, b.rotation, s);
++		outPose.q.Normalize();
++
++		outVelocity = Vec3::CreateLerp(a.velocity, b.velocity, s);
++		outAngularSpeed = a.angularSpeed + (b.angularSpeed - a.angularSpeed) * s;
++	}
++
++	//! Stage C: hysteresis driven lock/release around a stationary anchor pose.
++	void UpdateTripod(const QuatT& live, float frameTime)
++	{
++		const float dt = max(frameTime, 0.0f);
++		const bool stillEnough = m_debug.speed < max(m_params.tripodEnterSpeed, 0.0f)
++		                         && m_debug.angularSpeedDeg < kEnterAngularDeg;
++
++		switch (m_tripodState)
++		{
++		case EPoseFilterTripodState::Moving:
++			{
++				if (stillEnough)
++				{
++					m_tripodState = EPoseFilterTripodState::Arming;
++					m_armTimer = 0.0f;
++				}
++				m_output = live;
++			}
++			break;
++
++		case EPoseFilterTripodState::Arming:
++			{
++				if (!stillEnough)
++				{
++					m_tripodState = EPoseFilterTripodState::Moving;
++					m_armTimer = 0.0f;
++				}
++				else
++				{
++					m_armTimer += dt;
++					if (m_armTimer >= max(m_params.tripodHoldTime, 0.0f))
++					{
++						m_tripodState = EPoseFilterTripodState::Steady;
++						m_anchor = live;
++					}
++				}
++				m_output = live;
++			}
++			break;
++
++		case EPoseFilterTripodState::Steady:
++			{
++				TrackAnchor(live, dt);
++
++				const float drift = (live.t - m_anchor.t).GetLength();
++				const float angle = AngleBetween(m_anchor.q, live.q);
++				if (drift > max(m_params.tripodExitPosition, 0.0f)
++				    || angle > DEG2RAD(kExitAngleDeg)
++				    || m_debug.speed > kExitSpeed)
++				{
++					m_tripodState = EPoseFilterTripodState::Blending;
++					m_blendTimer = 0.0f;
++					m_blendFrom = m_anchor;
++				}
++				m_output = m_anchor;
++			}
++			break;
++
++		case EPoseFilterTripodState::Blending:
++			{
++				if (stillEnough)
++				{
++					// Re-lock straight from wherever the blend currently is; no visible step.
++					m_tripodState = EPoseFilterTripodState::Steady;
++					m_anchor = m_output;
++					m_armTimer = 0.0f;
++					m_blendTimer = 0.0f;
++					m_debug.blendWeight = 0.0f;
++					break;
++				}
++
++				m_blendTimer += dt;
++				const float blendTime = max(m_params.tripodBlendTime, 0.0001f);
++				const float u = clamp_tpl(m_blendTimer / blendTime, 0.0f, 1.0f);
++				const float w = u * u * (3.0f - 2.0f * u); // smoothstep
++				m_debug.blendWeight = w;
++
++				m_output.t = Vec3::CreateLerp(m_blendFrom.t, live.t, w);
++				m_output.q = Quat::CreateSlerp(m_blendFrom.q, live.q, w);
++				m_output.q.Normalize();
++
++				if (u >= 1.0f)
++				{
++					m_tripodState = EPoseFilterTripodState::Moving;
++					m_debug.blendWeight = 0.0f;
++				}
++			}
++			break;
++		}
++
++		if (m_tripodState != EPoseFilterTripodState::Blending)
++		{
++			m_debug.blendWeight = 0.0f;
++		}
++	}
++
++	//! Let the anchor creep towards the live pose so ARCore's slow drift is absorbed, but leave it
++	//! bit-identical while the difference sits inside the dead band; that is what makes a phone
++	//! resting on a table produce a literally unchanging transform.
++	void TrackAnchor(const QuatT& live, float dt)
++	{
++		if (dt <= 0.0f)
++			return;
++
++		const float alpha = LowPassAlpha(kSteadyCutoff, dt);
++
++		const Vec3 offset = live.t - m_anchor.t;
++		if (offset.GetLength() > kSteadyDeadbandPos)
++		{
++			m_anchor.t += offset * alpha;
++		}
++
++		if (AngleBetween(m_anchor.q, live.q) > DEG2RAD(kSteadyDeadbandDeg))
++		{
++			m_anchor.q = Quat::CreateSlerp(m_anchor.q, live.q, alpha);
++			m_anchor.q.Normalize();
++		}
++	}
++
++	static float AngleBetween(const Quat& a, const Quat& b)
++	{
++		const float dot = clamp_tpl(fabs_tpl(a.Dot(b)), 0.0f, 1.0f);
++		return 2.0f * acosf(dot);
++	}
++
++	SPoseFilterParams m_params;
++	SPoseFilterDebug  m_debug;
++
++	// Stage A state.
++	bool  m_hasClock = false;
++	int64 m_offsetNs = 0;
++	int64 m_intervalNs = kDefaultIntervalNs;
++	int64 m_lastFrameNs = 0;
++	int64 m_lastSampleTimeNs = 0;
++
++	// Stage B state.
++	bool  m_hasState = false;
++	Vec3  m_posHat = Vec3(ZERO);
++	Vec3  m_velHat = Vec3(ZERO);
++	Quat  m_rotHat = Quat(IDENTITY);
++	float m_angVelHat = 0.0f;
++
++	// Ring buffer.
++	SSample m_samples[kRingSize];
++	int     m_count = 0;
++	int     m_next = 0;
++
++	// Stage C state and the resulting output pose.
++	bool                   m_hasOutput = false;
++	QuatT                  m_output = QuatT(IDENTITY);
++	EPoseFilterTripodState m_tripodState = EPoseFilterTripodState::Moving;
++	float                  m_armTimer = 0.0f;
++	float                  m_blendTimer = 0.0f;
++	QuatT                  m_anchor = QuatT(IDENTITY);
++	QuatT                  m_blendFrom = QuatT(IDENTITY);
++};
++
++} // namespace PhoneTracker
++} // namespace Cry
+diff --git a/Code/CryPlugins/CryPhoneTracker/Module/StdAfx.cpp b/Code/CryPlugins/CryPhoneTracker/Module/StdAfx.cpp
+new file mode 100644
+index 00000000..e717491d
+--- /dev/null
++++ b/Code/CryPlugins/CryPhoneTracker/Module/StdAfx.cpp
+@@ -0,0 +1 @@
++#include "StdAfx.h"
+diff --git a/Code/CryPlugins/CryPhoneTracker/Module/StdAfx.h b/Code/CryPlugins/CryPhoneTracker/Module/StdAfx.h
+new file mode 100644
+index 00000000..22437430
+--- /dev/null
++++ b/Code/CryPlugins/CryPhoneTracker/Module/StdAfx.h
+@@ -0,0 +1,11 @@
++// CryPhoneTracker - precompiled header
++#pragma once
++
++#include <CryCore/Project/CryModuleDefs.h>
++#define eCryModule eCryM_EnginePlugin
++#define GAME_API   DLL_EXPORT
++
++#include <CryCore/Platform/platform.h>
++#include <CrySystem/ISystem.h>
++#include <Cry3DEngine/I3DEngine.h>
++#include <CryNetwork/ISerialize.h>
+diff --git a/Code/CryPlugins/CryPhoneTracker/Module/resource.h b/Code/CryPlugins/CryPhoneTracker/Module/resource.h
+new file mode 100644
+index 00000000..14acb0db
+--- /dev/null
++++ b/Code/CryPlugins/CryPhoneTracker/Module/resource.h
+@@ -0,0 +1,10 @@
++// Next default values for new objects
++//
++#ifdef APSTUDIO_INVOKED
++#ifndef APSTUDIO_READONLY_SYMBOLS
++	#define _APS_NEXT_RESOURCE_VALUE 101
++	#define _APS_NEXT_COMMAND_VALUE  40001
++	#define _APS_NEXT_CONTROL_VALUE  1001
++	#define _APS_NEXT_SYMED_VALUE    101
++#endif
++#endif
+diff --git a/Code/CryPlugins/CryPhoneTracker/PoseFilterSpec.md b/Code/CryPlugins/CryPhoneTracker/PoseFilterSpec.md
+new file mode 100644
+index 00000000..ce9ced0c
+--- /dev/null
++++ b/Code/CryPlugins/CryPhoneTracker/PoseFilterSpec.md
+@@ -0,0 +1,151 @@
++# PoseFilter 規格 — CryPhoneTracker 進階姿態濾波管線
++
++目標：手持虛擬攝影機的「電影感」。三個可感知的驗收目標，優先序由高到低：
++
++1. **構圖停頓時畫面完全靜止**（如上腳架，不是「幾乎不動」）
++2. **運鏡跟手**（1 m/s 移動時濾波額外延遲 < 10ms）
++3. **120fps 下絲滑**（30Hz 封包不得出現階梯感或因網路抖動的速度波動）
++
++技術取捨一律以感知效果為準。
++
++---
++
++## 0. 範圍與位置
++
++- 只改引擎側：`Code/CryPlugins/CryPhoneTracker/Module/`。
++  **不得**修改 Android app、封包協定（`PhoneTrackerProtocol.h` 的 wire format）、CinematicCamera。
++- 新增自包含檔案 `Module/PoseFilter.h`（header-only struct，僅依賴 CryMath / CryCore 基本型別，
++  不碰 gEnv），單元可測。`PhoneTrackerComponent` 只做接線。
++- 濾波運作於 **tracker 空間**（ARCore 轉 Cry 軸後的原始 pose，公尺制），
++  在既有的 origin/yaw/scale/offset 世界映射**之前**。這樣所有閾值都是物理單位，
++  不受 `Metres To Units` / `Yaw Offset` 影響。
++- 無動態配置：所有狀態為固定大小成員（環形緩衝 16 筆）。全部在主執行緒。
++
++## 1. Stage A — 時基重建（clock mapping + jitter 吸收）
++
++封包自帶 `frameNs`（手機 ARCore 幀時間戳，單調）。以它為樣本時間軸，
++把網路到達抖動隔離在時間映射層：
++
++- 維護 `offsetNs = EMA(engineNowNs − frameNs)`，EMA α = 0.05。
++  首個樣本直接初始化。每樣本對估計值的修正量 clamp 在 ±2ms（緩慢吸收時鐘漂移）。
++- 若瞬時 offset 與估計值差 > 200ms → 硬重置（手機時鐘跳變 / session 重啟）。
++- 樣本的引擎時間 = `frameNs + offsetNs`。
++- 以 seq 與 frameNs 拒收亂序/過期樣本（frameNs ≤ 上一筆者丟棄）。
++- 封包間隔估計：`intervalNs = EMA(ΔframeNs)`，α = 0.1，clamp [4ms, 100ms]，初值 33ms。
++
++## 2. Stage B — One Euro（封包率執行，每收到一筆有效 pose 跑一次）
++
++採樣間隔 `Te = ΔframeNs`（秒），clamp [1/240, 0.2]。
++
++通用低通：`alpha(fc) = 1 / (1 + tau/Te)`，`tau = 1/(2π·fc)`。
++
++### 位置（Vec3）
++
++```
++v_raw   = (x − x_prev) / Te                  // 每軸
++v_hat   = v_hat + alpha(dCutoff)·(v_raw − v_hat)   // dCutoff = 1.0 Hz 固定
++speed   = |v_hat|                            // 向量長，三軸共用 cutoff（避免各軸糊化不一致）
++fc      = posMinCutoff + posBeta · speed
++x_hat   = x_hat + alpha(fc)·(x − x_hat)      // 每軸，同一個 fc
++```
++
++### 旋轉（Quat）
++
++```
++q_delta = q_prev^-1 · q_new                  // 先確保最短弧：dot<0 則 q_new 取負
++angle   = 2·acos(clamp(q_delta.w, -1, 1))    // rad
++w_raw   = angle / Te                         // 角速率 rad/s（純量即可）
++w_hat   = w_hat + alpha(dCutoff)·(w_raw − w_hat)
++fc      = rotMinCutoff + rotBeta · w_hat
++q_hat   = Slerp(q_hat, q_new, alpha(fc))，之後 Normalize
++```
++
++輸出（`t, x_hat, v_hat, q_hat, w_hat`）推入環形緩衝（16 筆）。
++
++### 預設參數（反映到 Schematyc 屬性）
++
++| 屬性 | 預設 | 範圍 | 說明 |
++|---|---|---|---|
++| posMinCutoff | 1.0 Hz | 0.1–10 | 靜態位置抖動抑制強度（越低越穩） |
++| posBeta | 0.5 (per m/s) | 0–5 | 高速跟隨性 |
++| rotMinCutoff | 1.2 Hz | 0.1–10 | 靜態旋轉抖動抑制 |
++| rotBeta | 0.1 (per rad/s) | 0–5 | 旋轉跟隨性 |
++
++dCutoff 固定 1.0 Hz，不暴露。
++
++## 3. Stage C — 虛擬腳架（Tripod / steady mode）
++
++目標：構圖停頓 → 畫面**完全**鎖死；起步 → 無黏滯感地平滑接回。含遲滯避免顫振。
++
++狀態機（作用於 Stage B' 重採樣後的 tracker 空間 pose）：
++
++- **MOVING → ARMING**：`|v_hat| < enterSpeed (0.015 m/s)` 且 `w_hat < enterAngular (0.8 deg/s)`
++  開始計時；持續 `holdTime (0.25 s)` → 進入 **STEADY**，錨定
++  `anchor = 當前輸出 pose`。任一超標即重置計時回 MOVING。
++- **STEADY**：輸出 = anchor 以極低通緩慢追隨 live pose（固定 fc = 0.1 Hz，位置 EMA + 旋轉 Slerp），
++  吸收 ARCore 慢漂移但視覺上不可察覺。
++- **STEADY → MOVING（退出條件，任一）**：
++  - `|live_pos − anchor_pos| > exitPosition (0.01 m)`
++  - `angle(live_q, anchor_q) > exitAngle (0.5 deg)`
++  - `|v_hat| > exitSpeed (0.05 m/s)`
++  退出時**不得跳變**：啟動 `blendTime (0.15 s)` 的 smoothstep 混合，從 anchor 過渡到 live。
++  混合期間若再次滿足進入條件，允許直接以當前輸出重新錨定。
++
++暴露屬性：`tripodEnabled`（預設 on）、enterSpeed、holdTime、exitPosition、blendTime。
++enterAngular / exitAngle / exitSpeed 用上表常數即可，不必全部暴露（保持面板簡潔）。
++
++## 4. Stage B' — 定延遲重採樣（渲染率執行，每幀）
++
++- 查詢時間 `t_query = engineNowNs − interpDelayFactor × intervalNs`，
++  `interpDelayFactor` 屬性，預設 1.5（範圍 1.0–4.0）。
++- 在環形緩衝找包夾 `t_query` 的兩筆：
++  - **位置**：cubic Hermite（端點用各自的 `v_hat` 當切線）。
++  - **旋轉**：Slerp（B 級已濾過，squad 不必要）。
++- `t_query` 超出最新樣本（斷流）：
++  - 允許外插至多 `maxExtrapolationMs`（屬性，預設 0 = 關閉，範圍 0–80），
++    使用最新 `v_hat` 並隨超出時間線性衰減至 0。
++  - 超過外插上限 → 凍結在最後 pose。既有 `Signal Timeout` 邏輯不變。
++- 緩衝不足兩筆 → 直接輸出最新樣本。
++
++## 5. 接線與相容性
++
++- `ReceivePackets()`：解析出有效 pose 後（`ePoseFlag_Valid`），餵 `PoseFilter::Push(frameNs, pos, quat)`。
++  origin/epoch 邏輯不變，但注意：**origin 捕捉使用濾波後的當前輸出**（避免抖動被凍進原點）。
++- `ApplyPose(frameTime)`：改為
++  `filter.Sample(engineNowNs) → tripod → 既有世界映射（origin/yaw/scale/offset）→ 寫 entity`。
++  `m_applyPosition / m_applyRotation` 語義不變。
++- **既有 `Smoothing Half Life` 保留但預設改 0**，並在描述註明已被 Pose Filter 取代
++  （設 >0 時作為最後一段額外平滑，串在管線之後，行為同現狀）。
++- 新增總開關屬性 `Filter Mode`（enum：`Off` / `OneEuro` / `Cinematic`，預設 `Cinematic`）。
++  `Off` = 完全跳過管線（等同現狀）；`OneEuro` = 只有 A+B+B'；`Cinematic` = 全部。
++- **重置規則**（全部觸發 `PoseFilter::Reset()`，以下一筆樣本重新初始化，不得出現暫態擺動）：
++  socket 開啟、recenter / originEpoch 變更、`ePoseFlag_SessionResumed`、
++  訊號中斷超過 Signal Timeout 後恢復。
++- Debug Draw 增加一行：目前模式（MOVING/ARMING/STEADY+blend）、`|v_hat|`、`w_hat`(deg/s)、
++  有效 fc、緩衝深度、目前重採樣延遲 ms。
++
++## 6. 非目標（明確不做）
++
++- 不做鏡頭值（focal/aperture/focus）濾波。
++- 不做神經網路 / Minilag 類回溯補償。
++- 不改協定、不改 Android、不動 CinematicCamera。
++
++## 7. 驗收清單
++
++1. 手機平放桌面 30 秒：STEADY 進入後 entity transform 完全不變（逐位元），無顫振進出。
++2. 慢速起步：離開 STEADY 無可見跳變或黏滯突跳（blend 生效）。
++3. 快甩：Cinematic 與 Off 目測延遲差異不可察（< 1 幀 @60fps 量級）。
++4. 模擬 200ms 封包中斷再恢復：無位置跳變（外插關閉時凍結、恢復後平滑接回）。
++5. Recenter：與現狀相同，不瞬移，且濾波器無暫態。
++6. `Filter Mode = Off` 的行為與現版本逐幀一致（回歸保證）。
++7. 三個 config（Profile 必須；Debug/Release 至少編譯通過）建置成功，無新警告（/W3 /WX 環境）。
++
++## 8. 建置與部署（給實作者）
++
++- 一律用引擎內附 CMake：`Tools\CMake\Win32\bin\cmake.exe`（系統 CMake 4.x 會在 CMP0040 失敗）。
++- 建置：`cmake --build solutions_cmake\win64 --config Profile --target CryPhoneTracker`
++- 新檔 `PoseFilter.h` 記得加入 `Module/CMakeLists.txt` 的 `add_sources`。
++- 部署（若檔案被佔用則回報，不要強砍程序）：
++  `bin\win_x64\CryPhoneTracker.dll` → `S:\Crytek\crytek\cryengine-57-lts\5.7.1\bin\win_x64\`
++  與 `S:\Crytek\crytek\cryengine-gamesdk-sample-project2\5.7.1\bin\win_x64\`（連同 .pdb）。
++- 不 commit。程式碼與註釋使用英文，風格對齊現有檔案（tab 縮排、Cry 命名慣例）。
+diff --git a/Code/CryPlugins/CryPhoneTracker/README.md b/Code/CryPlugins/CryPhoneTracker/README.md
+new file mode 100644
+index 00000000..9d8b60ef
+--- /dev/null
++++ b/Code/CryPlugins/CryPhoneTracker/README.md
+@@ -0,0 +1,98 @@
++# CryPhoneTracker
++
++CRYENGINE 5.7 原生 plugin，提供 **Phone Tracker** entity component：接收 Android ARCore 手機
++追蹤器（`cryengine-57-lts/androidtracker`）送出的封包，用 6DoF pose 驅動 entity 的位置與旋轉，
++並把手機上的鏡頭推桿（focal length / aperture / focus distance / EV）轉交給同一個 entity 上的
++**Cinematic Camera** component。
++
++## 封包格式
++
++與手機端 `PacketCodec.kt`、驗證工具 `tools/pose_monitor.py` 完全一致，定義在
++`Module/PhoneTrackerProtocol.h`（全部 little endian，走同一個 UDP socket）：
++
++| 封包 | 方向 | 大小 | Magic |
++| --- | --- | --- | --- |
++| Pose | 手機 → PC | 64 bytes | `0x54443350` |
++| Lens | 手機 → PC | 32 bytes | `0x534E4C50` |
++| Control | PC → 手機 | 28 bytes | `0x54433350` |
++
++Lens 封包在推桿變動時立刻送出，另外以 4 Hz 補送，所以掉一個 datagram 不會讓 PC 卡在舊值。
++
++座標轉換沿用 `pose_monitor.py` 的做法：ARCore `(x, y, z)` → CRYENGINE `(x, -z, y)`，
++四元數 `(qx, qy, qz, qw)` → `(qx, -qz, qy, qw)`。兩者同為右手座標系，只需換軸。
++
++## 與 CinematicCamera 的連接方式
++
++`CryPhoneTracker` **沒有** link `CinematicCamera`，而是在執行期解析它匯出的 C 進入點：
++
++```
++CinematicCamera.dll : CryGetCinematicCameraOptics(IEntity*) -> ICinematicCameraOptics*
++```
++
++介面宣告在 `Code/CryPlugins/CinematicCamera/Interface/ICinematicCameraOptics.h`。
++專案沒載入 CinematicCamera 時只會拿到 nullptr，tracker 仍然可以單獨驅動 entity 位置。
++
++## 建置
++
++兩個 plugin 都掛在引擎的 `Code/CryPlugins/CMakeLists.txt` 底下：
++
++```
++Tools\CMake\Win32\bin\cmake.exe -S . -B solutions_cmake\win64
++Tools\CMake\Win32\bin\cmake.exe --build solutions_cmake\win64 --config Profile --target CryPhoneTracker
++Tools\CMake\Win32\bin\cmake.exe --build solutions_cmake\win64 --config Profile --target CinematicCamera
++```
++
++注意要用引擎內附的 CMake 3.22（`Tools\CMake\Win32\bin\cmake.exe`）。系統上的 CMake 4.x
++會在 `InitialSetup.cmake` 的 `CMP0040 OLD` 直接失敗。
++
++輸出在 `bin\win_x64\`，再複製到實際跑的引擎目錄（`cryengine-57-lts\5.7.1\bin\win_x64\`）。
++
++## 啟用
++
++在 `.cryproject` 的 plugin 清單加一行：
++
++```json
++{ "guid": "", "type": "EType::Native", "path": "CryPhoneTracker" },
++```
++
++（`cryengine-gamesdk-sample-project2\5.7.1\gamesdk.cryproject` 已經加好，
++原檔備份為 `gamesdk.cryproject.pretracker.backup`。）
++
++## 使用
++
++1. 選一個 entity → Add Component → **Cameras / Cinematic Camera**，再 Add Component →
++   **Tracking / Phone Tracker**。
++2. 手機 App 的 Host 填 PC 的區網 IP、Port 與 component 的 `Listen Port` 一致（預設 9050），
++   Transport 選 UDP。
++3. 進入 Game Mode（Ctrl+G）或 Simulation 模式，component 才會開 socket 並開始更新 entity。
++   純編輯模式下 entity 不會收到 Update 事件，這是引擎的行為。
++4. 手機上按「鏡頭」打開推桿面板：Focal Length / Aperture / Focus Distance 三支推桿加上
++   EV −2…+2 五段，以及 DOF、Exposure 兩個開關。
++5. 打開 `Debug Draw` 可在畫面左上看到連線狀態、封包數、掉包率、電量、手機 App FPS，
++   以及目前生效的鏡頭數值。
++
++## 屬性
++
++| 屬性 | 說明 |
++| --- | --- |
++| Enabled | 是否開啟 socket |
++| Listen Port | UDP 監聽埠（預設 9050） |
++| Apply Position / Apply Rotation | 分別決定是否寫入位移／旋轉 |
++| Relative To Start | 勾選時以「開始追蹤瞬間的 entity transform」為原點（建議）；取消則直接使用追蹤器原始座標 |
++| Metres To Units | 位移縮放，1 = 1 公尺對 1 個引擎單位 |
++| Yaw Offset | 繞 Z 軸旋轉追蹤結果，用來對齊手機朝向與場景朝向 |
++| Position Offset | 追蹤位移之後再加上的世界座標偏移 |
++| Smoothing Half Life | 指數平滑的半衰期（秒），0 = 不平滑，與 framerate 無關 |
++| Signal Timeout | 幾秒沒收到有效 pose 就視為斷訊 |
++| Drive Cinematic Camera | 是否把手機的鏡頭數值轉給同 entity 的 Cinematic Camera |
++| Lens Arms DOF And Exposure | 是否讓手機上的 DOF／Exposure 開關去切 Cinematic Camera 的對應選項 |
++| Debug Draw | 螢幕上顯示統計資訊 |
++
++## Schematyc 函式
++
++* `Recenter` — 下一個 pose 當作新原點，同時送 RECENTER 控制封包要求手機重設原點。
++* `SetTrackingEnabled` — 執行期開關 socket。
++* `IsTracking` — 是否仍持續收到有效 pose。
++
++手機端自行 recenter 時會遞增 `originEpoch`，component 會自動跟上，並把當下 entity 位置
++重新當成參考點，所以 recenter 不會讓 entity 瞬移。
+-- 
+2.47.1.windows.1
+

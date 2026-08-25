@@ -1,0 +1,216 @@
+From c346eed76754f9f0601118d51f2bdd32b50a4685 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Sun, 23 Aug 2026 09:30:37 +0800
+Subject: [PATCH 09/22] feat: shutter-linked motion blur, ND filter, bokeh
+ forward wiring
+
+- Motion blur now follows the camera shutter (r_MotionBlurShutterSpeed
+  = shutter denominator, cvar saved/restored): 1/50 gives the 180 degree
+  film look, fast shutters give crisp staccato motion. Closes the gap
+  where shutter affected brightness but not blur.
+- ND Filter (whole stops): darkens without touching DOF or motion blur
+  and starves the sensor slightly for grain, like a real matte box ND.
+- Aperture Blades property plus Dof_User_ApertureBlades/Dof_User_FNumber
+  post params: inert no-ops on the stock renderer, picked up by the
+  upcoming renderer-side polygonal bokeh change. Safe on official DLLs.
+
+Plugin-only freeze point: everything up to here runs on the unmodified
+engine. Renderer work starts after this commit.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_017nykaDjTHxHDSo11CsYx6M
+---
+ .../Module/CinematicCameraComponent.cpp       | 54 ++++++++++++++++++-
+ .../Module/CinematicCameraComponent.h         | 20 +++++++
+ 2 files changed, 72 insertions(+), 2 deletions(-)
+
+diff --git a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp
+index f6b28793..5b34174e 100644
+--- a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp
++++ b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp
+@@ -144,6 +144,7 @@ void CCinematicCameraComponent::ProcessEvent(const SEntityEvent& event)
+ 		// Leaving game mode: restore render state.
+ 		RestoreDOF();
+ 		RestoreFilmGrain();
++	RestoreMotionBlur();
+ 		if (m_bExpParamsSaved)
+ 		{
+ 			// Exposure is normally restored in the plugin's UpdateBeforeFinalizeCamera
+@@ -162,6 +163,7 @@ void CCinematicCameraComponent::OnShutDown()
+ {
+ 	RestoreDOF();
+ 	RestoreFilmGrain();
++	RestoreMotionBlur();
+ 	if (m_bExpParamsSaved)
+ 	{
+ 		RestoreExposure();
+@@ -206,6 +208,7 @@ void CCinematicCameraComponent::Deactivate()
+ {
+ 	RestoreDOF();
+ 	RestoreFilmGrain();
++	RestoreMotionBlur();
+ 
+ 	// Restore exposure immediately rather than waiting for the plugin hook.
+ 	if (m_bExpParamsSaved)
+@@ -426,6 +429,8 @@ void CCinematicCameraComponent::ApplyDOF()
+ 	gEnv->p3DEngine->SetPostEffectParam("Dof_User_FocusDistance", (float)m_focusDistance);
+ 	gEnv->p3DEngine->SetPostEffectParam("Dof_User_FocusRange",    ComputeFocusRange());
+ 	gEnv->p3DEngine->SetPostEffectParam("Dof_User_BlurAmount",    ComputeMaxBlurAmount());
++	gEnv->p3DEngine->SetPostEffectParam("Dof_User_ApertureBlades", (float)(int)m_apertureBlades);
++	gEnv->p3DEngine->SetPostEffectParam("Dof_User_FNumber",        (float)m_aperture);
+ }
+ 
+ void CCinematicCameraComponent::RestoreDOF()
+@@ -482,7 +487,7 @@ float CCinematicCameraComponent::ComputeFilmGrain01() const
+ 	const float g = clamp_tpl(gainStops / 8.0f, 0.0f, 1.0f);
+ 	const float base = 0.25f * powf(g, 1.2f) + powf(g, 3.5f);
+ 
+-	const float lightStops = log2f((t / (N * N)) / ((1.0f / 50.0f) / (5.6f * 5.6f)));
++	const float lightStops = log2f((t / (N * N)) / ((1.0f / 50.0f) / (5.6f * 5.6f))) - (float)(int)m_ndFilterStops;
+ 	const float lowLightBoost = clamp_tpl(powf(2.0f, -lightStops * 0.35f), 0.6f, 2.2f);
+ 
+ 	return clamp_tpl(base * lowLightBoost, 0.0f, 1.5f);
+@@ -496,6 +501,7 @@ void CCinematicCameraComponent::ApplyFilmGrain()
+ 	if (!m_bEnableGrain)
+ 	{
+ 		RestoreFilmGrain();
++	RestoreMotionBlur();
+ 		return;
+ 	}
+ 
+@@ -508,6 +514,49 @@ void CCinematicCameraComponent::ApplyFilmGrain()
+ 	gEnv->p3DEngine->SetPostEffectParam("FilterGrain_Amount", ComputeFilmGrain01() * (float)m_grainStrength);
+ }
+ 
++// The renderer's motion blur exposure window is 1 / r_MotionBlurShutterSpeed, so pointing
++// that cvar at the camera shutter closes the physics gap where shutter affected brightness
++// but not blur. 1/50 at 25 fps is the classic 180 degree look.
++void CCinematicCameraComponent::ApplyMotionBlur()
++{
++	if (!m_bEnableMotionBlur)
++	{
++		RestoreMotionBlur();
++		return;
++	}
++
++	ICVar* pShutter = gEnv->pConsole->GetCVar("r_MotionBlurShutterSpeed");
++	ICVar* pMode = gEnv->pConsole->GetCVar("r_MotionBlur");
++	if (pShutter == nullptr || pMode == nullptr)
++		return;
++
++	if (!m_bMBParamsSaved)
++	{
++		m_savedMBShutter = pShutter->GetFVal();
++		m_savedMBMode = pMode->GetIVal();
++		m_bMBParamsSaved = true;
++	}
++
++	if (pMode->GetIVal() == 0)
++		pMode->Set(2);
++
++	const float shutter = (float)max((int)m_shutterDenominator, 1);
++	if (fabs_tpl(pShutter->GetFVal() - shutter) > 0.01f)
++		pShutter->Set(shutter);
++}
++
++void CCinematicCameraComponent::RestoreMotionBlur()
++{
++	if (!m_bMBParamsSaved)
++		return;
++
++	if (ICVar* pShutter = gEnv->pConsole->GetCVar("r_MotionBlurShutterSpeed"))
++		pShutter->Set(m_savedMBShutter);
++	if (ICVar* pMode = gEnv->pConsole->GetCVar("r_MotionBlur"))
++		pMode->Set(m_savedMBMode);
++	m_bMBParamsSaved = false;
++}
++
+ void CCinematicCameraComponent::RestoreFilmGrain()
+ {
+ 	if (!m_bGrainParamSaved)
+@@ -530,7 +579,7 @@ float CCinematicCameraComponent::ComputeManualEV100() const
+ 	const float t = 1.0f / (float)max((int)m_shutterDenominator, 1);
+ 	const float iso = (float)max((int)m_iso, 1);
+ 
+-	const float ev100 = log2f(N * N / t) - log2f(iso / 100.0f) - (float)m_evCompensation;
++	const float ev100 = log2f(N * N / t) - log2f(iso / 100.0f) - (float)m_evCompensation + (float)(int)m_ndFilterStops;
+ 	return clamp_tpl(ev100, -6.0f, 24.0f);
+ }
+ 
+@@ -557,6 +606,7 @@ void CCinematicCameraComponent::FinalizeGameCamera()
+ 		ApplyDOF();
+ 
+ 	ApplyFilmGrain();
++	ApplyMotionBlur();
+ }
+ 
+ void CCinematicCameraComponent::ApplyExposureGlobalParam()
+diff --git a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
+index 62f4f50e..1d65074b 100644
+--- a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
++++ b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
+@@ -139,6 +139,12 @@ public:
+ 		desc.AddMember(&CCinematicCameraComponent::m_aperture,
+ 			'aptr', "Aperture", "Aperture (f-number)",
+ 			"Lower f-number = shallower depth of field.", 5.6f);
++		desc.AddMember(&CCinematicCameraComponent::m_apertureBlades,
++			'blad', "ApertureBlades", "Aperture Blades",
++			"Iris blade count. Shapes the bokeh: round when wide open, this polygon when stopped down.", 9);
++		desc.AddMember(&CCinematicCameraComponent::m_ndFilterStops,
++			'ndf_', "NDFilterStops", "ND Filter (stops)",
++			"Neutral density in front of the lens: darkens by whole stops without touching depth of field or motion blur - how a real crew holds wide apertures in daylight.", 0);
+ 		desc.AddMember(&CCinematicCameraComponent::m_focusDistance,
+ 			'fdst', "FocusDistance", "Focus Distance (m)",
+ 			"Distance to the sharp focus plane.", 5.0f);
+@@ -184,6 +190,10 @@ public:
+ 		desc.AddMember(&CCinematicCameraComponent::m_neutralEV,
+ 			'nuev', "NeutralEV", "Neutral EV",
+ 			"EV100 that renders as a neutral image; the response compression pivots here.", 9.0f);
++		desc.AddMember(&CCinematicCameraComponent::m_bEnableMotionBlur,
++			'mblr', "EnableMotionBlur", "Enable Motion Blur",
++			"Drive the renderer's motion blur shutter from the camera shutter, so 1/50 gives the "
++			"classic 180-degree film blur and fast shutters give crisp, staccato motion.", true);
+ 		desc.AddMember(&CCinematicCameraComponent::m_bEnableGrain,
+ 			'gren', "EnableFilmGrain", "Enable Film Grain",
+ 			"Drive the film grain post effect from ISO, aperture and shutter, following a "
+@@ -260,6 +270,8 @@ private:
+ 	void RestoreExposure();
+ 	void ApplyFilmGrain();
+ 	void RestoreFilmGrain();
++	void ApplyMotionBlur();
++	void RestoreMotionBlur();
+ 
+ private:
+ 	// Reflected properties
+@@ -270,6 +282,8 @@ private:
+ 	Schematyc::Range<1, 200>         m_customSensorWidth    = 36.f;
+ 	Schematyc::Range<1, 2400>        m_focalLength          = 50.f;
+ 	Schematyc::Range<1, 64>          m_aperture             = 5.6f;
++	Schematyc::Range<3, 16, 5, 12, int> m_apertureBlades    = 9;
++	Schematyc::Range<0, 10, 0, 6, int>  m_ndFilterStops     = 0;
+ 	Schematyc::Range<0, 10000>       m_focusDistance        = 5.f;
+ 	EFocalStepMode                   m_focalStepMode        = EFocalStepMode::PrimeSet;
+ 	Schematyc::Range<1, 24, 2, 12, int> m_focalStepsPerDoubling = 6;
+@@ -282,6 +296,7 @@ private:
+ 	Schematyc::Range<25, 25600, 50, 6400, int> m_iso          = 400;
+ 	Schematyc::Range<0, 1, 0, 1>     m_exposureResponse     = 0.6f;
+ 	Schematyc::Range<-6, 24, 4, 14>  m_neutralEV            = 9.0f;
++	bool                             m_bEnableMotionBlur    = true;
+ 	bool                             m_bEnableGrain         = true;
+ 	Schematyc::Range<0, 4, 0, 1>     m_grainStrength        = 1.0f;
+ 	Schematyc::Range<-3, 3, -3, 3>  m_evCompensation       = 0.f;
+@@ -310,6 +325,11 @@ private:
+ 	float m_savedGrainAmount  = 0.f;
+ 	bool  m_bGrainParamSaved  = false;
+ 
++	// Motion blur saved cvars (r_MotionBlurShutterSpeed / r_MotionBlur)
++	float m_savedMBShutter    = 250.f;
++	int   m_savedMBMode       = 0;
++	bool  m_bMBParamsSaved    = false;
++
+ 	// Singleton: which CinematicCameraComponent is currently the active camera
+ 	static CCinematicCameraComponent* s_pActive;
+ };
+-- 
+2.47.1.windows.1
+

@@ -1,0 +1,371 @@
+From efd7558dbace7fbcaed22aa554f737864fc923d9 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Sun, 23 Aug 2026 02:03:18 +0800
+Subject: [PATCH 07/22] feat: ISO film grain, exposure response, servo zoom for
+ CinematicCamera
+
+- ISO-driven film grain via FilterGrain_Amount: early-onset + cubic
+  top-end noise curve, baseline shifted by sensor size (SNR scales with
+  linear sensor dimension: full frame +0, APS-C +0.6, M43 +1.1 stops),
+  boosted when the lens is starved of light (t/N^2 vs f/5.6 at 1/50).
+- Exposure Response + Neutral EV: compress applied EV around a pivot so
+  aperture/EV feel like a processed camera image; 1.0 = strict physics.
+- Servo zoom motor: quantised focal targets are approached in log space
+  over Focal Step Time instead of snapping (real zoom optics cannot jump
+  focal length); FOV, DOF and blur all follow the eased value.
+- ICinematicCameraOptics gains SetISO/GetISO.
+- Opt-in ActivateOnGameStart (see earlier fix) retained.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_017nykaDjTHxHDSo11CsYx6M
+---
+ .../Interface/ICinematicCameraOptics.h        |   2 +
+ .../Module/CinematicCameraComponent.cpp       | 125 +++++++++++++++++-
+ .../Module/CinematicCameraComponent.h         |  39 ++++++
+ 3 files changed, 161 insertions(+), 5 deletions(-)
+
+diff --git a/Code/CryPlugins/CinematicCamera/Interface/ICinematicCameraOptics.h b/Code/CryPlugins/CinematicCamera/Interface/ICinematicCameraOptics.h
+index 34beec5f..0a2e8544 100644
+--- a/Code/CryPlugins/CinematicCamera/Interface/ICinematicCameraOptics.h
++++ b/Code/CryPlugins/CinematicCamera/Interface/ICinematicCameraOptics.h
+@@ -15,6 +15,7 @@ struct ICinematicCameraOptics
+ 	virtual void SetAperture(float fNumber) = 0;
+ 	virtual void SetFocusDistance(float metres) = 0;
+ 	virtual void SetEVCompensation(float ev) = 0;
++	virtual void SetISO(float iso) = 0;
+ 	virtual void SetDepthOfFieldEnabled(bool enable) = 0;
+ 	virtual void SetExposureEnabled(bool enable) = 0;
+ 
+@@ -22,6 +23,7 @@ struct ICinematicCameraOptics
+ 	virtual float GetAperture() const = 0;
+ 	virtual float GetFocusDistance() const = 0;
+ 	virtual float GetEVCompensation() const = 0;
++	virtual float GetISO() const = 0;
+ };
+ 
+ //! Name of the C entry point exported by CinematicCamera.dll.
+diff --git a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp
+index 86731df1..f6b28793 100644
+--- a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp
++++ b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp
+@@ -109,6 +109,7 @@ void CCinematicCameraComponent::ProcessEvent(const SEntityEvent& event)
+ 	switch (event.event)
+ 	{
+ 	case ENTITY_EVENT_UPDATE:
++		UpdateFocalMotor(event.fParam[0]);
+ 		// Keep the sibling CCameraComponent's FOV in sync even in edit mode
+ 		// (the editor viewport reads it directly from CCameraComponent).
+ 		UpdateCameraComponentParams();
+@@ -142,6 +143,7 @@ void CCinematicCameraComponent::ProcessEvent(const SEntityEvent& event)
+ 	case ENTITY_EVENT_RESET:
+ 		// Leaving game mode: restore render state.
+ 		RestoreDOF();
++		RestoreFilmGrain();
+ 		if (m_bExpParamsSaved)
+ 		{
+ 			// Exposure is normally restored in the plugin's UpdateBeforeFinalizeCamera
+@@ -159,6 +161,7 @@ void CCinematicCameraComponent::ProcessEvent(const SEntityEvent& event)
+ void CCinematicCameraComponent::OnShutDown()
+ {
+ 	RestoreDOF();
++	RestoreFilmGrain();
+ 	if (m_bExpParamsSaved)
+ 	{
+ 		RestoreExposure();
+@@ -182,6 +185,7 @@ void CCinematicCameraComponent::Activate()
+ 	if (s_pActive && s_pActive != this)
+ 	{
+ 		s_pActive->RestoreDOF();
++		s_pActive->RestoreFilmGrain();
+ 		// Exposure of the old camera will be overwritten immediately below.
+ 	}
+ 
+@@ -201,6 +205,7 @@ void CCinematicCameraComponent::Activate()
+ void CCinematicCameraComponent::Deactivate()
+ {
+ 	RestoreDOF();
++	RestoreFilmGrain();
+ 
+ 	// Restore exposure immediately rather than waiting for the plugin hook.
+ 	if (m_bExpParamsSaved)
+@@ -265,7 +270,7 @@ static const float s_primeFocalLengths[] = {
+ 	85.f, 100.f, 135.f, 150.f, 180.f, 200.f, 250.f, 300.f, 400.f, 500.f, 600.f
+ };
+ 
+-float CCinematicCameraComponent::GetEffectiveFocalLength() const
++float CCinematicCameraComponent::ComputeTargetFocalLength() const
+ {
+ 	const float f_mm = max((float)m_focalLength, 0.1f);
+ 
+@@ -300,6 +305,39 @@ float CCinematicCameraComponent::GetEffectiveFocalLength() const
+ 	}
+ }
+ 
++// Servo zoom: the quantised target is approached in log space with a framerate independent
++// exponential ease that settles within Focal Step Time - the behaviour of a broadcast servo
++// zoom rather than a hard cut. (A real prime swap IS a hard cut; the fader is a zoom rocker,
++// so the servo metaphor is the right one.) Continuous mode and the editor snap directly.
++void CCinematicCameraComponent::UpdateFocalMotor(float deltaSeconds)
++{
++	const uint32 frameId = (uint32)gEnv->nMainFrameID;
++	if (frameId == m_focalMotorFrameId)
++		return;
++	m_focalMotorFrameId = frameId;
++
++	const float target = ComputeTargetFocalLength();
++
++	if (m_focalMotorMm <= 0.0f || m_focalStepMode == EFocalStepMode::Continuous ||
++	    (float)m_focalStepTime <= 0.0f || gEnv->IsEditing())
++	{
++		m_focalMotorMm = target;
++		return;
++	}
++
++	const float alpha = 1.0f - expf(-max(deltaSeconds, 0.0f) * 3.0f / max((float)m_focalStepTime, 0.01f));
++	const float current = log2f(m_focalMotorMm);
++	m_focalMotorMm = powf(2.0f, current + (log2f(target) - current) * alpha);
++
++	if (fabs_tpl(m_focalMotorMm - target) < 0.01f)
++		m_focalMotorMm = target;
++}
++
++float CCinematicCameraComponent::GetEffectiveFocalLength() const
++{
++	return m_focalMotorMm > 0.0f ? m_focalMotorMm : ComputeTargetFocalLength();
++}
++
+ // vFOV = 2 * atan(sensorHeight / (2 * focalLength))
+ float CCinematicCameraComponent::ComputeVerticalFOV() const
+ {
+@@ -416,6 +454,69 @@ void CCinematicCameraComponent::RestoreExposure()
+ 	m_bExpParamsSaved = false;
+ }
+ 
++// ---------------------------------------------------------------------------
++// Film grain — sensor noise model, perceptual rather than radiometric.
++//
++// gain:  stops above ISO 100, normalised over the 8 stop range to ISO 25600 and raised
++//        to 1.7, so base ISO stays clean and the top end climbs steeply the way small
++//        sensor SNR curves do.
++// light: photons per exposure ~ t / N² (shutter open time times aperture area).
++//        Reference is f/5.6 at 1/50s. Starving the sensor raises grain at equal gain,
++//        flooding it lowers grain; ±0.35 per stop, clamped to [0.6, 2.2].
++// ---------------------------------------------------------------------------
++float CCinematicCameraComponent::ComputeFilmGrain01() const
++{
++	const float N   = max((float)m_aperture, 0.7f);
++	const float t   = 1.0f / (float)max((int)m_shutterDenominator, 1);
++	const float iso = (float)max((int)m_iso, 25);
++
++	// Early onset plus an explosive top end: a gentle sub-linear term makes grain readable
++	// from ISO 400 up (small sensor / pushed film stock behaviour rather than a clean modern
++	// full frame), and the cubic term models the SNR collapse once amplified read noise
++	// dominates - the top two stops get dramatically dirty.
++	// Sensor size sets the baseline: SNR scales with the sensor's linear size, so a smaller
++	// sensor behaves like a bigger one pushed by log2(36/width) stops. Full frame is the
++	// reference (+0), APS-C ≈ +0.6, Micro Four Thirds ≈ +1.1, and Custom follows its width.
++	const float sensorStops = log2f(36.0f / max(GetSensorWidth(), 4.0f));
++	const float gainStops = log2f(iso / 100.0f) + sensorStops;
++	const float g = clamp_tpl(gainStops / 8.0f, 0.0f, 1.0f);
++	const float base = 0.25f * powf(g, 1.2f) + powf(g, 3.5f);
++
++	const float lightStops = log2f((t / (N * N)) / ((1.0f / 50.0f) / (5.6f * 5.6f)));
++	const float lowLightBoost = clamp_tpl(powf(2.0f, -lightStops * 0.35f), 0.6f, 2.2f);
++
++	return clamp_tpl(base * lowLightBoost, 0.0f, 1.5f);
++}
++
++// FilterGrain_Amount is combined with the environment (TOD) grain by max() in PostAA,
++// so writing it every frame from the finalize hook cannot be stomped and needs no
++// ordering tricks. Save once / restore on release, mirroring the DOF params.
++void CCinematicCameraComponent::ApplyFilmGrain()
++{
++	if (!m_bEnableGrain)
++	{
++		RestoreFilmGrain();
++		return;
++	}
++
++	if (!m_bGrainParamSaved)
++	{
++		gEnv->p3DEngine->GetPostEffectParam("FilterGrain_Amount", m_savedGrainAmount);
++		m_bGrainParamSaved = true;
++	}
++
++	gEnv->p3DEngine->SetPostEffectParam("FilterGrain_Amount", ComputeFilmGrain01() * (float)m_grainStrength);
++}
++
++void CCinematicCameraComponent::RestoreFilmGrain()
++{
++	if (!m_bGrainParamSaved)
++		return;
++
++	gEnv->p3DEngine->SetPostEffectParam("FilterGrain_Amount", m_savedGrainAmount);
++	m_bGrainParamSaved = false;
++}
++
+ // ---------------------------------------------------------------------------
+ // Exposure — called from CCinematicCameraPlugin::UpdateBeforeFinalizeCamera()
+ // which runs AFTER ITimeOfDay::Update() so our write is the last one before render.
+@@ -442,6 +543,8 @@ void CCinematicCameraComponent::FinalizeGameCamera()
+ 	if (gEnv->IsEditing())
+ 		return;
+ 
++	UpdateFocalMotor(gEnv->pTimer->GetFrameTime());
++
+ 	CCamera camera = gEnv->pSystem->GetViewCamera();
+ 	camera.SetFrustum(camera.GetViewSurfaceX(), camera.GetViewSurfaceZ(),
+ 		ComputeVerticalFOV(), m_nearPlane, m_farPlane, camera.GetPixelAspectRatio());
+@@ -452,6 +555,8 @@ void CCinematicCameraComponent::FinalizeGameCamera()
+ 	// the sibling CCameraComponent won the camera-manager race.
+ 	if (m_bEnableDOF)
+ 		ApplyDOF();
++
++	ApplyFilmGrain();
+ }
+ 
+ void CCinematicCameraComponent::ApplyExposureGlobalParam()
+@@ -476,11 +581,16 @@ void CCinematicCameraComponent::ApplyExposureGlobalParam()
+ 	{
+ 		// The tone mapper clamps its auto EV100 to [EV_min, EV_max]; collapsing that window
+ 		// onto a single value is what pins exposure to the lens instead of the scene, and is
+-		// the only way the f-number can change brightness. The auto compensation term is left
+-		// at the scene default since the clamp makes it irrelevant.
++		// the only way the f-number can change brightness.
++		//
++		// Response compression: physically every stop is exactly 2x, but a processed camera
++		// image runs through an S curve that rolls extremes off, which is what photographic
++		// intuition is calibrated against. Compressing the applied EV around Neutral EV
++		// reproduces that feel; Exposure Response 1 restores strict physics.
+ 		const float ev100 = ComputeManualEV100();
+-		v.x = ev100;
+-		v.y = ev100;
++		const float applied = (float)m_neutralEV + (ev100 - (float)m_neutralEV) * (float)m_exposureResponse;
++		v.x = clamp_tpl(applied, -6.0f, 24.0f);
++		v.y = v.x;
+ 	}
+ 	else
+ 	{
+@@ -534,6 +644,11 @@ void CCinematicCameraComponent::SetEVCompensation(float ev)
+ 	m_evCompensation = clamp_tpl(ev, -3.0f, 3.0f);
+ }
+ 
++void CCinematicCameraComponent::SetISO(float iso)
++{
++	m_iso = (int)clamp_tpl(iso, 25.0f, 25600.0f);
++}
++
+ void CCinematicCameraComponent::SetDepthOfFieldEnabled(bool enable)
+ {
+ 	if (m_bEnableDOF == enable)
+diff --git a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
+index 9a715d4c..62f4f50e 100644
+--- a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
++++ b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
+@@ -150,6 +150,9 @@ public:
+ 		desc.AddMember(&CCinematicCameraComponent::m_focalStepsPerDoubling,
+ 			'fstn', "FocalStepsPerDoubling", "Steps Per Doubling",
+ 			"Detents between one focal length and twice that — only used by Geometric.", 6);
++		desc.AddMember(&CCinematicCameraComponent::m_focalStepTime,
++			'fstt', "FocalStepTime", "Focal Step Time",
++			"Seconds the zoom motor takes to settle on a new detent, instead of snapping. 0 snaps instantly.", 0.25f);
+ 
+ 		desc.AddMember(&CCinematicCameraComponent::m_bEnableDOF,
+ 			'dof_', "EnableDOF", "Enable Depth of Field",
+@@ -173,6 +176,22 @@ public:
+ 		desc.AddMember(&CCinematicCameraComponent::m_iso,
+ 			'iso_', "ISO", "ISO",
+ 			"Manual mode only. Higher ISO brightens the image.", 400);
++		desc.AddMember(&CCinematicCameraComponent::m_exposureResponse,
++			'xrsp', "ExposureResponse", "Exposure Response",
++			"Engine stops per photographic stop, compressed around Neutral EV. 1 = strict physics "
++			"(each aperture stop doubles/halves brightness, which reads as extreme on screen); "
++			"0.5-0.7 matches the tone response of a real camera's processed image.", 0.6f);
++		desc.AddMember(&CCinematicCameraComponent::m_neutralEV,
++			'nuev', "NeutralEV", "Neutral EV",
++			"EV100 that renders as a neutral image; the response compression pivots here.", 9.0f);
++		desc.AddMember(&CCinematicCameraComponent::m_bEnableGrain,
++			'gren', "EnableFilmGrain", "Enable Film Grain",
++			"Drive the film grain post effect from ISO, aperture and shutter, following a "
++			"real sensor noise curve: clean at base ISO, climbing steeply past ISO 6400, "
++			"boosted when the lens is starved of light.", true);
++		desc.AddMember(&CCinematicCameraComponent::m_grainStrength,
++			'grst', "GrainStrength", "Grain Strength",
++			"Scales the computed grain before it reaches the renderer.", 1.0f);
+ 		desc.AddMember(&CCinematicCameraComponent::m_evCompensation,
+ 			'evcp', "EVCompensation", "EV Compensation",
+ 			"EV bias (-3 darker … 0 neutral … +3 brighter). In Manual mode this is a true stop.", 0.0f);
+@@ -197,6 +216,7 @@ public:
+ 	virtual void SetAperture(float fNumber) override;
+ 	virtual void SetFocusDistance(float metres) override;
+ 	virtual void SetEVCompensation(float ev) override;
++	virtual void SetISO(float iso) override;
+ 	virtual void SetDepthOfFieldEnabled(bool enable) override;
+ 	virtual void SetExposureEnabled(bool enable) override;
+ 
+@@ -204,6 +224,7 @@ public:
+ 	virtual float GetAperture() const override { return m_aperture; }
+ 	virtual float GetFocusDistance() const override { return m_focusDistance; }
+ 	virtual float GetEVCompensation() const override { return m_evCompensation; }
++	virtual float GetISO() const override { return (float)(int)m_iso; }
+ 	// ~ICinematicCameraOptics
+ 
+ 	// Called by CCinematicCameraPlugin::UpdateBeforeFinalizeCamera() - the engine's
+@@ -221,7 +242,10 @@ private:
+ 	void UpdateCameraComponentParams();
+ 
+ 	float GetEffectiveFocalLength() const;
++	float ComputeTargetFocalLength() const;
++	void  UpdateFocalMotor(float deltaSeconds);
+ 	float ComputeManualEV100() const;
++	float ComputeFilmGrain01() const;
+ 	float ComputeFocusRange() const;
+ 
+ 	float GetSensorWidth()  const;
+@@ -234,6 +258,8 @@ private:
+ 	void ApplyDOF();
+ 	void RestoreDOF();
+ 	void RestoreExposure();
++	void ApplyFilmGrain();
++	void RestoreFilmGrain();
+ 
+ private:
+ 	// Reflected properties
+@@ -247,14 +273,23 @@ private:
+ 	Schematyc::Range<0, 10000>       m_focusDistance        = 5.f;
+ 	EFocalStepMode                   m_focalStepMode        = EFocalStepMode::PrimeSet;
+ 	Schematyc::Range<1, 24, 2, 12, int> m_focalStepsPerDoubling = 6;
++	Schematyc::Range<0, 2, 0, 1>     m_focalStepTime        = 0.25f;
+ 	bool                             m_bEnableDOF           = false;
+ 	Schematyc::Range<1, 10, 1, 6>    m_focusFalloff         = 3.f;
+ 	bool                             m_bEnableExposure      = false;
+ 	EExposureMode                    m_exposureMode         = EExposureMode::Manual;
+ 	Schematyc::Range<1, 8000, 1, 250, int>    m_shutterDenominator = 50;
+ 	Schematyc::Range<25, 25600, 50, 6400, int> m_iso          = 400;
++	Schematyc::Range<0, 1, 0, 1>     m_exposureResponse     = 0.6f;
++	Schematyc::Range<-6, 24, 4, 14>  m_neutralEV            = 9.0f;
++	bool                             m_bEnableGrain         = true;
++	Schematyc::Range<0, 4, 0, 1>     m_grainStrength        = 1.0f;
+ 	Schematyc::Range<-3, 3, -3, 3>  m_evCompensation       = 0.f;
+ 
++	// Zoom motor state: eased focal length chasing the quantised target.
++	float  m_focalMotorMm      = 0.0f;
++	uint32 m_focalMotorFrameId = 0;
++
+ 	// Sibling camera component (created in Initialize)
+ 	Cry::DefaultComponents::CCameraComponent* m_pCameraComponent = nullptr;
+ 
+@@ -271,6 +306,10 @@ private:
+ 	Vec3 m_savedEyeAdaptation = Vec3(4.5f, 17.0f, 1.5f);
+ 	bool m_bExpParamsSaved    = false;
+ 
++	// Film grain saved param (FilterGrain_Amount post effect)
++	float m_savedGrainAmount  = 0.f;
++	bool  m_bGrainParamSaved  = false;
++
+ 	// Singleton: which CinematicCameraComponent is currently the active camera
+ 	static CCinematicCameraComponent* s_pActive;
+ };
+-- 
+2.47.1.windows.1
+

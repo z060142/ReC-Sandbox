@@ -1,0 +1,214 @@
+From a6788060eca9ff9a35c5a887244da1988be8da11 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Sun, 23 Aug 2026 02:03:19 +0800
+Subject: [PATCH 08/22] feat: ISO passthrough, centre autofocus, yaw-aligned
+ anchoring
+
+- Lens packet's reserved field now carries ISO (0 = older app, ignored);
+  forwarded to the cinematic camera and shown in the debug overlay.
+- Centre autofocus: one-shot eLensFlag_AutofocusRequest raycasts the
+  scene along the camera axis (500 m, miss racks to infinity), sets the
+  focus distance and reports it back with eControlCmd_SetFocus so the
+  phone fader follows. The renderer's own ~0.3 s DOF easing provides the
+  focus rack glide.
+- Align Yaw On Start (default on): anchoring cancels only the heading of
+  the captured phone/entity poses, keeping pitch/roll gravity-aligned so
+  turning the phone always rotates the entity about world up.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_017nykaDjTHxHDSo11CsYx6M
+---
+ .../Module/PhoneTrackerComponent.cpp          | 63 +++++++++++++++++--
+ .../Module/PhoneTrackerComponent.h            |  4 ++
+ .../Module/PhoneTrackerProtocol.h             |  4 +-
+ 3 files changed, 65 insertions(+), 6 deletions(-)
+
+diff --git a/Code/CryPlugins/CryPhoneTracker/Module/PhoneTrackerComponent.cpp b/Code/CryPlugins/CryPhoneTracker/Module/PhoneTrackerComponent.cpp
+index 4d45860e..8aecf71d 100644
+--- a/Code/CryPlugins/CryPhoneTracker/Module/PhoneTrackerComponent.cpp
++++ b/Code/CryPlugins/CryPhoneTracker/Module/PhoneTrackerComponent.cpp
+@@ -5,6 +5,7 @@
+ #include <CryEntitySystem/IEntity.h>
+ #include <CryRenderer/IRenderAuxGeom.h>
+ #include <CryCore/Platform/CryLibrary.h>
++#include <CryPhysics/physinterface.h>
+ 
+ #include <CrySchematyc/Reflection/TypeDesc.h>
+ #include <CrySchematyc/Env/IEnvRegistry.h>
+@@ -316,13 +317,30 @@ void CPhoneTrackerComponent::ReceivePackets()
+ 	}
+ }
+ 
++//! Rotation about world Z carrying only the heading of q. With the phone looking straight
++//! up or down the forward axis has no horizontal part, so the heading is taken from the up
++//! axis instead (which is then roughly horizontal).
++static Quat ExtractYaw(const Quat& q)
++{
++	Vec3 forward = q.GetColumn1();
++	if (forward.x * forward.x + forward.y * forward.y < 1e-6f)
++	{
++		const Vec3 up = q.GetColumn2();
++		forward = forward.z > 0.0f ? -up : up;
++	}
++	return Quat::CreateRotationZ(atan2f(-forward.x, forward.y));
++}
++
+ //! Maps a tracker space pose (metres, Cry axes) through origin / yaw / scale / offset into world space.
+ QuatT CPhoneTrackerComponent::MapToWorld(const Vec3& trackerPosition, const Quat& trackerRotation) const
+ {
+ 	QuatT delta;
+ 	if (m_relativeToStartTransform)
+ 	{
+-		const Quat inverseOrigin = m_trackerOrigin.q.GetInverted();
++		// With yaw alignment only the heading of the captured origin is cancelled; pitch and
++		// roll pass through absolute, keeping gravity vertical and the turn axis upright.
++		const Quat originFrame = m_alignYawOnStart ? ExtractYaw(m_trackerOrigin.q) : m_trackerOrigin.q;
++		const Quat inverseOrigin = originFrame.GetInverted();
+ 		delta.q = inverseOrigin * trackerRotation;
+ 		delta.t = inverseOrigin * (trackerPosition - m_trackerOrigin.t);
+ 	}
+@@ -336,10 +354,13 @@ QuatT CPhoneTrackerComponent::MapToWorld(const Vec3& trackerPosition, const Quat
+ 	delta.t = yaw * delta.t;
+ 
+ 	const QuatT reference = m_relativeToStartTransform ? m_referenceTransform : QuatT(IDENTITY);
++	// The entity's own tilt must not lean the frame either: heading comes from the entity,
++	// attitude comes from the phone.
++	const Quat referenceRotation = (m_relativeToStartTransform && m_alignYawOnStart) ? ExtractYaw(reference.q) : reference.q;
+ 
+ 	QuatT result;
+-	result.q = reference.q * delta.q;
+-	result.t = reference.t + reference.q * (delta.t * m_scale.value) + m_positionOffset;
++	result.q = referenceRotation * delta.q;
++	result.t = reference.t + referenceRotation * (delta.t * m_scale.value) + m_positionOffset;
+ 	result.q.Normalize();
+ 	return result;
+ }
+@@ -448,6 +469,7 @@ void CPhoneTrackerComponent::ApplyLensPacket(const SLensPacket& packet)
+ 	m_apertureFNumber = packet.apertureFNumber;
+ 	m_focusDistanceM = packet.focusDistanceM;
+ 	m_evCompensation = packet.evCompensation;
++	m_lensIso = packet.iso;
+ 
+ 	ICinematicCameraOptics* pOptics = GetOptics();
+ 	if (pOptics == nullptr)
+@@ -466,10 +488,41 @@ void CPhoneTrackerComponent::ApplyLensPacket(const SLensPacket& packet)
+ 	pOptics->SetAperture(m_apertureFNumber);
+ 	pOptics->SetFocusDistance(m_focusDistanceM);
+ 	pOptics->SetEVCompensation(m_evCompensation);
++	if (packet.iso != 0) // 0 = older phone app that predates the ISO fader
++		pOptics->SetISO((float)packet.iso);
++
++	if ((packet.flags & eLensFlag_AutofocusRequest) != 0)
++		RunAutofocus(pOptics);
+ 
+ 	m_hasLensState = true;
+ }
+ 
++// Centre point autofocus: raycast the scene along the camera axis and rack focus to the
++// hit. The DOF user params are eased by the renderer itself (~0.3 s time constant), so the
++// rack glides like a real AF drive without any extra smoothing here. The result is reported
++// back to the phone so its focus fader follows and later 4 Hz lens resends carry it.
++void CPhoneTrackerComponent::RunAutofocus(ICinematicCameraOptics* pOptics)
++{
++	const Vec3 origin = m_pEntity->GetWorldPos();
++	const Vec3 direction = m_pEntity->GetWorldRotation().GetColumn1();
++
++	ray_hit hit;
++	const int hits = gEnv->pPhysicalWorld->RayWorldIntersection(
++		origin + direction * 0.3f, direction * 500.0f,
++		ent_static | ent_terrain | ent_rigid | ent_sleeping_rigid,
++		rwi_stop_at_pierceable | rwi_colltype_any, &hit, 1);
++
++	// No hit: focus to infinity, like an AF drive hunting out to the far stop.
++	const float distance = hits > 0 ? hit.dist + 0.3f : 10000.0f;
++
++	if (pOptics != nullptr)
++		pOptics->SetFocusDistance(distance);
++	m_focusDistanceM = distance;
++
++	SendControl(eControlCmd_SetFocus, (int32)(distance * 1000.0f));
++	CryLog("[PhoneTracker] Autofocus %s at %.2f m", hits > 0 ? "locked" : "no target, racked to infinity", distance);
++}
++
+ void CPhoneTrackerComponent::SendControl(EControlCommand cmd, int32 param)
+ {
+ 	if (m_socket == CRY_INVALID_SOCKET || !m_hasPeer)
+@@ -539,8 +592,8 @@ void CPhoneTrackerComponent::DrawDebug() const
+ 	{
+ 		const float lensColor[4] = { 0.7f, 0.85f, 1.0f, 1.0f };
+ 		IRenderAuxText::Draw2dLabel(20.0f, 80.0f, 1.4f, lensColor, false,
+-			"lens %.0fmm  f/%.1f  focus %.2fm  EV %+.0f%s",
+-			m_focalLengthMm, m_apertureFNumber, m_focusDistanceM, m_evCompensation,
++			"lens %.0fmm  f/%.1f  focus %.2fm  EV %+.0f  ISO %u%s",
++			m_focalLengthMm, m_apertureFNumber, m_focusDistanceM, m_evCompensation, m_lensIso,
+ 			m_pOptics != nullptr ? "" : "  (no Cinematic Camera)");
+ 	}
+ }
+diff --git a/Code/CryPlugins/CryPhoneTracker/Module/PhoneTrackerComponent.h b/Code/CryPlugins/CryPhoneTracker/Module/PhoneTrackerComponent.h
+index f063fe91..a6b4f4a2 100644
+--- a/Code/CryPlugins/CryPhoneTracker/Module/PhoneTrackerComponent.h
++++ b/Code/CryPlugins/CryPhoneTracker/Module/PhoneTrackerComponent.h
+@@ -53,6 +53,7 @@ public:
+ 		desc.AddMember(&CPhoneTrackerComponent::m_applyRotation, 'arot', "ApplyRotation", "Apply Rotation", "Write the tracked rotation into the entity transform", true);
+ 
+ 		desc.AddMember(&CPhoneTrackerComponent::m_relativeToStartTransform, 'rel', "Relative", "Relative To Start", "Treat the tracker origin as the entity transform captured when tracking started. Disable to place the entity at raw tracker coordinates", true);
++		desc.AddMember(&CPhoneTrackerComponent::m_alignYawOnStart, 'ayaw', "AlignYawOnStart", "Align Yaw On Start", "Anchor using only the yaw of the starting poses (phone and entity). Pitch and roll stay gravity aligned, so turning the phone always rotates the entity around the world up axis - without this, a tilted phone at capture time tilts the whole rotation frame", true);
+ 		desc.AddMember(&CPhoneTrackerComponent::m_scale, 'scal', "Scale", "Metres To Units", "Multiplier applied to the tracked translation (1 = 1 metre per engine unit)", 1.0f);
+ 		desc.AddMember(&CPhoneTrackerComponent::m_yawOffsetDegrees, 'yaw', "YawOffset", "Yaw Offset", "Rotation around Z applied to the tracked motion, to align the phone heading with the scene", 0.0f);
+ 		desc.AddMember(&CPhoneTrackerComponent::m_positionOffset, 'poff', "PositionOffset", "Position Offset", "Extra world space offset added after the tracked translation", Vec3(ZERO));
+@@ -95,6 +96,7 @@ public:
+ protected:
+ 	void OpenSocket();
+ 	void ApplyLensPacket(const SLensPacket& packet);
++	void RunAutofocus(ICinematicCameraOptics* pOptics);
+ 	ICinematicCameraOptics* GetOptics();
+ 	void CloseSocket();
+ 	void ReceivePackets();
+@@ -110,6 +112,7 @@ protected:
+ 	bool                       m_applyPosition = true;
+ 	bool                       m_applyRotation = true;
+ 	bool                       m_relativeToStartTransform = true;
++	bool                       m_alignYawOnStart = true;
+ 	Schematyc::Range<0, 1000, 0, 10>  m_scale = 1.0f;
+ 	Schematyc::Range<-360, 360> m_yawOffsetDegrees = 0.0f;
+ 	Vec3                       m_positionOffset = ZERO;
+@@ -169,6 +172,7 @@ protected:
+ 	float  m_apertureFNumber = 0.0f;
+ 	float  m_focusDistanceM = 0.0f;
+ 	float  m_evCompensation = 0.0f;
++	uint32 m_lensIso = 0;
+ };
+ 
+ } // namespace PhoneTracker
+diff --git a/Code/CryPlugins/CryPhoneTracker/Module/PhoneTrackerProtocol.h b/Code/CryPlugins/CryPhoneTracker/Module/PhoneTrackerProtocol.h
+index 3a71fdc7..a02fa473 100644
+--- a/Code/CryPlugins/CryPhoneTracker/Module/PhoneTrackerProtocol.h
++++ b/Code/CryPlugins/CryPhoneTracker/Module/PhoneTrackerProtocol.h
+@@ -35,6 +35,7 @@ enum EControlCommand : uint16
+ 	eControlCmd_SetRate = 4,
+ 	eControlCmd_Pause   = 5,
+ 	eControlCmd_Resume  = 6,
++	eControlCmd_SetFocus = 7, //!< PC -> phone: autofocus result; param = focus distance in millimetres.
+ };
+ 
+ //! Bits carried in SLensPacket::flags.
+@@ -42,6 +43,7 @@ enum ELensFlags : uint16
+ {
+ 	eLensFlag_EnableDepthOfField = 1, //!< The operator armed depth of field on the phone.
+ 	eLensFlag_EnableExposure     = 2, //!< The operator armed EV compensation on the phone.
++	eLensFlag_AutofocusRequest   = 4, //!< One-shot: run a centre autofocus raycast in the scene.
+ };
+ 
+ #pragma pack(push, 1)
+@@ -74,7 +76,7 @@ struct SLensPacket
+ 	float  apertureFNumber;
+ 	float  focusDistanceM;
+ 	float  evCompensation;
+-	uint32 reserved;
++	uint32 iso;              //!< Sensor sensitivity (e.g. 400). 0 = not sent (older phone app).
+ };
+ 
+ struct SControlPacket
+-- 
+2.47.1.windows.1
+

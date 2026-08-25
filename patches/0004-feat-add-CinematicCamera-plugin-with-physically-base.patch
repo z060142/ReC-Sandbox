@@ -1,0 +1,1227 @@
+From 9c725efe393e626813225ec3b76b06b6c50e9b2c Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Sat, 22 Aug 2026 18:45:00 +0800
+Subject: [PATCH 04/22] feat: add CinematicCamera plugin with physically-based
+ optics
+
+Physically-based camera entity component: FOV from focal length and
+sensor size, thin-lens DOF, manual exposure locking EV min/max to the
+aperture/shutter/ISO EV100 so the f-number actually drives brightness.
+Includes focal-length detents (prime lens set / geometric), a Focus
+Falloff factor that maps physical DOF width onto the engine's ramp-only
+DOF shader, opt-in game-start activation, and a game-mode camera
+takeover in UpdateBeforeFinalizeCamera (the engine's sanctioned final
+override point, after the GameSDK ViewSystem).
+
+Exports CryGetCinematicCameraOptics so other plugins can drive the lens
+at runtime without linking (Interface/ICinematicCameraOptics.h).
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_017nykaDjTHxHDSo11CsYx6M
+---
+ Code/CryPlugins/CMakeLists.txt                |   5 +-
+ .../Interface/ICinematicCameraOptics.h        |  32 +
+ .../CinematicCamera/Module/CMakeLists.txt     |  24 +
+ .../Module/CinematicCameraComponent.cpp       | 557 ++++++++++++++++++
+ .../Module/CinematicCameraComponent.h         | 276 +++++++++
+ .../Module/CinematicCameraPlugin.cpp          |  77 +++
+ .../Module/CinematicCameraPlugin.h            |  31 +
+ .../CinematicCamera/Module/StdAfx.cpp         |   1 +
+ .../CinematicCamera/Module/StdAfx.h           |  10 +
+ .../CinematicCamera/Module/resource.h         |  10 +
+ Code/CryPlugins/CinematicCamera/README.md     |  87 +++
+ 11 files changed, 1109 insertions(+), 1 deletion(-)
+ create mode 100644 Code/CryPlugins/CinematicCamera/Interface/ICinematicCameraOptics.h
+ create mode 100644 Code/CryPlugins/CinematicCamera/Module/CMakeLists.txt
+ create mode 100644 Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp
+ create mode 100644 Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
+ create mode 100644 Code/CryPlugins/CinematicCamera/Module/CinematicCameraPlugin.cpp
+ create mode 100644 Code/CryPlugins/CinematicCamera/Module/CinematicCameraPlugin.h
+ create mode 100644 Code/CryPlugins/CinematicCamera/Module/StdAfx.cpp
+ create mode 100644 Code/CryPlugins/CinematicCamera/Module/StdAfx.h
+ create mode 100644 Code/CryPlugins/CinematicCamera/Module/resource.h
+ create mode 100644 Code/CryPlugins/CinematicCamera/README.md
+
+diff --git a/Code/CryPlugins/CMakeLists.txt b/Code/CryPlugins/CMakeLists.txt
+index d0d6786c..f9774c64 100644
+--- a/Code/CryPlugins/CMakeLists.txt
++++ b/Code/CryPlugins/CMakeLists.txt
+@@ -29,4 +29,7 @@ add_subdirectory(CryGamePlatformNodes/Module)
+ # UQS: Optional plugin; option PLUGIN_CRYUQS to enable/disable it resides in its own sub directory
+ add_subdirectory(CryUQS)
+ 
+-add_subdirectory(CryHTTP/Module)
+\ No newline at end of file
++add_subdirectory(CryHTTP/Module)
++
++# CinematicCamera: physically-based camera plugin (focal length, aperture, DOF, exposure)
++add_subdirectory(CinematicCamera/Module)
+\ No newline at end of file
+diff --git a/Code/CryPlugins/CinematicCamera/Interface/ICinematicCameraOptics.h b/Code/CryPlugins/CinematicCamera/Interface/ICinematicCameraOptics.h
+new file mode 100644
+index 00000000..34beec5f
+--- /dev/null
++++ b/Code/CryPlugins/CinematicCamera/Interface/ICinematicCameraOptics.h
+@@ -0,0 +1,32 @@
++// Live lens control surface of the Cinematic Camera component.
++//
++// Other plugins (CryPhoneTracker) drive the lens without linking against CinematicCamera:
++// they resolve CryGetCinematicCameraOptics from the already loaded CinematicCamera.dll and
++// simply get nullptr back when that plugin is not part of the project.
++#pragma once
++
++struct IEntity;
++
++struct ICinematicCameraOptics
++{
++	virtual ~ICinematicCameraOptics() {}
++
++	virtual void SetFocalLength(float millimetres) = 0;
++	virtual void SetAperture(float fNumber) = 0;
++	virtual void SetFocusDistance(float metres) = 0;
++	virtual void SetEVCompensation(float ev) = 0;
++	virtual void SetDepthOfFieldEnabled(bool enable) = 0;
++	virtual void SetExposureEnabled(bool enable) = 0;
++
++	virtual float GetFocalLength() const = 0;
++	virtual float GetAperture() const = 0;
++	virtual float GetFocusDistance() const = 0;
++	virtual float GetEVCompensation() const = 0;
++};
++
++//! Name of the C entry point exported by CinematicCamera.dll.
++#define CINEMATIC_CAMERA_OPTICS_ENTRY "CryGetCinematicCameraOptics"
++
++//! Signature of that entry point: returns the optics interface of the cinematic camera
++//! component on pEntity, or nullptr when the entity carries no such component.
++typedef ICinematicCameraOptics* (* TGetCinematicCameraOpticsFn)(IEntity* pEntity);
+diff --git a/Code/CryPlugins/CinematicCamera/Module/CMakeLists.txt b/Code/CryPlugins/CinematicCamera/Module/CMakeLists.txt
+new file mode 100644
+index 00000000..04310d13
+--- /dev/null
++++ b/Code/CryPlugins/CinematicCamera/Module/CMakeLists.txt
+@@ -0,0 +1,24 @@
++start_sources()
++
++sources_platform(ALL)
++add_sources("CinematicCamera_uber_0.cpp"
++	SOURCE_GROUP "Root"
++		"resource.h"
++		"StdAfx.cpp"
++		"StdAfx.h"
++		"CinematicCameraPlugin.h"
++		"CinematicCameraPlugin.cpp"
++	SOURCE_GROUP "Components"
++		"CinematicCameraComponent.h"
++		"CinematicCameraComponent.cpp"
++)
++
++end_sources()
++
++CryEngineModule(CinematicCamera PCH "StdAfx.cpp" SOLUTION_FOLDER "CryPlugins")
++
++target_include_directories(${THIS_PROJECT}
++	PRIVATE
++		"${CRYENGINE_DIR}/Code/CryEngine/CryCommon"
++		"${CRYENGINE_DIR}/Code/CryPlugins/CryDefaultEntities/Module"
++)
+diff --git a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp
+new file mode 100644
+index 00000000..86731df1
+--- /dev/null
++++ b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp
+@@ -0,0 +1,557 @@
++#include "StdAfx.h"
++#include "CinematicCameraComponent.h"
++
++// Full CameraComponent definition needed for SetFieldOfView / Activate / IsActive calls.
++// Include path ${CRYENGINE_DIR}/Code/CryPlugins/CryDefaultEntities/Module is set in CMakeLists.
++#include <DefaultComponents/Cameras/CameraComponent.h>
++
++#include <CrySchematyc/Env/Elements/EnvComponent.h>
++#include <CrySchematyc/Env/Elements/EnvFunction.h>
++#include <CrySchematyc/Env/IEnvRegistrar.h>
++#include <CryCore/StaticInstanceList.h>
++#include <CryMath/Angle.h>
++
++// ---------------------------------------------------------------------------
++// Static member
++// ---------------------------------------------------------------------------
++CCinematicCameraComponent* CCinematicCameraComponent::s_pActive = nullptr;
++
++// ---------------------------------------------------------------------------
++// Schematyc registration
++// ---------------------------------------------------------------------------
++namespace
++{
++	static void RegisterCinematicCameraComponent(Schematyc::IEnvRegistrar& registrar)
++	{
++		Schematyc::CEnvRegistrationScope scope = registrar.Scope(IEntity::GetEntityScopeGUID());
++		{
++			Schematyc::CEnvRegistrationScope componentScope =
++				scope.Register(SCHEMATYC_MAKE_ENV_COMPONENT(CCinematicCameraComponent));
++			CCinematicCameraComponent::Register(componentScope);
++		}
++	}
++
++	CRY_STATIC_AUTO_REGISTER_FUNCTION(&RegisterCinematicCameraComponent);
++}
++
++void CCinematicCameraComponent::Register(Schematyc::CEnvRegistrationScope& componentScope)
++{
++	{
++		auto pFunc = SCHEMATYC_MAKE_ENV_FUNCTION(&CCinematicCameraComponent::Activate,
++			"{A1B2C3D4-E5F6-4A7B-C8D9-0E1F2A3B4C5D}"_cry_guid, "Activate");
++		pFunc->SetDescription("Make this the active cinematic camera");
++		pFunc->SetFlags(Schematyc::EEnvFunctionFlags::Construction);
++		componentScope.Register(pFunc);
++	}
++	{
++		auto pFunc = SCHEMATYC_MAKE_ENV_FUNCTION(&CCinematicCameraComponent::IsActive,
++			"{B2C3D4E5-F6A7-4B8C-D9E0-1F2A3B4C5D6E}"_cry_guid, "IsActive");
++		pFunc->SetDescription("Is this the currently active camera?");
++		pFunc->SetFlags(Schematyc::EEnvFunctionFlags::Construction);
++		pFunc->BindOutput(0, 'iact', "IsActive");
++		componentScope.Register(pFunc);
++	}
++	{
++		auto pFunc = SCHEMATYC_MAKE_ENV_FUNCTION(&CCinematicCameraComponent::Deactivate,
++			"{C3D4E5F6-A7B8-4C9D-E0F1-2A3B4C5D6E7F}"_cry_guid, "Deactivate");
++		pFunc->SetDescription("Restore previous DOF and exposure settings");
++		pFunc->SetFlags(Schematyc::EEnvFunctionFlags::Construction);
++		componentScope.Register(pFunc);
++	}
++}
++
++// ---------------------------------------------------------------------------
++// IEntityComponent lifecycle
++// ---------------------------------------------------------------------------
++void CCinematicCameraComponent::Initialize()
++{
++	// Create (or get) the sibling CCameraComponent.
++	// Having CCameraComponent present means:
++	//  - The entity appears in Sandbox's Camera → Camera Entity menu
++	//  - The editor viewport reads its FOV for preview rendering
++	//  - ICameraManager is handled by CCameraComponent (no extra wiring needed)
++	m_pCameraComponent = m_pEntity->GetOrCreateComponent<Cry::DefaultComponents::CCameraComponent>();
++
++	// Prevent CCameraComponent from auto-re-activating on ENTITY_EVENT_START_GAME;
++	// our Activate() is the single control point for that.
++	// Note: CCameraComponent::Initialize() already ran and may have auto-activated.
++	m_pCameraComponent->EnableAutomaticActivation(false);
++
++	// Push computed FOV / near / far into the sibling so the editor viewport
++	// immediately shows the correct frustum.
++	UpdateCameraComponentParams();
++
++	// If CCameraComponent auto-activated during its Initialize(), track it.
++	if (m_pCameraComponent->IsActive())
++	{
++		s_pActive = this;
++		m_pEntity->UpdateComponentEventMask(this);
++		if (m_bEnableDOF) ApplyDOF();
++	}
++}
++
++Cry::Entity::EventFlags CCinematicCameraComponent::GetEventMask() const
++{
++	Cry::Entity::EventFlags flags =
++		ENTITY_EVENT_START_GAME |
++		ENTITY_EVENT_COMPONENT_PROPERTY_CHANGED |
++		ENTITY_EVENT_RESET;
++
++	// Subscribe to per-frame updates while we are the active camera.
++	if (IsActive())
++		flags |= ENTITY_EVENT_UPDATE;
++
++	return flags;
++}
++
++void CCinematicCameraComponent::ProcessEvent(const SEntityEvent& event)
++{
++	switch (event.event)
++	{
++	case ENTITY_EVENT_UPDATE:
++		// Keep the sibling CCameraComponent's FOV in sync even in edit mode
++		// (the editor viewport reads it directly from CCameraComponent).
++		UpdateCameraComponentParams();
++		// DOF is a game-mode effect; don't apply in the editor.
++		if (!gEnv->IsEditing() && m_bEnableDOF)
++			ApplyDOF();
++		break;
++
++	case ENTITY_EVENT_START_GAME:
++		// Optional auto activation. This must stay opt-in: every component receives
++		// START_GAME, so with more than one cinematic camera in the level the last one
++		// to get the event would silently steal the view from a Schematyc Activate call.
++		if (m_bActivateOnGameStart && !IsActive() && m_pCameraComponent)
++			Activate();
++		break;
++
++	case ENTITY_EVENT_COMPONENT_PROPERTY_CHANGED:
++		// Immediately push updated lens params so the editor preview reflects changes.
++		UpdateCameraComponentParams();
++		if (!gEnv->IsEditing())
++		{
++			if (m_bEnableDOF)
++				ApplyDOF();
++			else
++				RestoreDOF();
++		}
++		// Event mask may have changed (e.g., EnableDOF toggled).
++		m_pEntity->UpdateComponentEventMask(this);
++		break;
++
++	case ENTITY_EVENT_RESET:
++		// Leaving game mode: restore render state.
++		RestoreDOF();
++		if (m_bExpParamsSaved)
++		{
++			// Exposure is normally restored in the plugin's UpdateBeforeFinalizeCamera
++			// once s_pActive is cleared, but force an immediate restore here.
++			RestoreExposure();
++		}
++		m_pEntity->UpdateComponentEventMask(this);
++		break;
++
++	default:
++		break;
++	}
++}
++
++void CCinematicCameraComponent::OnShutDown()
++{
++	RestoreDOF();
++	if (m_bExpParamsSaved)
++	{
++		RestoreExposure();
++	}
++
++	if (s_pActive == this)
++		s_pActive = nullptr;
++
++	m_pCameraComponent = nullptr;
++}
++
++// ---------------------------------------------------------------------------
++// Activate / Deactivate / IsActive
++// ---------------------------------------------------------------------------
++void CCinematicCameraComponent::Activate()
++{
++	if (!m_pCameraComponent)
++		return;
++
++	// Deactivate any previously active cinematic camera's effects.
++	if (s_pActive && s_pActive != this)
++	{
++		s_pActive->RestoreDOF();
++		// Exposure of the old camera will be overwritten immediately below.
++	}
++
++	s_pActive = this;
++
++	// Activate the sibling CCameraComponent (registers with ICameraManager,
++	// calls gEnv->pSystem->SetViewCamera in its own Update, etc.).
++	m_pCameraComponent->Activate();
++
++	// Subscribe to ENTITY_EVENT_UPDATE now that we are the active camera.
++	m_pEntity->UpdateComponentEventMask(this);
++
++	// Apply DOF immediately (exposure is applied from the plugin hook).
++	if (m_bEnableDOF) ApplyDOF();
++}
++
++void CCinematicCameraComponent::Deactivate()
++{
++	RestoreDOF();
++
++	// Restore exposure immediately rather than waiting for the plugin hook.
++	if (m_bExpParamsSaved)
++	{
++		RestoreExposure();
++	}
++
++	if (s_pActive == this)
++		s_pActive = nullptr;
++
++	m_pEntity->UpdateComponentEventMask(this);
++}
++
++bool CCinematicCameraComponent::IsActive() const
++{
++	return m_pCameraComponent && m_pCameraComponent->IsActive();
++}
++
++// ---------------------------------------------------------------------------
++// Sync lens params to the sibling CCameraComponent
++// ---------------------------------------------------------------------------
++void CCinematicCameraComponent::UpdateCameraComponentParams()
++{
++	if (!m_pCameraComponent)
++		return;
++
++	m_pCameraComponent->SetFieldOfView(
++		CryTransform::CAngle::FromRadians(ComputeVerticalFOV()));
++	m_pCameraComponent->SetNearPlane((float)m_nearPlane);
++	m_pCameraComponent->SetFarPlane((float)m_farPlane);
++}
++
++// ---------------------------------------------------------------------------
++// Optics helpers
++// ---------------------------------------------------------------------------
++float CCinematicCameraComponent::GetSensorWidth() const
++{
++	switch (m_sensorPreset)
++	{
++	case ESensorPreset::FullFrame35mm:   return 36.0f;
++	case ESensorPreset::APSC:            return 23.6f;
++	case ESensorPreset::MicroFourThirds: return 17.3f;
++	default:                             return max((float)m_customSensorWidth, 1.0f);
++	}
++}
++
++float CCinematicCameraComponent::GetSensorHeight() const
++{
++	switch (m_sensorPreset)
++	{
++	case ESensorPreset::FullFrame35mm:   return 24.0f;
++	case ESensorPreset::APSC:            return 15.7f;
++	case ESensorPreset::MicroFourThirds: return 13.0f;
++	default:                             return GetSensorWidth() * (2.0f / 3.0f);
++	}
++}
++
++// Classic prime lens series; the nearest entry (in log space, so the spacing feels even)
++// is what the optics actually use when Focal Step Mode is PrimeSet.
++static const float s_primeFocalLengths[] = {
++	8.f, 10.f, 12.f, 14.f, 16.f, 18.f, 20.f, 24.f, 28.f, 35.f, 40.f, 50.f, 65.f, 75.f,
++	85.f, 100.f, 135.f, 150.f, 180.f, 200.f, 250.f, 300.f, 400.f, 500.f, 600.f
++};
++
++float CCinematicCameraComponent::GetEffectiveFocalLength() const
++{
++	const float f_mm = max((float)m_focalLength, 0.1f);
++
++	switch (m_focalStepMode)
++	{
++	case EFocalStepMode::PrimeSet:
++		{
++			float best = s_primeFocalLengths[0];
++			float bestDistance = fabs_tpl(logf(f_mm / best));
++			for (const float candidate : s_primeFocalLengths)
++			{
++				const float distance = fabs_tpl(logf(f_mm / candidate));
++				if (distance < bestDistance)
++				{
++					bestDistance = distance;
++					best = candidate;
++				}
++			}
++			return best;
++		}
++
++	case EFocalStepMode::Geometric:
++		{
++			// Equal ratio steps: every m_focalStepsPerDoubling detents doubles the focal length.
++			const float stepsPerDoubling = (float)max((int)m_focalStepsPerDoubling, 1);
++			const float index = floorf(log2f(f_mm) * stepsPerDoubling + 0.5f);
++			return powf(2.0f, index / stepsPerDoubling);
++		}
++
++	default:
++		return f_mm;
++	}
++}
++
++// vFOV = 2 * atan(sensorHeight / (2 * focalLength))
++float CCinematicCameraComponent::ComputeVerticalFOV() const
++{
++	const float f_mm = GetEffectiveFocalLength();
++	const float h_mm = GetSensorHeight();
++	return 2.0f * atanf(h_mm * 0.5f / f_mm);
++}
++
++// Circle-of-confusion limit in metres (sensorDiagonal_mm / 1500 / 1000).
++float CCinematicCameraComponent::ComputeCoCLimit() const
++{
++	const float w = GetSensorWidth();
++	const float h = GetSensorHeight();
++	return (sqrtf(w * w + h * h) / 1500.0f) * 0.001f;
++}
++
++// Thin-lens DOF bounds.
++//   near = d * f² / (f² + N * c * (d - f))
++//   far  = d * f² / (f² - N * c * (d - f))
++void CCinematicCameraComponent::ComputeDOFBounds(float& outNear, float& outFar) const
++{
++	const float f_m = GetEffectiveFocalLength() * 0.001f;
++	const float N   = max((float)m_aperture, 0.7f);
++	const float d   = max((float)m_focusDistance, f_m * 1.01f);
++	const float c   = ComputeCoCLimit();
++	const float f2  = f_m * f_m;
++	const float nd  = f2 + N * c * (d - f_m);
++	const float fd  = f2 - N * c * (d - f_m);
++
++	outNear = (nd > 1e-6f) ? (d * f2 / nd) : 0.01f;
++	outFar  = (fd > 1e-6f) ? (d * f2 / fd) : 1.0e6f;
++	outNear = clamp_tpl(outNear, 0.01f, d - 0.001f);
++	outFar  = max(outFar, d + 0.001f);
++}
++
++// Normalised blur: maxBokeh_mm = focalLength / aperture; reference = 85mm / f1.4 ≈ 60mm.
++float CCinematicCameraComponent::ComputeMaxBlurAmount() const
++{
++	return clamp_tpl(GetEffectiveFocalLength() / max((float)m_aperture, 0.7f) / 60.0f, 0.0f, 1.0f);
++}
++
++// What to feed Dof_User_FocusRange.
++//
++// The DOF shader has no sharp band: it computes
++//     coc = saturate(|depth - focusDistance| / (focusRange * 0.5))^2 * blurAmount
++// so blur starts rising the moment you leave the focus plane and is maximal at
++// focusDistance +/- focusRange/2. Handing it the physical depth of field width therefore
++// puts *full* blur exactly where the image should still be acceptably sharp, which is why
++// the in-focus zone looked far too thin.
++//
++// Feeding it dofWidth * focusFalloff instead puts the physical DOF limits at
++// 1/focusFalloff^2 of maximum blur (11% at the default 3), so the depth of field reads as
++// sharp and the falloff beyond it stays smooth.
++float CCinematicCameraComponent::ComputeFocusRange() const
++{
++	float dofNear, dofFar;
++	ComputeDOFBounds(dofNear, dofFar);
++
++	const float dofWidth = max(dofFar - dofNear, 0.001f);
++	return clamp_tpl(dofWidth * (float)m_focusFalloff, 0.02f, 20000.0f);
++}
++
++// ---------------------------------------------------------------------------
++// DOF post-effect helpers
++// ---------------------------------------------------------------------------
++void CCinematicCameraComponent::ApplyDOF()
++{
++	// Ensure DOF is enabled.
++	ICVar* pDofCVar = gEnv->pConsole->GetCVar("r_dof");
++	if (pDofCVar && !m_bDofParamsSaved)
++		m_savedDofCVar = pDofCVar->GetIVal();
++	if (pDofCVar && pDofCVar->GetIVal() == 0)
++		pDofCVar->Set(1);
++
++	if (!m_bDofParamsSaved)
++	{
++		gEnv->p3DEngine->GetPostEffectParam("Dof_User_Active",        m_savedDofUserActive);
++		gEnv->p3DEngine->GetPostEffectParam("Dof_User_FocusDistance", m_savedDofFocusDist);
++		gEnv->p3DEngine->GetPostEffectParam("Dof_User_FocusRange",    m_savedDofFocusRange);
++		gEnv->p3DEngine->GetPostEffectParam("Dof_User_BlurAmount",    m_savedDofBlurAmount);
++		m_bDofParamsSaved = true;
++	}
++
++	gEnv->p3DEngine->SetPostEffectParam("Dof_Active",             0.0f);
++	gEnv->p3DEngine->SetPostEffectParam("Dof_User_Active",        1.0f);
++	gEnv->p3DEngine->SetPostEffectParam("Dof_User_FocusDistance", (float)m_focusDistance);
++	gEnv->p3DEngine->SetPostEffectParam("Dof_User_FocusRange",    ComputeFocusRange());
++	gEnv->p3DEngine->SetPostEffectParam("Dof_User_BlurAmount",    ComputeMaxBlurAmount());
++}
++
++void CCinematicCameraComponent::RestoreDOF()
++{
++	if (!m_bDofParamsSaved)
++		return;
++
++	gEnv->p3DEngine->SetPostEffectParam("Dof_User_Active",        m_savedDofUserActive);
++	gEnv->p3DEngine->SetPostEffectParam("Dof_User_FocusDistance", m_savedDofFocusDist);
++	gEnv->p3DEngine->SetPostEffectParam("Dof_User_FocusRange",    m_savedDofFocusRange);
++	gEnv->p3DEngine->SetPostEffectParam("Dof_User_BlurAmount",    m_savedDofBlurAmount);
++
++	ICVar* pDofCVar = gEnv->pConsole->GetCVar("r_dof");
++	if (pDofCVar)
++		pDofCVar->Set(m_savedDofCVar);
++
++	m_bDofParamsSaved = false;
++}
++
++void CCinematicCameraComponent::RestoreExposure()
++{
++	if (!m_bExpParamsSaved)
++		return;
++
++	gEnv->p3DEngine->SetGlobalParameter(E3DPARAM_HDR_EYEADAPTATION_PARAMS, m_savedEyeAdaptation);
++	m_bExpParamsSaved = false;
++}
++
++// ---------------------------------------------------------------------------
++// Exposure — called from CCinematicCameraPlugin::UpdateBeforeFinalizeCamera()
++// which runs AFTER ITimeOfDay::Update() so our write is the last one before render.
++// ---------------------------------------------------------------------------
++// Manual exposure: the standard photographic equation.
++//     EV100 = log2(N^2 / t) - log2(ISO / 100)
++// EV compensation is subtracted so +1 EV means one stop brighter, matching a real camera.
++float CCinematicCameraComponent::ComputeManualEV100() const
++{
++	const float N = max((float)m_aperture, 0.7f);
++	const float t = 1.0f / (float)max((int)m_shutterDenominator, 1);
++	const float iso = (float)max((int)m_iso, 1);
++
++	const float ev100 = log2f(N * N / t) - log2f(iso / 100.0f) - (float)m_evCompensation;
++	return clamp_tpl(ev100, -6.0f, 24.0f);
++}
++
++// Take over the view for the current frame. Runs after entity updates AND after the
++// GameSDK ViewSystem, so this write is the one the renderer actually uses - this is what
++// makes "view through the cinematic camera" work in game mode at all.
++void CCinematicCameraComponent::FinalizeGameCamera()
++{
++	// In the editor (editing or simulation mode) the viewport preview path owns the camera.
++	if (gEnv->IsEditing())
++		return;
++
++	CCamera camera = gEnv->pSystem->GetViewCamera();
++	camera.SetFrustum(camera.GetViewSurfaceX(), camera.GetViewSurfaceZ(),
++		ComputeVerticalFOV(), m_nearPlane, m_farPlane, camera.GetPixelAspectRatio());
++	camera.SetMatrix(GetWorldTransformMatrix());
++	gEnv->pSystem->SetViewCamera(camera);
++
++	// Keep DOF pinned every frame from here as well, so it no longer depends on whether
++	// the sibling CCameraComponent won the camera-manager race.
++	if (m_bEnableDOF)
++		ApplyDOF();
++}
++
++void CCinematicCameraComponent::ApplyExposureGlobalParam()
++{
++	if (!m_bEnableExposure)
++	{
++		RestoreExposure();
++		return;
++	}
++
++	// Read the full EyeAdaptation vector (EV_min, EV_max, EV_auto_compensation).
++	Vec3 v;
++	gEnv->p3DEngine->GetGlobalParameter(E3DPARAM_HDR_EYEADAPTATION_PARAMS, v);
++
++	if (!m_bExpParamsSaved)
++	{
++		m_savedEyeAdaptation = v;
++		m_bExpParamsSaved    = true;
++	}
++
++	if (m_exposureMode == EExposureMode::Manual)
++	{
++		// The tone mapper clamps its auto EV100 to [EV_min, EV_max]; collapsing that window
++		// onto a single value is what pins exposure to the lens instead of the scene, and is
++		// the only way the f-number can change brightness. The auto compensation term is left
++		// at the scene default since the clamp makes it irrelevant.
++		const float ev100 = ComputeManualEV100();
++		v.x = ev100;
++		v.y = ev100;
++	}
++	else
++	{
++		// Legacy behaviour: drive the scene-key auto compensation strength only.
++		v.z = (float)m_evCompensation;
++	}
++
++	gEnv->p3DEngine->SetGlobalParameter(E3DPARAM_HDR_EYEADAPTATION_PARAMS, v);
++}
++
++// ---------------------------------------------------------------------------
++// ICinematicCameraOptics - live lens control (driven by CryPhoneTracker)
++//
++// Setters take effect on the next frame through UpdateCameraComponentParams()/ApplyDOF();
++// they are called at pose rate, so they only do work when the value actually moved.
++// ---------------------------------------------------------------------------
++void CCinematicCameraComponent::SetFocalLength(float millimetres)
++{
++	const float clamped = clamp_tpl(millimetres, 1.0f, 2400.0f);
++	if (fabs_tpl(clamped - (float)m_focalLength) < 0.001f)
++		return;
++
++	m_focalLength = clamped;
++	UpdateCameraComponentParams();
++}
++
++void CCinematicCameraComponent::SetAperture(float fNumber)
++{
++	const float clamped = clamp_tpl(fNumber, 1.0f, 64.0f);
++	if (fabs_tpl(clamped - (float)m_aperture) < 0.001f)
++		return;
++
++	m_aperture = clamped;
++	if (!gEnv->IsEditing() && m_bEnableDOF)
++		ApplyDOF();
++}
++
++void CCinematicCameraComponent::SetFocusDistance(float metres)
++{
++	const float clamped = clamp_tpl(metres, 0.01f, 10000.0f);
++	if (fabs_tpl(clamped - (float)m_focusDistance) < 0.001f)
++		return;
++
++	m_focusDistance = clamped;
++	if (!gEnv->IsEditing() && m_bEnableDOF)
++		ApplyDOF();
++}
++
++void CCinematicCameraComponent::SetEVCompensation(float ev)
++{
++	m_evCompensation = clamp_tpl(ev, -3.0f, 3.0f);
++}
++
++void CCinematicCameraComponent::SetDepthOfFieldEnabled(bool enable)
++{
++	if (m_bEnableDOF == enable)
++		return;
++
++	m_bEnableDOF = enable;
++	if (!gEnv->IsEditing())
++	{
++		if (enable)
++			ApplyDOF();
++		else
++			RestoreDOF();
++	}
++}
++
++void CCinematicCameraComponent::SetExposureEnabled(bool enable)
++{
++	m_bEnableExposure = enable;
++	if (!enable)
++		RestoreExposure();
++}
+diff --git a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
+new file mode 100644
+index 00000000..0bfd4bc9
+--- /dev/null
++++ b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
+@@ -0,0 +1,276 @@
++#pragma once
++
++#include <CryEntitySystem/IEntityComponent.h>
++#include <CrySchematyc/MathTypes.h>
++#include <CrySchematyc/Reflection/TypeDesc.h>
++#include <CrySchematyc/Env/IEnvRegistrar.h>
++#include <Cry3DEngine/I3DEngine.h>
++
++#include "../Interface/ICinematicCameraOptics.h"
++
++// CCameraComponent is in CryDefaultEntities/Module — forward-declared here,
++// included fully in the .cpp (include path set in CMakeLists.txt).
++namespace Cry { namespace DefaultComponents { class CCameraComponent; } }
++
++// ---------------------------------------------------------------------------
++// Sensor size presets
++// ---------------------------------------------------------------------------
++enum class ESensorPreset : uint32
++{
++	FullFrame35mm = 0,  // 36 x 24 mm
++	APSC,               // 23.6 x 15.7 mm
++	MicroFourThirds,    // 17.3 x 13 mm
++	Custom
++};
++
++static void ReflectType(Schematyc::CTypeDesc<ESensorPreset>& desc)
++{
++	desc.SetGUID("{C3A1B2D4-9E5F-4C8A-B1D0-6E7F2A3C4B5D}"_cry_guid);
++	desc.SetLabel("Sensor Preset");
++	desc.SetDefaultValue(ESensorPreset::FullFrame35mm);
++	desc.AddConstant(ESensorPreset::FullFrame35mm,   "FullFrame35mm",   "Full Frame 35mm");
++	desc.AddConstant(ESensorPreset::APSC,            "APSC",            "APS-C");
++	desc.AddConstant(ESensorPreset::MicroFourThirds, "MicroFourThirds", "Micro Four Thirds");
++	desc.AddConstant(ESensorPreset::Custom,          "Custom",          "Custom");
++}
++
++// ---------------------------------------------------------------------------
++// Focal length detents
++//
++// The engine takes a continuous FOV, so "steps" are produced by quantising the focal
++// length that feeds the optics; the stored property still holds whatever the fader sent.
++// ---------------------------------------------------------------------------
++enum class EFocalStepMode : uint32
++{
++	Continuous = 0, // No quantisation.
++	PrimeSet,       // Snap to a classic prime lens series (12 … 600 mm).
++	Geometric       // Snap to N equal steps per doubling of focal length.
++};
++
++static void ReflectType(Schematyc::CTypeDesc<EFocalStepMode>& desc)
++{
++	desc.SetGUID("{7D4E9A16-2C58-4B31-8F6A-0B9E4C1D7A32}"_cry_guid);
++	desc.SetLabel("Focal Step Mode");
++	desc.SetDefaultValue(EFocalStepMode::PrimeSet);
++	desc.AddConstant(EFocalStepMode::Continuous, "Continuous", "Continuous");
++	desc.AddConstant(EFocalStepMode::PrimeSet,   "PrimeSet",   "Prime Lens Set");
++	desc.AddConstant(EFocalStepMode::Geometric,  "Geometric",  "Geometric Steps");
++}
++
++// ---------------------------------------------------------------------------
++// Exposure model
++// ---------------------------------------------------------------------------
++enum class EExposureMode : uint32
++{
++	//! Writes the scene-key auto-compensation strength. Aperture cannot affect brightness
++	//! here: the engine scales that term by how far the scene is from the reference key,
++	//! so its sign flips between bright and dark scenes.
++	AutoCompensation = 0,
++	//! Locks EV Min and EV Max to a single EV100 computed from aperture, shutter, ISO and
++	//! EV compensation, which is what makes the f-number actually change brightness.
++	Manual
++};
++
++static void ReflectType(Schematyc::CTypeDesc<EExposureMode>& desc)
++{
++	desc.SetGUID("{1E8B5C74-6A29-4D03-B5F1-8C2D7E6A0B94}"_cry_guid);
++	desc.SetLabel("Exposure Mode");
++	desc.SetDefaultValue(EExposureMode::Manual);
++	desc.AddConstant(EExposureMode::AutoCompensation, "AutoCompensation", "Auto Compensation");
++	desc.AddConstant(EExposureMode::Manual,           "Manual",           "Manual (physical)");
++}
++
++// ---------------------------------------------------------------------------
++// CCinematicCameraComponent
++//
++// Creates a sibling CCameraComponent that handles view/camera-manager integration
++// (so the entity appears in the Sandbox Camera Entity menu and the editor renders
++// through it with the correct frustum). This component drives:
++//   - FOV  via focal-length + sensor-size optics formula → written to CCameraComponent
++//   - DOF  via Dof_User_* post-effect params
++//   - EV   via E3DPARAM_HDR_EYEADAPTATION_PARAMS, applied in the plugin's
++//           UpdateBeforeFinalizeCamera() hook (runs after TOD::Update so it can't
++//           be overwritten by the TOD system in the same frame)
++// ---------------------------------------------------------------------------
++class CCinematicCameraComponent final
++	: public IEntityComponent
++	, public ICinematicCameraOptics
++{
++public:
++	static void ReflectType(Schematyc::CTypeDesc<CCinematicCameraComponent>& desc)
++	{
++		desc.SetGUID("{F2A3B4C5-D6E7-4F8A-B9C0-1D2E3F4A5B6C}"_cry_guid);
++		desc.SetEditorCategory("Cameras");
++		desc.SetLabel("Cinematic Camera");
++		desc.SetDescription(
++			"Physically-based camera: FOV from focal length, DOF from aperture, "
++			"exposure compensation from EV bias. Automatically creates a companion "
++			"Camera component so the entity appears in the Camera Entity menu.");
++		desc.SetIcon("icons:General/Camera.ico");
++		desc.SetComponentFlags({
++			IEntityComponent::EFlags::Transform,
++			IEntityComponent::EFlags::Socket,
++			IEntityComponent::EFlags::Attach,
++			IEntityComponent::EFlags::Singleton,
++			IEntityComponent::EFlags::ClientOnly });
++
++		desc.AddMember(&CCinematicCameraComponent::m_bActivateOnGameStart,
++			'aogs', "ActivateOnGameStart", "Activate On Game Start",
++			"Automatically make this the active camera when gameplay starts. Leave off when "
++			"Schematyc decides which camera is active - with several cameras in the level, "
++			"auto activation lets the last one initialised steal the view from an explicit "
++			"Activate call.", false);
++
++		desc.AddMember(&CCinematicCameraComponent::m_nearPlane,
++			'near', "NearPlane", "Near Plane (m)", nullptr, 0.25f);
++		desc.AddMember(&CCinematicCameraComponent::m_farPlane,
++			'far_', "FarPlane", "Far Plane (m)", nullptr, 1024.f);
++
++		desc.AddMember(&CCinematicCameraComponent::m_sensorPreset,
++			'sens', "SensorPreset", "Sensor Preset",
++			"Reference sensor size used to compute FOV and circle of confusion.",
++			ESensorPreset::FullFrame35mm);
++		desc.AddMember(&CCinematicCameraComponent::m_customSensorWidth,
++			'cswt', "CustomSensorWidth", "Custom Sensor Width (mm)",
++			"Width in mm — only used when Sensor Preset is Custom.", 36.0f);
++		desc.AddMember(&CCinematicCameraComponent::m_focalLength,
++			'focl', "FocalLength", "Focal Length (mm)",
++			"Shorter = wider angle. Drives the vertical field of view.", 50.0f);
++		desc.AddMember(&CCinematicCameraComponent::m_aperture,
++			'aptr', "Aperture", "Aperture (f-number)",
++			"Lower f-number = shallower depth of field.", 5.6f);
++		desc.AddMember(&CCinematicCameraComponent::m_focusDistance,
++			'fdst', "Focus Distance (m)", "Focus Distance (m)",
++			"Distance to the sharp focus plane.", 5.0f);
++
++		desc.AddMember(&CCinematicCameraComponent::m_focalStepMode,
++			'fstm', "FocalStepMode", "Focal Step Mode",
++			"Quantise the focal length so zooming has detents instead of sliding freely.",
++			EFocalStepMode::PrimeSet);
++		desc.AddMember(&CCinematicCameraComponent::m_focalStepsPerDoubling,
++			'fstn', "FocalStepsPerDoubling", "Steps Per Doubling",
++			"Detents between one focal length and twice that — only used by Geometric.", 6);
++
++		desc.AddMember(&CCinematicCameraComponent::m_bEnableDOF,
++			'dof_', "EnableDOF", "Enable Depth of Field",
++			"Compute and apply DOF blur from aperture + focus distance.", false);
++		desc.AddMember(&CCinematicCameraComponent::m_focusFalloff,
++			'ffal', "FocusFalloff", "Focus Falloff",
++			"How far past the depth of field limits the blur keeps ramping. 1 = fully blurred "
++			"right at the limits (the engine default, which reads as a very thin focus zone); "
++			"higher values widen the sharp zone.", 3.0f);
++
++		desc.AddMember(&CCinematicCameraComponent::m_bEnableExposure,
++			'expo', "EnableExposure", "Enable Exposure Control",
++			"Override HDR eye-adaptation EV compensation.", false);
++		desc.AddMember(&CCinematicCameraComponent::m_exposureMode,
++			'expm', "ExposureMode", "Exposure Mode",
++			"Manual locks exposure to the aperture / shutter / ISO triangle.",
++			EExposureMode::Manual);
++		desc.AddMember(&CCinematicCameraComponent::m_shutterDenominator,
++			'shut', "ShutterDenominator", "Shutter (1/x s)",
++			"Manual mode only. 50 is roughly a 180 degree shutter at 25 fps.", 50);
++		desc.AddMember(&CCinematicCameraComponent::m_iso,
++			'iso_', "ISO", "ISO",
++			"Manual mode only. Higher ISO brightens the image.", 400);
++		desc.AddMember(&CCinematicCameraComponent::m_evCompensation,
++			'evcp', "EVCompensation", "EV Compensation",
++			"EV bias (-3 darker … 0 neutral … +3 brighter). In Manual mode this is a true stop.", 0.0f);
++	}
++
++	static void Register(Schematyc::CEnvRegistrationScope& componentScope);
++
++	// IEntityComponent
++	virtual void Initialize() override;
++	virtual Cry::Entity::EventFlags GetEventMask() const override;
++	virtual void ProcessEvent(const SEntityEvent& event) override;
++	virtual void OnShutDown() override;
++	// ~IEntityComponent
++
++	// Schematyc / scripting API
++	void Activate();
++	void Deactivate();
++	bool IsActive() const;
++
++	// ICinematicCameraOptics - live lens control, used by CryPhoneTracker
++	virtual void SetFocalLength(float millimetres) override;
++	virtual void SetAperture(float fNumber) override;
++	virtual void SetFocusDistance(float metres) override;
++	virtual void SetEVCompensation(float ev) override;
++	virtual void SetDepthOfFieldEnabled(bool enable) override;
++	virtual void SetExposureEnabled(bool enable) override;
++
++	virtual float GetFocalLength() const override { return m_focalLength; }
++	virtual float GetAperture() const override { return m_aperture; }
++	virtual float GetFocusDistance() const override { return m_focusDistance; }
++	virtual float GetEVCompensation() const override { return m_evCompensation; }
++	// ~ICinematicCameraOptics
++
++	// Called by CCinematicCameraPlugin::UpdateBeforeFinalizeCamera() - the engine's
++	// sanctioned override point: the view camera "is only considered final after
++	// UpdateBeforeFinalizeCamera has been executed" (ISystem.h). Writing it any earlier
++	// (as CCameraComponent does from ENTITY_EVENT_UPDATE) loses to the GameSDK ViewSystem,
++	// which runs in the game framework post update.
++	void FinalizeGameCamera();
++	void ApplyExposureGlobalParam();
++
++	static CCinematicCameraComponent* GetActiveComponent() { return s_pActive; }
++	bool IsExposureEnabled() const { return m_bEnableExposure; }
++
++private:
++	void UpdateCameraComponentParams();
++
++	float GetEffectiveFocalLength() const;
++	float ComputeManualEV100() const;
++	float ComputeFocusRange() const;
++
++	float GetSensorWidth()  const;
++	float GetSensorHeight() const;
++	float ComputeVerticalFOV() const;
++	float ComputeCoCLimit() const;
++	void  ComputeDOFBounds(float& outNear, float& outFar) const;
++	float ComputeMaxBlurAmount() const;
++
++	void ApplyDOF();
++	void RestoreDOF();
++	void RestoreExposure();
++
++private:
++	// Reflected properties
++	bool                             m_bActivateOnGameStart = false;
++	Schematyc::Range<0, 32768>       m_nearPlane            = 0.25f;
++	Schematyc::Range<0, 32768>       m_farPlane             = 1024.f;
++	ESensorPreset                    m_sensorPreset         = ESensorPreset::FullFrame35mm;
++	Schematyc::Range<1, 200>         m_customSensorWidth    = 36.f;
++	Schematyc::Range<1, 2400>        m_focalLength          = 50.f;
++	Schematyc::Range<1, 64>          m_aperture             = 5.6f;
++	Schematyc::Range<0, 10000>       m_focusDistance        = 5.f;
++	EFocalStepMode                   m_focalStepMode        = EFocalStepMode::PrimeSet;
++	Schematyc::Range<1, 24, 2, 12, int> m_focalStepsPerDoubling = 6;
++	bool                             m_bEnableDOF           = false;
++	Schematyc::Range<1, 10, 1, 6>    m_focusFalloff         = 3.f;
++	bool                             m_bEnableExposure      = false;
++	EExposureMode                    m_exposureMode         = EExposureMode::Manual;
++	Schematyc::Range<1, 8000, 1, 250, int>    m_shutterDenominator = 50;
++	Schematyc::Range<25, 25600, 50, 6400, int> m_iso          = 400;
++	Schematyc::Range<-3, 3, -3, 3>  m_evCompensation       = 0.f;
++
++	// Sibling camera component (created in Initialize)
++	Cry::DefaultComponents::CCameraComponent* m_pCameraComponent = nullptr;
++
++	// DOF saved params
++	float m_savedDofUserActive = 0.f;
++	float m_savedDofFocusDist  = 3.5f;
++	float m_savedDofFocusRange = 5.f;
++	float m_savedDofBlurAmount = 1.f;
++	int   m_savedDofCVar       = 0;
++	bool  m_bDofParamsSaved    = false;
++
++	// Exposure saved param. Manual mode rewrites EV min and max as well as the auto
++	// compensation, so the whole vector has to be put back.
++	Vec3 m_savedEyeAdaptation = Vec3(4.5f, 17.0f, 1.5f);
++	bool m_bExpParamsSaved    = false;
++
++	// Singleton: which CinematicCameraComponent is currently the active camera
++	static CCinematicCameraComponent* s_pActive;
++};
+diff --git a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraPlugin.cpp b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraPlugin.cpp
+new file mode 100644
+index 00000000..fbce5e5d
+--- /dev/null
++++ b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraPlugin.cpp
+@@ -0,0 +1,77 @@
++#include "StdAfx.h"
++#include "CinematicCameraPlugin.h"
++#include "CinematicCameraComponent.h"
++
++#include <CrySchematyc/Env/IEnvRegistry.h>
++#include <CrySchematyc/Env/EnvPackage.h>
++#include <CrySchematyc/Utils/SharedString.h>
++#include <CryCore/StaticInstanceList.h>
++
++#include <CryCore/Platform/platform_impl.inl>
++
++CCinematicCameraPlugin::~CCinematicCameraPlugin()
++{
++	gEnv->pSystem->GetISystemEventDispatcher()->RemoveListener(this);
++	if (gEnv->pSchematyc)
++		gEnv->pSchematyc->GetEnvRegistry().DeregisterPackage(CCinematicCameraPlugin::GetCID());
++}
++
++bool CCinematicCameraPlugin::Initialize(SSystemGlobalEnvironment& env, const SSystemInitParams& initParams)
++{
++	gEnv->pSystem->GetISystemEventDispatcher()->RegisterListener(this, "CCinematicCameraPlugin");
++
++	// Register for the UpdateBeforeFinalizeCamera hook so we can apply EV compensation
++	// after the TOD system sets E3DPARAM_HDR_EYEADAPTATION_PARAMS.
++	EnableUpdate(EUpdateStep::BeforeFinalizeCamera, true);
++
++	return true;
++}
++
++void CCinematicCameraPlugin::UpdateBeforeFinalizeCamera()
++{
++	if (CCinematicCameraComponent* pActive = CCinematicCameraComponent::GetActiveComponent())
++	{
++		pActive->FinalizeGameCamera();
++		pActive->ApplyExposureGlobalParam();
++	}
++}
++
++void CCinematicCameraPlugin::OnSystemEvent(ESystemEvent event, UINT_PTR wparam, UINT_PTR lparam)
++{
++	switch (event)
++	{
++	case ESYSTEM_EVENT_REGISTER_SCHEMATYC_ENV:
++	{
++		auto staticAutoRegisterLambda = [](Schematyc::IEnvRegistrar& registrar)
++		{
++			Detail::CStaticAutoRegistrar<Schematyc::IEnvRegistrar&>::InvokeStaticCallbacks(registrar);
++		};
++
++		if (gEnv->pSchematyc)
++		{
++			gEnv->pSchematyc->GetEnvRegistry().RegisterPackage(
++				stl::make_unique<Schematyc::CEnvPackage>(
++					CCinematicCameraPlugin::GetCID(),
++					"CinematicCameraComponents",
++					"CryEngine",
++					"Cinematic Camera Components",
++					staticAutoRegisterLambda));
++		}
++		break;
++	}
++	}
++}
++
++CRYREGISTER_SINGLETON_CLASS(CCinematicCameraPlugin)
++
++// ---------------------------------------------------------------------------
++// C entry point used by other plugins (CryPhoneTracker) to drive the lens without
++// linking against this module. See Interface/ICinematicCameraOptics.h.
++// ---------------------------------------------------------------------------
++extern "C" DLL_EXPORT ICinematicCameraOptics* CryGetCinematicCameraOptics(IEntity* pEntity)
++{
++	if (pEntity == nullptr)
++		return nullptr;
++
++	return pEntity->GetComponent<CCinematicCameraComponent>();
++}
+diff --git a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraPlugin.h b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraPlugin.h
+new file mode 100644
+index 00000000..0dc5c1db
+--- /dev/null
++++ b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraPlugin.h
+@@ -0,0 +1,31 @@
++#pragma once
++
++#include <CrySystem/ICryPlugin.h>
++#include <CryEntitySystem/IEntityClass.h>
++
++class CCinematicCameraPlugin
++	: public Cry::IEnginePlugin
++	, public ISystemEventListener
++{
++public:
++	CRYINTERFACE_SIMPLE(Cry::IEnginePlugin)
++	CRYGENERATE_SINGLETONCLASS_GUID(CCinematicCameraPlugin, "CinematicCamera",
++		"8A3F1C2D-9B4E-4A7F-B2E0-5D6C3F8A1B9E"_cry_guid)
++
++	virtual ~CCinematicCameraPlugin();
++
++	// Cry::IEnginePlugin
++	virtual const char* GetName()     const override { return "CinematicCamera"; }
++	virtual const char* GetCategory() const override { return "CryPlugins"; }
++	virtual bool Initialize(SSystemGlobalEnvironment& env, const SSystemInitParams& initParams) override;
++
++	// Called after ITimeOfDay::Update() and entity updates, before camera is finalised.
++	// This is the correct place to write E3DPARAM_HDR_EYEADAPTATION_PARAMS so our
++	// EV compensation overrides the TOD system's value for the current frame.
++	virtual void UpdateBeforeFinalizeCamera() override;
++	// ~Cry::IEnginePlugin
++
++	// ISystemEventListener
++	virtual void OnSystemEvent(ESystemEvent event, UINT_PTR wparam, UINT_PTR lparam) override;
++	// ~ISystemEventListener
++};
+diff --git a/Code/CryPlugins/CinematicCamera/Module/StdAfx.cpp b/Code/CryPlugins/CinematicCamera/Module/StdAfx.cpp
+new file mode 100644
+index 00000000..e717491d
+--- /dev/null
++++ b/Code/CryPlugins/CinematicCamera/Module/StdAfx.cpp
+@@ -0,0 +1 @@
++#include "StdAfx.h"
+diff --git a/Code/CryPlugins/CinematicCamera/Module/StdAfx.h b/Code/CryPlugins/CinematicCamera/Module/StdAfx.h
+new file mode 100644
+index 00000000..dfd458d5
+--- /dev/null
++++ b/Code/CryPlugins/CinematicCamera/Module/StdAfx.h
+@@ -0,0 +1,10 @@
++#pragma once
++
++#include <CryCore/Project/CryModuleDefs.h>
++#define eCryModule eCryM_EnginePlugin
++#define GAME_API   DLL_EXPORT
++
++#include <CryCore/Platform/platform.h>
++#include <CrySystem/ISystem.h>
++#include <Cry3DEngine/I3DEngine.h>
++#include <CryNetwork/ISerialize.h>
+diff --git a/Code/CryPlugins/CinematicCamera/Module/resource.h b/Code/CryPlugins/CinematicCamera/Module/resource.h
+new file mode 100644
+index 00000000..14acb0db
+--- /dev/null
++++ b/Code/CryPlugins/CinematicCamera/Module/resource.h
+@@ -0,0 +1,10 @@
++// Next default values for new objects
++//
++#ifdef APSTUDIO_INVOKED
++#ifndef APSTUDIO_READONLY_SYMBOLS
++	#define _APS_NEXT_RESOURCE_VALUE 101
++	#define _APS_NEXT_COMMAND_VALUE  40001
++	#define _APS_NEXT_CONTROL_VALUE  1001
++	#define _APS_NEXT_SYMED_VALUE    101
++#endif
++#endif
+diff --git a/Code/CryPlugins/CinematicCamera/README.md b/Code/CryPlugins/CinematicCamera/README.md
+new file mode 100644
+index 00000000..4a5f141a
+--- /dev/null
++++ b/Code/CryPlugins/CinematicCamera/README.md
+@@ -0,0 +1,87 @@
++# CinematicCamera
++
++以真實鏡頭參數驅動的攝影機 component：焦距決定 FOV、光圈決定景深與亮度、EV 補償以「級」為單位。
++會自動在同一個 entity 上建立一個 `CCameraComponent`，所以它會出現在 Sandbox 的 Camera Entity 選單。
++
++鏡頭數值可以由 [CryPhoneTracker](../CryPhoneTracker/README.md) 從手機推桿即時灌進來，
++介面是 `Interface/ICinematicCameraOptics.h`。
++
++---
++
++## 曝光：Exposure Mode
++
++`Enable Exposure Control` 打開後才生效。兩種模式：
++
++### Manual（預設）
++
++用標準攝影公式算出一個 EV100，然後把 ToD 的 `EV Min` 與 `EV Max` **同時鎖到這個值**：
++
++```
++EV100 = log2(N² / t) − log2(ISO / 100) − EVCompensation
++```
++
++Tone mapper 的自動曝光會把它算出來的 EV100 夾在 `[EV Min, EV Max]` 之間；把這個區間壓成一個點，
++曝光就完全由鏡頭決定而不是場景決定 —— **這是光圈唯一能影響亮度的途徑**。
++
++| 參數 | 意義 |
++| --- | --- |
++| Aperture | N，每縮一級（×√2）暗一級 |
++| Shutter (1/x s) | t，50 約等於 25 fps 的 180° 快門 |
++| ISO | 感光度，翻倍亮一級 |
++| EV Compensation | 真正的 ±級數，+1 = 亮一級 |
++
++參考值：`f/5.6 · 1/50 · ISO400` → EV100 ≈ 8.6（室內／陰天）。ToD 預設的 EV 範圍是 4.5–17，
++所以外景晴天要往 `f/11 · 1/200 · ISO100` 之類的方向調。
++
++### Auto Compensation（舊行為）
++
++只寫 `E3DPARAM_HDR_EYEADAPTATION_PARAMS.z`。這個值**不是** EV 偏移，shader 裡是：
++
++```hlsl
++EV100 -= ((clamp(log10(illuminance * 1e4 + 1), 0.1, 5.2) - 3.0) / 2.0) * HDREyeAdaptation.z;
++```
++
++前面那個係數在亮場景是正的、暗場景是負的，所以同一個 `.z` 在不同亮度的場景會**往相反方向**
++調整曝光，強度也隨場景飄。光圈沒辦法從這裡注入。保留這個模式只是為了相容舊設定。
++
++---
++
++## 景深：Focus Falloff
++
++DOF shader 沒有「清楚的一段」，它是：
++
++```hlsl
++coc = saturate(|depth − focusDistance| / (focusRange × 0.5))² × blurAmount
++```
++
++離開對焦平面就開始糊，到 `focusDistance ± focusRange/2` 糊到最大。所以原本把**物理景深寬度**
++直接餵給 `Dof_User_FocusRange`，等於把「應該還算清楚」的景深邊界設成「糊到最大」的位置——
++這就是對焦範圍看起來特別小的原因。
++
++現在改成餵 `景深寬度 × Focus Falloff`。物理景深邊界會落在 `1/falloff²` 的模糊量上
++（預設 3 → 11%），景深看起來就是清楚的，外面再平順地化開。
++
++| Focus Falloff | 效果 |
++| --- | --- |
++| 1 | 引擎原本的行為，對焦區極薄 |
++| 3（預設） | 景深邊界約 11% 模糊，接近實際觀感 |
++| 6+ | 更寬鬆，模糊只在遠離對焦點時才明顯 |
++
++參考數字（Full Frame）：50mm f/5.6 對焦 5m → 景深 3.79–7.35m（寬 3.56m），FocusRange 送出 10.7。
++50mm f/1.4 同距離 → 景深 4.63–5.43m，FocusRange 2.4。超過超焦距時（例如 35mm f/8 對 10m）
++遠界為無限遠，FocusRange 會夾在上限，等於幾乎沒有景深，這是正確的。
++
++---
++
++## 焦距步進：Focal Step Mode
++
++引擎吃的是連續 FOV，所以「步進感」是靠量化**送進光學計算的焦距**做出來的——
++存起來的屬性仍然是推桿給的原值，只有實際算 FOV／景深／模糊時才吸附到格點。
++
++| 模式 | 行為 |
++| --- | --- |
++| Continuous | 不量化 |
++| Prime Lens Set（預設） | 吸附到 8/10/12/14/16/18/20/24/28/35/40/50/65/75/85/100/135/150/180/200/250/300/400/500/600 mm |
++| Geometric | 每倍焦距切 `Steps Per Doubling` 格（預設 6，即每格約 ×1.12） |
++
++吸附是在 log 空間取最近的一格，所以長短焦的手感一致。
+-- 
+2.47.1.windows.1
+

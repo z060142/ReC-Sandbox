@@ -1,0 +1,1105 @@
+From 961be44a324817bdceb6fae332a60642cdaa52c3 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Mon, 24 Aug 2026 00:37:04 +0800
+Subject: [PATCH 16/22] feat: revive Cinebox sprite bokeh with shaped-mask
+ intersection (v1)
+
+The CE3-era sprite DOF (technique DofBokehRef, dead code since the
+pipeline modernised) lives again as ExecuteSpriteBokeh in the DOF stage,
+selected by r_DepthOfFieldMode 0: one self-expanded quad per half-res
+pixel, splatting the classic procedural disc+rim - and beyond the
+original design, an optional shape TEXTURE (engine ships
+EngineAssets/ScreenSpace/bokeh_star/love/music/pentagon/square) that
+physically INTERSECTS with the iris polygon: effective aperture = mask
+intersected with blades, so stopping down eats the shape back into the
+blade polygon. Five latent bugs in the never-compiled shader fixed.
+
+Blade Rotation now turns all three aperture consumers in lockstep -
+diffraction streaks, gather kernel polygon, sprite intersection mask -
+via the new Dof_User_BladeRotation param.
+
+Two pipeline-order bugs found and fixed on the way, both latent in the
+default mode too: motion blur decided "did DOF run?" by re-deriving it
+from CDepthOfField::GetParams() - which is NOT pure (it advances a
+temporal smoother per call) and was called twice per frame, so MB could
+disagree with the DOF stage for exactly one frame on fast aperture
+sweeps and composite the pre-DOF sharp frame back over the result in
+velocity-tile-shaped stripes. The DOF stage now publishes
+HasWrittenHDRTarget() and MB consumes the fact.
+
+Marked v1: the exclusive full-splat mode 0 is preserved here before the
+hybrid (gather base + sparse highlight splats) supersedes it - spec in
+HybridDofSpec.md.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_017nykaDjTHxHDSo11CsYx6M
+---
+ .../Common/PostProcess/PostEffects.cpp        |   3 +
+ .../Common/PostProcess/PostEffects.h          |  10 +-
+ .../GraphicsPipeline/DepthOfField.cpp         | 229 +++++++++++++++++-
+ .../GraphicsPipeline/DepthOfField.h           |  27 ++-
+ .../GraphicsPipeline/MotionBlur.cpp           |  29 ++-
+ .../RenderDll/XRenderD3D9/PostProcessDOF.cpp  |   4 +
+ .../CinematicCamera/HybridDofSpec.md          |  57 +++++
+ .../Module/CinematicCameraComponent.cpp       |  56 +++++
+ .../Module/CinematicCameraComponent.h         |  32 ++-
+ .../CinematicCamera/SpriteBokehSpec.md        |  89 +++++++
+ .../Shaders/HWScripts/CryFX/DepthOfField.cfx  | 107 +++++---
+ 11 files changed, 590 insertions(+), 53 deletions(-)
+ create mode 100644 Code/CryPlugins/CinematicCamera/HybridDofSpec.md
+ create mode 100644 Code/CryPlugins/CinematicCamera/SpriteBokehSpec.md
+
+diff --git a/Code/CryEngine/RenderDll/Common/PostProcess/PostEffects.cpp b/Code/CryEngine/RenderDll/Common/PostProcess/PostEffects.cpp
+index d9e525a9..ee6f27a9 100644
+--- a/Code/CryEngine/RenderDll/Common/PostProcess/PostEffects.cpp
++++ b/Code/CryEngine/RenderDll/Common/PostProcess/PostEffects.cpp
+@@ -92,6 +92,9 @@ void CDepthOfField::Reset(bool bOnSpecChange)
+ 	m_pMaskedBlurAmount->ResetParam(0.0f);
+ 	m_pMaskedBlurMaskTex->Release();
+ 
++	m_pUserBokehShapeTex->Release();
++	m_pUserBladeRotation->ResetParam(0.0f);
++
+ 	m_pBokehMaskTex->Release();
+ 	m_pDebug->ResetParam(0.0f);
+ 	m_pActive->ResetParam(0.0f);
+diff --git a/Code/CryEngine/RenderDll/Common/PostProcess/PostEffects.h b/Code/CryEngine/RenderDll/Common/PostProcess/PostEffects.h
+index d23b7ac5..17186afa 100644
+--- a/Code/CryEngine/RenderDll/Common/PostProcess/PostEffects.h
++++ b/Code/CryEngine/RenderDll/Common/PostProcess/PostEffects.h
+@@ -143,7 +143,7 @@ private:
+ 
+ struct SDepthOfFieldParams
+ {
+-	SDepthOfFieldParams() : bGameMode(false), pMaskTex(0), fMaskBlendAmount(0.0f), fApertureBlades(8.0f), fApertureFNumber(8.0f)
++	SDepthOfFieldParams() : bGameMode(false), pMaskTex(0), pBokehShapeTex(0), fMaskBlendAmount(0.0f), fApertureBlades(8.0f), fApertureFNumber(8.0f), fBladeRotation(0.0f)
+ 	{
+ 	};
+ 
+@@ -152,8 +152,10 @@ struct SDepthOfFieldParams
+ 	bool      bGameMode;
+ 	float     fApertureBlades;   //!< Iris blade count shaping the bokeh polygon.
+ 	float     fApertureFNumber;  //!< F-number blending the kernel from circular (wide open) to polygonal (stopped down).
++	float     fBladeRotation;    //!< Iris phase in radians. One physical quantity shared by the bokeh polygon and the diffraction streaks.
+ 
+ 	CTexture* pMaskTex;
++	CTexture* pBokehShapeTex;    //!< Optional silhouette for the sprite bokeh splats; null keeps the procedural disc.
+ 	float     fMaskBlendAmount;
+ };
+ 
+@@ -187,7 +189,9 @@ public:
+ 		AddParamFloatNoTransition("Dof_User_FocusRange", m_pUserFocusRange, 5.0f);
+ 		AddParamFloatNoTransition("Dof_User_ApertureBlades", m_pUserApertureBlades, 8.0f);
+ 		AddParamFloatNoTransition("Dof_User_FNumber", m_pUserApertureFNumber, 8.0f);
++		AddParamFloatNoTransition("Dof_User_BladeRotation", m_pUserBladeRotation, 0.0f);
+ 		AddParamFloatNoTransition("Dof_User_BlurAmount", m_pUserBlurAmount, 1.0f);
++		AddParamTex("Dof_User_BokehShapeTex", m_pUserBokehShapeTex, 0);
+ 
+ 		AddParamFloatNoTransition("Dof_Tod_FocusRange", m_pTimeOfDayFocusRange, 1000.0f);
+ 		AddParamFloatNoTransition("Dof_Tod_BlurAmount", m_pTimeOfDayBlurAmount, 0.0f);
+@@ -236,7 +240,9 @@ private:
+ 	CEffectParam* m_pFocusMin, * m_pFocusMax, * m_pFocusLimit, * m_pMaskTex, * m_pDebug;
+ 	// bool, float, float, float, float
+ 	CEffectParam* m_pUserActive, * m_pUserFocusDistance, * m_pUserFocusRange, * m_pUserBlurAmount;
+-	CEffectParam* m_pUserApertureBlades, * m_pUserApertureFNumber;
++	CEffectParam* m_pUserApertureBlades, * m_pUserApertureFNumber, * m_pUserBladeRotation;
++	// CTexture: sprite bokeh silhouette
++	CEffectParam* m_pUserBokehShapeTex;
+ 	// float, float
+ 	CEffectParam* m_pTimeOfDayFocusRange, * m_pTimeOfDayBlurAmount;
+ 	// float, float
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DepthOfField.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DepthOfField.cpp
+index 6bfcb91f..95cbb166 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DepthOfField.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DepthOfField.cpp
+@@ -10,7 +10,7 @@ float NGon_Rad(float theta, float n)
+ }
+ 
+ // Shirley's concentric mapping
+-Vec4 CDepthOfFieldStage::ToUnitDisk(Vec4& origin, float blades, float fstop)
++Vec4 CDepthOfFieldStage::ToUnitDisk(Vec4& origin, float blades, float fstop, float rotation)
+ {
+ 	// Wide open irises are round (blades retracted); stopping down reveals the polygon.
+ 	// The window must overlap with LARGE bokeh discs or the shape is never readable, so the
+@@ -45,7 +45,10 @@ Vec4 CDepthOfFieldStage::ToUnitDisk(Vec4& origin, float blades, float fstop)
+ 	// centre and vertex is only 19% for a pentagon, 8% for an octagon - too subtle after
+ 	// the quarter-res gather and TAA). Live-tunable via r_DofBokehShapeStrength.
+ 	const float shapeStrength = clamp_tpl(CRenderer::CV_r_DofBokehShapeStrength, 0.25f, 4.0f);
+-	const float rr = fabsf(r) * powf(NGon_Rad(finalAngle, blades), normalizedStops * shapeStrength);
++	// Rotating the radius function rotates the polygon; the tap directions themselves stay put,
++	// so the disc keeps its coverage and only the flat edges turn. Same phase the diffraction
++	// streaks use - one iris, one orientation.
++	const float rr = fabsf(r) * powf(NGon_Rad(finalAngle - rotation, blades), normalizedStops * shapeStrength);
+ 
+ 	return Vec4(rr * cosf(finalAngle), rr * sinf(finalAngle), 0.0f, 0.0f);
+ }
+@@ -54,6 +57,8 @@ void CDepthOfFieldStage::Execute()
+ {
+ 	FUNCTION_PROFILER_RENDERER();
+ 
++	m_bWroteHDRTarget = false;
++
+ 	CDepthOfField* pDofRenderTech = (CDepthOfField*)PostEffectMgr()->GetEffect(EPostEffectID::DepthOfField);
+ 	SDepthOfFieldParams dofParams = pDofRenderTech->GetParams();
+ 
+@@ -107,11 +112,23 @@ void CDepthOfFieldStage::Execute()
+ 		dofParams.vFocus.w = -vFocus.z / (vFocus.x + 1e-6f);
+ 	}
+ 
++	// Iris phase, shared with the diffraction streaks so a rotating aperture turns the bokeh
++	// polygon and the sunstars together.
++	const float fBladeRotation = dofParams.fBladeRotation;
++
+ 	Vec4 vDofParams0 = dofParams.vFocus;
+ 
+ 	const float fNearestDofScaleBoost = dofParams.bGameMode ? CRenderer::CV_r_dofMinZBlendMult : 1.0f;
+ 	Vec4 vDofParams1 = Vec4(CRenderer::CV_r_dofMinZ + dofParams.vMinZParams.x, CRenderer::CV_r_dofMinZScale + dofParams.vMinZParams.y, fNearestDofScaleBoost, vFocus.w);
+ 
++	// r_DepthOfFieldMode 0 selects the legacy sprite/splat bokeh instead of the gather kernel.
++	// Everything below this branch is the untouched gather path.
++	if (CRenderer::CV_r_DofMode == 0)
++	{
++		ExecuteSpriteBokeh(dofParams, vDofParams0, vDofParams1);
++		return;
++	}
++
+ 	// For better blending later
+ 	m_passCopySceneTarget.Execute(m_graphicsPipelineResources.m_pTexHDRTarget, m_graphicsPipelineResources.m_pTexSceneTarget);
+ 
+@@ -181,7 +198,7 @@ void CDepthOfFieldStage::Execute()
+ 				for (int32 x = 0; x < nSquareTapsSide; ++x)
+ 				{
+ 					Vec4 t = Vec4(x * fRecipTaps, y * fRecipTaps, 0, 0);
+-					vTaps[x + y * nSquareTapsSide] = ToUnitDisk(t, fNumApertureSides, fFNumber);
++					vTaps[x + y * nSquareTapsSide] = ToUnitDisk(t, fNumApertureSides, fFNumber, fBladeRotation);
+ 				}
+ 			}
+ 
+@@ -226,7 +243,7 @@ void CDepthOfFieldStage::Execute()
+ 				for (int32 x = 0; x < nSquareTapsSide; ++x)
+ 				{
+ 					Vec4 t = Vec4(x * fRecipTaps, y * fRecipTaps, 0, 0);
+-					vTaps[x + y * nSquareTapsSide] = ToUnitDisk(t, fNumApertureSides, fFNumber);
++					vTaps[x + y * nSquareTapsSide] = ToUnitDisk(t, fNumApertureSides, fFNumber, fBladeRotation);
+ 				}
+ 			}
+ 
+@@ -288,4 +305,208 @@ void CDepthOfFieldStage::Execute()
+ 			m_passComposition.Execute();
+ 		}
+ 	}
++
++	m_bWroteHDRTarget = true;
++}
++
++//////////////////////////////////////////////////////////////////////////////////////////////////
++// Sprite bokeh (r_DepthOfFieldMode 0)
++//
++// Port of the pre-5.7 CMotionBlur::Execute() splat path onto CPrimitiveRenderPass. One quad per
++// half-resolution pixel is expanded on the GPU from SV_VertexID - there is no vertex stream at
++// all, so the draw is a plain non-indexed triangle list of width * height * 6 vertices. Every
++// quad reads scene colour and depth in the vertex shader, sizes itself by the circle of
++// confusion, and is additively accumulated into a near and a far layer; a normalization pass
++// then divides by the accumulated weight and composites the result over the scene.
++//////////////////////////////////////////////////////////////////////////////////////////////////
++void CDepthOfFieldStage::ExecuteSpriteBokeh(const SDepthOfFieldParams& dofParams, const Vec4& vDofParams0, const Vec4& vDofParams1)
++{
++	PROFILE_LABEL_SCOPE("SPRITE DOF");
++
++	CShader* pShader = CShaderMan::s_shPostDepthOfField;
++
++	CTexture* pSceneTarget = m_graphicsPipelineResources.m_pTexSceneTarget;
++	CTexture* pSplatSource = m_graphicsPipelineResources.m_pTexHDRTargetScaled[0][0];
++	CTexture* pLayerNear = m_graphicsPipelineResources.m_pTexHDRTargetMaskedScaled[0][0];
++	CTexture* pLayerFar = m_graphicsPipelineResources.m_pTexHDRTargetMaskedScaled[0][1];
++
++	if (!CTexture::IsTextureExist(pSplatSource) || !CTexture::IsTextureExist(pLayerNear) || !CTexture::IsTextureExist(pLayerFar))
++		return;
++
++	// Untouched scene copy for the composition pass to blend against, plus the half resolution
++	// source the splats sample from.
++	m_passSpriteCopySceneTarget.Execute(m_graphicsPipelineResources.m_pTexHDRTarget, pSceneTarget);
++	m_passSpriteDownscale.Execute(m_graphicsPipelineResources.m_pTexHDRTarget, pSplatSource);
++
++	const int32 nWidth = pLayerNear->GetWidth();
++	const int32 nHeight = pLayerNear->GetHeight();
++	const uint32 nBokehVertexCount = uint32(nWidth) * uint32(nHeight) * 3 * 2;
++	// Assume tweaked for 1600x900 with render target scale of 0.8
++	const float fBokehNormFactor = (float)(640 * 360 * 3 * 2) / (float)nBokehVertexCount;
++
++	// Iris shaping, sharing the gather path's semantics: blade count from the post params and a
++	// polygon blend that stays round at f/1.2 and is fully formed by f/2.8.
++	float fFNumber = dofParams.fApertureFNumber;
++	float fNumApertureSides = clamp_tpl(dofParams.fApertureBlades, 3.0f, 16.0f);
++	if (CRenderer::CV_r_DofBokehQuality >= 3)
++	{
++		fNumApertureSides = (float)CRenderer::CV_r_DofBokehQuality;
++		fFNumber = 8.0f;
++	}
++
++	const float minFstops = 1.2f;
++	const float maxFstops = 2.8f;
++	const float fPolygonBlend = clamp_tpl((fFNumber - minFstops) / (maxFstops - minFstops), 0.0f, 1.0f);
++
++	CTexture* pShapeTex = dofParams.pBokehShapeTex;
++	const bool bShapeTexValid = CTexture::IsTextureExist(pShapeTex);
++	if (!bShapeTexValid)
++		pShapeTex = CRendererResources::s_ptexWhite;
++
++	const float fTargetWidth = (float)m_graphicsPipelineResources.m_pTexHDRTarget->GetWidth();
++	const float fTargetHeight = (float)m_graphicsPipelineResources.m_pTexHDRTarget->GetHeight();
++	const float fAspectRatio = (1920.0f / 1080.0f) * (fTargetHeight / fTargetWidth);
++	const Vec4 vAspectRatio(fAspectRatio * (fTargetWidth / 1920.0f), fTargetHeight / 1080.0f, fBokehNormFactor / 80.0f, CRenderer::CV_r_dofDilation);
++	const Vec4 vBokehShape(fNumApertureSides, fPolygonBlend, bShapeTexValid ? 1.0f : 0.0f, dofParams.fBladeRotation);
++
++	static CCryNameR dofFocusParam0Name("vDofParamsFocus0");
++	static CCryNameR dofFocusParam1Name("vDofParamsFocus1");
++	static CCryNameR dofAspectRatioName("vAspectRatio");
++	static CCryNameR dofBokehShapeName("vDofBokehShape");
++
++	// Ground truth log, once per change: what the splat grid and the iris actually resolve to.
++	{
++		static int   s_lastWidth = -1, s_lastHeight = -1, s_lastShapeBound = -1;
++		static float s_lastBlades = -1.0f, s_lastBlend = -1.0f;
++		if (nWidth != s_lastWidth || nHeight != s_lastHeight || (bShapeTexValid ? 1 : 0) != s_lastShapeBound ||
++		    fabsf(fNumApertureSides - s_lastBlades) > 0.01f || fabsf(fPolygonBlend - s_lastBlend) > 0.01f)
++		{
++			s_lastWidth = nWidth;
++			s_lastHeight = nHeight;
++			s_lastShapeBound = bShapeTexValid ? 1 : 0;
++			s_lastBlades = fNumApertureSides;
++			s_lastBlend = fPolygonBlend;
++			CryLog("[DOF] sprite grid %dx%d (%u verts) norm=%.4f blades=%.0f polyBlend=%.2f shapeTex=%s",
++			       nWidth, nHeight, nBokehVertexCount, fBokehNormFactor, fNumApertureSides, fPolygonBlend,
++			       bShapeTexValid ? "yes" : "no");
++		}
++	}
++
++	// Accumulate the splats
++	{
++		PROFILE_LABEL_SCOPE("QUAD BOKEH DOF");
++
++		CClearSurfacePass::Execute(pLayerNear, Clr_Transparent);
++		CClearSurfacePass::Execute(pLayerFar, Clr_Transparent);
++
++		if (!m_pSpritePerViewCB)
++		{
++			m_pSpritePerViewCB = gcpRendD3D->m_DevBufMan.CreateConstantBuffer(sizeof(HLSL_PerViewGlobalConstantBuffer));
++			if (m_pSpritePerViewCB)
++				m_pSpritePerViewCB->SetDebugName("SpriteBokeh Per-View CB");
++		}
++		if (!m_pSpritePerViewCB)
++			return;
++
++		// The vertex shader derives its quad grid and pixel size from the per-view screen size,
++		// so that has to describe the half resolution layer, not the full screen.
++		const SRenderViewInfo& viewInfo = m_graphicsPipeline.GetCurrentViewInfo(CCamera::eEye_Left);
++		const SRenderViewport customViewport(0, 0, nWidth, nHeight);
++		m_graphicsPipeline.GeneratePerViewConstantBuffer(&viewInfo, (int)m_graphicsPipeline.GetViewInfoCount(), m_pSpritePerViewCB, &customViewport);
++
++		D3DViewPort viewport;
++		viewport.TopLeftX = 0.0f;
++		viewport.TopLeftY = 0.0f;
++		viewport.Width = (float)nWidth;
++		viewport.Height = (float)nHeight;
++		viewport.MinDepth = 0.0f;
++		viewport.MaxDepth = 1.0f;
++
++		m_passSpriteSplat.SetRenderTarget(0, pLayerNear);
++		m_passSpriteSplat.SetRenderTarget(1, pLayerFar);
++		m_passSpriteSplat.SetViewport(viewport);
++		m_passSpriteSplat.BeginAddingPrimitives();
++
++		static CCryNameTSCRC techSpriteBokeh("DofBokehRef");
++		const uint64 rtMask = (CRenderer::CV_r_dofDilation > 0.001f) ? g_HWSR_MaskBit[HWSR_SAMPLE1] : 0;
++
++		CRenderPrimitive& prim = m_spriteSplatPrimitive;
++		prim.SetFlags(CRenderPrimitive::eFlags_ReflectShaderConstants_VS | CRenderPrimitive::eFlags_ReflectShaderConstants_PS);
++		prim.SetTechnique(pShader, techSpriteBokeh, rtMask);
++		prim.SetRenderState(GS_NODEPTHTEST | GS_BLSRC_ONE | GS_BLDST_ONE);
++		prim.SetCullMode(eCULL_None);
++
++		// Procedural geometry: no vertex or index stream, six vertices per source pixel.
++		prim.SetCustomVertexStream(~0u, EDefaultInputLayouts::Empty, 0);
++		prim.SetDrawInfo(eptTriangleList, 0, 0, nBokehVertexCount);
++
++		// Scene colour and depth are read from the vertex shader as well as the pixel shader.
++		prim.SetTexture(0, pSplatSource, EDefaultResourceViews::Default, EShaderStage_Vertex | EShaderStage_Pixel);
++		prim.SetTexture(1, m_graphicsPipelineResources.m_pTexLinearDepth, EDefaultResourceViews::Default, EShaderStage_Vertex | EShaderStage_Pixel);
++		prim.SetTexture(2, CRendererResources::s_ptexGrainFilterMap);
++		prim.SetTexture(3, pShapeTex);
++		prim.SetSampler(0, EDefaultSamplerStates::PointClamp, EShaderStage_Vertex | EShaderStage_Pixel);
++		prim.SetSampler(1, EDefaultSamplerStates::PointClamp, EShaderStage_Vertex | EShaderStage_Pixel);
++		prim.SetSampler(2, EDefaultSamplerStates::PointWrap);
++		prim.SetSampler(3, EDefaultSamplerStates::LinearClamp);
++
++		prim.SetInlineConstantBuffer(eConstantBufferShaderSlot_PerView, m_pSpritePerViewCB, EShaderStage_Vertex | EShaderStage_Pixel);
++
++		if (prim.Compile(m_passSpriteSplat) == CRenderPrimitive::eDirty_None)
++		{
++			auto& constantManager = prim.GetConstantManager();
++			constantManager.BeginNamedConstantUpdate();
++			constantManager.SetNamedConstant(dofFocusParam0Name, vDofParams0, eHWSC_Vertex);
++			constantManager.SetNamedConstant(dofFocusParam1Name, vDofParams1, eHWSC_Vertex);
++			constantManager.SetNamedConstant(dofAspectRatioName, vAspectRatio, eHWSC_Vertex);
++			constantManager.SetNamedConstant(dofFocusParam0Name, vDofParams0, eHWSC_Pixel);
++			constantManager.SetNamedConstant(dofFocusParam1Name, vDofParams1, eHWSC_Pixel);
++			constantManager.SetNamedConstant(dofAspectRatioName, vAspectRatio, eHWSC_Pixel);
++			constantManager.SetNamedConstant(dofBokehShapeName, vBokehShape, eHWSC_Pixel);
++			constantManager.EndNamedConstantUpdate(&viewport, m_graphicsPipeline.GetCurrentRenderView());
++
++			m_passSpriteSplat.AddPrimitive(&prim);
++			m_passSpriteSplat.Execute();
++		}
++		else
++		{
++			static bool s_bWarned = false;
++			if (!s_bWarned)
++			{
++				s_bWarned = true;
++				CryLogAlways("[DOF] sprite bokeh primitive failed to compile - splat pass skipped");
++			}
++		}
++	}
++
++	// Normalize the accumulated layers and composite them over the scene copy
++	{
++		PROFILE_LABEL_SCOPE("BOKEH DOF COMPOSE");
++
++		if (m_passSpriteComposition.IsDirty())
++		{
++			static CCryNameTSCRC techSpriteCompose("RefDofMbNormalizePass");
++			m_passSpriteComposition.SetPrimitiveFlags(CRenderPrimitive::eFlags_ReflectShaderConstants_PS);
++			m_passSpriteComposition.SetPrimitiveType(CRenderPrimitive::ePrim_ProceduralTriangle);
++			m_passSpriteComposition.SetTechnique(pShader, techSpriteCompose, 0);
++			m_passSpriteComposition.SetRenderTarget(0, m_graphicsPipelineResources.m_pTexHDRTarget);
++			// RefDofMBNormalizePS already returns the finished composite (it lerps the scene
++			// copy against the normalized layers itself), so write it straight out. The legacy
++			// src-alpha blend applied that same weight a second time against an HDR target that
++			// still held the identical scene, which quietly halved the effect.
++			m_passSpriteComposition.SetState(GS_NODEPTHTEST);
++
++			m_passSpriteComposition.SetTextureSamplerPair(0, pLayerNear, EDefaultSamplerStates::LinearClamp);
++			m_passSpriteComposition.SetTextureSamplerPair(1, pLayerFar, EDefaultSamplerStates::LinearClamp);
++			m_passSpriteComposition.SetTextureSamplerPair(2, pSceneTarget, EDefaultSamplerStates::PointClamp);
++			m_passSpriteComposition.SetTextureSamplerPair(3, m_graphicsPipelineResources.m_pTexLinearDepth, EDefaultSamplerStates::PointClamp);
++		}
++
++		m_passSpriteComposition.BeginConstantUpdate();
++		m_passSpriteComposition.SetConstant(dofFocusParam0Name, vDofParams0, eHWSC_Pixel);
++		m_passSpriteComposition.SetConstant(dofFocusParam1Name, vDofParams1, eHWSC_Pixel);
++		m_passSpriteComposition.Execute();
++	}
++
++	m_bWroteHDRTarget = true;
+ }
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DepthOfField.h b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DepthOfField.h
+index 1d4f5224..71a0ecb0 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DepthOfField.h
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DepthOfField.h
+@@ -4,8 +4,11 @@
+ 
+ #include "Common/GraphicsPipelineStage.h"
+ #include "Common/FullscreenPass.h"
++#include "Common/PrimitiveRenderPass.h"
+ #include "Common/UtilityPasses.h"
+ 
++struct SDepthOfFieldParams;
++
+ class CDepthOfFieldStage : public CGraphicsPipelineStage
+ {
+ public:
+@@ -18,6 +21,9 @@ public:
+ 		, m_passGather0(&graphicsPipeline)
+ 		, m_passGather1(&graphicsPipeline)
+ 		, m_passComposition(&graphicsPipeline)
++		, m_passSpriteCopySceneTarget(&graphicsPipeline)
++		, m_passSpriteDownscale(&graphicsPipeline)
++		, m_passSpriteComposition(&graphicsPipeline)
+ 	{
+ 		for (auto& pass : m_passTileMinCoC)
+ 			pass.SetGraphicsPipeline(&graphicsPipeline);
+@@ -30,8 +36,17 @@ public:
+ 
+ 	void Execute();
+ 
++	//! True when this frame's Execute() actually composited depth of field into the HDR target.
++	//! CMotionBlurStage needs the fact, not a second guess at it: CDepthOfField::GetParams()
++	//! advances a temporal smoother on every call, so a second evaluation of the same
++	//! threshold can disagree with what this stage really did.
++	bool HasWrittenHDRTarget() const { return m_bWroteHDRTarget; }
++
+ private:
+-	Vec4 ToUnitDisk(Vec4& origin, float blades, float fstop);
++	Vec4 ToUnitDisk(Vec4& origin, float blades, float fstop, float rotation);
++
++	// Legacy sprite/splat bokeh path (r_DepthOfFieldMode 0), ported from the pre-5.7 pipeline.
++	void ExecuteSpriteBokeh(const SDepthOfFieldParams& dofParams, const Vec4& vDofParams0, const Vec4& vDofParams1);
+ 
+ private:
+ 	CStretchRectPass m_passCopySceneTarget;
+@@ -40,4 +55,14 @@ private:
+ 	CFullscreenPass  m_passGather0;
+ 	CFullscreenPass  m_passGather1;
+ 	CFullscreenPass  m_passComposition;
++
++	// Sprite bokeh path
++	CStretchRectPass     m_passSpriteCopySceneTarget;
++	CStretchRectPass     m_passSpriteDownscale;
++	CPrimitiveRenderPass m_passSpriteSplat;
++	CRenderPrimitive     m_spriteSplatPrimitive;
++	CConstantBufferPtr   m_pSpritePerViewCB;
++	CFullscreenPass      m_passSpriteComposition;
++
++	bool m_bWroteHDRTarget = false;
+ };
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/MotionBlur.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/MotionBlur.cpp
+index 8115fc2b..28cdc0fc 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/MotionBlur.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/MotionBlur.cpp
+@@ -2,6 +2,7 @@
+ 
+ #include "StdAfx.h"
+ #include "MotionBlur.h"
++#include "DepthOfField.h"
+ #include "D3DPostProcess.h"
+ 
+ float CMotionBlurStage::ComputeMotionScale()
+@@ -28,11 +29,25 @@ void CMotionBlurStage::Execute()
+ 
+ 	int vpWidth = viewport.width, vpHeight = viewport.height;
+ 
+-	// Check if DOF is enabled
++	// CDepthOfField::GetParams() is not a pure accessor - it advances the focus/blur temporal
++	// smoother by one step per call. The depth of field stage above already took this frame's
++	// step; this call is deliberately kept so the settling rate stays what it has always been.
+ 	CDepthOfField* pDofRenderTech = (CDepthOfField*)PostEffectMgr()->GetEffect(EPostEffectID::DepthOfField);
+-	SDepthOfFieldParams dofParams = pDofRenderTech->GetParams();
+-	dofParams.vFocus.w *= 2.0f;
+-	const bool bGatherDofEnabled = CRenderer::CV_r_dof > 0 && CRenderer::CV_r_DofMode == 1 && dofParams.vFocus.w > 0.0001f;
++	pDofRenderTech->GetParams();
++
++	// Whichever depth of field mode is active - gather (CDepthOfFieldStage's kernel) or sprite
++	// splats - has already written its result into the HDR target by the time this stage runs,
++	// so motion blur must source from a copy of that. HDRTargetPrev still holds the pre-DOF
++	// frame (CStandardGraphicsPipeline fills it just before the DOF stage); sourcing that when
++	// depth of field did run composites the sharp scene straight back over the blur.
++	//
++	// Ask the stage what it actually did rather than re-deriving it here. The two evaluations
++	// used to disagree for a single frame whenever the aperture moved fast, because this one
++	// sees the smoother one step further along AND tested a different threshold (2*w > 0.0001
++	// against the stage's w >= 0.0001) - which flashed one frame of velocity-tile stripes
++	// across the whole window.
++	const bool bDofEnabled = CRenderer::CV_r_dof > 0 &&
++	                         m_graphicsPipeline.GetStage<CDepthOfFieldStage>()->HasWrittenHDRTarget();
+ 
+ 	SRenderViewInfo viewInfo[2];
+ 	m_graphicsPipeline.GenerateViewInfo(viewInfo);
+@@ -165,12 +180,12 @@ void CMotionBlurStage::Execute()
+ 	{
+ 		PROFILE_LABEL_SCOPE("MOTION VECTOR APPLY");
+ 
+-		if (bGatherDofEnabled)
++		if (bDofEnabled)
+ 		{
+ 			m_passCopy.Execute(m_graphicsPipelineResources.m_pTexHDRTarget, m_graphicsPipelineResources.m_pTexSceneTargetR11G11B10F[0]);
+ 		}
+ 
+-		if (m_passMotionBlur.IsDirty(CRenderer::CV_r_MotionBlurQuality, bGatherDofEnabled))
++		if (m_passMotionBlur.IsDirty(CRenderer::CV_r_MotionBlurQuality, bDofEnabled))
+ 		{
+ 			uint64 rtMask = 0;
+ 			rtMask |= (CRenderer::CV_r_MotionBlurQuality >= 2) ? g_HWSR_MaskBit[HWSR_SAMPLE2] : 0;
+@@ -183,7 +198,7 @@ void CMotionBlurStage::Execute()
+ 			m_passMotionBlur.SetFlags(CPrimitiveRenderPass::ePassFlags_VrProjectionPass);
+ 			m_passMotionBlur.SetRenderTarget(0, m_graphicsPipelineResources.m_pTexHDRTarget);
+ 			m_passMotionBlur.SetState(GS_NODEPTHTEST | GS_BLSRC_ONE | GS_BLDST_ONEMINUSSRCALPHA);
+-			m_passMotionBlur.SetTexture(0, bGatherDofEnabled ? m_graphicsPipelineResources.m_pTexSceneTargetR11G11B10F[0] : m_graphicsPipelineResources.m_pTexHDRTargetPrev[RenderView()->GetCurrentEye()]);
++			m_passMotionBlur.SetTexture(0, bDofEnabled ? m_graphicsPipelineResources.m_pTexSceneTargetR11G11B10F[0] : m_graphicsPipelineResources.m_pTexHDRTargetPrev[RenderView()->GetCurrentEye()]);
+ 			m_passMotionBlur.SetTexture(1, m_graphicsPipelineResources.m_pTexVelocity);
+ 			m_passMotionBlur.SetTexture(2, m_graphicsPipelineResources.m_pTexVelocityTiles[2]);
+ 			m_passMotionBlur.SetSampler(0, EDefaultSamplerStates::LinearClamp);
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/PostProcessDOF.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/PostProcessDOF.cpp
+index 97154399..e5ff77f9 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/PostProcessDOF.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/PostProcessDOF.cpp
+@@ -103,11 +103,15 @@ SDepthOfFieldParams CDepthOfField::GetParams()
+ 
+ 	pParams.fApertureBlades = m_pUserApertureBlades->GetParam();
+ 	pParams.fApertureFNumber = m_pUserApertureFNumber->GetParam();
++	pParams.fBladeRotation = m_pUserBladeRotation->GetParam();
+ 
+ 	pParams.vMinZParams.x = m_pFocusMinZ->GetParam();
+ 	pParams.vMinZParams.y = m_pFocusMinZScale->GetParam();
+ 	pParams.vMinZParams.z = pParams.vMinZParams.w = 0.0f;
+ 
++	// Sprite bokeh silhouette (CDepthOfFieldStage::ExecuteSpriteBokeh); null = procedural shape.
++	pParams.pBokehShapeTex = const_cast<CTexture*>(static_cast<CParamTexture*>(m_pUserBokehShapeTex)->GetParamTexture());
++
+ 	pParams.pMaskTex = 0;
+ 	pParams.fMaskBlendAmount = 1.0;
+ 	if (m_pUseMask->GetParam())
+diff --git a/Code/CryPlugins/CinematicCamera/HybridDofSpec.md b/Code/CryPlugins/CinematicCamera/HybridDofSpec.md
+new file mode 100644
+index 00000000..f1ec5f37
+--- /dev/null
++++ b/Code/CryPlugins/CinematicCamera/HybridDofSpec.md
+@@ -0,0 +1,57 @@
++# Hybrid DOF（Sprite Bokeh 2.0）規格
++
++演進目標:把互斥的 mode 0（全潑濺）/ mode 1（gather）合體為業界現代做法——
++**gather 當底、潑濺只給亮點**（UE Diaphragm DOF / Frostbite 同族)。一石四鳥:
++模式互斥消失、潑濺量化閃爍的舞台縮小百倍、fillrate 有界、形狀貼圖與多邊形交集全數保留。
++
++前提:本規格動工前,v1(復刻版,mode 0=全潑濺)已 commit 留存,可隨時回溯對照。
++
++## 1. 新語意
++
++- `r_DepthOfFieldMode 1`(預設):純 gather,行為與現在**逐位元相同**。
++- `r_DepthOfFieldMode 0`:**Hybrid**——先跑完整 gather(與 mode 1 同一條路),
++  再疊亮點潑濺層。舊的全潑濺路徑退役(git 歷史留存,不留執行期開關)。
++- Plugin 的 `Use Sprite Bokeh` 屬性語意不變(驅動 cvar),文檔另更新。
++
++## 2. Hybrid 管線
++
++1. **Gather 先行**:mode 0 也執行既有 gather 全流程(含多邊形 kernel、
++   Focus Falloff、blur amount)。輸出與 mode 1 相同的模糊場景。
++2. **亮點篩選(在既有 sprite VS 內做,不引入 compute)**:
++   每 quad 取樣來源像素後,以**場景 HDR 亮度的軟膝閾值**決定去留:
++   ```
++   excess = max(0, luminance - threshold)        // soft knee 比照 streaks 的作法
++   if (excess 很小 || fDepthBlur 很小) → quad 歸零丟棄(現有 kill 路徑)
++   splat 顏色 = 色相保留 × excess 部分的能量     // 只潑「gather 表現不了的超出能量」
++   ```
++   只潑 excess 是能量雙算的解法:gather 已把基礎能量糊開,潑濺補的是高光在
++   gather 下被壓扁的那部分。閾值參數 `Dof_User_HighlightThreshold`
++   (post param,預設 2.0,場景 HDR 值域,plugin 端暫不暴露屬性——等實測後決定)。
++3. **合成順序改變**:潑濺層 normalize 後以加法(或 premultiplied over)疊在
++   **gather 結果**之上——不再是「潑濺 vs 銳利場景」的取代式合成。
++   v1 的 normalize pass 邏輯對應改寫。
++4. 形狀貼圖、多邊形交集、blade rotation(上一輪剛統一)在潑濺 PS 內原樣保留。
++
++## 3. 穩定性
++
++- 軟膝要夠寬(threshold 的 ±50%)以抑制亮點在閾值邊緣的 popping;
++  變焦/光圈快速變化下不得出現整窗閃爍(上一輪修的 bDofEnabled 遲滯照舊有效,
++  hybrid 下 vFocus.w 的語意不變)。
++- 半解析度來源的量化閃爍:潑濺數量級縮小後應大幅緩解;若殘留,
++  來源取樣改 2x2 平均(預濾波)——做成程式常數,不用暴露。
++
++## 4. 驗收
++
++1. mode 1 逐位元不變(gather 段 diff 為空)。
++2. mode 0:全畫面有 gather 模糊(v1 沒有的!) + 失焦亮點上有形狀潑濺
++   (貼圖形狀/多邊形交集/rotation 皆作用)。
++3. 亮點潑濺與 gather 光斑同位置、尺寸一致(CoC 同源),無「雙重光斑」錯位。
++4. 一般場景(無極亮點)mode 0 ≈ mode 1 畫面,潑濺量 ~0。
++5. 快速拉光圈/變焦:無整窗條紋、無亮點 popping 群舞。
++6. 效能:mode 0 在 1080p 高光場景 < gather + 1ms(潑濺已稀疏化)。
++7. 既有一切(星芒、gather 多邊形、診斷 cvar)不回歸。
++
++## 5. 建置部署約束
++
++同前輪:內附 CMake、Profile 零警告、部署至慣例位置(備份不可動、鎖檔回報)、
++loose `DepthOfField.cfx` 隨部署、不 commit(由主線驗收後統一收)。
+diff --git a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp
+index 3cfaed8c..e883eaf4 100644
+--- a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp
++++ b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp
+@@ -149,6 +149,7 @@ void CCinematicCameraComponent::ProcessEvent(const SEntityEvent& event)
+ 		RestoreDOF();
+ 		RestoreFilmGrain();
+ 	RestoreMotionBlur();
++	RestoreSpriteBokeh();
+ 	RestoreWhiteBalance();
+ 	RestoreLensCharacter();
+ 	RestoreStreaks();
+@@ -171,6 +172,7 @@ void CCinematicCameraComponent::OnShutDown()
+ 	RestoreDOF();
+ 	RestoreFilmGrain();
+ 	RestoreMotionBlur();
++	RestoreSpriteBokeh();
+ 	RestoreWhiteBalance();
+ 	RestoreLensCharacter();
+ 	RestoreStreaks();
+@@ -199,6 +201,7 @@ void CCinematicCameraComponent::Activate()
+ 		s_pActive->RestoreDOF();
+ 		s_pActive->RestoreFilmGrain();
+ 		s_pActive->RestoreMotionBlur();
++		s_pActive->RestoreSpriteBokeh();
+ 		s_pActive->RestoreWhiteBalance();
+ 		s_pActive->RestoreLensCharacter();
+ 		s_pActive->RestoreStreaks();
+@@ -223,6 +226,7 @@ void CCinematicCameraComponent::Deactivate()
+ 	RestoreDOF();
+ 	RestoreFilmGrain();
+ 	RestoreMotionBlur();
++	RestoreSpriteBokeh();
+ 	RestoreWhiteBalance();
+ 	RestoreLensCharacter();
+ 	RestoreStreaks();
+@@ -453,6 +457,7 @@ void CCinematicCameraComponent::ApplyDOF()
+ 		gEnv->p3DEngine->GetPostEffectParam("Dof_User_FocusDistance", m_savedDofFocusDist);
+ 		gEnv->p3DEngine->GetPostEffectParam("Dof_User_FocusRange",    m_savedDofFocusRange);
+ 		gEnv->p3DEngine->GetPostEffectParam("Dof_User_BlurAmount",    m_savedDofBlurAmount);
++		gEnv->p3DEngine->GetPostEffectParam("Dof_User_BladeRotation", m_savedDofBladeRotation);
+ 		m_bDofParamsSaved = true;
+ 	}
+ 
+@@ -463,6 +468,11 @@ void CCinematicCameraComponent::ApplyDOF()
+ 	gEnv->p3DEngine->SetPostEffectParam("Dof_User_BlurAmount",    ComputeMaxBlurAmount());
+ 	gEnv->p3DEngine->SetPostEffectParam("Dof_User_ApertureBlades", (float)(int)m_lens.apertureBlades);
+ 	gEnv->p3DEngine->SetPostEffectParam("Dof_User_FNumber",        (float)m_lens.aperture);
++	// The iris phase is one physical quantity: the same rotation that turns the diffraction
++	// streaks has to turn the bokeh polygon, or the two visibly de-sync. The property still
++	// lives in the Streaks group - moving it between groups would reset serialized values,
++	// so that migration waits for the lens-preset pass.
++	gEnv->p3DEngine->SetPostEffectParam("Dof_User_BladeRotation",  DEG2RAD((float)m_streaks.bladeRotation));
+ }
+ 
+ void CCinematicCameraComponent::RestoreDOF()
+@@ -474,6 +484,7 @@ void CCinematicCameraComponent::RestoreDOF()
+ 	gEnv->p3DEngine->SetPostEffectParam("Dof_User_FocusDistance", m_savedDofFocusDist);
+ 	gEnv->p3DEngine->SetPostEffectParam("Dof_User_FocusRange",    m_savedDofFocusRange);
+ 	gEnv->p3DEngine->SetPostEffectParam("Dof_User_BlurAmount",    m_savedDofBlurAmount);
++	gEnv->p3DEngine->SetPostEffectParam("Dof_User_BladeRotation", m_savedDofBladeRotation);
+ 
+ 	ICVar* pDofCVar = gEnv->pConsole->GetCVar("r_dof");
+ 	if (pDofCVar)
+@@ -717,6 +728,50 @@ void CCinematicCameraComponent::RestoreMotionBlur()
+ 	m_bMBParamsSaved = false;
+ }
+ 
++// Sprite bokeh is a renderer mode switch (r_DepthOfFieldMode 0) plus the shape texture the
++// splat shader intersects with the iris polygon. Saved and restored like the motion blur
++// cvars, so leaving the camera never strands the renderer in a mode nobody asked for.
++void CCinematicCameraComponent::ApplySpriteBokeh()
++{
++	if (!m_lens.bUseSpriteBokeh)
++	{
++		RestoreSpriteBokeh();
++		return;
++	}
++
++	ICVar* pDofMode = gEnv->pConsole->GetCVar("r_DepthOfFieldMode");
++	if (pDofMode == nullptr)
++		return;
++
++	if (!m_bSpriteBokehSaved)
++	{
++		m_savedDofModeCVar = pDofMode->GetIVal();
++
++		const char* szShapeTex = nullptr;
++		gEnv->p3DEngine->GetPostEffectParamString("Dof_User_BokehShapeTex", szShapeTex);
++		m_savedBokehShapeTex = szShapeTex ? szShapeTex : "";
++
++		m_bSpriteBokehSaved = true;
++	}
++
++	if (pDofMode->GetIVal() != 0)
++		pDofMode->Set(0);
++
++	gEnv->p3DEngine->SetPostEffectParamString("Dof_User_BokehShapeTex", m_lens.bokehShapeTex.value.c_str());
++}
++
++void CCinematicCameraComponent::RestoreSpriteBokeh()
++{
++	if (!m_bSpriteBokehSaved)
++		return;
++
++	if (ICVar* pDofMode = gEnv->pConsole->GetCVar("r_DepthOfFieldMode"))
++		pDofMode->Set(m_savedDofModeCVar);
++
++	gEnv->p3DEngine->SetPostEffectParamString("Dof_User_BokehShapeTex", m_savedBokehShapeTex.c_str());
++	m_bSpriteBokehSaved = false;
++}
++
+ void CCinematicCameraComponent::RestoreFilmGrain()
+ {
+ 	if (!m_bGrainParamSaved)
+@@ -835,6 +890,7 @@ void CCinematicCameraComponent::FinalizeGameCamera()
+ 
+ 	ApplyFilmGrain();
+ 	ApplyMotionBlur();
++	ApplySpriteBokeh();
+ 	ApplyWhiteBalance();
+ 	ApplyStreaks();
+ 	ApplyLensCharacter();
+diff --git a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
+index 9b20fdc1..42450f20 100644
+--- a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
++++ b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
+@@ -4,6 +4,7 @@
+ #include <CrySchematyc/MathTypes.h>
+ #include <CrySchematyc/Reflection/TypeDesc.h>
+ #include <CrySchematyc/Env/IEnvRegistrar.h>
++#include <CrySchematyc/ResourceTypes.h>
+ #include <Cry3DEngine/I3DEngine.h>
+ 
+ #include "../Interface/ICinematicCameraOptics.h"
+@@ -141,7 +142,12 @@ struct SCineBodyParams
+ 
+ struct SCineLensParams
+ {
+-	inline bool operator==(const SCineLensParams& rhs) const { return 0 == memcmp(this, &rhs, sizeof(rhs)); }
++	// bokehShapeTex holds a string, so only the POD prefix in front of it can be memcmp'd.
++	inline bool operator==(const SCineLensParams& rhs) const
++	{
++		return 0 == memcmp(this, &rhs, offsetof(SCineLensParams, bokehShapeTex))
++		       && bokehShapeTex.value == rhs.bokehShapeTex.value;
++	}
+ 
+ 	static void ReflectType(Schematyc::CTypeDesc<SCineLensParams>& desc)
+ 	{
+@@ -197,6 +203,18 @@ struct SCineLensParams
+ 			"How much the field of view tightens when focusing close (unit-focus lens physics: "
+ 			"magnification f/(d-f) scales the effective focal length). 0 = perfectly corrected "
+ 			"cine lens, 1 = typical stills lens, 2 = vintage glass.", 1.0f);
++		desc.AddMember(&SCineLensParams::bUseSpriteBokeh,
++			'sbok', "UseSpriteBokeh", "Use Sprite Bokeh",
++			"Splat one bokeh sprite per pixel instead of gathering, the way film out-of-focus "
++			"highlights actually build up: bright points grow into readable discs with a bright "
++			"rim. Costlier than the default gather blur, and required for Bokeh Shape Texture "
++			"to have any effect.", false);
++		desc.AddMember(&SCineLensParams::bokehShapeTex,
++			'bktx', "BokehShapeTexture", "Bokeh Shape Texture",
++			"Silhouette (red channel) each sprite bokeh takes when wide open. The iris polygon "
++			"is intersected with it as the lens is stopped down, so f/1.2 shows the pure shape "
++			"and by f/2.8 the blade polygon has eaten into it. Empty = procedural disc. Only "
++			"used when Use Sprite Bokeh is on.", Schematyc::TextureFileName());
+ 	}
+ 
+ 	Schematyc::Range<1, 2400> focalLength = 50.f;
+@@ -213,6 +231,9 @@ struct SCineLensParams
+ 	Schematyc::Range<-1, 1, -1, 1> distortion = 0.0f;
+ 	Schematyc::Range<-1, 1, -1, 1> distortionFocalLink = 0.0f;
+ 	Schematyc::Range<0, 2, 0, 1> breathingIntensity = 1.0f;
++	bool bUseSpriteBokeh = false;
++	// Keep last: operator== memcmp's the members in front of this one.
++	Schematyc::TextureFileName bokehShapeTex;
+ };
+ 
+ struct SCineExposureParams
+@@ -453,6 +474,8 @@ private:
+ 	void RestoreFilmGrain();
+ 	void ApplyMotionBlur();
+ 	void RestoreMotionBlur();
++	void ApplySpriteBokeh();
++	void RestoreSpriteBokeh();
+ 	void ApplyLensCharacter();
+ 	void RestoreLensCharacter();
+ 	void ApplyStreaks();
+@@ -486,6 +509,7 @@ private:
+ 	float m_savedDofFocusDist  = 3.5f;
+ 	float m_savedDofFocusRange = 5.f;
+ 	float m_savedDofBlurAmount = 1.f;
++	float m_savedDofBladeRotation = 0.f;
+ 	int   m_savedDofCVar       = 0;
+ 	bool  m_bDofParamsSaved    = false;
+ 
+@@ -513,6 +537,12 @@ private:
+ 	float m_savedLensDistortion = 0.f;
+ 	bool  m_bLensCharSaved      = false;
+ 
++	// Sprite bokeh saved state (r_DepthOfFieldMode cvar + Dof_User_BokehShapeTex post param).
++	// Unknown to an unmodified renderer, where the read returns nothing and the writes are dropped.
++	int    m_savedDofModeCVar  = 1;
++	string m_savedBokehShapeTex;
++	bool   m_bSpriteBokehSaved = false;
++
+ 	// Motion blur saved cvars (r_MotionBlurShutterSpeed / r_MotionBlur)
+ 	float m_savedMBShutter    = 250.f;
+ 	int   m_savedMBMode       = 0;
+diff --git a/Code/CryPlugins/CinematicCamera/SpriteBokehSpec.md b/Code/CryPlugins/CinematicCamera/SpriteBokehSpec.md
+new file mode 100644
+index 00000000..f9f0cd02
+--- /dev/null
++++ b/Code/CryPlugins/CinematicCamera/SpriteBokehSpec.md
+@@ -0,0 +1,89 @@
++# Sprite Bokeh 復活 + 形狀遮罩交集 規格
++
++目標兩層:
++
++1. **復活** CE3/Cinebox 世代的 sprite 散景路徑——shader 技術 `DofBokehRef` 完整存活於
++   `Engine/Shaders/HWScripts/CryFX/DepthOfField.cfx`(36–236 行),但 C++ 宿主
++   `CMotionBlur::Execute()`(`XRenderD3D9/PostProcessMotionBlur.cpp` 330–401 行)使用舊管線
++   API(`gRenDev->m_RP`),在 5.7 的新 graphics pipeline 中不可達。把那段繪製移植成新管線的 pass。
++2. **超越原設計**:形狀遮罩貼圖 + 與光圈葉片多邊形的**物理交集**(有效孔徑 = 遮罩 ∩ 葉片
++   多邊形,「誰小誰贏」)。原 Cinebox 只有程序式圓盤+ring;交集行為是新的。
++
++## 1. 移植(先讓原功能跑起來)
++
++- 落點:`XRenderD3D9/GraphicsPipeline/DepthOfField.cpp` 的 `CDepthOfFieldStage`。
++  `Execute()` 開頭分流:`CRenderer::CV_r_DofMode == 0` → `ExecuteSpriteBokeh()` 並 return;
++  否則走既有 gather 路徑(**gather 路徑一個位元組都不准變**,含多邊形 kernel、
++  `r_DofBokehShapeStrength`、`r_DepthOfFieldBokehQuality` 診斷)。cvar 已註冊
++  (`r_DepthOfFieldMode`,預設 1),語意即原本的 0=sprite/1=gather。
++- 逐行研讀 `PostProcessMotionBlur.cpp` 330–401 的舊實作再移植:quad 數
++  (`nWidth*nHeight*3*2`,一像素一 quad、6 頂點、無 vertex buffer,VS 用 `SV_VertexID`
++  自算位置)、`fBokehNormFactor` 正規化、technique `"DofBokehRef"`、輸入貼圖
++  (scene target / scene depth / dither)、加法混合與繪製狀態。新管線用
++  `CPrimitiveRenderPass` + `CRenderPrimitive`(procedural、無 VB、自訂頂點數)——
++  參考引擎中其他 procedural 多頂點 draw 的寫法。
++- 常數 `vDofParamsFocus0/1` 與 gather 共用同一來源(`CDepthOfField::GetParams()`
++  已提供),shader 端已在用,不用改語意。
++- 解析度/目標:依舊實作(半解析度 scene target 累積後合成;細節以舊碼為準,
++  不確定處以「能在畫面上正確出現 sprite 光斑」為準,並在報告中記錄決定)。
++
++## 2. 形狀遮罩 + 交集(shader 修改,`DofBokehRefPS` 一帶)
++
++- 新貼圖槽:`Dof_User_BokehShapeTex`(post param,`AddParamTex`,參考既有
++  `MotionBlur_MaskTexName` 的模式;`CDepthOfField` 加 `m_pBokehShapeTex`)。
++  Stage 綁定該貼圖;未設定時走原本的程序式圓盤+ring(行為不變)。
++- PS 中 quad 區域性 UV 已可推得(quad 展開的插值座標);
++  `shape = 貼圖有效 ? tex.Sample(quadUV).r : 原程序式形狀`。
++- **交集項**(物理核心,一個乘法):把 `NGon_Rad(theta, n) = cos(PI/n)/cos(theta − (2PI/n)·floor((n·theta+PI)/(2PI)))`
++  移植進 shader(C++ 版在 `GraphicsPipeline/DepthOfField.cpp` 頂部),以軟邊裁切:
++
++  ```hlsl
++  // r, theta: quad 區域極座標(r=1 為 quad 邊界內切圓)
++  float polyR = NGon_Rad(theta, blades);
++  float polyMask = saturate((polyR - r * blend) / edgeSoft + (1 - blend) * BIG);
++  shape *= polyMask;
++  ```
++
++  `blend` 用與 gather kernel 相同的窗口:f/1.2 → 0(全圓,不裁)、f/2.8 → 1(完整多邊形),
++  乘上 `r_DofBokehShapeStrength` 的可讀性語意可省略(sprite 光斑本來就大,物理值即可讀)。
++  葉片數與 f 值經既有 `Dof_User_ApertureBlades` / `Dof_User_FNumber` post params 傳入
++  (已存在,gather 在用),shader 端加兩個常數傳遞即可。
++- 湧現行為驗收:全開=純遮罩形狀;收光圈=多邊形逐漸啃進遮罩;無遮罩=多邊形 sprite 散景。
++
++## 3. Plugin 端(CinematicCamera)
++
++- Lens 抽屜新增:
++  - `Use Sprite Bokeh`(bool,預設 false)——以 MB/LensCharacter 相同的 cvar 存還原模式驅動
++    `r_DepthOfFieldMode`(true→0,false→還原)。id 需查現有 4CC 不衝突。
++  - `Bokeh Shape Texture`(`Schematyc::TextureFileName` 資源選擇器,預設空)——經
++    `SetPostEffectParamString` 送 `Dof_User_BokehShapeTex`。
++- 寫入時機與其他 DOF 參數相同(`ApplyDOF`);還原鏈全覆蓋(Deactivate / OnShutDown /
++  RESET / 換相機搶手),照 `ApplyMotionBlur`/`RestoreMotionBlur` 的模式。
++
++## 4. 測試素材
++
++引擎自帶 flare/glow 貼圖裡找一張非圓形的(`engine`/`EngineAssets` 的 textures 裡搜
++star/flare 形狀)當冒煙測試素材,把路徑寫在報告裡;自訂愛心等留給使用者自備。
++
++## 5. 硬性約束
++
++- 只用內附 CMake(`Tools\CMake\Win32\bin\cmake.exe`),target `CryRenderD3D11` 與
++  `CinematicCamera`,Profile 零錯誤零警告(/W3 /WX)。
++- gather DOF、多邊形 kernel、星芒、既有全部功能不得回歸;`r_DepthOfFieldMode` 預設維持 1。
++- shader 為 loose file 部署(引擎執行期編譯);部署清單:
++  `CryRenderD3D11.dll/.pdb` → `S:\Crytek\crytek\cryengine-57-lts\5.7.1\bin\win_x64\`
++  (`.official-backup` 不得動);`CinematicCamera.dll/.pdb` → 該處與
++  `S:\Crytek\crytek\cryengine-gamesdk-sample-project2\5.7.1\bin\win_x64\`;
++  `DepthOfField.cfx` → `S:\Crytek\crytek\cryengine-57-lts\5.7.1\engine\shaders\HWscripts\CryFX\`
++  (原始無 loose 檔則直接放,若已存在同名 loose 檔先備份)。檔案被鎖時回報,不殺程序。
++- 不 commit。程式碼註釋英文,風格對齊各檔案現況。
++
++## 6. 驗收清單(runtime 由使用者執行)
++
++1. `r_DepthOfFieldMode 1`(預設):一切與現在完全相同。
++2. `r_DepthOfFieldMode 0` + DOF 開 + 大光圈:sprite 光斑出現(程序式圓盤+ring,
++   即 Cinebox 原味 soap-bubble 散景)。
++3. 指定 shape 貼圖:全開時光斑呈貼圖形狀。
++4. 收光圈 f/1.2→f/2.8→f/5.6:多邊形逐漸啃進貼圖形狀(交集),繼續收則趨近純多邊形。
++5. `Use Sprite Bokeh` 屬性開關等效於 cvar,還原鏈正確。
++6. 效能:1080p sprite 模式 < 3ms(舊實作的正常水位)。
+diff --git a/Engine/Shaders/HWScripts/CryFX/DepthOfField.cfx b/Engine/Shaders/HWScripts/CryFX/DepthOfField.cfx
+index d0251cff..83d5fd26 100644
+--- a/Engine/Shaders/HWScripts/CryFX/DepthOfField.cfx
++++ b/Engine/Shaders/HWScripts/CryFX/DepthOfField.cfx
+@@ -22,6 +22,11 @@ float4 vDofParamsFocus1;
+ float4 vAspectRatio;
+ half4 vRainColor;
+ 
++// Sprite bokeh shaping. x: iris blade count, y: polygon blend (0 = round/wide open,
++// 1 = fully formed polygon - same f/1.2 to f/2.8 window the gather kernel uses),
++// z: 1 when a shape texture is bound, w: iris phase in radians (shared with the streaks).
++float4 vDofBokehShape;
++
+ 
+ /////////////////////////////////////////////////////////////////////////////////////////////////
+ // Sprite-Based DOF
+@@ -29,45 +34,46 @@ half4 vRainColor;
+ 
+ struct pixoutDofMRT
+ {
+-	half4 LayerNear  : COLOR0;
+-	half4 LayerFar   : COLOR1;
+-};
+-
+-struct a2vBokehQuad
+-{
+-  float4 Position  : POSITION;
+-  float2 baseTC	   : TEXCOORD0;
+-  float4 Color     : COLOR0;
++	half4 LayerNear  : SV_Target0;
++	half4 LayerFar   : SV_Target1;
+ };
+ 
++// One quad per source pixel, expanded from SV_VertexID - there is no vertex stream at all,
++// so this is the only interpolator set the sprite path uses.
+ struct v2fBokehQuad
+ {
+-	float4 Position  : SV_POSITION;  
+-	float4 QuadPos   : TEXCOORD0; //zw dof params
+-	float4 Color     : COLOR0;
+-};
+-
+-struct fragBokehQuad
+-{
+-  float4 Position  : POSITION;  
+-  float4 QuadPos   : TEXCOORD0; // this is implicitly filled by GPU after point sprite expansion
+-  float4 Color     : COLOR0;
++	float4 Position  : SV_POSITION;
++	float4 QuadPos   : TEXCOORD0; //xy quad-local uv, z near blur, w unused
++	float4 Color     : TEXCOORD1;
+ };
+ 
+ Texture2D texDofBkRef_SceneTarget : register(t0);
+ Texture2D texDofBkRef_SceneDepth  : register(t1);
+ Texture2D texDofBkRef_Dither      : register(t2);
++Texture2D texDofBkRef_BokehShape  : register(t3);
+ 
+ SamplerState ssDofBkRef_SceneTarget : register(s0);
+ SamplerState ssDofBkRef_SceneDepth  : register(s1);
+ SamplerState ssDofBkRef_Dither      : register(s2);
++SamplerState ssDofBkRef_BokehShape  : register(s3);
++
++// Radius of a regular n-gon at angle theta, normalized so the edge midpoints sit at 1.
++// Same closed form the gather kernel uses on the CPU (CDepthOfFieldStage::ToUnitDisk).
++float NGon_Rad(float theta, float n)
++{
++	return cos(PI / n) / cos(theta - (2 * PI / n) * floor((n * theta + PI) / (2 * PI)));
++}
+ 
+-v2fBokehQuad DofBokehRefVS(a2vBokehQuad IN, uint nVertexID : SV_VertexID)
++v2fBokehQuad DofBokehRefVS(uint nVertexID : SV_VertexID)
+ {
+ 	v2fBokehQuad OUT = (v2fBokehQuad) 0;
+ 
+-	int nQuadID = nVertexID / 6;
+-	float4 INPos = float4( nQuadID % g_VS_ScreenSize.x,  (nQuadID  - nQuadID % g_VS_ScreenSize.x)/g_VS_ScreenSize.x, 0, 0);
++	// Resolve the quad's cell in the source grid with integer math. The original float
++	// modulo against g_VS_ScreenSize.x works today, but the quad id reaches several million
++	// and would start banding into columns once it leaves fp32's exact integer range.
++	const int nQuadID    = (int)(nVertexID / 6);
++	const int nGridWidth = (int)g_VS_ScreenSize.x;
++	float4 INPos = float4((float)(nQuadID % nGridWidth), (float)(nQuadID / nGridWidth), 0, 0);
+ 	INPos.xy /= g_VS_HPosScale.xy;
+ 
+ 	float4 vOutPos = INPos;
+@@ -88,14 +94,14 @@ v2fBokehQuad DofBokehRefVS(a2vBokehQuad IN, uint nVertexID : SV_VertexID)
+ #if %_RT_SAMPLE1
+ 	// Dilate to avoid ghosting on edges due to lower resolution DOF
+ 	// This can cause artifacts in small cavities and on alpha-tested geometry
+-	fDepth = GetTexture2DLod(texDofBkRef_SceneDepth, ssDofBkRef_SceneDepth, float4(screenProj.xy + g_VS_ScreenSize.zw * half2( vAspectRatio.w, vAspectRatio.w), 0, 0)).x);
+-	fDepth = GetTexture2DLod(texDofBkRef_SceneDepth, ssDofBkRef_SceneDepth, float4(screenProj.xy + g_VS_ScreenSize.zw * half2(-vAspectRatio.w, vAspectRatio.w), 0, 0)).x);
+-	fDepth = GetTexture2DLod(texDofBkRef_SceneDepth, ssDofBkRef_SceneDepth, float4(screenProj.xy + g_VS_ScreenSize.zw * half2( vAspectRatio.w,-vAspectRatio.w), 0, 0)).x);
+-	fDepth = GetTexture2DLod(texDofBkRef_SceneDepth, ssDofBkRef_SceneDepth, float4(screenProj.xy + g_VS_ScreenSize.zw * half2(-vAspectRatio.w,-vAspectRatio.w), 0, 0)).x);
++	fDepth = min(fDepth, GetTexture2DLod(texDofBkRef_SceneDepth, ssDofBkRef_SceneDepth, float4(screenProj.xy + g_VS_ScreenSize.zw * half2( vAspectRatio.w, vAspectRatio.w), 0, 0)).x);
++	fDepth = min(fDepth, GetTexture2DLod(texDofBkRef_SceneDepth, ssDofBkRef_SceneDepth, float4(screenProj.xy + g_VS_ScreenSize.zw * half2(-vAspectRatio.w, vAspectRatio.w), 0, 0)).x);
++	fDepth = min(fDepth, GetTexture2DLod(texDofBkRef_SceneDepth, ssDofBkRef_SceneDepth, float4(screenProj.xy + g_VS_ScreenSize.zw * half2( vAspectRatio.w,-vAspectRatio.w), 0, 0)).x);
++	fDepth = min(fDepth, GetTexture2DLod(texDofBkRef_SceneDepth, ssDofBkRef_SceneDepth, float4(screenProj.xy + g_VS_ScreenSize.zw * half2(-vAspectRatio.w,-vAspectRatio.w), 0, 0)).x);
+ #endif
+ 
+ 	// fetch depth - scale quad here
+-	int2 vPosScreen = (screenProj.xy * g_VS_ScreenSize.xy);
++	int2 vPosScreen = (int2)(screenProj.xy * g_VS_ScreenSize.xy);
+ 
+ 	OUT.QuadPos = 1;
+ 
+@@ -163,15 +169,21 @@ v2fBokehQuad DofBokehRefVS(a2vBokehQuad IN, uint nVertexID : SV_VertexID)
+ 	vQuad[3].w = GetLuminance(vQuad[3]);
+ 	half fLumDelta = abs(vQuad[0].w *3 - (vQuad[1].w+vQuad[2].w+vQuad[3].w));
+ 
++	// This test predates physical light units: against 5.7's HDR magnitudes a fixed 0.02
++	// epsilon never trips, so the "flat neighbourhood" early-out silently stopped working
++	// and every pixel pays for a full quad. Scale it by the local luminance instead, which
++	// restores the original ~0.5% relative sensitivity in any unit system.
++	const half fLumScale = (vQuad[0].w + vQuad[1].w + vQuad[2].w + vQuad[3].w) * 0.25 + 1e-4;
++
+ 	const int2 WPos = (int2) vPosScreen.xy;
+-	const int nIndex = WPos % 2;
+-	if ((nIndex > 0) && fLumDelta <0.02) // if quad pixel similar luminance wise, just emit single geometry quad
++	const int nIndex = WPos.x % 2;
++	if ((nIndex > 0) && fLumDelta < 0.005 * fLumScale) // if quad pixel similar luminance wise, just emit single geometry quad
+ 	{
+ 		OUT.Position.xy=0;
+ 		return OUT;
+ 	}
+ 
+-	OUT.Color.rgb  = vQuad[0] + vQuad[1] + vQuad[2] + vQuad[3];
++	OUT.Color.rgb  = (vQuad[0] + vQuad[1] + vQuad[2] + vQuad[3]).rgb;
+ 	OUT.Color.rgb /= 4.0;
+ 
+   const float2 Verts[6] =
+@@ -191,12 +203,12 @@ v2fBokehQuad DofBokehRefVS(a2vBokehQuad IN, uint nVertexID : SV_VertexID)
+ 	return OUT;
+ }
+ 
+-pixoutDofMRT DofBokehRefPS(fragBokehQuad IN)
++pixoutDofMRT DofBokehRefPS(v2fBokehQuad IN)
+ {
+ 	pixoutDofMRT OUT = (pixoutDofMRT) 0.0;
+ 
+ 	//clip(-1);
+-	half2 tcQuad = IN.QuadPos.xy*2-1;	
++	half2 tcQuad = IN.QuadPos.xy*2-1;
+ 	// -8 ms for big kernels
+ 	half fLen = (dot(tcQuad, tcQuad));
+ 
+@@ -204,13 +216,32 @@ pixoutDofMRT DofBokehRefPS(fragBokehQuad IN)
+ 
+ 	//tcQuad*=1.1; // add slight border offset
+ 	fLen = (dot(tcQuad, tcQuad));
+-	
++
+ 	half fShapeBokeh = pow(fLen, ((IN.Color.w))) ;// * fLen;  // ^2
+ 	half4 cBokehShape = saturate(1-fShapeBokeh);
+-	
++
+ 	// aproximate diffusion ring
+   cBokehShape += saturate(1-abs(fShapeBokeh*2-1));
+ 
++	// Optional shape mask: replaces the procedural disc+ring with an arbitrary silhouette,
++	// sampled by the quad-local uv. Unbound (vDofBokehShape.z == 0) keeps the original look.
++	const half fShapeTex = GetTexture2D(texDofBkRef_BokehShape, ssDofBkRef_BokehShape, IN.QuadPos.xy).r;
++	cBokehShape = lerp(cBokehShape, (half4)fShapeTex, vDofBokehShape.z);
++
++	// Intersect with the iris polygon: the effective aperture is whatever both the mask and
++	// the blade polygon let through, so stopping down eats into the shape instead of
++	// replacing it. Wide open the blend is 0 and the polygon term is a no-op.
++	{
++		const float fBlend    = saturate(vDofBokehShape.y);
++		const float fEdgeSoft = 0.06f;      // soft edge width, in quad-local radius
++		const float fNoClip   = 8.0f;       // pushes the mask fully open at blend 0
++		const float fRadius   = sqrt(max(fLen, 1e-6f));
++		const float fTheta    = atan2(tcQuad.y, tcQuad.x);
++		const float fPolyRad  = NGon_Rad(fTheta - vDofBokehShape.w, max(vDofBokehShape.x, 3.0f));
++		const float fPolyMask = saturate((fPolyRad - fRadius * fBlend) / fEdgeSoft + (1 - fBlend) * fNoClip);
++		cBokehShape *= fPolyMask;
++	}
++
+ 	half4 cScene = half4(IN.Color.rgb, 1);
+ 	cScene *= half4(cBokehShape.rgb, dot(cBokehShape.rgb, 0.333));
+ 
+@@ -248,10 +279,10 @@ Texture2D texDofNrm_DofLayer1   : register(t1);
+ Texture2D texDofNrm_SceneTarget : register(t2);
+ Texture2D texDofNrm_DepthTarget : register(t3);
+ 
+-SamplerState ssDofNrm_DofLayer0   : register(s0)
+-SamplerState ssDofNrm_DofLayer1   : register(s1)
+-SamplerState ssDofNrm_SceneTarget : register(s2)
+-SamplerState ssDofNrm_DepthTarget : register(s3)
++SamplerState ssDofNrm_DofLayer0   : register(s0);
++SamplerState ssDofNrm_DofLayer1   : register(s1);
++SamplerState ssDofNrm_SceneTarget : register(s2);
++SamplerState ssDofNrm_DepthTarget : register(s3);
+ 
+ pixout RefDofMBNormalizePS(vtxOut IN)
+ {
+-- 
+2.47.1.windows.1
+
