@@ -1,11 +1,13 @@
 ﻿# Sync manifest
 
 Baseline : main @ a34100a9 (pristine CRYENGINE 5.7.1)
-Dev      : dev @ bef856de
-Synced   : 2026-08-25 09:54
+Dev      : dev @ 6deb64a2
+Synced   : 2026-08-25 10:47
 
 ## Commits (newest first)
 
+- 6deb64a2 feat: Mask Rotation - turn the bokeh shape mask independently of the iris phase
+- 9e79a6d0 feat: film halation - red-orange halo around emulsion-overloading sources (bloom domain)
 - bef856de chore: ignore the third-party SDK drop under Code/SDKs
 - e383db58 chore: keep engine textures tracked, ignore generated solutions_cmake
 - 4e418950 feat: anamorphic lens - squeeze (hFOV + gate mask / squeezed frame), oval bokeh, horizontal tinted flare
@@ -51,6 +53,7 @@ Synced   : 2026-08-25 09:54
 - A	Code/CryPlugins/CinematicCamera/AnamorphicSpec.md
 - A	Code/CryPlugins/CinematicCamera/DiffractionStreaksSpec.md
 - A	Code/CryPlugins/CinematicCamera/EffectAuthoritySpec.md
+- A	Code/CryPlugins/CinematicCamera/HalationSpec.md
 - A	Code/CryPlugins/CinematicCamera/HybridDofSpec.md
 - A	Code/CryPlugins/CinematicCamera/Interface/ICinematicCameraOptics.h
 - A	Code/CryPlugins/CinematicCamera/Module/CMakeLists.txt
