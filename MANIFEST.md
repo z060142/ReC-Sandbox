@@ -1,11 +1,12 @@
 ﻿# Sync manifest
 
 Baseline : main @ a34100a9 (pristine CRYENGINE 5.7.1)
-Dev      : dev @ 5b851c38
-Synced   : 2026-08-25 22:11
+Dev      : dev @ f82b7988
+Synced   : 2026-08-26 06:24
 
 ## Commits (newest first)
 
+- f82b7988 feat: field-dependent pupil - cat-eye barrel clip, coma, astigmatism; light loss applied once in the tonemap, Maximum Aperture lens parameter, stock fOptVignetting removed
 - 5b851c38 fix: focus peaking works - metre band with the engine depth constant, sampled depth, guide legend text
 - b0e9fd87 fix: halation halo is round - isotropic gaussian at 1/16 resolution instead of a separable exponential spread
 - 403eb41e feat: viewfinder overlays - frame guides and focus peaking in the final composite
@@ -56,6 +57,7 @@ Synced   : 2026-08-25 22:11
 - A	Code/CryPlugins/CinematicCamera/AnamorphicSpec.md
 - A	Code/CryPlugins/CinematicCamera/DiffractionStreaksSpec.md
 - A	Code/CryPlugins/CinematicCamera/EffectAuthoritySpec.md
+- A	Code/CryPlugins/CinematicCamera/FieldPupilSpec.md
 - A	Code/CryPlugins/CinematicCamera/HalationSpec.md
 - A	Code/CryPlugins/CinematicCamera/HybridDofSpec.md
 - A	Code/CryPlugins/CinematicCamera/Interface/ICinematicCameraOptics.h
@@ -87,4 +89,5 @@ Synced   : 2026-08-25 22:11
 - M	Engine/Shaders/HWScripts/CryFX/DepthOfField.cfx
 - M	Engine/Shaders/HWScripts/CryFX/HDRPostProcess.cfx
 - M	Engine/Shaders/HWScripts/CryFX/PostAA.cfx
+- M	Engine/Shaders/HWScripts/CryFX/PostEffectsLib.cfi
 - M	Tools/CMake/CRYENGINE-MSVC.cmake

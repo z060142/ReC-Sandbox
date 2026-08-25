@@ -46,7 +46,7 @@ foreach ($line in $changes) {
 }
 $deleted | Set-Content (Join-Path $srcDir "DELETED_FILES.txt")
 
-# 3. Docs: plugin READMEs, console reference and design specs.
+# 3. Docs: plugin READMEs and the console reference (user documentation only).
 $docDir = Join-Path $root "docs"
 Reset-Dir $docDir
 $docSources = @(
@@ -54,7 +54,7 @@ $docSources = @(
     "Code/CryPlugins/CinematicCamera/docs/ConsoleReference.md",
     "Code/CryPlugins/CryPhoneTracker/README.md"
 )
-$docSources += (git -C $DevRepo ls-tree -r --name-only $DevRef -- Code/CryPlugins/CinematicCamera Code/CryPlugins/CryPhoneTracker | Where-Object { $_ -like "*Spec.md" })
+# Design specs are internal work orders and stay out of the public snapshot.
 foreach ($doc in ($docSources | Select-Object -Unique)) {
     $name = Split-Path -Leaf $doc
     if ($doc -like "*CryPhoneTracker*" -and $name -eq "README.md") { $name = "CryPhoneTracker-README.md" }
