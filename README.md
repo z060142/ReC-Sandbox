@@ -1,6 +1,6 @@
-# ReC-Sandbox
+# ReC Sandbox
 
-Virtual cinematography for CRYENGINE 5.7.1: a physically based cinematic camera
+A sandbox for recording work: virtual cinematography for CRYENGINE 5.7.1 - a physically based cinematic camera
 (`CinematicCamera` plugin), a phone-driven 6DoF camera tracker (`CryPhoneTracker` plugin,
 paired with the `androidtracker` app) and the renderer work they need (hybrid sprite bokeh with
 shape masks, iris diffraction streaks, anamorphic lens model, lens character, T-stop exposure).
