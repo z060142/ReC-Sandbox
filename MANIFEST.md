@@ -1,11 +1,12 @@
 ﻿# Sync manifest
 
 Baseline : main @ a34100a9 (pristine CRYENGINE 5.7.1)
-Dev      : dev @ 6deb64a2
-Synced   : 2026-08-25 10:47
+Dev      : dev @ 403eb41e
+Synced   : 2026-08-25 11:43
 
 ## Commits (newest first)
 
+- 403eb41e feat: viewfinder overlays - frame guides and focus peaking in the final composite
 - 6deb64a2 feat: Mask Rotation - turn the bokeh shape mask independently of the iris phase
 - 9e79a6d0 feat: film halation - red-orange halo around emulsion-overloading sources (bloom domain)
 - bef856de chore: ignore the third-party SDK drop under Code/SDKs
@@ -66,6 +67,7 @@ Synced   : 2026-08-25 10:47
 - A	Code/CryPlugins/CinematicCamera/Module/resource.h
 - A	Code/CryPlugins/CinematicCamera/README.md
 - A	Code/CryPlugins/CinematicCamera/SpriteBokehSpec.md
+- A	Code/CryPlugins/CinematicCamera/ViewfinderSpec.md
 - A	Code/CryPlugins/CinematicCamera/docs/ConsoleReference.md
 - A	Code/CryPlugins/CryPhoneTracker/Module/CMakeLists.txt
 - A	Code/CryPlugins/CryPhoneTracker/Module/PhoneTrackerComponent.cpp
