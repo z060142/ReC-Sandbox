@@ -38,6 +38,12 @@ The third-party SDK drop (`Code/SDKs`) is not part of this repository.
 - `../Virtual-Lens-Module` - the physical camera-control module (hardware, firmware) that will
   integrate with the tracker as its controller.
 
+## License
+
+Two-part, see [LICENSE.md](LICENSE.md): the modifications to CRYENGINE files remain Crytek's
+copyright and are provided only for users who hold their own CRYENGINE license; the project's
+original work (the plugins, docs, specs and tooling) is released under the MIT License.
+
 ## Syncing a new stage
 
 ```
