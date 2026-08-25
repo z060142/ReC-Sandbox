@@ -1,11 +1,12 @@
 ﻿# Sync manifest
 
 Baseline : main @ a34100a9 (pristine CRYENGINE 5.7.1)
-Dev      : dev @ b0e9fd87
-Synced   : 2026-08-25 13:34
+Dev      : dev @ 5b851c38
+Synced   : 2026-08-25 22:11
 
 ## Commits (newest first)
 
+- 5b851c38 fix: focus peaking works - metre band with the engine depth constant, sampled depth, guide legend text
 - b0e9fd87 fix: halation halo is round - isotropic gaussian at 1/16 resolution instead of a separable exponential spread
 - 403eb41e feat: viewfinder overlays - frame guides and focus peaking in the final composite
 - 6deb64a2 feat: Mask Rotation - turn the bokeh shape mask independently of the iris phase
