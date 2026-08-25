@@ -1,0 +1,220 @@
+From b0e9fd879901807503ff98ec0252ea1dd294dccb Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Tue, 25 Aug 2026 13:33:48 +0800
+Subject: [PATCH 26/26] fix: halation halo is round - isotropic gaussian at
+ 1/16 resolution instead of a separable exponential spread
+
+Two 1D geometric falloffs multiply into |x|+|y| isolines, so the halo came out square (user report). The thresholded source is now halved twice into lazily allocated 1/8 and 1/16 targets and blurred there with the engine's separable gaussian, whose fixed +-8 texel footprint is +-128 full-res pixels at that resolution and whose kernel is a true 2D gaussian - round. Same radius mapping (~110 px sigma at 0.5, ~180 px at 1), same gain.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_017nykaDjTHxHDSo11CsYx6M
+---
+ .../XRenderD3D9/GraphicsPipeline/Bloom.cpp    | 112 ++++++++++--------
+ .../XRenderD3D9/GraphicsPipeline/Bloom.h      |  27 +++--
+ 2 files changed, 81 insertions(+), 58 deletions(-)
+
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Bloom.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Bloom.cpp
+index 2b06a87e..ac30b833 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Bloom.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Bloom.cpp
+@@ -353,10 +353,6 @@ void CBloomStage::ExecuteHalation()
+ 	static CCryNameR streakParams2Name("StreakParams2");
+ 
+ 	CTexture* pHalationSource = m_graphicsPipelineResources.m_pTexHDRTargetScaled[1][1];
+-	CTexture* pHalationTemp = m_graphicsPipelineResources.m_pTexHDRTargetScaled[1][0];
+-
+-	const float fTexelScaleX = 1.0f / (float)pHalationSource->GetWidth();
+-	const float fTexelScaleY = 1.0f / (float)pHalationSource->GetHeight();
+ 
+ 	// Same bloom-weight divide as the streaks: the tone mapper blends the bloom target in with
+ 	// weight bloomAmount * 0.3 / 8, so anything added here inherits that crush and has to have
+@@ -385,53 +381,27 @@ void CBloomStage::ExecuteHalation()
+ 	m_passHalationThreshold.SetConstant(streakParams1Name, Vec4(halationParams.fThreshold, max(halationParams.fThreshold * 0.25f, 0.01f), 0, 0), eHWSC_Pixel);
+ 	m_passHalationThreshold.Execute();
+ 
+-	// 2. Wide separable spread, horizontal then vertical, through the streak stretch shader
+-	//    with an isotropic (unrotated) direction. That shader's tap stride is what actually
+-	//    sets the halo's width: CGaussianBlurPass cannot, because its 16 bilinear taps are
+-	//    pinned to +-8 texels no matter how large its distribution gets. At radius 0.5 the
+-	//    stride is 7 quarter-res texels, so the 7 taps per side reach 49 texels ~ 196 full-res
+-	//    pixels on a 1080p frame, for a halo sigma of about 27 texels ~ 109 pixels. The bloom
+-	//    core next to it sits at roughly 24 pixels, so the halo reads about four times wider.
+-	const float fSpreadStride = 2.0f + 10.0f * fRadius01;
+-	// Near-flat per tap decay: emulsion scatter has no sharp falloff, and a flat weight set
+-	// puts the mass out at the far taps, which is where the halo has to be seen.
+-	const float fSpreadDecay = 0.90f;
+-
+-	for (int axis = 0; axis < 2; ++axis)
+-	{
+-		const bool bHorizontal = (axis == 0);
+-		CFullscreenPass& pass = bHorizontal ? m_passHalationSpreadH : m_passHalationSpreadV;
+-
+-		if (pass.IsDirty())
+-		{
+-			pass.SetPrimitiveFlags(CRenderPrimitive::eFlags_ReflectShaderConstants_PS);
+-			pass.SetPrimitiveType(CRenderPrimitive::ePrim_ProceduralTriangle);
+-			pass.SetTechnique(CShaderMan::s_shHDRPostProcess, techStreakStretch, 0);
+-			pass.SetRenderTarget(0, bHorizontal ? pHalationTemp : pHalationSource);
+-			pass.SetState(GS_NODEPTHTEST | GS_NOCOLMASK_A);
+-			pass.SetTexture(0, bHorizontal ? pHalationSource : pHalationTemp);
+-			pass.SetSampler(0, EDefaultSamplerStates::LinearClamp);
+-		}
+-
+-		pass.BeginConstantUpdate();
+-		pass.SetConstant(streakParams0Name, Vec4(bHorizontal ? fTexelScaleX : 0.0f, bHorizontal ? 0.0f : fTexelScaleY, fSpreadStride, 1.0f), eHWSC_Pixel);
+-		pass.SetConstant(streakParams1Name, Vec4(0, 0, fSpreadDecay, 0), eHWSC_Pixel);
+-		// Untinted here - the stock's colour is applied once, on the composite.
+-		pass.SetConstant(streakParams2Name, Vec4(1.0f, 1.0f, 1.0f, 0.0f), eHWSC_Pixel);
+-		pass.Execute();
+-	}
++	// 2. Take the thresholded source down to 1/16 resolution in two bilinear halvings (each one
++	//    averages a 2x2 block, so a small source keeps its energy instead of aliasing away).
++	//    The halo's WIDTH comes from the resolution the blur runs at, not from a tap stride:
++	//    CGaussianBlurPass has a fixed +-8 texel footprint, which at 1/16 resolution is +-128
++	//    full-res pixels. And it is a true separable Gaussian, so the result is ISOTROPIC - a
++	//    round halo. The earlier separable exponential spread was not: two 1D geometric
++	//    falloffs multiply into |x|+|y| isolines, a diamond/square halo emulsion scatter never
++	//    shows (verified square on screen by the user).
++	if (!AcquireHalationTargets(pHalationSource->GetWidth(), pHalationSource->GetHeight()))
++		return;
++	m_passHalationDown0.Execute(pHalationSource, m_pTexHalationEighth);
++	m_passHalationDown1.Execute(m_pTexHalationEighth, m_pTexHalationLow);
+ 
+-	// 3. Round the profile off. The spread above lands 15 discrete taps per axis, which on a
+-	//    small source shows as a cross of ticks; a couple of narrow Gaussian passes smear the
+-	//    gaps between them into the soft continuous edge halation actually has. The
+-	//    distribution is the Gaussian's rho in texels over a FIXED +-8 texel footprint, so it
+-	//    only controls the SHAPE: below ~3 the kernel is too peaked to fill the tap gaps,
+-	//    above ~8 it is flat enough to be a box and hands back a hard edge. 3 -> 8 across the
+-	//    radius range keeps it inside that band.
+-	const float fDistribution = 3.0f + 5.0f * fRadius01;
++	// 3. Isotropic Gaussian at 1/16 resolution. The distribution is the Gaussian's rho in
++	//    1/16-res texels (16 full-res pixels each on a 1080p frame): 2 -> 8 across the radius
++	//    range is a per-pass sigma of 32 -> 128 pixels, two passes about 1.4x that - radius
++	//    0.5 lands near 110 px (roughly four times the bloom core), radius 1 near 180 px.
++	const float fDistribution = 2.0f + 6.0f * fRadius01;
+ 
+ 	for (int iteration = 0; iteration < kHalationBlurIterations; ++iteration)
+-		m_passHalationBlur.Execute(pHalationSource, pHalationTemp, 1.0f, fDistribution, false);
++		m_passHalationBlur.Execute(m_pTexHalationLow, m_pTexHalationLowTemp, 1.0f, fDistribution, false);
+ 
+ 	// 4. Composite into the bloom target. The stretch shader is reused with a ZERO step, so all
+ 	//    15 taps land on the same texel and the normalised sum is a plain tinted sample.
+@@ -444,14 +414,17 @@ void CBloomStage::ExecuteHalation()
+ 	const float fOutputScale = halationParams.fAmount * fHalationGain / fBloomCompositeWeight;
+ 	const Vec4 vTint(halationParams.vTint.x, halationParams.vTint.y, halationParams.vTint.z, 0.0f);
+ 
+-	if (m_passHalationComposite.IsDirty())
++	// The 1/16-res result is read through a bilinear sampler, which is all the upsampling a
++	// halo this soft needs. The texture id is part of the dirty check: the low-res targets are
++	// re-created on a resolution change.
++	if (m_passHalationComposite.IsDirty(m_pTexHalationLow->GetTextureID()))
+ 	{
+ 		m_passHalationComposite.SetPrimitiveFlags(CRenderPrimitive::eFlags_ReflectShaderConstants_PS);
+ 		m_passHalationComposite.SetPrimitiveType(CRenderPrimitive::ePrim_ProceduralTriangle);
+ 		m_passHalationComposite.SetTechnique(CShaderMan::s_shHDRPostProcess, techStreakStretch, 0);
+ 		m_passHalationComposite.SetRenderTarget(0, m_graphicsPipelineResources.m_pTexHDRFinalBloom);
+ 		m_passHalationComposite.SetState(GS_NODEPTHTEST | GS_NOCOLMASK_A | GS_BLSRC_ONE | GS_BLDST_ONE);
+-		m_passHalationComposite.SetTexture(0, pHalationSource);
++		m_passHalationComposite.SetTexture(0, m_pTexHalationLow);
+ 		m_passHalationComposite.SetSampler(0, EDefaultSamplerStates::LinearClamp);
+ 	}
+ 
+@@ -461,3 +434,42 @@ void CBloomStage::ExecuteHalation()
+ 	m_passHalationComposite.SetConstant(streakParams2Name, vTint, eHWSC_Pixel);
+ 	m_passHalationComposite.Execute();
+ }
++
++bool CBloomStage::AcquireHalationTargets(int quarterWidth, int quarterHeight)
++{
++	const int w8  = max(quarterWidth / 2, 1);
++	const int h8  = max(quarterHeight / 2, 1);
++	const int w16 = max(quarterWidth / 4, 1);
++	const int h16 = max(quarterHeight / 4, 1);
++
++	if (m_pTexHalationEighth && m_pTexHalationLow && m_pTexHalationLowTemp &&
++	    m_halationLowWidth == w16 && m_halationLowHeight == h16)
++		return true;
++
++	ReleaseHalationTargets();
++
++	const uint32 flags = FT_NOMIPS | FT_DONT_STREAM | FT_USAGE_RENDERTARGET;
++	const std::string id = m_graphicsPipeline.GetUniqueIdentifierName();
++	m_pTexHalationEighth  = CTexture::GetOrCreateRenderTarget(("$HalationEighth" + id).c_str(),  w8,  h8,  Clr_Transparent, eTT_2D, flags, eTF_R16G16B16A16F);
++	m_pTexHalationLow     = CTexture::GetOrCreateRenderTarget(("$HalationLow" + id).c_str(),     w16, h16, Clr_Transparent, eTT_2D, flags, eTF_R16G16B16A16F);
++	m_pTexHalationLowTemp = CTexture::GetOrCreateRenderTarget(("$HalationLowTemp" + id).c_str(), w16, h16, Clr_Transparent, eTT_2D, flags, eTF_R16G16B16A16F);
++
++	if (!CTexture::IsTextureExist(m_pTexHalationEighth) || !CTexture::IsTextureExist(m_pTexHalationLow) || !CTexture::IsTextureExist(m_pTexHalationLowTemp))
++	{
++		ReleaseHalationTargets();
++		return false;
++	}
++
++	m_halationLowWidth = w16;
++	m_halationLowHeight = h16;
++	return true;
++}
++
++void CBloomStage::ReleaseHalationTargets()
++{
++	m_pTexHalationEighth.reset();
++	m_pTexHalationLow.reset();
++	m_pTexHalationLowTemp.reset();
++	m_halationLowWidth = 0;
++	m_halationLowHeight = 0;
++}
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Bloom.h b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Bloom.h
+index 2cecfe52..a7283308 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Bloom.h
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Bloom.h
+@@ -20,10 +20,10 @@ public:
+ 	//! 8^3 tap distances span the whole frame width, which is what makes the line read as a
+ 	//! single stroke across the frame instead of a stubby spike.
+ 	static const int kAnamorphicIterations = 3;
+-	//! Smoothing iterations for the halation halo. CGaussianBlurPass has a fixed 16 tap
+-	//! footprint (+-8 texels) whatever its distribution, so it cannot set the halo's width -
+-	//! it only rounds off the profile the wide separable spread leaves behind. See
+-	//! ExecuteHalation for the numbers.
++	//! Gaussian iterations for the halation halo, run at 1/16 resolution. CGaussianBlurPass has
++	//! a fixed 16 tap footprint (+-8 texels) whatever its distribution, so the halo's WIDTH comes
++	//! from the resolution it runs at (+-8 texels at 1/16 = +-128 full-res pixels), and being a
++	//! true separable Gaussian it is isotropic - a round halo, as emulsion scatter is.
+ 	static const int kHalationBlurIterations = 2;
+ 
+ 	CBloomStage(CGraphicsPipeline& graphicsPipeline)
+@@ -35,8 +35,8 @@ public:
+ 		, m_passStreakThreshold(&graphicsPipeline)
+ 		, m_passAnamorphicThreshold(&graphicsPipeline)
+ 		, m_passHalationThreshold(&graphicsPipeline)
+-		, m_passHalationSpreadH(&graphicsPipeline)
+-		, m_passHalationSpreadV(&graphicsPipeline)
++		, m_passHalationDown0(&graphicsPipeline)
++		, m_passHalationDown1(&graphicsPipeline)
+ 		, m_passHalationBlur(&graphicsPipeline)
+ 		, m_passHalationComposite(&graphicsPipeline)
+ 	{
+@@ -73,8 +73,19 @@ private:
+ 	CFullscreenPass m_passAnamorphicStretch[kAnamorphicIterations];
+ 
+ 	CFullscreenPass   m_passHalationThreshold;
+-	CFullscreenPass   m_passHalationSpreadH;
+-	CFullscreenPass   m_passHalationSpreadV;
++	CStretchRectPass  m_passHalationDown0;   // quarter -> 1/8
++	CStretchRectPass  m_passHalationDown1;   // 1/8 -> 1/16
+ 	CGaussianBlurPass m_passHalationBlur;
+ 	CFullscreenPass   m_passHalationComposite;
++
++	// Low-resolution halation targets (the shared HDR chain stops at quarter resolution).
++	// Allocated lazily, so halation off costs nothing.
++	_smart_ptr<CTexture> m_pTexHalationEighth;
++	_smart_ptr<CTexture> m_pTexHalationLow;
++	_smart_ptr<CTexture> m_pTexHalationLowTemp;
++	int                  m_halationLowWidth = 0;
++	int                  m_halationLowHeight = 0;
++
++	bool AcquireHalationTargets(int quarterWidth, int quarterHeight);
++	void ReleaseHalationTargets();
+ };
+-- 
+2.47.1.windows.1
+
