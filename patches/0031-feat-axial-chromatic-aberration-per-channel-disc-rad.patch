@@ -1,0 +1,705 @@
+From 5e9f27da35ff683ef5ab00db7afa70f52f6a62e9 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Wed, 26 Aug 2026 09:26:03 +0800
+Subject: [PATCH 31/31] feat: axial chromatic aberration - per-channel disc
+ radii in the gather (channel-masked taps, per-channel normalisation) and
+ two-scale pupil in the splat; green rim behind focus, magenta in front
+
+---
+ .../Common/PostProcess/PostEffects.cpp        |   1 +
+ .../Common/PostProcess/PostEffects.h          |   7 +-
+ .../GraphicsPipeline/DepthOfField.cpp         |  33 +++-
+ .../RenderDll/XRenderD3D9/PostProcessDOF.cpp  |   4 +
+ .../CinematicCamera/AxialChromaticSpec.md     | 102 ++++++++++
+ .../Module/CinematicCameraComponent.cpp       |   7 +
+ .../Module/CinematicCameraComponent.h         |  11 ++
+ Code/CryPlugins/CinematicCamera/README.md     |  21 ++
+ .../Shaders/HWScripts/CryFX/DepthOfField.cfx  | 184 ++++++++++++------
+ 9 files changed, 305 insertions(+), 65 deletions(-)
+ create mode 100644 Code/CryPlugins/CinematicCamera/AxialChromaticSpec.md
+
+diff --git a/Code/CryEngine/RenderDll/Common/PostProcess/PostEffects.cpp b/Code/CryEngine/RenderDll/Common/PostProcess/PostEffects.cpp
+index 90ac5cac..46ae50eb 100644
+--- a/Code/CryEngine/RenderDll/Common/PostProcess/PostEffects.cpp
++++ b/Code/CryEngine/RenderDll/Common/PostProcess/PostEffects.cpp
+@@ -117,6 +117,7 @@ void CDepthOfField::Reset(bool bOnSpecChange)
+ 	m_pUserAstigmatism->ResetParam(0.0f);
+ 	m_pUserFieldCurvature->ResetParam(0.0f);
+ 	m_pUserEdgeSoftness->ResetParam(0.0f);
++	m_pUserAxialChromatic->ResetParam(0.0f);
+ 
+ 	m_pFocusMinZ->ResetParam(0.0f);
+ 	m_pFocusMinZScale->ResetParam(0.0f);
+diff --git a/Code/CryEngine/RenderDll/Common/PostProcess/PostEffects.h b/Code/CryEngine/RenderDll/Common/PostProcess/PostEffects.h
+index 082794c5..9b81cf6f 100644
+--- a/Code/CryEngine/RenderDll/Common/PostProcess/PostEffects.h
++++ b/Code/CryEngine/RenderDll/Common/PostProcess/PostEffects.h
+@@ -143,7 +143,7 @@ private:
+ 
+ struct SDepthOfFieldParams
+ {
+-	SDepthOfFieldParams() : bGameMode(false), pMaskTex(0), pBokehShapeTex(0), fMaskBlendAmount(0.0f), fApertureBlades(8.0f), fApertureFNumber(8.0f), fBladeRotation(0.0f), fBladeCurvature(0.4f), fMaskFNumber(2.0f), fMaskRotation(0.0f), fHighlightThreshold(2.0f), fHighlightGain(3.0f), fAnamorphicSqueeze(1.0f), fCatEye(0.0f), fPupilScale(1.0f), fComa(0.0f), fAstigmatism(0.0f), fFieldCurvature(0.0f), fEdgeSoftness(0.0f)
++	SDepthOfFieldParams() : bGameMode(false), pMaskTex(0), pBokehShapeTex(0), fMaskBlendAmount(0.0f), fApertureBlades(8.0f), fApertureFNumber(8.0f), fBladeRotation(0.0f), fBladeCurvature(0.4f), fMaskFNumber(2.0f), fMaskRotation(0.0f), fHighlightThreshold(2.0f), fHighlightGain(3.0f), fAnamorphicSqueeze(1.0f), fCatEye(0.0f), fPupilScale(1.0f), fComa(0.0f), fAstigmatism(0.0f), fFieldCurvature(0.0f), fEdgeSoftness(0.0f), fAxialChromatic(0.0f)
+ 	{
+ 	};
+ 
+@@ -165,6 +165,7 @@ struct SDepthOfFieldParams
+ 	float     fAstigmatism;        //!< -1..1 radial/tangential focus split. The blur ellipse elongates radially on one side of focus and tangentially on the other; the sign swaps which side is which.
+ 	float     fFieldCurvature;     //!< -1..1 Petzval field curvature. The focal surface is curved, so with the centre in focus the edges focus at a different distance: positive = edges focus closer than the centre, negative = further. Being a focus error, stopping down hides it.
+ 	float     fEdgeSoftness;       //!< 0..1 residual off-axis aberration blur, applied as a far-layer circle of confusion floor that grows with the square of the field height and of the pupil radius, so it is strongest wide open and gone stopped down.
++	float     fAxialChromatic;     //!< 0..1 longitudinal chromatic aberration. Each wavelength focuses at its own distance, so the out-of-focus disc has a different size per channel: behind focus red and blue shrink and leave a green rim, in front of it green shrinks and leaves a magenta one. Unlike the lateral kind this is a focus error, so it is as strong in the centre as at the edges.
+ 
+ 	CTexture* pMaskTex;
+ 	CTexture* pBokehShapeTex;    //!< Optional silhouette for the sprite bokeh splats; null keeps the procedural disc.
+@@ -215,6 +216,7 @@ public:
+ 		AddParamFloatNoTransition("Dof_User_Astigmatism", m_pUserAstigmatism, 0.0f);
+ 		AddParamFloatNoTransition("Dof_User_FieldCurvature", m_pUserFieldCurvature, 0.0f);
+ 		AddParamFloatNoTransition("Dof_User_EdgeSoftness", m_pUserEdgeSoftness, 0.0f);
++		AddParamFloatNoTransition("Dof_User_AxialChromatic", m_pUserAxialChromatic, 0.0f);
+ 		AddParamTex("Dof_User_BokehShapeTex", m_pUserBokehShapeTex, 0);
+ 
+ 		AddParamFloatNoTransition("Dof_Tod_FocusRange", m_pTimeOfDayFocusRange, 1000.0f);
+@@ -276,6 +278,9 @@ private:
+ 	// float x2: lens flaws riding the same field vector - the curved focal surface and the
+ 	// residual off-axis blur floor. See SDepthOfFieldParams above and LensFlawsSpec.md.
+ 	CEffectParam* m_pUserFieldCurvature, * m_pUserEdgeSoftness;
++	// float: axial chromatic aberration. Not a field effect at all - it is a per-channel focus
++	// error, so it lives on its own rather than on the field vector. See AxialChromaticSpec.md.
++	CEffectParam* m_pUserAxialChromatic;
+ 	// CTexture: sprite bokeh silhouette
+ 	CEffectParam* m_pUserBokehShapeTex;
+ 	// float, float
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DepthOfField.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DepthOfField.cpp
+index 8d0618f3..f3abd7d8 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DepthOfField.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DepthOfField.cpp
+@@ -278,6 +278,17 @@ Vec4 CDepthOfFieldStage::SampleMaskKernelTap(float u, float v) const
+ // coma goes with the square of the pupil radius in ABSOLUTE terms and the shader's tap radius is
+ // already normalized to the pupil. Astigmatism is a focus shift, not a pupil-size effect, so it
+ // is aperture independent.
++// Axial chromatic aberration reduced to the one number the shaders need: the radius of the
++// SHRUNK channels' disc, in units of the full one. It is a ratio between wavelengths, a property
++// of the glass, so it is deliberately NOT aperture scaled - the discs themselves already shrink
++// with the circle of confusion, which is why stopping down hides the fringing on its own.
++// See AxialChromaticSpec.md.
++static float ResolveAxialChromaticScale(float amount)
++{
++	const float kAxial = 0.35f;   // how far the shrunk channels fall behind at amount = 1
++	return 1.0f - kAxial * clamp_tpl(amount, 0.0f, 1.0f);
++}
++
+ Vec4 CDepthOfFieldStage::ResolveFieldPupil(float catEye, float pupilScale, float coma, float astigmatism)
+ {
+ 	const float kComa = 0.6f;    // radii a rim tap travels at coma = 1, wide open, in the corner
+@@ -391,14 +402,19 @@ void CDepthOfFieldStage::Execute()
+ 	                        kFieldCurvature * clamp_tpl(dofParams.fFieldCurvature, -1.0f, 1.0f),
+ 	                        kEdgeSoftness * clamp_tpl(dofParams.fEdgeSoftness, 0.0f, 1.0f) * pField * pField);
+ 
++	// Axial chromatic aberration: one scale, shared by the gather and the splat so the halo and
++	// the sprite can never disagree on where the coloured rim starts.
++	const Vec4 vAxialChromatic(ResolveAxialChromaticScale(dofParams.fAxialChromatic), 0.0f, 0.0f, 0.0f);
++
+ 	// Once per change, never per frame: these four user values reach the shaders as derived
+ 	// numbers, so the log prints both sides of the derivation.
+ 	{
+ 		static float s_lastCatEye = -1.0f, s_lastPupilScale = -1.0f, s_lastComa = -1.0f, s_lastAstig = -2.0f;
+-		static float s_lastFieldCurvature = -2.0f, s_lastEdgeSoftness = -1.0f;
++		static float s_lastFieldCurvature = -2.0f, s_lastEdgeSoftness = -1.0f, s_lastAxial = -1.0f;
+ 		if (fabsf(dofParams.fCatEye - s_lastCatEye) > 0.005f || fabsf(dofParams.fPupilScale - s_lastPupilScale) > 0.005f ||
+ 		    fabsf(dofParams.fComa - s_lastComa) > 0.005f || fabsf(dofParams.fAstigmatism - s_lastAstig) > 0.005f ||
+-		    fabsf(dofParams.fFieldCurvature - s_lastFieldCurvature) > 0.005f || fabsf(dofParams.fEdgeSoftness - s_lastEdgeSoftness) > 0.005f)
++		    fabsf(dofParams.fFieldCurvature - s_lastFieldCurvature) > 0.005f || fabsf(dofParams.fEdgeSoftness - s_lastEdgeSoftness) > 0.005f ||
++		    fabsf(dofParams.fAxialChromatic - s_lastAxial) > 0.005f)
+ 		{
+ 			s_lastCatEye = dofParams.fCatEye;
+ 			s_lastPupilScale = dofParams.fPupilScale;
+@@ -406,9 +422,10 @@ void CDepthOfFieldStage::Execute()
+ 			s_lastAstig = dofParams.fAstigmatism;
+ 			s_lastFieldCurvature = dofParams.fFieldCurvature;
+ 			s_lastEdgeSoftness = dofParams.fEdgeSoftness;
+-			CryLog("[DOF] field pupil catEye=%.2f p=%.2f -> offset/field=%.2f barrel=%.2f coma=%.2f astig=%.2f fc=%.2f es=%.2f",
++			s_lastAxial = dofParams.fAxialChromatic;
++			CryLog("[DOF] field pupil catEye=%.2f p=%.2f -> offset/field=%.2f barrel=%.2f coma=%.2f astig=%.2f fc=%.2f es=%.2f loca=%.2f",
+ 			       dofParams.fCatEye, dofParams.fPupilScale, vFieldPupil.x, vFieldPupil.y, vFieldPupil.z, vFieldPupil.w,
+-			       vFieldPupil2.z, vFieldPupil2.w);
++			       vFieldPupil2.z, vFieldPupil2.w, vAxialChromatic.x);
+ 		}
+ 	}
+ 
+@@ -455,6 +472,7 @@ void CDepthOfFieldStage::Execute()
+ 	static CCryNameR dofTapsName("g_Taps");
+ 	static CCryNameR dofFieldPupilName("vDofFieldPupil");
+ 	static CCryNameR dofFieldPupil2Name("vDofFieldPupil2");
++	static CCryNameR dofAxialChromaticName("vDofAxialChromatic");
+ 
+ 	// TODO: Compute shader! because the targets are not compressed / able anyway, and we can half resource allocation)
+ 	{
+@@ -564,6 +582,7 @@ void CDepthOfFieldStage::Execute()
+ 			m_passGather0.SetConstantArray(dofTapsName, vTaps, nSquareTapsSide * nSquareTapsSide, eHWSC_Pixel);
+ 			m_passGather0.SetConstant(dofFieldPupilName, vFieldPupil, eHWSC_Pixel);
+ 			m_passGather0.SetConstant(dofFieldPupil2Name, vFieldPupil2, eHWSC_Pixel);
++			m_passGather0.SetConstant(dofAxialChromaticName, vAxialChromatic, eHWSC_Pixel);
+ 			m_passGather0.Execute();
+ 		}
+ 
+@@ -619,6 +638,7 @@ void CDepthOfFieldStage::Execute()
+ 			m_passGather1.SetConstantArray(dofTapsName, vTaps, nSquareTapsSide * nSquareTapsSide, eHWSC_Pixel);
+ 			m_passGather1.SetConstant(dofFieldPupilName, vFieldPupil, eHWSC_Pixel);
+ 			m_passGather1.SetConstant(dofFieldPupil2Name, vFieldPupil2, eHWSC_Pixel);
++			m_passGather1.SetConstant(dofAxialChromaticName, vAxialChromatic, eHWSC_Pixel);
+ 			m_passGather1.Execute();
+ 		}
+ 
+@@ -840,6 +860,9 @@ void CDepthOfFieldStage::ExecuteSpriteBokeh(const SDepthOfFieldParams& dofParams
+ 	// shader's quad-local coordinate IS pupil space and needs no further correction.
+ 	const Vec4 vFieldPupil = ResolveFieldPupil(dofParams.fCatEye, dofParams.fPupilScale, dofParams.fComa, dofParams.fAstigmatism);
+ 	const Vec4 vFieldPupil2(fSpriteSqueeze, (CRenderer::CV_r_DofFieldDebug > 0) ? 1.0f : 0.0f, 0.0f, 0.0f);
++	// Same derivation as the gather's, from the same user amount: the splat draws the shrunk
++	// channels at exactly the radius the gather masks its taps to.
++	const Vec4 vAxialChromatic(ResolveAxialChromaticScale(dofParams.fAxialChromatic), 0.0f, 0.0f, 0.0f);
+ 
+ 	// Soft knee spanning +/-50% of the threshold. Wide on purpose: a hard cut makes highlights
+ 	// pop in and out one frame at a time as the aperture or the focus sweeps past them.
+@@ -889,6 +912,7 @@ void CDepthOfFieldStage::ExecuteSpriteBokeh(const SDepthOfFieldParams& dofParams
+ 	static CCryNameR dofBokehMask2Name("vDofBokehMask2");
+ 	static CCryNameR dofFieldPupilName("vDofFieldPupil");
+ 	static CCryNameR dofFieldPupil2Name("vDofFieldPupil2");
++	static CCryNameR dofAxialChromaticName("vDofAxialChromatic");
+ 
+ 	// Ground truth log, once per change: what the splat grid and the iris actually resolve to.
+ 	{
+@@ -1001,6 +1025,7 @@ void CDepthOfFieldStage::ExecuteSpriteBokeh(const SDepthOfFieldParams& dofParams
+ 			constantManager.SetNamedConstant(dofFieldPupilName, vFieldPupil, eHWSC_Pixel);
+ 			constantManager.SetNamedConstant(dofFieldPupil2Name, vFieldPupil2, eHWSC_Vertex);
+ 			constantManager.SetNamedConstant(dofFieldPupil2Name, vFieldPupil2, eHWSC_Pixel);
++			constantManager.SetNamedConstant(dofAxialChromaticName, vAxialChromatic, eHWSC_Pixel);
+ 			constantManager.EndNamedConstantUpdate(&viewport, m_graphicsPipeline.GetCurrentRenderView());
+ 
+ 			m_passSpriteSplat.AddPrimitive(&prim);
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/PostProcessDOF.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/PostProcessDOF.cpp
+index ebfb8fb9..6edfdf5d 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/PostProcessDOF.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/PostProcessDOF.cpp
+@@ -128,6 +128,10 @@ SDepthOfFieldParams CDepthOfField::GetParams()
+ 	pParams.fFieldCurvature = clamp_tpl(m_pUserFieldCurvature->GetParam(), -1.0f, 1.0f);
+ 	pParams.fEdgeSoftness = clamp_tpl(m_pUserEdgeSoftness->GetParam(), 0.0f, 1.0f);
+ 
++	// Axial chromatic aberration. A focus error rather than a pupil or field effect, but it is
++	// clamped here with the rest so the stage can trust its range without re-checking.
++	pParams.fAxialChromatic = clamp_tpl(m_pUserAxialChromatic->GetParam(), 0.0f, 1.0f);
++
+ 	pParams.vMinZParams.x = m_pFocusMinZ->GetParam();
+ 	pParams.vMinZParams.y = m_pFocusMinZScale->GetParam();
+ 	pParams.vMinZParams.z = pParams.vMinZParams.w = 0.0f;
+diff --git a/Code/CryPlugins/CinematicCamera/AxialChromaticSpec.md b/Code/CryPlugins/CinematicCamera/AxialChromaticSpec.md
+new file mode 100644
+index 00000000..00f11a4e
+--- /dev/null
++++ b/Code/CryPlugins/CinematicCamera/AxialChromaticSpec.md
+@@ -0,0 +1,102 @@
++# Axial (Longitudinal) Chromatic Aberration — Specification
++
++Status: approved for implementation, 2026-08-26. Owner of semantics: the camera manager.
++Companion to LensFlawsSpec.md (lateral CA lives there). No new render pass.
++
++## 1. What this adds
++
++Lateral CA is a magnification difference (edges of the frame). Axial CA is a **focus**
++difference: each wavelength has its own focal plane, so every out-of-focus disc is a different
++size per channel. The look everyone knows from fast and vintage glass ("bokeh fringing"):
++
++* highlights **behind** the focus plane carry a **green** rim,
++* highlights **in front** of it carry a **magenta / purple** rim,
++* the centre of the frame is affected exactly like the edges (it is not a field effect),
++* it is a focus error, so its visibility rides the circle of confusion and stopping down hides it.
++
++One parameter, `Axial Chromatic Aberration` (0..1). Bold at 1: the shrunk channels' discs are
++65% the size of the full one — a fat coloured rim. Natural ~0.2–0.4.
++
++## 2. Model
++
++Each channel is convolved with its own disc. Rather than three gathers, the gather kernel stays
++at the layer's CoC and every tap's colour is multiplied by a **per-channel radial mask**: a
++channel whose disc is smaller only accepts taps inside its own radius. Per-channel weight
++accumulation then normalises each channel over the taps it actually took, so energy per channel
++is conserved and the rim carries only the wider channel's colour. Exactly what a smaller disc
++does, at the cost of a few multiplies per tap and no extra samples.
++
++Which channels shrink (empirical rule of undercorrected glass):
++
++| Layer | Shrunk channels | Rim colour |
++|---|---|---|
++| Far (behind focus) | R and B, to `s = 1 - K·amount` | green |
++| Near (in front) | G, to `s = 1 - K·amount` | magenta |
++
++`K = 0.35`. `s` is in pupil units (1 = the kernel's full radius). Not aperture scaled: the
++ratio between the channels' discs is a property of the glass; the discs themselves already
++scale with the CoC.
++
++Per-tap mask, one-sided outward so that `s = 1` is an exact identity for every tap of the unit
++pupil: `m(ρ) = saturate((s - ρ) / 0.08 + 1)` with `ρ = |x|`, `x` the tap in unsqueezed pupil
++space BEFORE coma/astigmatism (the same `x` FieldPupilSpec §4.2 clips with the barrel).
++
++## 3. Renderer
++
++### 3.1 Gather (`DofPS`)
++
++New constant `vDofAxialChromatic = (s, 0, 0, 0)` (PS, gather0 and gather1). In the loops:
++
++* far loop: `float3 chMask = float3(m(ρ), 1, m(ρ))`; near loop: `float3 chMask = float3(1, m(ρ), 1)`.
++* Weighted path: `cAccFar.rgb += cf.rgb * wf * chMask; cAccFar.a += cf.a * wf;` with
++  `caccFar` promoted to `float4` (`.rgb += wf * chMask; .a += wf`), and the normalisation
++  `cAccFar = caccFar.a ? cAccFar / max(caccFar, 1e-6) : cCenterTapFar` done per channel
++  (guard each lane; a channel with zero accumulated weight falls back to the centre tap's
++  channel). Same for near.
++* Max path (`SAMPLE0/1`): `cf.rgb *= chMask` before the `max`.
++* `s = 1` (amount 0) must reduce to today's code bit for bit apart from the float4 weight
++  arithmetic — check by reading, not by hoping: every mask is 1 for `ρ <= 1`.
++
++### 3.2 Splat (`DofBokehRefPS`)
++
++The pupil evaluation (barrel clip × polygon × mask, fill-style lerp) is factored into a
++function `EvalPupilShape(float2 tcQuad, ...) -> half4` taking the already growth-corrected,
++inverse-aberrated quad coordinate. It is evaluated at two scales:
++
++* `cFull   = EvalPupilShape(tcQuad)`
++* `cShrunk = EvalPupilShape(tcQuad / s) * (1 / (s * s))` — same light in a smaller disc, so
++  brighter per pixel; the bare-iris `clip(lerp(1 - fLen, 1, shapeTexBound))` must use the
++  FULL radius (the quad is not shrunk).
++
++Then per layer:
++* far layer deposit colour `= (cShrunk.r, cFull.g, cShrunk.b)`,
++* near layer deposit colour `= (cFull.r, cShrunk.g, cFull.b)`,
++* alpha of each `= dot(rgb, 0.333)` as today, then the existing `fSplatNorm`, `Field.z`,
++  layer split by `QuadPos.z`, dither.
++
++At `s = 1`, `cShrunk == cFull` and both layers reduce to today's deposit.
++
++### 3.3 Plumbing
++
++* `Dof_User_AxialChromatic` (0) → `SDepthOfFieldParams::fAxialChromatic` → `Execute()`
++  resolves `s = 1 - 0.35 * clamp(amount, 0, 1)` once, logs it in the existing field-pupil
++  line (`loca=%.2f`), binds `vDofAxialChromatic` to gather0 / gather1 (PS) and the splat
++  primitive (PS).
++* Component: `SCineLensParams::axialChromatic` ('axch'), label "Axial Chromatic Aberration",
++  `Range<0, 1, 0, 1>`, default 0, before `bokehShapeTex`. Tooltip: "Focus differs by
++  wavelength: out-of-focus highlights behind the focus plane get a green rim, in front of it
++  a magenta one, in the centre of the frame as much as at the edges. The bokeh fringing of
++  fast and vintage lenses. Hidden by stopping down like any focus error." Push / save /
++  restore like `Dof_User_FieldCurvature`.
++* Docs: README Lens table row + one paragraph; spec listed. ConsoleReference unchanged (no
++  cvar).
++
++## 4. Acceptance
++
++1. Amount 0: identical to today.
++2. Amount 1, f/1.4, point lights behind focus: green rims; pull focus past them: magenta rims.
++   Centre-frame lights show it as strongly as corner lights. f/8: gone (discs too small).
++3. Sprite bokeh on, shape mask + rotation: the rim follows the mask silhouette (the shrunk
++   channel is the same shape, smaller), and splat and halo agree in colour at the rim.
++4. Anamorphic 2×: the oval's rim is coloured, still an oval.
++5. RenderDoc: gather cost change < 0.03 ms at 1080p.
+diff --git a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp
+index d701ea9a..d634123a 100644
+--- a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp
++++ b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp
+@@ -750,6 +750,7 @@ void CCinematicCameraComponent::ApplyDOF()
+ 		gEnv->p3DEngine->GetPostEffectParam("Dof_User_Astigmatism", m_savedDofAstigmatism);
+ 		gEnv->p3DEngine->GetPostEffectParam("Dof_User_FieldCurvature", m_savedDofFieldCurvature);
+ 		gEnv->p3DEngine->GetPostEffectParam("Dof_User_EdgeSoftness", m_savedDofEdgeSoftness);
++		gEnv->p3DEngine->GetPostEffectParam("Dof_User_AxialChromatic", m_savedDofAxialChromatic);
+ 		m_bDofParamsSaved = true;
+ 	}
+ 
+@@ -789,6 +790,11 @@ void CCinematicCameraComponent::ApplyDOF()
+ 	gEnv->p3DEngine->SetPostEffectParam("Dof_User_FieldCurvature", (float)m_lens.fieldCurvature);
+ 	gEnv->p3DEngine->SetPostEffectParam("Dof_User_EdgeSoftness",   (float)m_lens.edgeSoftness);
+ 
++	// Axial chromatic aberration. A depth of field parameter rather than a lens character cvar,
++	// unlike its lateral namesake: it changes the SIZE of the out-of-focus disc per channel, so
++	// it has to reach the gather and the splat, not the final composite.
++	gEnv->p3DEngine->SetPostEffectParam("Dof_User_AxialChromatic", (float)m_lens.axialChromatic);
++
+ 	// Hybrid highlight splat tuning. Harmless in pure gather mode - nothing reads them there.
+ 	gEnv->p3DEngine->SetPostEffectParam("Dof_User_HighlightThreshold", (float)m_dof.highlightThreshold);
+ 	gEnv->p3DEngine->SetPostEffectParam("Dof_User_HighlightGain",      (float)m_dof.highlightSplatGain);
+@@ -822,6 +828,7 @@ void CCinematicCameraComponent::RestoreDOF()
+ 	gEnv->p3DEngine->SetPostEffectParam("Dof_User_Astigmatism", m_savedDofAstigmatism);
+ 	gEnv->p3DEngine->SetPostEffectParam("Dof_User_FieldCurvature", m_savedDofFieldCurvature);
+ 	gEnv->p3DEngine->SetPostEffectParam("Dof_User_EdgeSoftness", m_savedDofEdgeSoftness);
++	gEnv->p3DEngine->SetPostEffectParam("Dof_User_AxialChromatic", m_savedDofAxialChromatic);
+ 
+ 	ICVar* pDofCVar = gEnv->pConsole->GetCVar("r_dof");
+ 	if (pDofCVar)
+diff --git a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
+index 16c11dc2..73448423 100644
+--- a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
++++ b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
+@@ -290,6 +290,12 @@ struct SCineLensParams
+ 			"Lateral colour fringing: red and blue are magnified differently from green, so "
+ 			"high-contrast edges pick up red/cyan fringes that grow toward the frame edges. "
+ 			"Zero in the centre.", 0.0f);
++		desc.AddMember(&SCineLensParams::axialChromatic,
++			'axch', "AxialChromatic", "Axial Chromatic Aberration",
++			"Focus differs by wavelength: out-of-focus highlights behind the focus plane get a "
++			"green rim, in front of it a magenta one, in the centre of the frame as much as at "
++			"the edges. The bokeh fringing of fast and vintage lenses. Hidden by stopping down "
++			"like any focus error.", 0.0f);
+ 	}
+ 
+ 	Schematyc::Range<1, 2400> focalLength = 50.f;
+@@ -322,6 +328,10 @@ struct SCineLensParams
+ 	Schematyc::Range<-1, 1, -1, 1> fieldCurvature = 0.0f;
+ 	Schematyc::Range<0, 1, 0, 1> edgeSoftness = 0.0f;
+ 	Schematyc::Range<0, 1, 0, 1> chromaticAberration = 0.0f;
++	// Axial (longitudinal) chromatic aberration, AxialChromaticSpec.md. The other half of the
++	// colour error: chromaticAberration above is a magnification difference and lives in the
++	// PostAA composite, this one is a FOCUS difference and lives in the depth of field.
++	Schematyc::Range<0, 1, 0, 1> axialChromatic = 0.0f;
+ 	// Keep last: operator== memcmp's the members in front of this one.
+ 	Schematyc::TextureFileName bokehShapeTex;
+ };
+@@ -813,6 +823,7 @@ private:
+ 	float m_savedDofAstigmatism = 0.f;
+ 	float m_savedDofFieldCurvature = 0.f;
+ 	float m_savedDofEdgeSoftness = 0.f;
++	float m_savedDofAxialChromatic = 0.f;
+ 	int   m_savedDofCVar       = 0;
+ 	bool  m_bDofParamsSaved    = false;
+ 
+diff --git a/Code/CryPlugins/CinematicCamera/README.md b/Code/CryPlugins/CinematicCamera/README.md
+index ee7ea30a..8ee3e92f 100644
+--- a/Code/CryPlugins/CinematicCamera/README.md
++++ b/Code/CryPlugins/CinematicCamera/README.md
+@@ -147,6 +147,7 @@ range it is noted in brackets.
+ | Field Curvature | -1 to 1 | 0 | Curved focal surface: with the centre in focus the edges focus at a different distance. Positive = edges focus closer, so a flat wall goes soft toward the edges; negative = edges focus further. Hidden by stopping down, like any focus error. See *Lens flaws*. |
+ | Edge Softness | 0-1 | 0 | Residual off-axis aberration blur: edges stay soft even when in focus, strongest at Maximum Aperture and gone stopped down. The "sharp centre, mushy corners" of cheap and vintage glass. |
+ | Chromatic Aberration | 0-1 | 0 | Lateral colour fringing: red and blue are magnified differently from green, so high-contrast edges pick up red/cyan fringes that grow toward the frame edges. Zero in the centre. |
++| Axial Chromatic Aberration | 0-1 | 0 | Focus differs by wavelength: out-of-focus highlights behind the focus plane get a green rim, in front of it a magenta one, in the centre of the frame as much as at the edges. The bokeh fringing of fast and vintage lenses. Hidden by stopping down like any focus error. See *Axial chromatic aberration*. |
+ 
+ ### Anamorphic
+ 
+@@ -478,6 +479,24 @@ next to Distortion and the anamorphic squeeze, as two extra samples driven by
+ `r_LensChromaticAberration` and pushed and restored exactly like `r_LensDistortion`. Full model
+ in [LensFlawsSpec.md](LensFlawsSpec.md).
+ 
++### Axial chromatic aberration
++
++Chromatic Aberration above is a *magnification* error and shows at the edges of the frame.
++**Axial Chromatic Aberration** is the other half: a *focus* error, each wavelength landing on
++its own plane, so every out-of-focus disc is a different size per channel. Highlights behind
++the focus plane come back with a green rim, highlights in front of it with a magenta one, and
++because it has nothing to do with field height the centre of the frame fringes as hard as the
++corners. This is the bokeh fringing of fast and vintage glass; being a focus error, stopping
++down takes it away with everything else.
++
++No extra pass and no extra samples: the gather keeps one kernel at the layer's circle of
++confusion and multiplies each tap by a per-channel radial mask, so a channel whose disc is
++smaller only accepts the taps inside its own radius, and each channel is then normalised over
++the weight it actually took. The sprite splat draws the same pupil twice, once at full radius
++and once shrunk, and composes the layer's colour from the two - so halo and sprite agree on
++where the coloured rim starts. Full model in
++[AxialChromaticSpec.md](AxialChromaticSpec.md).
++
+ ---
+ 
+ ## Diffraction streak physics
+@@ -674,6 +693,8 @@ The design documents behind these features, each one the authority on its own se
+   astigmatism, and the rule that the mechanical light loss is applied exactly once.
+ - [LensFlawsSpec.md](LensFlawsSpec.md) - field curvature, edge softness and lateral chromatic
+   aberration: what a cheap lens does where it is in focus, at no extra render pass.
++- [AxialChromaticSpec.md](AxialChromaticSpec.md) - longitudinal chromatic aberration: the
++  per-channel disc size that puts green and magenta rims on out-of-focus highlights.
+ - [DiffractionStreaksSpec.md](DiffractionStreaksSpec.md) - sunstars.
+ - [AnamorphicSpec.md](AnamorphicSpec.md) - squeeze, gate mask and horizontal flare.
+ - [HalationSpec.md](HalationSpec.md) - the red-orange film halo.
+diff --git a/Engine/Shaders/HWScripts/CryFX/DepthOfField.cfx b/Engine/Shaders/HWScripts/CryFX/DepthOfField.cfx
+index c8070077..71881469 100644
+--- a/Engine/Shaders/HWScripts/CryFX/DepthOfField.cfx
++++ b/Engine/Shaders/HWScripts/CryFX/DepthOfField.cfx
+@@ -60,6 +60,12 @@ float4 vDofFieldPupil;
+ // ComputeCircleOfConfusion and reach the downscale and the composite, not the splat.
+ float4 vDofFieldPupil2;
+ 
++// Axial (longitudinal) chromatic aberration, AxialChromaticSpec.md. x = s, the radius of the
++// shrunk channels' out-of-focus disc in units of the full one (1 = off). Not a field effect:
++// each wavelength simply focuses at its own distance, so the centre of the frame fringes as
++// hard as the corners. yzw unused.
++float4 vDofAxialChromatic;
++
+ // Squared field radius of a pixel: 0 at the frame centre, 1 at the corners. Same normalisation
+ // as the field vector the pupil effects use (FieldPupilSpec 2.1), reduced to the only quantity
+ // the flaws below need - both of them are even in the field, so no direction is required.
+@@ -290,6 +296,59 @@ v2fBokehQuad DofBokehRefVS(uint nVertexID : SV_VertexID)
+ 	return OUT;
+ }
+ 
++// The pupil itself: barrel clip INTERSECT iris polygon INTERSECT shape mask, rendered in
++// whichever of the two fill styles the smaller hole calls for. Factored out of the pixel shader
++// below because axial chromatic aberration needs it evaluated TWICE, at two radii - a channel
++// that focuses short draws the very same pupil, only smaller. tcQuad is the quad-local
++// coordinate already brought back to pupil units and walked back through the aberrations;
++// vBarrelC is the barrel's apparent centre and fIrisExp the lod-driven iris falloff exponent.
++half4 EvalPupilShape(half2 tcQuad, float2 vBarrelC, half fIrisExp)
++{
++	const half fLen = dot(tcQuad, tcQuad);
++
++	// Iris fill style: radial falloff plus the approximate diffusion ring.
++	half fShapeBokeh = pow(fLen, fIrisExp) ;// * fLen;  // ^2
++	half4 cIris = saturate(1-fShapeBokeh);
++	cIris += saturate(1-abs(fShapeBokeh*2-1));
++
++	// Iris polygon at the curvature-driven sharpening exponent (vDofBokehShape.y: 0 = circle,
++	// ~1 = the true polygon, 2+ = sharpened, 4 = caricature - the same exponent the gather
++	// kernel raises its taps by, so both views of the iris always agree), at radius
++	// vDofBokehMask.z in quad units.
++	const float fEdgeSoft = 0.06f;      // soft edge width, in quad-local radius
++	const float fRadius   = sqrt(max(fLen, 1e-6f));
++	const float fTheta    = atan2(tcQuad.y, tcQuad.x);
++	const float fPolyRad  = pow(NGon_Rad(fTheta - vDofBokehShape.w, max(vDofBokehShape.x, 3.0f)), vDofBokehShape.y) * vDofBokehMask.z;
++	const half  fPolyMask = saturate((fPolyRad - fRadius) / fEdgeSoft);
++
++	// PUPIL = mask INTERSECT iris. The mask (white when none is bound) is sampled at the pupil's
++	// bounding scale (vDofBokehMask.y), the polygon at its own radius; their product is the
++	// physical aperture at every f-number. Stopping the iris down through the mask clips the
++	// silhouette corner by corner and rounds it off progressively - the two apertures are two
++	// separate mechanisms, but the crossover between them is a continuous intersection.
++	// Quad-local, from the CORRECTED coordinate: the mask is part of the pupil, so the barrel
++	// and the aberrations have to reshape its silhouette too, not be drawn as a circle over it.
++	float2 vMaskLocal = (tcQuad * 0.5) * vDofBokehMask.y;
++	vMaskLocal = float2( vMaskLocal.x * vDofBokehMask2.x + vMaskLocal.y * vDofBokehMask2.y,
++	                    -vMaskLocal.x * vDofBokehMask2.y + vMaskLocal.y * vDofBokehMask2.x);   // inverse rotation
++	const half fMaskVal = GetTexture2D(texDofBkRef_BokehShape, ssDofBkRef_BokehShape, vMaskLocal + 0.5).r;
++	// The barrel clip is the APERTURE and comes before the aberrations conceptually - it decides
++	// which rays exist at all, while coma and astigmatism are what the glass does to the ones
++	// that got through. Soft edge matched to the polygon's, so the two silhouettes blend alike.
++	const half  fBarrel = saturate((vDofFieldPupil.y - length(tcQuad - (half2)vBarrelC)) / 0.06 + 0.5);
++	const half fPupil   = fMaskVal * fPolyMask * fBarrel;
++
++	// Mask fill style: the pupil value field is the fill, and the soap-bubble diffusion ring
++	// rides the bilinear band where it crosses one half - the mask's outline inside the polygon,
++	// the polygon's edge where it clips the mask. A star gets a star-shaped ring.
++	const half4 cMaskLook = (half4)fPupil + saturate(1 - abs((1 - fPupil) * 2 - 1));
++	const half4 cIrisLook = cIris * fPupil;
++
++	// The fill style follows whichever hole is the smaller one (weight resolved on the CPU
++	// from N_mask / N); the geometry above is exact in both.
++	return lerp(cIrisLook, cMaskLook, vDofBokehMask.x);
++}
++
+ pixoutDofMRT DofBokehRefPS(v2fBokehQuad IN)
+ {
+ 	pixoutDofMRT OUT = (pixoutDofMRT) 0.0;
+@@ -326,58 +385,30 @@ pixoutDofMRT DofBokehRefPS(v2fBokehQuad IN)
+ 	}
+ 
+ 	// -8 ms for big kernels
+-	half fLen = (dot(tcQuad, tcQuad));
++	const half fLen = (dot(tcQuad, tcQuad));
+ 
+ 	// Bare iris: the circular clip is the lens barrel. With a shape texture bound the pupil is
+ 	// the mask x polygon product below, which is zero outside itself - and the mask may own
+-	// the quad's corners, so the barrel must not eat them.
++	// the quad's corners, so the barrel must not eat them. Always at the FULL radius: the quad
++	// is sized for the widest channel, so clipping it to the shrunk one would cut the rim off.
+ 	clip( lerp(1 - fLen, 1.0, vDofBokehShape.z) );
+ 
+-	//tcQuad*=1.1; // add slight border offset
+-	fLen = (dot(tcQuad, tcQuad));
+-
+-	// Iris fill style: radial falloff plus the approximate diffusion ring.
+-	half fShapeBokeh = pow(fLen, ((IN.Color.w))) ;// * fLen;  // ^2
+-	half4 cIris = saturate(1-fShapeBokeh);
+-  cIris += saturate(1-abs(fShapeBokeh*2-1));
+-
+-	// Iris polygon at the curvature-driven sharpening exponent (vDofBokehShape.y: 0 = circle,
+-	// ~1 = the true polygon, 2+ = sharpened, 4 = caricature - the same exponent the gather
+-	// kernel raises its taps by, so both views of the iris always agree), at radius
+-	// vDofBokehMask.z in quad units.
+-	const float fEdgeSoft = 0.06f;      // soft edge width, in quad-local radius
+-	const float fRadius   = sqrt(max(fLen, 1e-6f));
+-	const float fTheta    = atan2(tcQuad.y, tcQuad.x);
+-	const float fPolyRad  = pow(NGon_Rad(fTheta - vDofBokehShape.w, max(vDofBokehShape.x, 3.0f)), vDofBokehShape.y) * vDofBokehMask.z;
+-	const half  fPolyMask = saturate((fPolyRad - fRadius) / fEdgeSoft);
+-
+-	// PUPIL = mask INTERSECT iris. The mask (white when none is bound) is sampled at the pupil's
+-	// bounding scale (vDofBokehMask.y), the polygon at its own radius; their product is the
+-	// physical aperture at every f-number. Stopping the iris down through the mask clips the
+-	// silhouette corner by corner and rounds it off progressively - the two apertures are two
+-	// separate mechanisms, but the crossover between them is a continuous intersection.
+-	// Quad-local, from the CORRECTED coordinate: the mask is part of the pupil, so the barrel
+-	// and the aberrations have to reshape its silhouette too, not be drawn as a circle over it.
+-	float2 vMaskLocal = (tcQuad * 0.5) * vDofBokehMask.y;
+-	vMaskLocal = float2( vMaskLocal.x * vDofBokehMask2.x + vMaskLocal.y * vDofBokehMask2.y,
+-	                    -vMaskLocal.x * vDofBokehMask2.y + vMaskLocal.y * vDofBokehMask2.x);   // inverse rotation
+-	const half fMaskVal = GetTexture2D(texDofBkRef_BokehShape, ssDofBkRef_BokehShape, vMaskLocal + 0.5).r;
+-	// The barrel clip is the APERTURE and comes before the aberrations conceptually - it decides
+-	// which rays exist at all, while coma and astigmatism are what the glass does to the ones
+-	// that got through. Soft edge matched to the polygon's, so the two silhouettes blend alike.
+ 	const float2 vBarrelC = -vFieldU * (vDofFieldPupil.x * fFieldR);
+-	const half  fBarrel = saturate((vDofFieldPupil.y - length(tcQuad - (half2)vBarrelC)) / 0.06 + 0.5);
+-	const half fPupil   = fMaskVal * fPolyMask * fBarrel;
+ 
+-	// Mask fill style: the pupil value field is the fill, and the soap-bubble diffusion ring
+-	// rides the bilinear band where it crosses one half - the mask's outline inside the polygon,
+-	// the polygon's edge where it clips the mask. A star gets a star-shaped ring.
+-	const half4 cMaskLook = (half4)fPupil + saturate(1 - abs((1 - fPupil) * 2 - 1));
+-	const half4 cIrisLook = cIris * fPupil;
+-
+-	// The fill style follows whichever hole is the smaller one (weight resolved on the CPU
+-	// from N_mask / N); the geometry above is exact in both.
+-	half4 cBokehShape = lerp(cIrisLook, cMaskLook, vDofBokehMask.x);
++	// Axial chromatic aberration. The shrunk channels focus at a different distance, so they
++	// draw the SAME pupil at a smaller radius: evaluating the shape at tcQuad / s is exactly
++	// that shape scaled by s. Dividing by s^2 keeps the light in it constant, so the smaller
++	// disc is correspondingly brighter - the same energy through a smaller circle. At s = 1
++	// the two evaluations are identical and this reduces to the single deposit it replaced.
++	const half fAxialS = (half)max(vDofAxialChromatic.x, 0.05);
++	const half4 cFull   = EvalPupilShape(tcQuad, vBarrelC, (half)IN.Color.w);
++	const half4 cShrunk = EvalPupilShape(tcQuad / fAxialS, vBarrelC, (half)IN.Color.w) / (fAxialS * fAxialS);
++
++	// Behind focus red and blue are the short-focusing pair, so the rim beyond their discs is
++	// green alone; in front of focus it is green that shrinks and the rim reads magenta. Which
++	// side a splat lands on is the same near/far split QuadPos.z already carries.
++	const half3 cShapeFar  = half3(cShrunk.r, cFull.g,   cShrunk.b);
++	const half3 cShapeNear = half3(cFull.r,   cShrunk.g, cFull.b);
+ 
+ 	// Energy conserving deposit. QuadPos.w carries the CoC in pixels, so dividing by its area
+ 	// spreads a fixed amount of energy over the disc however large it grows - a highlight
+@@ -388,26 +419,31 @@ pixoutDofMRT DofBokehRefPS(v2fBokehQuad IN)
+ 	// narrowed by that same factor in the VS), so the deposit is divided by the real area.
+ 	const half fSplatNorm = vDofBokehHighlight.z / (fCocPixels * fCocPixels * vAspectRatio.z);
+ 
+-	half4 cScene = half4(IN.Color.rgb, 1);
+-	cScene *= half4(cBokehShape.rgb, dot(cBokehShape.rgb, 0.333));
+-	cScene *= fSplatNorm;
++	// Each layer composes its own silhouette now, so the deposit is built twice. Everything
++	// that is not the colour - the area normalisation, the transmission divide, the alpha from
++	// the mean of the channels - is exactly what it was.
+ 	// fSplatNorm divides by the FULL disc area, so a barrel-clipped pupil would dim this splat
+ 	// by the transmission T all by itself - and the tonemap vignette dims it again. Divide T
+ 	// back out (Field.z is 1/T) so the mechanical light loss is applied exactly once, in the
+ 	// tonemap, for blurred and sharp pixels alike.
+-	cScene *= (half)IN.Field.z;
++	const half fDeposit = fSplatNorm * (half)IN.Field.z;
++	half4 cSceneFar  = half4(IN.Color.rgb * cShapeFar,  dot(cShapeFar,  0.333)) * fDeposit;
++	half4 cSceneNear = half4(IN.Color.rgb * cShapeNear, dot(cShapeNear, 0.333)) * fDeposit;
+ 
+ 	// DIAGNOSTIC (r_DofSpriteBokehDebug): ignore the scene colour and the area
+ 	// normalization and paint the silhouette itself, blazing. If the shape texture and the
+ 	// iris polygon reach this shader at all, this makes them impossible to miss.
+ 	if (vDofBokehHighlight.w > 0.5)
+-		cScene = half4(cBokehShape.rgb, dot(cBokehShape.rgb, 0.333)) * 4.0;
++	{
++		cSceneFar  = half4(cShapeFar,  dot(cShapeFar,  0.333)) * 4.0;
++		cSceneNear = half4(cShapeNear, dot(cShapeNear, 0.333)) * 4.0;
++	}
+ 
+ 	// Background layer splats
+-	OUT.LayerFar = cScene * saturate(1-IN.QuadPos.z);
++	OUT.LayerFar = cSceneFar * saturate(1-IN.QuadPos.z);
+ 
+ 	// Foreground layer splats
+-	OUT.LayerNear = cScene * saturate(IN.QuadPos.z);
++	OUT.LayerNear = cSceneNear * saturate(IN.QuadPos.z);
+ 
+ 	// Apply dither pattern (minimize banding artefacts from accumulation/blending + aproximate lens particles)	
+ 	half fDither = GetTexture2D(texDofBkRef_Dither, ssDofBkRef_Dither, IN.QuadPos.xy).w;
+@@ -768,6 +804,12 @@ pixout_dof DofPS(vtxOut IN)
+ 	const float fSqueezeS = max(vDofFieldPupil2.x, 1.0);
+ 	const float fComaK = vDofFieldPupil.z * fFieldR;
+ 	const float fAstigA = vDofFieldPupil.w * fFieldR * fFieldR;   // signed per layer below
++	// Axial chromatic aberration: the radius, in pupil units, of the disc the SHRUNK channels
++	// convolve with. Rather than three gathers, every tap keeps the layer's kernel and its
++	// colour is masked per channel - a channel whose disc is smaller simply does not accept
++	// taps outside its own radius, and the per-channel weight sum below renormalises what it
++	// did accept. Same result, a few multiplies instead of a second and third kernel.
++	const float fAxialS = vDofAxialChromatic.x;
+ 
+ #if %_RT_SAMPLE0 || %_RT_SAMPLE1
+ 	fCocScale *= 0.15;
+@@ -781,19 +823,23 @@ pixout_dof DofPS(vtxOut IN)
+ 
+ #if %_RT_SAMPLE0 || %_RT_SAMPLE1	
+ 	float4 cAccNear = float4(0,0,0,0);
+-	float caccNear = 0;
++	float4 caccNear = 0;
+ 
+ 	float4 cAccFar = float4(0,0,0,fCocFar);
+-	float caccFar = 0;
++	float4 caccFar = 0;
+ 
+ 	OUT.LayerFar = cCenterTapFar;
+ 	OUT.LayerNear = cCenterTapNear;
+ #else
++	// The weight accumulators carry one lane per colour channel plus alpha: with a per-channel
++	// tap mask each channel takes a different subset of the taps, so each has to be normalised
++	// over the weight IT accumulated. .a keeps the unmasked sum, which is what the alpha (the
++	// circle of confusion the layer carries onward) has always been averaged by.
+ 	float4 cAccNear = float4(0,0,0,0);
+-	float caccNear = 0;
++	float4 caccNear = 0;
+ 
+ 	float4 cAccFar = float4(0,0,0,0);
+-	float caccFar = 0;
++	float4 caccFar = 0;
+ #endif
+ 
+ 	const float2 vMinTileCoC = (GetTexture2DLod(DOF_CoCM, DOF_PCSamp, float4(IN.baseTC.xy, 0, 0)).rg);
+@@ -828,12 +874,20 @@ pixout_dof DofPS(vtxOut IN)
+ 			// tonemap vignette instead (FieldPupilSpec.md section 2.3).
+ 			wn *= clipW;
+ 
++			// Per-channel disc: in FRONT of focus it is green that focuses short, so green
++			// alone is masked to the smaller radius and the rim left over reads magenta. rho is
++			// the tap's radius in the unsqueezed pupil BEFORE coma and astigmatism - the mask
++			// is a property of the aperture, like the barrel clip, not of the deformation.
++			// One-sided and outward, so at s = 1 every tap of the unit pupil masks to exactly 1.
++			const float mn = saturate((fAxialS - length(x)) / 0.08 + 1);
++			cn.rgb *= float3(1, mn, 1);
++
+ #if %_RT_SAMPLE0 || %_RT_SAMPLE1
+ 			// The max path ignores wn entirely, so the clip has to reach the colour itself.
+ 			cAccNear = max(cAccNear, cn * clipW);
+ #else
+ 			cAccNear += cn*wn;
+-			caccNear += wn;
++			caccNear += wn * float4(1, mn, 1, 1);
+ #endif
+ 		}
+ 	}
+@@ -858,18 +912,28 @@ pixout_dof DofPS(vtxOut IN)
+ 			float wf = (cf.w >= fCocFar) ? 1 : saturate( cf.w );
+ 			wf *= clipW;
+ 
++			// BEHIND focus red and blue are the pair that focuses short, so they take the
++			// smaller disc and green alone survives at the rim - the green fringe of fast and
++			// vintage glass. Alpha is left alone: it is the circle of confusion, not light.
++			const float mf = saturate((fAxialS - length(x)) / 0.08 + 1);
++			cf.rgb *= float3(mf, 1, mf);
++
+ #if %_RT_SAMPLE0 || %_RT_SAMPLE1
+ 			cAccFar = max(cAccFar, cf*wf);
+ #else
+ 			cAccFar += cf*wf;
+-			caccFar += wf;
++			caccFar += wf * float4(mf, 1, mf, 1);
+ #endif
+ 		}
+ 	}
+ 
+ #if !%_RT_SAMPLE0 && !%_RT_SAMPLE1
+-	cAccNear = caccNear ? cAccNear * rcp(caccNear) : cCenterTapNear;
+-	cAccFar = caccFar? cAccFar * rcp(caccFar) : cCenterTapFar;
++	// Per channel, not per pixel: a channel that accepted no weight at all - fully masked out,
++	// or the whole kernel clipped away - falls back to the centre tap's own channel, exactly as
++	// the scalar version fell back for the whole pixel. The guard is per lane because the lanes
++	// no longer share a weight.
++	cAccNear = (caccNear > 0) ? cAccNear / max(caccNear, 1e-6) : cCenterTapNear;
++	cAccFar = (caccFar > 0) ? cAccFar / max(caccFar, 1e-6) : cCenterTapFar;
+ #endif
+ 
+ 	OUT.LayerNear = cAccNear;
+-- 
+2.47.1.windows.1
+

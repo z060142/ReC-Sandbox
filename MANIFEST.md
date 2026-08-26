@@ -1,11 +1,14 @@
 ﻿# Sync manifest
 
 Baseline : main @ a34100a9 (pristine CRYENGINE 5.7.1)
-Dev      : dev @ f82b7988
-Synced   : 2026-08-26 06:24
+Dev      : dev @ 5e9f27da
+Synced   : 2026-08-26 10:19
 
 ## Commits (newest first)
 
+- 5e9f27da feat: axial chromatic aberration - per-channel disc radii in the gather (channel-masked taps, per-channel normalisation) and two-scale pupil in the splat; green rim behind focus, magenta in front
+- b7713475 feat: lens flaws pack - field curvature and edge softness in the circle of confusion, lateral chromatic aberration as per-channel radial remap in the PostAA composite
+- 08ea77e0 fix: cat-eye reach capped below the barrel radius (default 1.0) - stopping down removes the clipping instead of blacking out the corners
 - f82b7988 feat: field-dependent pupil - cat-eye barrel clip, coma, astigmatism; light loss applied once in the tonemap, Maximum Aperture lens parameter, stock fOptVignetting removed
 - 5b851c38 fix: focus peaking works - metre band with the engine depth constant, sampled depth, guide legend text
 - b0e9fd87 fix: halation halo is round - isotropic gaussian at 1/16 resolution instead of a separable exponential spread
@@ -55,12 +58,14 @@ Synced   : 2026-08-26 06:24
 - M	Code/CryEngine/RenderDll/XRenderD3D9/PostProcessDOF.cpp
 - M	Code/CryPlugins/CMakeLists.txt
 - A	Code/CryPlugins/CinematicCamera/AnamorphicSpec.md
+- A	Code/CryPlugins/CinematicCamera/AxialChromaticSpec.md
 - A	Code/CryPlugins/CinematicCamera/DiffractionStreaksSpec.md
 - A	Code/CryPlugins/CinematicCamera/EffectAuthoritySpec.md
 - A	Code/CryPlugins/CinematicCamera/FieldPupilSpec.md
 - A	Code/CryPlugins/CinematicCamera/HalationSpec.md
 - A	Code/CryPlugins/CinematicCamera/HybridDofSpec.md
 - A	Code/CryPlugins/CinematicCamera/Interface/ICinematicCameraOptics.h
+- A	Code/CryPlugins/CinematicCamera/LensFlawsSpec.md
 - A	Code/CryPlugins/CinematicCamera/Module/CMakeLists.txt
 - A	Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp
 - A	Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
