@@ -1,11 +1,13 @@
 ﻿# Sync manifest
 
 Baseline : main @ a34100a9 (pristine CRYENGINE 5.7.1)
-Dev      : dev @ 5e9f27da
-Synced   : 2026-08-26 10:19
+Dev      : dev @ 0391f529
+Synced   : 2026-08-26 20:36
 
 ## Commits (newest first)
 
+- 0391f529 fix: ghost energy scales with the aperture area (p^2) and is decoupled from the bokeh highlight gain - ghosts shrink when stopping down instead of turning into blazing specks
+- 6aa0d296 feat: lens ghosts - internal-reflection aperture images drawn by the splat pixel shader from a mirrored quarter-res grid, one layer per draw, hue-fanned coating tints, near layer
 - 5e9f27da feat: axial chromatic aberration - per-channel disc radii in the gather (channel-masked taps, per-channel normalisation) and two-scale pupil in the splat; green rim behind focus, magenta in front
 - b7713475 feat: lens flaws pack - field curvature and edge softness in the circle of confusion, lateral chromatic aberration as per-channel radial remap in the PostAA composite
 - 08ea77e0 fix: cat-eye reach capped below the barrel radius (default 1.0) - stopping down removes the clipping instead of blacking out the corners
@@ -66,6 +68,7 @@ Synced   : 2026-08-26 10:19
 - A	Code/CryPlugins/CinematicCamera/HybridDofSpec.md
 - A	Code/CryPlugins/CinematicCamera/Interface/ICinematicCameraOptics.h
 - A	Code/CryPlugins/CinematicCamera/LensFlawsSpec.md
+- A	Code/CryPlugins/CinematicCamera/LensGhostSpec.md
 - A	Code/CryPlugins/CinematicCamera/Module/CMakeLists.txt
 - A	Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp
 - A	Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
