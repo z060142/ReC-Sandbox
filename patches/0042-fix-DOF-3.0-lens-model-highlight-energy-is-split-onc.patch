@@ -1,0 +1,485 @@
+From e6ba876a8f4e6bd4a459422997c3627c0fe53324 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Thu, 27 Aug 2026 09:22:54 +0800
+Subject: [PATCH 42/44] fix: DOF 3.0 lens model - highlight energy is split
+ once between gather and splat, near opacity weighted by tap density, jitter
+ gets a per-frame phase, mask-domain jitter reined in
+
+1. Energy split. The lens-mode gather layers carried each texel whole while the sprite
+   deposited its excess on top, so a lamp was drawn at up to 2x its brightness and by an
+   amount set by a purely aesthetic threshold. DownscaleDofPS now hands the excess over
+   using the sprite's OWN knee (one shared function, CPU and HLSL), per sample before the
+   5-tap average, scaled by the sprite's own fade, and only when the splat actually runs.
+   base + sprite == the texel by construction.
+2. Near-layer opacity. Covering taps were counted as a fraction of the whole reach disc,
+   whose radius is the dilated tile MAXIMUM CoC - correct only when the foreground's own
+   CoC equals it. The numerator now carries (R / c_i)^2, so an object blurred less than the
+   tile max no longer composites in too transparent.
+3. Jitter. The per-pixel-only pattern was fixed-pattern noise, which is exactly what TSAA
+   cannot average away. Both IGN lanes take a per-frame golden-ratio phase from the frame
+   counter in vDofLensModel2.z. r_DepthOfFieldLensModelJitter 2 freezes it for debugging.
+4. Mask domain. g_Taps[].z is the bounding circle there, so the shader's clamp cannot hold
+   a tap inside a mask silhouette; the CPU quarters the amplitude and the [DOF] kernel line
+   says so.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01A72MFkdSczncE7au9UVnmu
+---
+ .../RenderDll/Common/RendererCVars.cpp        |  11 +-
+ .../GraphicsPipeline/DepthOfField.cpp         |  88 +++++++++++++--
+ .../CinematicCamera/DofLensModelSpec.md       |  73 +++++++++++-
+ .../CinematicCamera/docs/ConsoleReference.md  |   3 +-
+ .../Shaders/HWScripts/CryFX/DepthOfField.cfx  | 106 ++++++++++++++++--
+ 5 files changed, 259 insertions(+), 22 deletions(-)
+
+diff --git a/Code/CryEngine/RenderDll/Common/RendererCVars.cpp b/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
+index 90048396..1aca37ea 100644
+--- a/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
++++ b/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
+@@ -1631,8 +1631,15 @@ void CRendererCVars::InitCVars()
+ 	               "reads as a separate copy of the source and the disc comes apart into a handful "
+ 	               "of circles; a per-pixel offset turns that structure into noise the temporal AA "
+ 	               "resolves. The offset is clamped back inside the iris polygon, so the silhouette's "
+-	               "outline stays exact - only the interior is roughened. Set 0 to see the tap "
+-	               "copies again for comparison. Default 1.0.");
++	               "outline stays exact - only the interior is roughened. The pattern also advances "
++	               "one step along the golden-ratio sequence every frame: a jitter that depends on "
++	               "the pixel alone is fixed-pattern noise, which is the one thing temporal AA "
++	               "cannot average away. In the mask-kernel domain the amplitude is quartered - the "
++	               "clamp is a polygon radius and a mask silhouette has none, so a full-amplitude "
++	               "tap could leave the mask's open area. "
++	               "0 = the bare stratified grid (see the tap copies again for comparison). "
++	               "2 = full amplitude with the frame phase FROZEN, for telling tap structure "
++	               "apart from TAA ghosting. Default 1.0.");
+ 	REGISTER_CVAR3("r_DepthOfFieldLensModelDebug", CV_r_DofLensModelDebug, 0, VF_NULL,
+ 	               "DIAGNOSTIC for the lens model. 1 = log the UNCAPPED circle of confusion the thin "
+ 	               "lens is asking for once a second (so the clipping against "
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DepthOfField.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DepthOfField.cpp
+index c52a428e..a8046c6b 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DepthOfField.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DepthOfField.cpp
+@@ -334,6 +334,18 @@ Vec4 CDepthOfFieldStage::ResolveFieldPupil(float catEye, float pupilScale, float
+ 	            kAstig * clamp_tpl(astigmatism, -1.0f, 1.0f));
+ }
+ 
++// The highlight knee, resolved in ONE place. Two passes threshold on it now - the splat, which
++// deposits the excess, and (in lens mode) the downscale, which subtracts exactly that excess
++// from the layers the gather is built on. If the two ever disagreed the hybrid would stop
++// summing to the frame, so neither is allowed its own copy of the derivation.
++// Soft knee spanning +/-50% of the threshold: wide on purpose, a hard cut makes highlights pop
++// as the aperture or the focus sweeps past them.
++static void ResolveHighlightKnee(float fUserThreshold, float& fThreshold, float& fKnee)
++{
++	fThreshold = max(fUserThreshold, 0.0f);
++	fKnee = max(fThreshold * 0.5f, 0.01f);
++}
++
+ void CDepthOfFieldStage::Execute()
+ {
+ 	FUNCTION_PROFILER_RENDERER();
+@@ -475,9 +487,34 @@ void CDepthOfFieldStage::Execute()
+ 	// DIAMETER, the texture is a RADIUS in gather units. Never below the gather's cap: a splat
+ 	// ceiling under the kernel reach would starve the gather, which is nobody's intent.
+ 	const float fLensPhysCapUnits = max(fLensSplatCap * 0.5f / fUnitPx, fLensGatherCap);
++	// The jitter's temporal phase. A per-pixel-only jitter is fixed-pattern noise and the
++	// temporal AA cannot average it - it re-accumulates the same error every frame, which is
++	// the exact opposite of what the jitter was added for. The frame counter advances the
++	// pattern; wrapped at 1024 so it stays an exact float and the golden-ratio phase in the
++	// shader keeps full precision. r_DepthOfFieldLensModelJitter 2 pins it to 0 (a frozen
++	// pattern, for telling tap structure apart from TAA ghosting).
++	const bool  bStaticJitter = (CRenderer::CV_r_DofLensModelJitter > 1.5f);
++	const float fJitterFrame  = bStaticJitter ? 0.0f : (float)(SPostEffectsUtils::m_iFrameCounter & 1023);
+ 	// x = that cap; y is the tap jitter amplitude and is filled per gather pass (it scales with
+-	// the tap spacing, which differs between the two iterations).
+-	Vec4 vDofLensModel2(fLensPhysCapUnits, 0.0f, 0.0f, 0.0f);
++	// the tap spacing, which differs between the two iterations); z = the jitter's frame phase.
++	Vec4 vDofLensModel2(fLensPhysCapUnits, 0.0f, fJitterFrame, 0.0f);
++
++	// The hybrid splat is what makes the energy split below legitimate: only when it is actually
++	// running is there a second consumer to hand the highlight excess to. Resolved here rather
++	// than at the splat call site because the DOWNSCALE, which runs first, is the pass that has
++	// to give the energy away.
++	const bool bSplat = (CRenderer::CV_r_DofMode == 0);
++
++	// The downscale's copy of the highlight constant: threshold and knee identical to the
++	// sprite's (shared derivation), then z = the circle of confusion at which a sprite reaches
++	// full strength and w = whether the splat runs at all. With the splat off the gather is the
++	// only thing carrying light and w = 0 keeps every texel whole; the stock permutation never
++	// reads any of it.
++	float fSplitThreshold, fSplitKnee;
++	ResolveHighlightKnee(dofParams.fHighlightThreshold, fSplitThreshold, fSplitKnee);
++	const Vec4 vDownscaleHighlight(fSplitThreshold, fSplitKnee,
++	                               max(CRenderer::CV_r_DofSpriteBokehFadeCoC, 0.0f),
++	                               bSplat ? 1.0f : 0.0f);
+ 
+ 	if (bLensModel)
+ 	{
+@@ -618,6 +655,7 @@ void CDepthOfFieldStage::Execute()
+ 	static CCryNameR dofAxialChromaticName("vDofAxialChromatic");
+ 	static CCryNameR dofLensModelName("vDofLensModel");
+ 	static CCryNameR dofLensModel2Name("vDofLensModel2");
++	static CCryNameR dofBokehHighlightName("vDofBokehHighlight");
+ 
+ 	// TODO: Compute shader! because the targets are not compressed / able anyway, and we can half resource allocation)
+ 	{
+@@ -657,6 +695,15 @@ void CDepthOfFieldStage::Execute()
+ 			// The physical cap: this pass is where the circle of confusion texture is written, so
+ 			// it is where the only clamp the texture ever takes is applied.
+ 			m_passLayerDownscale.SetConstant(dofLensModel2Name, vDofLensModel2, eHWSC_Pixel);
++			// The energy split between the gather and the hybrid splat (spec 3.3). The layers
++			// used to carry each texel whole while the sprite deposited the excess above the
++			// threshold on top, so a lamp was drawn at up to twice its brightness and by an
++			// amount that depended on a purely aesthetic threshold. In lens mode the downscale
++			// hands the excess over instead, using the sprite's own knee so that base + sprite
++			// is exactly the texel - but only in proportion to the fade the sprite applies, and
++			// only when the splat is actually running. This pass repacks zw of the constant for
++			// that (see DownscaleDofPS); the splat's own copy is unaffected.
++			m_passLayerDownscale.SetConstant(dofBokehHighlightName, vDownscaleHighlight, eHWSC_Pixel);
+ 			m_passLayerDownscale.Execute();
+ 		}
+ 
+@@ -749,9 +796,20 @@ void CDepthOfFieldStage::Execute()
+ 			// unit disc, so the spacing there is 2 / side and half of it is 1 / side - the largest
+ 			// offset that keeps a tap inside its own stratum, which is what makes the jitter
+ 			// noise rather than a second, coarser structure.
++			//
++			// In the MASK domain the amplitude is quartered. The shader clamps a jittered tap
++			// back to g_Taps[].z, the aperture's radius at that angle - which for a mask kernel
++			// is 1, the bounding circle, because a mask silhouette has no radius function. The
++			// clamp therefore does nothing there and a tap can be pushed out of the mask's open
++			// area into its closed one, smearing the silhouette the mask kernel exists to keep.
++			// A quarter amplitude still breaks up the tap copies inside the shape while staying
++			// well within it.
+ 			{
++				const float fJitterAmount = bStaticJitter ? 1.0f : clamp_tpl(CRenderer::CV_r_DofLensModelJitter, 0.0f, 1.0f);
+ 				Vec4 vGather0Lens2 = vDofLensModel2;
+-				vGather0Lens2.y = clamp_tpl(CRenderer::CV_r_DofLensModelJitter, 0.0f, 1.0f) / (float)nSquareTapsSide;
++				vGather0Lens2.y = fJitterAmount / (float)nSquareTapsSide;
++				if (bMaskKernel)
++					vGather0Lens2.y *= 0.25f;
+ 				m_passGather0.SetConstant(dofLensModel2Name, vGather0Lens2, eHWSC_Pixel);
+ 			}
+ 			m_passGather0.Execute();
+@@ -759,12 +817,21 @@ void CDepthOfFieldStage::Execute()
+ 			// The tap count is the one number that says whether the dense kernel actually reached
+ 			// the shader, so it rides the existing kernel line.
+ 			static int32 s_lastLoggedTaps = -1;
+-			if (nSquareTapsSide != s_lastLoggedTaps)
++			static int32 s_lastLoggedJitterMode = -1;
++			const int32 nJitterMode = !bLensModel ? 0
++			                        : (CRenderer::CV_r_DofLensModelJitter <= 0.0f ? 1 : (bStaticJitter ? 2 : 3))
++			                          | (bMaskKernel ? 4 : 0);
++			if (nSquareTapsSide != s_lastLoggedTaps || nJitterMode != s_lastLoggedJitterMode)
+ 			{
+ 				s_lastLoggedTaps = nSquareTapsSide;
+-				CryLog("[DOF] kernel taps=%dx%d=%d (%s) jitter=%.2f", nSquareTapsSide, nSquareTapsSide,
+-				       nSquareTapsSide * nSquareTapsSide, bLensModel ? "lens model" : "stock",
+-				       bLensModel ? clamp_tpl(CRenderer::CV_r_DofLensModelJitter, 0.0f, 1.0f) : 0.0f);
++				s_lastLoggedJitterMode = nJitterMode;
++				const float fLoggedJitter = bLensModel
++				                          ? (bStaticJitter ? 1.0f : clamp_tpl(CRenderer::CV_r_DofLensModelJitter, 0.0f, 1.0f)) * (bMaskKernel ? 0.25f : 1.0f)
++				                          : 0.0f;
++				CryLog("[DOF] kernel taps=%dx%d=%d (%s) jitter=%.2f %s%s", nSquareTapsSide, nSquareTapsSide,
++				       nSquareTapsSide * nSquareTapsSide, bLensModel ? "lens model" : "stock", fLoggedJitter,
++				       (!bLensModel || CRenderer::CV_r_DofLensModelJitter <= 0.0f) ? "off" : (bStaticJitter ? "STATIC (no temporal phase)" : "temporal"),
++				       bMaskKernel ? " [mask domain: amplitude x0.25, the polygon clamp cannot hold a mask silhouette]" : "");
+ 			}
+ 		}
+ 
+@@ -878,7 +945,6 @@ void CDepthOfFieldStage::Execute()
+ 	// scene, so they are independent of the depth of field mode: with the splat off (mode 1)
+ 	// the layer pass still runs and draws them alone. With both off nothing here executes and
+ 	// mode 1 stops at the gather exactly as it always did.
+-	const bool bSplat = (CRenderer::CV_r_DofMode == 0);
+ 	const bool bGhost = (dofParams.fGhostAmount > 0.001f);
+ 	if (bSplat || bGhost)
+ 	{
+@@ -1108,10 +1174,12 @@ void CDepthOfFieldStage::ExecuteSplatLayers(const SDepthOfFieldParams& dofParams
+ 	// the shape exponent can no longer stretch the corners past the physical polygon.
+ 	const Vec4 vAxialChromatic(ResolveAxialChromaticScale(dofParams.fAxialChromatic), fIrisEdgeSoft, 0.0f, 0.0f);
+ 
++	// Resolved by the shared helper, because the gather's energy split subtracts exactly this
++	// knee from the layers it builds (spec 3.3) and the two may not drift apart.
+ 	// Soft knee spanning +/-50% of the threshold. Wide on purpose: a hard cut makes highlights
+ 	// pop in and out one frame at a time as the aperture or the focus sweeps past them.
+-	const float fHighlightThreshold = max(dofParams.fHighlightThreshold, 0.0f);
+-	const float fHighlightKnee = max(fHighlightThreshold * 0.5f, 0.01f);
++	float fHighlightThreshold, fHighlightKnee;
++	ResolveHighlightKnee(dofParams.fHighlightThreshold, fHighlightThreshold, fHighlightKnee);
+ 	// Energy gain of a single splat. The pixel shader divides by the disc area to conserve
+ 	// energy; this scales the result back up, since the shape function's own integral is only
+ 	// a fraction of its bounding square (roughly 0.47 for the procedural disc+ring, and
+diff --git a/Code/CryPlugins/CinematicCamera/DofLensModelSpec.md b/Code/CryPlugins/CinematicCamera/DofLensModelSpec.md
+index a32272f6..6ed8b691 100644
+--- a/Code/CryPlugins/CinematicCamera/DofLensModelSpec.md
++++ b/Code/CryPlugins/CinematicCamera/DofLensModelSpec.md
+@@ -186,13 +186,62 @@ colour by its CoC (that premultiply was the stock proxy for coverage), and the c
+ and written to the CoC target as today, so the tile pass, the splat sizing and the second
+ iteration keep reading what they read now.
+ 
++**The energy split with the splat (added 2026-08-27).** The gather layers used to carry each
++texel's FULL colour while the sprite pass *additionally* deposited its excess above `Highlight
++Threshold`. A gather is a normalised average, but over a stratified kernel it still spreads a
++point's whole light L over its disc in expectation, so a lamp came out at L (gather) + (L - T)
++(sprite): up to **twice** its real brightness, with the error a function of a purely aesthetic
++threshold. The lamp's full L inside the gather is also what made the tap copies so visible - the
++brightest thing in the frame was the thing being sampled 121 times.
++
++The frame's energy is therefore split once, in the **downscale**, before the 5-tap average:
++
++```
++base_i  = c_i * (L_i - handover * excess(L_i)) / max(L_i, 1e-4)      // hue preserving
++excess  = the sprite's OWN soft knee (quadratic over [T-k, T+k], linear above), shared code
++handover = splatActive * smoothstep(fade*0.333, fade, CoC)           // the sprite's own fade
++```
++
++so that `base + sprite == the texel` by construction. Three things make it exact rather than
++approximate:
++
++* **The knee is one function** (`LensHighlightExcess` in the .cfx, `ResolveHighlightKnee` on the
++  CPU). Two authored copies of the same derivation would let the two halves of the hybrid stop
++  summing to the frame.
++* **Per sample, not per average.** `max(0, x - t)` is convex, so the excess of a mean understates
++  the mean of the excesses; the sprite already thresholds its four native texels individually for
++  the same reason. The downscale takes 5 bilinear taps and the sprite 4 native texels of the same
++  cell - per-sample clamping is the consistent choice on both sides.
++* **The handover follows the sprite's own fade and cull.** A highlight whose disc is too small to
++  be splatted keeps its excess in the gather, or it would be given away to nobody. The downscale
++  reads this pixel's own CoC while the sprite reads the once-dilated tile copy, which is never
++  smaller: any disagreement leaves a sliver of excess in the gather rather than counting it twice.
++* **With the splat off (`r_DepthOfFieldMode 1`) `splatActive = 0`** and the gather keeps every
++  texel whole, because then it is the only thing carrying light.
++
++On screen: with the threshold below a lamp's luminance the gather's underlay of that lamp is dim
++(at most T) and the lamp is essentially the sprite alone. Total brightness no longer depends on
++where the threshold sits.
++
+ **Near-layer opacity** (what the composite blends the near layer over the rest with) is the
+ pupil-weighted fraction of rays that land on the foreground:
+ 
+ ```
+-α_near = Σ_i cov_i · P_i · isNear_i  /  Σ_i P_i        // isNear_i = tap's near CoC > 0.01
++α_near = Σ_i cov_i · P_i · isNear_i · (R / c_i)²  /  Σ_i P_i    // isNear_i = tap's near CoC > 0.01
+ ```
+ 
++**The density weight `(R / c_i)²` (added 2026-08-27) is not cosmetic.** The taps are spread over
++a disc of radius `R = fNearReach`, which is the tile **maximum** CoC, dilated along the tile
++chain. A foreground point of CoC `c_i` spreads its light over `π c_i²`, not `π R²`, so counting
++covering taps as a fraction of all taps in the reach disc measures the pupil fraction *only* when
++`c_i == R`. Whenever the tile maximum came from a closer object or from the dilation at an edge -
++which is most of the time - the count is low by `(c_i/R)²` and the foreground composites in too
++transparent. `c_i` here is the same capped, floored copy the colour weights use
++(`max(min(coc, cap), 0.125)`); the denominator is unchanged and the result still saturates.
++Sanity: a uniform foreground at `c_i = R` is unchanged; at `c_i = R/2` the quarter as many taps
++that still cover are each worth four times as much, so α lands where it would if `R` had been
++`c_i`.
++
+ written to the near layer's alpha in lens mode **instead of** the averaged CoC. In a uniformly
+ blurred foreground every tap covers, α = 1; at a blurred foreground edge over a sharp
+ background α falls off as the true fraction of the pupil that sees the foreground — the partial
+@@ -222,7 +271,27 @@ jittered tap is clamped back to the iris polygon's radius at its own angle, whic
+ in `g_Taps[].z` (re-deriving it in the shader costs an `atan2` and a `pow` 242 times a pixel).
+ The kernel as a whole is never rotated or translated — that would soften the polygon's outline,
+ which is exactly the part worth keeping exact; only the interior is roughened. TSAA resolves the
+-noise. `r_DepthOfFieldLensModelJitter 0` restores the bare grid for A/B.
++noise.
++
++**Temporal phase (added 2026-08-27).** `IGN_pixel` depends on the pixel alone, which makes the
++jitter *fixed-pattern* noise — and fixed-pattern noise is the one thing temporal AA cannot average
++away: every frame it re-accumulates the identical error, so the taps never converge and the whole
++point of the jitter is lost. Both lanes therefore take a per-frame golden-ratio phase,
++`frac(IGN + frac(frame · (0.618034, 0.381966)))`, with the frame counter
++(`SPostEffectsUtils::m_iFrameCounter`, wrapped at 1024 so it stays an exact float) arriving in
++`vDofLensModel2.z`. Each frame hands TSAA a different member of the sample set, which is what
++turns 121 taps into a smooth disc instead of 121 stable copies.
++
++**Mask domain (added 2026-08-27).** When the gather runs the mask CDF kernel, `g_Taps[].z` is 1 —
++the bounding circle — because a mask silhouette has no radius function, so the shader's clamp back
++to the aperture does nothing and a full-amplitude jitter can push a tap out of the mask's open area
++into its closed one, smearing the silhouette the mask kernel exists to keep. The CPU therefore
++quarters the amplitude in that domain (`vGather0Lens2.y *= 0.25`) and says so on the `[DOF] kernel`
++line.
++
++`r_DepthOfFieldLensModelJitter 0` restores the bare grid for A/B; `2` keeps full amplitude but
++freezes the frame phase (the old static per-pixel pattern), which is how tap structure is told
++apart from TAA ghosting.
+ 
+ ### 3.4 Composite — sharp where the lens is sharp
+ 
+diff --git a/Code/CryPlugins/CinematicCamera/docs/ConsoleReference.md b/Code/CryPlugins/CinematicCamera/docs/ConsoleReference.md
+index 39787848..8408dd53 100644
+--- a/Code/CryPlugins/CinematicCamera/docs/ConsoleReference.md
++++ b/Code/CryPlugins/CinematicCamera/docs/ConsoleReference.md
+@@ -251,7 +251,8 @@ diagnostics outrank the mask. Kernel parameter changes are logged as
+ | | |
+ | --- | --- |
+ | Default | 1.0 |
+-| Purpose | How far the lens-model gather may offset each of its 121 taps inside its own cell, as a fraction of the largest offset that still keeps the tap in that cell. 0 = the bare stratified grid, 1 = full. A fixed tap grid samples the source at the *same* places in every pixel, so above a few units of reach each tap's bilinear footprint reads as a separate copy of the source and a big disc comes apart into a handful of circles. A per-pixel offset turns that structure into noise, which the temporal AA resolves. The offset is clamped back inside the iris polygon, so only the disc's interior is roughened - the silhouette's outline stays exact. Set 0 to bring the tap copies back for an A/B. |
++| Purpose | How far the lens-model gather may offset each of its 121 taps inside its own cell, as a fraction of the largest offset that still keeps the tap in that cell. A fixed tap grid samples the source at the *same* places in every pixel, so above a few units of reach each tap's bilinear footprint reads as a separate copy of the source and a big disc comes apart into a handful of circles. A per-pixel offset turns that structure into noise, which the temporal AA resolves. The offset is clamped back inside the iris polygon, so only the disc's interior is roughened - the silhouette's outline stays exact. The pattern also advances one golden-ratio step per frame: a jitter that depends on the pixel alone is fixed-pattern noise, and fixed-pattern noise is precisely what temporal AA cannot average away. In the **mask-kernel domain** the amplitude is automatically quartered, because the clamp is a polygon radius and a mask silhouette has none - at full amplitude a tap could be pushed out of the mask's open area and smear the silhouette into the halo. |
++| Values | `0` = the bare stratified grid (brings the tap copies back for an A/B). `0..1` = amplitude, 1 = full. `2` = full amplitude with the per-frame phase **frozen**, i.e. the old static per-pixel pattern - use it to tell tap structure apart from TAA ghosting. |
+ 
+ ### r_DepthOfFieldLensModelDebug
+ 
+diff --git a/Engine/Shaders/HWScripts/CryFX/DepthOfField.cfx b/Engine/Shaders/HWScripts/CryFX/DepthOfField.cfx
+index ef0c1881..d31189db 100644
+--- a/Engine/Shaders/HWScripts/CryFX/DepthOfField.cfx
++++ b/Engine/Shaders/HWScripts/CryFX/DepthOfField.cfx
+@@ -29,6 +29,9 @@ float4 vDofBokehShape;
+ 
+ // Sparse highlight selection for the hybrid splat layer. x: scene-HDR luminance threshold,
+ // y: soft knee half width, z: energy gain of one splat, w: diagnostic flag.
++// The DOWNSCALE pass repacks zw for the lens-mode energy split (z: the sprite's full-strength
++// circle of confusion, w: whether the splat is running at all) - it is a separate draw with its
++// own constant update, and it has no use for a gain or a sprite diagnostic. See DownscaleDofPS.
+ float4 vDofBokehHighlight;
+ 
+ // Pupil = shape mask INTERSECT iris polygon, continuous at every f-number.
+@@ -121,8 +124,10 @@ float4 vDofLensModel;
+ //       pinned every sprite to the gather's disc, which is the one thing the splat exists to
+ //       exceed. The gather clamps its own reach internally instead (vDofLensModel.z).
+ //   y = per-tap jitter amplitude in pupil units (r_DepthOfFieldLensModelJitter x half the tap
+-//       spacing). 0 = the bare stratified grid.
+-//   z, w = reserved.
++//       spacing, quartered in the mask domain where a jittered tap can leave the mask's open
++//       area). 0 = the bare stratified grid.
++//   z = the frame counter, wrapped, for the jitter's temporal phase. 0 = frozen pattern.
++//   w = reserved.
+ float4 vDofLensModel2;
+ 
+ // Thin lens, signed, in the gather's existing CoC units. This is the whole point of the round:
+@@ -195,6 +200,29 @@ float LensApodize(float fR2, float fSide)
+ 	return clamp(1.0 + fSide * vDofLensModel.w * (2.0 * fR2 - 1.0), 0.05, 2.0);
+ }
+ 
++// The soft-knee highlight excess, EXACTLY as DofBokehRefVS computes it for the sprite: a
++// quadratic knee across [threshold - knee, threshold + knee], linear above. Shared so that
++// base + excess == the texel by construction rather than by two authors agreeing.
++//
++// This is what splits the frame's energy between the two halves of the hybrid depth of field.
++// The gather layers used to carry each texel's FULL colour AND the splat deposited the excess
++// on top: a gather is a normalised average, but over a stratified kernel it still spreads a
++// point's whole light L over its disc in expectation, so a lamp came out at L (gather) plus
++// L - T (sprite) - up to twice its real brightness, with the error a function of a purely
++// aesthetic threshold. The lamp's full L in the gather is also what made the tap copies so
++// visible: the brightest thing in the frame was the thing being sampled 121 times.
++//
++// So in lens mode the downscale keeps only the BASE (min(L, T)-ish, softened by the same knee)
++// and the sprite carries the rest. Per SAMPLE, before the 5-tap average: max(0, x - t) is
++// convex, so the excess of a mean understates the mean of the excesses, and the sprite itself
++// thresholds its four native texels individually for the same reason.
++float LensHighlightExcess(float fLum, float fThreshold, float fKnee)
++{
++	float fSoft = clamp(fLum - fThreshold + fKnee, 0, 2 * fKnee);
++	fSoft = (fSoft * fSoft) / (4 * fKnee);
++	return max(fSoft, fLum - fThreshold);
++}
++
+ // The pupil, as a single function of a point in pupil space (unit disc = the wide-open geometric
+ // pupil). Returns rgb = the per-channel transmittance x intensity profile, a = the same thing
+ // without the per-channel mask - the lane the layer's own circle of confusion is averaged by.
+@@ -1011,9 +1039,11 @@ OutDownscaleDof DownscaleDofPS(vtxOutDownscaleDof IN)
+ 	float4 c1 = float4(GetTexture2D(DnScDoF_HDRTarg, DnScDoF_HDRTargSamp, IN.tc0.zw).rgb, 1);
+ 	float4 c2 = float4(GetTexture2D(DnScDoF_HDRTarg, DnScDoF_HDRTargSamp, IN.tc1.xy).rgb, 1);
+ 	float4 c3 = float4(GetTexture2D(DnScDoF_HDRTarg, DnScDoF_HDRTargSamp, IN.tc1.zw).rgb, 1);
+-	OUT.LayerNear = (c+c0 + c1 + c2 + c3) * 0.2; 
+-	OUT.LayerFar = OUT.LayerNear; 
+ 
++	// The circle of confusion is resolved BEFORE the colour in lens mode: how much of a
++	// highlight this pass may keep depends on whether the sprite is going to carry it, and
++	// that is a function of the disc's size. In the stock permutation the two are independent
++	// and the order is immaterial.
+ 	float4 vCocNear, vCocFar;
+ #if %_RT_SAMPLE2
+ 	LensModelCoC(depths, LensFieldRadius2(IN.tc2.xy), vCocNear, vCocFar);
+@@ -1021,6 +1051,47 @@ OutDownscaleDof DownscaleDofPS(vtxOutDownscaleDof IN)
+ 	ComputeCircleOfConfusion(depths, LensFieldRadius2(IN.tc2.xy), vCocNear, vCocFar);
+ #endif
+ 
++#if %_RT_SAMPLE2
++	// Energy split with the hybrid splat (spec 3.3). This pass's copy of vDofBokehHighlight is
++	// packed for the split rather than for the sprite - the splat pass is a different draw with
++	// its own constant update, so the two never collide:
++	//   x = highlight threshold, y = soft knee half width  (identical to the sprite's)
++	//   z = the circle of confusion at which a sprite reaches full strength (r_DofSpriteBokehFadeCoC)
++	//   w = 1 when the splat is actually running (r_DepthOfFieldMode 0), else 0.
++	//
++	// With the splat off the gather is the ONLY thing carrying light and must keep every texel
++	// whole. With it on, the gather hands the excess over - but only in proportion to the fade
++	// the sprite itself applies, or a highlight too small to be splatted would lose its excess
++	// to nobody. The fade here is read from this pixel's own circle of confusion; the sprite
++	// reads the once-dilated tile copy, which is never smaller, so any disagreement leaves a
++	// sliver of excess in the gather rather than counting it twice.
++	{
++		const float fThreshold = vDofBokehHighlight.x;
++		const float fKnee      = max(vDofBokehHighlight.y, 1e-4);
++		const float fFadeFull  = max(vDofBokehHighlight.z, 1e-3);
++		const float fCocHere   = max(max(max(vCocNear.x, vCocNear.y), max(vCocNear.z, vCocNear.w)),
++		                             min(min(vCocFar.x, vCocFar.y), min(vCocFar.z, vCocFar.w)));
++		const float fHandOver  = vDofBokehHighlight.w * smoothstep(fFadeFull * 0.333, fFadeFull, fCocHere);
++
++		// Per sample, before the average: see LensHighlightExcess.
++		const float fL  = GetLuminance(c.rgb);
++		const float fL0 = GetLuminance(c0.rgb);
++		const float fL1 = GetLuminance(c1.rgb);
++		const float fL2 = GetLuminance(c2.rgb);
++		const float fL3 = GetLuminance(c3.rgb);
++		// Hue preserving, exactly like the sprite's: the texel rescaled so its luminance is
++		// what is left after the sprite's share is removed.
++		c.rgb  *= (fL  - fHandOver * LensHighlightExcess(fL,  fThreshold, fKnee)) / max(fL,  1e-4);
++		c0.rgb *= (fL0 - fHandOver * LensHighlightExcess(fL0, fThreshold, fKnee)) / max(fL0, 1e-4);
++		c1.rgb *= (fL1 - fHandOver * LensHighlightExcess(fL1, fThreshold, fKnee)) / max(fL1, 1e-4);
++		c2.rgb *= (fL2 - fHandOver * LensHighlightExcess(fL2, fThreshold, fKnee)) / max(fL2, 1e-4);
++		c3.rgb *= (fL3 - fHandOver * LensHighlightExcess(fL3, fThreshold, fKnee)) / max(fL3, 1e-4);
++	}
++#endif
++
++	OUT.LayerNear = (c+c0 + c1 + c2 + c3) * 0.2;
++	OUT.LayerFar = OUT.LayerNear;
++
+ 	OUT.LayerNear.a = max(vCocNear.x, vCocNear.y);
+ 	OUT.LayerNear.a = max(OUT.LayerNear.a, vCocNear.z);
+ 	OUT.LayerNear.a = max(OUT.LayerNear.a, vCocNear.w);
+@@ -1259,8 +1330,16 @@ pixout_dof DofPS(vtxOut IN)
+ 	// noise: a screen-space pattern that decorrelates neighbours at every scale and costs one
+ 	// dot product, which is what a 121-tap loop can afford.
+ 	const float2 vPixIGN = IN.baseTC.xy * PS_ScreenSize.xy;
+-	const float2 fIGN = frac(52.9829189 * frac(float2(0.06711056 * vPixIGN.x + 0.00583715 * vPixIGN.y,
+-	                                                  0.06711056 * vPixIGN.y + 0.00583715 * vPixIGN.x)));
++	float2 fIGN = frac(52.9829189 * frac(float2(0.06711056 * vPixIGN.x + 0.00583715 * vPixIGN.y,
++	                                            0.06711056 * vPixIGN.y + 0.00583715 * vPixIGN.x)));
++	// Per-FRAME phase, without which the whole exercise is pointless: a jitter that depends on
++	// the pixel alone is fixed-pattern noise, and fixed-pattern noise is the one thing temporal
++	// AA cannot average away - every frame it accumulates the identical error. Advancing the
++	// phase along the golden-ratio sequence (each lane by its own increment, so the two do not
++	// walk in step) gives TSAA a different member of the sample set each frame, which is what
++	// turns 121 taps into a smooth disc instead of 121 stable copies. vDofLensModel2.z is the
++	// frame counter from the CPU, already wrapped; 0 there freezes the pattern for A/B.
++	fIGN = frac(fIGN + frac(vDofLensModel2.z * float2(0.61803398875, 0.38196601125)));
+ 	const float fJitAmp = vDofLensModel2.y;
+ #else
+ 	const float fNearReach = vMinTileCoC.r;
+@@ -1353,7 +1432,20 @@ pixout_dof DofPS(vtxOut IN)
+ 				// the foreground. The denominator is the WHOLE pupil, including the rays that
+ 				// saw past the object - those are exactly what makes a blurred edge translucent
+ 				// rather than a hard cut.
+-				fNearAlphaNum += fCov * fIsNear * vPupil.a;
++				//
++				// The numerator is weighted by DENSITY relative to the reach disc, and that is
++				// not cosmetic. The taps are spread over a disc of radius R = fNearReach, which
++				// is the TILE MAXIMUM circle of confusion, dilated along the tile chain. A
++				// foreground point whose own disc is c_i spreads its light over pi*c_i^2, not
++				// pi*R^2, so counting covering taps as a fraction of all taps in the reach disc
++				// only measures the pupil fraction when c_i == R. Whenever the tile maximum came
++				// from a closer object or from the dilation at an edge - which is most of the
++				// time - the count is low by (c_i/R)^2 and the foreground composites in too
++				// transparent. (R/c_i)^2 puts it back: a uniform foreground at c_i = R is
++				// unchanged, and at c_i = R/2 the quarter as many taps that still cover are each
++				// worth four times as much, so alpha lands where it would if R had been c_i.
++				const float fNearDensity = (fNearReach * fNearReach) / (fCocD * fCocD);
++				fNearAlphaNum += fCov * fIsNear * vPupil.a * fNearDensity;
+ 				fNearAlphaDen += vPupil.a;
+ 			}
+ #else
+-- 
+2.47.1.windows.1
+

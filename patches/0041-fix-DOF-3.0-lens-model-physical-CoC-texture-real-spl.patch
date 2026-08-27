@@ -1,0 +1,803 @@
+From fb2ac924399aae4eb425352f3066157ac7f12edb Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Thu, 27 Aug 2026 09:13:10 +0800
+Subject: [PATCH 41/44] fix: DOF 3.0 lens model - physical CoC texture, real
+ splat cap, 121 jittered taps, one-pixel polygon edge
+
+Four defects in the %_RT_SAMPLE2 lens-model path, all of which made the sprite and the gather
+disagree on screen. The stock permutation is untouched throughout.
+
+1. The CoC texture was clamped to the GATHER's cap. LensModelCoC is called from the downscale,
+   so the CoC target and everything built from it - the tile min/max pass, the layer alphas and
+   above all the SPRITE's size - never saw anything past the kernel's reach; the splat cap was
+   dead code and the sprite could not grow past the gather's disc, which is the one thing it
+   exists to do. The texture now carries the PHYSICAL circle of confusion, clamped only to the
+   splat's own ceiling in units (new constant vDofLensModel2.x = SplatMaxCoC * 0.5 / U, floored
+   at the gather cap so a low splat cap cannot starve the gather). DofPS applies the reach cap
+   itself, on every copy of a CoC the kernel derives something from - near reach, far reach, and
+   each tap's coverage and density - while the tap's raw alpha stays physical, so what the
+   gather writes onward is still the real lens. Second iteration takes the same reach cap;
+   composite (beta_far saturates), normalize and the tile min/max pass verified fine larger.
+
+2. The splat pass's constant lane now carries the cap already HALVED: the cvar is documented and
+   authored as a DIAMETER while the vertex shader compares it against the quad's half extent, so
+   every sprite ceiling was twice what the cvar said. Compared through abs(), so the gather's
+   debug sign trick can never leak into a size.
+
+3. Gather taps showed as discrete blobs. 49 taps over a 32 px radius are 9 px apart and every
+   pixel samples the source at the same 49 places, so each tap's bilinear footprint reads as a
+   separate copy - "several circles trying to form a triangle". Lens mode now runs 11x11 = 121
+   taps (g_Taps sized to 121, the count still arriving in vDofParamsFocus1.z, so the stock loop
+   reads exactly its own 49), and offsets each tap inside its own cell by a per-pixel amount:
+   one interleaved-gradient-noise pair per pixel plus R2 increments per tap, amplitude half the
+   tap spacing. The jittered tap is clamped back to the iris polygon's radius at its own angle,
+   stored by the CPU in g_Taps[].z - the kernel is never rotated or translated as a whole, so
+   the polygon's outline stays exact and only the interior is roughened. TSAA resolves the
+   noise. New cvar r_DepthOfFieldLensModelJitter (0..1, default 1); 0 restores the bare grid.
+   The tap count and the jitter are logged on the existing [DOF] kernel line.
+
+4. EvalPupilShape's polygon edge width is floored at one native pixel. Blade curvature authors
+   0.015 quad-local radius units for a straight blade, which on a 32 px sprite is half a pixel:
+   the outline aliased into a dotted line and curvature read as doing nothing. The pixel shader
+   knows the sprite's radius in pixels (QuadPos.w), so the floor is 1 / that - and 1 / (that * s)
+   for the axial-CA shrunk channel, which is drawn at radius s. A floor, so a curved blade's
+   deliberately soft outline is untouched. Both permutations take it; it is our own splat code.
+
+Spec 3.1 / 3.3 / 3.5, README and ConsoleReference updated for the corrected cap semantics and
+the new cvar.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01A72MFkdSczncE7au9UVnmu
+---
+ .../RenderDll/Common/RendererCVars.cpp        |  31 +++-
+ .../RenderDll/Common/RendererCVars.h          |   1 +
+ .../GraphicsPipeline/DepthOfField.cpp         | 103 +++++++++---
+ .../GraphicsPipeline/DepthOfField.h           |   2 +-
+ .../CinematicCamera/DofLensModelSpec.md       |  82 +++++++---
+ Code/CryPlugins/CinematicCamera/README.md     |  25 ++-
+ .../CinematicCamera/docs/ConsoleReference.md  |  11 +-
+ .../Shaders/HWScripts/CryFX/DepthOfField.cfx  | 147 +++++++++++++++---
+ 8 files changed, 324 insertions(+), 78 deletions(-)
+
+diff --git a/Code/CryEngine/RenderDll/Common/RendererCVars.cpp b/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
+index 9e650c1c..90048396 100644
+--- a/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
++++ b/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
+@@ -412,6 +412,7 @@ int CRendererCVars::CV_r_DofLensModel;
+ float CRendererCVars::CV_r_DofLensModelMaxCoC;
+ float CRendererCVars::CV_r_DofLensModelSplatMaxCoC;
+ int CRendererCVars::CV_r_DofLensModelDebug;
++float CRendererCVars::CV_r_DofLensModelJitter;
+ 
+ //AllocateConstIntCVar(CRendererCVars, CV_r_measureoverdraw);
+ AllocateConstIntCVar(CRendererCVars, CV_r_printmemoryleaks);
+@@ -1603,19 +1604,35 @@ void CRendererCVars::InitCVars()
+ 	               "0 = ignore it and always take the stock path, which is then byte for byte the "
+ 	               "engine's own depth of field.");
+ 	REGISTER_CVAR3("r_DepthOfFieldLensModelMaxCoC", CV_r_DofLensModelMaxCoC, 4.0f, VF_NULL,
+-	               "Largest circle of confusion the lens-model GATHER will form, in gather units "
+-	               "(~4 px of disc radius per unit at 1080p). Not an optical quantity: the gather has "
+-	               "49 taps at half resolution and cannot resolve a disc of any size, so beyond this "
+-	               "the physical blur is clipped and the sprite splats carry the rest. Raising it "
+-	               "gives larger discs at the cost of sparser sampling (ringing, holes); the second "
+-	               "gather iteration fills the small ones. Default 4.0, the stock kernel's own reach.");
++	               "Largest circle of confusion the lens-model GATHER will REACH, in gather units "
++	               "(~4 px of disc radius per unit at 1080p). Not an optical quantity and not a cap "
++	               "on the lens: the circle of confusion texture carries the physical blur either "
++	               "way, and the sprite splats are sized from it - this only bounds the 121-tap "
++	               "half-resolution kernel, which cannot resolve a disc of any size. Beyond it the "
++	               "gather's halo stops growing and the splat carries the rest. Raising it gives "
++	               "larger halos at the cost of sparser sampling (ringing, holes); "
++	               "r_DepthOfFieldLensModelJitter and the second gather iteration hide what is "
++	               "left. Default 4.0, the stock kernel's own reach; ~8 is usable with jitter on.");
+ 	REGISTER_CVAR3("r_DepthOfFieldLensModelSplatMaxCoC", CV_r_DofLensModelSplatMaxCoC, 256.0f, VF_NULL,
+-	               "Largest bokeh sprite the lens-model splat will draw, in native pixels. A sprite is "
++	               "Largest bokeh sprite the lens-model splat will draw, as a DIAMETER in native "
++	               "pixels (so 256 = a disc 128 px in radius). It is also the only ceiling the "
++	               "circle of confusion texture takes, so it bounds the physical blur every "
++	               "consumer downstream sees. A sprite is "
+ 	               "an EXACT evaluation of the pupil rather than a sparse sample of it, so a big disc "
+ 	               "costs fill rate and nothing else - hence far above the gather's cap. A very bright "
+ 	               "point far out of focus therefore shows the gather's clipped halo plus a larger, "
+ 	               "fainter exact disc; if that reads wrong, lower this or raise "
+ 	               "r_DepthOfFieldLensModelMaxCoC. Default 256 (the stock path is fixed at 64).");
++	REGISTER_CVAR3("r_DepthOfFieldLensModelJitter", CV_r_DofLensModelJitter, 1.0f, VF_NULL,
++	               "How far the lens-model gather is allowed to offset each of its 121 taps inside "
++	               "its own cell, as a fraction of the largest offset that still keeps the tap in "
++	               "that cell (0 = the bare stratified grid, 1 = full). A fixed tap grid samples the "
++	               "source at the SAME places in every pixel, so above a few units of reach each tap "
++	               "reads as a separate copy of the source and the disc comes apart into a handful "
++	               "of circles; a per-pixel offset turns that structure into noise the temporal AA "
++	               "resolves. The offset is clamped back inside the iris polygon, so the silhouette's "
++	               "outline stays exact - only the interior is roughened. Set 0 to see the tap "
++	               "copies again for comparison. Default 1.0.");
+ 	REGISTER_CVAR3("r_DepthOfFieldLensModelDebug", CV_r_DofLensModelDebug, 0, VF_NULL,
+ 	               "DIAGNOSTIC for the lens model. 1 = log the UNCAPPED circle of confusion the thin "
+ 	               "lens is asking for once a second (so the clipping against "
+diff --git a/Code/CryEngine/RenderDll/Common/RendererCVars.h b/Code/CryEngine/RenderDll/Common/RendererCVars.h
+index 76c1cbec..7a20b4e4 100644
+--- a/Code/CryEngine/RenderDll/Common/RendererCVars.h
++++ b/Code/CryEngine/RenderDll/Common/RendererCVars.h
+@@ -407,6 +407,7 @@ public:
+ 	static float CV_r_DofLensModelMaxCoC;
+ 	static float CV_r_DofLensModelSplatMaxCoC;
+ 	static int   CV_r_DofLensModelDebug;
++	static float CV_r_DofLensModelJitter;
+ 	DeclareStaticConstIntCVar(CV_r_nohwgamma, 2);
+ 	DeclareStaticConstIntCVar(CV_r_wireframe, 0);
+ 	DeclareStaticConstIntCVar(CV_r_printmemoryleaks, 0);
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DepthOfField.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DepthOfField.cpp
+index c5879eb5..c52a428e 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DepthOfField.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DepthOfField.cpp
+@@ -82,9 +82,14 @@ Vec4 CDepthOfFieldStage::ToUnitDisk(Vec4& origin, float blades, float shapeExpon
+ 	// Rotating the radius function rotates the polygon; the tap directions themselves stay put,
+ 	// so the disc keeps its coverage and only the flat edges turn. Same phase the diffraction
+ 	// streaks use - one iris, one orientation.
+-	const float rr = fabsf(r) * powf(NGon_Rad(finalAngle - rotation, blades), shapeExponent);
+-
+-	return Vec4(rr * cosf(finalAngle), rr * sinf(finalAngle), 0.0f, 0.0f);
++	const float fPolyRad = powf(NGon_Rad(finalAngle - rotation, blades), shapeExponent);
++	const float rr = fabsf(r) * fPolyRad;
++
++	// .z carries the polygon's radius at this tap's ANGLE - the opening's edge in the direction
++	// the tap sits in. The lens-mode gather jitters each tap inside its own cell and has to keep
++	// it inside the aperture; re-deriving the polygon per tap in the shader costs an atan2 and a
++	// pow 242 times a pixel, and it is a constant of the tap, so it is resolved once here.
++	return Vec4(rr * cosf(finalAngle), rr * sinf(finalAngle), fPolyRad, 0.0f);
+ }
+ 
+ // Mask-domain gather kernel. When the mask is the smaller aperture, the gather taps are
+@@ -282,7 +287,10 @@ Vec4 CDepthOfFieldStage::SampleMaskKernelTap(float u, float v) const
+ 	// splat samples the texture through the inverse rotation, so both views turn together.
+ 	const float c = cosf(m_maskRotation);
+ 	const float s = sinf(m_maskRotation);
+-	return Vec4(px * c - py * s, px * s + py * c, 0.0f, 0.0f);
++	// .z is the jitter's ceiling (see ToUnitDisk). A mask tap has no polygon behind it - the
++	// silhouette is the mask's own value field, which the shader cannot invert - so the ceiling
++	// is the pupil's bounding circle and the mask's shape is left to the importance sampling.
++	return Vec4(px * c - py * s, px * s + py * c, 1.0f, 0.0f);
+ }
+ 
+ // Field-dependent pupil: barrel clip (cat-eye), coma and astigmatism, all expressed in PUPIL
+@@ -455,12 +463,24 @@ void CDepthOfFieldStage::Execute()
+ 	float fLensGatherCap = max(CRenderer::CV_r_DofLensModelMaxCoC, 0.05f);
+ 	float fLensSplatCap = max(CRenderer::CV_r_DofLensModelSplatMaxCoC, 1.0f);
+ 	const float fLensKsa = clamp_tpl(dofParams.fSphericalAberration, -1.0f, 1.0f);
++
++	const float fFrameW = (float)m_graphicsPipelineResources.m_pTexHDRTarget->GetWidth();
++	const float fFrameH = (float)m_graphicsPipelineResources.m_pTexHDRTarget->GetHeight();
++	const float fUnitPx = 4.0f * max(fFrameW / 1920.0f, fFrameH / 1080.0f);
++
++	// The circle of confusion TEXTURE carries the physical lens, and is clipped only by the
++	// largest sprite the splat may draw - because the sprite is sized from that texture, and
++	// clipping it to the gather's kernel reach (which is what it used to do) made the splat cap
++	// dead code and pinned every sprite inside the gather's own disc. The cvar is a native-pixel
++	// DIAMETER, the texture is a RADIUS in gather units. Never below the gather's cap: a splat
++	// ceiling under the kernel reach would starve the gather, which is nobody's intent.
++	const float fLensPhysCapUnits = max(fLensSplatCap * 0.5f / fUnitPx, fLensGatherCap);
++	// x = that cap; y is the tap jitter amplitude and is filled per gather pass (it scales with
++	// the tap spacing, which differs between the two iterations).
++	Vec4 vDofLensModel2(fLensPhysCapUnits, 0.0f, 0.0f, 0.0f);
++
+ 	if (bLensModel)
+ 	{
+-		const float fFrameW = (float)m_graphicsPipelineResources.m_pTexHDRTarget->GetWidth();
+-		const float fFrameH = (float)m_graphicsPipelineResources.m_pTexHDRTarget->GetHeight();
+-		const float fUnitPx = 4.0f * max(fFrameW / 1920.0f, fFrameH / 1080.0f);
+-
+ 		const float f_m = max(dofParams.fLensFocalMM, 1.0f) * 0.001f;
+ 		const bool  bMaskAperture = CTexture::IsTextureExist(dofParams.pBokehShapeTex);
+ 		const float fNGeo = max(bMaskAperture ? max(dofParams.fApertureFNumber, dofParams.fMaskFNumber)
+@@ -491,8 +511,9 @@ void CDepthOfFieldStage::Execute()
+ 			s_lastFocus = d_f;
+ 			s_lastSensor = fSensorW;
+ 			s_lastKsa = fLensKsa;
+-			CryLog("[DOF] lens model ON (f=%.1fmm N=%.2f df=%.2fm sensor=%.1fmm sa=%.2f K=%.2f units cap=%.2f)",
+-			       dofParams.fLensFocalMM, fNGeo, d_f, fSensorW, fLensKsa, K, fLensGatherCap);
++			CryLog("[DOF] lens model ON (f=%.1fmm N=%.2f df=%.2fm sensor=%.1fmm sa=%.2f K=%.2f units gatherCap=%.2f physCap=%.2f units / %.0f px)",
++			       dofParams.fLensFocalMM, fNGeo, d_f, fSensorW, fLensKsa, K, fLensGatherCap,
++			       fLensPhysCapUnits, fLensPhysCapUnits * fUnitPx);
+ 		}
+ 		if (CRenderer::CV_r_DofLensModelDebug > 0)
+ 		{
+@@ -596,6 +617,7 @@ void CDepthOfFieldStage::Execute()
+ 	static CCryNameR dofFieldPupil2Name("vDofFieldPupil2");
+ 	static CCryNameR dofAxialChromaticName("vDofAxialChromatic");
+ 	static CCryNameR dofLensModelName("vDofLensModel");
++	static CCryNameR dofLensModel2Name("vDofLensModel2");
+ 
+ 	// TODO: Compute shader! because the targets are not compressed / able anyway, and we can half resource allocation)
+ 	{
+@@ -632,6 +654,9 @@ void CDepthOfFieldStage::Execute()
+ 			// The thin lens itself. Set unconditionally so the constant can never be stale in
+ 			// the frame the permutation switches on.
+ 			m_passLayerDownscale.SetConstant(dofLensModelName, vDofLensModel, eHWSC_Pixel);
++			// The physical cap: this pass is where the circle of confusion texture is written, so
++			// it is where the only clamp the texture ever takes is applied.
++			m_passLayerDownscale.SetConstant(dofLensModel2Name, vDofLensModel2, eHWSC_Pixel);
+ 			m_passLayerDownscale.Execute();
+ 		}
+ 
+@@ -662,10 +687,16 @@ void CDepthOfFieldStage::Execute()
+ 	{
+ 		// 1st gather pass
+ 		{
+-			const int32 nSquareTapsSide = 7;
++			// 49 taps over a disc the lens model is allowed to grow well past the stock four
++			// units are 9 px apart, and at that spacing each tap's bilinear footprint reads as a
++			// separate COPY of the source: the disc comes apart into a handful of circles trying
++			// to form a triangle. 121 taps halve the spacing; the per-pixel jitter below breaks
++			// what is left into noise for the temporal AA. The stock permutation keeps its 49 -
++			// its reach is capped at four units, where the grid is dense enough.
++			const int32 nSquareTapsSide = bLensModel ? 11 : 7;
+ 			const float fRecipTaps = 1.0f / ((float)nSquareTapsSide - 1.0f);
+ 
+-			Vec4 vTaps[nSquareTapsSide * nSquareTapsSide];
++			Vec4 vTaps[11 * 11];
+ 			for (int32 y = 0; y < nSquareTapsSide; ++y)
+ 			{
+ 				for (int32 x = 0; x < nSquareTapsSide; ++x)
+@@ -706,7 +737,7 @@ void CDepthOfFieldStage::Execute()
+ 			}
+ 
+ 			m_passGather0.BeginConstantUpdate();
+-			vDofParams1.z = nSquareTapsSide * nSquareTapsSide;
++			vDofParams1.z = (float)(nSquareTapsSide * nSquareTapsSide);
+ 			m_passGather0.SetConstant(dofFocusParam0Name, vDofParams0, eHWSC_Pixel);
+ 			m_passGather0.SetConstant(dofFocusParam1Name, vDofParams1, eHWSC_Pixel);
+ 			m_passGather0.SetConstantArray(dofTapsName, vTaps, nSquareTapsSide * nSquareTapsSide, eHWSC_Pixel);
+@@ -714,7 +745,27 @@ void CDepthOfFieldStage::Execute()
+ 			m_passGather0.SetConstant(dofFieldPupil2Name, vFieldPupil2, eHWSC_Pixel);
+ 			m_passGather0.SetConstant(dofAxialChromaticName, vAxialChromatic, eHWSC_Pixel);
+ 			m_passGather0.SetConstant(dofLensModelName, vDofLensModel, eHWSC_Pixel);
++			// Jitter amplitude: half the tap spacing. The taps are a square grid mapped onto the
++			// unit disc, so the spacing there is 2 / side and half of it is 1 / side - the largest
++			// offset that keeps a tap inside its own stratum, which is what makes the jitter
++			// noise rather than a second, coarser structure.
++			{
++				Vec4 vGather0Lens2 = vDofLensModel2;
++				vGather0Lens2.y = clamp_tpl(CRenderer::CV_r_DofLensModelJitter, 0.0f, 1.0f) / (float)nSquareTapsSide;
++				m_passGather0.SetConstant(dofLensModel2Name, vGather0Lens2, eHWSC_Pixel);
++			}
+ 			m_passGather0.Execute();
++
++			// The tap count is the one number that says whether the dense kernel actually reached
++			// the shader, so it rides the existing kernel line.
++			static int32 s_lastLoggedTaps = -1;
++			if (nSquareTapsSide != s_lastLoggedTaps)
++			{
++				s_lastLoggedTaps = nSquareTapsSide;
++				CryLog("[DOF] kernel taps=%dx%d=%d (%s) jitter=%.2f", nSquareTapsSide, nSquareTapsSide,
++				       nSquareTapsSide * nSquareTapsSide, bLensModel ? "lens model" : "stock",
++				       bLensModel ? clamp_tpl(CRenderer::CV_r_DofLensModelJitter, 0.0f, 1.0f) : 0.0f);
++			}
+ 		}
+ 
+ 		// 2nd gather iteration
+@@ -774,6 +825,9 @@ void CDepthOfFieldStage::Execute()
+ 			m_passGather1.SetConstant(dofFieldPupil2Name, vFieldPupil2, eHWSC_Pixel);
+ 			m_passGather1.SetConstant(dofAxialChromaticName, vAxialChromatic, eHWSC_Pixel);
+ 			m_passGather1.SetConstant(dofLensModelName, vDofLensModel, eHWSC_Pixel);
++			// No jitter on the second iteration: it is a 3x3 hole-filling dilate, not a sampling
++			// of the disc, and jittering a max filter only makes the holes move.
++			m_passGather1.SetConstant(dofLensModel2Name, vDofLensModel2, eHWSC_Pixel);
+ 			m_passGather1.Execute();
+ 		}
+ 
+@@ -810,6 +864,8 @@ void CDepthOfFieldStage::Execute()
+ 			// disagrees with the layer it is blending.
+ 			m_passComposition.SetConstant(dofFieldPupil2Name, vFieldPupil2, eHWSC_Pixel);
+ 			m_passComposition.SetConstant(dofLensModelName, vDofLensModel, eHWSC_Pixel);
++			// LensModelCoC clamps to the physical cap, so every pass that calls it needs it.
++			m_passComposition.SetConstant(dofLensModel2Name, vDofLensModel2, eHWSC_Pixel);
+ 			m_passComposition.Execute();
+ 		}
+ 	}
+@@ -827,7 +883,7 @@ void CDepthOfFieldStage::Execute()
+ 	if (bSplat || bGhost)
+ 	{
+ 		ExecuteSplatLayers(dofParams, vDofParams0, vDofParams1, fNumApertureSides, fIrisExponent, fIrisEdgeSoft,
+-		                   bSplat, bGhost, bLensModel, vDofLensModel, fLensSplatCap, vFieldPupil2);
++		                   bSplat, bGhost, bLensModel, vDofLensModel, vDofLensModel2, fLensSplatCap, vFieldPupil2);
+ 	}
+ 
+ 	m_bWroteHDRTarget = true;
+@@ -923,15 +979,18 @@ static Vec3 RotateHueAroundGrey(const Vec3& c, float fAngleRad)
+ void CDepthOfFieldStage::ExecuteSplatLayers(const SDepthOfFieldParams& dofParams, const Vec4& vDofParams0, const Vec4& vDofParams1,
+                                             float fNumApertureSides, float fIrisExponent, float fIrisEdgeSoft,
+                                             bool bSplat, bool bGhost,
+-                                            bool bLensModel, const Vec4& vLensModel, float fSplatCapPx,
++                                            bool bLensModel, const Vec4& vLensModel, const Vec4& vLensModel2, float fSplatCapPx,
+                                             const Vec4& vGatherFieldPupil2)
+ {
+ 	// Two views of one constant. The splat and the ghost draws never form a circle of confusion
+-	// (they read the gather's), so their .z lane carries the SPRITE's own size cap in native
+-	// pixels; the overlay pass does form one - it has to mask the far splats by exactly the
+-	// sharpness the composite blended the far layer with - so it takes the gather's copy
+-	// unchanged, debug sign included.
+-	const Vec4 vSpriteLensModel(0.0f, 0.0f, fSplatCapPx, vLensModel.w);
++	// (they read the gather's), so their .z lane carries the SPRITE's own size cap; the overlay
++	// pass does form one - it has to mask the far splats by exactly the sharpness the composite
++	// blended the far layer with - so it takes the gather's copy unchanged, debug sign included.
++	//
++	// HALVED on the way in: r_DepthOfFieldLensModelSplatMaxCoC is documented and authored as a
++	// DIAMETER in native pixels, while the vertex shader compares it against the quad's half
++	// extent. Passing the diameter made every sprite ceiling twice what the cvar said.
++	const Vec4 vSpriteLensModel(0.0f, 0.0f, fSplatCapPx * 0.5f, vLensModel.w);
+ 	const Vec4& vLensOverlay = vLensModel;
+ 	PROFILE_LABEL_SCOPE("HYBRID BOKEH SPLATS");
+ 
+@@ -1099,6 +1158,7 @@ void CDepthOfFieldStage::ExecuteSplatLayers(const SDepthOfFieldParams& dofParams
+ 	static CCryNameR dofFieldPupil2Name("vDofFieldPupil2");
+ 	static CCryNameR dofAxialChromaticName("vDofAxialChromatic");
+ 	static CCryNameR dofLensModelName("vDofLensModel");
++	static CCryNameR dofLensModel2Name("vDofLensModel2");
+ 
+ 	// Ground truth log, once per change: what the splat grid and the iris actually resolve to.
+ 	{
+@@ -1426,6 +1486,9 @@ void CDepthOfFieldStage::ExecuteSplatLayers(const SDepthOfFieldParams& dofParams
+ 		m_passSpriteComposition.SetConstant(dofFocusParam0Name, vDofParams0, eHWSC_Pixel);
+ 		m_passSpriteComposition.SetConstant(dofFocusParam1Name, vDofParams1, eHWSC_Pixel);
+ 		m_passSpriteComposition.SetConstant(dofLensModelName, vLensOverlay, eHWSC_Pixel);
++		// It forms a circle of confusion of its own through LensModelCoC, so it takes the same
++		// physical cap the downscale and the composite clamp to.
++		m_passSpriteComposition.SetConstant(dofLensModel2Name, vLensModel2, eHWSC_Pixel);
+ 		// The GATHER's copy: the overlay's far mask has to agree with the composite's far blend
+ 		// down to the field curvature and the edge softness floor, which the splat's own copy of
+ 		// this constant deliberately does not carry.
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DepthOfField.h b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DepthOfField.h
+index eb2b3c3d..ea8c6614 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DepthOfField.h
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DepthOfField.h
+@@ -68,7 +68,7 @@ private:
+ 	// and how crisp its edge is cut, both resolved once in Execute() from blade curvature.
+ 	void ExecuteSplatLayers(const SDepthOfFieldParams& dofParams, const Vec4& vDofParams0, const Vec4& vDofParams1,
+ 	                        float blades, float shapeExponent, float edgeSoftness, bool bSplat, bool bGhost,
+-	                        bool bLensModel, const Vec4& vLensModel, float fSplatCapPx,
++	                        bool bLensModel, const Vec4& vLensModel, const Vec4& vLensModel2, float fSplatCapPx,
+ 	                        const Vec4& vGatherFieldPupil2);
+ 
+ 	// Mask gather kernel: CDFs importance-sampling the PUPIL (mask x iris disc of radius
+diff --git a/Code/CryPlugins/CinematicCamera/DofLensModelSpec.md b/Code/CryPlugins/CinematicCamera/DofLensModelSpec.md
+index 0355c0d4..a32272f6 100644
+--- a/Code/CryPlugins/CinematicCamera/DofLensModelSpec.md
++++ b/Code/CryPlugins/CinematicCamera/DofLensModelSpec.md
+@@ -107,18 +107,28 @@ The existing lens flaws fold in as natural terms of the same function, exactly w
+ * edge softness: `farCoC = max(farCoC, k_es · r²)` after it (unchanged meaning);
+ * MinZ near-clip blur (`FocusRangeNearMin`) is a body effect and is added to `nearCoC` as today.
+ 
+-**Cap.** The stock ±4 clamp is a kernel-reach cap (16 px radius at 1080p over 49 half-res
+-taps). In lens mode the cap is `vDofLensModel.z`, from cvar `r_DepthOfFieldLensModelMaxCoC`
+-(float, default 4.0, units). Raising it gives larger discs at the cost of sparser sampling —
+-the user decides by eye; the second gather iteration (3×3, unchanged) fills small holes. Log the
+-uncapped maximum once per second at `r_DepthOfFieldLensModelDebug 1` so the user can see how far
+-the physical CoC is being clipped in a scene.
+-
+-The splat has its own cap: `min(64, …)` px diameter today. In lens mode it becomes
+-`r_DepthOfFieldLensModelSplatMaxCoC` (float, default 256, native px diameter): the sprite is an
+-exact PSF, so large discs cost fill rate only. Because the gather underneath is capped lower, a
+-very bright point far out of focus will show a capped halo plus a larger, fainter exact disc —
+-expected; if it reads wrong the user lowers the splat cap or raises the gather cap.
++**Caps — two different things, and the distinction is load-bearing.** (Corrected 2026-08-27;
++the first implementation conflated them and the splat cap was dead code.)
++
++*The CoC texture carries the PHYSICAL circle of confusion.* `LensModelCoC` clamps only to
++`vDofLensModel2.x` = `r_DepthOfFieldLensModelSplatMaxCoC * 0.5 / U` — the splat's own ceiling
++expressed as a radius in units, floored at the gather cap so a low splat cap can never starve
++the gather. Everything downstream of the downscale reads that texture: the tile min/max pass,
++the layer alphas, the composite's β_far, and above all the **sprite's size**. Clamping it to the
++gather's reach instead pinned every sprite inside the gather's disc, which is the one thing the
++splat exists to exceed.
++
++*The gather caps its own REACH, internally.* `r_DepthOfFieldLensModelMaxCoC` (`vDofLensModel.z`,
++float, default 4.0, units) is a property of a fixed-tap-count kernel, not of the lens. In
++`DofPS` it is applied to every copy of a CoC the kernel derives something from — the near reach
++(`min(vMinTileCoC.r, cap)`), the far reach (`min(fCocFar, cap)`), and each tap's coverage
++(`CoC_i − r_i`) and density (`1/CoC_i²`). The tap's raw `.w` stays physical, so the alpha the
++gather writes onward (and therefore the sprite's size) is the real lens. Log the uncapped
++maximum once per second at `r_DepthOfFieldLensModelDebug 1`.
++
++On screen: a bright point far out of focus shows a full-size, energy-correct sprite carrying
++most of its light, with the gather's smaller capped disc under it as a faint underlay. If that
++reads wrong the user lowers the splat cap or raises the gather cap until the two meet.
+ 
+ ### 3.2 One pupil function
+ 
+@@ -193,7 +203,26 @@ The stock `k = 1.075` near heuristic, the `wf = (cf.w >= fCocFar) ? 1 : saturate
+ heuristic and the `clipW` product are all inside the stock permutation and stay there untouched.
+ 
+ Second gather iteration (`%_RT_SAMPLE0`, 3×3 max path): unchanged in both modes — it is a
+-hole-filling dilate, not an energy step.
++hole-filling dilate, not an energy step. It does take the gather reach cap (its reach is derived
++from the same, now physical, CoC) and it takes no jitter: jittering a max filter only moves the
++holes.
++
++**Tap count and jitter (added 2026-08-27).** The lens-mode first iteration runs **11×11 = 121
++taps** instead of 7×7; the stock permutation keeps its 49. `g_Taps` is sized to 121 in both and
++the count in use arrives in `vDofParamsFocus1.z`, so the stock loop still reads exactly its own
++49 entries. 49 taps over a 32 px radius are 9 px apart and each tap's bilinear footprint reads as
++a separate copy of the source — the disc comes apart into a handful of circles.
++
++121 taps halve the spacing; what is left is broken by a **per-pixel stratified jitter**. Each tap
++is offset inside its own cell, in pupil space, by
++`(frac(IGN_pixel + t·R2) − 0.5) · amp`, `amp = r_DepthOfFieldLensModelJitter / side` (half the tap
++spacing on the unit disc). `IGN_pixel` is one interleaved-gradient-noise pair resolved per pixel;
++the R2 increments decorrelate the taps from each other without a second hash per tap. The
++jittered tap is clamped back to the iris polygon's radius at its own angle, which the CPU stores
++in `g_Taps[].z` (re-deriving it in the shader costs an `atan2` and a `pow` 242 times a pixel).
++The kernel as a whole is never rotated or translated — that would soften the polygon's outline,
++which is exactly the part worth keeping exact; only the interior is roughened. TSAA resolves the
++noise. `r_DepthOfFieldLensModelJitter 0` restores the bare grid for A/B.
+ 
+ ### 3.4 Composite — sharp where the lens is sharp
+ 
+@@ -215,8 +244,19 @@ same sharpness the composite uses.
+ 
+ ### 3.5 Splat in lens mode
+ 
+-* CoC from the gather's CoC texture as today (same units, so nothing changes in sizing except
+-  the cap in 3.1).
++* CoC from the gather's CoC texture as today (same units) — and that texture is the PHYSICAL
++  circle of confusion (3.1), so the sprite is the physical size up to its own cap.
++* The sprite's cap is `r_DepthOfFieldLensModelSplatMaxCoC`, a native-pixel **diameter**, handed
++  to the vertex shader already halved (`fSplatCapPx * 0.5`) because `fDepthBlur` is the quad's
++  half extent. The comparison lane is read through `abs()`: the gather's copy of that constant
++  flags the diagnostic with the cap's sign, and a lane that can be negative anywhere is not a
++  lane to compare a size against.
++* `EvalPupilShape`'s polygon edge width is floored at **one native pixel**
++  (`max(vDofAxialChromatic.y, 1 / QuadPos.w)`, and `1 / (QuadPos.w · s)` for the axial-CA
++  shrunk channel). Blade curvature authors 0.06 curved / 0.015 straight in quad-local radius
++  units; on a large sprite 0.015 is half a pixel, the outline aliases into a dotted line and
++  curvature reads as doing nothing. It is a floor, so a curved blade's deliberately soft outline
++  is untouched at every size. Both permutations take this — it is our own splat code.
+ * `EvalPupilShape` × apodization (3.2).
+ * The fade-in over `[1/3, 1] · r_DepthOfFieldSpriteBokehFadeCoC` and `Highlight Gain` stay as
+   parameters — the expectation (to be confirmed by eye) is that with the energy-weighted gather
+@@ -242,20 +282,24 @@ Post params (new): `Dof_User_LensModel`, `Dof_User_LensFocal`, `Dof_User_SensorW
+ `SDepthOfFieldParams` (new fields `bLensModel`, `fLensFocalMM`, `fSensorWidthMM`, `fSphericalAberration`),
+ saved / restored by the component.
+ 
+-Cvars (new, all in `RendererCVars`): `r_DepthOfFieldLensModel` (int, 1), `r_DepthOfFieldLensModelMaxCoC`
++Cvars (new, all in `RendererCVars`): `r_DepthOfFieldLensModel` (int, 1), `r_DepthOfFieldLensModelJitter`
++(float, 1.0), `r_DepthOfFieldLensModelMaxCoC`
+ (float, 4.0), `r_DepthOfFieldLensModelSplatMaxCoC` (float, 256), `r_DepthOfFieldLensModelDebug`
+ (int, 0: 1 = log the uncapped max CoC once per second and paint the composite's `β_far` /
+ `near.α` as a false-colour overlay — green = sharp, red = far blend, blue = near opacity).
+ 
+-Shader constants (new): `vDofLensModel` (3.1). Everything else reuses the existing constants.
++Shader constants (new): `vDofLensModel` (3.1) and `vDofLensModel2` (x = the physical CoC cap in
++units, y = the tap jitter amplitude in pupil units, z/w reserved), on every gather-side pass that
++calls `LensModelCoC` or runs the kernel. Everything else reuses the existing constants.
+ 
+ ## 5. Limitations, stated up front
+ 
+ * Far-layer reach is the centre CoC (stock), so a blurred background disc does not cross over a
+   *less* blurred background neighbour. Acceptable; a far tile-max reach needs a third CoC
+   channel and is out of scope.
+-* The gather is still 49 + 9 taps at half resolution; the cap in 3.1 is the honest limit of
+-  disc size, the splat carries the rest.
++* The gather is 121 + 9 taps at half resolution in lens mode (49 + 9 on the stock path); the
++  reach cap in 3.1 is the honest limit of the HALO's size, and the splat carries the rest at the
++  full physical size.
+ * Axial CA keeps its radius-mask model (per-channel focal length in the thin lens is the
+   natural next step but changes three passes; not this round).
+ * No compute scatter, no FFT, no full-resolution gather.
+diff --git a/Code/CryPlugins/CinematicCamera/README.md b/Code/CryPlugins/CinematicCamera/README.md
+index 3e600429..7805ee60 100644
+--- a/Code/CryPlugins/CinematicCamera/README.md
++++ b/Code/CryPlugins/CinematicCamera/README.md
+@@ -413,13 +413,24 @@ Four consequences you can see:
+ - **Hyperfocal behaviour works.** Focusing far genuinely leaves the background sharp, which the
+   stock quadratic ramp cannot express at all.
+ 
+-The gather is still 49 + 9 taps at half resolution, so it cannot resolve a disc of any size:
+-`r_DepthOfFieldLensModelMaxCoC` (default 4 units, ~16 px radius at 1080p) is where the physical
+-blur is clipped, and `r_DepthOfFieldLensModelSplatMaxCoC` (default 256 px) is how far the exact
+-sprite is allowed to carry it. `r_DepthOfFieldLensModel 0` disables the whole thing from the
+-console; `r_DepthOfFieldLensModelDebug 1` logs the uncapped circle of confusion once a second
+-and paints the composite as a false-colour map. Full model in
+-[DofLensModelSpec.md](DofLensModelSpec.md).
++The two caps are not the same kind of thing, and it matters. The circle of confusion the
++renderer writes and every consumer downstream reads - the tile pass, the layer alpha, above all
++the **sprite's size** - is the *physical* one, clipped only by
++`r_DepthOfFieldLensModelSplatMaxCoC` (default 256, a native-pixel **diameter**, so 128 px of
++radius). `r_DepthOfFieldLensModelMaxCoC` (default 4 units, ~16 px radius at 1080p) is not a cap
++on the lens at all: it is how far the 121-tap half-resolution **gather kernel** is allowed to
++reach, applied inside the gather on its own copies of the number. So a lamp well behind focus
++draws its sprite at the full physical size and carries most of the light, and the gather's
++capped disc sits underneath it as a fainter, smaller underlay.
++
++`r_DepthOfFieldLensModelJitter` (default 1) offsets every gather tap inside its own cell by a
++per-pixel amount, clamped back inside the iris polygon so the silhouette's outline stays exact.
++Without it a fixed tap grid samples the source at the same 121 places in every pixel and a large
++disc comes apart into visible copies of the source; with it (and TSAA resolving the noise) a
++gather cap of ~8 is usable. Set it to 0 to see the tap copies again for comparison.
++`r_DepthOfFieldLensModel 0` disables the whole thing from the console;
++`r_DepthOfFieldLensModelDebug 1` logs the uncapped circle of confusion once a second and paints
++the composite as a false-colour map. Full model in [DofLensModelSpec.md](DofLensModelSpec.md).
+ 
+ **Spherical Aberration** is the one lens property this round adds, and it exists because there is
+ now a single pupil function every consumer evaluates. It is an *apodization*:
+diff --git a/Code/CryPlugins/CinematicCamera/docs/ConsoleReference.md b/Code/CryPlugins/CinematicCamera/docs/ConsoleReference.md
+index 2d0dc22f..39787848 100644
+--- a/Code/CryPlugins/CinematicCamera/docs/ConsoleReference.md
++++ b/Code/CryPlugins/CinematicCamera/docs/ConsoleReference.md
+@@ -237,14 +237,21 @@ diagnostics outrank the mask. Kernel parameter changes are logged as
+ | | |
+ | --- | --- |
+ | Default | 4.0 |
+-| Purpose | Largest circle of confusion the lens-model **gather** will form, in gather units (~4 px of disc radius per unit at 1080p). Not an optical quantity: the gather is 49 taps at half resolution and cannot resolve a disc of any size, so past this the physical blur is clipped and the sprite splats carry the rest. Raising it gives larger discs at the cost of sparser sampling - ringing and holes in a big disc - which the second 3x3 gather iteration only fills at small sizes. 4.0 is the stock kernel's own reach, so it is the value at which the sampling quality is known good. Use `r_DepthOfFieldLensModelDebug 1` to see how far past the cap the lens is actually asking to go. |
++| Purpose | How far the lens-model **gather kernel** is allowed to reach, in gather units (~4 px of disc radius per unit at 1080p). Not an optical quantity and **not a cap on the lens**: the circle of confusion texture carries the physical blur regardless, and the sprite splats are sized from it - this bounds only the 121-tap half-resolution kernel, which cannot resolve a disc of any size. Past it the gather's halo stops growing and the splat carries the rest. Raising it gives larger halos at the cost of sparser sampling - ringing and visible tap copies in a big disc - which `r_DepthOfFieldLensModelJitter` and the second 3x3 iteration hide. 4.0 is the stock kernel's own reach; ~8 is usable with jitter on. Use `r_DepthOfFieldLensModelDebug 1` to see how far past the cap the lens is actually asking to go. |
+ 
+ ### r_DepthOfFieldLensModelSplatMaxCoC
+ 
+ | | |
+ | --- | --- |
+ | Default | 256 |
+-| Purpose | Largest bokeh sprite the lens-model splat will draw, in native pixels. A sprite is an *exact* evaluation of the pupil rather than a sparse sample of it, so a large disc costs fill rate and nothing else - hence a cap far above the gather's. The consequence to watch for: a very bright point far out of focus shows the gather's clipped halo *plus* a larger, fainter exact disc. If that reads wrong, lower this or raise `r_DepthOfFieldLensModelMaxCoC` so the two meet. The stock path is fixed at 64 px and ignores this. |
++| Purpose | Largest bokeh sprite the lens-model splat will draw, as a **diameter** in native pixels - 256 means a disc 128 px in radius. It is also the only ceiling the circle of confusion texture takes, so it bounds the physical blur every consumer downstream sees (tile pass, layer alpha, sprite size). A sprite is an *exact* evaluation of the pupil rather than a sparse sample of it, so a large disc costs fill rate and nothing else - hence a cap far above the gather's reach. The consequence to watch for: a very bright point far out of focus shows the gather's capped halo *plus* a larger, fainter exact disc. If that reads wrong, lower this or raise `r_DepthOfFieldLensModelMaxCoC` so the two meet. The stock path is fixed at 64 px and ignores this. |
++
++### r_DepthOfFieldLensModelJitter
++
++| | |
++| --- | --- |
++| Default | 1.0 |
++| Purpose | How far the lens-model gather may offset each of its 121 taps inside its own cell, as a fraction of the largest offset that still keeps the tap in that cell. 0 = the bare stratified grid, 1 = full. A fixed tap grid samples the source at the *same* places in every pixel, so above a few units of reach each tap's bilinear footprint reads as a separate copy of the source and a big disc comes apart into a handful of circles. A per-pixel offset turns that structure into noise, which the temporal AA resolves. The offset is clamped back inside the iris polygon, so only the disc's interior is roughened - the silhouette's outline stays exact. Set 0 to bring the tap copies back for an A/B. |
+ 
+ ### r_DepthOfFieldLensModelDebug
+ 
+diff --git a/Engine/Shaders/HWScripts/CryFX/DepthOfField.cfx b/Engine/Shaders/HWScripts/CryFX/DepthOfField.cfx
+index acd141dd..ef0c1881 100644
+--- a/Engine/Shaders/HWScripts/CryFX/DepthOfField.cfx
++++ b/Engine/Shaders/HWScripts/CryFX/DepthOfField.cfx
+@@ -111,6 +111,20 @@ float LensFieldRadius2(float2 tc)
+ //   w = k_sa, spherical aberration. The one lane every consumer reads the same way.
+ float4 vDofLensModel;
+ 
++// The second lens-model constant, read by the gather-side passes only.
++//   x = the cap on the PHYSICAL circle of confusion, in gather units. This is the splat's own
++//       ceiling (r_DepthOfFieldLensModelSplatMaxCoC, a native-pixel DIAMETER) expressed as a
++//       radius in units, and it is the ONLY clamp the circle of confusion texture ever takes:
++//       the texture has to carry what the lens really does, because the tile pass, the layer
++//       alpha and above all the SPRITE size are all built from it. Clamping it to the gather's
++//       kernel reach instead - which is what this used to do - made the splat cap dead code and
++//       pinned every sprite to the gather's disc, which is the one thing the splat exists to
++//       exceed. The gather clamps its own reach internally instead (vDofLensModel.z).
++//   y = per-tap jitter amplitude in pupil units (r_DepthOfFieldLensModelJitter x half the tap
++//       spacing). 0 = the bare stratified grid.
++//   z, w = reserved.
++float4 vDofLensModel2;
++
+ // Thin lens, signed, in the gather's existing CoC units. This is the whole point of the round:
+ // a real lens has no "focus range" and no quadratic ramp - the blur is fixed by focal length,
+ // f-number, focus distance and sensor size, and the near/far split falls out of the SIGN of the
+@@ -140,9 +154,13 @@ void LensModelCoC(in float4 depths, in float fFieldR2, out float4 nearCoC, out f
+ 	// blends behind the near layer instead of washing over the sharp centre.
+ 	farCoC = max(farCoC, vDofFieldPupil2.w * fFieldR2);
+ 
+-	// Kernel reach cap. Not a lens property at all - the gather has 49 taps and cannot resolve a
+-	// disc of any size - so the user owns it by cvar and the splat carries what it clips off.
+-	const float fCap = abs(vDofLensModel.z);
++	// PHYSICAL cap only. The circle of confusion this function produces is what the CoC texture
++	// carries and therefore what the sprite sizes itself from, so the only ceiling that belongs
++	// here is the largest disc the SPLAT is allowed to draw. The gather's kernel reach is a
++	// property of the gather - 121 taps cannot resolve a disc of any size - and is applied
++	// inside DofPS, on the copies of the CoC it uses for reach, coverage and density, so that
++	// clipping the halo does not also clip the sprite.
++	const float fCap = max(vDofLensModel2.x, 0.0001);
+ 	farCoC  = clamp(farCoC,  0, fCap);
+ 	nearCoC = clamp(nearCoC, 0, fCap);
+ }
+@@ -314,8 +332,12 @@ v2fBokehQuad DofBokehRefVS(uint nVertexID : SV_VertexID)
+ #if %_RT_SAMPLE2
+ 	// A sprite is an EXACT evaluation of the pupil, not a sparse sample of it, so a large disc
+ 	// costs fill rate and nothing else - the 64 px ceiling only ever existed to bound a sprite
+-	// that had to agree with a 4-unit gather. r_DepthOfFieldLensModelSplatMaxCoC owns it now.
+-	fDepthBlur = min(vDofLensModel.z, fDepthBlur);
++	// that had to agree with a 4-unit gather. r_DepthOfFieldLensModelSplatMaxCoC owns it now,
++	// and the CPU hands it down already halved: the cvar is a DIAMETER, fDepthBlur is the quad's
++	// half extent. abs() because the gather's copy of this constant flags the diagnostic with the
++	// cap's sign - the sprite's copy never does, but a lane that can be negative anywhere is not
++	// a lane to compare a size against.
++	fDepthBlur = min(abs(vDofLensModel.z), fDepthBlur);
+ #else
+ 	fDepthBlur = min(64, fDepthBlur);
+ #endif
+@@ -452,7 +474,10 @@ v2fBokehQuad DofBokehRefVS(uint nVertexID : SV_VertexID)
+ // vBarrelC is the barrel's apparent centre and fIrisExp the lod-driven iris falloff exponent.
+ // fSide is +1 behind focus and -1 in front, which is all the spherical-aberration apodization
+ // needs to know: it is the same function of pupil radius on both sides of focus, turned over.
+-half4 EvalPupilShape(half2 tcQuad, float2 vBarrelC, half fIrisExp, half fSide)
++// fRadiusPx is how many native pixels ONE unit of tcQuad radius covers - the drawn shape's own
++// radius on screen - which is what turns the polygon's edge width from an abstract number into
++// a number of pixels (see fEdgeSoft below).
++half4 EvalPupilShape(half2 tcQuad, float2 vBarrelC, half fIrisExp, half fSide, float fRadiusPx)
+ {
+ 	const half fLen = dot(tcQuad, tcQuad);
+ 
+@@ -467,7 +492,13 @@ half4 EvalPupilShape(half2 tcQuad, float2 vBarrelC, half fIrisExp, half fSide)
+ 	// gather kernel raises its taps by, so both views of the iris always agree), at radius
+ 	// vDofBokehMask.z in quad units. Blade curvature is expressed as the EDGE instead: soft for
+ 	// a curved blade, crisp for a straight one (vDofAxialChromatic.y).
+-	const float fEdgeSoft = max(vDofAxialChromatic.y, 0.001f);   // soft edge width, quad-local radius
++	// Soft edge width in quad-local RADIUS units, floored at one native pixel. Blade curvature
++	// authors this number for the look (0.06 curved, 0.015 straight), but on a large sprite a
++	// straight blade's 0.015 is half a pixel wide and the outline stops being an edge at all: it
++	// aliases into a dotted line and reads as if curvature did nothing. One pixel is the finest
++	// edge the grid can express, so that is the floor - and it is a floor, so a curved blade's
++	// deliberately soft outline is untouched at every size.
++	const float fEdgeSoft = max(vDofAxialChromatic.y, 1.0f / max(fRadiusPx, 1.0f));
+ 	const float fRadius   = sqrt(max(fLen, 1e-6f));
+ 	const float fTheta    = atan2(tcQuad.y, tcQuad.x);
+ 	const float fPolyRad  = pow(NGon_Rad(fTheta - vDofBokehShape.w, max(vDofBokehShape.x, 3.0f)), vDofBokehShape.y) * vDofBokehMask.z;
+@@ -560,8 +591,12 @@ pixoutDofMRT DofBokehRefPS(v2fBokehQuad IN)
+ 	const half fAxialS = (half)max(vDofAxialChromatic.x, 0.05);
+ 	// Same near/far split the astigmatic ellipse uses - a sprite lands on one side of focus.
+ 	const half fApodSide = (half)fAstigSign;
+-	const half4 cFull   = EvalPupilShape(tcQuad, vBarrelC, (half)IN.Color.w, fApodSide);
+-	const half4 cShrunk = EvalPupilShape(tcQuad / fAxialS, vBarrelC, (half)IN.Color.w, fApodSide) / (fAxialS * fAxialS);
++	// QuadPos.w is the quad's half extent in native pixels, i.e. exactly how many pixels one unit
++	// of quad-local radius spans. The shrunk channel is drawn at radius fAxialS of that, so its
++	// edge has correspondingly fewer pixels to be soft over.
++	const float fQuadRadPx = max(IN.QuadPos.w, 1.0);
++	const half4 cFull   = EvalPupilShape(tcQuad, vBarrelC, (half)IN.Color.w, fApodSide, fQuadRadPx);
++	const half4 cShrunk = EvalPupilShape(tcQuad / fAxialS, vBarrelC, (half)IN.Color.w, fApodSide, fQuadRadPx * fAxialS) / (fAxialS * fAxialS);
+ 
+ 	// Behind focus red and blue are the short-focusing pair, so the rim beyond their discs is
+ 	// green alone; in front of focus it is green that shrinks and the rim reads magenta. Which
+@@ -1095,7 +1130,35 @@ Texture2D<float4> DOF_HDRDoF0        : register(t1);
+ Texture2D<float4> DOF_HDRDoF1        : register(t2);
+ SamplerState DOF_LCSamp              : register(s1);  //LinearClamp
+ 
+-float4 g_Taps[7*7];  // Max is 7x7 (for first iteration)
++// Sized to the LARGEST kernel any permutation uses: 11x11 = 121 taps for the lens model's first
++// iteration, 7x7 = 49 for the stock one, 3x3 for the second iteration in both. The count in use
++// arrives per pass in vDofParamsFocus1.z and the loops below run exactly that many, so the stock
++// permutation still reads its own 49 taps and nothing else - only the reserved space grew.
++// .xy = the tap in pupil space (polygon mapped, anamorphically narrowed);
++// .z  = the iris polygon's radius at that tap's angle, the ceiling the jitter below is clamped
++//       back to so a per-pixel offset can roughen the INTERIOR without softening the outline.
++float4 g_Taps[11*11];
++
++// Per-pixel, per-tap stratified jitter (lens mode). 121 taps spread over a large disc are still
++// 121 discrete copies of the source - the "several circles trying to form a triangle" - because
++// every pixel samples the source at the SAME 121 places. Offsetting each tap inside its own cell
++// by a per-pixel amount turns that structure into noise, which the temporal AA then resolves into
++// the smooth disc the taps were supposed to be approximating.
++//
++// The offset is applied in PUPIL space and clamped back inside the iris polygon: jittering the
++// kernel as a whole (a rotation or a common translation) would blur the polygon's outline, which
++// is the one part of the shape worth keeping exact. fIGN is the pixel's own pair of hashes,
++// resolved once outside the loops; the R2 low-discrepancy increments decorrelate the taps from
++// each other without another hash per tap.
++float2 LensTapJitter(float2 x, float fPolyRad, float2 fIGN, float fTap, float fAmp)
++{
++	const float2 vJit = (frac(fIGN + fTap * float2(0.7548776662, 0.5698402909)) - 0.5) * fAmp;
++	float2 xj = x + vJit;
++	const float fRj = length(xj);
++	// A tap may not leave the opening it came through. fPolyRad is the polygon's radius at the
++	// unjittered angle, which is within a jitter of the right one and costs nothing here.
++	return (fRj > fPolyRad) ? xj * (fPolyRad / max(fRj, 1e-5)) : xj;
++}
+ 
+ struct pixout_dof
+ {
+@@ -1182,6 +1245,28 @@ pixout_dof DofPS(vtxOut IN)
+ 
+ 	const float2 vMinTileCoC = (GetTexture2DLod(DOF_CoCM, DOF_PCSamp, float4(IN.baseTC.xy, 0, 0)).rg);
+ 
++#if %_RT_SAMPLE2
++	// The gather's OWN reach cap. The circle of confusion arriving from the texture is the
++	// physical one (it has to be - the sprite is sized from it), but a fixed tap count cannot
++	// resolve a disc of any size, so everything the KERNEL derives from a CoC - how far it
++	// reaches, whether a tap's disc covers this pixel, and how thinly that tap's light was
++	// spread - is taken from the capped copy. The light beyond the cap is the splat's to carry.
++	const float fGatherCap = abs(vDofLensModel.z);
++	const float fNearReach = min(vMinTileCoC.r, fGatherCap);
++	const float fFarReach  = min(fCocFar, fGatherCap);
++
++	// The pixel's own pair of hashes for the tap jitter, resolved once. Interleaved gradient
++	// noise: a screen-space pattern that decorrelates neighbours at every scale and costs one
++	// dot product, which is what a 121-tap loop can afford.
++	const float2 vPixIGN = IN.baseTC.xy * PS_ScreenSize.xy;
++	const float2 fIGN = frac(52.9829189 * frac(float2(0.06711056 * vPixIGN.x + 0.00583715 * vPixIGN.y,
++	                                                  0.06711056 * vPixIGN.y + 0.00583715 * vPixIGN.x)));
++	const float fJitAmp = vDofLensModel2.y;
++#else
++	const float fNearReach = vMinTileCoC.r;
++	const float fFarReach  = fCocFar;
++#endif
++
+ 	// note - on nvidia getting better perf with single branch outside loops. on amd the oposite
+ 
+ 	[branch] if (vMinTileCoC.r>0.0)
+@@ -1196,13 +1281,21 @@ pixout_dof DofPS(vtxOut IN)
+ 			// The aperture: this ray only exists if it clears the mechanical opening. Soft edged
+ 			// so the clipped silhouette does not alias from one tap to the next.
+ 			const float clipW = saturate((vDofFieldPupil.y - length(x - vBarrelC)) / 0.08 + 0.5);
++#if %_RT_SAMPLE2 && !%_RT_SAMPLE0 && !%_RT_SAMPLE1
++			// Stratified jitter, first iteration only: the second one is a hole-filling dilate,
++			// not a sampling of the disc, and has nothing to stratify.
++			const float2 xj = LensTapJitter(x, g_Taps[t].z, fIGN, (float)t, fJitAmp);
++#else
++			// Identical to x in every other permutation, so the stock kernel is untouched.
++			const float2 xj = x;
++#endif
+ 			// Near layer sits on the opposite side of focus from the far layer, so its
+ 			// astigmatic ellipse is the far layer's turned by 90 degrees - hence the minus.
+ 			const float aNear = -fAstigA;
+-			float2 xn = vFieldU * dot(x, vFieldU) * (1 + aNear) + vFieldT * dot(x, vFieldT) * (1 - aNear);
+-			xn += vFieldU * (fComaK * dot(x, x));
++			float2 xn = vFieldU * dot(xj, vFieldU) * (1 + aNear) + vFieldT * dot(xj, vFieldT) * (1 - aNear);
++			xn += vFieldU * (fComaK * dot(xj, xj));
+ 
+-			float2 cocOffset = vMinTileCoC.r * fCocScale * float2(xn.x / fSqueezeS, xn.y);
++			float2 cocOffset = fNearReach * fCocScale * float2(xn.x / fSqueezeS, xn.y);
+ 			float4 cn = GetTexture2DLod(DOF_HDRDoF0, DOF_LCSamp, float4(IN.baseTC.xy + cocOffset, 0, 0));
+ 
+ 			const float k = 1.075;
+@@ -1235,8 +1328,11 @@ pixout_dof DofPS(vtxOut IN)
+ 			{
+ 				// The tap's distance from this pixel, in the same units its CoC is expressed
+ 				// in - measured on the SQUEEZED offset, because that is where it really landed.
+-				const float fTapR = vMinTileCoC.r * length(float2(xn.x / fSqueezeS, xn.y));
+-				const float fTapCoC = cn.w;
++				const float fTapR = fNearReach * length(float2(xn.x / fSqueezeS, xn.y));
++				// Capped: coverage and density describe the disc the GATHER is drawing, which is
++				// the clipped one. cn.w itself stays physical and is what the layer's alpha - and
++				// therefore the sprite's size - is averaged from.
++				const float fTapCoC = min(cn.w, fGatherCap);
+ 				// Soft over a quarter unit (~1 px): a hard coverage test aliases into rings.
+ 				const float fCov = saturate((fTapCoC - fTapR) / 0.25 + 0.5);
+ 				const float fCocD = max(fTapCoC, 0.125);
+@@ -1247,7 +1343,7 @@ pixout_dof DofPS(vtxOut IN)
+ 				// foreground would then be composited over the background as a picture OF the
+ 				// background: a blurred edge that spills nothing.
+ 				const float fIsNear = (fTapCoC > 0.01) ? 1.0 : 0.0;
+-				const float4 vPupil = LensPupil(x, vBarrelC, -1.0, fAxialS);
++				const float4 vPupil = LensPupil(xj, vBarrelC, -1.0, fAxialS);
+ 				const float4 wLens = (fCov * fIsNear * fDens) * vPupil;
+ 
+ 				cAccNear += float4(cn.rgb * wLens.rgb, cn.w * wLens.a);
+@@ -1277,11 +1373,16 @@ pixout_dof DofPS(vtxOut IN)
+ 			// round: this is the far side of focus. See the near loop for the reasoning.
+ 			const float2 x = float2(offset.x * fSqueezeS, offset.y);
+ 			const float clipW = saturate((vDofFieldPupil.y - length(x - vBarrelC)) / 0.08 + 0.5);
++#if %_RT_SAMPLE2 && !%_RT_SAMPLE0 && !%_RT_SAMPLE1
++			const float2 xj = LensTapJitter(x, g_Taps[t].z, fIGN, (float)t, fJitAmp);
++#else
++			const float2 xj = x;
++#endif
+ 			const float aFar = fAstigA;
+-			float2 xf = vFieldU * dot(x, vFieldU) * (1 + aFar) + vFieldT * dot(x, vFieldT) * (1 - aFar);
+-			xf += vFieldU * (fComaK * dot(x, x));
++			float2 xf = vFieldU * dot(xj, vFieldU) * (1 + aFar) + vFieldT * dot(xj, vFieldT) * (1 - aFar);
++			xf += vFieldU * (fComaK * dot(xj, xj));
+ 
+-			float2 cocOffset = fCocFar * fCocScale * float2(xf.x / fSqueezeS, xf.y);
++			float2 cocOffset = fFarReach * fCocScale * float2(xf.x / fSqueezeS, xf.y);
+ 
+ 			float4 cf = GetTexture2DLod(DOF_HDRDoF1, DOF_LCSamp, float4(IN.baseTC.xy + cocOffset, 0, 0));
+ 			float wf = (cf.w >= fCocFar) ? 1 : saturate( cf.w );
+@@ -1303,12 +1404,14 @@ pixout_dof DofPS(vtxOut IN)
+ 			// a background disc therefore cannot spill over a LESS blurred background
+ 			// neighbour, which is the one honest limitation of doing this as a gather.
+ 			{
+-				const float fTapR = fCocFar * length(float2(xf.x / fSqueezeS, xf.y));
+-				const float fTapCoC = cf.w;
++				const float fTapR = fFarReach * length(float2(xf.x / fSqueezeS, xf.y));
++				// Capped for the same reason as the near loop: the gather's disc is the clipped
++				// one, cf.w stays physical so the alpha the splat reads is the real lens.
++				const float fTapCoC = min(cf.w, fGatherCap);
+ 				const float fCov = saturate((fTapCoC - fTapR) / 0.25 + 0.5);
+ 				const float fCocD = max(fTapCoC, 0.125);
+ 				const float fDens = 1.0 / (fCocD * fCocD);
+-				const float4 vPupil = LensPupil(x, vBarrelC, 1.0, fAxialS);
++				const float4 vPupil = LensPupil(xj, vBarrelC, 1.0, fAxialS);
+ 				const float4 wLens = (fCov * fDens) * vPupil;
+ 
+ 				cAccFar += float4(cf.rgb * wLens.rgb, cf.w * wLens.a);
+-- 
+2.47.1.windows.1
+

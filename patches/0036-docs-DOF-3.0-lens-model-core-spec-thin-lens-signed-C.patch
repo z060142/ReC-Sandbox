@@ -1,0 +1,324 @@
+From b1f7e1154806b64acac13acfb27e16cbff3245e1 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Thu, 27 Aug 2026 06:03:46 +0800
+Subject: [PATCH 36/44] docs: DOF 3.0 lens-model core spec - thin-lens signed
+ CoC, shared pupil function with spherical aberration, energy-weighted
+ scatter-as-gather, CoC-layered composite; ccam-exclusive permutation, stock
+ path byte-identical
+
+---
+ .../CinematicCamera/DofLensModelSpec.md       | 302 ++++++++++++++++++
+ 1 file changed, 302 insertions(+)
+ create mode 100644 Code/CryPlugins/CinematicCamera/DofLensModelSpec.md
+
+diff --git a/Code/CryPlugins/CinematicCamera/DofLensModelSpec.md b/Code/CryPlugins/CinematicCamera/DofLensModelSpec.md
+new file mode 100644
+index 00000000..bf140f27
+--- /dev/null
++++ b/Code/CryPlugins/CinematicCamera/DofLensModelSpec.md
+@@ -0,0 +1,302 @@
++# DOF 3.0 — Lens-Model Core — Specification
++
++Status: approved for implementation, 2026-08-27. Owner of semantics: the camera manager.
++Branch: `dof3` (off `dev` @ 2f89e681). Merged back to `dev` only after user verification.
++
++## 0. Why, and the one rule
++
++Everything the cinematic camera added to the depth of field so far — the field-dependent
++pupil, the shape mask, axial CA, the sprite splat, the ghosts, the anamorphic oval — hangs off
++Crytek's stock skeleton, and four pieces of that skeleton are not optical at all:
++
++1. **The circle of confusion** (`ComputeCircleOfConfusion`) is `saturate(depth·a + b)² · scale`,
++   clamped to ±4: a focus *range* with a quadratic ramp, not a lens. The component has to
++   reverse-engineer a `FocusRange` and a `BlurAmount` from thin-lens numbers and then fudge the
++   result with `Focus Falloff` because the ramp saturates exactly where the picture should still
++   be sharp. Field curvature and edge softness are patches on that fake curve.
++2. **The gather is an average**, not a sum of light. Every tap is weighted by an ad-hoc
++   "is the tap at least as blurred as me" heuristic and the accumulation is divided by the
++   weight sum. A bright point therefore does not get dimmer as its disc grows, taps from a
++   sharp neighbour leak into a blurred pixel at the wrong strength, and the splat had to be
++   bolted on with a second, additive energy convention — plus `Highlight Gain` and the fade-in
++   cvar to hide the seam between the two conventions.
++3. **The near / far split** decides occlusion with a tile-min CoC and the same heuristic
++   weights: partial occlusion at a foreground edge is approximate.
++4. **The composite** upsamples the half-resolution layers bicubically and lerps them over the
++   sharp frame by `saturate(CoC)`, where CoC = 1 is an 8-pixel radius. A pixel that is 2 px out
++   of focus is already a 25 % blend of a half-resolution blur: the focus zone is never truly
++   sharp.
++
++This round replaces the *mathematics inside* those four pieces with a lens model, keeping
++every pass, target and constant the pipeline already has. The visible payoff: focus, blur size
++and near/far behaviour that follow focal length, f-number, focus distance and sensor exactly;
++bokeh discs whose brightness is right relative to each other so the splat becomes a refinement
++instead of a second system; a genuinely sharp focus zone; and a shared pupil function every
++consumer (gather, splat, ghost, later the FFT glare) evaluates identically, with one new lens
++parameter (spherical aberration) that only a shared pupil function could give.
++
++**The one rule (the user's, 2026-08-27): this is ccam-exclusive.** The lens model runs only
++when the Cinematic Camera component asks for it. With the component off, disabled, or its
++`Lens Model DOF` switch off — and whenever the kill-switch cvar is 0 — every DOF shader and
++every CPU path must be **byte-identical to `dev`**: the stock permutation of each technique is
++not edited, the stock `ComputeCircleOfConfusion` is not edited, the stock weights are not
++edited. The lens model is a separate shader permutation and separate CPU branches. If anything
++in it is wrong, the engine is still an ordinary CRYENGINE.
++
++## 1. Gating
++
++* New post-effect parameter `Dof_User_LensModel` (0/1, default 0). The component sets it to 1
++  in `ApplyDOF` when `Enable Depth of Field` is on and the new `Lens Model DOF` bool (group
++  Depth Of Field, default **true**) is on; saved / restored like every other `Dof_User_*`
++  parameter (`m_savedDof...`).
++* New cvar `r_DepthOfFieldLensModel` (int, default 1): 0 = ignore the request, stock path
++  always; 1 = lens model when the component asks. Kill switch, nothing else.
++* The renderer resolves `bLensModel = (r_DepthOfFieldLensModel != 0) && (Dof_User_LensModel > 0.5) && bGameMode-style user path`
++  once in `CDepthOfFieldStage::Execute` (the TOD / non-user branch never gets the lens model;
++  there is no focal length there). Log one line on every change:
++  `[DOF] lens model ON (f=%.1fmm N=%.2f df=%.2fm sensor=%.1fmm) / OFF`.
++* Shader: one runtime flag bit for the lens model, on the downscale, tile, gather, composite,
++  normalize and splat techniques. `%_RT_SAMPLE0` / `%_RT_SAMPLE1` are taken (second gather
++  iteration, depth dilation); use `%_RT_SAMPLE2` after confirming it is free for this shader,
++  otherwise the next free bit. The stock permutation compiles to exactly what it compiles to
++  today — **verify by diffing the generated shader cache / the disassembly of the flag-off
++  permutation, or at minimum by an A/B screenshot with the switch off (acceptance 1).**
++
++## 2. Inputs
++
++From the component (all already exist except where marked):
++
++| Quantity | Source | Notes |
++|---|---|---|
++| `f` effective focal length, mm | `GetEffectiveFocalLength()` → **new** `Dof_User_LensFocal` | includes breathing and servo zoom |
++| `N` geometric f-number | `Dof_User_FNumber` (raw iris) + `Dof_User_MaskFNumber` | renderer: `N_geo = max(N, N_mask)` when the mask texture is valid, else `N` — identical to `GetGeometricAperture()` |
++| `d_f` focus distance, m | `Dof_User_FocusDistance` | |
++| `W_s` sensor width, mm | `GetSensorWidth()` → **new** `Dof_User_SensorWidth` | the horizontal is what maps to `W_px`; the anamorphic hFOV gate already changed the frustum, so no squeeze term here |
++| `p` pupil scale | `Dof_User_PupilScale` | unchanged; still drives edge softness, ghosts, cat-eye |
++| `k_sa` spherical aberration | **new** lens parameter `Spherical Aberration`, group Lens, `Range<-1,1>` default 0 → **new** `Dof_User_SphericalAberration` | see 3.2 |
++| field curvature, edge softness, axial CA, squeeze | unchanged | |
++
++`Focus Falloff`, `FocusRange`, `BlurAmount` are **not used** on the lens-model path (the
++component keeps computing and sending them so the stock path is unaffected; the tooltip of
++`Focus Falloff` says "stock DOF path only, ignored by Lens Model DOF").
++
++## 3. Model
++
++### 3.1 Circle of confusion — thin lens, signed, in pixels
++
++Object distance `d` (m, from linear depth), focus distance `d_f`, focal length `f` (m):
++
++```
++c_mm(d)  = (f² / (N_geo · (d_f − f))) · (d − d_f) / d          // signed diameter on the sensor, mm
++c_px(d)  = c_mm · W_px / W_s                                    // native pixels, signed
++r_unit   = 0.5 · c_px / U,   U = 8 · max(W_px/1920, H_px/1080)  // the gather's existing unit: 1 = 8 px radius at 1080p
++```
++
++Positive = behind focus (far layer), negative = in front (near layer): `farCoC = max(0, r_unit)`,
++`nearCoC = max(0, −r_unit)`. The formula is evaluated by **one HLSL function**
++`LensModelCoC(depth, fieldR2) → (near, far)` used by the downscale, the composite and the
++normalize pass in lens mode — every consumer of `vDofParamsFocus0` today has a lens-mode branch
++calling it instead. Constants arrive in a new `float4 vDofLensModel`: `x = K = f² · W_px / (2 · N_geo · (d_f − f) · W_s · U)`
++(so `r_unit = K · (d − d_f) / d`), `y = d_f`, `z = CoC cap in units` (below), `w = k_sa`.
++CPU side computes `K` once per frame in `Execute` from the inputs above; `f` and `d_f` in metres,
++`d_f` floored at `1.01 f`.
++
++The existing lens flaws fold in as natural terms of the same function, exactly where they are now:
++
++* field curvature: `d ← d · (1 + k_fc · r²)` before the formula (unchanged meaning);
++* edge softness: `farCoC = max(farCoC, k_es · r²)` after it (unchanged meaning);
++* MinZ near-clip blur (`FocusRangeNearMin`) is a body effect and is added to `nearCoC` as today.
++
++**Cap.** The stock ±4 clamp is a kernel-reach cap (32 px radius at 1080p over 49 half-res
++taps). In lens mode the cap is `vDofLensModel.z`, from cvar `r_DepthOfFieldLensModelMaxCoC`
++(float, default 4.0, units). Raising it gives larger discs at the cost of sparser sampling —
++the user decides by eye; the second gather iteration (3×3, unchanged) fills small holes. Log the
++uncapped maximum once per second at `r_DepthOfFieldLensModelDebug 1` so the user can see how far
++the physical CoC is being clipped in a scene.
++
++The splat has its own cap: `min(64, …)` px diameter today. In lens mode it becomes
++`r_DepthOfFieldLensModelSplatMaxCoC` (float, default 256, native px diameter): the sprite is an
++exact PSF, so large discs cost fill rate only. Because the gather underneath is capped lower, a
++very bright point far out of focus will show a capped halo plus a larger, fainter exact disc —
++expected; if it reads wrong the user lowers the splat cap or raises the gather cap.
++
++### 3.2 One pupil function
++
++```
++// pupil-space x (unit disc = wide-open geometric pupil), field vector, side (+1 far / −1 near), channel
++float LensPupil(float2 x, float2 field, float side, int channel)
++```
++
++returns the pupil **transmittance × intensity profile** at `x`:
++
++1. barrel clip (cat-eye) — as today (`LensFieldPupilTransmission` / `fBarrel`);
++2. iris polygon at the curvature exponent — as today (`NGon_Rad` / `fPolyMask`);
++3. shape mask ∩ polygon — as today (`fMaskVal`), with the mask rotation;
++4. axial CA per-channel radius — as today (`fAxialS`, channel-masked);
++5. **new — spherical-aberration apodization:**
++   `w(r) = 1 + side · k_sa · (2 r² − 1)`, clamped to `[0.05, 2]`, `r = |x|`.
++   `k_sa > 0`: far-side discs bright-rimmed (over-corrected, "soap bubble"), near-side discs
++   soft-edged; `k_sa < 0` the reverse (STF / DC look). Energy of the disc is preserved to first
++   order because `∫(2r²−1) r dr` over the unit disc is zero; the splat's area normalisation
++   stays as it is.
++
++Coma and astigmatism remain what they are: coordinate transforms *before* the pupil is sampled
++(`M⁻¹(x)` in the splat, forward in the gather). The function lives in a new `DepthOfField.cfi`
++(or at the top of the `.cfx` if the include machinery fights back) and is called by:
++
++* the gather (lens mode): per tap, `P_i = LensPupil(x_i, field, side, channel)` replaces the
++  separate `clipW` and `mn/mf` products and adds the apodization;
++* the splat `EvalPupilShape` (both modes — the apodization multiplies the returned fill; at
++  `k_sa = 0` it is exactly 1, so the stock look is unchanged, and the ghosts inherit it);
++* the ghost VS/PS through `EvalPupilShape` — nothing to do.
++
++This is the function the FFT glare kernel will take its pupil from later; keep its signature
++free of anything pass-specific.
++
++### 3.3 Gather — scatter-as-gather with energy weights
++
++Lens-mode permutation of `DofPS`, both loops. Per tap `i` at pupil offset `x_i` (unit disc,
++after the anamorphic un-squeeze, before coma/astigmatism), placed at screen offset
++`o_i = R · M(x_i)`:
++
++```
++reach R:      near loop = tile-max near CoC (as today)
++              far loop  = centre far CoC (as today; see limitations)
++tap radius:   r_i  = |o_i| in units      (distance from the pixel to the tap, screen space)
++coverage:     cov_i = saturate((CoC_i − r_i) / 0.25 + 0.5)    // the tap's own disc reaches this pixel, soft over a quarter unit (2 px)
++density:      dens_i = 1 / max(CoC_i, 0.125)²                 // one point's light spread over its disc area
++pupil:        P_i = LensPupil(x_i, field, side, ch)           // per channel (axial CA lanes)
++weight:       w_i = cov_i · dens_i · P_i
++colour:       C = Σ c_i · w_i / Σ w_i        (per channel, lanes as today; centre-tap fallback when Σ w = 0)
++```
++
++`c_i` is **straight** colour: in lens mode the downscale does **not** premultiply the layer
++colour by its CoC (that premultiply was the stock proxy for coverage), and the composite does
++**not** divide by alpha. Alpha (the layer's CoC) is still accumulated with the unmasked weight
++and written to the CoC target as today, so the tile pass, the splat sizing and the second
++iteration keep reading what they read now.
++
++**Near-layer opacity** (what the composite blends the near layer over the rest with) is the
++pupil-weighted fraction of rays that land on the foreground:
++
++```
++α_near = Σ_i cov_i · P_i · isNear_i  /  Σ_i P_i        // isNear_i = tap's near CoC > 0.01
++```
++
++written to the near layer's alpha in lens mode **instead of** the averaged CoC. In a uniformly
++blurred foreground every tap covers, α = 1; at a blurred foreground edge over a sharp
++background α falls off as the true fraction of the pupil that sees the foreground — the partial
++occlusion the stock heuristic approximates. (The far layer's opacity is the composite's own
++business, 3.4.)
++
++The stock `k = 1.075` near heuristic, the `wf = (cf.w >= fCocFar) ? 1 : saturate(cf.w)`
++heuristic and the `clipW` product are all inside the stock permutation and stay there untouched.
++
++Second gather iteration (`%_RT_SAMPLE0`, 3×3 max path): unchanged in both modes — it is a
++hole-filling dilate, not an energy step.
++
++### 3.4 Composite — sharp where the lens is sharp
++
++Lens-mode permutation of `CompositeDofPS`:
++
++```
++r_px(far)  = farCoC · U          (from LensModelCoC at the pixel's own depth)
++β_far      = saturate((r_px − 0.5) / 1.5)         // 0 until the disc exceeds one pixel, 1 by 2 px radius (the half-res layer is ≥ 1 px blur anyway)
++out        = lerp(scene, far.rgb, β_far)
++out        = lerp(out, near.rgb, near.α)          // near.α from 3.3
++```
++
++No unpremultiply. The bicubic upsample stays. Pixels inside the depth of field are the native
++frame, untouched — this is what makes the focus zone read sharp.
++
++`RefDofMBNormalizePS` (splat overlay) in lens mode: `fFarMask` from `β_far` of the same
++function instead of the stock `vFocusRanges` ramp, so the splat's far layer is masked by the
++same sharpness the composite uses.
++
++### 3.5 Splat in lens mode
++
++* CoC from the gather's CoC texture as today (same units, so nothing changes in sizing except
++  the cap in 3.1).
++* `EvalPupilShape` × apodization (3.2).
++* The fade-in over `[1/3, 1] · r_DepthOfFieldSpriteBokehFadeCoC` and `Highlight Gain` stay as
++  parameters — the expectation (to be confirmed by eye) is that with the energy-weighted gather
++  underneath the useful gain drops toward 1 and the fade window can shrink; the user retunes
++  the defaults after seeing the picture (this is why the round precedes the preset camera).
++  Do not change the defaults in this round; report what looked right.
++
++## 4. Parameters, cvars, constants
++
++Component:
++
++| Group | Name | Type | Default | Meaning |
++|---|---|---|---|---|
++| Depth Of Field | `LensModelDof` ('lmdf') "Lens Model DOF" | bool | true | Drive the depth of field from the thin-lens model (focal length, f-number, focus distance, sensor) with energy-weighted bokeh, a sharp focus zone and the shared pupil. Off = the stock engine DOF fed with Focus Falloff / Blur Amount. |
++| Lens | `SphericalAberration` ('sabr') "Spherical Aberration" | `Range<-1,1>` (slider −1..1, step 0.05) | 0 | Intensity profile of the bokeh disc. Positive: bright rim behind focus, soft in front (over-corrected, soap-bubble bokeh). Negative: soft behind, bright rim in front (STF / DC look). 0 = flat disc. |
++
++Schematyc `szName`s strictly `[A-Za-z0-9_]+` (see the AddMember pitfall in memory / the
++README). New `SCineLensParams` member goes **before** `bokehShapeTex` (the `TextureFileName`
++must stay last for the memcmp `operator==`).
++
++Post params (new): `Dof_User_LensModel`, `Dof_User_LensFocal`, `Dof_User_SensorWidth`,
++`Dof_User_SphericalAberration`. Registered wherever the other `Dof_User_*` live, read into
++`SDepthOfFieldParams` (new fields `bLensModel`, `fLensFocalMM`, `fSensorWidthMM`, `fSphericalAberration`),
++saved / restored by the component.
++
++Cvars (new, all in `RendererCVars`): `r_DepthOfFieldLensModel` (int, 1), `r_DepthOfFieldLensModelMaxCoC`
++(float, 4.0), `r_DepthOfFieldLensModelSplatMaxCoC` (float, 256), `r_DepthOfFieldLensModelDebug`
++(int, 0: 1 = log the uncapped max CoC once per second and paint the composite's `β_far` /
++`near.α` as a false-colour overlay — green = sharp, red = far blend, blue = near opacity).
++
++Shader constants (new): `vDofLensModel` (3.1). Everything else reuses the existing constants.
++
++## 5. Limitations, stated up front
++
++* Far-layer reach is the centre CoC (stock), so a blurred background disc does not cross over a
++  *less* blurred background neighbour. Acceptable; a far tile-max reach needs a third CoC
++  channel and is out of scope.
++* The gather is still 49 + 9 taps at half resolution; the cap in 3.1 is the honest limit of
++  disc size, the splat carries the rest.
++* Axial CA keeps its radius-mask model (per-channel focal length in the thin lens is the
++  natural next step but changes three passes; not this round).
++* No compute scatter, no FFT, no full-resolution gather.
++
++## 6. Acceptance (user, by eye, in the sample project)
++
++1. **Stock unchanged.** `Lens Model DOF` off (or `r_DepthOfFieldLensModel 0`): A/B screenshot
++   against `dev` at the same camera — pixel-identical. The Fable reviewer also checks the diff
++   of the stock permutation's source is empty.
++2. **Thin lens.** 50 mm f/1.4 focused at 2 m on the sample scene: the in-focus band is sharp
++   (native pixels), blur grows continuously behind and in front; changing to f/8 shrinks every
++   disc and widens the sharp band; 85 mm at the same N and distance blurs more than 50 mm;
++   focusing at 10 m makes the far background nearly sharp (hyperfocal behaviour, which the stock
++   ramp cannot do). `Focus Falloff` no longer changes anything.
++3. **Energy.** A row of point lights at increasing distance behind focus: discs get larger *and
++   dimmer* with distance; no disc is a flat grey plate; the splat sprites sit on halos of
++   matching brightness with `Highlight Gain` near 1 (report the value that looked right).
++4. **Occlusion.** A blurred foreground object edge over a sharp background: the edge is
++   translucent in proportion to the blur, no hard cut, no dark halo; a sharp foreground over a
++   blurred background keeps a clean edge.
++5. **Sharp zone.** Focus peaking overlay on: pixels the peaking marks are native-sharp in the
++   final frame (compare a 400 % crop with DOF off).
++6. **Spherical aberration.** +1: far-side discs show a bright rim, near-side discs soft; −1 the
++   reverse; sprites, gather halos and ghosts all agree.
++7. **Everything else still works** with the lens model on: mask ∩ iris, mask rotation, cat-eye
++   (corners), coma / astigmatism, axial CA rim, field curvature, edge softness, anamorphic oval,
++   ghosts, halation and streaks untouched, TrackView tracks still animate the DOF parameters.
++8. **Performance.** RenderDoc at 1080p, same scene as the 0.09 ms measurement: the whole DOF
++   within +0.05 ms of the stock-path cost.
++
++## 7. Docs
++
++README: "Depth Of Field" group table gains `Lens Model DOF`; "Lens" gains `Spherical Aberration`;
++"Depth of field and bokeh" section rewritten around the thin lens (the `Focus Falloff` and `Blur
++amount` subsections become "stock path only"). ConsoleReference: the four new cvars. This spec
++listed with the others. English only.
++
++## 8. Build, deploy, commit
++
++Bundled CMake, targets `CryRenderD3D11` → `CinematicCamera` (no `CryPhoneTracker` change
++expected), 0 error / 0 warning outside `Code/SDKs`. Deploy the DLLs and `DepthOfField.cfx` to the
++usual runtime locations (HANDOVER.md); if a DLL is locked, leave the built binaries in place and
++say so — never kill the engine. Commit on `dof3` per reviewed step; do not touch `dev`; do not
++run `sync.ps1` (that happens after the user's verification and the merge).
+-- 
+2.47.1.windows.1
+

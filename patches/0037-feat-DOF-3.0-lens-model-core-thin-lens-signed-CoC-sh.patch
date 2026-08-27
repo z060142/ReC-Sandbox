@@ -1,0 +1,964 @@
+From c4e8b4b779da7770066d60bdf13c164c79708499 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Thu, 27 Aug 2026 06:21:37 +0800
+Subject: [PATCH 37/44] feat: DOF 3.0 lens-model core - thin-lens signed CoC,
+ shared pupil function with spherical-aberration apodization, energy-weighted
+ scatter-as-gather with pupil-fraction near alpha, natively sharp composite;
+ %_RT_SAMPLE2 permutation, stock path untouched
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01A72MFkdSczncE7au9UVnmu
+---
+ .../Common/PostProcess/PostEffects.cpp        |   7 +
+ .../Common/PostProcess/PostEffects.h          |  18 ++
+ .../RenderDll/Common/RendererCVars.cpp        |  37 ++-
+ .../RenderDll/Common/RendererCVars.h          |   4 +
+ .../GraphicsPipeline/DepthOfField.cpp         | 170 +++++++++-
+ .../GraphicsPipeline/DepthOfField.h           |   8 +-
+ .../RenderDll/XRenderD3D9/PostProcessDOF.cpp  |  10 +
+ .../Shaders/HWScripts/CryFX/DepthOfField.cfx  | 293 +++++++++++++++++-
+ 8 files changed, 518 insertions(+), 29 deletions(-)
+
+diff --git a/Code/CryEngine/RenderDll/Common/PostProcess/PostEffects.cpp b/Code/CryEngine/RenderDll/Common/PostProcess/PostEffects.cpp
+index 79dea23f..ada7390f 100644
+--- a/Code/CryEngine/RenderDll/Common/PostProcess/PostEffects.cpp
++++ b/Code/CryEngine/RenderDll/Common/PostProcess/PostEffects.cpp
+@@ -119,6 +119,13 @@ void CDepthOfField::Reset(bool bOnSpecChange)
+ 	m_pUserEdgeSoftness->ResetParam(0.0f);
+ 	m_pUserAxialChromatic->ResetParam(0.0f);
+ 
++	// Lens model off by default: a reset puts the engine back on the stock depth of field, which
++	// is the state every consumer other than the cinematic camera expects to find.
++	m_pUserLensModel->ResetParam(0.0f);
++	m_pUserLensFocal->ResetParam(50.0f);
++	m_pUserSensorWidth->ResetParam(36.0f);
++	m_pUserSphericalAberration->ResetParam(0.0f);
++
+ 	m_pUserGhostAmount->ResetParam(0.0f);
+ 	m_pUserGhostCount->ResetParam(3.0f);
+ 	m_pUserGhostSpread->ResetParam(1.0f);
+diff --git a/Code/CryEngine/RenderDll/Common/PostProcess/PostEffects.h b/Code/CryEngine/RenderDll/Common/PostProcess/PostEffects.h
+index a0cbb895..c0a4137c 100644
+--- a/Code/CryEngine/RenderDll/Common/PostProcess/PostEffects.h
++++ b/Code/CryEngine/RenderDll/Common/PostProcess/PostEffects.h
+@@ -144,6 +144,7 @@ private:
+ struct SDepthOfFieldParams
+ {
+ 	SDepthOfFieldParams() : bGameMode(false), pMaskTex(0), pBokehShapeTex(0), fMaskBlendAmount(0.0f), fApertureBlades(8.0f), fApertureFNumber(8.0f), fBladeRotation(0.0f), fBladeCurvature(0.4f), fMaskFNumber(2.0f), fMaskRotation(0.0f), fHighlightThreshold(2.0f), fHighlightGain(3.0f), fAnamorphicSqueeze(1.0f), fCatEye(0.0f), fPupilScale(1.0f), fComa(0.0f), fAstigmatism(0.0f), fFieldCurvature(0.0f), fEdgeSoftness(0.0f), fAxialChromatic(0.0f)
++		, bLensModel(false), fLensFocalMM(50.0f), fSensorWidthMM(36.0f), fSphericalAberration(0.0f)
+ 		, fGhostAmount(0.0f), nGhostCount(3), fGhostSpread(1.0f), fGhostSize(1.0f), fGhostThreshold(8.0f), fGhostHueSpread(0.3f), vGhostTint(0.6f, 0.8f, 1.0f, 0.0f)
+ 	{
+ 	};
+@@ -168,6 +169,15 @@ struct SDepthOfFieldParams
+ 	float     fEdgeSoftness;       //!< 0..1 residual off-axis aberration blur, applied as a far-layer circle of confusion floor that grows with the square of the field height and of the pupil radius, so it is strongest wide open and gone stopped down.
+ 	float     fAxialChromatic;     //!< 0..1 longitudinal chromatic aberration. Each wavelength focuses at its own distance, so the out-of-focus disc has a different size per channel: behind focus red and blue shrink and leave a green rim, in front of it green shrinks and leaves a magenta one. Unlike the lateral kind this is a focus error, so it is as strong in the centre as at the edges.
+ 
++	// Lens model (DofLensModelSpec.md). The cinematic camera asks for the depth of field to be
++	// driven by the thin lens itself rather than by the engine's focus-range ramp; everything
++	// below is what a thin lens needs and the stock path has never had. Nothing else in the
++	// engine sets bLensModel, so with the component off the renderer takes the stock branches.
++	bool      bLensModel;          //!< The component requested the lens model. Gated again by r_DepthOfFieldLensModel.
++	float     fLensFocalMM;        //!< Effective focal length in mm, breathing and servo zoom included.
++	float     fSensorWidthMM;      //!< Sensor width in mm - what maps the circle of confusion from the sensor onto the frame.
++	float     fSphericalAberration; //!< -1..1 intensity profile across the pupil. Positive: bright-rimmed discs behind focus, soft ones in front (over-corrected, soap bubble). Negative: the reverse, the STF / DC apodized look. 0 = a flat disc.
++
+ 	// Internal reflection ghosts. Drawn by the sprite bokeh's own pixel shader, so they inherit
+ 	// the iris polygon, the shape mask and every pupil effect above without asking for any of
+ 	// it - a ghost IS an image of the aperture. See LensGhostSpec.md.
+@@ -229,6 +239,10 @@ public:
+ 		AddParamFloatNoTransition("Dof_User_FieldCurvature", m_pUserFieldCurvature, 0.0f);
+ 		AddParamFloatNoTransition("Dof_User_EdgeSoftness", m_pUserEdgeSoftness, 0.0f);
+ 		AddParamFloatNoTransition("Dof_User_AxialChromatic", m_pUserAxialChromatic, 0.0f);
++		AddParamFloatNoTransition("Dof_User_LensModel", m_pUserLensModel, 0.0f);
++		AddParamFloatNoTransition("Dof_User_LensFocal", m_pUserLensFocal, 50.0f);
++		AddParamFloatNoTransition("Dof_User_SensorWidth", m_pUserSensorWidth, 36.0f);
++		AddParamFloatNoTransition("Dof_User_SphericalAberration", m_pUserSphericalAberration, 0.0f);
+ 		AddParamFloatNoTransition("Dof_User_GhostAmount", m_pUserGhostAmount, 0.0f);
+ 		AddParamFloatNoTransition("Dof_User_GhostCount", m_pUserGhostCount, 3.0f);
+ 		AddParamFloatNoTransition("Dof_User_GhostSpread", m_pUserGhostSpread, 1.0f);
+@@ -300,6 +314,10 @@ private:
+ 	// float: axial chromatic aberration. Not a field effect at all - it is a per-channel focus
+ 	// error, so it lives on its own rather than on the field vector. See AxialChromaticSpec.md.
+ 	CEffectParam* m_pUserAxialChromatic;
++	// float x4: the lens model (DofLensModelSpec.md). The switch plus the three quantities a
++	// thin lens needs that the stock focus-range path never carried - focal length, sensor
++	// width, and the spherical aberration only a shared pupil function can express.
++	CEffectParam* m_pUserLensModel, * m_pUserLensFocal, * m_pUserSensorWidth, * m_pUserSphericalAberration;
+ 	// float x6 + Vec4: internal reflection ghosts. Re-use the sprite bokeh splat pass rather
+ 	// than a pass of their own, so they live with the depth of field parameters even though
+ 	// nothing about them depends on focus. See LensGhostSpec.md.
+diff --git a/Code/CryEngine/RenderDll/Common/RendererCVars.cpp b/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
+index cd995006..52e0eb3c 100644
+--- a/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
++++ b/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
+@@ -408,6 +408,10 @@ float CRendererCVars::CV_r_DofSpriteBokehFadeCoC;
+ float CRendererCVars::CV_r_DofCatEyeBarrel;
+ float CRendererCVars::CV_r_DofCatEyeReach;
+ int CRendererCVars::CV_r_DofFieldDebug;
++int CRendererCVars::CV_r_DofLensModel;
++float CRendererCVars::CV_r_DofLensModelMaxCoC;
++float CRendererCVars::CV_r_DofLensModelSplatMaxCoC;
++int CRendererCVars::CV_r_DofLensModelDebug;
+ 
+ //AllocateConstIntCVar(CRendererCVars, CV_r_measureoverdraw);
+ AllocateConstIntCVar(CRendererCVars, CV_r_printmemoryleaks);
+@@ -1563,7 +1567,7 @@ void CRendererCVars::InitCVars()
+ 	               "2 = reserved for native-resolution GATHER as well (currently behaves as 1; "
+ 	               "the gather still runs on the shared half-resolution target chain).");
+ 	REGISTER_CVAR3("r_DepthOfFieldSpriteBokehFadeCoC", CV_r_DofSpriteBokehFadeCoC, 1.0f, VF_NULL,
+-	               "Circle of confusion (gather units, ~16 px of disc diameter per unit at 1080p) at which "
++	               "Circle of confusion (gather units, 4 px of disc RADIUS per unit at 1080p) at which "
+ 	               "the hybrid sprite bokeh splats reach full strength; they fade in from one third of "
+ 	               "this value and are skipped below it. The gather's own halo loses energy as a highlight "
+ 	               "approaches focus while an energy-conserving splat only gets brighter, so without this "
+@@ -1587,6 +1591,37 @@ void CRendererCVars::InitCVars()
+ 	               "picture with the pupil transmission T as a grey ramp, which is exactly the "
+ 	               "mechanical light loss the vignette applies (white = full pupil, black = "
+ 	               "fully clipped). 0 = off (default).");
++	REGISTER_CVAR3("r_DepthOfFieldLensModel", CV_r_DofLensModel, 1, VF_NULL,
++	               "Kill switch for the LENS MODEL depth of field (DofLensModelSpec.md), which drives "
++	               "focus and blur from the thin lens itself - focal length, f-number, focus distance "
++	               "and sensor - instead of the engine's focus-range ramp, weights the gather by the "
++	               "energy each tap actually scatters here, and leaves the depth of field natively "
++	               "sharp. It is a separate shader permutation that ONLY runs when the Cinematic "
++	               "Camera component asks for it (Lens Model DOF). 1 = honour the request (default), "
++	               "0 = ignore it and always take the stock path, which is then byte for byte the "
++	               "engine's own depth of field.");
++	REGISTER_CVAR3("r_DepthOfFieldLensModelMaxCoC", CV_r_DofLensModelMaxCoC, 4.0f, VF_NULL,
++	               "Largest circle of confusion the lens-model GATHER will form, in gather units "
++	               "(~4 px of disc radius per unit at 1080p). Not an optical quantity: the gather has "
++	               "49 taps at half resolution and cannot resolve a disc of any size, so beyond this "
++	               "the physical blur is clipped and the sprite splats carry the rest. Raising it "
++	               "gives larger discs at the cost of sparser sampling (ringing, holes); the second "
++	               "gather iteration fills the small ones. Default 4.0, the stock kernel's own reach.");
++	REGISTER_CVAR3("r_DepthOfFieldLensModelSplatMaxCoC", CV_r_DofLensModelSplatMaxCoC, 256.0f, VF_NULL,
++	               "Largest bokeh sprite the lens-model splat will draw, in native pixels. A sprite is "
++	               "an EXACT evaluation of the pupil rather than a sparse sample of it, so a big disc "
++	               "costs fill rate and nothing else - hence far above the gather's cap. A very bright "
++	               "point far out of focus therefore shows the gather's clipped halo plus a larger, "
++	               "fainter exact disc; if that reads wrong, lower this or raise "
++	               "r_DepthOfFieldLensModelMaxCoC. Default 256 (the stock path is fixed at 64).");
++	REGISTER_CVAR3("r_DepthOfFieldLensModelDebug", CV_r_DofLensModelDebug, 0, VF_NULL,
++	               "DIAGNOSTIC for the lens model. 1 = log the UNCAPPED circle of confusion the thin "
++	               "lens is asking for once a second (so the clipping against "
++	               "r_DepthOfFieldLensModelMaxCoC is visible as a number), and paint the composite as "
++	               "a false-colour map: red = how much of the far layer replaced the frame, green = "
++	               "the frame the lens says is sharp, blue = the near layer's pupil opacity. "
++	               "0 = off (default).");
++
+ 	REGISTER_CVAR3("r_MotionBlurShutterSpeed", CV_r_MotionBlurShutterSpeed, 250.0f, 0,
+ 	               "Sets camera exposure time for motion blur as 1/x seconds.\n"
+ 	               "Default: 250 (1/250 of a second)");
+diff --git a/Code/CryEngine/RenderDll/Common/RendererCVars.h b/Code/CryEngine/RenderDll/Common/RendererCVars.h
+index c7ca9b3b..76c1cbec 100644
+--- a/Code/CryEngine/RenderDll/Common/RendererCVars.h
++++ b/Code/CryEngine/RenderDll/Common/RendererCVars.h
+@@ -403,6 +403,10 @@ public:
+ 	static float CV_r_DofCatEyeBarrel;
+ 	static float CV_r_DofCatEyeReach;
+ 	static int   CV_r_DofFieldDebug;
++	static int   CV_r_DofLensModel;
++	static float CV_r_DofLensModelMaxCoC;
++	static float CV_r_DofLensModelSplatMaxCoC;
++	static int   CV_r_DofLensModelDebug;
+ 	DeclareStaticConstIntCVar(CV_r_nohwgamma, 2);
+ 	DeclareStaticConstIntCVar(CV_r_wireframe, 0);
+ 	DeclareStaticConstIntCVar(CV_r_printmemoryleaks, 0);
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DepthOfField.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DepthOfField.cpp
+index 07115fc1..3b52d7fb 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DepthOfField.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DepthOfField.cpp
+@@ -406,6 +406,105 @@ void CDepthOfFieldStage::Execute()
+ 	// the sprite can never disagree on where the coloured rim starts.
+ 	const Vec4 vAxialChromatic(ResolveAxialChromaticScale(dofParams.fAxialChromatic), 0.0f, 0.0f, 0.0f);
+ 
++	// ---------------------------------------------------------------------------------------
++	// Lens model (DofLensModelSpec.md). The component asks; the cvar may refuse; the request is
++	// already restricted to the user path, where a focal length exists. When this is false not
++	// one line below changes and every technique runs its stock permutation.
++	// ---------------------------------------------------------------------------------------
++	const bool bLensModel = (CRenderer::CV_r_DofLensModel != 0) && dofParams.bLensModel;
++
++	// The circle of confusion in the gather's own units, as one constant.
++	//
++	//   c_mm(d) = f^2 / (N * (d_f - f)) * (d - d_f) / d      signed DIAMETER on the sensor
++	//   c_px    = c_mm * W_px / W_sensor_mm
++	//   r_unit  = 0.5 * c_px / U                             U = native px of RADIUS per unit
++	//
++	// so r_unit = K * (d - d_f) / d with everything else folded into K once per frame. U is not
++	// a choice: it is what DofPS's own tap scale works out to, and the splat sizes itself from
++	// the same number, so anything else would put the sprite and the halo at different sizes.
++	//
++	// N is the GEOMETRIC aperture - the smaller of the two holes light actually passes, iris or
++	// shape mask - exactly as the component's GetGeometricAperture() resolves it, because a
++	// mask in front of the lens shrinks the disc just as an iris does.
++	// -1 = nothing logged yet, 0 = last logged OFF, 1 = last logged ON. One line per transition.
++	static int s_nLastLensState = -1;
++	Vec4 vDofLensModel(0.0f, 0.0f, 0.0f, 0.0f);
++	float fLensGatherCap = max(CRenderer::CV_r_DofLensModelMaxCoC, 0.05f);
++	float fLensSplatCap = max(CRenderer::CV_r_DofLensModelSplatMaxCoC, 1.0f);
++	const float fLensKsa = clamp_tpl(dofParams.fSphericalAberration, -1.0f, 1.0f);
++	if (bLensModel)
++	{
++		const float fFrameW = (float)m_graphicsPipelineResources.m_pTexHDRTarget->GetWidth();
++		const float fFrameH = (float)m_graphicsPipelineResources.m_pTexHDRTarget->GetHeight();
++		const float fUnitPx = 4.0f * max(fFrameW / 1920.0f, fFrameH / 1080.0f);
++
++		const float f_m = max(dofParams.fLensFocalMM, 1.0f) * 0.001f;
++		const bool  bMaskAperture = CTexture::IsTextureExist(dofParams.pBokehShapeTex);
++		const float fNGeo = max(bMaskAperture ? max(dofParams.fApertureFNumber, dofParams.fMaskFNumber)
++		                                      : dofParams.fApertureFNumber, 0.7f);
++		// Focusing AT the focal length is the lens imaging infinity onto the sensor; closer than
++		// that has no image at all, so the denominator is floored rather than allowed to flip.
++		const float d_f = max(vFocus.z, 1.01f * f_m);
++		const float fSensorW = max(dofParams.fSensorWidthMM, 1.0f);
++
++		// 1000 turns the metres of f^2 / (d_f - f) into the millimetres the sensor is measured in.
++		const float K = 0.5f * (f_m * f_m * 1000.0f) * fFrameW / (fNGeo * (d_f - f_m) * fSensorW * fUnitPx);
++
++		// The cap's sign is the debug flag: a kernel reach is positive by construction, so its
++		// sign is the one free bit in a constant that has no free lane left.
++		vDofLensModel = Vec4(K, d_f, (CRenderer::CV_r_DofLensModelDebug > 0) ? -fLensGatherCap : fLensGatherCap, fLensKsa);
++
++		// One line per change, plus the uncapped reach at a one-second beat while the diagnostic
++		// is on: K IS the far circle of confusion at infinity, so it says directly how far past
++		// the kernel cap the physical lens is asking to go.
++		static float s_lastFocal = -1.0f, s_lastN = -1.0f, s_lastFocus = -1.0f, s_lastSensor = -1.0f, s_lastKsa = -2.0f;
++		if (s_nLastLensState != 1 || fabsf(dofParams.fLensFocalMM - s_lastFocal) > 0.05f ||
++		    fabsf(fNGeo - s_lastN) > 0.005f || fabsf(d_f - s_lastFocus) > 0.005f ||
++		    fabsf(fSensorW - s_lastSensor) > 0.005f || fabsf(fLensKsa - s_lastKsa) > 0.005f)
++		{
++			s_nLastLensState = 1;
++			s_lastFocal = dofParams.fLensFocalMM;
++			s_lastN = fNGeo;
++			s_lastFocus = d_f;
++			s_lastSensor = fSensorW;
++			s_lastKsa = fLensKsa;
++			CryLog("[DOF] lens model ON (f=%.1fmm N=%.2f df=%.2fm sensor=%.1fmm sa=%.2f K=%.2f units cap=%.2f)",
++			       dofParams.fLensFocalMM, fNGeo, d_f, fSensorW, fLensKsa, K, fLensGatherCap);
++		}
++		if (CRenderer::CV_r_DofLensModelDebug > 0)
++		{
++			static CTimeValue s_lastCoCLog;
++			const CTimeValue now = gEnv->pTimer->GetAsyncTime();
++			if ((now - s_lastCoCLog).GetSeconds() >= 1.0f)
++			{
++				s_lastCoCLog = now;
++				// Near side sampled at half the focus distance, which is where a foreground
++				// object usually sits; the far side at infinity, which is its own maximum.
++				const float dNear = max(d_f * 0.5f, 0.01f);
++				CryLog("[DOF] lens model uncapped CoC: far(inf)=%.2f near(%.2fm)=%.2f units, cap=%.2f (%.0f%% clipped at infinity)",
++				       K, dNear, K * (d_f - dNear) / dNear, fLensGatherCap,
++				       100.0f * max(0.0f, 1.0f - fLensGatherCap / max(K, 1e-4f)));
++			}
++		}
++	}
++	else
++	{
++		if (s_nLastLensState == 1)
++		{
++			s_nLastLensState = 0;
++			CryLog("[DOF] lens model OFF");
++		}
++		// Even off, the spherical aberration reaches the splat and the ghosts: it is a property
++		// of the glass, and EvalPupilShape applies it in both permutations (at 0 it is exactly
++		// 1, so the stock look is unchanged).
++		vDofLensModel = Vec4(0.0f, 0.0f, fLensGatherCap, fLensKsa);
++	}
++
++	// The runtime flag every lens-mode permutation is selected by. %_RT_SAMPLE0 is the second
++	// gather iteration and %_RT_SAMPLE1 the splat's depth dilation, so SAMPLE2 is the first free
++	// bit in this shader.
++	const uint64 nLensRTMask = bLensModel ? g_HWSR_MaskBit[HWSR_SAMPLE2] : 0;
++
+ 	// Once per change, never per frame: these four user values reach the shaders as derived
+ 	// numbers, so the log prints both sides of the derivation.
+ 	{
+@@ -473,6 +572,7 @@ void CDepthOfFieldStage::Execute()
+ 	static CCryNameR dofFieldPupilName("vDofFieldPupil");
+ 	static CCryNameR dofFieldPupil2Name("vDofFieldPupil2");
+ 	static CCryNameR dofAxialChromaticName("vDofAxialChromatic");
++	static CCryNameR dofLensModelName("vDofLensModel");
+ 
+ 	// TODO: Compute shader! because the targets are not compressed / able anyway, and we can half resource allocation)
+ 	{
+@@ -480,11 +580,15 @@ void CDepthOfFieldStage::Execute()
+ 		{
+ 			PROFILE_LABEL_SCOPE("DOWNSCALE LAYERS");
+ 
+-			if (m_passLayerDownscale.IsDirty())
++			// The lens model is a technique FLAG, and a flag change does not make the pass dirty
++			// by itself - the variadic IsDirty is how a pass tracks an input of its own, so
++			// toggling Lens Model DOF at runtime re-selects the permutation instead of leaving
++			// the previously compiled one bound.
++			if (m_passLayerDownscale.IsDirty(nLensRTMask))
+ 			{
+ 				static CCryNameTSCRC techNameDownscale("DownscaleDof");
+ 				m_passLayerDownscale.SetPrimitiveFlags(CRenderPrimitive::eFlags_ReflectShaderConstants_PS);
+-				m_passLayerDownscale.SetTechnique(pShader, techNameDownscale, 0);
++				m_passLayerDownscale.SetTechnique(pShader, techNameDownscale, nLensRTMask);
+ 				m_passLayerDownscale.SetRenderTarget(0, m_graphicsPipelineResources.m_pTexHDRTargetMaskedScaled[0][0]);  // Near
+ 				m_passLayerDownscale.SetRenderTarget(1, m_graphicsPipelineResources.m_pTexHDRTargetMaskedScaled[0][1]);  // Far
+ 				m_passLayerDownscale.SetRenderTarget(2, m_graphicsPipelineResources.m_pTexSceneCoC[0]);      // CoC Near/Far
+@@ -502,6 +606,9 @@ void CDepthOfFieldStage::Execute()
+ 			// none of the pupil lanes. Everything downstream (tile min/max, splat sizing) is
+ 			// built from this output, so bending focus here bends it for every consumer.
+ 			m_passLayerDownscale.SetConstant(dofFieldPupil2Name, vFieldPupil2, eHWSC_Pixel);
++			// The thin lens itself. Set unconditionally so the constant can never be stale in
++			// the frame the permutation switches on.
++			m_passLayerDownscale.SetConstant(dofLensModelName, vDofLensModel, eHWSC_Pixel);
+ 			m_passLayerDownscale.Execute();
+ 		}
+ 
+@@ -555,12 +662,12 @@ void CDepthOfFieldStage::Execute()
+ 
+ 			PROFILE_LABEL_SCOPE("FAR/NEAR LAYER");
+ 
+-			if (m_passGather0.IsDirty())
++			if (m_passGather0.IsDirty(nLensRTMask))
+ 			{
+ 				static CCryNameTSCRC techDOF("Dof");
+ 				m_passGather0.SetPrimitiveFlags(CRenderPrimitive::eFlags_ReflectShaderConstants_PS);
+ 				m_passGather0.SetPrimitiveType(CRenderPrimitive::ePrim_ProceduralTriangle);
+-				m_passGather0.SetTechnique(pShader, techDOF, 0);
++				m_passGather0.SetTechnique(pShader, techDOF, nLensRTMask);
+ 				m_passGather0.SetRenderTarget(0, m_graphicsPipelineResources.m_pTexHDRTargetMaskedScaled[0][2]);
+ 				m_passGather0.SetRenderTarget(1, m_graphicsPipelineResources.m_pTexHDRTargetMaskedScaled[0][3]);
+ 				m_passGather0.SetRenderTarget(2, m_graphicsPipelineResources.m_pTexSceneCoCTemp);
+@@ -583,6 +690,7 @@ void CDepthOfFieldStage::Execute()
+ 			m_passGather0.SetConstant(dofFieldPupilName, vFieldPupil, eHWSC_Pixel);
+ 			m_passGather0.SetConstant(dofFieldPupil2Name, vFieldPupil2, eHWSC_Pixel);
+ 			m_passGather0.SetConstant(dofAxialChromaticName, vAxialChromatic, eHWSC_Pixel);
++			m_passGather0.SetConstant(dofLensModelName, vDofLensModel, eHWSC_Pixel);
+ 			m_passGather0.Execute();
+ 		}
+ 
+@@ -611,12 +719,15 @@ void CDepthOfFieldStage::Execute()
+ 
+ 			PROFILE_LABEL_SCOPE("FAR/NEAR LAYER ITERATION");
+ 
+-			if (m_passGather1.IsDirty())
++			if (m_passGather1.IsDirty(nLensRTMask))
+ 			{
+ 				static CCryNameTSCRC techDOF("Dof");
+ 				m_passGather1.SetPrimitiveFlags(CRenderPrimitive::eFlags_ReflectShaderConstants_PS);
+ 				m_passGather1.SetPrimitiveType(CRenderPrimitive::ePrim_ProceduralTriangle);
+-				m_passGather1.SetTechnique(pShader, techDOF, g_HWSR_MaskBit[HWSR_SAMPLE0]);
++				// The second iteration is a hole-filling dilate in BOTH modes - it is not an
++				// energy step - but it still needs the flag so its splat cap and its circle of
++				// confusion conventions match the first pass.
++				m_passGather1.SetTechnique(pShader, techDOF, g_HWSR_MaskBit[HWSR_SAMPLE0] | nLensRTMask);
+ 				m_passGather1.SetRenderTarget(0, m_graphicsPipelineResources.m_pTexHDRTargetMaskedScaled[0][0]);
+ 				m_passGather1.SetRenderTarget(1, m_graphicsPipelineResources.m_pTexHDRTargetMaskedScaled[0][1]);
+ 				m_passGather1.SetRenderTarget(2, m_graphicsPipelineResources.m_pTexSceneCoC[0]);
+@@ -639,6 +750,7 @@ void CDepthOfFieldStage::Execute()
+ 			m_passGather1.SetConstant(dofFieldPupilName, vFieldPupil, eHWSC_Pixel);
+ 			m_passGather1.SetConstant(dofFieldPupil2Name, vFieldPupil2, eHWSC_Pixel);
+ 			m_passGather1.SetConstant(dofAxialChromaticName, vAxialChromatic, eHWSC_Pixel);
++			m_passGather1.SetConstant(dofLensModelName, vDofLensModel, eHWSC_Pixel);
+ 			m_passGather1.Execute();
+ 		}
+ 
+@@ -646,12 +758,12 @@ void CDepthOfFieldStage::Execute()
+ 		{
+ 			PROFILE_LABEL_SCOPE("COMPOSITE");
+ 
+-			if (m_passComposition.IsDirty())
++			if (m_passComposition.IsDirty(nLensRTMask))
+ 			{
+ 				static CCryNameTSCRC techCompositeDof("CompositeDof");
+ 				m_passComposition.SetPrimitiveFlags(CRenderPrimitive::eFlags_ReflectShaderConstants_PS);
+ 				m_passComposition.SetPrimitiveType(CRenderPrimitive::ePrim_ProceduralTriangle);
+-				m_passComposition.SetTechnique(pShader, techCompositeDof, 0);
++				m_passComposition.SetTechnique(pShader, techCompositeDof, nLensRTMask);
+ 				m_passComposition.SetRenderTarget(0, m_graphicsPipelineResources.m_pTexHDRTarget);
+ 				m_passComposition.SetState(GS_NODEPTHTEST);
+ 
+@@ -674,6 +786,7 @@ void CDepthOfFieldStage::Execute()
+ 			// alpha and has to bend focus with exactly the same numbers, or the blended alpha
+ 			// disagrees with the layer it is blending.
+ 			m_passComposition.SetConstant(dofFieldPupil2Name, vFieldPupil2, eHWSC_Pixel);
++			m_passComposition.SetConstant(dofLensModelName, vDofLensModel, eHWSC_Pixel);
+ 			m_passComposition.Execute();
+ 		}
+ 	}
+@@ -689,7 +802,10 @@ void CDepthOfFieldStage::Execute()
+ 	const bool bSplat = (CRenderer::CV_r_DofMode == 0);
+ 	const bool bGhost = (dofParams.fGhostAmount > 0.001f);
+ 	if (bSplat || bGhost)
+-		ExecuteSplatLayers(dofParams, vDofParams0, vDofParams1, fNumApertureSides, fIrisExponent, bSplat, bGhost);
++	{
++		ExecuteSplatLayers(dofParams, vDofParams0, vDofParams1, fNumApertureSides, fIrisExponent, bSplat, bGhost,
++		                   bLensModel, vDofLensModel, fLensSplatCap, vFieldPupil2);
++	}
+ 
+ 	m_bWroteHDRTarget = true;
+ }
+@@ -782,8 +898,17 @@ static Vec3 RotateHueAroundGrey(const Vec3& c, float fAngleRad)
+ // that sharing is the whole reason the two live in one function.
+ //////////////////////////////////////////////////////////////////////////////////////////////////
+ void CDepthOfFieldStage::ExecuteSplatLayers(const SDepthOfFieldParams& dofParams, const Vec4& vDofParams0, const Vec4& vDofParams1,
+-                                            float fNumApertureSides, float fIrisExponent, bool bSplat, bool bGhost)
++                                            float fNumApertureSides, float fIrisExponent, bool bSplat, bool bGhost,
++                                            bool bLensModel, const Vec4& vLensModel, float fSplatCapPx,
++                                            const Vec4& vGatherFieldPupil2)
+ {
++	// Two views of one constant. The splat and the ghost draws never form a circle of confusion
++	// (they read the gather's), so their .z lane carries the SPRITE's own size cap in native
++	// pixels; the overlay pass does form one - it has to mask the far splats by exactly the
++	// sharpness the composite blended the far layer with - so it takes the gather's copy
++	// unchanged, debug sign included.
++	const Vec4 vSpriteLensModel(0.0f, 0.0f, fSplatCapPx, vLensModel.w);
++	const Vec4& vLensOverlay = vLensModel;
+ 	PROFILE_LABEL_SCOPE("HYBRID BOKEH SPLATS");
+ 
+ 	CShader* pShader = CShaderMan::s_shPostDepthOfField;
+@@ -945,6 +1070,7 @@ void CDepthOfFieldStage::ExecuteSplatLayers(const SDepthOfFieldParams& dofParams
+ 	static CCryNameR dofFieldPupilName("vDofFieldPupil");
+ 	static CCryNameR dofFieldPupil2Name("vDofFieldPupil2");
+ 	static CCryNameR dofAxialChromaticName("vDofAxialChromatic");
++	static CCryNameR dofLensModelName("vDofLensModel");
+ 
+ 	// Ground truth log, once per change: what the splat grid and the iris actually resolve to.
+ 	{
+@@ -1009,7 +1135,12 @@ void CDepthOfFieldStage::ExecuteSplatLayers(const SDepthOfFieldParams& dofParams
+ 		m_passSpriteSplat.BeginAddingPrimitives();
+ 
+ 		static CCryNameTSCRC techSpriteBokeh("DofBokehRef");
+-		const uint64 rtMask = (CRenderer::CV_r_dofDilation > 0.001f) ? g_HWSR_MaskBit[HWSR_SAMPLE1] : 0;
++		// SAMPLE1 = depth dilation, SAMPLE2 = lens model. Independent bits: the splat's lens-mode
++		// permutation only changes how big a sprite is allowed to get and how the circle of
++		// confusion it reads is clamped, so it composes with the dilation as it stands.
++		uint64 rtMask = (CRenderer::CV_r_dofDilation > 0.001f) ? g_HWSR_MaskBit[HWSR_SAMPLE1] : 0;
++		if (bLensModel)
++			rtMask |= g_HWSR_MaskBit[HWSR_SAMPLE2];
+ 
+ 		CRenderPrimitive& prim = m_spriteSplatPrimitive;
+ 		prim.SetFlags(CRenderPrimitive::eFlags_ReflectShaderConstants_VS | CRenderPrimitive::eFlags_ReflectShaderConstants_PS);
+@@ -1059,6 +1190,10 @@ void CDepthOfFieldStage::ExecuteSplatLayers(const SDepthOfFieldParams& dofParams
+ 			constantManager.SetNamedConstant(dofFieldPupil2Name, vFieldPupil2, eHWSC_Vertex);
+ 			constantManager.SetNamedConstant(dofFieldPupil2Name, vFieldPupil2, eHWSC_Pixel);
+ 			constantManager.SetNamedConstant(dofAxialChromaticName, vAxialChromatic, eHWSC_Pixel);
++			// Vertex: the sprite's own size cap. Pixel: the spherical-aberration apodization,
++			// which EvalPupilShape applies in both permutations (at 0 it is exactly 1).
++			constantManager.SetNamedConstant(dofLensModelName, vSpriteLensModel, eHWSC_Vertex);
++			constantManager.SetNamedConstant(dofLensModelName, vSpriteLensModel, eHWSC_Pixel);
+ 			constantManager.EndNamedConstantUpdate(&viewport, m_graphicsPipeline.GetCurrentRenderView());
+ 
+ 			m_passSpriteSplat.AddPrimitive(&prim);
+@@ -1199,6 +1334,9 @@ void CDepthOfFieldStage::ExecuteSplatLayers(const SDepthOfFieldParams& dofParams
+ 			constantManager.SetNamedConstant(dofFieldPupilName, vFieldPupil, eHWSC_Pixel);
+ 			constantManager.SetNamedConstant(dofFieldPupil2Name, vFieldPupil2, eHWSC_Pixel);
+ 			constantManager.SetNamedConstant(dofAxialChromaticName, vAxialChromatic, eHWSC_Pixel);
++			// A ghost is an image of the aperture drawn by the splat's own pixel shader, so it
++			// inherits the apodization along with everything else that shapes the pupil.
++			constantManager.SetNamedConstant(dofLensModelName, vSpriteLensModel, eHWSC_Pixel);
+ 			constantManager.EndNamedConstantUpdate(&ghostVP, m_graphicsPipeline.GetCurrentRenderView());
+ 
+ 			m_passGhostSplat.AddPrimitive(&ghostPrim);
+@@ -1234,12 +1372,13 @@ void CDepthOfFieldStage::ExecuteSplatLayers(const SDepthOfFieldParams& dofParams
+ 	{
+ 		PROFILE_LABEL_SCOPE("SPLAT OVERLAY");
+ 
+-		if (m_passSpriteComposition.IsDirty())
++		const uint64 nOverlayRTMask = bLensModel ? g_HWSR_MaskBit[HWSR_SAMPLE2] : 0;
++		if (m_passSpriteComposition.IsDirty(nOverlayRTMask))
+ 		{
+ 			static CCryNameTSCRC techSpriteCompose("RefDofMbNormalizePass");
+ 			m_passSpriteComposition.SetPrimitiveFlags(CRenderPrimitive::eFlags_ReflectShaderConstants_PS);
+ 			m_passSpriteComposition.SetPrimitiveType(CRenderPrimitive::ePrim_ProceduralTriangle);
+-			m_passSpriteComposition.SetTechnique(pShader, techSpriteCompose, 0);
++			m_passSpriteComposition.SetTechnique(pShader, techSpriteCompose, nOverlayRTMask);
+ 			m_passSpriteComposition.SetRenderTarget(0, m_graphicsPipelineResources.m_pTexHDRTarget);
+ 			// Additive overlay: the HDR target already holds the gathered frame, and the splat
+ 			// layer only carries the extra highlight energy that has to be added on top of it.
+@@ -1258,6 +1397,11 @@ void CDepthOfFieldStage::ExecuteSplatLayers(const SDepthOfFieldParams& dofParams
+ 		m_passSpriteComposition.BeginConstantUpdate();
+ 		m_passSpriteComposition.SetConstant(dofFocusParam0Name, vDofParams0, eHWSC_Pixel);
+ 		m_passSpriteComposition.SetConstant(dofFocusParam1Name, vDofParams1, eHWSC_Pixel);
++		m_passSpriteComposition.SetConstant(dofLensModelName, vLensOverlay, eHWSC_Pixel);
++		// The GATHER's copy: the overlay's far mask has to agree with the composite's far blend
++		// down to the field curvature and the edge softness floor, which the splat's own copy of
++		// this constant deliberately does not carry.
++		m_passSpriteComposition.SetConstant(dofFieldPupil2Name, vGatherFieldPupil2, eHWSC_Pixel);
+ 		m_passSpriteComposition.Execute();
+ 	}
+ }
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DepthOfField.h b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DepthOfField.h
+index 25cd29c3..e9720b23 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DepthOfField.h
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DepthOfField.h
+@@ -60,8 +60,14 @@ private:
+ 	// (bSplat, r_DepthOfFieldMode 0) and the internal reflection ghosts (bGhost, amount > 0).
+ 	// One pass, because the two draw the SAME object through the same pixel shader - an image
+ 	// of the aperture - so every constant describing the pupil is resolved once and shared.
++	// bLensModel / vLensModel / fSplatCapPx / vGatherFieldPupil2: the lens model
++	// (DofLensModelSpec.md) resolved once in Execute(). The sprite draws take their own cap and
++	// the spherical-aberration lane; the overlay pass takes the gather's whole constant, because
++	// it has to mask the far splats with exactly the sharpness the composite used.
+ 	void ExecuteSplatLayers(const SDepthOfFieldParams& dofParams, const Vec4& vDofParams0, const Vec4& vDofParams1,
+-	                        float blades, float shapeExponent, bool bSplat, bool bGhost);
++	                        float blades, float shapeExponent, bool bSplat, bool bGhost,
++	                        bool bLensModel, const Vec4& vLensModel, float fSplatCapPx,
++	                        const Vec4& vGatherFieldPupil2);
+ 
+ 	// Mask gather kernel: CDFs importance-sampling the PUPIL (mask x iris disc of radius
+ 	// fIrisRadius in mask units, 1 = the mask's bounding circle, >= 1.5 = no clipping), built on
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/PostProcessDOF.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/PostProcessDOF.cpp
+index d79e66fc..23e10a7b 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/PostProcessDOF.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/PostProcessDOF.cpp
+@@ -132,6 +132,16 @@ SDepthOfFieldParams CDepthOfField::GetParams()
+ 	// clamped here with the rest so the stage can trust its range without re-checking.
+ 	pParams.fAxialChromatic = clamp_tpl(m_pUserAxialChromatic->GetParam(), 0.0f, 1.0f);
+ 
++	// Lens model (DofLensModelSpec.md). Only a request: the stage decides, and refuses it
++	// outright on the time-of-day path, where there is no focal length to build a lens from.
++	// Only ever on the USER path (the branch the cinematic camera drives): the gameplay and the
++	// time-of-day branches author a focus RANGE and a blur amount and carry no focal length at
++	// all, so there is nothing there to build a thin lens out of.
++	pParams.bLensModel = m_pUserLensModel->GetParam() > 0.5f && !bGameDof && m_pUserActive->GetParam() != 0.0f;
++	pParams.fLensFocalMM = clamp_tpl(m_pUserLensFocal->GetParam(), 1.0f, 2400.0f);
++	pParams.fSensorWidthMM = clamp_tpl(m_pUserSensorWidth->GetParam(), 1.0f, 200.0f);
++	pParams.fSphericalAberration = clamp_tpl(m_pUserSphericalAberration->GetParam(), -1.0f, 1.0f);
++
+ 	// Internal reflection ghosts. Clamped here like everything else so the stage can size and
+ 	// place the chain without re-checking ranges; the count is a float on the wire because the
+ 	// post parameter system has no integer channel.
+diff --git a/Engine/Shaders/HWScripts/CryFX/DepthOfField.cfx b/Engine/Shaders/HWScripts/CryFX/DepthOfField.cfx
+index 408cea5b..b2df57a9 100644
+--- a/Engine/Shaders/HWScripts/CryFX/DepthOfField.cfx
++++ b/Engine/Shaders/HWScripts/CryFX/DepthOfField.cfx
+@@ -88,6 +88,124 @@ float LensFieldRadius2(float2 tc)
+ }
+ 
+ 
++/////////////////////////////////////////////////////////////////////////////////////////////////
++// Lens model (DofLensModelSpec.md), %_RT_SAMPLE2. Everything below is dead code in the stock
++// permutation: the cinematic camera asks for the lens model explicitly, and with it off the
++// engine is an ordinary CRYENGINE down to the instruction.
++/////////////////////////////////////////////////////////////////////////////////////////////////
++
++// The gather-side passes (downscale, gather, composite, splat overlay) read:
++//   x = K, the thin-lens constant, so that the SIGNED circle of confusion radius in gather
++//       units is simply K * (d - d_f) / d. Positive = behind focus, negative = in front.
++//   y = d_f, the focus distance in metres.
++//   z = the circle of confusion cap in gather units (r_DepthOfFieldLensModelMaxCoC), NEGATED
++//       when r_DepthOfFieldLensModelDebug is on - a cap is a positive quantity by construction,
++//       so its sign is a free flag and costs no lane in a constant that has none to spare.
++// The SPLAT and the GHOST draws never form a circle of confusion themselves (they read the
++// gather's own CoC texture), so for those two passes x and y are unused and z carries the
++// SPLAT's own cap in native pixels instead.
++//   w = k_sa, spherical aberration. The one lane every consumer reads the same way.
++float4 vDofLensModel;
++
++// Thin lens, signed, in the gather's existing CoC units. This is the whole point of the round:
++// a real lens has no "focus range" and no quadratic ramp - the blur is fixed by focal length,
++// f-number, focus distance and sensor size, and the near/far split falls out of the SIGN of the
++// defocus rather than out of two independently authored ramps.
++//
++// The lens flaws fold in exactly where they do on the stock path, because they are the same
++// physical statements: field curvature bends the object distance BEFORE the lens sees it, edge
++// softness is a residual far-side blur floor after it, and the minimum-Z near blur is a camera
++// BODY effect that must not be bent by the curved focal surface.
++void LensModelCoC(in float4 depths, in float fFieldR2, out float4 nearCoC, out float4 farCoC)
++{
++	// Petzval field curvature: same depth scale, same meaning as the stock path.
++	const float4 depthsF = max(depths * (1.0 + vDofFieldPupil2.z * fFieldR2), 1e-4);
++
++	// c_px / 2 / U, folded into K on the CPU: the sensor, the frame width and the unit size are
++	// all constants of the frame, so the per-pixel cost of the thin lens is one divide.
++	const float4 vSigned = vDofLensModel.x * (depthsF - vDofLensModel.y) / depthsF;
++
++	// Body near-clip blur on the RAW depth, as on the stock path.
++	const float4 FocusRangeNearMin = vDofParamsFocus1.y * saturate(1 - (depths / vDofParamsFocus1.x));
++
++	farCoC  = max(vSigned, 0.0);
++	nearCoC = max(-vSigned, 0.0) + FocusRangeNearMin;
++
++	farCoC = max(farCoC, 0.00001);
++	// Residual off-axis aberration blur, unchanged in meaning: a far-layer floor, so a soft edge
++	// blends behind the near layer instead of washing over the sharp centre.
++	farCoC = max(farCoC, vDofFieldPupil2.w * fFieldR2);
++
++	// Kernel reach cap. Not a lens property at all - the gather has 49 taps and cannot resolve a
++	// disc of any size - so the user owns it by cvar and the splat carries what it clips off.
++	const float fCap = abs(vDofLensModel.z);
++	farCoC  = clamp(farCoC,  0, fCap);
++	nearCoC = clamp(nearCoC, 0, fCap);
++}
++
++// Native pixels of disc RADIUS per unit of circle of confusion. This is not a choice: it is
++// what DofPS's own tap scale works out to (PS_ScreenSize.zw = 0.5 / size, times two, times the
++// 1080-referenced scale), so anything that wants to know how big the gather's disc really is on
++// screen has to use exactly this. Evaluated with the FULL resolution screen size.
++float LensCoCUnitPixels(float2 vScreenSize)
++{
++	return 4.0 * max(vScreenSize.x / 1920.0, vScreenSize.y / 1080.0);
++}
++
++// How much of the frame the far layer is allowed to replace. Zero until the disc exceeds one
++// pixel and complete by two: inside the depth of field the composite must hand back the NATIVE
++// frame, or a half-resolution blur is lerped over pixels that the lens says are sharp - which is
++// exactly why the stock focus zone never reads sharp.
++float LensFarBlend(float fFarCoC, float2 vScreenSize)
++{
++	return saturate((fFarCoC * LensCoCUnitPixels(vScreenSize) - 0.5) / 1.5);
++}
++
++// Spherical aberration as a pupil APODIZATION: the rays through the rim of the pupil focus at a
++// different distance from the ones through its centre, so on one side of focus the disc piles
++// its light up at the rim and on the other it smears it into the middle. w(r) = 1 + side*k*(2r^2-1)
++// integrates to zero over the unit disc, so the disc's total energy is unchanged to first order
++// and no normalisation has to follow it. side = +1 behind focus, -1 in front.
++// k > 0: bright-rimmed behind focus, soft in front (over-corrected, "soap bubble").
++// k < 0: the reverse - the STF / DC apodized look. 0 = a flat disc, exactly what it was.
++float LensApodize(float fR2, float fSide)
++{
++	return clamp(1.0 + fSide * vDofLensModel.w * (2.0 * fR2 - 1.0), 0.05, 2.0);
++}
++
++// The pupil, as a single function of a point in pupil space (unit disc = the wide-open geometric
++// pupil). Returns rgb = the per-channel transmittance x intensity profile, a = the same thing
++// without the per-channel mask - the lane the layer's own circle of confusion is averaged by.
++//
++// It carries the terms that are pure arithmetic and therefore identical for every consumer: the
++// mechanical barrel clip, the axial chromatic per-channel radius, and the apodization above. The
++// two terms that need a RESOURCE rather than arithmetic - the iris polygon and the shape mask -
++// are not in here because each consumer already owns them in the only form it can afford: the
++// gather has them baked into the DISTRIBUTION of its taps (CPU-side polygon mapping, or
++// importance sampling of the mask texture), the splat evaluates them per pixel from the texture
++// it has bound. Putting them here would double count on one side and cost a texture binding on
++// the other. Coma and astigmatism are coordinate transforms and belong outside a pupil function
++// by definition - they say where a ray lands, not whether it exists.
++float4 LensPupil(float2 x, float2 vBarrelC, float fSide, float fAxialS)
++{
++	const float fR2 = dot(x, x);
++
++	// The aperture: this ray only exists if it clears the mechanical opening. Soft edged so the
++	// clipped silhouette does not alias from one tap to the next.
++	const float fBarrel = saturate((vDofFieldPupil.y - length(x - vBarrelC)) / 0.08 + 0.5);
++	const float fBase = fBarrel * LensApodize(fR2, fSide);
++
++	// Per-channel disc: the short-focusing pair simply does not accept rays outside its own,
++	// smaller radius. Behind focus that pair is red and blue and the rim left over reads green;
++	// in front of focus it is green and the rim reads magenta. One-sided and outward, so at
++	// s = 1 every point of the unit pupil masks to exactly 1.
++	const float m = saturate((fAxialS - length(x)) / 0.08 + 1);
++	const float3 vChannel = (fSide > 0.0) ? float3(m, 1, m) : float3(1, m, 1);
++
++	return float4(fBase * vChannel, fBase);
++}
++
++
+ /////////////////////////////////////////////////////////////////////////////////////////////////
+ // Sprite-Based DOF
+ /////////////////////////////////////////////////////////////////////////////////////////////////
+@@ -175,13 +293,28 @@ v2fBokehQuad DofBokehRefVS(uint nVertexID : SV_VertexID)
+ 	// / max (near) and its tile dilation. Recomputing from a different depth source put the two
+ 	// a little apart at every edge, and that read as the splat lagging the halo.
+ 	const half2 vCocGather = GetTexture2DLod(texDofBkRef_CoC, ssDofBkRef_SceneDepth, float4(screenProj.xy, 0, 0)).rg;
++#if %_RT_SAMPLE2
++	// Lens mode: the gather already clamped its circle of confusion to the user's kernel cap, so
++	// a second hard clamp at 4 here would silently cut the sprite back to the stock kernel's
++	// reach - the one number the splat exists to exceed.
++	half fCocNear = max(vCocGather.r, 0);
++	half fCocFar  = max(vCocGather.g, 0);
++#else
+ 	half fCocNear = clamp(vCocGather.r, 0, 4);
+ 	half fCocFar  = clamp(vCocGather.g, 0, 4);
++#endif
+ 
+ 	// DofPS turns a CoC into a tap radius with this scale; doubling it gives the diameter.
+ 	const half fCocScalePixels = max(g_VS_ScreenSize.x / 1920.0, g_VS_ScreenSize.y / 1080.0) * 4.0;
+ 	half fDepthBlur = max(fCocFar, fCocNear) * 2.0 * fCocScalePixels;
++#if %_RT_SAMPLE2
++	// A sprite is an EXACT evaluation of the pupil, not a sparse sample of it, so a large disc
++	// costs fill rate and nothing else - the 64 px ceiling only ever existed to bound a sprite
++	// that had to agree with a 4-unit gather. r_DepthOfFieldLensModelSplatMaxCoC owns it now.
++	fDepthBlur = min(vDofLensModel.z, fDepthBlur);
++#else
+ 	fDepthBlur = min(64, fDepthBlur);
++#endif
+ 
+ 	// Amplitude in step with the gather. The gather's halo loses energy as a highlight nears
+ 	// focus (its taps are weighted by CoC), while an energy-conserving splat only gets
+@@ -313,7 +446,9 @@ v2fBokehQuad DofBokehRefVS(uint nVertexID : SV_VertexID)
+ // that focuses short draws the very same pupil, only smaller. tcQuad is the quad-local
+ // coordinate already brought back to pupil units and walked back through the aberrations;
+ // vBarrelC is the barrel's apparent centre and fIrisExp the lod-driven iris falloff exponent.
+-half4 EvalPupilShape(half2 tcQuad, float2 vBarrelC, half fIrisExp)
++// fSide is +1 behind focus and -1 in front, which is all the spherical-aberration apodization
++// needs to know: it is the same function of pupil radius on both sides of focus, turned over.
++half4 EvalPupilShape(half2 tcQuad, float2 vBarrelC, half fIrisExp, half fSide)
+ {
+ 	const half fLen = dot(tcQuad, tcQuad);
+ 
+@@ -357,7 +492,11 @@ half4 EvalPupilShape(half2 tcQuad, float2 vBarrelC, half fIrisExp)
+ 
+ 	// The fill style follows whichever hole is the smaller one (weight resolved on the CPU
+ 	// from N_mask / N); the geometry above is exact in both.
+-	return lerp(cIrisLook, cMaskLook, vDofBokehMask.x);
++	// Spherical aberration rides on top of all of it as an intensity profile across the pupil -
++	// not a silhouette change, so it multiplies whatever shape the pupil turned out to be, star
++	// or disc alike, and the ghosts (which share this function) inherit it. At k_sa = 0 the
++	// factor is exactly 1, so this is a no-op on the stock path.
++	return lerp(cIrisLook, cMaskLook, vDofBokehMask.x) * (half)LensApodize(fLen, fSide);
+ }
+ 
+ pixoutDofMRT DofBokehRefPS(v2fBokehQuad IN)
+@@ -377,13 +516,14 @@ pixoutDofMRT DofBokehRefPS(v2fBokehQuad IN)
+ 	// Undefined at the exact frame centre, where every field term vanishes anyway.
+ 	const float2 vFieldU = (fFieldR > 1e-4) ? (IN.Field.xy / fFieldR) : float2(1, 0);
+ 	const float2 vFieldT = float2(-vFieldU.y, vFieldU.x);
++	// Near and far layers sit on opposite sides of focus, so their astigmatic ellipses are
++	// each other turned by 90 degrees. QuadPos.z is the near/far split the vertex shader
++	// resolved from the CoC. Hoisted out of the block below because the spherical-aberration
++	// apodization is turned over by the very same split - one side of focus, one sign.
++	const float fAstigSign = (IN.QuadPos.z > 0.5) ? -1.0 : 1.0;
+ 	{
+ 		tcQuad *= (half)IN.Field.w;
+ 
+-		// Near and far layers sit on opposite sides of focus, so their astigmatic ellipses are
+-		// each other turned by 90 degrees. QuadPos.z is the near/far split the vertex shader
+-		// resolved from the CoC.
+-		const float fAstigSign = (IN.QuadPos.z > 0.5) ? -1.0 : 1.0;
+ 		const float a = fAstigSign * vDofFieldPupil.w * fFieldR * fFieldR;
+ 		float2 x = vFieldU * (dot(tcQuad, vFieldU) / (1 + a)) + vFieldT * (dot(tcQuad, vFieldT) / (1 - a));
+ 
+@@ -412,8 +552,10 @@ pixoutDofMRT DofBokehRefPS(v2fBokehQuad IN)
+ 	// disc is correspondingly brighter - the same energy through a smaller circle. At s = 1
+ 	// the two evaluations are identical and this reduces to the single deposit it replaced.
+ 	const half fAxialS = (half)max(vDofAxialChromatic.x, 0.05);
+-	const half4 cFull   = EvalPupilShape(tcQuad, vBarrelC, (half)IN.Color.w);
+-	const half4 cShrunk = EvalPupilShape(tcQuad / fAxialS, vBarrelC, (half)IN.Color.w) / (fAxialS * fAxialS);
++	// Same near/far split the astigmatic ellipse uses - a sprite lands on one side of focus.
++	const half fApodSide = (half)fAstigSign;
++	const half4 cFull   = EvalPupilShape(tcQuad, vBarrelC, (half)IN.Color.w, fApodSide);
++	const half4 cShrunk = EvalPupilShape(tcQuad / fAxialS, vBarrelC, (half)IN.Color.w, fApodSide) / (fAxialS * fAxialS);
+ 
+ 	// Behind focus red and blue are the short-focusing pair, so the rim beyond their discs is
+ 	// green alone; in front of focus it is green that shrinks and the rim reads magenta. Which
+@@ -644,9 +786,17 @@ pixout RefDofMBNormalizePS(vtxOut IN)
+ 	// DESTINATION pixel is, which is what stops a distant highlight bleeding over an in-focus
+ 	// object standing in front of it. Foreground splats are added unmasked - an out of focus
+ 	// foreground highlight is supposed to wash over whatever is behind it.
++#if %_RT_SAMPLE2
++	// Lens mode: mask the far splats by exactly the sharpness the composite blended the far
++	// LAYER with, or the sprite and the halo under it disagree about where the focus zone ends.
++	float4 vLensNear, vLensFar;
++	LensModelCoC(fDepth.xxxx, LensFieldRadius2(IN.baseTC.xy), vLensNear, vLensFar);
++	const half fFarMask = (half)LensFarBlend(vLensFar.x, PS_ScreenSize.xy);
++#else
+ 	half4 vFocusRanges = saturate( half4(fDepth.xxxx ) * vDofParamsFocus0.xzxz + vDofParamsFocus0.ywyw );
+ 	vFocusRanges.x *= vFocusRanges.x;
+ 	const half fFarMask = saturate( vFocusRanges.x * vDofParamsFocus1.w );
++#endif
+ 
+ 	OUT.Color = float4(cLayerNear.rgb + cLayerFar.rgb * fFarMask, 0);
+ 
+@@ -824,7 +974,11 @@ OutDownscaleDof DownscaleDofPS(vtxOutDownscaleDof IN)
+ 	OUT.LayerFar = OUT.LayerNear; 
+ 
+ 	float4 vCocNear, vCocFar;
++#if %_RT_SAMPLE2
++	LensModelCoC(depths, LensFieldRadius2(IN.tc2.xy), vCocNear, vCocFar);
++#else
+ 	ComputeCircleOfConfusion(depths, LensFieldRadius2(IN.tc2.xy), vCocNear, vCocFar);
++#endif
+ 
+ 	OUT.LayerNear.a = max(vCocNear.x, vCocNear.y);
+ 	OUT.LayerNear.a = max(OUT.LayerNear.a, vCocNear.z);
+@@ -835,14 +989,27 @@ OutDownscaleDof DownscaleDofPS(vtxOutDownscaleDof IN)
+ 	OUT.LayerFar.a = min(OUT.LayerFar.a, vCocFar.w);
+ 
+ 	OUT.CocNearFar = float2(OUT.LayerNear.a, OUT.LayerFar.a);
+-	
++
++#if %_RT_SAMPLE2
++	// Lens mode keeps the near layer's alpha as the TRUE circle of confusion, unsaturated: the
++	// energy gather below needs to know how far each tap's own disc reaches, and a foreground
++	// two units out of focus is not the same tap as one at ten. Nothing downstream wants the
++	// clamped version any more - the near layer's opacity is computed from the pupil instead
++	// (spec 3.3) and the composite reads that.
++	//
++	// And no premultiply by the CoC. That multiply was the stock proxy for "how much of this
++	// pixel's light actually reaches its neighbours", which is precisely the coverage term the
++	// gather now computes per tap; doing both would darken every disc by its own radius twice.
++	// The layers therefore carry STRAIGHT colour and the composite does not unpremultiply.
++#else
+ 	// Clamp for proper masking later (avoids "super strong" edges on very blurry foreground objects).
+ 	OUT.LayerNear.a = saturate(OUT.LayerNear.a);
+ 
+ 	// Scale with CoC to avoid leaking of sharper details.
+ 	OUT.LayerFar.rgb *= (OUT.LayerFar.a);
+ 	OUT.LayerNear.rgb *= (OUT.LayerNear.a);
+-	
++#endif
++
+ 	return OUT;
+ }
+ 
+@@ -997,8 +1164,18 @@ pixout_dof DofPS(vtxOut IN)
+ 	float4 caccFar = 0;
+ #endif
+ 
++#if %_RT_SAMPLE2 && !%_RT_SAMPLE0 && !%_RT_SAMPLE1
++	// Near-layer opacity, spec 3.3: the pupil-weighted fraction of the rays arriving at this
++	// pixel that came off the FOREGROUND. In a uniformly blurred foreground every ray does and
++	// it is 1; at the edge of a blurred foreground over a sharp background it falls off as the
++	// true fraction of the pupil that still sees the object - which is what partial occlusion
++	// physically is, rather than the heuristic the stock path approximates it with.
++	float fNearAlphaNum = 0;
++	float fNearAlphaDen = 0;
++#endif
++
+ 	const float2 vMinTileCoC = (GetTexture2DLod(DOF_CoCM, DOF_PCSamp, float4(IN.baseTC.xy, 0, 0)).rg);
+-	
++
+ 	// note - on nvidia getting better perf with single branch outside loops. on amd the oposite
+ 
+ 	[branch] if (vMinTileCoC.r>0.0)
+@@ -1035,11 +1212,48 @@ pixout_dof DofPS(vtxOut IN)
+ 			// is a property of the aperture, like the barrel clip, not of the deformation.
+ 			// One-sided and outward, so at s = 1 every tap of the unit pupil masks to exactly 1.
+ 			const float mn = saturate((fAxialS - length(x)) / 0.08 + 1);
++#if !%_RT_SAMPLE2
+ 			cn.rgb *= float3(1, mn, 1);
++#endif
+ 
+ #if %_RT_SAMPLE0 || %_RT_SAMPLE1
+ 			// The max path ignores wn entirely, so the clip has to reach the colour itself.
+ 			cAccNear = max(cAccNear, cn * clipW);
++#elif %_RT_SAMPLE2
++			// Scatter-as-gather. Each tap is a POINT that threw a disc of its own; this pixel
++			// gets a share of that point's light only if the disc actually reaches here
++			// (coverage), and the share is the point's light divided by the area it was spread
++			// over (density). That single change is what makes a bright point dim as it goes
++			// further out of focus instead of staying a flat plate, and it is what lets the
++			// splat be a refinement of the same quantity rather than a second energy system.
++			{
++				// The tap's distance from this pixel, in the same units its CoC is expressed
++				// in - measured on the SQUEEZED offset, because that is where it really landed.
++				const float fTapR = vMinTileCoC.r * length(float2(xn.x / fSqueezeS, xn.y));
++				const float fTapCoC = cn.w;
++				// Soft over a quarter unit (~1 px): a hard coverage test aliases into rings.
++				const float fCov = saturate((fTapCoC - fTapR) / 0.25 + 0.5);
++				const float fCocD = max(fTapCoC, 0.125);
++				const float fDens = 1.0 / (fCocD * fCocD);
++				// The near LAYER is the image formed by foreground points, and by nothing else.
++				// Without this the sharp background sitting one tap away - whose own disc is
++				// tiny, so its density is enormous - would dominate the layer's colour, and the
++				// foreground would then be composited over the background as a picture OF the
++				// background: a blurred edge that spills nothing.
++				const float fIsNear = (fTapCoC > 0.01) ? 1.0 : 0.0;
++				const float4 vPupil = LensPupil(x, vBarrelC, -1.0, fAxialS);
++				const float4 wLens = (fCov * fIsNear * fDens) * vPupil;
++
++				cAccNear += float4(cn.rgb * wLens.rgb, cn.w * wLens.a);
++				caccNear += wLens;
++
++				// Opacity: the pupil-weighted fraction of the rays arriving here that came off
++				// the foreground. The denominator is the WHOLE pupil, including the rays that
++				// saw past the object - those are exactly what makes a blurred edge translucent
++				// rather than a hard cut.
++				fNearAlphaNum += fCov * fIsNear * vPupil.a;
++				fNearAlphaDen += vPupil.a;
++			}
+ #else
+ 			cAccNear += cn*wn;
+ 			caccNear += wn * float4(1, mn, 1, 1);
+@@ -1071,10 +1285,29 @@ pixout_dof DofPS(vtxOut IN)
+ 			// smaller disc and green alone survives at the rim - the green fringe of fast and
+ 			// vintage glass. Alpha is left alone: it is the circle of confusion, not light.
+ 			const float mf = saturate((fAxialS - length(x)) / 0.08 + 1);
++#if !%_RT_SAMPLE2
+ 			cf.rgb *= float3(mf, 1, mf);
++#endif
+ 
+ #if %_RT_SAMPLE0 || %_RT_SAMPLE1
+ 			cAccFar = max(cAccFar, cf*wf);
++#elif %_RT_SAMPLE2
++			// Same energy weights as the near loop, on the far side of focus. The reach here is
++			// the CENTRE pixel's own circle of confusion rather than a tile maximum (spec 5):
++			// a background disc therefore cannot spill over a LESS blurred background
++			// neighbour, which is the one honest limitation of doing this as a gather.
++			{
++				const float fTapR = fCocFar * length(float2(xf.x / fSqueezeS, xf.y));
++				const float fTapCoC = cf.w;
++				const float fCov = saturate((fTapCoC - fTapR) / 0.25 + 0.5);
++				const float fCocD = max(fTapCoC, 0.125);
++				const float fDens = 1.0 / (fCocD * fCocD);
++				const float4 vPupil = LensPupil(x, vBarrelC, 1.0, fAxialS);
++				const float4 wLens = (fCov * fDens) * vPupil;
++
++				cAccFar += float4(cf.rgb * wLens.rgb, cf.w * wLens.a);
++				caccFar += wLens;
++			}
+ #else
+ 			cAccFar += cf*wf;
+ 			caccFar += wf * float4(mf, 1, mf, 1);
+@@ -1089,6 +1322,13 @@ pixout_dof DofPS(vtxOut IN)
+ 	// no longer share a weight.
+ 	cAccNear = (caccNear > 0) ? cAccNear / max(caccNear, 1e-6) : cCenterTapNear;
+ 	cAccFar = (caccFar > 0) ? cAccFar / max(caccFar, 1e-6) : cCenterTapFar;
++#if %_RT_SAMPLE2
++	// The near layer's alpha is no longer a circle of confusion at all in lens mode - it is the
++	// fraction of the pupil that saw the foreground, i.e. exactly what the composite should
++	// blend this layer over the rest of the frame with. The far layer keeps its CoC, because
++	// the composite forms the far blend from the pixel's own depth instead.
++	cAccNear.a = (fNearAlphaDen > 1e-6) ? saturate(fNearAlphaNum / fNearAlphaDen) : 0.0;
++#endif
+ #endif
+ 
+ 	OUT.LayerNear = cAccNear;
+@@ -1128,9 +1368,33 @@ pixout CompositeDofPS(vtxOut IN)
+ 	half4 cLayerNear = tex2D_bicubic(CDOF_HDRDoF0, CDOF_LCSamp, IN.baseTC.xy, PS_ScreenSize.xy *0.5);
+ 	half4 cLayerFar = tex2D_bicubic(CDOF_HDRDoF1, CDOF_LCSamp, IN.baseTC.xy, PS_ScreenSize.xy *0.5);
+ 	
+-	float depth = GetTexture2D(CDOF_Depth, CDOF_PCSamp, IN.baseTC.xy).x * PS_NearFarClipDist.y; 
+-	
++	float depth = GetTexture2D(CDOF_Depth, CDOF_PCSamp, IN.baseTC.xy).x * PS_NearFarClipDist.y;
++
+ 	float4 nearCoC, farCoC;
++#if %_RT_SAMPLE2
++	LensModelCoC(depth.xxxx, LensFieldRadius2(IN.baseTC.xy), nearCoC, farCoC);
++
++	// Sharp where the lens is sharp. The layers are half resolution, so ANY amount of them
++	// blended over an in-focus pixel costs it its native detail - the stock saturate(CoC) ramp
++	// starts eating the picture the moment the circle of confusion leaves zero, which is why
++	// the focus zone never read sharp. Hold the frame until the disc is bigger than the pixel
++	// it is supposed to be blurring, then hand over within another pixel and a half.
++	const half fFarBlend = (half)LensFarBlend(farCoC.x, PS_ScreenSize.xy);
++	// Straight colour on both layers: the downscale did not premultiply and the gather divided
++	// by its own weight, so there is nothing to undo here.
++	const half fNearBlend = saturate(cLayerNear.a);
++
++	OUT.Color = lerp(cScene, cLayerFar, fFarBlend);
++	OUT.Color = lerp(OUT.Color, cLayerNear, fNearBlend);
++
++	// DIAGNOSTIC (r_DepthOfFieldLensModelDebug, flagged by a negative cap): green = the frame
++	// the lens says is sharp, red = how much of the far layer replaced it, blue = the near
++	// layer's pupil opacity. If focus, the far ramp and the occlusion disagree, this shows it.
++	if (vDofLensModel.z < 0)
++		OUT.Color = float4(fFarBlend, saturate(1 - fFarBlend - fNearBlend), fNearBlend, 1);
++
++	return OUT;
++#else
+ 	ComputeCircleOfConfusion(depth.xxxx, LensFieldRadius2(IN.baseTC.xy), nearCoC, farCoC);
+ 
+ 	cLayerFar.rgb /= cLayerFar.a > 0 ? cLayerFar.a : 1.0f;
+@@ -1141,8 +1405,9 @@ pixout CompositeDofPS(vtxOut IN)
+ 	
+ 	OUT.Color = lerp(cScene, cLayerFar, cLayerFar.a);
+ 	OUT.Color = lerp(OUT.Color, cLayerNear, cLayerNear.a);
+-	
++
+ 	return OUT;
++#endif
+ }
+ 
+ technique CompositeDof
+-- 
+2.47.1.windows.1
+

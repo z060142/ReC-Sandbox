@@ -1,0 +1,410 @@
+From bc6e297c9235d3b7ac12adcde64a38808dc4ddc3 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Thu, 27 Aug 2026 10:08:01 +0800
+Subject: [PATCH 44/44] fix: lens ghosts composite after the glare family
+ extracts its sources, so ghosts no longer throw their own streaks, flares and
+ filter stars
+
+---
+ .../GraphicsPipeline/DepthOfField.cpp         | 124 +++++++++++++++++-
+ .../GraphicsPipeline/DepthOfField.h           |  37 +++++-
+ .../StandardGraphicsPipeline.cpp              |   9 ++
+ .../CinematicCamera/LensGhostSpec.md          |  36 ++++-
+ Code/CryPlugins/CinematicCamera/README.md     |   7 +-
+ .../Shaders/HWScripts/CryFX/DepthOfField.cfx  |  30 ++++-
+ 6 files changed, 227 insertions(+), 16 deletions(-)
+
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DepthOfField.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DepthOfField.cpp
+index 84fe0cd6..9da5a023 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DepthOfField.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DepthOfField.cpp
+@@ -1014,10 +1014,100 @@ void CDepthOfFieldStage::ReleaseSplatLayers()
+ 	m_splatLayerHeight = 0;
+ }
+ 
++// The ghost layer. Same size and format as the splat layers - the ghost draws are rasterized at
++// native layer resolution, so anything smaller would only cost the discs their edges - but its
++// own allocation, because it must survive past the splat overlay: it is added to the frame after
++// the glare family has taken its light sources, not with the splats.
++bool CDepthOfFieldStage::AcquireGhostLayer(int width, int height)
++{
++	if (width <= 0 || height <= 0)
++		return false;
++
++	if (m_pTexGhostLayer && m_ghostLayerWidth == width && m_ghostLayerHeight == height)
++		return true;
++
++	ReleaseGhostLayer();
++
++	const uint32 flags = FT_NOMIPS | FT_DONT_STREAM | FT_USAGE_RENDERTARGET;
++	const std::string name = "$DofGhostLayer" + m_graphicsPipeline.GetUniqueIdentifierName();
++
++	m_pTexGhostLayer = CTexture::GetOrCreateRenderTarget(name.c_str(), width, height, Clr_Transparent, eTT_2D, flags, eTF_R16G16B16A16F);
++
++	if (!CTexture::IsTextureExist(m_pTexGhostLayer))
++	{
++		ReleaseGhostLayer();
++		return false;
++	}
++
++	m_ghostLayerWidth = width;
++	m_ghostLayerHeight = height;
++	return true;
++}
++
++void CDepthOfFieldStage::ReleaseGhostLayer()
++{
++	m_pTexGhostLayer.reset();
++	m_ghostLayerWidth = 0;
++	m_ghostLayerHeight = 0;
++	m_bGhostLayerValid = false;
++}
++
+ void CDepthOfFieldStage::Resize(int renderWidth, int renderHeight)
+ {
+ 	// Drop them; the next hybrid frame reallocates at the new size.
+ 	ReleaseSplatLayers();
++	ReleaseGhostLayer();
++}
++
++//////////////////////////////////////////////////////////////////////////////////////////////////
++// Lens ghosts into the frame - the ONE place they reach it (LensGhostSpec.md, section 3.4).
++//
++// The pipeline calls this after the half and quarter resolution downsamples of the HDR target,
++// i.e. after every thresholded glare source has been extracted (diffraction streaks, the
++// anamorphic flare, the front filter PSF, halation) and after auto exposure has metered, and
++// before the tone map, which is the last reader of the HDR target. A ghost is an image of the
++// aperture formed by a SECOND-order reflection between two lens surfaces; a flare struck off one
++// would be third order, some 1/50 to 1/200 of the ghost, and invisible. So ghosts light nothing:
++// they are laid onto the finished frame and nothing downstream thresholds them.
++//
++// Being here also means they are not motion blurred by the scene's velocities - correct, a ghost
++// is formed in the glass and follows the source, not the geometry behind it - and not depth
++// masked, exactly as before.
++//////////////////////////////////////////////////////////////////////////////////////////////////
++void CDepthOfFieldStage::ExecuteGhostComposite()
++{
++	// Consume-once: whoever calls this ends the frame's ghosts, and a frame in which the DOF
++	// stage never ran (r_dof 0, no focus) leaves the flag false and this a no-op.
++	if (!m_bGhostLayerValid)
++		return;
++
++	m_bGhostLayerValid = false;
++
++	CTexture* pGhostLayer = m_pTexGhostLayer;
++	CTexture* pHDRTarget = m_graphicsPipelineResources.m_pTexHDRTarget;
++	if (!CTexture::IsTextureExist(pGhostLayer) || !CTexture::IsTextureExist(pHDRTarget))
++		return;
++
++	PROFILE_LABEL_SCOPE("LENS GHOST COMPOSITE");
++
++	CShader* pShader = CShaderMan::s_shPostDepthOfField;
++
++	if (m_passGhostComposition.IsDirty())
++	{
++		static CCryNameTSCRC techGhostCompose("DofGhostComposite");
++		m_passGhostComposition.SetPrimitiveType(CRenderPrimitive::ePrim_ProceduralTriangle);
++		m_passGhostComposition.SetTechnique(pShader, techGhostCompose, 0);
++		m_passGhostComposition.SetRenderTarget(0, pHDRTarget);
++		// The layer carries only the energy the ghosts deposited, so it is added, not blended.
++		m_passGhostComposition.SetState(GS_NODEPTHTEST | GS_BLSRC_ONE | GS_BLDST_ONE);
++	}
++
++	// Bound every frame: the layer is lazily allocated and recreated on a resolution change, so
++	// its identity is not stable across the pass's cached state. 1:1 read, point sampled.
++	m_passGhostComposition.SetTextureSamplerPair(0, pGhostLayer, EDefaultSamplerStates::PointClamp);
++
++	m_passGhostComposition.BeginConstantUpdate();
++	m_passGhostComposition.Execute();
+ }
+ 
+ // Rotation of an RGB colour around the grey axis, the standard 3x3 form. Luminance is preserved
+@@ -1271,11 +1361,20 @@ void CDepthOfFieldStage::ExecuteSplatLayers(const SDepthOfFieldParams& dofParams
+ 		}
+ 	}
+ 
+-	// Clear the layers once, before either draw: both accumulate additively into them and the
+-	// overlay composites whatever ends up there without knowing which pass wrote it.
++	// Clear the splat layers once, before the draw: it accumulates additively into them and the
++	// overlay composites whatever ends up there.
+ 	CClearSurfacePass::Execute(pLayerNear, Clr_Transparent);
+ 	CClearSurfacePass::Execute(pLayerFar, Clr_Transparent);
+ 
++	// The ghosts get a layer of their own, cleared on the frames they run. It is NOT part of the
++	// splat overlay: see ExecuteGhostComposite().
++	CTexture* pGhostLayer = nullptr;
++	if (bGhost && AcquireGhostLayer(nLayerWidth, nLayerHeight))
++	{
++		pGhostLayer = m_pTexGhostLayer;
++		CClearSurfacePass::Execute(pGhostLayer, Clr_Transparent);
++	}
++
+ 	if (bSplat && !m_pSpritePerViewCB)
+ 	{
+ 		m_pSpritePerViewCB = gcpRendD3D->m_DevBufMan.CreateConstantBuffer(sizeof(HLSL_PerViewGlobalConstantBuffer));
+@@ -1393,9 +1492,9 @@ void CDepthOfFieldStage::ExecuteSplatLayers(const SDepthOfFieldParams& dofParams
+ 			m_pGhostPerViewCB->SetDebugName("LensGhost Per-View CB");
+ 	}
+ 
+-	// Internal reflection ghosts: one draw per ghost layer into the same near layer, with the
+-	// same pixel shader and the same pupil constants the splat above just resolved.
+-	if (bGhost && m_pGhostPerViewCB)
++	// Internal reflection ghosts: one draw per ghost layer into the dedicated ghost target, with
++	// the same pixel shader and the same pupil constants the splat above just resolved.
++	if (bGhost && pGhostLayer && m_pGhostPerViewCB)
+ 	{
+ 		PROFILE_LABEL_SCOPE("LENS GHOSTS");
+ 
+@@ -1422,7 +1521,10 @@ void CDepthOfFieldStage::ExecuteSplatLayers(const SDepthOfFieldParams& dofParams
+ 		ghostVP.MinDepth = 0.0f;
+ 		ghostVP.MaxDepth = 1.0f;
+ 
+-		m_passGhostSplat.SetRenderTarget(0, pLayerNear);
++		// Target 0 is the ghost layer; DofBokehRefPS is an MRT shader and its far output must
++		// still land somewhere, so the far splat layer keeps that slot - the ghost quads carry
++		// QuadPos.z = 1, so what they write there is exactly zero.
++		m_passGhostSplat.SetRenderTarget(0, pGhostLayer);
+ 		m_passGhostSplat.SetRenderTarget(1, pLayerFar);
+ 		m_passGhostSplat.SetViewport(ghostVP);
+ 		m_passGhostSplat.BeginAddingPrimitives();
+@@ -1520,7 +1622,12 @@ void CDepthOfFieldStage::ExecuteSplatLayers(const SDepthOfFieldParams& dofParams
+ 		}
+ 
+ 		if (nDrawn > 0)
++		{
+ 			m_passGhostSplat.Execute();
++			// Hand the layer to ExecuteGhostComposite(), which the pipeline calls once the glare
++			// family has taken its sources from the HDR target.
++			m_bGhostLayerValid = true;
++		}
+ 
+ 		// Ground truth log, once per change: what the chain actually resolves to.
+ 		{
+@@ -1544,7 +1651,10 @@ void CDepthOfFieldStage::ExecuteSplatLayers(const SDepthOfFieldParams& dofParams
+ 		}
+ 	}
+ 
+-	// Normalize the accumulated layers and composite them over the scene copy
++	// Normalize the accumulated layers and composite them over the scene copy. Only the SPLAT
++	// writes these layers now, so with the splat off (mode 1, ghosts alone) they are empty and
++	// this fullscreen pass would add nothing but its own cost.
++	if (bSplat)
+ 	{
+ 		PROFILE_LABEL_SCOPE("SPLAT OVERLAY");
+ 
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DepthOfField.h b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DepthOfField.h
+index ea8c6614..e8e932a9 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DepthOfField.h
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DepthOfField.h
+@@ -25,6 +25,7 @@ public:
+ 		, m_passGather1(&graphicsPipeline)
+ 		, m_passComposition(&graphicsPipeline)
+ 		, m_passSpriteComposition(&graphicsPipeline)
++		, m_passGhostComposition(&graphicsPipeline)
+ 	{
+ 		for (auto& pass : m_passTileMinCoC)
+ 			pass.SetGraphicsPipeline(&graphicsPipeline);
+@@ -38,6 +39,20 @@ public:
+ 	void Execute();
+ 	void Resize(int renderWidth, int renderHeight) override;
+ 
++	//! Adds this frame's lens ghosts into the HDR target. Deliberately NOT part of Execute():
++	//! a ghost is a second-order internal reflection, so it must not be a light source for the
++	//! glare family (streaks, anamorphic flare, front filter PSF, halation) - a flare off a
++	//! ghost would be third order and invisible. The pipeline therefore calls this AFTER the
++	//! half/quarter resolution downsamples that feed every one of those thresholds, and before
++	//! the tone map, which is the last reader of the HDR target. Consumes the frame's ghost
++	//! layer: a second call, or a frame in which the DOF stage did not run, does nothing.
++	//! See LensGhostSpec.md, "Pipeline placement".
++	void ExecuteGhostComposite();
++
++	//! This frame's lens ghost layer, or null when no ghost was drawn (Amount 0, no source above
++	//! the threshold, or the DOF stage did not run). Full resolution, RGBA16F, additive.
++	CTexture* GetGhostLayer() const { return m_bGhostLayerValid ? m_pTexGhostLayer.get() : nullptr; }
++
+ 	//! True when this frame's Execute() actually composited depth of field into the HDR target.
+ 	//! CMotionBlurStage needs the fact, not a second guess at it: CDepthOfField::GetParams()
+ 	//! advances a temporal smoother on every call, so a second evaluation of the same
+@@ -96,12 +111,19 @@ private:
+ 
+ 	// Internal reflection ghosts (LensGhostSpec.md). Their own primitives and per-view constant
+ 	// buffer: the grid is quarter resolution and every ghost layer is a draw of its own, with
+-	// its own place, size and coating colour. They write into the very same layer targets with
+-	// the same additive state, so the overlay composites them without knowing they exist.
++	// its own place, size and coating colour.
++	//
++	// They used to write into the splat layers, which the overlay adds into the HDR target here
++	// in the DOF stage - and that made every ghost a light source for the glare family, which
++	// thresholds that target afterwards: ghost chains grew their own horizontal flares and
++	// stars. A ghost is already a second-order reflection, so a flare off one is third order
++	// (~1/50 of the ghost) and does not exist. They therefore accumulate into a layer of their
++	// own, which ExecuteGhostComposite() adds to the frame after the glare sources are out.
+ 	static const int     kMaxGhostLayers = 6;
+ 	CPrimitiveRenderPass m_passGhostSplat;
+ 	CRenderPrimitive     m_ghostPrimitives[kMaxGhostLayers];
+ 	CConstantBufferPtr   m_pGhostPerViewCB;
++	CFullscreenPass      m_passGhostComposition;
+ 
+ 	// Splat accumulation layers, at FULL resolution. The quad grid stays half resolution (the
+ 	// vertex count and the source sampling are unchanged), but the discs are rasterized at
+@@ -115,6 +137,17 @@ private:
+ 	bool AcquireSplatLayers(int width, int height);
+ 	void ReleaseSplatLayers();
+ 
++	// The ghost accumulation layer, same size and format as the splat layers but allocated only
++	// on the frames ghosts are actually drawn (Amount 0 costs nothing, and the far more common
++	// splat-only path does not pay for it either).
++	_smart_ptr<CTexture> m_pTexGhostLayer;
++	int                  m_ghostLayerWidth = 0;
++	int                  m_ghostLayerHeight = 0;
++	bool                 m_bGhostLayerValid = false; //!< ghosts were drawn this frame, not yet composited
++
++	bool AcquireGhostLayer(int width, int height);
++	void ReleaseGhostLayer();
++
+ 	// Mask-domain gather kernel state. Built once per texture name from the DDS file itself
+ 	// (the GPU resource has no CPU-side copy); steady state costs one string compare.
+ 	std::vector<float> m_maskRowCDF;    // marginal CDF over rows
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/StandardGraphicsPipeline.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/StandardGraphicsPipeline.cpp
+index 2fbfa615..0c9c39f3 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/StandardGraphicsPipeline.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/StandardGraphicsPipeline.cpp
+@@ -230,6 +230,15 @@ void CStandardGraphicsPipeline::ExecuteHDRPostProcessing()
+ 	if (GetStage<CBloomStage>()->IsStageActive(m_renderingFlags))
+ 		GetStage<CBloomStage>()->Execute();
+ 
++	// Lens ghosts into the HDR target. This is the point, and the reason it is not done inside
++	// the DOF stage: every thresholded glare source (bloom, diffraction streaks, the anamorphic
++	// flare, the front filter PSF, halation) has been taken from the downsampled copies above,
++	// and auto exposure has metered, so a ghost cannot light any of them. A ghost is a
++	// second-order internal reflection; a flare off one would be third order and invisible.
++	// Unconditional, so the ghosts appear with bloom off exactly as with bloom on. See
++	// LensGhostSpec.md, "Pipeline placement".
++	GetStage<CDepthOfFieldStage>()->ExecuteGhostComposite();
++
+ 	// writes m_graphicsPipelineResources.m_pTexSceneTargetR11G11B10F[0]
+ 	if (GetStage<CLensOpticsStage>()->IsStageActive(m_renderingFlags))
+ 		GetStage<CLensOpticsStage>()->Execute();
+diff --git a/Code/CryPlugins/CinematicCamera/LensGhostSpec.md b/Code/CryPlugins/CinematicCamera/LensGhostSpec.md
+index 7f0e2a74..3e7824ea 100644
+--- a/Code/CryPlugins/CinematicCamera/LensGhostSpec.md
++++ b/Code/CryPlugins/CinematicCamera/LensGhostSpec.md
+@@ -42,8 +42,9 @@ surfaces — one base tint, the rest fan out around it), deposited energy-conser
+ disc exactly as a bokeh sprite is (`fSplatNorm` with `QuadPos.w = r_i`, `Field.z`, dither).
+ 
+ Ghosts are formed in the lens, not in the scene: they are NOT depth-masked and NOT blurred by
+-the depth of field. They go into the **near** splat layer (`QuadPos.z = 1`), which the overlay
+-adds unmasked; the far layer is depth-masked against in-focus foreground and would cut them.
++the depth of field. They are drawn as **near** layer quads (`QuadPos.z = 1`), so they are added
++unmasked; the far layer is depth-masked against in-focus foreground and would cut them. They go
++into a layer of their own, composited later — see 3.4.
+ 
+ ## 3. Renderer
+ 
+@@ -51,8 +52,8 @@ adds unmasked; the far layer is depth-masked against in-focus foreground and wou
+ 
+ `ExecuteSpriteBokeh` becomes `ExecuteSplatLayers(bool bSplat, bool bGhost)`: acquire + clear
+ the layers, draw the bokeh splat if `bSplat` (`CV_r_DofMode == 0`, as today), draw the ghost
+-layers if `bGhost` (`fGhostAmount > 0.001`), then the existing overlay composite. `Execute()`
+-calls it when either is true. All the per-frame constants the splat resolves (`vAspectRatio`,
++layers if `bGhost` (`fGhostAmount > 0.001`) into their own target (3.4), then the existing
++overlay composite if `bSplat`. `Execute()` calls it when either is true. All the per-frame constants the splat resolves (`vAspectRatio`,
+ `vDofBokehShape`, `vDofBokehMask/2`, `vDofFieldPupil/2`, `vDofAxialChromatic`, the pupil-fill
+ gain division) are resolved once and shared by both draws — that is the point of the re-use.
+ 
+@@ -106,6 +107,33 @@ like the rest. Hue rotation of the per-layer tints is done on the CPU in the sta
+ 
+ Amount is game-mode + editor-live like the other DOF params (it rides `ApplyDOF`).
+ 
++### 3.4 Pipeline placement
++
++Ghosts do NOT go into the splat layers (the first cut did, and it was wrong). The splat overlay
++runs inside the DOF stage and adds into `$HDRTarget`, which the glare family thresholds
++afterwards for its light sources — so every ghost above the glare threshold grew its own
++diffraction streaks, anamorphic flare and filter star. Physically a ghost is already a
++second-order internal reflection; a flare struck off one is third order, ~1/50–1/200 of the
++ghost, and invisible. **Ghosts are not light sources.**
++
++So the ghost draws accumulate into a dedicated full-resolution RGBA16F layer
++(`$DofGhostLayer`, allocated only on frames ghosts run, cleared each such frame, dropped on
++resize), and `CDepthOfFieldStage::ExecuteGhostComposite()` — a single full-screen
++`GS_BLSRC_ONE | GS_BLDST_ONE` pass, technique `DofGhostComposite` — adds it into
++`$HDRTarget` from `CStandardGraphicsPipeline::ExecuteHDRPostProcessing`, immediately after
++`CBloomStage::Execute()`. That point is after the half- and quarter-resolution downsamples of
++the HDR target, i.e. after every thresholded source has been extracted (bloom, streaks,
++anamorphic flare, front filter PSF, halation) and after auto exposure has metered, and before
++the tone map, which is the last reader of the target. The call is unconditional, so **bloom off
++changes nothing**: the ghosts appear at the same place in the frame either way. Being past
++motion blur is also correct — a ghost is formed in the glass and follows its source, not the
++geometry behind it — and it stays undepth-masked as before.
++
++Consequences, accepted: ghosts are not halated (halation's source is thresholded earlier), do
++not bloom, and do not drive auto exposure. With the sprite splat off (`r_DepthOfFieldMode 1`)
++the splat overlay pass is now skipped entirely — the ghosts no longer need it. Cost: one
++full-screen additive pass on frames with ghosts, nothing at all when `Amount <= 0.001`.
++
+ ## 4. Acceptance
+ 
+ 1. Amount 0: no ghost draw, no cost, frame identical.
+diff --git a/Code/CryPlugins/CinematicCamera/README.md b/Code/CryPlugins/CinematicCamera/README.md
+index 3d3cd802..5171da1b 100644
+--- a/Code/CryPlugins/CinematicCamera/README.md
++++ b/Code/CryPlugins/CinematicCamera/README.md
+@@ -726,8 +726,11 @@ different vertex shader, so they carry the iris polygon, the shape mask and its
+ anamorphic oval, the cat-eye clip and the axial chromatic rim without a line of their own, and
+ they shrink with the iris the way the pupil does. Being formed inside the lens, they are neither
+ blurred by the depth of field nor cut by an in-focus foreground, and they still draw with the
+-sprite bokeh turned off (`r_DepthOfFieldMode 1`). Full model in
+-[LensGhostSpec.md](LensGhostSpec.md).
++sprite bokeh turned off (`r_DepthOfFieldMode 1`). A ghost is also not a light source: it is
++composited into the frame after the glare family has taken its sources, so a ghost never grows
++diffraction streaks, an anamorphic flare or a filter star of its own - a flare off a
++second-order reflection would be a third-order one, and there is nothing there to see. Full
++model in [LensGhostSpec.md](LensGhostSpec.md).
+ 
+ ---
+ 
+diff --git a/Engine/Shaders/HWScripts/CryFX/DepthOfField.cfx b/Engine/Shaders/HWScripts/CryFX/DepthOfField.cfx
+index d31189db..e0a009b2 100644
+--- a/Engine/Shaders/HWScripts/CryFX/DepthOfField.cfx
++++ b/Engine/Shaders/HWScripts/CryFX/DepthOfField.cfx
+@@ -878,7 +878,35 @@ technique RefDofMbNormalizePass
+   {
+     VertexShader = FullscreenTriVS() PostMotionBlurVS;
+     PixelShader = RefDofMBNormalizePS() PostMotionBlurPS;
+-    CullMode = None;        
++    CullMode = None;
++  }
++}
++
++/////////////////////////////////////////////////////////////////////////////////////////////////
++// Lens ghost composite (LensGhostSpec.md, "Pipeline placement")
++//
++// The ghosts accumulate into a layer of their own instead of riding the splat layers, because
++// the pass above runs INSIDE the depth of field stage and everything it adds to the HDR target
++// is still a light source for the glare family that thresholds that target afterwards. A ghost
++// is a second-order internal reflection; a flare struck off one would be third order and
++// invisible. So this - a straight additive blit of the layer, no threshold, no depth, no mask -
++// runs later, once the streaks, the anamorphic flare, the filter PSF and halation have taken
++// their sources. Alpha is left at 0 exactly as the splat overlay leaves it.
++/////////////////////////////////////////////////////////////////////////////////////////////////
++pixout DofGhostCompositePS(vtxOut IN)
++{
++	pixout OUT = (pixout) 0;
++	OUT.Color = float4(GetTexture2D(texDofNrm_DofLayer0, ssDofNrm_DofLayer0, IN.baseTC.xy).rgb, 0);
++	return OUT;
++}
++
++technique DofGhostComposite
++{
++  pass p0
++  {
++    VertexShader = FullscreenTriVS() PostMotionBlurVS;
++    PixelShader = DofGhostCompositePS() PostMotionBlurPS;
++    CullMode = None;
+   }
+ }
+ 
+-- 
+2.47.1.windows.1
+

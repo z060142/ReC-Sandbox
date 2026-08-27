@@ -1,0 +1,260 @@
+From 2bc6a8987d16330f0c831a558dbfeb8b35459410 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Thu, 27 Aug 2026 09:47:25 +0800
+Subject: [PATCH 43/44] fix: bokeh polygon roundness follows the pupil scale,
+ so Blade Curvature shapes the outline at every aperture instead of only below
+ f/2.8
+
+---
+ .../RenderDll/Common/RendererCVars.cpp        | 13 +--
+ .../GraphicsPipeline/DepthOfField.cpp         | 82 ++++++++++++-------
+ .../Module/CinematicCameraComponent.h         | 18 ++--
+ Code/CryPlugins/CinematicCamera/README.md     | 28 +++++--
+ .../CinematicCamera/docs/ConsoleReference.md  | 13 +--
+ 5 files changed, 99 insertions(+), 55 deletions(-)
+
+diff --git a/Code/CryEngine/RenderDll/Common/RendererCVars.cpp b/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
+index 1aca37ea..745599cb 100644
+--- a/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
++++ b/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
+@@ -1550,11 +1550,14 @@ void CRendererCVars::InitCVars()
+ 	               "Master switch for all viewfinder overlays (guides and peaking), which are never part of the picture: "
+ 	               "0 kills them regardless of the other cvars - the recording switch.");
+ 	REGISTER_CVAR3("r_DepthOfFieldBokehShapeStrength", CV_r_DofBokehShapeStrength, 1.0f, VF_NULL,
+-	               "Formation exponent for the polygonal bokeh kernel. "
+-	               "1 = physical: the bokeh is exactly the iris polygon; "
+-	               "< 1 rounds the polygon back toward a circle; "
+-	               "values above 1 are clamped - a real iris opening is convex and nothing may "
+-	               "stretch its corners past the true polygon.");
++	               "Reach of the blade curvature in the bokeh outline. The iris exponent is "
++	               "1 - curvature * p * strength, where p is the pupil scale (opening radius "
++	               "relative to wide open): exponent 0 = perfect circle, 1 = the exact polygon. "
++	               "1 = physical: curved blades bulge exactly as far as their arc allows; "
++	               "> 1 keeps curved blades round further down the stops; "
++	               "< 1 sharpens them into the polygon sooner. "
++	               "The result is clamped to [0, 1] - a real iris opening is convex and nothing "
++	               "may stretch its corners past the true polygon.");
+ 	REGISTER_CVAR3("r_DepthOfFieldSpriteBokehDebug", CV_r_DofSpriteBokehDebug, 0, VF_NULL,
+ 	               "DIAGNOSTIC for the hybrid sprite bokeh splats (r_DepthOfFieldMode 0). "
+ 	               "1 = every surviving splat is drawn as its raw shape mask at full strength, "
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DepthOfField.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DepthOfField.cpp
+index a8046c6b..84fe0cd6 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DepthOfField.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DepthOfField.cpp
+@@ -22,24 +22,33 @@ float NGon_Rad(float theta, float n)
+ // always convex; exponents above 1 were a "make it readable" caricature tuned on 5-9 blades and
+ // are not physical at any blade count.
+ //
+-// Two things drive what is left. Stopping down reveals the polygon (round at f/1.2, complete by
+-// f/2.8, deliberately overlapping the apertures that produce LARGE discs or the shape would
+-// never be readable). And blade curvature: only a CURVED blade can retract into a circle, so
+-// straight blades keep the fully formed polygon at EVERY aperture - low curvature floors the
+-// formation window. What makes a straight blade look SHARPER than a curved one is the edge, not
+-// the corner length; that lives in ComputeIrisEdgeSoftness below.
+-static float ComputeIrisShapeExponent(float fstop, float curvature)
++// What is left is one continuous geometric fact. A curved blade bounds the opening with a
++// circular ARC, and how much that arc bulges away from the polygon's chord is the ratio of the
++// OPENING radius to the blade's own arc radius. The blade is a fixed piece of metal, so its arc
++// radius never changes; only the opening does. Wide open the opening fills the arc and the
++// outline is round; stopped down the same arc subtends a small angle across a small opening and
++// reads as a straight chord, i.e. the polygon. Straight blades (curvature 0) have no arc at all
++// and give the exact polygon at every aperture.
++//
++// The opening radius relative to wide open is exactly the pupil scale p = N_open / N_geo the
++// field-pupil code already carries (1 wide open, 0.5 one stop down, 0.25 two stops down), so:
++//
++//     exponent = 1 - curvature * p        (0 = perfect circle, 1 = exact polygon)
++//
++// This is a function of the aperture at EVERY stop, not a window: the old f/1.2 - f/2.8 blend
++// was an approximation of exactly this curve for a f/1.2 lens, and it wrongly forced the exact
++// polygon on every lens above f/2.8, which killed the curvature control at ordinary working
++// apertures. What makes a straight blade look SHARPER than a curved one beyond the outline is
++// the edge; that lives in ComputeIrisEdgeSoftness below.
++static float ComputeIrisShapeExponent(float pupilScale, float curvature)
+ {
+-	const float minFstops = 1.2f;
+-	const float maxFstops = 2.8f;
+-	const float stopBlend = clamp_tpl((fstop - minFstops) / (maxFstops - minFstops), 0.0f, 1.0f);
+-	const float straight = 1.0f - clamp_tpl(curvature, 0.0f, 1.0f);
+-	// Straight blades are always fully formed; curved blades follow the f-stop window.
+-	const float formed = straight + (1.0f - straight) * stopBlend;
++	const float p = clamp_tpl(pupilScale, 0.0f, 1.0f);
++	const float curv = clamp_tpl(curvature, 0.0f, 1.0f);
++	// r_DofBokehShapeStrength scales the ROUNDING term, i.e. the reach of the blade curvature:
++	// above 1 curved blades stay round further down the stops, below 1 they sharpen sooner.
++	// It can no longer push past the true polygon - that is what the clamp to 1 protects.
+ 	const float strength = clamp_tpl(CRenderer::CV_r_DofBokehShapeStrength, 0.25f, 4.0f);
+-	// 1 is the true iris and the ceiling. r_DofBokehShapeStrength below 1 rounds the polygon
+-	// back toward a circle; above 1 it can no longer push past the physical shape.
+-	return clamp_tpl(formed * strength, 0.0f, 1.0f);
++	return clamp_tpl(1.0f - curv * p * strength, 0.0f, 1.0f);
+ }
+ 
+ // Soft width of the polygon's edge in the splat, in quad-local radius units. This is where the
+@@ -377,17 +386,6 @@ void CDepthOfFieldStage::Execute()
+ 		fFNumber = 8.0f;
+ 	}
+ 
+-	// Ground truth log: what actually reaches the kernel, once per change.
+-	static float s_lastLoggedBlades = -1.0f;
+-	static float s_lastLoggedFNumber = -1.0f;
+-	if (fabsf(fNumApertureSides - s_lastLoggedBlades) > 0.01f || fabsf(fFNumber - s_lastLoggedFNumber) > 0.01f)
+-	{
+-		s_lastLoggedBlades = fNumApertureSides;
+-		s_lastLoggedFNumber = fFNumber;
+-		CryLog("[DOF] kernel blades=%.0f fNumber=%.1f%s", fNumApertureSides, fFNumber,
+-		       CRenderer::CV_r_DofBokehQuality >= 3 ? " (FORCED)" : "");
+-	}
+-
+ 	if (dofParams.bGameMode)
+ 	{
+ 		dofParams.vFocus.x = 1.0f / (vFocus.z + 1e-6f);
+@@ -410,13 +408,35 @@ void CDepthOfFieldStage::Execute()
+ 	const float fBladeRotation = dofParams.fBladeRotation;
+ 
+ 	// Resolved once, consumed by the gather taps below and by the splat mask in the hybrid
+-	// overlay. The diagnostic force mode pins fFNumber to 8 and the curvature to fully curved,
+-	// which reduces the exponent to the legacy strength-at-full-formation.
+-	const float fBladeCurvatureEff = (CRenderer::CV_r_DofBokehQuality >= 3) ? 1.0f : dofParams.fBladeCurvature;
+-	const float fIrisExponent = ComputeIrisShapeExponent(fFNumber, fBladeCurvatureEff);
++	// overlay. The diagnostic force mode wants the shape as readable as it gets, so it pins the
++	// blades straight: no arc, exponent 1, the fully formed polygon at any aperture.
++	const float fBladeCurvatureEff = (CRenderer::CV_r_DofBokehQuality >= 3) ? 0.0f : dofParams.fBladeCurvature;
++	// Roundness follows the opening radius relative to wide open, which is the same pupil scale
++	// the field-dependent pupil below uses - one aperture, one geometry.
++	const float fIrisPupilScale = clamp_tpl(dofParams.fPupilScale, 0.0f, 1.0f);
++	const float fIrisExponent = ComputeIrisShapeExponent(fIrisPupilScale, fBladeCurvatureEff);
+ 	// The other half of the curvature knob: how crisp the polygon's edge is cut in the splat.
+ 	const float fIrisEdgeSoft = ComputeIrisEdgeSoftness(fBladeCurvatureEff);
+ 
++	// Ground truth log: what actually reaches the kernel, once per change.
++	{
++		static float s_lastLoggedBlades = -1.0f;
++		static float s_lastLoggedFNumber = -1.0f;
++		static float s_lastLoggedExponent = -1.0f;
++		static float s_lastLoggedPupil = -1.0f;
++		if (fabsf(fNumApertureSides - s_lastLoggedBlades) > 0.01f || fabsf(fFNumber - s_lastLoggedFNumber) > 0.01f ||
++		    fabsf(fIrisExponent - s_lastLoggedExponent) > 0.01f || fabsf(fIrisPupilScale - s_lastLoggedPupil) > 0.01f)
++		{
++			s_lastLoggedBlades = fNumApertureSides;
++			s_lastLoggedFNumber = fFNumber;
++			s_lastLoggedExponent = fIrisExponent;
++			s_lastLoggedPupil = fIrisPupilScale;
++			CryLog("[DOF] kernel blades=%.0f fNumber=%.1f p=%.2f curv=%.2f irisExp=%.2f edgeSoft=%.3f%s",
++			       fNumApertureSides, fFNumber, fIrisPupilScale, fBladeCurvatureEff, fIrisExponent, fIrisEdgeSoft,
++			       CRenderer::CV_r_DofBokehQuality >= 3 ? " (FORCED)" : "");
++		}
++	}
++
+ 	// Anamorphic squeeze. The cylindrical element compresses the pupil image horizontally, so
+ 	// the gather kernel's horizontal reach shrinks by the same factor while the vertical reach
+ 	// stays the spherical CoC: every out-of-focus disc becomes a vertical oval of
+diff --git a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
+index 87ab9e7f..07f1bf35 100644
+--- a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
++++ b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
+@@ -182,14 +182,16 @@ struct SCineLensParams
+ 			"Iris blade count. Shapes the bokeh: round when wide open, this polygon when stopped down.", 9);
+ 		desc.AddMember(&SCineLensParams::bladeCurvature,
+ 			'bcrv', "BladeCurvature", "Blade Curvature",
+-			"How curved the iris blades are, which decides whether the aperture can actually "
+-			"close to a circle. 0 = perfectly straight blades: the full polygon shows at every "
+-			"f-stop and its edges are cut crisply, so a 3-blade iris stays a clean triangle even "
+-			"wide open. 1 = fully curved blades that retract into a true circle wide open and "
+-			"draw a slightly softer outline when stopped down. The silhouette is the same convex "
+-			"polygon either way - curvature decides when it forms and how hard its edge is, it "
+-			"never stretches the corners. Real lenses sit in between, and low blade counts show "
+-			"it most - at 9 blades the polygon is nearly round anyway.", 0.4f);
++			"How curved the iris blades are, which decides how round the opening is at a given "
++			"aperture. 0 = perfectly straight blades: the exact polygon at every f-stop, edges "
++			"cut crisply, so a 3-blade iris stays a clean sharp triangle. 1 = fully curved "
++			"blades: a true circle wide open, and the polygon reappearing gradually as you stop "
++			"down (half way one stop down, three quarters two stops down), with a slightly "
++			"softer outline. At an ordinary working aperture this is the fat-rounded-triangle "
++			"versus sharp-triangle control. The silhouette is always the same convex polygon - "
++			"curvature decides how far its edges bulge and how hard they are cut, it never "
++			"stretches the corners. Real lenses sit in between, and low blade counts show it "
++			"most - at 9 blades the polygon is nearly round anyway.", 0.4f);
+ 		desc.AddMember(&SCineLensParams::transmission,
+ 			'trns', "Transmission", "Transmission",
+ 			"Fraction of light the glass actually passes; defines the T-stop as T = f / sqrt(transmission). "
+diff --git a/Code/CryPlugins/CinematicCamera/README.md b/Code/CryPlugins/CinematicCamera/README.md
+index 7805ee60..3d3cd802 100644
+--- a/Code/CryPlugins/CinematicCamera/README.md
++++ b/Code/CryPlugins/CinematicCamera/README.md
+@@ -468,19 +468,35 @@ the gather kernel is still 49 taps, so watch for sparse/ringy discs at the top e
+ 
+ The component writes `Dof_User_ApertureBlades`, `Dof_User_FNumber`, `Dof_User_BladeCurvature`
+ and `Dof_User_BladeRotation` every frame. The renderer's kernel crosses from a circle to the
+-blade polygon over an f/1.2 - f/2.8 window, but **only for curved blades**: at Blade Curvature
+-0 the polygon is fully formed at every aperture, and at curvature 1 the behaviour reduces to
+-the plain f-stop window.
++blade polygon **continuously with the aperture**, because that is what the blades actually do:
++a curved blade bounds the opening with a circular arc, and how far that arc bulges away from
++the polygon's chord is the ratio of the opening radius to the blade's own (fixed) arc radius.
++Wide open the outline is round; stopped down the same arc reads as a straight chord. The
++opening radius relative to wide open is the pupil scale `p` the field-pupil code already
++carries, so the shaping exponent is
++
++```
++exponent = clamp(1 - BladeCurvature * p * r_DepthOfFieldBokehShapeStrength, 0, 1)
++```
++
++with 0 = a perfect circle and 1 = the exact polygon. Straight blades (curvature 0) have no arc
++and give the exact polygon at every aperture; fully curved blades are a circle wide open, half
++way to the polygon one stop down, three quarters two stops down. There is no f-stop window any
++more - the old f/1.2 - f/2.8 blend was an approximation of exactly this curve for an f/1.2
++lens, and it wrongly pinned every lens to the exact polygon above f/2.8, which made Blade
++Curvature do nothing to the outline at ordinary working apertures.
+ 
+ **The polygon never exceeds the true iris.** A real aperture is the intersection of its blades,
+ so it is always convex; the shaping exponent is therefore capped at 1 (= exactly the n-gon),
+-with 0 being a perfect circle. `r_DepthOfFieldBokehShapeStrength` (default 1.0) can only round
+-the polygon back toward a circle, never sharpen past it. It used to run up to 4, which
++with 0 being a perfect circle. `r_DepthOfFieldBokehShapeStrength` (default 1.0) scales the
++**rounding** term above - the reach of the blade curvature, not a "polygon strength": above 1
++curved blades stay round further down the stops, below 1 they sharpen into the polygon sooner.
++Neither direction can push past the true polygon. It used to run up to 4, which
+ stretched the corners outward - harmless-looking at 8 blades, where an octagon's corners sit
+ only 8% past its edge midpoints, but catastrophic at 3, where a triangle's corners sit 2.0x out
+ and squaring that turned the bokeh into a concave three-lobed cloverleaf.
+ 
+-Blade curvature's second - and now only - sharpening role is the **edge**: a curved blade
++Blade curvature's second role is the **edge**: a curved blade
+ presents a slightly soft, rounded outline and a straight blade cuts a crisp one, so the splat's
+ polygon edge width runs from 0.06 (curvature 1) to 0.015 (curvature 0) in pupil-radius units.
+ Same silhouette either way, only how hard it is cut.
+diff --git a/Code/CryPlugins/CinematicCamera/docs/ConsoleReference.md b/Code/CryPlugins/CinematicCamera/docs/ConsoleReference.md
+index 8408dd53..027ea0c5 100644
+--- a/Code/CryPlugins/CinematicCamera/docs/ConsoleReference.md
++++ b/Code/CryPlugins/CinematicCamera/docs/ConsoleReference.md
+@@ -72,7 +72,7 @@ hybrid path — the shape texture follows the effective cvar, not the property.
+ | --- | --- |
+ | Default | 1.0 |
+ | Range | input clamped to 0.25-4.0, then the resulting exponent is clamped to 0-1 |
+-| Purpose | Formation exponent for the polygonal bokeh kernel, applied to both the gather taps and the splat's polygon. 1 = physical: the bokeh is exactly the iris polygon. Below 1 the polygon is rounded back toward a circle (0 = a perfect disc). Above 1 has no effect - it is clamped. |
++| Purpose | Reach of the **blade curvature** in the bokeh outline, applied to both the gather taps and the splat's polygon. The iris exponent is `1 - curvature * p * strength`, where `p` is the pupil scale (the opening radius relative to the lens wide open): exponent 0 = perfect circle, 1 = the exact polygon. 1 = physical: a curved blade's arc bulges exactly as far as the opening allows. Above 1 keeps curved blades round further down the stops; below 1 sharpens them into the polygon sooner. |
+ 
+ A real iris opening is the intersection of its blades and is therefore always **convex**, so
+ nothing may push its corners past the true polygon. The old 2-4 range did exactly that: the
+@@ -81,10 +81,13 @@ radius function is normalised to the edge midpoints, so a corner sits 8% out for
+ concave cloverleaf instead of an aperture.
+ 
+ Not overwritten by the plugin; tune it from the console at any time. Blade Curvature feeds the
+-same exponent: straight blades (curvature 0) stay fully formed at every aperture instead of
+-following the f/1.2 - f/2.8 window. Curvature's other half is the polygon's **edge softness**
+-in the splat (0.06 pupil-radius units when fully curved, 0.015 when fully straight), which is
+-what makes a straight blade read as sharper without deforming the silhouette.
++same exponent: straight blades (curvature 0) stay the exact polygon at every aperture, curved
++blades round off in proportion to how far the iris is open. This replaces the old f/1.2 - f/2.8
++formation window, which was an approximation of the same curve for a single fast lens and
++wrongly forced the exact polygon on **every** lens above f/2.8. Curvature's other half is the
++polygon's **edge softness** in the splat (0.06 pupil-radius units when fully curved, 0.015 when
++fully straight), which is what makes a straight blade read as sharper without deforming the
++silhouette.
+ 
+ ### r_DepthOfFieldResolutionScale
+ 
+-- 
+2.47.1.windows.1
+

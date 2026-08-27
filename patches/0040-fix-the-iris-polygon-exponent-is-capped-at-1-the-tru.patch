@@ -1,0 +1,307 @@
+From 62edf95281c43a22eabc09255fec36bd3d5b53b1 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Thu, 27 Aug 2026 08:18:05 +0800
+Subject: [PATCH 40/44] fix: the iris polygon exponent is capped at 1 (the true
+ convex n-gon) and blade curvature moves to edge softness - a 3-blade bokeh is
+ a triangle again, not a cloverleaf
+
+---
+ .../RenderDll/Common/RendererCVars.cpp        | 10 +--
+ .../GraphicsPipeline/DepthOfField.cpp         | 70 +++++++++++++------
+ .../GraphicsPipeline/DepthOfField.h           |  4 +-
+ .../Module/CinematicCameraComponent.h         |  9 ++-
+ Code/CryPlugins/CinematicCamera/README.md     | 20 ++++--
+ .../CinematicCamera/docs/ConsoleReference.md  | 18 +++--
+ .../Shaders/HWScripts/CryFX/DepthOfField.cfx  | 18 +++--
+ 7 files changed, 105 insertions(+), 44 deletions(-)
+
+diff --git a/Code/CryEngine/RenderDll/Common/RendererCVars.cpp b/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
+index 52e0eb3c..9e650c1c 100644
+--- a/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
++++ b/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
+@@ -1548,10 +1548,12 @@ void CRendererCVars::InitCVars()
+ 	REGISTER_CVAR3("r_LensOverlays", CV_r_LensOverlays, 1, VF_NULL,
+ 	               "Master switch for all viewfinder overlays (guides and peaking), which are never part of the picture: "
+ 	               "0 kills them regardless of the other cvars - the recording switch.");
+-	REGISTER_CVAR3("r_DepthOfFieldBokehShapeStrength", CV_r_DofBokehShapeStrength, 2.0f, VF_NULL,
+-	               "Exaggeration exponent for the polygonal bokeh kernel. "
+-	               "1 = physical radius modulation (subtle for high blade counts), "
+-	               "2-3 = clearly readable polygons, 4 = star-like caricature.");
++	REGISTER_CVAR3("r_DepthOfFieldBokehShapeStrength", CV_r_DofBokehShapeStrength, 1.0f, VF_NULL,
++	               "Formation exponent for the polygonal bokeh kernel. "
++	               "1 = physical: the bokeh is exactly the iris polygon; "
++	               "< 1 rounds the polygon back toward a circle; "
++	               "values above 1 are clamped - a real iris opening is convex and nothing may "
++	               "stretch its corners past the true polygon.");
+ 	REGISTER_CVAR3("r_DepthOfFieldSpriteBokehDebug", CV_r_DofSpriteBokehDebug, 0, VF_NULL,
+ 	               "DIAGNOSTIC for the hybrid sprite bokeh splats (r_DepthOfFieldMode 0). "
+ 	               "1 = every surviving splat is drawn as its raw shape mask at full strength, "
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DepthOfField.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DepthOfField.cpp
+index 3b52d7fb..c5879eb5 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DepthOfField.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DepthOfField.cpp
+@@ -11,17 +11,23 @@ float NGon_Rad(float theta, float n)
+ 	return cosf(PI / n) / cosf(theta - (2 * PI / n) * floorf((n * theta + PI) / (2 * PI)));
+ }
+ 
+-// The sharpening exponent raised over the iris polygon's radius function: 0 = perfect circle,
+-// ~1 = the physical polygon, 2+ = deliberately sharpened corners, 4 = caricature. THE single
+-// place this is decided - the gather kernel and the splat mask are two views of one iris and
+-// must never derive it separately.
++// The exponent raised over the iris polygon's radius function: 0 = perfect circle, 1 = the
++// exact polygon. THE single place this is decided - the gather kernel and the splat mask are
++// two views of one iris and must never derive it separately.
+ //
+-// Two things drive it. Stopping down reveals the polygon (round at f/1.2, complete by f/2.8,
+-// deliberately overlapping the apertures that produce LARGE discs or the shape would never be
+-// readable). And blade curvature: only a CURVED blade can retract into a circle. Straight
+-// blades keep the fully formed polygon at EVERY aperture and cut visibly sharper corners, so
+-// low curvature both floors the formation window and pushes the exponent toward caricature.
+-// The knob has to read at a glance - tuned to the picture, not to arithmetic timidity.
++// It CANNOT exceed 1. NGon_Rad is normalised so the edge midpoints sit at 1 and the corners at
++// 1/cos(pi/n) - 1.08 for eight blades, but 2.0 for a triangle - so an exponent of 2 pushes a
++// triangle's corners out to four times the radius and turns every corner into a spike, i.e. a
++// concave three-lobed cloverleaf. A real iris opening is the INTERSECTION of the blades and is
++// always convex; exponents above 1 were a "make it readable" caricature tuned on 5-9 blades and
++// are not physical at any blade count.
++//
++// Two things drive what is left. Stopping down reveals the polygon (round at f/1.2, complete by
++// f/2.8, deliberately overlapping the apertures that produce LARGE discs or the shape would
++// never be readable). And blade curvature: only a CURVED blade can retract into a circle, so
++// straight blades keep the fully formed polygon at EVERY aperture - low curvature floors the
++// formation window. What makes a straight blade look SHARPER than a curved one is the edge, not
++// the corner length; that lives in ComputeIrisEdgeSoftness below.
+ static float ComputeIrisShapeExponent(float fstop, float curvature)
+ {
+ 	const float minFstops = 1.2f;
+@@ -31,10 +37,21 @@ static float ComputeIrisShapeExponent(float fstop, float curvature)
+ 	// Straight blades are always fully formed; curved blades follow the f-stop window.
+ 	const float formed = straight + (1.0f - straight) * stopBlend;
+ 	const float strength = clamp_tpl(CRenderer::CV_r_DofBokehShapeStrength, 0.25f, 4.0f);
+-	// Straight blades sharpen on top of forming: at curvature 0 the polygon runs at double
+-	// strength (a caricature on purpose); at curvature 1 this reduces exactly to the legacy
+-	// stopBlend * strength.
+-	return formed * strength * (1.0f + straight);
++	// 1 is the true iris and the ceiling. r_DofBokehShapeStrength below 1 rounds the polygon
++	// back toward a circle; above 1 it can no longer push past the physical shape.
++	return clamp_tpl(formed * strength, 0.0f, 1.0f);
++}
++
++// Soft width of the polygon's edge in the splat, in quad-local radius units. This is where the
++// blade's own shape shows: a curved blade presents a rounded, slightly soft outline, a straight
++// blade cuts a crisp one. It replaces the corner-stretching the exponent used to do, and unlike
++// that it stays physical - the silhouette is the same convex polygon either way, only its edge
++// is harder or softer. 0.06 at fully curved (the legacy hard-coded width), 0.015 at fully
++// straight.
++static float ComputeIrisEdgeSoftness(float curvature)
++{
++	const float straight = 1.0f - clamp_tpl(curvature, 0.0f, 1.0f);
++	return 0.06f + (0.015f - 0.06f) * straight;
+ }
+ 
+ // Shirley's concentric mapping
+@@ -377,6 +394,8 @@ void CDepthOfFieldStage::Execute()
+ 	// which reduces the exponent to the legacy strength-at-full-formation.
+ 	const float fBladeCurvatureEff = (CRenderer::CV_r_DofBokehQuality >= 3) ? 1.0f : dofParams.fBladeCurvature;
+ 	const float fIrisExponent = ComputeIrisShapeExponent(fFNumber, fBladeCurvatureEff);
++	// The other half of the curvature knob: how crisp the polygon's edge is cut in the splat.
++	const float fIrisEdgeSoft = ComputeIrisEdgeSoftness(fBladeCurvatureEff);
+ 
+ 	// Anamorphic squeeze. The cylindrical element compresses the pupil image horizontally, so
+ 	// the gather kernel's horizontal reach shrinks by the same factor while the vertical reach
+@@ -404,7 +423,11 @@ void CDepthOfFieldStage::Execute()
+ 
+ 	// Axial chromatic aberration: one scale, shared by the gather and the splat so the halo and
+ 	// the sprite can never disagree on where the coloured rim starts.
+-	const Vec4 vAxialChromatic(ResolveAxialChromaticScale(dofParams.fAxialChromatic), 0.0f, 0.0f, 0.0f);
++	// .y = the iris polygon's edge softness (blade curvature), riding this constant's free lane
++	// because it is the one every pupil-drawing pass already receives. The gather does not read
++	// it - 49 taps have no crisp edge to soften - but it is filled here as well so the two
++	// copies of the constant can never differ.
++	const Vec4 vAxialChromatic(ResolveAxialChromaticScale(dofParams.fAxialChromatic), fIrisEdgeSoft, 0.0f, 0.0f);
+ 
+ 	// ---------------------------------------------------------------------------------------
+ 	// Lens model (DofLensModelSpec.md). The component asks; the cvar may refuse; the request is
+@@ -803,8 +826,8 @@ void CDepthOfFieldStage::Execute()
+ 	const bool bGhost = (dofParams.fGhostAmount > 0.001f);
+ 	if (bSplat || bGhost)
+ 	{
+-		ExecuteSplatLayers(dofParams, vDofParams0, vDofParams1, fNumApertureSides, fIrisExponent, bSplat, bGhost,
+-		                   bLensModel, vDofLensModel, fLensSplatCap, vFieldPupil2);
++		ExecuteSplatLayers(dofParams, vDofParams0, vDofParams1, fNumApertureSides, fIrisExponent, fIrisEdgeSoft,
++		                   bSplat, bGhost, bLensModel, vDofLensModel, fLensSplatCap, vFieldPupil2);
+ 	}
+ 
+ 	m_bWroteHDRTarget = true;
+@@ -898,7 +921,8 @@ static Vec3 RotateHueAroundGrey(const Vec3& c, float fAngleRad)
+ // that sharing is the whole reason the two live in one function.
+ //////////////////////////////////////////////////////////////////////////////////////////////////
+ void CDepthOfFieldStage::ExecuteSplatLayers(const SDepthOfFieldParams& dofParams, const Vec4& vDofParams0, const Vec4& vDofParams1,
+-                                            float fNumApertureSides, float fIrisExponent, bool bSplat, bool bGhost,
++                                            float fNumApertureSides, float fIrisExponent, float fIrisEdgeSoft,
++                                            bool bSplat, bool bGhost,
+                                             bool bLensModel, const Vec4& vLensModel, float fSplatCapPx,
+                                             const Vec4& vGatherFieldPupil2)
+ {
+@@ -1019,7 +1043,11 @@ void CDepthOfFieldStage::ExecuteSplatLayers(const SDepthOfFieldParams& dofParams
+ 	const Vec4 vFieldPupil2(fSpriteSqueeze, (CRenderer::CV_r_DofFieldDebug > 0) ? 1.0f : 0.0f, 0.0f, 0.0f);
+ 	// Same derivation as the gather's, from the same user amount: the splat draws the shrunk
+ 	// channels at exactly the radius the gather masks its taps to.
+-	const Vec4 vAxialChromatic(ResolveAxialChromaticScale(dofParams.fAxialChromatic), 0.0f, 0.0f, 0.0f);
++	// .y = the iris polygon's edge softness in quad-local radius units, resolved in Execute()
++	// from blade curvature (0.06 curved, 0.015 straight) and handed down unchanged. This is
++	// what a straight blade actually does differently - it cuts a crisper outline - now that
++	// the shape exponent can no longer stretch the corners past the physical polygon.
++	const Vec4 vAxialChromatic(ResolveAxialChromaticScale(dofParams.fAxialChromatic), fIrisEdgeSoft, 0.0f, 0.0f);
+ 
+ 	// Soft knee spanning +/-50% of the threshold. Wide on purpose: a hard cut makes highlights
+ 	// pop in and out one frame at a time as the aperture or the focus sweeps past them.
+@@ -1087,9 +1115,9 @@ void CDepthOfFieldStage::ExecuteSplatLayers(const SDepthOfFieldParams& dofParams
+ 			s_lastBlades = fNumApertureSides;
+ 			s_lastBlend = fIrisExponent;
+ 			s_lastThreshold = fHighlightThreshold;
+-			CryLog("[DOF] hybrid splat grid %dx%d -> layer %dx%d (%u verts) blades=%.0f irisExp=%.2f curv=%.2f rot=%.2f domain=%s (N=%.1f maskN=%.1f) thresh=%.2f shapeTex=%s",
++			CryLog("[DOF] hybrid splat grid %dx%d -> layer %dx%d (%u verts) blades=%.0f irisExp=%.2f edgeSoft=%.3f curv=%.2f rot=%.2f domain=%s (N=%.1f maskN=%.1f) thresh=%.2f shapeTex=%s",
+ 			       nWidth, nHeight, nLayerWidth, nLayerHeight, nBokehVertexCount, fNumApertureSides,
+-			       fIrisExponent, dofParams.fBladeCurvature, dofParams.fBladeRotation,
++			       fIrisExponent, fIrisEdgeSoft, dofParams.fBladeCurvature, dofParams.fBladeRotation,
+ 			       bMaskDomain ? "MASK" : "iris", dofParams.fApertureFNumber, dofParams.fMaskFNumber,
+ 			       fHighlightThreshold, bShapeTexValid ? "yes" : "no");
+ 		}
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DepthOfField.h b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DepthOfField.h
+index e9720b23..eb2b3c3d 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DepthOfField.h
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DepthOfField.h
+@@ -64,8 +64,10 @@ private:
+ 	// (DofLensModelSpec.md) resolved once in Execute(). The sprite draws take their own cap and
+ 	// the spherical-aberration lane; the overlay pass takes the gather's whole constant, because
+ 	// it has to mask the far splats with exactly the sharpness the composite used.
++	// shapeExponent / edgeSoftness: the iris polygon's shape (0 = circle, 1 = the true polygon)
++	// and how crisp its edge is cut, both resolved once in Execute() from blade curvature.
+ 	void ExecuteSplatLayers(const SDepthOfFieldParams& dofParams, const Vec4& vDofParams0, const Vec4& vDofParams1,
+-	                        float blades, float shapeExponent, bool bSplat, bool bGhost,
++	                        float blades, float shapeExponent, float edgeSoftness, bool bSplat, bool bGhost,
+ 	                        bool bLensModel, const Vec4& vLensModel, float fSplatCapPx,
+ 	                        const Vec4& vGatherFieldPupil2);
+ 
+diff --git a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
+index f763be83..87ab9e7f 100644
+--- a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
++++ b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
+@@ -184,9 +184,12 @@ struct SCineLensParams
+ 			'bcrv', "BladeCurvature", "Blade Curvature",
+ 			"How curved the iris blades are, which decides whether the aperture can actually "
+ 			"close to a circle. 0 = perfectly straight blades: the full polygon shows at every "
+-			"f-stop, so a 3-blade iris stays a rounded triangle even wide open. 1 = fully curved "
+-			"blades that retract into a true circle wide open. Real lenses sit in between, and "
+-			"low blade counts show it most - at 9 blades the polygon is nearly round anyway.", 0.4f);
++			"f-stop and its edges are cut crisply, so a 3-blade iris stays a clean triangle even "
++			"wide open. 1 = fully curved blades that retract into a true circle wide open and "
++			"draw a slightly softer outline when stopped down. The silhouette is the same convex "
++			"polygon either way - curvature decides when it forms and how hard its edge is, it "
++			"never stretches the corners. Real lenses sit in between, and low blade counts show "
++			"it most - at 9 blades the polygon is nearly round anyway.", 0.4f);
+ 		desc.AddMember(&SCineLensParams::transmission,
+ 			'trns', "Transmission", "Transmission",
+ 			"Fraction of light the glass actually passes; defines the T-stop as T = f / sqrt(transmission). "
+diff --git a/Code/CryPlugins/CinematicCamera/README.md b/Code/CryPlugins/CinematicCamera/README.md
+index fda15199..3e600429 100644
+--- a/Code/CryPlugins/CinematicCamera/README.md
++++ b/Code/CryPlugins/CinematicCamera/README.md
+@@ -458,10 +458,22 @@ the gather kernel is still 49 taps, so watch for sparse/ringy discs at the top e
+ The component writes `Dof_User_ApertureBlades`, `Dof_User_FNumber`, `Dof_User_BladeCurvature`
+ and `Dof_User_BladeRotation` every frame. The renderer's kernel crosses from a circle to the
+ blade polygon over an f/1.2 - f/2.8 window, but **only for curved blades**: at Blade Curvature
+-0 the polygon is fully formed at every aperture (and sharpened further, on purpose), and at
+-curvature 1 the behaviour reduces to the plain f-stop window. The visual strength of the
+-polygon is exaggerated by `r_DepthOfFieldBokehShapeStrength` (default 2.0), because the
+-physical radius modulation is far too subtle at high blade counts (8% for an octagon).
++0 the polygon is fully formed at every aperture, and at curvature 1 the behaviour reduces to
++the plain f-stop window.
++
++**The polygon never exceeds the true iris.** A real aperture is the intersection of its blades,
++so it is always convex; the shaping exponent is therefore capped at 1 (= exactly the n-gon),
++with 0 being a perfect circle. `r_DepthOfFieldBokehShapeStrength` (default 1.0) can only round
++the polygon back toward a circle, never sharpen past it. It used to run up to 4, which
++stretched the corners outward - harmless-looking at 8 blades, where an octagon's corners sit
++only 8% past its edge midpoints, but catastrophic at 3, where a triangle's corners sit 2.0x out
++and squaring that turned the bokeh into a concave three-lobed cloverleaf.
++
++Blade curvature's second - and now only - sharpening role is the **edge**: a curved blade
++presents a slightly soft, rounded outline and a straight blade cuts a crisp one, so the splat's
++polygon edge width runs from 0.06 (curvature 1) to 0.015 (curvature 0) in pupil-radius units.
++Same silhouette either way, only how hard it is cut.
++
+ `r_DepthOfFieldBokehQuality N` (N >= 3) forces an N-sided kernel for diagnostics. See
+ [docs/ConsoleReference.md](docs/ConsoleReference.md).
+ 
+diff --git a/Code/CryPlugins/CinematicCamera/docs/ConsoleReference.md b/Code/CryPlugins/CinematicCamera/docs/ConsoleReference.md
+index 068a2f98..2d0dc22f 100644
+--- a/Code/CryPlugins/CinematicCamera/docs/ConsoleReference.md
++++ b/Code/CryPlugins/CinematicCamera/docs/ConsoleReference.md
+@@ -70,13 +70,21 @@ hybrid path — the shape texture follows the effective cvar, not the property.
+ 
+ | | |
+ | --- | --- |
+-| Default | 2.0 |
+-| Range | clamped to 0.25-4.0 in use |
+-| Purpose | Exaggeration exponent for the polygonal bokeh kernel. 1 = physical radius modulation (very subtle at high blade counts: 19% for a pentagon, 8% for an octagon, nearly invisible after the quarter-resolution gather and TAA); 2-3 = clearly readable polygons; 4 = star-like caricature. |
++| Default | 1.0 |
++| Range | input clamped to 0.25-4.0, then the resulting exponent is clamped to 0-1 |
++| Purpose | Formation exponent for the polygonal bokeh kernel, applied to both the gather taps and the splat's polygon. 1 = physical: the bokeh is exactly the iris polygon. Below 1 the polygon is rounded back toward a circle (0 = a perfect disc). Above 1 has no effect - it is clamped. |
++
++A real iris opening is the intersection of its blades and is therefore always **convex**, so
++nothing may push its corners past the true polygon. The old 2-4 range did exactly that: the
++radius function is normalised to the edge midpoints, so a corner sits 8% out for an octagon but
++**2.0x** out for a triangle, and an exponent of 2 gave that triangle 4x-radius spikes - a
++concave cloverleaf instead of an aperture.
+ 
+ Not overwritten by the plugin; tune it from the console at any time. Blade Curvature feeds the
+-same exponent: straight blades (curvature 0) run it at double strength and stay fully formed at
+-every aperture.
++same exponent: straight blades (curvature 0) stay fully formed at every aperture instead of
++following the f/1.2 - f/2.8 window. Curvature's other half is the polygon's **edge softness**
++in the splat (0.06 pupil-radius units when fully curved, 0.015 when fully straight), which is
++what makes a straight blade read as sharper without deforming the silhouette.
+ 
+ ### r_DepthOfFieldResolutionScale
+ 
+diff --git a/Engine/Shaders/HWScripts/CryFX/DepthOfField.cfx b/Engine/Shaders/HWScripts/CryFX/DepthOfField.cfx
+index b2df57a9..acd141dd 100644
+--- a/Engine/Shaders/HWScripts/CryFX/DepthOfField.cfx
++++ b/Engine/Shaders/HWScripts/CryFX/DepthOfField.cfx
+@@ -63,7 +63,11 @@ float4 vDofFieldPupil2;
+ // Axial (longitudinal) chromatic aberration, AxialChromaticSpec.md. x = s, the radius of the
+ // shrunk channels' out-of-focus disc in units of the full one (1 = off). Not a field effect:
+ // each wavelength simply focuses at its own distance, so the centre of the frame fringes as
+-// hard as the corners. yzw unused.
++// hard as the corners.
++// y = the iris polygon's soft edge width in quad-local radius units, resolved on the CPU from
++// blade curvature (0.06 fully curved, 0.015 fully straight). A curved blade presents a rounded,
++// slightly soft outline and a straight one cuts a crisp edge - that, not corner length, is how
++// the two differ, since the silhouette itself is the convex polygon in both cases. zw unused.
+ float4 vDofAxialChromatic;
+ 
+ // Internal reflection ghosts (LensGhostSpec.md), one draw per ghost layer - the chain cannot
+@@ -457,11 +461,13 @@ half4 EvalPupilShape(half2 tcQuad, float2 vBarrelC, half fIrisExp, half fSide)
+ 	half4 cIris = saturate(1-fShapeBokeh);
+ 	cIris += saturate(1-abs(fShapeBokeh*2-1));
+ 
+-	// Iris polygon at the curvature-driven sharpening exponent (vDofBokehShape.y: 0 = circle,
+-	// ~1 = the true polygon, 2+ = sharpened, 4 = caricature - the same exponent the gather
+-	// kernel raises its taps by, so both views of the iris always agree), at radius
+-	// vDofBokehMask.z in quad units.
+-	const float fEdgeSoft = 0.06f;      // soft edge width, in quad-local radius
++	// Iris polygon at the formation exponent (vDofBokehShape.y: 0 = circle, 1 = the true
++	// polygon and the hard ceiling - a real iris opening is the intersection of the blades and
++	// is always convex, so nothing may push the corners past NGon_Rad - the same exponent the
++	// gather kernel raises its taps by, so both views of the iris always agree), at radius
++	// vDofBokehMask.z in quad units. Blade curvature is expressed as the EDGE instead: soft for
++	// a curved blade, crisp for a straight one (vDofAxialChromatic.y).
++	const float fEdgeSoft = max(vDofAxialChromatic.y, 0.001f);   // soft edge width, quad-local radius
+ 	const float fRadius   = sqrt(max(fLen, 1e-6f));
+ 	const float fTheta    = atan2(tcQuad.y, tcQuad.x);
+ 	const float fPolyRad  = pow(NGon_Rad(fTheta - vDofBokehShape.w, max(vDofBokehShape.x, 3.0f)), vDofBokehShape.y) * vDofBokehMask.z;
+-- 
+2.47.1.windows.1
+
