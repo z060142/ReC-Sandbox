@@ -1,0 +1,414 @@
+From fc454afaf43e135725513d010bb49fc1b43c738d Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Thu, 27 Aug 2026 11:39:21 +0800
+Subject: [PATCH 50/57] fix: wave glare samples the diffraction kernel through
+ a prefiltered mip chain, so the rays survive the sub-pixel texel pitch at
+ working apertures
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01A72MFkdSczncE7au9UVnmu
+---
+ .../XRenderD3D9/GraphicsPipeline/Bloom.cpp    | 22 +++++-
+ .../GraphicsPipeline/DiffractionKernel.cpp    | 75 +++++++++++++++++--
+ .../GraphicsPipeline/DiffractionKernel.h      | 11 ++-
+ .../CinematicCamera/DiffractionKernelSpec.md  | 61 ++++++++++++---
+ .../HWScripts/CryFX/HDRPostProcess.cfx        | 40 ++++++++--
+ 5 files changed, 179 insertions(+), 30 deletions(-)
+
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Bloom.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Bloom.cpp
+index c9196434..b9d46076 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Bloom.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Bloom.cpp
+@@ -490,6 +490,17 @@ void CBloomStage::ExecuteDiffraction(const SHDRStreaksParams& streakParams, floa
+ 	const float fNorm = 1.0f / (fPitchQuarterPx * fPitchQuarterPx);
+ 	const float fEnergy = streakParams.fWaveAmount / fBloomCompositeWeight;
+ 
++	// The mip level the sprite reads the kernel at. One quarter-resolution pixel spans
++	// 1 / s_q kernel texels - seventeen at f/16, a hundred wide open - and the rays inside the
++	// kernel are one or two texels across, so a single tap lands on a ray about one time in
++	// seventeen and the pattern vanishes from the picture. Reading level log2(1 / s_q) instead
++	// gives the pixel the MEAN intensity over its own footprint in one tap, and the 1 / s_q^2
++	// above then turns that mean into the true integral over the footprint. The shader redoes
++	// this per wavelength (the pattern is stretched by lambda0 / lambda); what is passed is the
++	// ceiling, the coarsest level that exists.
++	const float fMaxLod = (float)max(kernel.GetKernelMipCount() - 1, 0);
++	const float fLodRef = clamp_tpl(logf(max(1.0f / fPitchQuarterPx, 1.0f)) / logf(2.0f), 0.0f, fMaxLod);
++
+ 	// Spectral sampling. Each wavelength is a SCALED copy of the same pattern -
+ 	// PSF_lambda(u) = (l0/l)^2 * PSF_l0(u * l0/l) - so blue sits compact near the core and red
+ 	// runs out to the tips. That is what makes a real sunstar's rays rainbow: dispersion, not a
+@@ -533,9 +544,10 @@ void CBloomStage::ExecuteDiffraction(const SHDRStreaksParams& streakParams, floa
+ 			s_lastReach = streakParams.fWaveReach;
+ 			s_lastDispersion = streakParams.fDispersion;
+ 			s_lastN = pDofStage->GetDiffractionNGeo();
+-			CryLog("[BLOOM] diffraction glare amount=%.2f reach=%.2f disp=%.2f N=%.1f -> pitch=%.3f q-px/texel sprite=%.0f q-px (%.0f texels) core=%.2f deposited glare fraction=%.3f norm=%.3g",
++			CryLog("[BLOOM] diffraction glare amount=%.2f reach=%.2f disp=%.2f N=%.1f -> pitch=%.3f q-px/texel (%.1f texels/px) lod=%.1f of %.0f sprite=%.0f q-px (%.0f texels) core=%.2f deposited glare fraction=%.3f norm=%.3g",
+ 			       streakParams.fWaveAmount, streakParams.fWaveReach, streakParams.fDispersion,
+-			       pDofStage->GetDiffractionNGeo(), fPitchQuarterPx, fRadiusQuarterPx, fSpriteRadiusTexels,
++			       pDofStage->GetDiffractionNGeo(), fPitchQuarterPx, 1.0f / fPitchQuarterPx, fLodRef, fMaxLod,
++			       fRadiusQuarterPx, fSpriteRadiusTexels,
+ 			       kernel.GetCoreFraction(), fGlareFraction * streakParams.fWaveAmount, fNorm);
+ 		}
+ 	}
+@@ -572,7 +584,9 @@ void CBloomStage::ExecuteDiffraction(const SHDRStreaksParams& streakParams, floa
+ 	prim.SetTexture(1, kernel.GetKernelTexture(), EDefaultResourceViews::Default, EShaderStage_Pixel);
+ 	prim.SetTexture(2, kernel.GetRingTexture(), EDefaultResourceViews::Default, EShaderStage_Pixel);
+ 	prim.SetSampler(0, EDefaultSamplerStates::PointClamp, EShaderStage_Vertex);
+-	prim.SetSampler(1, EDefaultSamplerStates::LinearClamp, EShaderStage_Pixel);
++	// TRILINEAR, not LinearClamp: FILTER_LINEAR is built with MaxLOD 0, which would silently
++	// pin every SampleLevel to mip 0 and undo the prefiltering the kernel exists for.
++	prim.SetSampler(1, EDefaultSamplerStates::TrilinearClamp, EShaderStage_Pixel);
+ 	// The ring is an angle, so it WRAPS: theta = -pi and theta = +pi are the same direction and
+ 	// a clamped sampler would flatten the pattern along the -x axis.
+ 	prim.SetSampler(2, EDefaultSamplerStates::LinearWrap, EShaderStage_Pixel);
+@@ -591,7 +605,7 @@ void CBloomStage::ExecuteDiffraction(const SHDRStreaksParams& streakParams, floa
+ 	}
+ 
+ 	const Vec4 vDiffParams0(fRadiusQuarterPx, fPitchQuarterPx, fRingRadius, fNorm);
+-	const Vec4 vDiffParams1(clamp_tpl(streakParams.fDispersion, 0.0f, 1.0f), (float)kernel.GetGridSize(), 0.0f, 0.0f);
++	const Vec4 vDiffParams1(clamp_tpl(streakParams.fDispersion, 0.0f, 1.0f), (float)kernel.GetGridSize(), fMaxLod, 0.0f);
+ 	const Vec4 vDiffParams2(fRadiusNdcX, fRadiusNdcY, fEnergy, 0.0f);
+ 
+ 	auto& constantManager = prim.GetConstantManager();
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DiffractionKernel.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DiffractionKernel.cpp
+index 7efed2f6..3741b35b 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DiffractionKernel.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DiffractionKernel.cpp
+@@ -520,12 +520,61 @@ void CDiffractionKernel::BuildJob()
+ 		}
+ 	}
+ 
++	// A PREFILTERED MIP CHAIN of the pattern, and the reason it exists is the whole point of the
++	// pass. The kernel's texel pitch on screen is lambda * N * d / L, a small FRACTION of a
++	// pixel: 0.23 native pixels at f/16, so a quarter-resolution pixel covers some seventeen
++	// kernel texels (a hundred at f/2.8). The rays themselves are one or two texels wide. One
++	// tap per pixel therefore lands on a ray about one time in seventeen and misses the pattern
++	// everywhere else - which is exactly what "no rays at all at f/16" looks like. The average
++	// energy was right; the sampling was not integrated. With the chain the shader picks the
++	// level whose texel IS the pixel's footprint and reads the footprint's mean in one tap.
++	//
++	// Filter the LINEAR intensity and encode afterwards, never the other way round: sqrt is not
++	// linear, so a box filter of sqrt(I) is not sqrt(mean I), and the pixel shader's k*k would
++	// then be systematically too dark. Level by level, k^2 is the mean intensity over the texel.
++	const int nMips = nLogL + 1;                     // L down to 1x1
++	size_t nTotalTexels = 0;
++	for (int m = 0; m < nMips; ++m)
++	{
++		const size_t w = (size_t)(L >> m);
++		nTotalTexels += w * w;
++	}
++
++	m_resultKernel.resize(nTotalTexels);
++	m_resultMipCount = nMips;
++
+ 	// sqrt encoding in both textures: the tails run down to 1e-8, which is below half float's
+ 	// denormals, and the square root lifts them to 1e-4 where R16F is exact. The pixel shader
+ 	// squares them back.
+-	m_resultKernel.resize((size_t)L * L);
+-	for (size_t i = 0; i < intensity.size(); ++i)
+-		m_resultKernel[i] = CryConvertFloatToHalf(sqrtf(max(intensity[i], 0.0f)));
++	std::vector<float> level(std::move(intensity));   // level 0, linear
++	std::vector<float> coarser;
++	size_t nOffset = 0;
++	for (int m = 0; m < nMips; ++m)
++	{
++		const int w = L >> m;
++		for (size_t i = 0; i < (size_t)w * w; ++i)
++			m_resultKernel[nOffset + i] = CryConvertFloatToHalf(sqrtf(max(level[i], 0.0f)));
++		nOffset += (size_t)w * w;
++
++		if (m + 1 >= nMips)
++			break;
++
++		// Box 2x2 of the linear intensity: the mean of four means over equal areas IS the mean
++		// over their union, so every level stays the true footprint average.
++		const int hw = w >> 1;
++		coarser.resize((size_t)hw * hw);
++		for (int y = 0; y < hw; ++y)
++		{
++			for (int x = 0; x < hw; ++x)
++			{
++				coarser[(size_t)y * hw + x] = 0.25f * (level[(size_t)(2 * y) * w + (2 * x)]
++				                                       + level[(size_t)(2 * y) * w + (2 * x + 1)]
++				                                       + level[(size_t)(2 * y + 1) * w + (2 * x)]
++				                                       + level[(size_t)(2 * y + 1) * w + (2 * x + 1)]);
++			}
++		}
++		level.swap(coarser);
++	}
+ 
+ 	m_resultRing.resize((size_t)kRingBins);
+ 	double fRingMean = 0.0;
+@@ -574,12 +623,19 @@ void CDiffractionKernel::Update(const char* szNameSuffix)
+ void CDiffractionKernel::UploadResult(const char* szNameSuffix)
+ {
+ 	const int L = m_jobDesc.nGridSize;
+-	if (m_resultKernel.size() != (size_t)L * L || m_resultRing.size() != (size_t)kRingBins)
++	size_t nExpected = 0;
++	for (int m = 0; m < m_resultMipCount; ++m)
++	{
++		const size_t w = (size_t)(L >> m);
++		nExpected += w * w;
++	}
++
++	if (m_resultKernel.size() != nExpected || m_resultRing.size() != (size_t)kRingBins)
+ 		return;
+ 
+ 	// The grid size changing means new textures; everything else is a re-upload into the same
+ 	// two, which is what keeps a blade-rotation pull from churning resources.
+-	if (m_pTexKernel && (m_pTexKernel->GetWidth() != L))
++	if (m_pTexKernel && (m_pTexKernel->GetWidth() != L || m_pTexKernel->GetNumMips() != m_resultMipCount))
+ 		ReleaseTextures();
+ 
+ 	const std::string suffix = szNameSuffix ? szNameSuffix : "";
+@@ -587,7 +643,11 @@ void CDiffractionKernel::UploadResult(const char* szNameSuffix)
+ 	{
+ 		const std::string kernelName = "$DiffractionKernel" + suffix;
+ 		const std::string ringName = "$DiffractionRing" + suffix;
+-		m_pTexKernel = CTexture::GetOrCreate2DTexture(kernelName.c_str(), L, L, 1, FT_DONT_STREAM | FT_NOMIPS,
++		// WITH mips, and therefore without FT_NOMIPS: the whole chain is uploaded here, level
++		// after level, and the sprite pass reads it with an explicit LOD. Both the creation path
++		// and UpdateTextureRegion walk a source buffer whose levels are consecutive, which is
++		// exactly how BuildJob laid it out.
++		m_pTexKernel = CTexture::GetOrCreate2DTexture(kernelName.c_str(), L, L, m_resultMipCount, FT_DONT_STREAM,
+ 		                                              (const byte*)m_resultKernel.data(), eTF_R16F);
+ 		m_pTexRing = CTexture::GetOrCreate2DTexture(ringName.c_str(), kRingBins, 1, 1, FT_DONT_STREAM | FT_NOMIPS,
+ 		                                            (const byte*)m_resultRing.data(), eTF_R16F);
+@@ -606,6 +666,7 @@ void CDiffractionKernel::UploadResult(const char* szNameSuffix)
+ 
+ 	m_builtDesc = m_jobDesc;
+ 	m_bBuiltValid = true;
++	m_nKernelMips = m_pTexKernel->GetNumMips();
+ 	m_fRingRadius = (float)L * 0.5f - 2.0f;
+ 	m_fTexelPitchPupilUnits = 0.5f;      // d / L, and d is L/2 by construction
+ 	m_fTextureIntegral = m_resultIntegral;
+@@ -622,6 +683,8 @@ void CDiffractionKernel::UploadResult(const char* szNameSuffix)
+ 	       m_builtDesc.maskName.empty() ? "none" : m_builtDesc.maskName.c_str(),
+ 	       RAD2DEG(m_builtDesc.fMaskRotation), m_builtDesc.fIrisRadius, m_builtDesc.fKsa,
+ 	       m_fCoreFraction, m_fTailCoefficient, 1.0f - m_fCoreFraction, L, m_resultJobMs);
++	CryLog("[BLOOM] diffraction kernel mip chain: %d levels (%d..1), %.0f KB", m_nKernelMips, L,
++	       (float)(m_resultKernel.size() * sizeof(uint16)) / 1024.0f);
+ }
+ 
+ void CDiffractionKernel::ReleaseTextures()
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DiffractionKernel.h b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DiffractionKernel.h
+index bc49e7fc..f9b31614 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DiffractionKernel.h
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DiffractionKernel.h
+@@ -81,6 +81,13 @@ public:
+ 	CTexture* GetRingTexture() const   { return m_pTexRing; }
+ 
+ 	int   GetGridSize() const      { return m_builtDesc.nGridSize; }
++	//! Levels in the kernel's prefiltered mip chain, L x L down to 1 x 1. The pattern's texel
++	//! pitch on screen is a small FRACTION of a pixel (0.23 native px at f/16), so one pixel
++	//! covers tens of texels and a single tap would miss the one-texel-wide rays almost
++	//! everywhere. Each level is the MEAN INTENSITY over its footprint, which is exactly what
++	//! the sprite pass needs to integrate - see UploadResult for why the sqrt encoding happens
++	//! after the filtering and never before.
++	int   GetKernelMipCount() const { return m_nKernelMips; }
+ 	//! Radius, in kernel texels, out to which the TEXTURE is valid. Past it the pixel shader
+ 	//! extrapolates with the edge-diffraction law off the boundary ring.
+ 	float GetRingRadius() const    { return m_fRingRadius; }
+@@ -117,6 +124,7 @@ private:
+ 
+ 	CTexture*             m_pTexKernel = nullptr;
+ 	CTexture*             m_pTexRing = nullptr;
++	int                   m_nKernelMips = 1;
+ 
+ 	float                 m_fRingRadius = 0.0f;
+ 	float                 m_fTexelPitchPupilUnits = 0.5f;
+@@ -131,7 +139,8 @@ private:
+ 	int                   m_jobMaskWidth = 0;
+ 	int                   m_jobMaskHeight = 0;
+ 
+-	std::vector<uint16>   m_resultKernel;             //!< L*L, R16F, sqrt-encoded
++	std::vector<uint16>   m_resultKernel;             //!< the whole mip chain, R16F, sqrt-encoded, levels consecutive
++	int                   m_resultMipCount = 1;
+ 	std::vector<uint16>   m_resultRing;               //!< kRingBins, R16F, sqrt-encoded
+ 	float                 m_resultIntegral = 1.0f;
+ 	float                 m_resultTailCoefficient = 0.0f;
+diff --git a/Code/CryPlugins/CinematicCamera/DiffractionKernelSpec.md b/Code/CryPlugins/CinematicCamera/DiffractionKernelSpec.md
+index c399f45b..dabf0c68 100644
+--- a/Code/CryPlugins/CinematicCamera/DiffractionKernelSpec.md
++++ b/Code/CryPlugins/CinematicCamera/DiffractionKernelSpec.md
+@@ -79,12 +79,31 @@ diffracted light. Zero every texel within `r_core = 2.5` Airy radii of the centr
+ texels per Airy radius → ~6 texels) and record the removed fraction `E_core` (log it; for a
+ circular pupil it is ≈ 0.9). What remains — `I_glare`, integral `1 − E_core` — is the kernel.
+ 
+-Store `sqrt(I_glare)` in an `R16F` `L×L` texture (`$DiffractionKernel`; the square root keeps
+-the 10⁻⁸ tails above half-float denormals; the pixel shader squares it back). Track the
++Store `I_glare` as a **prefiltered mip chain of the LINEAR intensity** in an `R16F` `L×L`
++texture with `log₂ L + 1` levels (`$DiffractionKernel`). The chain exists because the kernel's
++texel pitch on screen is a small *fraction* of a pixel (§2.3): one quarter-res pixel covers
++~17 kernel texels at f/16 and ~100 wide open, while the rays inside the kernel are 1–2 texels
++wide, so a single tap per pixel lands on a ray about one time in seventeen and the pattern
++disappears from the picture even though its *average* energy is right. Level `m` is built by
++box-filtering 2×2 of level `m−1` **in linear intensity**, so `I` at every level is the mean
++intensity over that level's texel footprint.
++
++Encode `sqrt(I)` per level **after** the filtering, never before: `sqrt` is not linear, so a
++box filter of `sqrt(I)` is not `sqrt(mean I)` and the shader's `k²` would come out
++systematically dark. The square root keeps the 10⁻⁸ tails above half-float denormals; the
++pixel shader squares it back, and because of the ordering `k²` *is* the mean intensity over the
++sampled level's texel. Upload every level (the texture is created with the mip count and
++**without** `FT_NOMIPS`; both `GetOrCreate2DTexture`'s creation path and `UpdateTextureRegion`
++walk a source buffer whose levels are consecutive, which is how the job lays them out). Track the
+ extrapolation boundary ring: `I_ring(θ)` = the mean of `I_glare` on the ring `r ∈ [R_tex − 4, R_tex]`
+ (`R_tex = L/2 − 2` texels), 256 angular bins, stored in a second small texture
+-`$DiffractionRing` (`256×1`, R16F, sqrt-encoded as well). The ring is what the far-field
+-extrapolation samples.
++`$DiffractionRing` (`256×1`, R16F, sqrt-encoded as well, **not** mipped — 256 bins over a
++~1600-texel circumference is already 6+ texels per bin, the same order as the angular footprint
++of a pixel covering 17 texels). The ring is what the far-field extrapolation samples.
++
++The removed core is left as it is: `r_core ≈ 6` texels is 1.4 native pixels at f/16, so a
++coarse level averages the hole with its surroundings — which is correct, because the hole sits
++at the source pixel and the frame carries the source there anyway.
+ 
+ Implementation of the FFT: the engine already carries a radix-2 complex 1-D/2-D FFT in
+ `Code/CryEngine/RenderDll/Common/WaterUtils.cpp` (`CWaterSim::ComputeFFT1D/2D`, "2 Dimensional
+@@ -188,16 +207,32 @@ through a small function or a second technique on the same VS with a constant),
+ 
+ ```
+ d        = quad-local in [-1, 1] · R_sprite_px                       (native px from the sprite centre; x already carries the squeeze)
+-for each λ: u_λ = |d| / s_px · (λ₀ / λ);  θ = atan2(d.y, d.x)
+-            I_λ = (u_λ ≤ R_tex) ? kernel(u_λ, θ)² : ring(θ)² · (R_tex / u_λ)²
++for each λ: fScale = lerp(1, λ₀/λ, dispersion)
++            u_λ = |d| / s_q · fScale;  θ = atan2(d.y, d.x)
++            f_λ = fScale / s_q                                      (kernel texels covered by ONE pixel at this λ)
++            lod  = clamp(log₂(max(f_λ, 1)), 0, mips − 1)
++            I_λ = (u_λ ≤ R_tex) ? kernelLod(u_λ, θ, lod)² : ring(θ)² · (R_tex / u_λ)²
+             c  += colour_λ · (λ₀/λ)² · I_λ
+ out = Color.rgb · c · norm                                            (norm = 1 / s_q² only — texel to pixel; the kernel is NOT renormalised)
+ ```
+ 
+-`kernel(u, θ)` samples `$DiffractionKernel` at `0.5 + u/L · (cos θ, sin θ)` (bilinear); `ring(θ)`
+-samples `$DiffractionRing` at `θ / 2π` (bilinear, wrap). Constants: `DiffractionParams0 =
+-(R_sprite_px, s_px, R_tex, norm)`, `DiffractionParams1 = (dispersion, L, 0, 0)`, and the six
+-`colour_λ · (λ₀/λ)²` as a `float4[6]` array (rgb + `λ₀/λ`).
++**The LOD is what makes the deposit an integral rather than a lottery.** `u = r · fScale / s_q`,
++so one pixel of `r` is `f = fScale / s_q` texels of `u`; reading level `log₂ f` returns the mean
++intensity over the pixel's own footprint in one tap, and the surviving `1 / s_q²` (the texel
++count in that footprint) turns that mean into the footprint's integral. The energy bookkeeping
++of §2.4 is unchanged — what changes is that the *sampling* now integrates instead of point-
++testing 1 texel in 17. Never go below level 0 (`max(f, 1)`): the pattern can be magnified, in
++which case level 0 is already finer than a pixel.
++
++`kernelLod(u, θ, lod)` samples `$DiffractionKernel` with `SampleLevel` at
++`0.5 + u/L · (cos θ, sin θ)`; `ring(θ)` samples `$DiffractionRing` at `θ / 2π` (bilinear, wrap).
++The kernel's sampler must be **`TrilinearClamp`** — CRYENGINE builds `FILTER_LINEAR` samplers
++with `MaxLOD = 0`, which would silently pin every `SampleLevel` back to level 0 and undo the
++whole chain. Constants: `DiffractionParams0 = (R_sprite_px, s_q, R_tex, norm)`,
++`DiffractionParams1 = (dispersion, L, maxLod = mips − 1, 0)`, and the six
++`colour_λ · (λ₀/λ)²` as a `float4[6]` array (rgb + `λ₀/λ`). The debug view
++(`r_HDRDiffractionDebug`) deliberately stays on level 0: it is there to show the kernel's true
++structure, not what a pixel averages out of it.
+ 
+ Sprite radius `R_sprite = Reach · H_q` (quarter-res pixels; `Reach` ('stRc', 0..1, default 0.35,
+ fraction of frame height) — the cut-off of the extrapolated tail, purely a cost/coverage
+@@ -207,8 +242,10 @@ sprite pixel = 6 texture reads + 6 ring reads).
+ Log once per change: `[BLOOM] diffraction kernel blades=%d exp=%.2f phase=%.0f mask=%s
+ maskRot=%.0f maskScale=%.2f sa=%.2f -> core=%.2f tail=%.3f physical glare fraction = %.3f
+ L=%d (job %.1f ms)` — the fraction is `1 − E_core`, so how much of the light really becomes
+-glare is readable at a glance. The glare pass logs the fraction it actually deposits (tail
+-included, `amount` applied).
++glare is readable at a glance, plus one line for the mip chain (levels and size). The glare
++pass logs the fraction it actually deposits (tail included, `amount` applied) together with
++the texels a pixel covers and the LOD that follows from it at `λ₀`, so a "no rays" report can
++be read straight off the log.
+ 
+ ## 4. Parameters
+ 
+diff --git a/Engine/Shaders/HWScripts/CryFX/HDRPostProcess.cfx b/Engine/Shaders/HWScripts/CryFX/HDRPostProcess.cfx
+index e5a2711f..f2355553 100644
+--- a/Engine/Shaders/HWScripts/CryFX/HDRPostProcess.cfx
++++ b/Engine/Shaders/HWScripts/CryFX/HDRPostProcess.cfx
+@@ -384,6 +384,18 @@ float4 FilterPSFPS(v2fFilterPSF IN) : SV_Target
+ //    edge. That is exact for a straight blade and pessimistic for anything smoother, so the
+ //    extrapolated tail is never brighter than the physics allows.
+ //
++//  * Sampling. Because the pitch is a fraction of a pixel, ONE PIXEL COVERS TENS OF KERNEL
++//    TEXELS - about 17 at f/16, about 100 wide open - while the rays inside the kernel are one
++//    or two texels wide. A single tap per pixel therefore hits a ray roughly one time in
++//    seventeen and the pattern disappears from the picture even though its average energy is
++//    correct. So the kernel carries a PREFILTERED MIP CHAIN of the LINEAR intensity (built on
++//    the CPU, sqrt-encoded only after filtering, because sqrt is not linear) and each
++//    wavelength is read with an explicit LOD: f = fScale / s_q texels per pixel along the
++//    pattern, lod = log2(max(f, 1)). The tap is then the MEAN intensity over the pixel's
++//    footprint, and the 1 / s_q^2 below turns that mean into the footprint's integral.
++//    The sampler must be TRILINEAR - a MIP_NONE sampler is created with MaxLOD 0 and would pin
++//    every read to level 0.
++//
+ //  * Energy. The kernel is NOT renormalised. Its texels are the Parseval-normalised |F{A}|^2
+ //    of the pupil - the whole pattern summed to 1 before the core was removed - so what the
+ //    texture holds is literally the fraction of the source that was diffracted away. The only
+@@ -396,7 +408,7 @@ float4 FilterPSFPS(v2fFilterPSF IN) : SV_Target
+ //    at the tip. Six samples, weights pre-multiplied and normalised to white on the CPU.
+ 
+ float4 DiffractionParams0;    // (sprite radius in quarter-res px, kernel texel pitch in the same px, R_tex, 1 / pitch^2)
+-float4 DiffractionParams1;    // (dispersion 0..1, grid size L, unused, unused)
++float4 DiffractionParams1;    // (dispersion 0..1, grid size L, max LOD = mip count - 1, unused)
+ float4 DiffractionParams2;    // (sprite half extent x in NDC, half extent y in NDC, energy per unit of source excess, unused)
+ float4 DiffractionSpectrum[6];// rgb = colour * (l0/l)^2 normalised to white, w = l0 / l
+ float4 DiffractionDebugParams;// (display width fraction, display height fraction, log gain, output scale)
+@@ -405,7 +417,7 @@ Texture2D<float4> HDRDiffraction_Src   : register(t0);  // thresholded quarter r
+ Texture2D<float4> HDRDiffraction_Kernel: register(t1);  // sqrt(|F{pupil}|^2), L x L, R16F
+ Texture2D<float4> HDRDiffraction_Ring  : register(t2);  // sqrt(I) on the kernel's boundary ring, 256 x 1, R16F
+ SamplerState HDRDiffraction_PClampSampler : register(s0);  // PointClamp
+-SamplerState HDRDiffraction_LClampSampler : register(s1);  // LinearClamp
++SamplerState HDRDiffraction_LClampSampler : register(s1);  // TrilinearClamp - the kernel is mipped
+ SamplerState HDRDiffraction_LWrapSampler  : register(s2);  // LinearWrap - the ring is an angle
+ 
+ struct v2fDiffraction
+@@ -465,12 +477,16 @@ float4 DiffractionPSFPS(v2fDiffraction IN) : SV_Target
+ 	const float fTheta = atan2(vDir.y, vDir.x);
+ 
+ 	// Distance from the source in KERNEL TEXELS at the reference wavelength.
+-	const float u0 = r / max(DiffractionParams0.y, 1e-6);
++	const float fPitch = max(DiffractionParams0.y, 1e-6);
++	const float u0 = r / fPitch;
+ 	const float fRingRadius = DiffractionParams0.z;
+ 	const float fInvL = 1.0 / max(DiffractionParams1.y, 1.0);
++	const float fMaxLod = DiffractionParams1.z;
+ 
+ 	// The boundary ring, once: it is a function of the angle only, and all six wavelengths
+-	// extrapolate off the same edge. The CPU binned it over [0, 2pi) starting at +x, so u is
++	// extrapolate off the same edge. It is NOT mipped: its 256 bins already span 6+ texels of a
++	// ~1600-texel circumference, which is the same order as the angular footprint of a pixel
++	// covering 17 texels, so a bin is already the pixel's angular average to within a factor. The CPU binned it over [0, 2pi) starting at +x, so u is
+ 	// theta / 2pi with NO half-texture offset; atan2's negative half wraps round through the
+ 	// sampler, which is why the ring must be sampled wrapped and not clamped.
+ 	const float fRingEnc = GetTexture2D(HDRDiffraction_Ring, HDRDiffraction_LWrapSampler,
+@@ -489,9 +505,17 @@ float4 DiffractionPSFPS(v2fDiffraction IN) : SV_Target
+ 		float I;
+ 		if (u <= fRingRadius)
+ 		{
+-			// sqrt-encoded so the 1e-8 tails stay above half float's denormals.
+-			const float k = GetTexture2D(HDRDiffraction_Kernel, HDRDiffraction_LClampSampler,
+-			                             0.5 + (u * fInvL) * vDir).x;
++			// This pixel's footprint in kernel texels at THIS wavelength: u = r * fScale / s_q,
++			// so one pixel of r is fScale / s_q texels of u. Never below one texel (the pattern
++			// can be magnified, in which case level 0 is already finer than the pixel).
++			const float fFootprint = fScale / fPitch;
++			const float fLod = clamp(log2(max(fFootprint, 1.0)), 0.0, fMaxLod);
++
++			// sqrt-encoded so the 1e-8 tails stay above half float's denormals. The chain was
++			// box filtered in LINEAR intensity, so k * k is the mean intensity over the
++			// footprint at every level - which is what makes one tap an integral.
++			const float k = GetTexture2DLod(HDRDiffraction_Kernel, HDRDiffraction_LClampSampler,
++			                                float4(0.5 + (u * fInvL) * vDir, 0, fLod)).x;
+ 			I = k * k;
+ 		}
+ 		else
+@@ -515,6 +539,8 @@ float4 DiffractionDebugPS(vtxOut IN) : SV_Target
+ 	if (uv.x > 1.0 || uv.y > 1.0)
+ 		return float4(0, 0, 0, 0);
+ 
++	// Level 0 deliberately: this view is here to show the kernel's true structure, not what a
++	// screen pixel would average out of it.
+ 	const float k = GetTexture2DLod(HDRDiffraction_Kernel, HDRDiffraction_LClampSampler, float4(uv, 0, 0)).x;
+ 	const float I = k * k * DiffractionDebugParams.z;
+ 	const float v = log(1.0 + I) / log(1.0 + DiffractionDebugParams.z);
+-- 
+2.47.1.windows.1
+

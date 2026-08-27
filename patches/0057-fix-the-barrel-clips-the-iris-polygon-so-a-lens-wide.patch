@@ -1,0 +1,236 @@
+From 28a492c1c2f367ddce7d501ef1cf1c07089bbbdb Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Thu, 27 Aug 2026 14:00:33 +0800
+Subject: [PATCH 57/57] fix: the barrel clips the iris polygon, so a lens wide
+ open diffracts rings and not rays
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01A72MFkdSczncE7au9UVnmu
+---
+ .../GraphicsPipeline/DepthOfField.cpp         |  5 +++
+ .../GraphicsPipeline/DiffractionKernel.cpp    | 41 +++++++++++++++++--
+ .../GraphicsPipeline/DiffractionKernel.h      |  9 +++-
+ .../CinematicCamera/DiffractionKernelSpec.md  | 30 ++++++++++++--
+ .../Module/CinematicCameraComponent.h         |  9 ++--
+ Code/CryPlugins/CinematicCamera/README.md     |  7 +++-
+ 6 files changed, 90 insertions(+), 11 deletions(-)
+
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DepthOfField.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DepthOfField.cpp
+index 05ee05a8..61dab438 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DepthOfField.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DepthOfField.cpp
+@@ -347,6 +347,11 @@ void CDepthOfFieldStage::Execute()
+ 		// gather CDF scale the mask by. Without a mask the pupil is the bare iris polygon.
+ 		pupil.fIrisRadius = bMaskTex ? max(dofParams.fMaskFNumber, 0.7f) / max(dofParams.fApertureFNumber, 0.7f) : 1.0f;
+ 		pupil.fMaskRotation = dofParams.fMaskRotation;
++		// p = N_open / N_geo: how far the blades have come out of the barrel. Wide open the blade
++		// edges sit on the barrel, so the pupil IS the barrel circle - rings, no rays. Stop down
++		// and the polygon emerges from it. This is why a lens only throws sunstars once it is
++		// stopped down. Request() quantises it, and only in the range where it bites.
++		pupil.fPupilScale = clamp_tpl(dofParams.fPupilScale, 0.0f, 1.0f);
+ 		pupil.fKsa = clamp_tpl(dofParams.fSphericalAberration, -1.0f, 1.0f);
+ 		pupil.fSaWaves = clamp_tpl(CRenderer::CV_r_HDRDiffractionSAWaves, 0.0f, 2.0f);
+ 		if (bMaskTex)
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DiffractionKernel.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DiffractionKernel.cpp
+index 1cc5b6a6..8c74d228 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DiffractionKernel.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DiffractionKernel.cpp
+@@ -265,6 +265,21 @@ void CDiffractionKernel::Request(const SDiffractionPupilDesc& descIn)
+ 	desc.fPhase = DEG2RAD(floorf(RAD2DEG(desc.fPhase) + 0.5f));
+ 	desc.fIrisRadius = floorf(clamp_tpl(desc.fIrisRadius, 0.2f, 2.0f) * 20.0f + 0.5f) / 20.0f;
+ 	desc.fMaskRotation = DEG2RAD(floorf(RAD2DEG(desc.fMaskRotation) + 0.5f));
++
++	// The pupil scale is the one shape parameter that moves with the aperture ring, so it is
++	// quantised only in the range where it changes the pupil at all. The barrel sits at
++	// cos(pi/n)^exponent / p and the polygon's corners at 1: for p below cos(pi/n)^exponent the
++	// barrel is outside every corner and the pupil is the bare polygon, the same pupil for every
++	// value down there. All of it collapses onto that one boundary, so a normal aperture sweep -
++	// which lives there - never rebuilds the kernel, and only the last stop or so before wide
++	// open steps in 0.02. Uses the ALREADY QUANTISED blades and exponent, so the bucket is
++	// reproducible.
++	{
++		const float fCorner = powf(cosf(PI / max(desc.fBlades, 3.0f)), desc.fExponent);
++		const float p = clamp_tpl(desc.fPupilScale, 0.0f, 1.0f);
++		desc.fPupilScale = (p < fCorner - 0.02f) ? fCorner
++		                                        : floorf(p * 50.0f + 0.5f) / 50.0f;
++	}
+ 	desc.fKsa = floorf(clamp_tpl(desc.fKsa, -1.0f, 1.0f) * 20.0f + 0.5f) / 20.0f;
+ 	desc.fSaWaves = floorf(clamp_tpl(desc.fSaWaves, 0.0f, 2.0f) * 100.0f + 0.5f) / 100.0f;
+ 
+@@ -370,6 +385,23 @@ void CDiffractionKernel::BuildJob()
+ 	const bool  bMask = !m_jobMaskPixels.empty() && m_jobMaskWidth > 0 && m_jobMaskHeight > 0;
+ 	const float fMaskBound = bMask ? min(m_jobDesc.fIrisRadius, 1.0f) : 1.0f;
+ 	const float fPolyRadius = bMask ? m_jobDesc.fIrisRadius / max(fMaskBound, 1e-3f) : 1.0f;
++	// The barrel is the round mechanical opening the blades retract INTO, and it does not move
++	// with the iris. p = N_open / N_geo is the polygon's size divided by the barrel's, so the
++	// barrel's radius is (the polygon's size) / p. "The polygon's size" is its INSCRIBED radius,
++	// where the blade edges are - NGon_Rad is normalised to the CIRCUMRADIUS, so that is
++	// cos(pi/n) raised to the shape exponent (which is 1 for a circle, i.e. curved blades that
++	// have no corners to hide are never clipped).
++	//
++	// Wide open (p = 1) the barrel disc therefore sits exactly on the blade edges and lies inside
++	// the polygon everywhere else: the intersection IS the circle, tangent to the edges at their
++	// midpoints, and a circular pupil diffracts into rings, not rays. Stop down and the polygon
++	// shrinks inside the barrel, its corners and flats emerge whole, and the rays appear. That is
++	// the other half of "sunstars appear when you stop down" - the first half being the lambda*N
++	// scale on the sensor. Below p = cos(pi/n)^exponent the barrel is past the corners and clips
++	// nothing at all, which is where a normal working aperture lives.
++	const float fPupilScale = max(clamp_tpl(m_jobDesc.fPupilScale, 0.0f, 1.0f), 1e-3f);
++	const float fBladeRadius = powf(cosf(PI / max(m_jobDesc.fBlades, 3.0f)), m_jobDesc.fExponent);
++	const float fBarrelRadius = fPolyRadius * fBladeRadius / fPupilScale;
+ 	const float fMaskCos = cosf(-m_jobDesc.fMaskRotation);
+ 	const float fMaskSin = sinf(-m_jobDesc.fMaskRotation);
+ 
+@@ -399,7 +431,7 @@ void CDiffractionKernel::BuildJob()
+ 				const float r = sqrtf(x * x + y * y);
+ 				fR2Sum += r * r;
+ 
+-				if (r > 1.0f)                                     // the mechanical barrel
++				if (r > fBarrelRadius)                            // the mechanical barrel
+ 					continue;
+ 
+ 				const float theta = atan2_tpl(y, x);
+@@ -701,10 +733,13 @@ void CDiffractionKernel::UploadResult(const char* szNameSuffix)
+ 	// source's own bloom) excluded. It is typically a few parts in a thousand, spread over
+ 	// hundreds of pixels, which is why the physically exact amount of 1 shows almost nothing and
+ 	// why Streak Amount is a source-radiance boost rather than a fudge factor.
+-	CryLog("[BLOOM] diffraction kernel blades=%.0f exp=%.2f phase=%.0f mask=%s maskRot=%.0f maskScale=%.2f sa=%.2f -> core=%.2f tail=%.3g physical glare fraction = %.3f E_far(>%.0f Airy) = %.4f L=%d (job %.1f ms)",
++	CryLog("[BLOOM] diffraction kernel blades=%.0f exp=%.2f phase=%.0f mask=%s maskRot=%.0f maskScale=%.2f p=%.2f barrel=%.2f sa=%.2f -> core=%.2f tail=%.3g physical glare fraction = %.3f E_far(>%.0f Airy) = %.4f L=%d (job %.1f ms)",
+ 	       m_builtDesc.fBlades, m_builtDesc.fExponent, RAD2DEG(m_builtDesc.fPhase),
+ 	       m_builtDesc.maskName.empty() ? "none" : m_builtDesc.maskName.c_str(),
+-	       RAD2DEG(m_builtDesc.fMaskRotation), m_builtDesc.fIrisRadius, m_builtDesc.fKsa,
++	       RAD2DEG(m_builtDesc.fMaskRotation), m_builtDesc.fIrisRadius,
++	       m_builtDesc.fPupilScale,
++	       powf(cosf(PI / max(m_builtDesc.fBlades, 3.0f)), m_builtDesc.fExponent) / max(m_builtDesc.fPupilScale, 1e-3f),
++	       m_builtDesc.fKsa,
+ 	       m_fCoreFraction, m_fTailCoefficient, 1.0f - m_fCoreFraction, kFarAiryRadii, m_fFarFraction,
+ 	       L, m_resultJobMs);
+ 	CryLog("[BLOOM] diffraction kernel mip chain: %d levels (%d..1), %.0f KB", m_nKernelMips, L,
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DiffractionKernel.h b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DiffractionKernel.h
+index ca8504e0..f887765f 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DiffractionKernel.h
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DiffractionKernel.h
+@@ -36,6 +36,13 @@ struct SDiffractionPupilDesc
+ 	float       fExponent = 1.0f;   //!< Iris polygon exponent (1 = the true convex n-gon, 0 = a circle).
+ 	float       fPhase = 0.0f;      //!< Blade rotation, radians.
+ 	float       fIrisRadius = 1.0f; //!< N_mask / N: the iris radius in MASK units. 1 when no mask.
++	//! Pupil scale p = N_open / N_geo, 1 wide open: the iris polygon's size divided by the
++	//! mechanical barrel's. The barrel therefore sits at cos(pi/n)^exponent / p in the polygon's
++	//! units, and wide open it lands exactly on the blade edges - the pupil is then the barrel
++	//! circle, which is why a lens wide open makes rings and not rays. Quantised by Request(),
++	//! and only where it can reach the polygon at all: below cos(pi/n)^exponent the barrel is
++	//! outside the corners and every value down there is the same pupil.
++	float       fPupilScale = 1.0f;
+ 	float       fMaskRotation = 0.0f; //!< Mask rotation, radians. The mask is its own element.
+ 	float       fKsa = 0.0f;        //!< Spherical aberration, -1..1. Enters as a PHASE error.
+ 	float       fSaWaves = 0.25f;   //!< Wavefront error in waves at |k_sa| = 1.
+@@ -45,7 +52,7 @@ struct SDiffractionPupilDesc
+ 	{
+ 		return nGridSize == rhs.nGridSize
+ 		       && fBlades == rhs.fBlades && fExponent == rhs.fExponent && fPhase == rhs.fPhase
+-		       && fIrisRadius == rhs.fIrisRadius && fMaskRotation == rhs.fMaskRotation
++		       && fIrisRadius == rhs.fIrisRadius && fPupilScale == rhs.fPupilScale && fMaskRotation == rhs.fMaskRotation
+ 		       && fKsa == rhs.fKsa && fSaWaves == rhs.fSaWaves && maskName == rhs.maskName;
+ 	}
+ 	bool operator!=(const SDiffractionPupilDesc& rhs) const { return !(*this == rhs); }
+diff --git a/Code/CryPlugins/CinematicCamera/DiffractionKernelSpec.md b/Code/CryPlugins/CinematicCamera/DiffractionKernelSpec.md
+index 00e75908..e54c6707 100644
+--- a/Code/CryPlugins/CinematicCamera/DiffractionKernelSpec.md
++++ b/Code/CryPlugins/CinematicCamera/DiffractionKernelSpec.md
+@@ -62,13 +62,34 @@ shift-invariant; the corners' clipped stars are a later refinement):
+ r, θ from the grid centre, unit radius = d/2
+ polygon:  inside if r ≤ NGon_Rad(θ − phase, blades)^exponent          (same closed form and the SAME exponent the gather/splat use: 1 − curvature · p · strength)
+ mask:     × mask(rotate(x, −maskRotation) · maskScale)                 (R channel of the shape DDS, read through the DOF stage's existing CryPak DDS reader; N_mask / N scaling exactly as the splat's vDofBokehMask.y; 1 when no mask)
+-barrel:   × (r ≤ 1)                                                    (the mechanical opening; no field offset on axis)
++barrel:   × (r ≤ cos(π/n)^exponent / p)                                (the mechanical opening; no field offset on axis. p = N_open/N_geo = fPupilScale, 1 wide open)
+ A(x)      = sqrt(polygon · mask)  ×  exp(i · 2π · W(x))                 (amplitude = sqrt of the intensity transmittance; W = wavefront error in waves)
+ W(x)      = k_sa · W_sa · r⁴                                            (spherical aberration as a PHASE error; W_sa = 0.25 waves at |k_sa| = 1, cvar r_HDRDiffractionSAWaves, default 0.25. This is the physically right place for SA in the glare: an aberrated pupil puts rings and halos around the rays. Optional, 0 disables.)
+ ```
+ 
++**The barrel is what makes the rays appear when you stop down.** It is the fixed round opening
++the blades retract into, so it does not move with the iris: `p = N_open / N_geo` is the polygon's
++size divided by the barrel's, and the barrel's radius in the polygon's own units is therefore
++`(polygon size) / p`. `NGon_Rad` is normalised to the CIRCUMRADIUS, so "polygon size" — the
++inscribed radius, where the blade edges actually are — is `cos(π/n)^exponent`. Consequences:
++
++* `p = 1` (wide open): the barrel disc sits exactly on the blade edges and lies inside the
++  polygon everywhere else, so the intersection **is** the circle, tangent to the edges at their
++  midpoints. A circular pupil diffracts into rings. **No rays wide open** — which is what a real
++  lens does, and the second half of "sunstars appear when you stop down" (the first half being
++  the `λ·N` scale on the sensor). Curved blades (exponent < 1) are clipped by exactly the same
++  relative amount; at exponent 0 the polygon is already a circle and nothing is clipped.
++* `p ≤ cos(π/n)^exponent` (≈ 0.92 for eight straight blades, 0.5 for three): the barrel is past
++  the corners and clips nothing at all. This is where a normal working aperture lives, and the
++  pupil there is the bare polygon — unchanged from before this rule existed.
++* In between, the corners are cut back and the rays fade in continuously.
++
++The on-screen scale (`λ·N·d/L`, §2.3) is untouched by any of this: the polygon's size in the
++raster stays the unit and only the barrel moves.
++
+ Edges are anti-aliased: evaluate 2×2 supersamples per texel (the polygon and barrel tests) and
+-average; the mask is bilinearly sampled. A hard-edged pupil gives the sharp `1/u²` rays; the
++average; the mask is bilinearly sampled. The barrel applies to the mask as well — the pupil is
++`mask ∩ polygon ∩ barrel`, and the mask's scale relative to the polygon is unchanged. A hard-edged pupil gives the sharp `1/u²` rays; the
+ splat's soft edge (`fEdgeSoft`) is a rendering convenience and is **not** applied here.
+ 
+ ### 2.2 The transform
+@@ -119,7 +140,10 @@ when the current one finishes.
+ 
+ Rebuild triggers (quantised so a smooth pull does not rebuild every frame; log each rebuild
+ once): blades; exponent (steps of 0.02); phase (1°); mask texture name; mask rotation (1°);
+-`N_mask/N` scale (steps of 0.05); `k_sa` (0.05); mode/cvar switches. Note that N itself does
++`N_mask/N` scale (steps of 0.05); `k_sa` (0.05); mode/cvar switches; **the pupil scale `p`**
++(steps of 0.02, but ONLY above `cos(π/n)^exponent − 0.02` — below that the barrel cannot reach
++the polygon and every value gives the same pupil, so all of it collapses onto that one boundary
++bucket and an ordinary aperture sweep does not rebuild the kernel at all). Note that N itself does
+ NOT trigger a rebuild — the kernel is computed in the pupil's own units, and N enters only
+ as the on-screen scale (§2.3). The kernel therefore changes only when the pupil's *shape*
+ changes.
+diff --git a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
+index 212606de..3f76303c 100644
+--- a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
++++ b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
+@@ -287,9 +287,12 @@ struct SCineLensParams
+ 			"silhouette and to the soft gather halo alike.", 0.0f);
+ 		desc.AddMember(&SCineLensParams::maxAperture,
+ 			'mxap', "MaxAperture", "Maximum Aperture",
+-			"The lens's wide-open f-number. Sets how big the pupil is relative to the barrel: "
+-			"cat-eye and coma are strongest at this f-number and fade as the iris is stopped "
+-			"down from it. Does not clamp Aperture.", 1.4f);
++			"The lens's wide-open f-number. Sets how big the pupil is relative to the barrel, i.e. "
++			"where the blades disappear into it: at this f-number they are fully retracted, the "
++			"pupil is the round barrel, and the glare is rings rather than rays - the sunstars "
++			"only appear as the polygon emerges from the barrel on the way down. Cat-eye and coma "
++			"are likewise strongest here and fade as the iris is stopped down from it. Does not "
++			"clamp Aperture.", 1.4f);
+ 		desc.AddMember(&SCineLensParams::catEye,
+ 			'ctey', "CatEye", "Cat-eye",
+ 			"Mechanical clipping of the pupil by the lens barrel toward the frame edges: corner "
+diff --git a/Code/CryPlugins/CinematicCamera/README.md b/Code/CryPlugins/CinematicCamera/README.md
+index cf44c276..c102fb82 100644
+--- a/Code/CryPlugins/CinematicCamera/README.md
++++ b/Code/CryPlugins/CinematicCamera/README.md
+@@ -141,7 +141,7 @@ range it is noted in brackets.
+ | Mask Aperture | 1-22 (slider 1-8) | 2.0 | Equivalent f-number of the shape mask's bounding circle. The pupil is iris ∩ mask at every f-number: iris wider than this and the mask bounds the pupil (its shape rules, the polygon only trims what pokes past it); iris stopped down past it and the polygon bounds the pupil, clipping the silhouette corner by corner. Depth of field and bokeh SIZE follow whichever hole is the smaller one. Only used when a Bokeh Shape Texture is set. |
+ | Mask Rotation (deg) | 0-360 | 0 | Rotation of the shape mask around the optical axis, independent of Blade Rotation (the mask is its own element): a note cut-out turns while the blade polygon and the sunstars stay put. Applies to the splatted silhouette and the soft gather halo alike. |
+ | Mask Open Area | 0-1 | 1.0 | Transmittance of the mask's OPEN parts (a tinted gel in the cut-out; 1 = clear). The blocked part is measured from the texture itself: light reaching the sensor = area(iris ∩ mask) / area(iris) × this value, through the same T-stop term as glass transmission, so exposure and film grain react like a neutral density loss - continuously, at every f-number. |
+-| Maximum Aperture | 1-22 (slider 1-8) | 1.4 | The lens's wide-open f-number. Sets how big the pupil is relative to the barrel: cat-eye and coma are strongest at this f-number and fade as the iris is stopped down from it. Does not clamp Aperture. See *Field-dependent pupil*. |
++| Maximum Aperture | 1-22 (slider 1-8) | 1.4 | The lens's wide-open f-number. Sets how big the pupil is relative to the barrel, i.e. where the blades disappear into it: at this f-number they are flush with the barrel, the pupil is its round opening, and the glare is rings rather than rays - the sunstars appear only as the polygon emerges from the barrel on the way down. Cat-eye and coma are likewise strongest here and fade as the iris is stopped down from it. Does not clamp Aperture. See *Field-dependent pupil*. |
+ | Cat-eye | 0-1 | 0 | Mechanical clipping of the pupil by the lens barrel toward the frame edges: corner bokeh becomes lens-shaped (long axis tangential), edges darken and their bokeh dims, all fading as the iris closes. 0.2-0.4 natural, 1 caricature. Replaces the guessed mechanical part of Vignette Aperture Link. |
+ | Coma | 0-1 | 0 | Off-axis highlights grow radial comet tails, strongest wide open, gone when stopped down. |
+ | Astigmatism | -1 to 1 | 0 | Radial/tangential focus split: off-axis blur stretches radially on one side of focus and tangentially on the other. Sign swaps which side. |
+@@ -667,6 +667,11 @@ What that buys, none of it authored:
+   enough to hide under the source's own bloom. That IS "sunstars appear when you stop down".
+   The component's Analytic f-number ramp does not gate this model either — in Wave mode the pass
+   is live at every aperture, so nothing pops in at f/6.4.
++- **Wide open there are no rays at all, because there is no polygon.** The blades retract into
++  the round barrel, and at `Maximum Aperture` they are flush with it: the pupil is the barrel's
++  circle, and a circle diffracts into rings. The iris polygon only emerges from the barrel as
++  you stop down (below `p = N_open/N ≈ cos(pi/n)` it is clear of it entirely), and the rays come
++  out with it. That is the other half of "sunstars appear when you stop down".
+ - **Blade Curvature shortens and softens the rays** — a rounded outline has less straight edge
+   to diffract off — and **a shape mask throws its own pattern**, turning with `Mask Rotation`.
+ - **The rainbow is dispersion.** Six wavelengths (420-670 nm), each a scaled copy
+-- 
+2.47.1.windows.1
+

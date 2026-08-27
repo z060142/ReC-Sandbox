@@ -1,0 +1,829 @@
+From 2a8c050bf184dd9628d0afc5f70fc1cfec1825c8 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Thu, 27 Aug 2026 11:20:14 +0800
+Subject: [PATCH 47/57] feat: wave glare sprite pass - the frame's highlights
+ convolved with the pupil's diffraction pattern, six wavelengths as scaled
+ copies and a 1/u^2 far-field tail off the kernel's boundary ring; streak Mode
+ switch, four r_HDRDiffraction* cvars, analytic path untouched
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01A72MFkdSczncE7au9UVnmu
+---
+ .../Common/PostProcess/PostEffects.cpp        |  10 +
+ .../Common/PostProcess/PostEffects.h          |  17 +
+ .../RenderDll/Common/RendererCVars.cpp        |  25 ++
+ .../RenderDll/Common/RendererCVars.h          |   6 +
+ .../XRenderD3D9/GraphicsPipeline/Bloom.cpp    | 329 +++++++++++++++++-
+ .../XRenderD3D9/GraphicsPipeline/Bloom.h      |  16 +
+ .../HWScripts/CryFX/HDRPostProcess.cfx        | 217 ++++++++++--
+ 7 files changed, 593 insertions(+), 27 deletions(-)
+
+diff --git a/Code/CryEngine/RenderDll/Common/PostProcess/PostEffects.cpp b/Code/CryEngine/RenderDll/Common/PostProcess/PostEffects.cpp
+index ada7390f..9e767908 100644
+--- a/Code/CryEngine/RenderDll/Common/PostProcess/PostEffects.cpp
++++ b/Code/CryEngine/RenderDll/Common/PostProcess/PostEffects.cpp
+@@ -170,6 +170,11 @@ void CHDRStreaks::Reset(bool bOnSpecChange)
+ 	m_pFilterRotation->ResetParam(0.0f);
+ 	m_pFilterThreshold->ResetParam(6.0f);
+ 	m_pFilterPoints->ResetParam(4.0f);
++
++	m_pMode->ResetParam(1.0f);
++	m_pWaveAmount->ResetParam(1.0f);
++	m_pWaveReach->ResetParam(0.35f);
++	m_pDispersion->ResetParam(1.0f);
+ 	// The PSF image is deliberately NOT dropped here, exactly as the DOF leaves its bokeh
+ 	// shape texture alone: the owner re-pushes the name every frame, and releasing it would
+ 	// only make the plate blink out for one frame on every spec change.
+@@ -198,6 +203,11 @@ SHDRStreaksParams CHDRStreaks::GetParams() const
+ 	params.nFilterPoints = (int)clamp_tpl(m_pFilterPoints->GetParam(), 4.0f, 8.0f);
+ 	params.pFilterPSFTex = const_cast<CTexture*>(static_cast<CParamTexture*>(m_pFilterPSFTex)->GetParamTexture());
+ 
++	params.nMode = (m_pMode->GetParam() > 0.5f) ? 1 : 0;
++	params.fWaveAmount = clamp_tpl(m_pWaveAmount->GetParam(), 0.0f, 4.0f);
++	params.fWaveReach = clamp_tpl(m_pWaveReach->GetParam(), 0.02f, 1.0f);
++	params.fDispersion = clamp_tpl(m_pDispersion->GetParam(), 0.0f, 1.0f);
++
+ 	return params;
+ }
+ 
+diff --git a/Code/CryEngine/RenderDll/Common/PostProcess/PostEffects.h b/Code/CryEngine/RenderDll/Common/PostProcess/PostEffects.h
+index c0a4137c..dd77f088 100644
+--- a/Code/CryEngine/RenderDll/Common/PostProcess/PostEffects.h
++++ b/Code/CryEngine/RenderDll/Common/PostProcess/PostEffects.h
+@@ -354,6 +354,7 @@ struct SHDRStreaksParams
+ 		: bActive(false), nDirectionCount(8), fAngle(0.0f), fAmount(0.0f), fThreshold(4.0f), fLength(0.5f)
+ 		, fAnamorphicAmount(0.0f), fAnamorphicLength(0.7f), fAnamorphicThreshold(3.0f), vAnamorphicTint(0.35f, 0.62f, 1.0f, 0.0f)
+ 		, fFilterAmount(0.0f), fFilterSize(0.25f), fFilterRotation(0.0f), fFilterThreshold(6.0f), nFilterPoints(4), pFilterPSFTex(nullptr)
++		, nMode(1), fWaveAmount(1.0f), fWaveReach(0.35f), fDispersion(1.0f)
+ 	{
+ 	};
+ 
+@@ -382,6 +383,15 @@ struct SHDRStreaksParams
+ 	float     fFilterThreshold; //!< Scene HDR value a source has to exceed to spawn the pattern.
+ 	int       nFilterPoints;    //!< Points of the procedural star when no PSF texture is bound (4/6/8).
+ 	CTexture* pFilterPSFTex;    //!< RGB point spread image, centred, black outside. Null = procedural star.
++
++	//! Wave-optics diffraction mode (DiffractionKernelSpec.md). 0 = Analytic (the line pairs
++	//! above), 1 = Wave: the frame's highlights are convolved with |FFT(pupil)|^2, the real
++	//! diffraction pattern of the iris. The two are exclusive; the anamorphic flare and the
++	//! front filter are unaffected either way.
++	int   nMode;         //!< 0 = analytic line pairs, 1 = wave-optics kernel.
++	float fWaveAmount;   //!< 0-4 strength of the wave glare. 1 = what the pupil says (no f-number ramp).
++	float fWaveReach;    //!< Sprite radius as a fraction of frame height: where the 1/u^2 tail is cut off.
++	float fDispersion;   //!< 0-1. 1 = the full six-wavelength rainbow, 0 = a monochrome pattern at 550 nm.
+ };
+ 
+ //! Parameter container only - the passes live in CBloomStage, which reads these the same way
+@@ -412,6 +422,11 @@ public:
+ 		AddParamFloatNoTransition("HDR_Filter_Threshold", m_pFilterThreshold, 6.0f);
+ 		AddParamFloatNoTransition("HDR_Filter_Points", m_pFilterPoints, 4.0f);
+ 		AddParamTex("HDR_Filter_PSFTex", m_pFilterPSFTex, 0);
++
++		AddParamFloatNoTransition("HDR_Streaks_Mode", m_pMode, 1.0f);
++		AddParamFloatNoTransition("HDR_Streaks_WaveAmount", m_pWaveAmount, 1.0f);
++		AddParamFloatNoTransition("HDR_Streaks_WaveReach", m_pWaveReach, 0.35f);
++		AddParamFloatNoTransition("HDR_Streaks_Dispersion", m_pDispersion, 1.0f);
+ 	}
+ 
+ 	//! Never preprocessed or executed: the effect exists purely to own the parameters.
+@@ -444,6 +459,8 @@ private:
+ 	// Front filter PSF: four floats, a float carrying the star's point count, and a CTexture.
+ 	CEffectParam* m_pFilterAmount, * m_pFilterSize, * m_pFilterRotation, * m_pFilterThreshold, * m_pFilterPoints;
+ 	CEffectParam* m_pFilterPSFTex;
++	// Wave-optics diffraction: the mode switch and the three knobs that only apply in it.
++	CEffectParam* m_pMode, * m_pWaveAmount, * m_pWaveReach, * m_pDispersion;
+ };
+ 
+ ////////////////////////////////////////////////////////////////////////////////////////////////////
+diff --git a/Code/CryEngine/RenderDll/Common/RendererCVars.cpp b/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
+index 745599cb..19e5e310 100644
+--- a/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
++++ b/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
+@@ -188,6 +188,10 @@ int CRendererCVars::CV_r_HDRBloom;
+ int CRendererCVars::CV_r_HDRBloomQuality;
+ int CRendererCVars::CV_r_HDRStreaks;
+ int CRendererCVars::CV_r_HDRHalation;
++int CRendererCVars::CV_r_HDRDiffractionKernel;
++int CRendererCVars::CV_r_HDRDiffractionDebug;
++int CRendererCVars::CV_r_HDRDiffractionKernelSize;
++float CRendererCVars::CV_r_HDRDiffractionSAWaves;
+ int CRendererCVars::CV_r_HDRVignetting;
+ int CRendererCVars::CV_r_HDRTexFormat;
+ AllocateConstIntCVar(CRendererCVars, CV_r_HDRRangeAdapt);
+@@ -1219,6 +1223,27 @@ void CRendererCVars::InitCVars()
+ 	               "2 = DIAGNOSTIC force mode (amount 1, threshold 0.5, radius 0.7, "
+ 	               "independent of the game-side params).");
+ 
++	REGISTER_CVAR3("r_HDRDiffractionKernel", CV_r_HDRDiffractionKernel, 1, VF_NULL,
++	               "Wave-optics glare kernel: the sunstar of a point source is the Fraunhofer "
++	               "diffraction pattern of the pupil, |FFT(pupil)|^2, computed on a job and "
++	               "convolved with the frame's highlights. 0 = never built, so the streaks' Wave "
++	               "mode falls back to the analytic line pairs (kill switch). 1 = on.");
++
++	REGISTER_CVAR3("r_HDRDiffractionDebug", CV_r_HDRDiffractionDebug, 0, VF_NULL,
++	               "Diffraction kernel diagnostics. 0 = off, 1 = draw the kernel texture into the "
++	               "top-left corner of the frame with a log tone curve, so the pattern the FFT "
++	               "actually produced can be read directly.");
++
++	REGISTER_CVAR3("r_HDRDiffractionKernelSize", CV_r_HDRDiffractionKernelSize, 512, VF_NULL,
++	               "Grid the pupil is rastered and transformed on: 512 (default) or 256. 256 is a "
++	               "4x cheaper job at half the structural resolution; the pupil stays half the "
++	               "grid either way, so the pattern's reach is unchanged.");
++
++	REGISTER_CVAR3("r_HDRDiffractionSAWaves", CV_r_HDRDiffractionSAWaves, 0.25f, VF_NULL,
++	               "Wavefront error, in waves, that the lens' Spherical Aberration 1 corresponds "
++	               "to in the diffraction kernel. Spherical aberration is a PHASE error across the "
++	               "pupil, which is what puts rings and a halo around the rays. 0 disables it.");
++
+ 	REGISTER_CVAR3("r_HDRVignetting", CV_r_HDRVignetting, 1, VF_DUMPTODISK,
+ 	               "HDR viggneting\n"
+ 	               "Usage: r_HDRVignetting [Value]\n"
+diff --git a/Code/CryEngine/RenderDll/Common/RendererCVars.h b/Code/CryEngine/RenderDll/Common/RendererCVars.h
+index 7a20b4e4..72c0de61 100644
+--- a/Code/CryEngine/RenderDll/Common/RendererCVars.h
++++ b/Code/CryEngine/RenderDll/Common/RendererCVars.h
+@@ -251,6 +251,12 @@ public:
+ 	static int CV_r_HDRBloomQuality;
+ 	static int CV_r_HDRStreaks;
+ 	static int CV_r_HDRHalation;
++	//! Wave-optics diffraction kernel (DiffractionKernelSpec.md): the FFT of the pupil used as
++	//! the glare PSF, instead of the analytic line pairs.
++	static int   CV_r_HDRDiffractionKernel;
++	static int   CV_r_HDRDiffractionDebug;
++	static int   CV_r_HDRDiffractionKernelSize;
++	static float CV_r_HDRDiffractionSAWaves;
+ 	static int CV_r_HDRVignetting;
+ 	static int CV_r_HDRTexFormat;
+ 	DeclareStaticConstIntCVar(CV_r_HDRRangeAdapt, HDR_RANGE_ADAPT_DEFAULT_VAL);
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Bloom.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Bloom.cpp
+index a641f3fb..29590310 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Bloom.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Bloom.cpp
+@@ -2,6 +2,7 @@
+ 
+ #include "StdAfx.h"
+ #include "Bloom.h"
++#include "DepthOfField.h"
+ #include "D3DPostProcess.h"
+ 
+ // Taps per stretch iteration. Must match the unrolled loop in HDRStreakStretchPS.
+@@ -139,13 +140,45 @@ void CBloomStage::ExecuteStreaks()
+ 		streakParams.fLength = 0.6f;
+ 	}
+ 
+-	// Two independent effects share this pass block: the iris diffraction spikes and the
+-	// anamorphic horizontal flare thrown by a cylindrical front element. Either one alone is
+-	// enough to run the block; only both being off skips it.
+-	const bool bBlade = streakParams.bActive && streakParams.fAmount >= 0.001f && streakParams.nDirectionCount >= 4;
++	// The iris diffraction has two models of the SAME physics and they are exclusive.
++	//
++	//   Analytic - the original: N line pairs painted by directional stretch blurs, with an
++	//              f-number ramp tuned by eye. Untouched, byte for byte.
++	//   Wave     - DiffractionKernelSpec.md: the frame's highlights convolved with the pupil's
++	//              real Fraunhofer pattern, |FFT(pupil)|^2. No ramp; stopping down spreads the
++	//              pattern by itself, which IS why sunstars appear when you stop down.
++	//
++	// r_HDRStreaks 2 is the ANALYTIC diagnostic force and deliberately does not force Wave: it
++	// exists to prove the analytic passes still run, and forcing a different model would defeat
++	// exactly that.
++	//
++	// The kernel lives in the DOF stage, so Wave needs that stage to be running (r_dof > 0) -
++	// it is what resolves the pupil and ticks the job. Until the first kernel has landed, and
++	// for as long as it never does, the analytic lines carry the effect rather than nothing.
++	// Readiness is a latch, not a per-frame test: a rebuild keeps the PREVIOUS kernel live, so
++	// this cannot flicker between the two models while the pupil is being pulled.
++	const CDepthOfFieldStage* pDofStageForKernel = m_graphicsPipeline.GetStage<CDepthOfFieldStage>();
++	const bool bKernelReady = (pDofStageForKernel != nullptr) && pDofStageForKernel->GetDiffractionKernel().IsReady();
++
++	const bool bWaveMode = (streakParams.nMode == 1) && (CRenderer::CV_r_HDRStreaks != 2) && (CRenderer::CV_r_HDRDiffractionKernel != 0) && bKernelReady;
++	const bool bWave = bWaveMode && streakParams.bActive && streakParams.fWaveAmount >= 0.001f;
++	const bool bBlade = !bWaveMode && streakParams.bActive && streakParams.fAmount >= 0.001f && streakParams.nDirectionCount >= 4;
+ 	const bool bAnamorphic = streakParams.fAnamorphicAmount >= 0.001f;
+ 
+-	if (!bBlade && !bAnamorphic)
++	// The kill switch: with the kernel refused, Wave mode falls back to the analytic lines, once
++	// per transition in the log rather than silently looking broken.
++	{
++		static int s_nLastFallback = -1;
++		const int nFallback = ((streakParams.nMode == 1) && (CRenderer::CV_r_HDRDiffractionKernel == 0)) ? 1 : 0;
++		if (nFallback != s_nLastFallback)
++		{
++			s_nLastFallback = nFallback;
++			if (nFallback)
++				CryLog("[BLOOM] r_HDRDiffractionKernel 0: streak mode Wave falls back to the analytic line pairs");
++		}
++	}
++
++	if (!bBlade && !bAnamorphic && !bWave)
+ 		return;
+ 
+ 	PROFILE_LABEL_SCOPE("HDR_STREAKS");
+@@ -244,6 +277,12 @@ void CBloomStage::ExecuteStreaks()
+ 		}
+ 	}
+ 
++	// Wave-optics diffraction. Sits exactly where the analytic lines would have been - the two
++	// are alternatives, never both - and, like them, it consumes the scratch targets and hands
++	// them back before the anamorphic flare re-thresholds into them below.
++	if (bWave)
++		ExecuteDiffraction(streakParams, fBloomCompositeWeight);
++
+ 	// Anamorphic horizontal flare. A cylindrical front element throws one long tinted line
+ 	// across the frame instead of a star, so this is a single horizontal march - but a much
+ 	// longer one: three iterations of 8 taps span 8^3 tap distances, the whole frame width.
+@@ -312,6 +351,286 @@ void CBloomStage::ExecuteStreaks()
+ 	}
+ }
+ 
++// Wave-optics diffraction glare (DiffractionKernelSpec.md).
++//
++// The glare of a point source is not a set of lines someone painted: it is the Fraunhofer
++// diffraction pattern of the pupil the light came through, |F{A}|^2. A 9-blade iris throws 18
++// rays with a specific intensity pattern; a star-shaped mask throws its own; curved blades
++// soften and shorten the rays; an aberrated pupil puts rings around them. All of that is one
++// transform, which the DOF stage's job has already computed by the time we get here - the pupil
++// lives there, so the kernel does too.
++//
++// What is left for this pass is the CONVOLUTION and the SCALE.
++//
++// Scale: a DFT of a pupil d texels across on an L texel grid gives a pattern whose texel pitch
++// on the sensor is lambda * N * d / L. At f/11 on a full frame that is about 0.16 native pixels,
++// so the whole 512^2 texture spans only some 40 pixels of screen. The FFT resolves the
++// STRUCTURE; the REACH has to come from the far-field law, and the pixel shader extrapolates
++// past the texture's edge with the 1/u^2 of a straight edge, read off the kernel's boundary
++// ring. This is also where "sunstars appear when you stop down" comes from for free: N scales
++// the pattern, so stopping down spreads the same energy fraction over a larger pattern - longer
++// rays, dimmer per pixel. No f-number ramp exists anywhere in this path, by design.
++//
++// Convolution: the front filter's sparse sprite convolution, unchanged in shape - threshold the
++// quarter-resolution frame, one sprite per surviving texel, deposit additively into the bloom
++// target with the bloom composite weight divided back out.
++void CBloomStage::ExecuteDiffraction(const SHDRStreaksParams& streakParams, float fBloomCompositeWeight)
++{
++	CDepthOfFieldStage* pDofStage = m_graphicsPipeline.GetStage<CDepthOfFieldStage>();
++	if (pDofStage == nullptr)
++		return;
++
++	const CDiffractionKernel& kernel = pDofStage->GetDiffractionKernel();
++
++	// Not ready yet: the first job takes a frame or two to land, and a pupil change re-runs it.
++	// Draw NOTHING rather than falling back to the analytic lines - a per-frame fallback would
++	// flash the old model on every blade-rotation step.
++	if (!kernel.IsReady())
++		return;
++
++	CTexture* pSource = m_graphicsPipelineResources.m_pTexHDRTargetScaled[1][1];
++	CTexture* pTarget = m_graphicsPipelineResources.m_pTexHDRFinalBloom;
++
++	if (!CTexture::IsTextureExist(pSource) || !CTexture::IsTextureExist(pTarget))
++		return;
++
++	PROFILE_LABEL_SCOPE("HDR_DIFFRACTION");
++
++	static CCryNameTSCRC techStreakThreshold("HDRStreakThreshold");
++	static CCryNameTSCRC techDiffraction("HDRDiffractionPSF");
++	static CCryNameTSCRC techDiffractionDebug("HDRDiffractionDebug");
++	static CCryNameR streakParams1Name("StreakParams1");
++	static CCryNameR diffParams0Name("DiffractionParams0");
++	static CCryNameR diffParams1Name("DiffractionParams1");
++	static CCryNameR diffParams2Name("DiffractionParams2");
++	static CCryNameR diffSpectrumName("DiffractionSpectrum");
++	static CCryNameR diffDebugName("DiffractionDebugParams");
++
++	// 1. Threshold, the streaks' own technique and their own threshold - one source of glare
++	//    sources for the whole family, so a lamp that streaks also stars and halates.
++	if (m_passDiffractionThreshold.IsDirty())
++	{
++		m_passDiffractionThreshold.SetPrimitiveFlags(CRenderPrimitive::eFlags_ReflectShaderConstants_PS);
++		m_passDiffractionThreshold.SetPrimitiveType(CRenderPrimitive::ePrim_ProceduralTriangle);
++		m_passDiffractionThreshold.SetTechnique(CShaderMan::s_shHDRPostProcess, techStreakThreshold, 0);
++		m_passDiffractionThreshold.SetRenderTarget(0, pSource);
++		m_passDiffractionThreshold.SetState(GS_NODEPTHTEST | GS_NOCOLMASK_A);
++		m_passDiffractionThreshold.SetTexture(0, m_graphicsPipelineResources.m_pTexHDRTargetScaled[0][0]);
++		m_passDiffractionThreshold.SetSampler(0, EDefaultSamplerStates::LinearClamp);
++	}
++
++	m_passDiffractionThreshold.BeginConstantUpdate();
++	m_passDiffractionThreshold.SetConstant(streakParams1Name, Vec4(streakParams.fThreshold, max(streakParams.fThreshold * 0.25f, 0.01f), 0, 0), eHWSC_Pixel);
++	m_passDiffractionThreshold.Execute();
++
++	const int32 nGridWidth = pSource->GetWidth();
++	const int32 nGridHeight = pSource->GetHeight();
++	const uint32 nVertexCount = uint32(nGridWidth) * uint32(nGridHeight) * 3 * 2;
++
++	if (!m_pDiffractionPerViewCB)
++	{
++		m_pDiffractionPerViewCB = gcpRendD3D->m_DevBufMan.CreateConstantBuffer(sizeof(HLSL_PerViewGlobalConstantBuffer));
++		if (m_pDiffractionPerViewCB)
++			m_pDiffractionPerViewCB->SetDebugName("Diffraction Per-View CB");
++	}
++
++	if (!m_pDiffractionPerViewCB)
++		return;
++
++	// The pattern's texel pitch on the sensor, in QUARTER RESOLUTION pixels - the unit the
++	// sprite grid is measured in.
++	//
++	//   s = lambda0 * N_geo * d / L        (metres on the sensor)
++	//   s_q = s * grid_width / sensor_width
++	//
++	// N is the geometric aperture the DOF resolved (max(N, N_mask) with a mask bound), because
++	// a mask stops the light down just as the iris does and the pattern follows the hole light
++	// actually passed.
++	const float kLambda0 = 550e-9f;
++	const float fSensorWidthM = max(pDofStage->GetDiffractionSensorWidthMM(), 1.0f) * 0.001f;
++	const float fPitchQuarterPx = max(kLambda0 * pDofStage->GetDiffractionNGeo() * kernel.GetTexelPitchPupilUnits()
++	                                  * (float)nGridWidth / fSensorWidthM, 1e-6f);
++
++	// Sprite radius, a fraction of the frame HEIGHT so the reach is the same at any aspect
++	// ratio. This is purely where the extrapolated tail is CUT OFF - a cost and coverage choice,
++	// not a property of the lens. Bigger = more of the faint tail, quadratically more pixels.
++	const float fRadiusQuarterPx = max(streakParams.fWaveReach * (float)nGridHeight, 2.0f);
++
++	// Anamorphic: the iris sits BEHIND the cylindrical front group, so its pattern is formed
++	// unsqueezed and then stretched horizontally by the desqueeze - the sprite's x half extent
++	// is multiplied by S. This is the OPPOSITE of the front filter PSF, which is a plate in
++	// front of the cylinder and is therefore squeezed like the rest of the picture. The analytic
++	// streaks do neither: they march in texel space and ignore the squeeze entirely, which is a
++	// known simplification of that model and is left exactly as it is.
++	const float fSqueeze = clamp_tpl(PostEffectMgr()->GetByNameF("Dof_User_AnamorphicSqueeze"), 1.0f, 2.0f);
++
++	const float fRadiusNdcY = 2.0f * fRadiusQuarterPx / (float)nGridHeight;
++	const float fRadiusNdcX = 2.0f * (fRadiusQuarterPx * fSqueeze) / (float)nGridWidth;
++
++	// Energy. The kernel's integral is the texture's own plus the extrapolated tail out to the
++	// sprite's rim; the tail is logarithmic, hence finite, and the CPU handed us its coefficient
++	// so the deposit is energy correct INCLUDING what the sprite cuts off. Dividing by the pitch
++	// squared converts "per kernel texel" into "per quarter-resolution pixel", which is what the
++	// sprite actually rasterizes.
++	//
++	// With that, amount 1 puts the source's whole thresholded excess into the pattern the pupil
++	// dictates - no gain constant tuned by eye anywhere. (The removed core is NOT added back:
++	// the frame already carries the source itself. Its fraction is in the kernel's log line, so
++	// how much of the light really went into the glare stays readable.)
++	const float fRingRadius = max(kernel.GetRingRadius(), 1.0f);
++	const float fSpriteRadiusTexels = max(fRadiusQuarterPx / fPitchQuarterPx, fRingRadius);
++	const float fIntegral = max(kernel.GetTextureIntegral()
++	                            + kernel.GetTailCoefficient() * logf(fSpriteRadiusTexels / fRingRadius), 1e-12f);
++	const float fNorm = 1.0f / (fIntegral * fPitchQuarterPx * fPitchQuarterPx);
++	const float fEnergy = streakParams.fWaveAmount / fBloomCompositeWeight;
++
++	// Spectral sampling. Each wavelength is a SCALED copy of the same pattern -
++	// PSF_lambda(u) = (l0/l)^2 * PSF_l0(u * l0/l) - so blue sits compact near the core and red
++	// runs out to the tips. That is what makes a real sunstar's rays rainbow: dispersion, not a
++	// hue ramp. The six columns are rescaled once so their weighted sum is exactly white.
++	Vec4 vSpectrum[6];
++	{
++		static const float s_lambdaNm[6] = { 420.0f, 470.0f, 520.0f, 570.0f, 620.0f, 670.0f };
++		static const Vec3  s_colour[6] =
++		{
++			Vec3(0.05f, 0.00f, 0.35f), Vec3(0.00f, 0.10f, 0.50f), Vec3(0.00f, 0.55f, 0.15f),
++			Vec3(0.35f, 0.35f, 0.00f), Vec3(0.45f, 0.00f, 0.00f), Vec3(0.15f, 0.00f, 0.00f)
++		};
++
++		Vec3 vSum(0.0f, 0.0f, 0.0f);
++		float fRatio[6];
++		float fWeight[6];
++		for (int i = 0; i < 6; ++i)
++		{
++			fRatio[i] = 550.0f / s_lambdaNm[i];
++			fWeight[i] = fRatio[i] * fRatio[i];
++			vSum += s_colour[i] * fWeight[i];
++		}
++
++		const Vec3 vScale(1.0f / max(vSum.x, 1e-4f), 1.0f / max(vSum.y, 1e-4f), 1.0f / max(vSum.z, 1e-4f));
++		for (int i = 0; i < 6; ++i)
++		{
++			const Vec3 c = s_colour[i] * fWeight[i];
++			vSpectrum[i] = Vec4(c.x * vScale.x, c.y * vScale.y, c.z * vScale.z, fRatio[i]);
++		}
++	}
++
++	// Once per change, never per frame: what the pattern actually resolves to on screen.
++	{
++		static float s_lastPitch = -1.0f, s_lastAmount = -1.0f, s_lastReach = -1.0f, s_lastDispersion = -1.0f, s_lastN = -1.0f;
++		if (fabsf(fPitchQuarterPx - s_lastPitch) > 0.0005f || fabsf(streakParams.fWaveAmount - s_lastAmount) > 0.005f ||
++		    fabsf(streakParams.fWaveReach - s_lastReach) > 0.005f || fabsf(streakParams.fDispersion - s_lastDispersion) > 0.005f ||
++		    fabsf(pDofStage->GetDiffractionNGeo() - s_lastN) > 0.01f)
++		{
++			s_lastPitch = fPitchQuarterPx;
++			s_lastAmount = streakParams.fWaveAmount;
++			s_lastReach = streakParams.fWaveReach;
++			s_lastDispersion = streakParams.fDispersion;
++			s_lastN = pDofStage->GetDiffractionNGeo();
++			CryLog("[BLOOM] diffraction glare amount=%.2f reach=%.2f disp=%.2f N=%.1f -> pitch=%.3f q-px/texel sprite=%.0f q-px (%.0f texels) core=%.2f norm=%.3g",
++			       streakParams.fWaveAmount, streakParams.fWaveReach, streakParams.fDispersion,
++			       pDofStage->GetDiffractionNGeo(), fPitchQuarterPx, fRadiusQuarterPx, fSpriteRadiusTexels,
++			       kernel.GetCoreFraction(), fNorm);
++		}
++	}
++
++	// 2. One sprite per surviving source texel. The per-view constant buffer describes the
++	//    quarter-resolution GRID the vertex shader walks, not the render target - the same
++	//    separation the front filter and the DOF's splat and ghost passes use.
++	const SRenderViewInfo& viewInfo = m_graphicsPipeline.GetCurrentViewInfo(CCamera::eEye_Left);
++	const SRenderViewport customViewport(0, 0, nGridWidth, nGridHeight);
++	m_graphicsPipeline.GeneratePerViewConstantBuffer(&viewInfo, (int)m_graphicsPipeline.GetViewInfoCount(), m_pDiffractionPerViewCB, &customViewport);
++
++	D3DViewPort viewport;
++	viewport.TopLeftX = 0.0f;
++	viewport.TopLeftY = 0.0f;
++	viewport.Width = (float)pTarget->GetWidth();
++	viewport.Height = (float)pTarget->GetHeight();
++	viewport.MinDepth = 0.0f;
++	viewport.MaxDepth = 1.0f;
++
++	m_passDiffraction.SetRenderTarget(0, pTarget);
++	m_passDiffraction.SetViewport(viewport);
++	m_passDiffraction.BeginAddingPrimitives();
++
++	CRenderPrimitive& prim = m_diffractionPrimitive;
++	prim.SetFlags(CRenderPrimitive::eFlags_ReflectShaderConstants_VS | CRenderPrimitive::eFlags_ReflectShaderConstants_PS);
++	prim.SetTechnique(CShaderMan::s_shHDRPostProcess, techDiffraction, 0);
++	prim.SetRenderState(GS_NODEPTHTEST | GS_NOCOLMASK_A | GS_BLSRC_ONE | GS_BLDST_ONE);
++	prim.SetCullMode(eCULL_None);
++
++	prim.SetCustomVertexStream(~0u, EDefaultInputLayouts::Empty, 0);
++	prim.SetDrawInfo(eptTriangleList, 0, 0, nVertexCount);
++
++	prim.SetTexture(0, pSource, EDefaultResourceViews::Default, EShaderStage_Vertex);
++	prim.SetTexture(1, kernel.GetKernelTexture(), EDefaultResourceViews::Default, EShaderStage_Pixel);
++	prim.SetTexture(2, kernel.GetRingTexture(), EDefaultResourceViews::Default, EShaderStage_Pixel);
++	prim.SetSampler(0, EDefaultSamplerStates::PointClamp, EShaderStage_Vertex);
++	prim.SetSampler(1, EDefaultSamplerStates::LinearClamp, EShaderStage_Pixel);
++	// The ring is an angle, so it WRAPS: theta = -pi and theta = +pi are the same direction and
++	// a clamped sampler would flatten the pattern along the -x axis.
++	prim.SetSampler(2, EDefaultSamplerStates::LinearWrap, EShaderStage_Pixel);
++
++	prim.SetInlineConstantBuffer(eConstantBufferShaderSlot_PerView, m_pDiffractionPerViewCB, EShaderStage_Vertex | EShaderStage_Pixel);
++
++	if (prim.Compile(m_passDiffraction) != CRenderPrimitive::eDirty_None)
++	{
++		static bool s_bWarned = false;
++		if (!s_bWarned)
++		{
++			s_bWarned = true;
++			CryLogAlways("[BLOOM] diffraction primitive failed to compile - pass skipped");
++		}
++		return;
++	}
++
++	const Vec4 vDiffParams0(fRadiusQuarterPx, fPitchQuarterPx, fRingRadius, fNorm);
++	const Vec4 vDiffParams1(clamp_tpl(streakParams.fDispersion, 0.0f, 1.0f), (float)kernel.GetGridSize(), 0.0f, 0.0f);
++	const Vec4 vDiffParams2(fRadiusNdcX, fRadiusNdcY, fEnergy, 0.0f);
++
++	auto& constantManager = prim.GetConstantManager();
++	constantManager.BeginNamedConstantUpdate();
++	constantManager.SetNamedConstant(diffParams2Name, vDiffParams2, eHWSC_Vertex);
++	constantManager.SetNamedConstant(diffParams0Name, vDiffParams0, eHWSC_Pixel);
++	constantManager.SetNamedConstant(diffParams1Name, vDiffParams1, eHWSC_Pixel);
++	constantManager.SetNamedConstantArray(diffSpectrumName, vSpectrum, 6, eHWSC_Pixel);
++	constantManager.EndNamedConstantUpdate(&viewport, m_graphicsPipeline.GetCurrentRenderView());
++
++	m_passDiffraction.AddPrimitive(&prim);
++	m_passDiffraction.Execute();
++
++	// 3. r_HDRDiffractionDebug 1: the kernel itself, into the top-left corner of the bloom
++	//    target on a log tone curve. The whole L x L texture is fitted into a square half the
++	//    frame height (the spec's "4x" would be 2048 px, larger than the frame at 1080p), which
++	//    is what makes the ray structure and the core hole readable at a glance.
++	if (CRenderer::CV_r_HDRDiffractionDebug > 0)
++	{
++		const float fDisplaySize = (float)max(nGridHeight / 2, 16);
++
++		if (m_passDiffractionDebug.IsDirty(kernel.GetKernelTexture()->GetTextureID()))
++		{
++			m_passDiffractionDebug.SetPrimitiveFlags(CRenderPrimitive::eFlags_ReflectShaderConstants_PS);
++			m_passDiffractionDebug.SetPrimitiveType(CRenderPrimitive::ePrim_ProceduralTriangle);
++			m_passDiffractionDebug.SetTechnique(CShaderMan::s_shHDRPostProcess, techDiffractionDebug, 0);
++			m_passDiffractionDebug.SetRenderTarget(0, pTarget);
++			m_passDiffractionDebug.SetState(GS_NODEPTHTEST | GS_NOCOLMASK_A | GS_BLSRC_ONE | GS_BLDST_ONE);
++			// Slot 1 and sampler 1: the debug shader shares the sprite pass's declarations, and
++			// there t1 is the kernel and s1 the linear clamp sampler.
++			m_passDiffractionDebug.SetTexture(1, kernel.GetKernelTexture());
++			m_passDiffractionDebug.SetSampler(1, EDefaultSamplerStates::LinearClamp);
++		}
++
++		// The kernel integrates to well under one over a quarter of a million texels, so a raw
++		// display is black. 1e6 puts a typical ray texel in the middle of the log curve.
++		const float kDebugGain = 1.0e6f;
++		m_passDiffractionDebug.BeginConstantUpdate();
++		m_passDiffractionDebug.SetConstant(diffDebugName,
++		                                   Vec4(fDisplaySize / (float)nGridWidth, fDisplaySize / (float)nGridHeight,
++		                                        kDebugGain, 1.0f / fBloomCompositeWeight), eHWSC_Pixel);
++		m_passDiffractionDebug.Execute();
++	}
++}
++
+ // Front filter point spread function (FilterPSFSpec.md).
+ //
+ // A cross-screen / star filter is a plate of etched grooves mounted in FRONT of the lens, so
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Bloom.h b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Bloom.h
+index 77cf2858..13197e2a 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Bloom.h
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Bloom.h
+@@ -7,6 +7,8 @@
+ #include "Common/PrimitiveRenderPass.h"
+ #include "Common/UtilityPasses.h"
+ 
++struct SHDRStreaksParams;
++
+ class CBloomStage : public CGraphicsPipelineStage
+ {
+ public:
+@@ -36,6 +38,8 @@ public:
+ 		, m_passStreakThreshold(&graphicsPipeline)
+ 		, m_passAnamorphicThreshold(&graphicsPipeline)
+ 		, m_passFilterThreshold(&graphicsPipeline)
++		, m_passDiffractionThreshold(&graphicsPipeline)
++		, m_passDiffractionDebug(&graphicsPipeline)
+ 		, m_passHalationThreshold(&graphicsPipeline)
+ 		, m_passHalationDown0(&graphicsPipeline)
+ 		, m_passHalationDown1(&graphicsPipeline)
+@@ -61,6 +65,7 @@ public:
+ 
+ private:
+ 	void ExecuteStreaks();
++	void ExecuteDiffraction(const SHDRStreaksParams& streakParams, float fBloomCompositeWeight);
+ 	void ExecuteFilterPSF();
+ 	void ExecuteHalation();
+ 
+@@ -85,6 +90,17 @@ private:
+ 	CRenderPrimitive     m_filterPSFPrimitive;
+ 	CConstantBufferPtr   m_pFilterPSFPerViewCB;
+ 
++	// Wave-optics diffraction glare (DiffractionKernelSpec.md). Same sparse convolution shape as
++	// the front filter above - a threshold pass and one sprite per surviving quarter-resolution
++	// texel - but the pattern is not authored: it is the FFT of the pupil, built by the DOF
++	// stage's job, sampled radially and extrapolated past its own edge by the edge-diffraction
++	// law. The debug pass draws that kernel into the corner of the frame.
++	CFullscreenPass      m_passDiffractionThreshold;
++	CPrimitiveRenderPass m_passDiffraction;
++	CRenderPrimitive     m_diffractionPrimitive;
++	CConstantBufferPtr   m_pDiffractionPerViewCB;
++	CFullscreenPass      m_passDiffractionDebug;
++
+ 	CFullscreenPass   m_passHalationThreshold;
+ 	CStretchRectPass  m_passHalationDown0;   // quarter -> 1/8
+ 	CStretchRectPass  m_passHalationDown1;   // 1/8 -> 1/16
+diff --git a/Engine/Shaders/HWScripts/CryFX/HDRPostProcess.cfx b/Engine/Shaders/HWScripts/CryFX/HDRPostProcess.cfx
+index adfdf04f..8d5c6c83 100644
+--- a/Engine/Shaders/HWScripts/CryFX/HDRPostProcess.cfx
++++ b/Engine/Shaders/HWScripts/CryFX/HDRPostProcess.cfx
+@@ -237,13 +237,13 @@ struct v2fFilterPSF
+ 	float4 Color    : TEXCOORD1;  // rgb: this source's deposit. a unused.
+ };
+ 
+-v2fFilterPSF FilterPSFVS(uint nVertexID : SV_VertexID)
++// Shared by every sparse-convolution sprite pass in this file (the front filter and the
++// wave-optics diffraction glare): the clip-space CENTRE of the quad a vertex belongs to.
++// One quad per grid cell, and the grid IS the thresholded target, so a cell and a source
++// texel are the same thing. Same integer walk the DOF's sprite passes use; the grid size
++// arrives through the pass's own per-view constant buffer.
++float4 SpriteGridCentrePos(uint nVertexID)
+ {
+-	v2fFilterPSF OUT = (v2fFilterPSF) 0;
+-
+-	// One quad per grid cell, and the grid IS the thresholded target, so a cell and a source
+-	// texel are the same thing. Same integer walk the DOF's sprite passes use; the grid size
+-	// arrives through this pass's own per-view constant buffer.
+ 	const int nQuadID    = (int)(nVertexID / 6);
+ 	const int nGridWidth = (int)g_VS_ScreenSize.x;
+ 	float4 INPos = float4((float)(nQuadID % nGridWidth), (float)(nQuadID / nGridWidth), 0, 0);
+@@ -252,10 +252,27 @@ v2fFilterPSF FilterPSFVS(uint nVertexID : SV_VertexID)
+ 	INPos.xy *= g_VS_ScreenSize.zw * 2.0;
+ 	INPos.xy += g_VS_ScreenSize.zw;
+ 
+-	float4 vOutPos = INPos;
+-	vOutPos.xy = vOutPos.xy * 2 - 1;
++	return float4(INPos.xy * 2 - 1, 0, 1);
++}
++
++// Two triangles, corners in [-1, 1]. The pixel shaders read the quad-local coordinate back out
++// of QuadUV, so the winding and the order here are part of both passes' contract.
++static const float2 g_SpriteQuadVerts[6] =
++{
++	float2( 1,  1),
++	float2(-1,  1),
++	float2( 1, -1),
++
++	float2( 1, -1),
++	float2(-1,  1),
++	float2(-1, -1)
++};
++
++v2fFilterPSF FilterPSFVS(uint nVertexID : SV_VertexID)
++{
++	v2fFilterPSF OUT = (v2fFilterPSF) 0;
+ 
+-	OUT.Position = float4(vOutPos.xy, 0, 1);
++	OUT.Position = SpriteGridCentrePos(nVertexID);
+ 	const float4 screenProj = HPosToScreenTC(OUT.Position);
+ 
+ 	// One point read at the texel centre. The threshold pass already rescaled the source to
+@@ -277,19 +294,8 @@ v2fFilterPSF FilterPSFVS(uint nVertexID : SV_VertexID)
+ 	// pattern is compressed horizontally exactly as the rest of the picture is.
+ 	const float2 vHalfExtent = FilterPSFParams0.xy;
+ 
+-	const float2 Verts[6] =
+-	{
+-		float2( 1,  1),
+-		float2(-1,  1),
+-		float2( 1, -1),
+-
+-		float2( 1, -1),
+-		float2(-1,  1),
+-		float2(-1, -1)
+-	};
+-
+-	OUT.Position.xy += Verts[nVertexID % 6].xy * vHalfExtent;
+-	OUT.QuadUV = float4(Verts[nVertexID % 6].xy * 0.5 + 0.5, 0, 0);
++	OUT.Position.xy += g_SpriteQuadVerts[nVertexID % 6].xy * vHalfExtent;
++	OUT.QuadUV = float4(g_SpriteQuadVerts[nVertexID % 6].xy * 0.5 + 0.5, 0, 0);
+ 
+ 	return OUT;
+ }
+@@ -364,6 +370,154 @@ float4 FilterPSFPS(v2fFilterPSF IN) : SV_Target
+ ////////////////////////////////////////////////////////////////////////////////////////////////////
+ ////////////////////////////////////////////////////////////////////////////////////////////////////
+ 
++// Wave-optics diffraction glare (DiffractionKernelSpec.md).
++//
++// The glare of a point source IS the Fraunhofer diffraction pattern of the pupil, |F{A}|^2. The
++// CPU has already transformed the pupil into $DiffractionKernel (sqrt-encoded, core removed:
++// the frame carries the source itself). What is left here is the two things that make it a
++// picture: the wavelength scaling and the far field.
++//
++//  * Scale. The kernel's texel pitch on the sensor is lambda * N * d / L, which at working
++//    apertures is a fraction of a pixel - the whole texture spans some tens of pixels. So the
++//    texture resolves the STRUCTURE and the reach comes from the far-field law: past its edge
++//    the pattern is extrapolated as I_ring(theta) * (R_tex / u)^2, the 1/u^2 of a straight
++//    edge. That is exact for a straight blade and pessimistic for anything smoother, so the
++//    extrapolated tail is never brighter than the physics allows.
++//
++//  * Colour. Each wavelength is a scaled copy: PSF_l(u) = (l0/l)^2 * PSF_l0(u * l0/l). Blue is
++//    compact, red is stretched, which is why a real sunstar's ray runs blue at the core and red
++//    at the tip. Six samples, weights pre-multiplied and normalised to white on the CPU.
++
++float4 DiffractionParams0;    // (sprite radius in quarter-res px, kernel texel pitch in the same px, R_tex, 1 / kernel integral)
++float4 DiffractionParams1;    // (dispersion 0..1, grid size L, unused, unused)
++float4 DiffractionParams2;    // (sprite half extent x in NDC, half extent y in NDC, energy per unit of source excess, unused)
++float4 DiffractionSpectrum[6];// rgb = colour * (l0/l)^2 normalised to white, w = l0 / l
++float4 DiffractionDebugParams;// (display width fraction, display height fraction, log gain, output scale)
++
++Texture2D<float4> HDRDiffraction_Src   : register(t0);  // thresholded quarter res source, vertex shader
++Texture2D<float4> HDRDiffraction_Kernel: register(t1);  // sqrt(|F{pupil}|^2), L x L, R16F
++Texture2D<float4> HDRDiffraction_Ring  : register(t2);  // sqrt(I) on the kernel's boundary ring, 256 x 1, R16F
++SamplerState HDRDiffraction_PClampSampler : register(s0);  // PointClamp
++SamplerState HDRDiffraction_LClampSampler : register(s1);  // LinearClamp
++SamplerState HDRDiffraction_LWrapSampler  : register(s2);  // LinearWrap - the ring is an angle
++
++struct v2fDiffraction
++{
++	float4 Position : SV_POSITION;
++	float4 QuadUV   : TEXCOORD0;  // xy: quad local, 0..1 across the sprite. zw unused.
++	float4 Color    : TEXCOORD1;  // rgb: this source's deposit. a unused.
++};
++
++v2fDiffraction DiffractionPSFVS(uint nVertexID : SV_VertexID)
++{
++	v2fDiffraction OUT = (v2fDiffraction) 0;
++
++	OUT.Position = SpriteGridCentrePos(nVertexID);
++	const float4 screenProj = HPosToScreenTC(OUT.Position);
++
++	// One point read at the texel centre. The threshold pass already rescaled the source to its
++	// own excess above the knee with the hue preserved, so this IS the excess E.
++	const float3 cExcess = GetTexture2DLod(HDRDiffraction_Src, HDRDiffraction_PClampSampler, float4(screenProj.xy, 0, 0)).rgb;
++
++	// Nothing survived the threshold here: collapse the quad instead of rasterizing a sprite
++	// that would deposit zero. This is what keeps the cost proportional to the number of bright
++	// sources rather than to the frame area - and these sprites are large.
++	if (dot(cExcess, float3(1, 1, 1)) < 1e-4)
++	{
++		OUT.Position.xy = 0;
++		return OUT;
++	}
++
++	// float, not half: the deposit carries the bloom-weight divide (a factor of some 250) on top
++	// of an HDR excess, which overflows half long before it overflows anything visible.
++	OUT.Color.rgb = cExcess * DiffractionParams2.z;
++
++	// The x half extent already carries the anamorphic stretch: the iris sits BEHIND the
++	// cylindrical group, so its pattern is formed unsqueezed and the desqueeze widens it.
++	OUT.Position.xy += g_SpriteQuadVerts[nVertexID % 6].xy * DiffractionParams2.xy;
++	OUT.QuadUV = float4(g_SpriteQuadVerts[nVertexID % 6].xy * 0.5 + 0.5, 0, 0);
++
++	return OUT;
++}
++
++float4 DiffractionPSFPS(v2fDiffraction IN) : SV_Target
++{
++	// Quad local in [-1, 1] scaled to the PATTERN's own coordinates. The y flip puts us in the
++	// texture space the pupil was rastered in (v down), which is the space the bokeh shape mask
++	// is authored in and the space the iris phase is measured in - so a mask's diffraction
++	// pattern comes out the same way up as its bokeh, and Blade Rotation turns both together.
++	// x needs no undo of the anamorphic stretch: the quad was widened, so quad-local x = 1 is
++	// still one pattern radius.
++	const float2 vLocal = IN.QuadUV.xy * 2.0 - 1.0;
++	const float2 d = float2(vLocal.x, -vLocal.y) * DiffractionParams0.x;
++
++	const float r = length(d);
++	const float2 vDir = (r > 1e-6) ? (d / r) : float2(1, 0);
++	// Off the normalised direction, not off d: at the exact sprite centre atan2(0, 0) is not
++	// defined and would poison the ring lookup for that pixel.
++	const float fTheta = atan2(vDir.y, vDir.x);
++
++	// Distance from the source in KERNEL TEXELS at the reference wavelength.
++	const float u0 = r / max(DiffractionParams0.y, 1e-6);
++	const float fRingRadius = DiffractionParams0.z;
++	const float fInvL = 1.0 / max(DiffractionParams1.y, 1.0);
++
++	// The boundary ring, once: it is a function of the angle only, and all six wavelengths
++	// extrapolate off the same edge. The CPU binned it over [0, 2pi) starting at +x, so u is
++	// theta / 2pi with NO half-texture offset; atan2's negative half wraps round through the
++	// sampler, which is why the ring must be sampled wrapped and not clamped.
++	const float fRingEnc = GetTexture2D(HDRDiffraction_Ring, HDRDiffraction_LWrapSampler,
++	                                    float2(fTheta * (0.5 / PI), 0.5)).x;
++	const float fRingI = fRingEnc * fRingEnc;
++
++	float3 cSum = 0;
++
++	[unroll]
++	for (int i = 0; i < 6; ++i)
++	{
++		// Dispersion 0 collapses every wavelength onto 550 nm: one white pattern, no rainbow.
++		const float fScale = lerp(1.0, DiffractionSpectrum[i].w, DiffractionParams1.x);
++		const float u = u0 * fScale;
++
++		float I;
++		if (u <= fRingRadius)
++		{
++			// sqrt-encoded so the 1e-8 tails stay above half float's denormals.
++			const float k = GetTexture2D(HDRDiffraction_Kernel, HDRDiffraction_LClampSampler,
++			                             0.5 + (u * fInvL) * vDir).x;
++			I = k * k;
++		}
++		else
++		{
++			const float t = fRingRadius / u;
++			I = fRingI * t * t;
++		}
++
++		cSum += DiffractionSpectrum[i].rgb * I;
++	}
++
++	// Alpha 0: the bloom target's alpha channel is not ours to touch.
++	return float4(IN.Color.rgb * cSum * DiffractionParams0.w, 0.0);
++}
++
++// r_HDRDiffractionDebug 1: the kernel itself, into the top-left corner on a log tone curve.
++// The pattern spans eight decades, so anything linear is a black square with a white dot.
++float4 DiffractionDebugPS(vtxOut IN) : SV_Target
++{
++	const float2 uv = IN.baseTC.xy / max(DiffractionDebugParams.xy, 1e-4);
++	if (uv.x > 1.0 || uv.y > 1.0)
++		return float4(0, 0, 0, 0);
++
++	const float k = GetTexture2DLod(HDRDiffraction_Kernel, HDRDiffraction_LClampSampler, float4(uv, 0, 0)).x;
++	const float I = k * k * DiffractionDebugParams.z;
++	const float v = log(1.0 + I) / log(1.0 + DiffractionDebugParams.z);
++
++	return float4(v.xxx * DiffractionDebugParams.w, 0.0);
++}
++
++////////////////////////////////////////////////////////////////////////////////////////////////////
++////////////////////////////////////////////////////////////////////////////////////////////////////
++
+ float4 SampleLumOffsets0;
+ float4 SampleLumOffsets1;
+ 
+@@ -1359,6 +1513,25 @@ technique HDRFilterPSF
+   }
+ }
+ 
++technique HDRDiffractionPSF
++{
++  pass p0
++  {
++    VertexShader = DiffractionPSFVS() HDRPostProcessVS;
++    PixelShader = DiffractionPSFPS() HDRPostProcessPS;
++    CullMode = None;
++  }
++}
++
++technique HDRDiffractionDebug
++{
++  pass p0
++  {
++    VertexShader = FullscreenTriVS() HDRPostProcessVS;
++    PixelShader = DiffractionDebugPS() HDRPostProcessPS;
++  }
++}
++
+ technique HDRFinalPass
+ {
+   pass p0
+-- 
+2.47.1.windows.1
+

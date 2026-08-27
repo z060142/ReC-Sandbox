@@ -1,0 +1,284 @@
+From 0e3972a1c58ff2ddb62c7da91576d9b4dea974d7 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Thu, 27 Aug 2026 10:59:03 +0800
+Subject: [PATCH 45/57] docs: wave-optics diffraction kernel spec - FFT of the
+ on-axis pupil (polygon x mask, SA as phase) as the glare PSF, 1/u^2 far-field
+ extrapolation, spectral sampling, sparse sprite convolution; analytic streaks
+ kept as a mode
+
+---
+ .../CinematicCamera/DiffractionKernelSpec.md  | 262 ++++++++++++++++++
+ 1 file changed, 262 insertions(+)
+ create mode 100644 Code/CryPlugins/CinematicCamera/DiffractionKernelSpec.md
+
+diff --git a/Code/CryPlugins/CinematicCamera/DiffractionKernelSpec.md b/Code/CryPlugins/CinematicCamera/DiffractionKernelSpec.md
+new file mode 100644
+index 00000000..92f2013d
+--- /dev/null
++++ b/Code/CryPlugins/CinematicCamera/DiffractionKernelSpec.md
+@@ -0,0 +1,262 @@
++# Wave-Optics Diffraction Kernel (FFT glare) — Specification
++
++Status: approved for implementation, 2026-08-27. Owner of semantics: the camera manager.
++Branch: `glare` (off `dev` @ bc6e297c). Merged back to `dev` only after user verification.
++Predecessors: `DiffractionStreaksSpec.md` (the analytic streaks, which stay as a mode),
++`FilterPSFSpec.md` (the sparse PSF convolution this reuses), `DofLensModelSpec.md` §3.2
++(`LensPupil`, the pupil this diffracts).
++
++## 0. What this adds, and why now
++
++The analytic streaks paint N line pairs with an exponential falloff, a hue ramp and an f-number
++fade-in that was tuned by eye. They cannot show what a *real* aperture does: a 9-blade iris
++throws 18 rays with a specific intensity pattern, a star-shaped mask throws a pattern of its
++own, a rounded polygon (curved blades) softens and broadens the rays, and a slightly aberrated
++pupil puts halos around them. All of that is one statement: **the glare of a point source is
++the Fraunhofer diffraction pattern of the pupil, |F{P}|².** With `LensPupil` / the iris polygon
++/ the shape mask now defined in one place, the pupil is available; this round computes its
++diffraction pattern and convolves the frame's highlights with it, using the sparse sprite
++convolution the front filter already has.
++
++Physics reminders that shape the design:
++
++* The pattern's scale on the sensor is set by `λ · N`: stopping down spreads the same energy
++  fraction over a proportionally larger pattern. Rays get longer *and dimmer per pixel* as N
++  grows; wide open they are short and hide under the source's own bloom. This IS the "sunstars
++  appear when you stop down" behaviour — no hand-authored f-number ramp is needed or wanted.
++* Straight edges diffract into rays whose intensity falls as `1/u²` along the edge normal
++  (edge diffraction); corners and smooth outlines fall faster (`1/u⁴`). The rays of a real
++  sunstar are visible for hundreds of pixels only because the source is 10³–10⁵× brighter than
++  the scene; the pattern itself is fixed.
++* Each wavelength is a scaled copy: `PSF_λ(u) = (λ₀/λ)² · PSF_λ₀(u · λ₀/λ)`. Blue is compact,
++  red is stretched — the rainbow along a ray is dispersion, not a colour ramp.
++* A DFT of the pupil sampled on an `L×L` grid with the pupil `d` texels across gives a PSF
++  whose texel pitch on the sensor is `λ N · d / L` — for `L = 512, d = 256, λ = 550 nm, N = 11`
++  that is 3 µm ≈ 0.16 px at 1080p full frame, so the whole texture spans only ~40 px of
++  screen. **The FFT resolves the structure; the reach has to come from the analytic far-field
++  law.** That is the central design decision below (§2.3).
++
++## 1. Modes and gating
++
++`Diffraction Streaks` group gains `Mode` ('stMd', enum): `Analytic` (today's line pairs,
++byte-identical behaviour) / `Wave` (this spec). **Default `Wave`.** Post param
++`HDR_Streaks_Mode` (0/1). Everything under the `Wave` branch is new code; the analytic passes
++are not touched. `r_HDRStreaks` stays the master switch (0 = neither mode; 2 = the analytic
++diagnostic force, unchanged, does not force Wave). New cvar `r_HDRDiffractionKernel` (int,
++default 1; 0 = kernel never built, Wave mode falls back to Analytic with one log line — kill
++switch) and `r_HDRDiffractionDebug` (int, default 0; 1 = draw the kernel texture in the top-left
++corner at 4× with a log-scale tone curve, and log the rebuild parameters).
++
++## 2. Model
++
++### 2.1 The pupil raster
++
++On the CPU, a job builds the pupil amplitude `A(x)` on an `L × L` complex grid, `L = 512`,
++pupil bounding diameter `d = L/2 = 256` texels (zero-padded ×2 so `|F|²` — the transform of the
++pupil's autocorrelation, which is twice as wide — does not wrap). The pupil is the ON-AXIS pupil
++(no cat-eye: field-dependent clipping varies across the frame and a convolution kernel must be
++shift-invariant; the corners' clipped stars are a later refinement):
++
++```
++r, θ from the grid centre, unit radius = d/2
++polygon:  inside if r ≤ NGon_Rad(θ − phase, blades)^exponent          (same closed form and the SAME exponent the gather/splat use: 1 − curvature · p · strength)
++mask:     × mask(rotate(x, −maskRotation) · maskScale)                 (R channel of the shape DDS, read through the DOF stage's existing CryPak DDS reader; N_mask / N scaling exactly as the splat's vDofBokehMask.y; 1 when no mask)
++barrel:   × (r ≤ 1)                                                    (the mechanical opening; no field offset on axis)
++A(x)      = sqrt(polygon · mask)  ×  exp(i · 2π · W(x))                 (amplitude = sqrt of the intensity transmittance; W = wavefront error in waves)
++W(x)      = k_sa · W_sa · r⁴                                            (spherical aberration as a PHASE error; W_sa = 0.25 waves at |k_sa| = 1, cvar r_HDRDiffractionSAWaves, default 0.25. This is the physically right place for SA in the glare: an aberrated pupil puts rings and halos around the rays. Optional, 0 disables.)
++```
++
++Edges are anti-aliased: evaluate 2×2 supersamples per texel (the polygon and barrel tests) and
++average; the mask is bilinearly sampled. A hard-edged pupil gives the sharp `1/u²` rays; the
++splat's soft edge (`fEdgeSoft`) is a rendering convenience and is **not** applied here.
++
++### 2.2 The transform
++
++2-D FFT of `A`, `I(u) = |F{A}|²`, DC at the centre (fftshift). Normalise so that `Σ I = 1`
++over the grid (Parseval: this is the total transmitted light). Then **remove the core**: the
++frame already contains the source itself (and its bloom), so the kernel must carry only the
++diffracted light. Zero every texel within `r_core = 2.5` Airy radii of the centre (`1.22 · L/d`
++texels per Airy radius → ~6 texels) and record the removed fraction `E_core` (log it; for a
++circular pupil it is ≈ 0.9). What remains — `I_glare`, integral `1 − E_core` — is the kernel.
++
++Store `sqrt(I_glare)` in an `R16F` `L×L` texture (`$DiffractionKernel`; the square root keeps
++the 10⁻⁸ tails above half-float denormals; the pixel shader squares it back). Track the
++extrapolation boundary ring: `I_ring(θ)` = the mean of `I_glare` on the ring `r ∈ [R_tex − 4, R_tex]`
++(`R_tex = L/2 − 2` texels), 256 angular bins, stored in a second small texture
++`$DiffractionRing` (`256×1`, R16F, sqrt-encoded as well). The ring is what the far-field
++extrapolation samples.
++
++Implementation of the FFT: the engine already carries a radix-2 complex 1-D/2-D FFT in
++`Code/CryEngine/RenderDll/Common/WaterUtils.cpp` (`CWaterSim::ComputeFFT1D/2D`, "2 Dimensional
++FFT" by Paul Bourke). Lift that routine into a small standalone helper (`DiffractionKernel.cpp/.h`
++in the DOF stage's folder — do not touch the water code) so the job has no dependency on the
++water simulation. `512²` on one core is on the order of 10–30 ms: **never on the render
++thread.** The build runs as a `DECLARE_JOB` on the job system, double-buffered: the render thread
++keeps using the last finished kernel; when a job completes its result is uploaded to the
++texture on the render thread (`CTexture::UpdateTextureRegion` or recreate). At most one job in
++flight; if parameters change again while one runs, remember the newest request and start it
++when the current one finishes.
++
++Rebuild triggers (quantised so a smooth pull does not rebuild every frame; log each rebuild
++once): blades; exponent (steps of 0.02); phase (1°); mask texture name; mask rotation (1°);
++`N_mask/N` scale (steps of 0.05); `k_sa` (0.05); mode/cvar switches. Note that N itself does
++NOT trigger a rebuild — the kernel is computed in the pupil's own units, and N enters only
++as the on-screen scale (§2.3). The kernel therefore changes only when the pupil's *shape*
++changes.
++
++### 2.3 On-screen scale and the far-field extrapolation
++
++Kernel texel pitch on the sensor: `s = λ₀ · N_geo · d / L` (metres; `λ₀ = 550 nm`, `N_geo` =
++the same geometric f-number the DOF uses, `max(N, N_mask)` when a mask is bound). In native
++pixels: `s_px = s · W_px / W_sensor`. The texture covers `R_tex` texels, i.e. `R_tex · s_px`
++pixels — tens of pixels. The sprite is much larger (§3); outside the texture the kernel is
++extrapolated by the edge-diffraction law:
++
++```
++u   = distance from the sprite centre, in kernel texels (after the λ scaling below)
++I(u, θ) = I_tex(u, θ)                              u ≤ R_tex
++        = I_ring(θ) · (R_tex / u)²                 u >  R_tex
++```
++
++The `1/u²` law is exact for a straight edge and pessimistic for everything else, so the
++extrapolated tail is never brighter than the physics; a smooth (round) pupil, whose ring is
++already tiny, extrapolates to nothing. The energy in the extrapolated tail up to the sprite
++radius is `Σ_θ I_ring(θ) · R_tex² · ln(R_sprite / R_tex)` — finite; the CPU adds it to the
++kernel's integral when it normalises (the ring and `ln(R_sprite/R_tex)` are known), so the
++deposit is energy-correct including the tail.
++
++Wavelength: the pixel shader samples at `n_λ = 6` wavelengths (420, 470, 520, 570, 620, 670 nm),
++each a scaled copy `u_λ = u · λ₀ / λ`, weight `(λ₀/λ)²`, colour from a small RGB table
++(approximate CIE → sRGB, normalised so the six sum to white):
++
++| λ nm | R | G | B |
++|---|---|---|---|
++| 420 | 0.05 | 0.00 | 0.35 |
++| 470 | 0.00 | 0.10 | 0.50 |
++| 520 | 0.00 | 0.55 | 0.15 |
++| 570 | 0.35 | 0.35 | 0.00 |
++| 620 | 0.45 | 0.00 | 0.00 |
++| 670 | 0.15 | 0.00 | 0.00 |
++
++(Columns are then rescaled on the CPU so `Σ_λ colour_λ · (λ₀/λ)² = (1,1,1)` — white light stays
++white in the sum.) `Dispersion` ('stDs', 0..1, default 1) lerps every `λ` toward `λ₀`: 0 = a
++monochrome white pattern at 550 nm.
++
++### 2.4 Energy and the source excess
++
++Exactly the front filter's sparse convolution (`FilterPSFSpec.md` §2–3): the quarter-res HDR
++frame thresholded with the streaks' own threshold (`HDR_Streaks_Threshold`, soft knee `T/4`),
++one sprite per surviving texel, deposit `E · amount · I(u)` additively into `m_pTexHDRFinalBloom`
++divided by `fBloomCompositeWeight`. With the kernel normalised to unit integral (core removed,
++tail included), **`amount = 1` is the physical answer**: the fraction of a source's light that
++lands in its glare is what the pupil says. `amount` is the look knob on top (0–4, default 1);
++no f-number ramp on the component side in Wave mode. `HDR_Streaks_Threshold` keeps its meaning
++and default.
++
++Anamorphic squeeze: the iris sits *behind* the cylindrical front group, so its diffraction
++pattern is formed unsqueezed on the sensor and the desqueeze stretches it horizontally by `S`:
++sprite x half-extent = `R · S` (the opposite of the front filter, which sits in front of the
++cylinder). Check what the analytic streaks do with the squeeze today and note the difference
++in the code comment; do not change the analytic path.
++
++## 3. Renderer
++
++DOF stage (`DepthOfField.cpp/.h`) owns the kernel (it already owns the pupil description and
++the CPU mask reader): `CDiffractionKernel m_diffraction` with `Request(desc)` (quantise,
++compare, spawn job), `Update()` (called once per frame from `Execute`; uploads a finished job),
++`GetKernelTexture()`, `GetRingTexture()`, `GetNormalisation()`, `GetTexelPitchPupilUnits()`.
++The pupil description struct: blades, exponent, phase, mask texture name (or empty), mask
++rotation, mask scale, `k_sa`, `L`, `d`.
++
++Bloom stage (`Bloom.cpp`): `ExecuteDiffraction()` in the Wave branch of `ExecuteStreaks()`
++(same place in the frame: after bloom's downsamples, before the filter PSF and halation), using
++the same threshold pass into `m_pTexHDRTargetScaled[1][1]` and a sprite primitive built like
++`m_passFilterPSF` (own per-view CB for the quarter-res grid, `SetCustomVertexStream(~0u,…)`,
++`width_q · height_q · 6` vertices, additive, alpha masked). New technique `HDRDiffractionPSF`
++in `HDRPostProcess.cfx`: VS = the filter PSF's VS with the x half-extent × `S` (share the code
++through a small function or a second technique on the same VS with a constant), PS:
++
++```
++d        = quad-local in [-1, 1] · R_sprite_px                       (native px from the sprite centre; x already carries the squeeze)
++for each λ: u_λ = |d| / s_px · (λ₀ / λ);  θ = atan2(d.y, d.x)
++            I_λ = (u_λ ≤ R_tex) ? kernel(u_λ, θ)² : ring(θ)² · (R_tex / u_λ)²
++            c  += colour_λ · (λ₀/λ)² · I_λ
++out = Color.rgb · c · norm                                            (norm = 1 / kernel integral incl. tail, from the CPU)
++```
++
++`kernel(u, θ)` samples `$DiffractionKernel` at `0.5 + u/L · (cos θ, sin θ)` (bilinear); `ring(θ)`
++samples `$DiffractionRing` at `θ / 2π` (bilinear, wrap). Constants: `DiffractionParams0 =
++(R_sprite_px, s_px, R_tex, norm)`, `DiffractionParams1 = (dispersion, L, 0, 0)`, and the six
++`colour_λ · (λ₀/λ)²` as a `float4[6]` array (rgb + `λ₀/λ`).
++
++Sprite radius `R_sprite = Reach · H_q` (quarter-res pixels; `Reach` ('stRc', 0..1, default 0.35,
++fraction of frame height) — the cut-off of the extrapolated tail, purely a cost/coverage
++choice, documented as such). Cost target: < 0.3 ms GPU at 1080p with a few sources (each
++sprite pixel = 6 texture reads + 6 ring reads).
++
++Log once per change: `[BLOOM] diffraction kernel blades=%d exp=%.2f phase=%.0f mask=%s
++maskRot=%.0f maskScale=%.2f sa=%.2f -> core=%.2f tail=%.3f pitch=%.2fpx N=%.1f (job %.1f ms)`.
++
++## 4. Parameters
++
++Component `SCineStreakParams` (Diffraction Streaks): `Mode` (enum Analytic/Wave, default Wave),
++`Streak Amount` ('stAm', 0..4, default 1; Wave only — in Analytic the f-number ramp still owns
++the amount), `Reach` ('stRc'), `Dispersion` ('stDs'). Existing `Blade Rotation`, `Enable
++Streaks`, threshold unchanged. Post params: `HDR_Streaks_Mode`, `HDR_Streaks_WaveAmount`,
++`HDR_Streaks_WaveReach`, `HDR_Streaks_Dispersion`; `SHDRStreaksParams` gains the four fields.
++Pupil description reaches the bloom stage through the DOF stage (`GetStage<CDepthOfFieldStage>()`),
++not through more post params: the DOF stage already resolves blades / exponent / phase / mask /
++mask rotation / mask scale / `k_sa` / `N_geo` every frame — expose them from there.
++
++Cvars: `r_HDRDiffractionKernel` (1), `r_HDRDiffractionDebug` (0), `r_HDRDiffractionSAWaves`
++(0.25), `r_HDRDiffractionKernelSize` (512; 256 allowed for a 4× cheaper job at half the
++structural resolution — same `d = L/2`).
++
++Schematyc `szName`s `[A-Za-z0-9_]+`; enum reflection as the other enums in the component.
++
++## 5. Limitations, stated up front
++
++* On-axis pupil only: the corners do not get their cat-eye-clipped stars. Later.
++* Shift-invariant: the pattern of a source is the same anywhere in the frame (true for the
++  iris; not for a vignetting barrel).
++* The `1/u²` extrapolation is exact for straight edges only; rounded pupils fade faster than
++  the tail says — but their ring is small, so the error is invisible.
++* The kernel is built on the CPU with a frame or two of latency after a shape change; during
++  a fast blade-rotation animation the pattern lags by that much. Acceptable; a compute-shader
++  FFT is the upgrade path.
++* Spectral sampling at six wavelengths shows slight banding in very long rays; raise `n_λ`
++  if the user sees it.
++
++## 6. Acceptance (user, by eye)
++
++1. Analytic mode: byte-identical to before (A/B).
++2. Wave mode, 8 blades, f/16, a lamp: 8 sharp rays with rainbow tails (blue near the core,
++   red at the tips), turning with Blade Rotation; f/8 → shorter rays; f/2.8 → nothing visible
++   beyond the bloom. No fade-in ramp needed.
++3. 3 blades → 6 rays; 9 blades → 18 rays (the analytic mode clamps at 24 line pairs; here
++   there is no clamp because it is not drawing lines).
++4. A shape mask (star / heart): the glare is the mask's own diffraction pattern, turning with
++   Mask Rotation; stopping the iris down through the mask (N > N_mask) changes it as the
++   polygon takes over.
++5. Blade Curvature 1 at f/2.8 (rounded polygon): rays soften and shorten compared with
++   curvature 0.
++6. Spherical Aberration ±1 (with `r_HDRDiffractionSAWaves` 0.25): faint rings / halo around
++   the core of the pattern; 0 → none.
++7. Dispersion 0: white rays.
++8. `Streak Amount` 1 reads as physically plausible against the lamp; 0 → no pass;
++   `r_HDRDiffractionKernel 0` → analytic fallback, one log line.
++9. RenderDoc: sprite pass < 0.3 ms at 1080p with a few sources; kernel job time in the log;
++   no hitch on the render thread when the pupil changes.
++
++## 7. Docs
++
++README: "Diffraction Streaks" group table (Mode, Streak Amount, Reach, Dispersion) and the
++"Diffraction streak physics" section rewritten around the wave model (keep a short Analytic
++paragraph). ConsoleReference: the four cvars. This spec listed. English.
++
++## 8. Build, deploy, commit
++
++Bundled CMake, `CryRenderD3D11` → `CinematicCamera`, 0 error / 0 warning outside `Code/SDKs`.
++Deploy the DLLs and `HDRPostProcess.cfx` (and `DepthOfField.cfx` if touched) per HANDOVER; a
++locked file means the engine is running — report, do not kill. Commit on `glare` per reviewed
++step; do not touch `dev`; no `sync.ps1`.
+-- 
+2.47.1.windows.1
+

@@ -1,11 +1,24 @@
 ﻿# Sync manifest
 
 Baseline : main @ a34100a9 (pristine CRYENGINE 5.7.1)
-Dev      : dev @ bc6e297c
-Synced   : 2026-08-27 10:18
+Dev      : dev @ 28a492c1
+Synced   : 2026-08-27 19:39
 
 ## Commits (newest first)
 
+- 28a492c1 fix: the barrel clips the iris polygon, so a lens wide open diffracts rings and not rays
+- 5587483d fix: the wave glare moves to half resolution, its own layer and a pre-blurred source
+- 0223903b fix: the wave glare is no longer gated by the analytic f-number ramp
+- 4f67dd30 fix: the mode 3 panel border is measured in panel-relative uv
+- c9040adb fix: round the wave-glare sprite off with radial and centre windows, map mode 2 over ten decades and give mode 3's source panel a max filter, floor and border
+- 96dbaf73 feat: r_HDRDiffractionDebug 2 paints the wave-glare pattern at full visibility and 3 shows the thresholded sources with a once-a-second max-excess readback
+- ac33f377 feat: Streak Amount becomes a source radiance boost (0-200, default 20) so the physical wave glare is actually visible, and the kernel logs E_far
+- fc454afa fix: wave glare samples the diffraction kernel through a prefiltered mip chain, so the rays survive the sub-pixel texel pitch at working apertures
+- 9307157e fix: wave glare deposits the pupil's physical diffracted fraction at Streak Amount 1 - drop the renormalisation of the core-removed kernel to unit integral, keep only the texel-to-pixel area conversion
+- a52d41ad feat: Streak Model / Streak Amount / Reach / Dispersion on the camera component - Wave by default and with no f-number amount ramp, since stopping down spreads the pattern instead of fading it in; README and ConsoleReference for the wave model and its cvars
+- 2a8c050b feat: wave glare sprite pass - the frame's highlights convolved with the pupil's diffraction pattern, six wavelengths as scaled copies and a 1/u^2 far-field tail off the kernel's boundary ring; streak Mode switch, four r_HDRDiffraction* cvars, analytic path untouched
+- c379efb3 feat: wave-optics diffraction kernel - the on-axis pupil (iris polygon x shape mask x barrel, spherical aberration as a phase error) rastered, FFT'd on a job and stripped of its core to give the glare point spread function; DOF stage owns it, the shape-mask DDS reader is now shared
+- 0e3972a1 docs: wave-optics diffraction kernel spec - FFT of the on-axis pupil (polygon x mask, SA as phase) as the glare PSF, 1/u^2 far-field extrapolation, spectral sampling, sparse sprite convolution; analytic streaks kept as a mode
 - bc6e297c fix: lens ghosts composite after the glare family extracts its sources, so ghosts no longer throw their own streaks, flares and filter stars
 - 2bc6a898 fix: bokeh polygon roundness follows the pupil scale, so Blade Curvature shapes the outline at every aperture instead of only below f/2.8
 - e6ba876a fix: DOF 3.0 lens model - highlight energy is split once between gather and splat, near opacity weighted by tap density, jitter gets a per-frame phase, mask-domain jitter reined in
@@ -61,10 +74,13 @@ Synced   : 2026-08-27 10:18
 - M	Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.h
 - M	Code/CryEngine/RenderDll/Common/RendererCVars.cpp
 - M	Code/CryEngine/RenderDll/Common/RendererCVars.h
+- M	Code/CryEngine/RenderDll/XRenderD3D9/CMakeLists.txt
 - M	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Bloom.cpp
 - M	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Bloom.h
 - M	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DepthOfField.cpp
 - M	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DepthOfField.h
+- A	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DiffractionKernel.cpp
+- A	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DiffractionKernel.h
 - M	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/MotionBlur.cpp
 - M	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/PostAA.cpp
 - M	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/StandardGraphicsPipeline.cpp
@@ -73,6 +89,7 @@ Synced   : 2026-08-27 10:18
 - M	Code/CryPlugins/CMakeLists.txt
 - A	Code/CryPlugins/CinematicCamera/AnamorphicSpec.md
 - A	Code/CryPlugins/CinematicCamera/AxialChromaticSpec.md
+- A	Code/CryPlugins/CinematicCamera/DiffractionKernelSpec.md
 - A	Code/CryPlugins/CinematicCamera/DiffractionStreaksSpec.md
 - A	Code/CryPlugins/CinematicCamera/DofLensModelSpec.md
 - A	Code/CryPlugins/CinematicCamera/EffectAuthoritySpec.md
