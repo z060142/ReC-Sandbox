@@ -1,11 +1,31 @@
 # RenderDoc per-pass GPU timing report. Run inside qrenderdoc's embedded Python:
-#   qrenderdoc.exe --python rdc_perf.py
+#   qrenderdoc.exe --python rdc_perf.py [capture_dir]
+#
+# The capture directory holds the .rdc files to analyse and receives the log and the report. It
+# can also come from the RDC_CAPTURE_DIR environment variable. With no argument the legacy path
+# below is used unchanged, so an existing invocation keeps working.
 # Python 3.6 compatible on purpose.
 import os
 import sys
 import traceback
 
-LOG_PATH = os.path.join(r"S:\Crytek\crytek\cryengine-57-lts\renderdoc", "rdc_perf_log.txt")
+LEGACY_CAPTURE_DIR = r"S:\Crytek\crytek\cryengine-57-lts\renderdoc"
+
+# argv[0] is the script; qrenderdoc passes everything after it through. Resolved BEFORE the log is
+# opened: a missing directory used to fail at the open() below with an empty log file and no
+# message, which reads as a RenderDoc problem and is not one.
+_args = sys.argv[1:]
+CAPTURE_DIR = os.environ.get("RDC_CAPTURE_DIR", LEGACY_CAPTURE_DIR)
+if _args and os.path.isdir(_args[0]):
+    CAPTURE_DIR = _args.pop(0)
+
+if not os.path.isdir(CAPTURE_DIR):
+    sys.stderr.write(
+        "rdc_perf: capture directory not found: %s\n"
+        "Pass one as the first argument, or set RDC_CAPTURE_DIR.\n" % CAPTURE_DIR)
+    os._exit(1)
+
+LOG_PATH = os.path.join(CAPTURE_DIR, "rdc_perf_log.txt")
 _log = open(LOG_PATH, "w", encoding="utf-8")
 _log.write("script started, python %s\n" % sys.version)
 _log.flush()
@@ -18,7 +38,6 @@ except Exception:
     _log.close()
     os._exit(1)
 
-CAPTURE_DIR = r"S:\Crytek\crytek\cryengine-57-lts\renderdoc"
 CAPTURES = sorted(f for f in os.listdir(CAPTURE_DIR) if f.lower().endswith(".rdc"))
 OUT_PATH = os.path.join(CAPTURE_DIR, "rdc_perf_report.txt")
 MAX_DEPTH = 4
