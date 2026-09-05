@@ -1,0 +1,547 @@
+From 1a8c4306bc7e144872497a5c7b85375e93cf2e31 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Sun, 30 Aug 2026 13:45:04 +0800
+Subject: [PATCH 114/119] fix: the wave glare's log line said "half-res" about
+ the deposit layer and was read as the source, and the report now says what a
+ ray is actually worth
+
+TEST-CHECKLIST K1/K4: a night lamp at Streak Amount 50 shows no rays and needs 70,
+and r_HDRDiffractionDebug 3 was read as reporting the half-res copy as the threshold
+source - i.e. that round 3's full-resolution read (b372dde2) was not active.
+
+It was active. The proof is in the user's own other two results. The gate
+IsSceneReferredStage(5) is read by CHDRStreaks::GetParams() at the top of
+ExecuteStreaks() and by the source selection a few lines into ExecuteDiffraction(),
+which ExecuteStreaks() calls - the same thread, the same call stack, and a gate that
+LatchSceneReferredExposure() sets once per render view before pipeline->Execute().
+K2 PASSED (ten units of Streak Amount = one stop), and that mapping exists only
+inside the same if (IsSceneReferredStage(5)) in GetParams(), so stage 5 was on. Rays
+APPEARED at 70, and ExecuteDiffractionComposite() returns early unless $HDRTarget has
+a device texture, so the target existed. Stage 5 true and $HDRTarget present is
+exactly the condition for pGlareSrc = pFullHDR. There is no third branch.
+
+What K4 read was "own half-res layer" - the glare's own DEPOSIT target, half
+resolution since 5587483d - nineteen words before "threshold source =" in the same
+240-character sentence. A diagnostic that can be misread will be, and three days went
+into a branch that was being taken. The source is now its own line, printed first, in
+capitals, with the source's pixel dimensions and the reason, and the words "half-res"
+appear in it only when the half-res copy really was what was read. The deposit layer
+is called "own deposit layer". A scene-referred frame that somehow reaches the
+selection with no $HDRTarget now says so once in CryLogAlways instead of silently
+costing three and a half stops.
+
+Round 3 recovered four stops (110 -> 70) rather than fourteen, and that is consistent:
+the trace costed the WORST case, a lamp one native pixel across where the firefly
+filter's 1-of-4 block gives x30 000. A lamp big enough to fill blocks round-trips that
+filter exactly, so neither fix had fifteen stops to give back. The mechanism was
+right; the case was not the one on screen.
+
+The two stops that remain cannot be argued, only measured, because the unknown is the
+lamp. r_HDRDiffractionDebug 3 now prints, once a second, in the units the camera's own
+controls are in: the source peak in exposed units and in stops over mid grey and where
+it is; the threshold both ways; the fraction of a source's light the pupil scatters
+into the pattern; what the sprite's inner fade keeps of it; the resolved gain and the
+Streak Amount it came from; and the line the mode exists for - what a SPIKE lands at a
+stated number of native pixels out, in stops versus mid grey, with a verdict and the
+Streak Amount that would put it on mid grey. Past R_tex the whole chain is
+deposit(r) = excess * gain * I_ring(theta) * R_tex^2 / r^2, in which the texel pitch
+cancels exactly, so the report is arithmetic and not an interpolation.
+
+Two errors in the reasoning of rounds 2 and 3, both now instrumented rather than
+argued:
+
+  * The ring's MEAN is not the ray. m_fTailCoefficient carries the boundary ring's
+    angular average - right for an energy budget, wrong for brightness, because a
+    bladed iris runs 30-300x between a spike and the gap beside it. Every estimate
+    those rounds made was made off the dark part of the pattern. GetRingPeak() now
+    exists and the kernel's log prints the ray/gap contrast, the core radius and R_tex.
+  * The sprite's inner fade is not "a small extra deficit". The kernel texel pitch is
+    lambda*N*d/L, about 0.047 half-res px at f/8 on a 1080p frame, so the whole kernel
+    TEXTURE spans some twelve half-res pixels and w_in = smoothstep(0, 4, r) covers the
+    first four of them. Energy grows as ln(u) outside the core, so the fade keeps
+    roughly a third of the texture's share: one and a half stops that the logged
+    "deposited glare fraction" has never included. It does NOT dim the rays, which live
+    past r = 4 px in the 1/u^2 tail, so it is not narrowed here - that would not answer
+    the evidence and would re-open the blocks artefact three rounds were spent closing.
+    It becomes the named constant kDiffractionInnerWindowHalfPx, its cost is printed,
+    and narrowing it is written up as approach B for the next round.
+
+Audited and clean, recorded so the next round does not re-walk it: the 5-tap pre-blur's
+weights sum to exactly 1; the kernel mip chain box-filters LINEAR intensity with the
+sqrt applied afterwards, so k*k really is the footprint mean; the half-res deposit
+layer's additive upscale preserves radiance, which is the correct semantics; the six
+spectral copies are renormalised to white in the working space.
+
+No shader is touched and no constant moves - the picture is bit-identical on both
+paths. decisions/s8-glare-source.md round 4 has the full argument and the three
+approaches; DiffractionKernelSpec.md 4.2 is corrected on the inner window and on
+reading the far field off the ring's mean.
+
+Co-Authored-By: Claude Opus <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01A72MFkdSczncE7au9UVnmu
+---
+ .../XRenderD3D9/GraphicsPipeline/Bloom.cpp    | 188 ++++++++++++++++--
+ .../XRenderD3D9/GraphicsPipeline/Bloom.h      |  34 +++-
+ .../GraphicsPipeline/DiffractionKernel.cpp    |  19 ++
+ .../GraphicsPipeline/DiffractionKernel.h      |  13 ++
+ .../CinematicCamera/DiffractionKernelSpec.md  |  29 ++-
+ 5 files changed, 267 insertions(+), 16 deletions(-)
+
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Bloom.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Bloom.cpp
+index 9c535772..9e51cbc5 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Bloom.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Bloom.cpp
+@@ -7,6 +7,14 @@
+ 
+ // Taps per stretch iteration. Must match the unrolled loop in HDRStreakStretchPS.
+ static const int s_nStreakTapCount = 8;
++
++// The wave glare's inner fade, in HALF-RESOLUTION pixels. Must match kDiffractionInnerWindowPx
++// in DiffractionPSFPS (HDRPostProcess.cfx): the pixel shader fades the deposit in over this
++// radius so the pattern's 1/u^2 slope, which crosses a whole deposit texel just outside the
++// removed core, does not show as native blocks around every source. It is named here because
++// the CPU has to know it to report what it costs - and it costs more than the round-2 comment
++// admitted, see the report in ExecuteDiffraction.
++static const float kDiffractionInnerWindowHalfPx = 4.0f;
+ // Per tap intensity falloff of the first iteration. Later iterations raise it by the tap
+ // count so the combined falloff stays exponential in distance rather than in iteration.
+ static const float s_fStreakDecay = 0.93f;
+@@ -484,12 +492,29 @@ void CBloomStage::ExecuteDiffraction(const SHDRStreaksParams& streakParams, floa
+ 	//    numbers are claimed to be physical, and it is the only one that can be checked against
+ 	//    a calculation. The threshold itself is still shared, so a lamp that stars still streaks
+ 	//    and halates - what differs is how much of the lamp each of them is told about.
++	const bool bSceneReferredGlare = CRendererResources::IsSceneReferredStage(5);
++
+ 	CTexture* pGlareSrc = pHalfHDR;
+-	if (CRendererResources::IsSceneReferredStage(5))
++	if (bSceneReferredGlare)
+ 	{
+ 		CTexture* pFullHDR = m_graphicsPipelineResources.m_pTexHDRTarget;
+ 		if (CTexture::IsTextureExist(pFullHDR))
++		{
+ 			pGlareSrc = pFullHDR;
++		}
++		else
++		{
++			// It has never happened and it must never be silent if it does: falling back to the
++			// filtered copy costs three and a half stops on a small source, and a glare that is
++			// three stops dark with no line in the log is a week of looking in the wrong place.
++			static bool s_bWarnedNoFullRes = false;
++			if (!s_bWarnedNoFullRes)
++			{
++				s_bWarnedNoFullRes = true;
++				CryLogAlways("[BLOOM] diffraction glare: the scene-referred path is on but $HDRTarget has no device texture - "
++				             "falling back to the firefly-filtered half-res copy, which is about 3.5 stops dark on a small source");
++			}
++		}
+ 	}
+ 
+ 	if (m_passDiffractionThreshold.IsDirty(m_pTexDiffractionSourceTemp->GetTextureID(), pGlareSrc->GetTextureID()))
+@@ -640,7 +665,7 @@ void CBloomStage::ExecuteDiffraction(const SHDRStreaksParams& streakParams, floa
+ 	                                 + kernel.GetTailCoefficient() * logf(max(0.9f * fSpriteRadiusTexels / fRingRadius, 1.0f)), 0.0f);
+ 	// The inner window's radius (4 half-res pixels = 8 native) expressed in kernel texels, for
+ 	// the log. Must match kDiffractionInnerWindowPx in the pixel shader.
+-	const float fInnerWindowTexels = 4.0f / fPitchHalfPx;
++	const float fInnerWindowTexels = kDiffractionInnerWindowHalfPx / fPitchHalfPx;
+ 	const float fNorm = 1.0f / (fPitchHalfPx * fPitchHalfPx);
+ 	const float fEnergy = streakParams.fWaveAmount;
+ 
+@@ -711,6 +736,75 @@ void CBloomStage::ExecuteDiffraction(const SHDRStreaksParams& streakParams, floa
+ 	const float fHalfExtentNativeX = fRadiusHalfPx * fSqueeze * fNativeScaleX;
+ 	const float fHalfExtentNativeY = fRadiusHalfPx * fNativeScaleY;
+ 
++	// ---------------------------------------------------------------------------------------
++	// The report r_HDRDiffractionDebug 3 prints once a second. Built here because this is where
++	// every number that decides the rays' brightness exists at once, and handed to the readback
++	// so the source's measured peak and the parameters that produced it are the same frame's.
++	//
++	// The whole chain, in one line of arithmetic, is
++	//
++	//     deposit(r) = excess * gain * I(u) / pitch^2          u = r / pitch, r in half-res px
++	//
++	// and past the kernel's own edge I(u) = I_ring(theta) * (R_tex / u)^2, in which the pitch
++	// cancels exactly:
++	//
++	//     deposit(r) = excess * gain * I_ring(theta) * R_tex^2 / r^2
++	//
++	// so a single coefficient per angle says what a ray is worth at a given radius, with no
++	// aperture, no resolution and no sensor size left in it. The report evaluates it at
++	// u = 2 R_tex - the first radius at which the far-field law is certainly the one in force,
++	// so the number is exact rather than an interpolation of the texture.
++	SDiffractionReport report;
++	{
++		const float fRingMeanI = (fRingRadius > 1.0f)
++		                         ? (kernel.GetTailCoefficient() / (2.0f * PI * fRingRadius * fRingRadius))
++		                         : 0.0f;
++		// u = 2 R_tex, so I is a quarter of the ring's own value.
++		const float fReportU = 2.0f * fRingRadius;
++
++		report.fThreshold = streakParams.fThreshold;
++		report.fThresholdStops = logf(max(streakParams.fThreshold, 1e-9f) / CRendererResources::kSceneReferredMidGrey) / logf(2.0f);
++		report.fGain = streakParams.fWaveAmount;
++		report.fGainSlider = bSceneReferredGlare
++		                     ? (50.0f + 10.0f * logf(max(streakParams.fWaveAmount, 1e-9f)) / logf(2.0f))
++		                     : streakParams.fWaveAmount;
++		report.fGlareFraction = fGlareFraction;
++		report.fRayCoeff = 0.25f * kernel.GetRingPeak() * fNorm;
++		report.fRingMeanCoeff = 0.25f * fRingMeanI * fNorm;
++		report.fReportRadiusHalfPx = fReportU * fPitchHalfPx;
++		report.fNativeScale = fNativeScaleY;
++		report.bFullResSource = (pGlareSrc != pHalfHDR);
++		report.bSceneReferred = bSceneReferredGlare;
++		report.nSourceW = pGlareSrc->GetWidth();
++		report.nSourceH = pGlareSrc->GetHeight();
++		report.nGridW = nGridWidth;
++		report.nGridH = nGridHeight;
++
++		// What the sprite's INNER FADE costs, which the deposited-fraction figure above has never
++		// included and which is not small: the kernel texture spans only R_tex * pitch half-res
++		// pixels - about twelve at f/8 on a 1080p frame - and the fade covers the first four of
++		// them. The pattern's energy grows as ln(u) outside the core, so the fade sits on the
++		// part of the curve where most of the texture's share lives.
++		//
++		//     kept = (1 / ln(R_tex / u_core)) * integral of w_in(u * pitch) d(ln u)
++		//
++		// Sixty-four log steps, once a second, on the two decades between the core edge and the
++		// texture's rim. It is an estimate - it assumes the 1/u^2 law inside the texture too -
++		// and it is labelled as one, but it turns "a small extra deficit at the very centre"
++		// into a number that can be argued with.
++		const float fCoreU = max(kernel.GetCoreRadiusTexels(), 1.0f);
++		const float fLnSpan = logf(max(fRingRadius / fCoreU, 1.0001f));
++		float fKept = 0.0f;
++		const int kSteps = 64;
++		for (int i = 0; i < kSteps; ++i)
++		{
++			const float u = fCoreU * expf(fLnSpan * ((float)i + 0.5f) / (float)kSteps);
++			const float t = clamp_tpl((u * fPitchHalfPx) / kDiffractionInnerWindowHalfPx, 0.0f, 1.0f);
++			fKept += t * t * (3.0f - 2.0f * t);   // smoothstep, the pixel shader's w_in
++		}
++		report.fInnerKept = fKept / (float)kSteps;
++	}
++
+ 	// Once per change, never per frame: what the pattern actually resolves to on screen.
+ 	{
+ 		static float s_lastPitch = -1.0f, s_lastAmount = -1.0f, s_lastReach = -1.0f, s_lastDispersion = -1.0f, s_lastN = -1.0f;
+@@ -744,13 +838,24 @@ void CBloomStage::ExecuteDiffraction(const SHDRStreaksParams& streakParams, floa
+ 			// complete story.
+ 			if (nDebugMode > 0)
+ 			{
+-				// energy IS the amount now: the layer is composited straight into the HDR
+-				// target, so the tone mapper's bloom weight (printed for reference only) no
+-				// longer stands between the deposit and the screen.
+-				CryLog("[BLOOM] diffraction glare debug=%d energy=%.4g (= resolved gain %.4g, own half-res layer, scene bloom weight %.4g no longer applies) sprite half extent = %.0f x %.0f native px, threshold source = %s",
++				// The SOURCE first, on a line of its own, and the phrase "half-res" is allowed to
++				// appear exactly once in it. Round 3's version put the source at the end of a
++				// sentence that also called the deposit layer "half-res", and the line was read as
++				// saying the threshold had read the half-res copy when it had not - three days
++				// spent looking for a bug in a branch that was being taken. A diagnostic that can
++				// be misread is a diagnostic that will be.
++				CryLog("[BLOOM] diffraction glare THRESHOLD SOURCE = %s, %d x %d px%s",
++				       report.bFullResSource ? "the FULL-RESOLUTION $HDRTarget" : "$HDRTarget 1/2a, the firefly-FILTERED downsample",
++				       report.nSourceW, report.nSourceH,
++				       report.bFullResSource ? " (scene-referred: the frame as lit, undenoised)"
++				                             : (report.bSceneReferred ? " (FALLBACK - about 3.5 stops dark on a small source)"
++				                                                      : " (stock path)"));
++				// energy IS the amount now: the deposit goes into the glare's own layer, which is
++				// composited straight into the HDR target, so the tone mapper's bloom weight
++				// (printed for reference only) no longer stands between the deposit and the screen.
++				CryLog("[BLOOM] diffraction glare debug=%d energy=%.4g (= resolved gain %.4g, own deposit layer, scene bloom weight %.4g no longer applies) sprite half extent = %.0f x %.0f native px",
+ 				       nDebugMode, fEnergy, streakParams.fWaveAmount, fBloomCompositeWeight,
+-				       fHalfExtentNativeX, fHalfExtentNativeY,
+-				       (pGlareSrc == pHalfHDR) ? "half-res downsample (firefly filtered)" : "full-res HDR target");
++				       fHalfExtentNativeX, fHalfExtentNativeY);
+ 			}
+ 		}
+ 	}
+@@ -885,7 +990,7 @@ void CBloomStage::ExecuteDiffraction(const SHDRStreaksParams& streakParams, floa
+ 	//    resolution excess into a readback target, issue the staging download, and map it on a
+ 	//    later frame when the fence has signalled - a copy of some 130 kpx at 1080p, off the
+ 	//    critical path, and only while the mode is on.
+-	UpdateDiffractionSourceReadback(nDebugMode, pSource, streakParams.fThreshold);
++	UpdateDiffractionSourceReadback(nDebugMode, pSource, report);
+ 
+ 	// The layer now holds this frame's glare. ExecuteDiffractionComposite() adds it to the HDR
+ 	// target once the pipeline is past every glare threshold.
+@@ -894,7 +999,7 @@ void CBloomStage::ExecuteDiffraction(const SHDRStreaksParams& streakParams, floa
+ 
+ // The readback half of r_HDRDiffractionDebug 3. Split out because it is a small state machine
+ // and has nothing to do with the drawing above.
+-void CBloomStage::UpdateDiffractionSourceReadback(int nDebugMode, CTexture* pSource, float fThreshold)
++void CBloomStage::UpdateDiffractionSourceReadback(int nDebugMode, CTexture* pSource, const SDiffractionReport& report)
+ {
+ 	if (nDebugMode != 3)
+ 	{
+@@ -997,8 +1102,7 @@ void CBloomStage::UpdateDiffractionSourceReadback(int nDebugMode, CTexture* pSou
+ 		// this into a per-frame download.
+ 		m_fDiffractionReadbackTime = fNow;
+ 
+-		CryLog("[BLOOM] diffraction sources: max excess = %.1f (threshold %.1f) at (%d, %d) half-res",
+-		       fMaxExcess, fThreshold, nMaxX, nMaxY);
++		PrintDiffractionReport(m_diffractionReportInFlight, fMaxExcess, nMaxX, nMaxY);
+ 		return;
+ 	}
+ 
+@@ -1009,6 +1113,66 @@ void CBloomStage::UpdateDiffractionSourceReadback(int nDebugMode, CTexture* pSou
+ 	pDevTex->DownloadToStagingResource(0);
+ 	m_bDiffractionReadbackIssued = true;
+ 	m_fDiffractionReadbackTime = fNow;
++	// The parameters that made the pixels now on their way back from the GPU. Captured here and
++	// not read again when the download lands, so a slider moved in between cannot make the report
++	// describe a frame that never existed.
++	m_diffractionReportInFlight = report;
++}
++
++// The report itself. Everything r_HDRDiffractionDebug 3 knows, said in the units the user's
++// controls are in - exposed scene values and stops over mid grey - and ending in the one sentence
++// the mode exists to produce: how bright a ray actually is in this frame, and how much more gain
++// it would take to put it at mid grey.
++//
++// It is deliberately several short lines rather than one long one. Round 3's single line was
++// misread (see the THRESHOLD SOURCE line in ExecuteDiffraction), and a diagnostic that has to be
++// parsed carefully is not a diagnostic.
++void CBloomStage::PrintDiffractionReport(const SDiffractionReport& report, float fMaxExcess, int nMaxX, int nMaxY)
++{
++	const float fGrey = CRendererResources::kSceneReferredMidGrey;
++	const float fInvLn2 = 1.0f / logf(2.0f);
++	const auto stops = [fGrey, fInvLn2](float v) -> float
++	{
++		return (v > 1e-12f) ? (logf(v / fGrey) * fInvLn2) : -99.0f;
++	};
++
++	// The deposit along a SPIKE, and between the spikes, at the radius the report is defined at.
++	// deposit = excess * gain * coefficient; nothing else is in it.
++	const float fRay = fMaxExcess * report.fGain * report.fRayCoeff;
++	const float fGap = fMaxExcess * report.fGain * report.fRingMeanCoeff;
++	const float fRayStops = stops(fRay);
++	const float fRadiusNative = report.fReportRadiusHalfPx * report.fNativeScale;
++
++	const char* szVerdict =
++	  (fMaxExcess <= 0.0f)   ? "NOTHING cleared the threshold - no source in the frame is bright enough to grow rays" :
++	  (fRayStops >= -1.0f)   ? "plainly visible" :
++	  (fRayStops >= -4.0f)   ? "visible against a dark background" :
++	  (fRayStops >= -7.0f)   ? "faint - findable if you know where to look" :
++	                           "invisible: below anything the display transform can show";
++
++	CryLog("[BLOOM] ---- wave glare, once a second (r_HDRDiffractionDebug 3) ----");
++	CryLog("[BLOOM]   source peak %.4g exposed = %+.1f stops over mid grey, at (%d, %d) of the %d x %d grid"
++	       " -- this is the EXCESS above the threshold, after the 5-tap pre-blur: exactly what one sprite is fed",
++	       fMaxExcess, stops(fMaxExcess), nMaxX, nMaxY, report.nGridW, report.nGridH);
++	CryLog("[BLOOM]   threshold %.4g exposed = %+.1f stops over mid grey -- nothing dimmer than this grows rays at all",
++	       report.fThreshold, report.fThresholdStops);
++	CryLog("[BLOOM]   pupil scatters %.2f%% of a source's light into the pattern; the sprite's inner %.0f-native-px fade"
++	       " then keeps about %.0f%% of the texture's share (estimate, 1/u^2 law)",
++	       report.fGlareFraction * 100.0f,
++	       kDiffractionInnerWindowHalfPx * report.fNativeScale, report.fInnerKept * 100.0f);
++	CryLog("[BLOOM]   gain x%.4g = %+.1f stops (Streak Amount %.0f)",
++	       report.fGain, logf(max(report.fGain, 1e-9f)) * fInvLn2, report.fGainSlider);
++	CryLog("[BLOOM]   RAYS: %.0f native px out from that source a spike lands at %.4g = %+.1f stops vs mid grey -- %s",
++	       fRadiusNative, fRay, fRayStops, szVerdict);
++	if (fRay > 1e-12f)
++	{
++		CryLog("[BLOOM]         between the spikes, %.4g = %+.1f stops; %+.0f stops of gain (Streak Amount %.0f) would put the spike ON mid grey",
++		       fGap, stops(fGap), -fRayStops, clamp_tpl(report.fGainSlider - 10.0f * fRayStops, 0.0f, 200.0f));
++	}
++	CryLog("[BLOOM]   threshold source = %s, %d x %d px%s",
++	       report.bFullResSource ? "the FULL-RESOLUTION $HDRTarget" : "$HDRTarget 1/2a, the firefly-FILTERED downsample",
++	       report.nSourceW, report.nSourceH,
++	       report.bFullResSource ? "" : (report.bSceneReferred ? "  <-- FALLBACK, about 3.5 stops dark on a small source" : "  (stock path)"));
+ }
+ 
+ // The glare layer's composite. Called by the pipeline right after the bloom stage, in the same
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Bloom.h b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Bloom.h
+index 025de1b0..71df1ba2 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Bloom.h
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Bloom.h
+@@ -74,9 +74,38 @@ public:
+ 	void ExecuteDiffractionComposite();
+ 
+ private:
++	//! Everything r_HDRDiffractionDebug 3's once-a-second report needs in order to say, in plain
++	//! numbers, why the rays are as bright as they are. Filled by ExecuteDiffraction from the
++	//! values that frame actually used and handed to the readback, which prints it when the
++	//! source's peak comes back from the GPU a frame or two later. One struct rather than eight
++	//! arguments, and it is captured at ISSUE time so the peak and the parameters that produced
++	//! it can never be a frame apart.
++	struct SDiffractionReport
++	{
++		float fThreshold = 0.0f;          //!< resolved, in exposed units
++		float fThresholdStops = 0.0f;     //!< the same number as stops over mid grey
++		float fGain = 1.0f;               //!< resolved Streak Amount (2^stops under the switch)
++		float fGainSlider = 0.0f;         //!< what the user typed
++		float fGlareFraction = 0.0f;      //!< texture + tail, BEFORE the sprite's inner fade
++		float fInnerKept = 1.0f;          //!< what the inner fade leaves of the texture's share
++		float fRayCoeff = 0.0f;           //!< deposit along a SPIKE  = excess * gain * this
++		float fRingMeanCoeff = 0.0f;      //!< deposit at the ring MEAN, same radius
++		float fReportRadiusHalfPx = 0.0f; //!< where those two are evaluated
++		float fNativeScale = 2.0f;        //!< half-res px -> native px
++		bool  bFullResSource = false;
++		bool  bSceneReferred = false;
++		int   nSourceW = 0;
++		int   nSourceH = 0;
++		int   nGridW = 0;                 //!< the half-res sprite grid, which is what the peak's (x, y) index
++		int   nGridH = 0;
++	};
++
+ 	void ExecuteStreaks();
+ 	void ExecuteDiffraction(const SHDRStreaksParams& streakParams, float fBloomCompositeWeight);
+-	void UpdateDiffractionSourceReadback(int nDebugMode, CTexture* pSource, float fThreshold);
++	void UpdateDiffractionSourceReadback(int nDebugMode, CTexture* pSource, const SDiffractionReport& report);
++	//! r_HDRDiffractionDebug 3's once-a-second answer to "why are the rays that bright", in
++	//! exposed scene units and stops over mid grey.
++	static void PrintDiffractionReport(const SDiffractionReport& report, float fMaxExcess, int nMaxX, int nMaxY);
+ 	void ExecuteFilterPSF();
+ 	void ExecuteHalation();
+ 
+@@ -145,6 +174,9 @@ private:
+ 	bool                 m_bDiffractionReadbackIssued = false;
+ 	bool                 m_bDiffractionReadbackStalled = false;
+ 	float                m_fDiffractionReadbackTime = 0.0f;
++	//! Captured when the download is issued, printed when it lands: the numbers that produced
++	//! the peak the GPU is on its way back with.
++	SDiffractionReport   m_diffractionReportInFlight;
+ 
+ 	CFullscreenPass   m_passHalationThreshold;
+ 	CStretchRectPass  m_passHalationDown0;   // quarter -> 1/8
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DiffractionKernel.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DiffractionKernel.cpp
+index 8c74d228..c6543eb2 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DiffractionKernel.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DiffractionKernel.cpp
+@@ -626,11 +626,13 @@ void CDiffractionKernel::BuildJob()
+ 
+ 	m_resultRing.resize((size_t)kRingBins);
+ 	double fRingMean = 0.0;
++	double fRingPeak = 0.0;
+ 	for (int b = 0; b < kRingBins; ++b)
+ 	{
+ 		const float I = (ringCount[(size_t)b] > 0) ? (float)(ringSum[(size_t)b] / (double)ringCount[(size_t)b]) : 0.0f;
+ 		m_resultRing[(size_t)b] = CryConvertFloatToHalf(sqrtf(max(I, 0.0f)));
+ 		fRingMean += (double)I;
++		fRingPeak = max(fRingPeak, (double)I);
+ 	}
+ 	fRingMean /= (double)kRingBins;
+ 
+@@ -643,6 +645,13 @@ void CDiffractionKernel::BuildJob()
+ 	m_resultIntegral = (float)fTexIntegral;
+ 	m_resultCoreFraction = (float)fCore;
+ 	m_resultFarFraction = (float)fFar;
++	// The ring's PEAK bin, next to its mean. The mean is what the tail coefficient carries and it
++	// is the right number for an energy budget; it is the wrong number for "how bright is the
++	// ray", because a spike occupies a handful of the 256 bins and stands one to two orders of
++	// magnitude over the average of the dark angles between the spikes. Reporting only the mean
++	// is how a pattern that draws perfectly good rays gets called faint.
++	m_resultRingPeak = (float)fRingPeak;
++	m_resultCoreRadiusTexels = fCoreRadius;
+ 	m_resultJobMs = (gEnv->pTimer->GetAsyncTime() - tStart).GetMilliSeconds();
+ }
+ 
+@@ -722,6 +731,8 @@ void CDiffractionKernel::UploadResult(const char* szNameSuffix)
+ 	m_fTailCoefficient = m_resultTailCoefficient;
+ 	m_fCoreFraction = m_resultCoreFraction;
+ 	m_fFarFraction = m_resultFarFraction;
++	m_fRingPeak = m_resultRingPeak;
++	m_fCoreRadiusTexels = max(m_resultCoreRadiusTexels, 1.0f);
+ 
+ 	// The physical glare fraction is what is NOT in the core: the pattern was Parseval-normalised
+ 	// to the pupil's whole transmitted light before the core was cut out, so 1 - core is the
+@@ -742,6 +753,14 @@ void CDiffractionKernel::UploadResult(const char* szNameSuffix)
+ 	       m_builtDesc.fKsa,
+ 	       m_fCoreFraction, m_fTailCoefficient, 1.0f - m_fCoreFraction, kFarAiryRadii, m_fFarFraction,
+ 	       L, m_resultJobMs);
++	// The ray-to-gap contrast on the boundary ring, which is what decides whether the far field
++	// reads as RAYS or as a round halo. peak/mean of 1 is a halo; a bladed iris runs 30 to 300.
++	CryLog("[BLOOM] diffraction kernel far field: ring peak %.3g, ring mean %.3g (ray/gap contrast %.0fx), core radius %.1f texels, R_tex %.0f texels",
++	       m_fRingPeak,
++	       (m_fRingRadius > 1.0f) ? (m_fTailCoefficient / (2.0f * PI * m_fRingRadius * m_fRingRadius)) : 0.0f,
++	       (m_fTailCoefficient > 1e-30f && m_fRingRadius > 1.0f)
++	         ? (m_fRingPeak / (m_fTailCoefficient / (2.0f * PI * m_fRingRadius * m_fRingRadius))) : 0.0f,
++	       m_fCoreRadiusTexels, m_fRingRadius);
+ 	CryLog("[BLOOM] diffraction kernel mip chain: %d levels (%d..1), %.0f KB", m_nKernelMips, L,
+ 	       (float)(m_resultKernel.size() * sizeof(uint16)) / 1024.0f);
+ }
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DiffractionKernel.h b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DiffractionKernel.h
+index f887765f..1e75847e 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DiffractionKernel.h
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DiffractionKernel.h
+@@ -110,6 +110,15 @@ public:
+ 	//! Fraction of the pupil's transmitted light that sat in the removed core (~0.9 for a round
+ 	//! pupil). Diagnostic only: the frame already carries the source itself.
+ 	float GetCoreFraction() const { return m_fCoreFraction; }
++	//! PEAK intensity over the boundary ring's angular bins. The tail coefficient above carries
++	//! the ring's MEAN, which is the right number for an energy budget and the wrong one for
++	//! "how bright is the ray": a spike covers a handful of bins and stands one to two orders of
++	//! magnitude over the mean, so the mean answers a question nobody asked. The glare's report
++	//! prints the deposit both ways so "faint" can never be an impression.
++	float GetRingPeak() const { return m_fRingPeak; }
++	//! Radius of the removed core, in kernel texels. The pattern's energy grows as ln(u) from
++	//! here outwards, so this is what turns the sprite's inner fade into a number.
++	float GetCoreRadiusTexels() const { return m_fCoreRadiusTexels; }
+ 
+ 	bool  IsReady() const { return m_pTexKernel != nullptr && m_pTexRing != nullptr; }
+ 
+@@ -139,6 +148,8 @@ private:
+ 	float                 m_fTailCoefficient = 0.0f;
+ 	float                 m_fCoreFraction = 0.0f;
+ 	float                 m_fFarFraction = 0.0f;   //!< diagnostics: energy past kFarAiryRadii
++	float                 m_fRingPeak = 0.0f;      //!< brightest angular bin of the boundary ring
++	float                 m_fCoreRadiusTexels = 1.0f;
+ 
+ 	// --- shared with the job; touched by the render thread only while it is not running ---
+ 	JobManager::SJobState m_jobState;
+@@ -154,6 +165,8 @@ private:
+ 	float                 m_resultTailCoefficient = 0.0f;
+ 	float                 m_resultCoreFraction = 0.0f;
+ 	float                 m_resultFarFraction = 0.0f;
++	float                 m_resultRingPeak = 0.0f;
++	float                 m_resultCoreRadiusTexels = 1.0f;
+ 	float                 m_resultJobMs = 0.0f;
+ 
+ 	// --- mask cache, render thread only ---
+diff --git a/Code/CryPlugins/CinematicCamera/DiffractionKernelSpec.md b/Code/CryPlugins/CinematicCamera/DiffractionKernelSpec.md
+index 85557fc3..78acd4b1 100644
+--- a/Code/CryPlugins/CinematicCamera/DiffractionKernelSpec.md
++++ b/Code/CryPlugins/CinematicCamera/DiffractionKernelSpec.md
+@@ -359,15 +359,38 @@ artefact that is a property of the RASTERIZATION, not of the physics.
+   gentler.) That radius already belongs to the source itself and to the bloom around it, so
+   fading the glare in over it costs nothing visible. It is **not** free in energy: it is the
+   steepest part of the pattern. The kernel's own core removal (2.5 Airy radii) is unchanged, so
+-  the accounting of §2.4 stands and this is a small extra deficit at the very centre — not
+-  estimated, because it needs the kernel's radial profile, which lives on the job side; the pass
+-  logs the window's radius in kernel texels instead.
++  the accounting of §2.4 stands and this is an extra deficit at the very centre; the pass logs
++  the window's radius in kernel texels.
++
++  > **Corrected 2026-08-30 (scene-referred round 4).** "A small extra deficit" was wrong, and the
++  > constant is now named `kDiffractionInnerWindowHalfPx` in `Bloom.cpp` so that the CPU can cost
++  > it. The kernel texel pitch is `λ·N·d/L`, about **0.047 half-res pixels** at f/8 on a 1080p
++  > frame, so the whole kernel **texture** spans only some **twelve half-res pixels** — and the
++  > fade covers the first four of them. The pattern's energy grows as `ln(u)` outside the core, so
++  > the fade sits exactly where most of the texture's share lives: it keeps roughly **a third** of
++  > it, one and a half stops. The `r_HDRDiffractionDebug 3` report now prints that fraction, and
++  > the "deposited glare fraction" logged next to it should be read as the figure **before** the
++  > fade — it has always over-reported the deposit by about 3×.
++  >
++  > It does **not** dim the rays. Everything past `r = 4` half-res pixels is untouched, and that is
++  > where the 1/u² tail — the visible spikes — lives. Narrowing the fade is a real option and is
++  > written up as approach B in `scene-notes/decisions/s8-glare-source.md` round 4; it was not
++  > taken, because it does not answer the evidence and re-opens the blocks artefact.
+ 
+ That prediction was tested and came true: the blocks survived the inner window, so the step named
+ here — "run the sprite pass into a half-resolution target of its own and composite that down" —
+ has been taken, together with the source pre-blur the prediction missed (it read the deposit grid
+ as the whole fault; the source grid was the other half).
+ 
++> **Round 4 note on reading the far field.** `c_tail` is built from the boundary ring's angular
++> **MEAN**. That is the correct number for an energy budget and the wrong one for "how bright is
++> the spike": a bladed iris runs 30–300× between a ray and the gap beside it, so an estimate made
++> off `c_tail` is an estimate of the DARK part of the pattern. `CDiffractionKernel::GetRingPeak()`
++> carries the peak bin, the kernel's log line prints the ray/gap contrast, and the
++> `r_HDRDiffractionDebug 3` report prints the deposit both ways. Past `R_tex` the deposit is
++> `excess · gain · I_ring(θ) · R_tex² / r²` with `r` in half-res pixels — the texel pitch cancels
++> exactly, so aperture, resolution and sensor size are all already inside `r`.
++
+ `kernelLod(u, θ, lod)` samples `$DiffractionKernel` with `SampleLevel` at
+ `0.5 + u/L · (cos θ, sin θ)`; `ring(θ)` samples `$DiffractionRing` at `θ / 2π` (bilinear, wrap).
+ The kernel's sampler must be **`TrilinearClamp`** — CRYENGINE builds `FILTER_LINEAR` samplers
+-- 
+2.47.1.windows.1
+

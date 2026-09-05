@@ -1,0 +1,223 @@
+From cfbd5d94dd84f765cb6a3c62abf994e55d335ef6 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Fri, 28 Aug 2026 06:23:12 +0800
+Subject: [PATCH 060/119] scene-referred S0: force fp16 on the HDR satellite
+ targets
+
+Second item of Stage S0. Seven colour-path targets take the "low quality" HDR alias and are
+R11G11B10F at r_HDRTexFormat 0 and 1 - $HDRTargetPrev[0..1], $SceneTargetR11G11B10F[0..1],
+$HDRFinalBloom and $WaterVolumeRefl[0..1]. That format has no sign bit, so on the
+scene-referred path it would clip every negative channel the wide-gamut working space
+produces: a wrong picture with no error anywhere. This forces them to fp16 while the switch
+is on and leaves them exactly as they were when it is off.
+
+Decision: scene-notes/decisions/s0-fp16-forcing.md, approach A. Research:
+scene-notes/research/s0-hdr-format-selection.md.
+
+- ResolveHDRSatelliteFormat() in GraphicsPipeline.cpp computes
+  effective = max(CV_r_HDRTexFormat, IsSceneReferred() ? 2 : 0) and is used at the two
+  pipeline call sites (CreateHDRMaps, CreatePostFXMaps). With the switch off it is a straight
+  pass-through to the stock CRendererResources::GetHDRFormat(false, true), so the stock
+  formats are bit-for-bit unchanged.
+- GetHDRFormat() itself is deliberately untouched: it is engine-wide, and its value 0 also
+  selects the depth-fixup / thin-hair forward path, the particle fixup, $ZTargetFixup and the
+  PostAA accumulator format. nLDRPFormat (the display target's UNORM clamp) is untouched too -
+  that is S4's wall, not this item's.
+- Setting a format at creation is not enough: the target objects are pre-registered by name in
+  Init(), and CTexture::CreateRenderTarget only assigns m_eSrcFormat while it is eTF_Unknown,
+  so the format argument of an existing texture is silently discarded. UpdateHDRSatelliteFormats()
+  therefore compares the wanted format against GetDstFormat(), releases all seven and lets the
+  create functions rebuild them - the CPostAAStage::Resize pattern. It runs from
+  CGraphicsPipelineResources::Update(), on the render thread before Execute() and before
+  CompileModifiedRenderObjects(), which is where the pipeline already creates and releases the
+  rain occlusion texture on demand.
+- All seven or none: $HDRTargetPrev[] and $SceneTargetR11G11B10F[] are ping-ponged and copied
+  into each other's roles across passes, so a mixed set would leave a silent precision cliff
+  mid-chain.
+- One documented deviation from the decision note, and it is load-bearing: the release must be
+  SAFE_RELEASE_FORCE, not SAFE_RELEASE. CTexture::Release() is a no-op on an FT_DONT_RELEASE
+  texture; PostAA's accumulators do not carry that flag and all seven of ours do, so a plain
+  SAFE_RELEASE would have done nothing and the format would never have moved. ReleaseForce()
+  is what CGraphicsPipelineResources::Shutdown() already uses on these exact targets. The
+  research and decision notes have been corrected.
+- The memory delta is logged once per flip (CryLog), summed from GetDeviceDataSize() before
+  and after, with the resolution: roughly +37 MiB at 1080p and +150 MiB at 4K, per pipeline.
+
+Built clean (0 errors, 0 warnings outside Code/SDKs): CryRenderD3D11, CinematicCamera.
+
+Co-Authored-By: Claude Opus <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01A72MFkdSczncE7au9UVnmu
+---
+ .../Common/GraphicsPipeline.cpp               | 117 +++++++++++++++++-
+ .../Common/GraphicsPipeline.h                 |   4 +
+ 2 files changed, 119 insertions(+), 2 deletions(-)
+
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Common/GraphicsPipeline.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Common/GraphicsPipeline.cpp
+index 8a46f258..116f0763 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Common/GraphicsPipeline.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Common/GraphicsPipeline.cpp
+@@ -205,6 +205,29 @@ void CGraphicsPipelineResources::CreateDepthMaps(int resourceWidth, int resource
+ 	}
+ }
+ 
++// Scene-referred pipeline (SceneReferredSpec.md, S0 fp16 forcing).
++//
++// Seven colour-path targets take the "low quality" HDR alias and are therefore R11G11B10F at
++// r_HDRTexFormat 0 and 1: $HDRTargetPrev[0..1], $SceneTargetR11G11B10F[0..1], $HDRFinalBloom
++// and $WaterVolumeRefl[0..1]. That format has no sign bit and 5-6 mantissa bits, so on the
++// scene-referred path it would silently clip every negative channel the wide-gamut working
++// space produces - the worst kind of failure: a wrong picture with no error anywhere.
++//
++// The cvar stays a floor and gains a second one: effective = max(cvar, sceneReferred ? 2 : 0).
++// The decision is made HERE and not inside CRendererResources::GetHDRFormat(), which is
++// engine-wide - value 0 there also selects the depth-fixup / thin-hair forward path and the
++// PostAA accumulator format, none of which may move. With the switch off this function is a
++// straight pass-through to the stock helper, so the stock formats are bit-for-bit unchanged.
++static ETEX_Format ResolveHDRSatelliteFormat()
++{
++	const int effective = std::max(CRenderer::CV_r_HDRTexFormat, CRendererResources::IsSceneReferred() ? 2 : 0);
++
++	if (effective >= 2)
++		return eTF_R16G16B16A16F;
++
++	return CRendererResources::GetHDRFormat(false, true);
++}
++
+ void CGraphicsPipelineResources::CreateHDRMaps(int resourceWidth, int resourceHeight)
+ {
+ 	m_renderTargetPool.ClearRenderTargetList();
+@@ -215,7 +238,7 @@ void CGraphicsPipelineResources::CreateHDRMaps(int resourceWidth, int resourceHe
+ 	uint32 nHDRTargetFlagsUAV = nHDRTargetFlags | (FT_USAGE_UNORDERED_ACCESS);  // UAV required for tiled deferred shading
+ 
+ 	const ETEX_Format nHDRFormat = CRendererResources::GetHDRFormat(false, false); // No alpha, default is HiQ, can be downgraded
+-	const ETEX_Format nHDRQFormat = CRendererResources::GetHDRFormat(false, true); // No alpha, default is LoQ, can be upgraded
++	const ETEX_Format nHDRQFormat = ResolveHDRSatelliteFormat();                   // No alpha, default is LoQ, can be upgraded - forced to fp16 on the scene-referred path
+ 	const ETEX_Format nHDRAFormat = CRendererResources::GetHDRFormat(true, false); // With alpha
+ 	
+ 	m_renderTargetPool.AddRenderTarget(width, height, Clr_Unknown, nHDRFormat, 1.0f, m_graphicsPipeline.MakeUniqueTexIdentifierName("$HDRTarget").c_str(), &m_pTexHDRTarget, nHDRTargetFlagsUAV);
+@@ -279,7 +302,7 @@ void CGraphicsPipelineResources::CreatePostFXMaps(int resourceWidth, int resourc
+ 	CRY_DISABLE_WARN_UNUSED_VARIABLES();
+ 	const ETEX_Format nHDRFormat = CRendererResources::GetHDRFormat(false, false); // No alpha, default is HiQ, can be downgraded
+ 	const ETEX_Format nHDRAFormat = CRendererResources::GetHDRFormat(true, false); // With alpha
+-	const ETEX_Format nHDRQFormat = CRendererResources::GetHDRFormat(false, true); // No alpha, default is LoQ, can be upgraded
++	const ETEX_Format nHDRQFormat = ResolveHDRSatelliteFormat();                   // No alpha, default is LoQ, can be upgraded - forced to fp16 on the scene-referred path
+ 	const ETEX_Format nLDRPFormat = CRendererResources::GetLDRFormat(true);         // With more than 8 mantissa bits for calculations
+ 	CRY_RESTORE_WARN_UNUSED_VARIABLES();
+ 
+@@ -427,8 +450,98 @@ void CGraphicsPipelineResources::OnCVarsChanged(const CCVarUpdateRecorder& rCVar
+ 	}
+ }
+ 
++// Re-format the seven HDR satellite targets when the scene-referred switch flips.
++//
++// Setting a format at creation time is not enough: r_HDRTexFormat is apply-on-startup in
++// practice, because the target objects are pre-registered by name in Init() and
++// CTexture::CreateRenderTarget only assigns m_eSrcFormat when it is still eTF_Unknown - the
++// format argument of an already-formatted texture is silently discarded. So the objects have
++// to be destroyed before the create functions can rebuild them, which is the
++// CPostAAStage::Resize pattern (compare against GetDstFormat(), release, re-create).
++//
++// One deviation from that pattern, and it is load-bearing: PostAA's accumulators do not carry
++// FT_DONT_RELEASE, ours do, and CTexture::Release() is a NO-OP on an FT_DONT_RELEASE texture
++// (Texture.h). SAFE_RELEASE here would do nothing at all and the format would never move.
++// ReleaseForce() clears the flag first, which is what Shutdown() already uses on these exact
++// targets.
++//
++// All seven or none: $HDRTargetPrev[] and $SceneTargetR11G11B10F[] are ping-ponged and copied
++// into each other's roles across passes, so a mixed set would leave a silent precision cliff
++// in the middle of the chain.
++void CGraphicsPipelineResources::UpdateHDRSatelliteFormats()
++{
++	const ETEX_Format wanted = ResolveHDRSatelliteFormat();
++
++	CTexture* const satellites[] =
++	{
++		m_pTexHDRTargetPrev[0],
++		m_pTexHDRTargetPrev[1],
++		m_pTexSceneTargetR11G11B10F[0],
++		m_pTexSceneTargetR11G11B10F[1],
++		m_pTexHDRFinalBloom,
++		m_pTexWaterVolumeRefl[0],
++		m_pTexWaterVolumeRefl[1],
++	};
++
++	uint64 sizeBefore = 0;
++	bool bMismatch = false;
++	for (CTexture* pTex : satellites)
++	{
++		if (!pTex)
++			continue;
++
++		sizeBefore += pTex->GetDeviceDataSize();
++		bMismatch |= (pTex->GetDstFormat() != wanted);
++	}
++
++	if (!bMismatch)
++		return;
++
++	SAFE_RELEASE_FORCE(m_pTexHDRTargetPrev[0]);
++	SAFE_RELEASE_FORCE(m_pTexHDRTargetPrev[1]);
++	SAFE_RELEASE_FORCE(m_pTexSceneTargetR11G11B10F[0]);
++	SAFE_RELEASE_FORCE(m_pTexSceneTargetR11G11B10F[1]);
++	SAFE_RELEASE_FORCE(m_pTexHDRFinalBloom);
++	SAFE_RELEASE_FORCE(m_pTexWaterVolumeRefl[0]);
++	SAFE_RELEASE_FORCE(m_pTexWaterVolumeRefl[1]);
++
++	CreateHDRMaps(m_resourceWidth, m_resourceHeight);
++	CreatePostFXMaps(m_resourceWidth, m_resourceHeight);
++
++	uint64 sizeAfter = 0;
++	CTexture* const rebuilt[] =
++	{
++		m_pTexHDRTargetPrev[0],
++		m_pTexHDRTargetPrev[1],
++		m_pTexSceneTargetR11G11B10F[0],
++		m_pTexSceneTargetR11G11B10F[1],
++		m_pTexHDRFinalBloom,
++		m_pTexWaterVolumeRefl[0],
++		m_pTexWaterVolumeRefl[1],
++	};
++	for (CTexture* pTex : rebuilt)
++	{
++		if (pTex)
++			sizeAfter += pTex->GetDeviceDataSize();
++	}
++
++	// Once per flip, not once per frame: the mismatch test above is false on every other frame.
++	// The number is per graphics pipeline - Sandbox pays it again for every extra viewport.
++	CryLog("[SceneReferred] HDR satellite targets -> %s at %dx%d; %.1f MiB -> %.1f MiB (%+.1f MiB)",
++	       (wanted == eTF_R16G16B16A16F) ? "R16G16B16A16F" : "R11G11B10F",
++	       m_resourceWidth, m_resourceHeight,
++	       sizeBefore / (1024.0 * 1024.0), sizeAfter / (1024.0 * 1024.0),
++	       (double(sizeAfter) - double(sizeBefore)) / (1024.0 * 1024.0));
++}
++
+ void CGraphicsPipelineResources::Update(EShaderRenderingFlags renderingFlags)
+ {
++	// Scene-referred pipeline: pick up a flip of the switch. Update() is the sanctioned place
++	// for a stage to manage or retire resources - it runs on the render thread, before
++	// CompileModifiedRenderObjects() and before Execute(), so nothing is bound yet - and the
++	// rain occlusion texture right below is created and released on demand in the same way.
++	UpdateHDRSatelliteFormats();
++
+ 	const auto shouldApplyOcclusion = gcpRendD3D->m_bDeferredRainOcclusionEnabled && CRendererCVars::IsRainEnabled();
+ 
+ 	// Create/release the occlusion texture on demand
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Common/GraphicsPipeline.h b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Common/GraphicsPipeline.h
+index c95ca972..be99fcdc 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Common/GraphicsPipeline.h
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Common/GraphicsPipeline.h
+@@ -142,6 +142,10 @@ public:
+ 	void OnCVarsChanged(const CCVarUpdateRecorder& rCVarRecs);
+ 	void Update(EShaderRenderingFlags renderingFlags);
+ 
++	//! Scene-referred pipeline (SceneReferredSpec.md): re-format the seven low-quality HDR
++	//! satellite targets when the switch flips. Render thread, between frames.
++	void UpdateHDRSatelliteFormats();
++
+ 	void PrepareRainOcclusionMaps();
+ 	void CreateRainOcclusionMaps(int resourceWidth, int resourceHeight);
+ 	void DestroyRainOcclusionMaps();
+-- 
+2.47.1.windows.1
+

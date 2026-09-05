@@ -1,0 +1,463 @@
+From 012b0605a5c34b750f8dce40d192d7b53b38a7ee Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Fri, 28 Aug 2026 10:10:35 +0800
+Subject: [PATCH 089/119] scene-referred S6: the capture commands, and a frame
+ that says what took it
+
+rec_CaptureEXR <folder> [prefix] arms a sequence, rec_CaptureEXRStop ends it, rec_CaptureEXRFrame
+writes exactly one. Commands and not a cvar, because arming takes arguments and because
+capture_frames has already demonstrated what happens when a capture's on/off state and its frame
+counter share one console variable that ManualFrameStep and CryMovie also write. This counter
+belongs to the capture and starts at zero on every arm. Files are <prefix>.%06d.exr, dot-separated,
+which is what Nuke and Resolve auto-detect as a sequence rather than as a folder of stills.
+
+Four cvars decide what the file IS, all latched when the capture starts: the tap (graded or
+negative), the encoding, the compression, and the fixed step. The encoding default is ACES2065-1 -
+AP0, converted from AP1 during the write, tagged with AP0 chromaticities AND acesImageContainerFlag
+- because an untagged EXR in an ACES project is assumed to be ACES2065-1, so the file imports
+correctly with the operator doing nothing at all. ACEScg is the alternative: the buffer byte for
+byte, AP1 chromaticities and never the container flag, since that flag asserts ST 2065-4
+conformance and that is a claim about AP0 data.
+
+A sequence sets t_FixedStep and puts it back on stop. Outside the editor nothing else locks frame
+time - capture_frames certainly does not, whatever its name suggests - so without this a sequence
+is one file per rendered frame at whatever rate the machine managed, and N frames is not N/fps
+seconds. An EXR sequence is a timed artefact or it cannot be conformed. It also pins
+r_DepthOfFieldLensModelJitter to 2 for the duration: a sequence in which every frame carries a
+different sub-pixel dither is noise with a picture behind it, and it is indistinguishable from TAA
+ghosting when someone tries to work out what went wrong.
+
+Metadata reaches the renderer on the post-effect bus, which is already the one channel the camera
+and the renderer share - cheaper than a new CryCommon interface for a string. The bus gains a
+string param type for the two values that are genuinely names, and ccam publishes camera name,
+focal length, T-stop (not f-number: the T-stop is what the exposure is computed from, and
+`aperture` is the classic attribute name to get wrong), ISO, shutter, ND and EV100 every frame it
+owns the render state. The renderer adds the exposure scale actually applied, the working space,
+the tap, the ODT and LMT names (read off the bound LUT textures), the CDL in the ASC's own order,
+the frame index and the render frame ID.
+
+Two of those are load-bearing rather than decorative. rec/exposureScale is the number that makes
+the file's absolute scale recoverable at all - this whole pipeline rests on 1.0 = 10 000 cd/m2 and
+the pre-exposure destroys that unless the scale travels with the frame. rec/exportTap is what lets
+anything reading these files tell a graded frame from a negative, which look alike and mean
+entirely different things.
+
+rec/lensName is published empty on purpose: lens presets are a later item, and an invented name
+stamped on every frame would be worse than no name at all.
+
+Co-Authored-By: Claude Opus <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01A72MFkdSczncE7au9UVnmu
+---
+ .../Common/PostProcess/PostProcess.cpp        | 45 ++++++++++++
+ .../Common/PostProcess/PostProcess.h          | 69 ++++++++++++++++++-
+ .../RenderDll/Common/RendererCVars.cpp        | 52 ++++++++++++++
+ .../GraphicsPipeline/SceneReferredExport.cpp  | 34 +++++++++
+ .../Module/CinematicCameraComponent.cpp       | 50 ++++++++++++++
+ .../Module/CinematicCameraComponent.h         |  7 ++
+ 6 files changed, 256 insertions(+), 1 deletion(-)
+
+diff --git a/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.cpp b/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.cpp
+index 6b9c64c0..722d52a7 100644
+--- a/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.cpp
++++ b/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.cpp
+@@ -427,6 +427,22 @@ int CPostEffectsMgr::Init()
+ 	AddParamVec4NoTransition("Global_User_GradePower", m_pUserGradePower, Vec4(1.0f, 1.0f, 1.0f, 0.0f));
+ 	AddParamFloatNoTransition("Global_User_GradeSaturation", m_pUserGradeSaturation, 1.0f);
+ 
++	// The camera's identity and its exposure triangle, for the EXR header (SceneReferredSpec.md
++	// S6). Nothing in the renderer draws with these: they are metadata, published by ccam and read
++	// once per captured frame. They are on the bus rather than behind a new IRenderer method
++	// because the bus is already the one channel the camera and the renderer share, and adding to
++	// a public CryCommon interface for a string is not a trade worth making.
++	//
++	// No transition on any of them, for the reason a cross-faded ISO is nonsense.
++	AddParamString("Global_User_CamName", m_pUserCamName);
++	AddParamString("Global_User_LensName", m_pUserLensName);
++	AddParamFloatNoTransition("Global_User_CamFocal", m_pUserCamFocal, 0.0f);
++	AddParamFloatNoTransition("Global_User_CamTStop", m_pUserCamTStop, 0.0f);
++	AddParamFloatNoTransition("Global_User_CamISO", m_pUserCamISO, 0.0f);
++	AddParamFloatNoTransition("Global_User_CamShutter", m_pUserCamShutter, 0.0f);
++	AddParamFloatNoTransition("Global_User_CamND", m_pUserCamND, 0.0f);
++	AddParamFloatNoTransition("Global_User_CamEV100", m_pUserCamEV100, 0.0f);
++
+ 	// Register all post processes
+ 	AddEffect(CSunShafts);
+ 	AddEffect(CDepthOfField);
+@@ -736,6 +752,13 @@ float CPostEffectsMgr::GetByNameF(const char* pszParam)
+ 	return 0.0f;
+ }
+ 
++const char* CPostEffectsMgr::GetByNameStr(const char* pszParam)
++{
++	CEffectParam* pParam = GetByName(pszParam);
++	const char* szValue = pParam ? pParam->GetParamString() : nullptr;
++	return szValue ? szValue : "";
++}
++
+ Vec4 CPostEffectsMgr::GetByNameVec4(const char* pszParam)
+ {
+ 	CEffectParam* pParam = GetByName(pszParam);
+@@ -820,6 +843,28 @@ void CParamTexture::Release()
+ 	pFillData->bSetThisFrame = true;
+ }
+ 
++void CParamString::SyncMainWithRender()
++{
++	CParamStringThreadSafeData* pFillData = &m_threadSafeData[gRenDev->GetMainThreadID()];
++
++	const bool bIsMultiThreaded = (gRenDev->m_pRT) ? (gRenDev->m_pRT->IsMultithreaded()) : false;
++	if (bIsMultiThreaded)
++	{
++		CParamStringThreadSafeData* pProcessData = &m_threadSafeData[gRenDev->GetRenderThreadID()];
++		// A value set on the render thread overrides the main thread's once, the same rule every
++		// other param type follows.
++		if (pProcessData->bSetThisFrame)
++			pFillData->value = pProcessData->value;
++
++		pFillData->bSetThisFrame = false;
++		*pProcessData = *pFillData;
++	}
++	else
++	{
++		pFillData->bSetThisFrame = false;
++	}
++}
++
+ void CParamTexture::SyncMainWithRender()
+ {
+ 	CParamTextureThreadSafeData* pFillData = &m_threadSafeData[gRenDev->GetMainThreadID()];
+diff --git a/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.h b/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.h
+index e4c4ca55..31be3119 100644
+--- a/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.h
++++ b/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.h
+@@ -255,6 +255,65 @@ private:
+ ////////////////////////////////////////////////////////////////////////////////////////////////////
+ 
+ // CTexture type effect param
++//! String type effect param. The bus is otherwise float and Vec4 only, and the camera metadata an
++//! exported frame has to carry (SceneReferredSpec.md S6) includes things that are genuinely names -
++//! the camera, the lens. CParamTexture already carries a string, but it turns it into a texture on
++//! the way in, which is not what is wanted here.
++//!
++//! Double-buffered per thread exactly like the other param types, with the same "set on the render
++//! thread wins once" rule, so a name written from a component on the main thread reaches the render
++//! thread on the following frame and never tears.
++class CParamString : public CEffectParam
++{
++public:
++	CParamString()
++	{
++		Reset();
++	}
++
++	CParamString(int nInit, bool bSmoothTransition)
++	{
++		Reset();
++	}
++
++	virtual void SetParamString(const char* pszParam)
++	{
++		CParamStringThreadSafeData* pFillData = &m_threadSafeData[gRenDev->GetMainThreadID()];
++		pFillData->value = pszParam ? pszParam : "";
++		pFillData->bSetThisFrame = true;
++	}
++
++	virtual const char* GetParamString() const
++	{
++		const int threadID = gRenDev->m_pRT ? gRenDev->m_pRT->GetThreadList() : 0;
++		return m_threadSafeData[threadID].value.c_str();
++	}
++
++	virtual void SyncMainWithRender();
++
++private:
++
++	void Reset()
++	{
++		for (int i = 0; i < RT_COMMAND_BUF_COUNT; ++i)
++		{
++			m_threadSafeData[i].value.clear();
++			m_threadSafeData[i].bSetThisFrame = false;
++		}
++	}
++
++	struct CParamStringThreadSafeData
++	{
++		string value;
++		bool   bSetThisFrame;
++	};
++
++	CParamStringThreadSafeData m_threadSafeData[RT_COMMAND_BUF_COUNT];
++};
++
++////////////////////////////////////////////////////////////////////////////////////////////////////
++////////////////////////////////////////////////////////////////////////////////////////////////////
++
+ class CParamTexture : public CEffectParam
+ {
+ public:
+@@ -551,7 +610,8 @@ public:
+ 	CEffectParam* GetLutLMTSizeParam() const { return m_pUserLutLMTSize; }
+ 
+ 	// Given a string returns containing value if exists, else returns 0
+-	float GetByNameF(const char* pszParam);
++	float       GetByNameF(const char* pszParam);
++	const char* GetByNameStr(const char* pszParam);
+ 	Vec4  GetByNameVec4(const char* pszParam);
+ 
+ 	// Register effect
+@@ -671,6 +731,12 @@ protected:
+ 	// trade worth making.
+ 	CEffectParam*       m_pUserGradeBypass, * m_pUserGradeWBEnable, * m_pUserGradeWBKelvin, * m_pUserGradeWBTint;
+ 	CEffectParam*       m_pUserGradeSlope, * m_pUserGradeOffset, * m_pUserGradePower, * m_pUserGradeSaturation;
++
++	//! The camera identity and settings an exported EXR carries in its header (S6 item 3). They
++	//! change nothing about the picture - they exist so that a frame on disk can say what took it.
++	CEffectParam*       m_pUserCamName, * m_pUserLensName;
++	CEffectParam*       m_pUserCamFocal, * m_pUserCamTStop, * m_pUserCamISO, * m_pUserCamShutter;
++	CEffectParam*       m_pUserCamND, * m_pUserCamEV100;
+ 	CEffectParam*       m_pUserColorC, * m_pUserColorY, * m_pUserColorM, * m_pUserColorK, * m_pUserColorHue;
+ 
+ 	CPostEffectVec      m_pEffects;
+@@ -710,6 +776,7 @@ static CPostEffectsMgr* PostEffectMgr()
+ #define AddParamFloatNoTransition(szName, pParam, val) PostEffectMgr()->RegisterParam<CParamFloat, float>((szName), (pParam), val, false)
+ #define AddParamVec4NoTransition(szName, pParam, val)  PostEffectMgr()->RegisterParam<CParamVec4, Vec4>((szName), (pParam), val, false)
+ #define AddParamTex(szName, pParam, val)               PostEffectMgr()->RegisterParam<CParamTexture, int>((szName), (pParam), val)
++#define AddParamString(szName, pParam)                 PostEffectMgr()->RegisterParam<CParamString, int>((szName), (pParam), 0, false)
+ 
+ struct container_object_safe_delete
+ {
+diff --git a/Code/CryEngine/RenderDll/Common/RendererCVars.cpp b/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
+index f3c0c9a1..9693e3c9 100644
+--- a/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
++++ b/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
+@@ -2,6 +2,7 @@
+ 
+ #include "StdAfx.h"
+ #include "Textures/Image/ExrImage.h"
++#include <GraphicsPipeline/SceneReferredExport.h>
+ #include "RendererCVars.h"
+ #include "Renderer.h"
+ #include <CrySystem/CryVersion.h>
+@@ -721,6 +722,31 @@ static void OnChange_CV_r_SceneReferredExrSelfTest(ICVar* pCVar)
+ 		ExrSelfTest();
+ }
+ 
++// ---------------------------------------------------------------------------------------------
++// The EXR capture's user surface (SceneReferredSpec.md S6 item 3). Commands rather than a cvar,
++// because arming a capture takes arguments and because `capture_frames` has already demonstrated
++// what happens when a capture's on/off state and its frame counter share one console variable that
++// three other systems also write.
++// ---------------------------------------------------------------------------------------------
++static void Cmd_CaptureEXR(IConsoleCmdArgs* pArgs)
++{
++	const char* szFolder = (pArgs && pArgs->GetArgCount() > 1) ? pArgs->GetArg(1) : "";
++	const char* szPrefix = (pArgs && pArgs->GetArgCount() > 2) ? pArgs->GetArg(2) : "";
++	CSceneReferredExport::Get().StartSequence(szFolder, szPrefix);
++}
++
++static void Cmd_CaptureEXRStop(IConsoleCmdArgs* pArgs)
++{
++	CSceneReferredExport::Get().Stop("stopped from the console");
++}
++
++static void Cmd_CaptureEXRFrame(IConsoleCmdArgs* pArgs)
++{
++	const char* szFolder = (pArgs && pArgs->GetArgCount() > 1) ? pArgs->GetArg(1) : "";
++	const char* szPrefix = (pArgs && pArgs->GetArgCount() > 2) ? pArgs->GetArg(2) : "";
++	CSceneReferredExport::Get().RequestSingleFrame(szFolder, szPrefix);
++}
++
+ static void OnChange_CV_r_HDRTexFormat(ICVar* pCVar)
+ {
+ 	if (!pCVar)
+@@ -3231,6 +3257,32 @@ void CRendererCVars::InitCVars()
+ 	                                                                              "\n3 - Lanczos filter");
+ 
+ #if CRY_PLATFORM_DESKTOP
++	REGISTER_COMMAND("rec_CaptureEXR", &Cmd_CaptureEXR, VF_NULL,
++	                 "Start writing the scene-referred frame to OpenEXR, one file per rendered "
++	                 "frame, until rec_CaptureEXRStop.\n"
++	                 "Usage: rec_CaptureEXR [folder] [prefix]\n"
++	                 "  folder - relative folders land under the user folder; absolute paths are "
++	                 "taken as given. Created if it does not exist. Default 'CaptureEXR'.\n"
++	                 "  prefix - default 'frame'. Files are <prefix>.%06d.exr, dot-separated, "
++	                 "which is what Nuke and Resolve auto-detect as a sequence.\n"
++	                 "WHAT is written is r_SceneReferredExportTap (graded or negative), HOW it is "
++	                 "tagged is r_SceneReferredExportEncoding, and how hard it is squeezed is "
++	                 "r_SceneReferredExportCompression; all three are latched when the capture "
++	                 "starts. The sequence forces t_FixedStep (r_SceneReferredExportFixedStep) and "
++	                 "freezes the lens model's jitter phase, and puts both back when it stops.\n"
++	                 "It writes NOTHING unless the Cinematic Camera's Scene Referred path is "
++	                 "actually running - there is no pre-ODT buffer otherwise. If the disk or the "
++	                 "GPU falls behind, the capture stops and says so rather than dropping a "
++	                 "frame: a hole in a sequence is invisible until someone tries to conform it.");
++	REGISTER_COMMAND("rec_CaptureEXRStop", &Cmd_CaptureEXRStop, VF_NULL,
++	                 "Stop the EXR capture started by rec_CaptureEXR and restore t_FixedStep and "
++	                 "the lens jitter mode. The frames still in flight are finished off, not "
++	                 "abandoned.");
++	REGISTER_COMMAND("rec_CaptureEXRFrame", &Cmd_CaptureEXRFrame, VF_NULL,
++	                 "Write exactly ONE scene-referred EXR and disarm.\n"
++	                 "Usage: rec_CaptureEXRFrame [folder] [prefix]\n"
++	                 "Same settings as rec_CaptureEXR, but t_FixedStep is left alone - one frame "
++	                 "has no cadence to fix.");
+ 	REGISTER_COMMAND("r_PrecacheShaderList", &ShadersPrecacheList, VF_NULL, "");
+ 	REGISTER_COMMAND("r_StatsShaderList", &ShadersStatsList, VF_NULL, "");
+ #endif
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/SceneReferredExport.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/SceneReferredExport.cpp
+index f2888059..653c5c5d 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/SceneReferredExport.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/SceneReferredExport.cpp
+@@ -248,8 +248,20 @@ void CSceneReferredExport::GatherMetadata(SSceneReferredExportMetadata& out) con
+ 	out.whiteBalanceK = GetBusParam("Global_User_GradeWBKelvin");
+ 	out.whiteBalanceTint = GetBusParam("Global_User_GradeWBTint");
+ 
++	// The camera's own numbers, published by ccam on the same bus. They describe the frame; they
++	// do not affect it.
++	out.focalLength = GetBusParam("Global_User_CamFocal");
++	out.tStop = GetBusParam("Global_User_CamTStop");
++	out.iso = GetBusParam("Global_User_CamISO");
++	out.shutterTime = GetBusParam("Global_User_CamShutter");
++	out.nd = GetBusParam("Global_User_CamND");
++	out.ev100 = GetBusParam("Global_User_CamEV100");
++
+ 	if (CPostEffectsMgr* pPostMgr = PostEffectMgr())
+ 	{
++		out.cameraName = pPostMgr->GetByNameStr("Global_User_CamName");
++		out.lensName = pPostMgr->GetByNameStr("Global_User_LensName");
++
+ 		out.odtName = GetLutName(pPostMgr->GetLutODTParam(), pPostMgr->GetLutODTSizeParam());
+ 		out.lmtName = GetLutName(pPostMgr->GetLutLMTParam(), pPostMgr->GetLutLMTSizeParam());
+ 
+@@ -454,6 +466,28 @@ bool CSceneReferredExport::ConsumeSlot(SRingSlot& slot)
+ 	a.push_back(SExrAttribute::Float("rec/exposureScale", md.exposureScale));
+ 	a.push_back(SExrAttribute::Float("rec/whiteBalance_K", md.whiteBalanceK));
+ 	a.push_back(SExrAttribute::Float("rec/whiteBalance_tint", md.whiteBalanceTint));
++	// The exposure triangle. T-stop and not f-number: the T-stop is the control the camera model
++	// actually has, and `aperture` is the classic attribute name to get wrong, since a
++	// photographic reading and a projection reading both plausibly claim it.
++	if (md.focalLength > 0.0f)
++		a.push_back(SExrAttribute::Float("rec/focalLength_mm", md.focalLength));
++	if (md.tStop > 0.0f)
++		a.push_back(SExrAttribute::Float("rec/tStop", md.tStop));
++	if (md.iso > 0.0f)
++		a.push_back(SExrAttribute::Float("rec/iso", md.iso));
++	if (md.shutterTime > 0.0f)
++	{
++		a.push_back(SExrAttribute::Float("rec/shutterTime_s", md.shutterTime));
++		// `expTime` is a standard EXR attribute and readers already understand it, so it goes in
++		// alongside ours rather than instead of it.
++		a.push_back(SExrAttribute::Float("expTime", md.shutterTime));
++	}
++	a.push_back(SExrAttribute::Float("rec/ndStops", md.nd));
++	a.push_back(SExrAttribute::Float("rec/ev100", md.ev100));
++	if (!md.cameraName.empty())
++		a.push_back(SExrAttribute::String("rec/cameraName", md.cameraName));
++	if (!md.lensName.empty())
++		a.push_back(SExrAttribute::String("rec/lensName", md.lensName));
+ 	if (!md.odtName.empty())
+ 		a.push_back(SExrAttribute::String("rec/odt", md.odtName));
+ 	if (!md.lmtName.empty())
+diff --git a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp
+index 5a5ff747..18f21ef3 100644
+--- a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp
++++ b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp
+@@ -166,6 +166,7 @@ void CCinematicCameraComponent::ProcessEvent(const SEntityEvent& event)
+ 		// The scene-referred switch changes the whole picture, so it is editor-live too.
+ 		ApplySceneReferred();
+ 		ApplySceneExposure();
++		ApplyExportMetadata();
+ 		ApplyDisplayLuts();
+ 		ApplyGrade();
+ 		// DOF is a game-mode effect; don't apply in the editor.
+@@ -203,6 +204,7 @@ void CCinematicCameraComponent::ProcessEvent(const SEntityEvent& event)
+ 		ApplyViewfinder();
+ 		ApplySceneReferred();
+ 		ApplySceneExposure();
++		ApplyExportMetadata();
+ 		ApplyDisplayLuts();
+ 		ApplyGrade();
+ 		break;
+@@ -338,6 +340,7 @@ void CCinematicCameraComponent::RestoreAllEffects()
+ 	RestoreLensCharacter();
+ 	RestoreSceneReferred();
+ 	RestoreSceneExposure();
++	RestoreExportMetadata();
+ 	RestoreDisplayLuts();
+ 	RestoreGrade();
+ 	RestoreViewfinder();
+@@ -1656,6 +1659,53 @@ void CCinematicCameraComponent::ApplySceneExposure()
+ 	gEnv->p3DEngine->SetPostEffectParam("Global_User_SceneExposure", ComputeSceneReferredExposureScale());
+ }
+ 
++// The camera's identity and its exposure triangle, onto the same bus everything else travels on.
++// Written every frame the camera owns the render state, and read once per CAPTURED frame - the
++// renderer samples it at readback time, so a value that is a frame stale would attach the wrong
++// numbers to a picture.
++//
++// Nothing here is drawn with. The one that matters most is the EV100: the pre-exposure has already
++// been folded into the pixels by the time they reach the export tap, so without the exposure
++// travelling in the header the file's relation to real luminance is gone.
++void CCinematicCameraComponent::ApplyExportMetadata()
++{
++	if (!CanDriveRenderState())
++		return;
++
++	const I3DEngine* p3DEngine = gEnv->p3DEngine;
++
++	p3DEngine->SetPostEffectParamString("Global_User_CamName", m_pEntity ? m_pEntity->GetName() : "");
++	// Lens PRESETS do not exist yet - the preset camera is its own later item - so this is
++	// deliberately empty rather than a made-up name, and the writer omits an empty attribute
++	// instead of stamping every frame with a lie about which lens took it.
++	p3DEngine->SetPostEffectParamString("Global_User_LensName", "");
++
++	p3DEngine->SetPostEffectParam("Global_User_CamFocal", (float)m_lens.focalLength);
++
++	// T-stop, not f-number: the T-stop is what the exposure is actually computed from here, and it
++	// is the number a cinematographer reads off the barrel. f-number / sqrt(transmission).
++	const float transmission = clamp_tpl((float)m_lens.transmission, 0.01f, 1.0f);
++	p3DEngine->SetPostEffectParam("Global_User_CamTStop", (float)m_lens.aperture / sqrtf(transmission));
++
++	p3DEngine->SetPostEffectParam("Global_User_CamISO", (float)(int)m_body.iso);
++	p3DEngine->SetPostEffectParam("Global_User_CamShutter", 1.0f / (float)max((int)m_body.shutterDenominator, 1));
++	p3DEngine->SetPostEffectParam("Global_User_CamND", (float)(int)m_lens.ndFilterStops);
++	p3DEngine->SetPostEffectParam("Global_User_CamEV100", ComputeSceneReferredEV100());
++}
++
++void CCinematicCameraComponent::RestoreExportMetadata()
++{
++	const I3DEngine* p3DEngine = gEnv->p3DEngine;
++	p3DEngine->SetPostEffectParamString("Global_User_CamName", "");
++	p3DEngine->SetPostEffectParamString("Global_User_LensName", "");
++	p3DEngine->SetPostEffectParam("Global_User_CamFocal", 0.0f);
++	p3DEngine->SetPostEffectParam("Global_User_CamTStop", 0.0f);
++	p3DEngine->SetPostEffectParam("Global_User_CamISO", 0.0f);
++	p3DEngine->SetPostEffectParam("Global_User_CamShutter", 0.0f);
++	p3DEngine->SetPostEffectParam("Global_User_CamND", 0.0f);
++	p3DEngine->SetPostEffectParam("Global_User_CamEV100", 0.0f);
++}
++
+ void CCinematicCameraComponent::RestoreSceneExposure()
+ {
+ 	if (!m_bSceneExposureSaved)
+diff --git a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
+index 3335b3b0..09620d38 100644
+--- a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
++++ b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
+@@ -1141,6 +1141,13 @@ private:
+ 	//! above (Global_User_SceneExposure). Editor-live for the same reason.
+ 	void ApplySceneExposure();
+ 	void RestoreSceneExposure();
++
++	//! Publish what the camera IS onto the post-effect bus, for the EXR header (S6 item 3). None of
++	//! it changes a pixel: it exists so that a frame on disk can say what took it, and above all so
++	//! that the pre-exposure that was applied travels with the file - without it the EXR's absolute
++	//! scale is unrecoverable.
++	void ApplyExportMetadata();
++	void RestoreExportMetadata();
+ 	//! The linear scale the renderer must multiply scene light by so that this camera's EV100
+ 	//! renders correctly. 1.0 when the scene-referred path is not requested.
+ 	float ComputeSceneReferredExposureScale();
+-- 
+2.47.1.windows.1
+

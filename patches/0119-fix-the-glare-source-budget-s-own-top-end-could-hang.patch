@@ -1,0 +1,341 @@
+From d8567f37a4f95996554cf99d95b5f713b66d2caa Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Sat, 5 Sep 2026 09:21:06 +0800
+Subject: [PATCH 119/119] fix: the glare source budget's own top end could hang
+ the editor, so it now has a ceiling
+
+r_HDRDiffractionMaxSources was introduced with 0 = unlimited as the escape hatch. The escape hatch
+was the hazard. Swept on the airfield with the sun in frame and Streak Amount at 200: below 256 the
+sun's star FLICKERS, 256 is the first value at which it holds still, 512 fans it up, 1024 costs a
+large slice of the frame rate, 2048 is the LAST value at which the picture changes at all, 16384
+puts a star on every reflection at a few fps, and 32768 ran at 2 fps and held the main thread long
+enough for Windows to kill Sandbox as AppHangB1. At the shipping default Streak Amount 50 in
+daylight, 10 and 100 are indistinguishable. The useful range is entirely inside [256, 2048] and
+everything above it is paid for and not seen.
+
+So: a hard cap of 4096 - one stop of headroom over the last setting that alters the picture -
+clamped in ExecuteDiffraction at the CONSUMER rather than as a REGISTER_CVAR3 range, because a
+value set in a config or before this DLL loaded would otherwise walk straight past a registration
+range and the number that has to be safe is the one the pass actually draws with. 0 or less no
+longer means unlimited; it means the cap. The default stays 256. A clamped value is printed in the
+debug report rather than swallowed - silently ignoring a console command is worse than refusing it.
+
+r_HDRDiffractionDebug 3's once-a-second report also gains the COST next to the count:
+
+  [BLOOM]            GPU 1.83 ms in the sprite pass + 0.11 ms in the composite = 1.94 ms of this
+                     frame, for 261 sprites (7.4 us each)
+
+No new instrumentation was needed. The pass already carries PROFILE_LABEL_SCOPE markers
+(HDR_DIFFRACTION, with the budget chain nested inside it, and HDR_DIFFRACTION_COMPOSITE), and
+CRenderPipelineProfiler times every labelled section with GPU timestamps and publishes them as
+detailed stats keyed by that label, so the report looks the two up by name off the render thread's
+array. Smoothed rather than instantaneous: a once-a-second line built from one frame's timestamps
+jitters by more than the difference being read. It is sampled at PRINT time, not captured with the
+rest of the report, because the profiler's sections resolve two or three frames behind the draw.
+
+What it deliberately does not do is switch the profiler on. Recording costs a timestamp pair per
+section for the whole frame and is governed by r_profiler / r_DisplayInfo 3, which are engine-wide
+switches and not this debug mode's to flip; when it is off the line says so instead of printing a
+zero that would read as "free".
+
+Recorded in decisions/s8-glare-budget.md as a dated addendum, with the sweep table and the
+observation that explains the flicker below 256: the energy cutoff selects TEXELS, and the sun's
+disc is not one source but hundreds of half-res texels within a stop of each other, so the cutoff
+lands inside a single physical object and the controller moves it every frame - which half of the
+disc survives changes frame to frame. Approach B (source-space blob merge, sprite at the block's
+energy-weighted centroid) is promoted from "kept" to the next step: the measurement answers all
+three of the grounds it was rejected on, and no choice of N removes a within-blob artefact.
+
+Docs: DiffractionKernelSpec 3.1 gains the sweep table, the cap and the cost line; ConsoleReference
+gains a Hard cap row and the profiler caveat under Measuring.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01HXzRVK4yBVDUNfdWXEwV5y
+---
+ .../RenderDll/Common/RendererCVars.cpp        | 11 ++-
+ .../XRenderD3D9/GraphicsPipeline/Bloom.cpp    | 95 +++++++++++++++++--
+ .../XRenderD3D9/GraphicsPipeline/Bloom.h      | 13 ++-
+ .../CinematicCamera/DiffractionKernelSpec.md  | 27 ++++--
+ .../CinematicCamera/docs/ConsoleReference.md  |  5 +-
+ 5 files changed, 133 insertions(+), 18 deletions(-)
+
+diff --git a/Code/CryEngine/RenderDll/Common/RendererCVars.cpp b/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
+index a2ab8bb5..f28feda2 100644
+--- a/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
++++ b/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
+@@ -1326,9 +1326,14 @@ void CRendererCVars::InitCVars()
+ 	               "put tens of thousands of them on screen and the frame rate follows the "
+ 	               "brightness down. Above the budget the dimmest sources lose their STAR but not "
+ 	               "their LIGHT: the energy their pattern would have spread is deposited at the "
+-	               "source instead, so nothing darkens and nothing pops. 0 = unlimited (the "
+-	               "pre-budget behaviour). Scene-referred path only. Measure the population with "
+-	               "r_HDRDiffractionDebug 3, whose SOURCES line prints the raw count first.");
++	               "source instead, so nothing darkens and nothing pops. HARD CAP 4096: 0 = "
++	               "unlimited is NOT allowed any more (0 or less now means the cap) and values "
++	               "above 4096 are clamped, because measurement showed the sun's star stops "
++	               "changing past about 2048 while the frame time keeps growing, and 32768 held "
++	               "the main thread long enough for Windows to kill the editor. Scene-referred "
++	               "path only. Measure the population AND its GPU cost with "
++	               "r_HDRDiffractionDebug 3, whose SOURCES lines print the raw count first and "
++	               "the glare pass' milliseconds under it (those need r_profiler 1).");
+ 
+ 	REGISTER_CVAR3("r_HDRDiffractionKernelSize", CV_r_HDRDiffractionKernelSize, 512, VF_NULL,
+ 	               "Grid the pupil is rastered and transformed on: 512 (default) or 256. 256 is a "
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Bloom.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Bloom.cpp
+index dce10d9f..05a85191 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Bloom.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Bloom.cpp
+@@ -19,6 +19,15 @@ static const float kDiffractionInnerWindowHalfPx = 4.0f;
+ // nothing in the shader - it is passed as a constant - but it does set how big the tile stats
+ // target is: a 1080p half-res grid (960 x 540) reduces to 120 x 68.
+ static const int kDiffractionStatsTileSize = 8;
++// HARD CAP on the source budget, enforced here at the CONSUMER so no console value can get past
++// it (decisions/s8-glare-budget.md, addendum 2026-09-05). Measured on the airfield scene with the
++// sun in frame: 256 is the first population at which the sun's star is stable, 2048 is the last
++// one at which it still CHANGES, and above that the extra sprites buy nothing but fill - 16384
++// puts a star on every reflection at a few frames per second and 32768 stalled the render thread
++// long enough for Windows to kill Sandbox as AppHangB1. A budget whose top end can hang the
++// editor is not a budget, so 4096 (one stop of headroom over the last value that alters the
++// picture) is the ceiling and there is no "unlimited" any more.
++static const int kDiffractionMaxSourceBudget = 4096;
+ // Per tap intensity falloff of the first iteration. Later iterations raise it by the tap
+ // count so the combined falloff stays exponential in distance rather than in iteration.
+ static const float s_fStreakDecay = 0.93f;
+@@ -739,8 +748,16 @@ void CBloomStage::ExecuteDiffraction(const SHDRStreaksParams& streakParams, floa
+ 	// It runs when the budget is on AND whenever the debug report is on, because the population
+ 	// has to be MEASURABLE before anyone can decide what N should be - with the budget off the
+ 	// chain writes only its own targets and does not move a pixel.
+-	const int  nSourceBudget = max(CRenderer::CV_r_HDRDiffractionMaxSources, 0);
+-	const bool bBudgetActive = bSceneReferredGlare && (nSourceBudget > 0);
++	//
++	// The cvar is CLAMPED here rather than at registration: a REGISTER_CVAR3 range would let a
++	// value set before this DLL loaded, or a config file, slip through, and the number that has to
++	// be safe is the one this pass actually draws with. <= 0 no longer means "unlimited" - that
++	// was the setting that hung the editor - it means the cap.
++	const int  nRequestedBudget = CRenderer::CV_r_HDRDiffractionMaxSources;
++	const int  nSourceBudget    = (nRequestedBudget <= 0)
++	                              ? kDiffractionMaxSourceBudget
++	                              : min(nRequestedBudget, kDiffractionMaxSourceBudget);
++	const bool bBudgetActive    = bSceneReferredGlare;
+ 
+ 	if (bBudgetActive || nDebugMode == 3)
+ 		ExecuteDiffractionBudget(pSource, bBudgetActive ? nSourceBudget : 0);
+@@ -807,6 +824,7 @@ void CBloomStage::ExecuteDiffraction(const SHDRStreaksParams& streakParams, floa
+ 		report.nGridH = nGridHeight;
+ 		report.bBudgetActive = bBudgetInForce;
+ 		report.nBudget = nSourceBudget;
++		report.nBudgetRequested = nRequestedBudget;
+ 		report.fSpriteHalfPx = fRadiusHalfPx;
+ 
+ 		// What the sprite's INNER FADE costs, which the deposited-fraction figure above has never
+@@ -1296,6 +1314,11 @@ void CBloomStage::UpdateDiffractionSourceReadback(int nDebugMode, CTexture* pSou
+ 		// this into a per-frame download.
+ 		m_fDiffractionReadbackTime = fNow;
+ 
++		// The COST, sampled here rather than captured with the rest of the report: the profiler's
++		// sections resolve two or three frames behind the draw, so the freshest reading is the one
++		// taken at PRINT time, and it belongs to the same steady state as the counts anyway.
++		SampleDiffractionGpuTimes(m_diffractionReportInFlight);
++
+ 		PrintDiffractionReport(m_diffractionReportInFlight, fMaxExcess, nMaxX, nMaxY);
+ 		return;
+ 	}
+@@ -1326,6 +1349,43 @@ void CBloomStage::UpdateDiffractionSourceReadback(int nDebugMode, CTexture* pSou
+ 	m_diffractionReportInFlight = report;
+ }
+ 
++// The glare's GPU time, so the report can print what the population COSTS next to how big it is.
++//
++// The pass already carries PROFILE_LABEL_SCOPE markers ("HDR_DIFFRACTION", with the budget chain
++// nested inside it, and "HDR_DIFFRACTION_COMPOSITE"), and the render pipeline profiler times every
++// labelled section with GPU timestamps and publishes them as detailed stats, keyed by that same
++// label. So there is nothing to instrument: this looks the two sections up by name.
++//
++// What it cannot do is turn the profiler ON. Recording costs a timestamp pair per section for the
++// whole frame, and CRenderPipelineProfiler::IsEnabled() is driven by r_profiler and r_DisplayInfo 3
++// - engine-wide switches that are not this debug mode's to flip. When it is off the array is empty
++// and the fields stay negative; the report then says which cvar to set instead of printing a zero
++// that would read as "free".
++void CBloomStage::SampleDiffractionGpuTimes(SDiffractionReport& report)
++{
++	report.fGlareGpuMs = -1.0f;
++	report.fCompositeGpuMs = -1.0f;
++
++	if (gcpRendD3D == nullptr)
++		return;
++
++	// false = the RENDER thread's array, which is the thread this stage executes on and the one
++	// the profiler writes its resolved sections into.
++	const DynArray<RPProfilerDetailedStats>* pStats = gcpRendD3D->GetRPPDetailedStatsArray(false);
++	if (pStats == nullptr)
++		return;
++
++	for (const RPProfilerDetailedStats& stat : *pStats)
++	{
++		// The smoothed time, not the instantaneous one: a once-a-second line made of a single
++		// frame's timestamps jitters by more than the difference the user is trying to read.
++		if (strcmp(stat.name, "HDR_DIFFRACTION") == 0)
++			report.fGlareGpuMs = stat.gpuTimeSmoothed;
++		else if (strcmp(stat.name, "HDR_DIFFRACTION_COMPOSITE") == 0)
++			report.fCompositeGpuMs = stat.gpuTimeSmoothed;
++	}
++}
++
+ // The report itself. Everything r_HDRDiffractionDebug 3 knows, said in the units the user's
+ // controls are in - exposed scene values and stops over mid grey - and ending in the one sentence
+ // the mode exists to produce: how bright a ray actually is in this frame, and how much more gain
+@@ -1379,15 +1439,38 @@ void CBloomStage::PrintDiffractionReport(const SDiffractionReport& report, float
+ 			       report.nBudget, report.fBudgetSources, report.fCutoff, stops(report.fCutoff),
+ 			       max(report.fRawSources - report.fBudgetSources, 0.0f), report.fResidualEnergyFrac * 100.0f);
+ 		}
+-		else if (report.nBudget <= 0)
+-		{
+-			CryLog("[BLOOM]            budget OFF (r_HDRDiffractionMaxSources 0) -- every one of them drew a full sprite");
+-		}
+ 		else
+ 		{
+ 			CryLog("[BLOOM]            budget %d is SET but not in force: the scene-referred path is off and the budget is"
+ 			       " scene-referred only -- every one of them drew a full sprite", report.nBudget);
+ 		}
++
++		// The hard cap, said out loud whenever the value in force is not the value the user typed.
++		// Silently ignoring a console command is worse than refusing it.
++		if (report.nBudgetRequested != report.nBudget)
++		{
++			CryLog("[BLOOM]            r_HDRDiffractionMaxSources %d was CLAMPED to %d: %s",
++			       report.nBudgetRequested, report.nBudget,
++			       (report.nBudgetRequested <= 0)
++			       ? "0 no longer means unlimited -- unlimited is what hung the editor"
++			       : "beyond ~2048 sources the picture stops changing and only the frame time grows");
++		}
++
++		// The COST, next to the count. This is the number the budget exists to bound.
++		if (report.fGlareGpuMs >= 0.0f)
++		{
++			const float fTotal = report.fGlareGpuMs + max(report.fCompositeGpuMs, 0.0f);
++			const float fDrawn = report.bBudgetActive ? report.fBudgetSources : report.fRawSources;
++			CryLog("[BLOOM]            GPU %.2f ms in the sprite pass + %.2f ms in the composite = %.2f ms of this frame,"
++			       " for %.0f sprites (%.1f us each)",
++			       report.fGlareGpuMs, max(report.fCompositeGpuMs, 0.0f), fTotal,
++			       fDrawn, (fDrawn > 0.5f) ? (1000.0f * fTotal / fDrawn) : 0.0f);
++		}
++		else
++		{
++			CryLog("[BLOOM]            GPU time not measured: the render pipeline profiler is not recording."
++			       " Set r_profiler 1 (or r_DisplayInfo 3) to put the glare's milliseconds on this line.");
++		}
+ 	}
+ 	else
+ 	{
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Bloom.h b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Bloom.h
+index 52f66aff..9fed649b 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Bloom.h
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Bloom.h
+@@ -108,7 +108,14 @@ private:
+ 		// performance and it has to be measurable whether the budget is on or off.
+ 		bool  bStatsValid = false;        //!< the 1x1 stats texel made it back this cycle
+ 		bool  bBudgetActive = false;      //!< r_HDRDiffractionMaxSources > 0 AND scene-referred
+-		int   nBudget = 0;                //!< r_HDRDiffractionMaxSources as it was that frame
++		int   nBudget = 0;                //!< the budget actually IN FORCE, after the hard cap
++		int   nBudgetRequested = 0;       //!< r_HDRDiffractionMaxSources as the user set it
++		//! GPU time of the glare passes, milliseconds, from the render pipeline profiler's
++		//! HDR_DIFFRACTION / HDR_DIFFRACTION_COMPOSITE sections. Negative means the profiler was
++		//! not recording this frame, which is the normal state - it costs timestamps, so it is
++		//! only on with r_profiler or r_DisplayInfo 3. The report says which.
++		float fGlareGpuMs = -1.0f;        //!< sprite pass, budget chain included (they nest)
++		float fCompositeGpuMs = -1.0f;    //!< the layer's composite into the HDR target
+ 		float fRawSources = 0.0f;         //!< texels over the threshold BEFORE any budgeting
+ 		float fBudgetSources = 0.0f;      //!< of those, how many still drew a sprite
+ 		float fResidualEnergyFrac = 0.0f; //!< share of the source excess that lost its star
+@@ -122,6 +129,10 @@ private:
+ 	//! shader must read (never null once the targets exist), after updating this frame's cutoff.
+ 	CTexture* ExecuteDiffractionBudget(CTexture* pSource, int nBudget);
+ 	void UpdateDiffractionSourceReadback(int nDebugMode, CTexture* pSource, const SDiffractionReport& report);
++	//! Reads this frame's HDR_DIFFRACTION / HDR_DIFFRACTION_COMPOSITE GPU times out of the render
++	//! pipeline profiler's detailed sections, so the report can print the COST next to the count.
++	//! Leaves the fields negative when the profiler is not recording.
++	static void SampleDiffractionGpuTimes(SDiffractionReport& report);
+ 	//! r_HDRDiffractionDebug 3's once-a-second answer to "why are the rays that bright", in
+ 	//! exposed scene units and stops over mid grey.
+ 	static void PrintDiffractionReport(const SDiffractionReport& report, float fMaxExcess, int nMaxX, int nMaxY);
+diff --git a/Code/CryPlugins/CinematicCamera/DiffractionKernelSpec.md b/Code/CryPlugins/CinematicCamera/DiffractionKernelSpec.md
+index 9f8c30a2..ff13d9f0 100644
+--- a/Code/CryPlugins/CinematicCamera/DiffractionKernelSpec.md
++++ b/Code/CryPlugins/CinematicCamera/DiffractionKernelSpec.md
+@@ -451,7 +451,8 @@ That is why the frame rate followed the brightness. It is a population problem,
+ the physics of a broad bright region is a *veil*, and drawing it as fifty thousand overlapping
+ copies of the same star buys a picture a single blur would have produced.
+ 
+-**`r_HDRDiffractionMaxSources`** (default 256, 0 = unlimited) caps the population. Three small
++**`r_HDRDiffractionMaxSources`** (default 256, **hard cap 4096**, 0 = unlimited is no longer
++allowed) caps the population. Three small
+ passes reduce the thresholded source to one texel holding `(cutoff, raw count, count above the
+ cutoff, share of the excess below it)`; the last one corrects the cutoff from the previous
+ frame's count with a multiplicative controller, and the sprite vertex shader reads that one texel:
+@@ -479,9 +480,18 @@ Three properties are load bearing:
+ Worst case is then `N` sprites plus one pixel per remaining source, i.e. bounded by the budget and
+ `Reach` rather than by how bright the scene is.
+ 
+-**Measuring it.** `r_HDRDiffractionDebug 3`'s once-a-second report now leads with the population,
+-raw first, and the stats chain runs whenever that mode is on even with the budget at 0 — so the
+-number can be read before deciding what `N` should be:
++**The hard cap (2026-09-05).** The budget's own upper end could still hang the editor, so it is
++clamped at the consumer at **4096** and `0` no longer means unlimited. Measured on the airfield
++with the sun in frame at `Streak Amount 200`: 256 is the first value at which the sun's star is
++*stable* (below it, it flickers), 512 fans it up, 1024 costs a large slice of the frame rate,
++**2048 is the last value at which the picture changes at all**, 16384 puts a star on every
++reflection and 32768 ran at 2 fps and held the main thread long enough for Windows to kill
++Sandbox as `AppHangB1`. 4096 is one stop of headroom over the last setting that alters the
++picture. A clamp is reported in the log rather than applied silently.
++
++**Measuring it.** `r_HDRDiffractionDebug 3`'s once-a-second report leads with the population,
++raw first, and with the **GPU cost** under it, so the count and what it buys are on adjacent
++lines:
+ 
+ ```
+ [BLOOM]   SOURCES: raw above threshold = 51234 of the 960 x 540 grid -- one sprite each,
+@@ -489,10 +499,15 @@ number can be read before deciding what `N` should be:
+ [BLOOM]            budget 256 (r_HDRDiffractionMaxSources): 261 drew a star, cutoff 2.9 = +4.0
+           stops -- the other 50973 kept their LIGHT (12.4% of the source excess, deposited at
+           the source) and lost their shape
++[BLOOM]            GPU 1.83 ms in the sprite pass + 0.11 ms in the composite = 1.94 ms of this
++          frame, for 261 sprites (7.4 us each)
+ ```
+ 
+ The counts are the GPU's own arithmetic over that frame's source, not an estimate, and the raw
+-count uses exactly the vertex shader's collapse test.
++count uses exactly the vertex shader's collapse test. The milliseconds are the render pipeline
++profiler's own GPU timestamps for the `HDR_DIFFRACTION` and `HDR_DIFFRACTION_COMPOSITE` sections
++(smoothed), which means they need the profiler to be **recording**: with `r_profiler 0` and
++`r_DisplayInfo` under 3 the line says so instead of printing a zero that would read as free.
+ 
+ **The analytic streaks, the anamorphic flare and halation need no budget and do not have one.**
+ They are directional stretch blurs: a fixed number of full-screen passes whose cost is independent
+@@ -514,7 +529,7 @@ mask rotation / mask scale / `k_sa` / `N_geo` every frame — expose them from t
+ 
+ Cvars: `r_HDRDiffractionKernel` (1), `r_HDRDiffractionDebug` (0), `r_HDRDiffractionSAWaves`
+ (0.25), `r_HDRDiffractionKernelSize` (512; 256 allowed for a 4× cheaper job at half the
+-structural resolution — same `d = L/2`)., `r_HDRDiffractionMaxSources` (256; 0 = unlimited,
++structural resolution — same `d = L/2`)., `r_HDRDiffractionMaxSources` (256; hard cap 4096,
+ §3.1 — the source budget, scene-referred path only).
+ 
+ Schematyc `szName`s `[A-Za-z0-9_]+`; enum reflection as the other enums in the component.
+diff --git a/Code/CryPlugins/CinematicCamera/docs/ConsoleReference.md b/Code/CryPlugins/CinematicCamera/docs/ConsoleReference.md
+index d19a2333..fa66c8e3 100644
+--- a/Code/CryPlugins/CinematicCamera/docs/ConsoleReference.md
++++ b/Code/CryPlugins/CinematicCamera/docs/ConsoleReference.md
+@@ -669,8 +669,9 @@ diagnostics outrank the mask. Kernel parameter changes are logged as
+ | | |
+ | --- | --- |
+ | Default | 256 |
+-| Purpose | **Source budget** for the wave glare. The sprite pass draws one sprite per half-resolution texel above `HDR_Streaks_Threshold`, and each sprite is some 160 px across, so under the scene-referred pre-exposure a bright sky can put tens of thousands of them on screen and the frame rate follows the brightness down. This is the largest number of texels that may draw a sprite in one frame. Above the budget the dimmest sources lose their **star** but not their **light**: the whole energy their pattern would have spread is deposited at the source instead, so nothing darkens, and a one-stop crossfade at the budget means nothing pops while panning. 0 = unlimited (the pre-budget behaviour). Scene-referred path only; with it off, and whenever the raw population already fits the budget, the pass is bit-identical to the un-budgeted one. |
+-| Measuring | `r_HDRDiffractionDebug 3`'s once-a-second report leads with `SOURCES: raw above threshold = N of the W x H grid`, and the counting chain runs even with the budget at 0 - so the real population of a scene can be read before deciding what the budget should be. |
++| Purpose | **Source budget** for the wave glare. The sprite pass draws one sprite per half-resolution texel above `HDR_Streaks_Threshold`, and each sprite is some 160 px across, so under the scene-referred pre-exposure a bright sky can put tens of thousands of them on screen and the frame rate follows the brightness down. This is the largest number of texels that may draw a sprite in one frame. Above the budget the dimmest sources lose their **star** but not their **light**: the whole energy their pattern would have spread is deposited at the source instead, so nothing darkens, and a one-stop crossfade at the budget means nothing pops while panning. Scene-referred path only; with it off, and whenever the raw population already fits the budget, the pass is bit-identical to the un-budgeted one. |
++| Hard cap | **4096**, clamped at the consumer, and **0 = unlimited is no longer allowed** (0 or less now means the cap). Measured 2026-09-05 on the airfield with the sun in frame at `Streak Amount 200`: 256 is the first value at which the sun's star holds still, 2048 is the last value at which the picture changes at all, 16384 puts a star on every reflection at a few fps, and 32768 held the main thread long enough for Windows to kill Sandbox as `AppHangB1`. A value that is clamped is said so in the debug report rather than swallowed. |
++| Measuring | `r_HDRDiffractionDebug 3`'s once-a-second report leads with `SOURCES: raw above threshold = N of the W x H grid`, then the budgeted count, then the **GPU milliseconds** of the sprite pass and its composite - so the population and its cost are read on adjacent lines. The milliseconds come from the render pipeline profiler's timestamps and therefore need `r_profiler 1` (or `r_DisplayInfo 3`); without it the line says the profiler is not recording. |
+ 
+ ### r_HDRDiffractionKernelSize
+ 
+-- 
+2.47.1.windows.1
+

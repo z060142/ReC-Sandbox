@@ -1,0 +1,541 @@
+From 0c67f8ea04e7b83ce14d231a07a6dc81ba1e9ca0 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Sat, 29 Aug 2026 02:56:58 +0800
+Subject: [PATCH 103/119] S8 metering: the camera takes the middle of the
+ frame, not the average of it
+
+decisions/s8-metering.md approach A, parts 2 and 3: the camera half.
+
+ComputeSceneReferredEV100 now reduces the renderer's 64 bins instead of reading
+a single log-mean. One walk of the CDF finds the [Metering Band Low, Metering
+Band High] percentile band - 50 to 90 by default - splits the two straddling
+bins linearly (which takes the quantisation from half a stop to under a tenth,
+and is not optional), takes the weighted log-mean of what is inside, and asks
+for the EV that lands it on 0.18.
+
+Why a band. For a geometric mean, a fraction f of the frame at V_hot shifts the
+answer by exactly f * log2(V_hot / V_bg): the sensitivity is LINEAR in area
+fraction. That is why the old meter was nearly blind to the sun (0.025 % of a
+50 mm frame, 0.0035 stops) and violently sensitive to the sky (half the frame,
+2.65 stops at a fabricated albedo), and why no amount of clamping could have
+fixed it. 50/90 discards the shadow half - which is what dragged the airfield's
+ground below mid grey - and the top decile - sky, glints, the sun. Deliberately
+not UE's 10/90, which exists to make Histogram agree with Basic; the mean is
+the bug and we do not want to agree with it.
+
+The target EV is the same calibration written the other way round:
+EV100 = log2(L * LIGHT_UNIT_SCALE / (1.2 * 0.18)) is algebraically identical to
+log2(E * LIGHT_UNIT_SCALE * 100 / (120*pi)) once L = E * 0.18 / pi is
+substituted. Metering luminance rather than an albedo-divided illuminance
+estimate changes what is measured, not what "correctly exposed" means.
+
+A band that resolves entirely inside bin 0 or bin 63 is a BOUND and not a
+value, and is refused; so is a result outside the plausibility window. Refused
+means hold the last EV, the rule the scalar meter already had.
+
+Auto Darken Time (0.5 s, half of Response Time) makes the smoothing asymmetric.
+A symmetric tau on an asymmetric problem is what made walking out of a hangar a
+three-second over-exposure: a camera stops down at once and photopic light
+adaptation is a fifth of a second, while dark adaptation takes minutes. The
+scene getting brighter - the picture having to darken - now takes the short
+constant; the other direction keeps Response Time. 0 restores the old symmetry.
+
+New members, new CRCs, shipped ones untouched: 'adkt' Auto Darken Time, 'mtmd'
+Metering Mode, 'mtlo'/'mthi' the two percentiles.
+
+r_HDRDebug 1 prints the histogram as a 64-character bar, log-scaled against its
+own peak, with the mode, the window and the bin width; and beside it the band's
+two edges in cd/m2, the exposure they were measured at, the target EV and the
+applied EV. The camera owns the reduction, so the band travels back over the
+post-effect bus for the overlay to print - a metering complaint stays one
+screenshot to diagnose.
+
+Co-Authored-By: Claude Opus <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01A72MFkdSczncE7au9UVnmu
+---
+ .../GraphicsPipeline/ToneMapping.cpp          |  60 ++++-
+ .../Module/CinematicCameraComponent.cpp       | 223 +++++++++++++++++-
+ .../Module/CinematicCameraComponent.h         |  76 ++++++
+ 3 files changed, 350 insertions(+), 9 deletions(-)
+
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.cpp
+index 09cd2f1c..c235728f 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.cpp
+@@ -758,6 +758,63 @@ void CToneMappingStage::DisplayDebugInfo()
+ //                applied pinned at a limit while target sits far away is the loop having lost.
+ void CToneMappingStage::DisplaySceneReferredMeterInfo(float appliedEV)
+ {
++	const SSceneReferredMeterHistogram& hist = gcpRendD3D->m_sceneReferredMeterHistogram;
++	const bool bHistogram = (hist.sampleId != 0 && hist.totalWeight > 0.0f);
++
++	char str[512];
++
++	if (bHistogram)
++	{
++		// The bins as a 64-character bar, one character per bin, log-scaled against the fullest
++		// bin so that a scene with one dominant band still shows the tails. This is the picture of
++		// the measurement itself: a spike hard against the right edge is the sun in bin 63 (which
++		// the band discards, and that is the point), a spike hard left is a black frame, and a
++		// broad hump straddling the middle is a scene the meter can actually read.
++		static const char* const kRamp = " .:-=+*#%@";
++		const int nRampMax = 9;
++
++		float fPeak = 0.0f;
++		for (int i = 0; i < SSceneReferredMeterHistogram::kBinCount; ++i)
++			fPeak = max(fPeak, hist.bins[i]);
++
++		char bar[SSceneReferredMeterHistogram::kBinCount + 1];
++		for (int i = 0; i < SSceneReferredMeterHistogram::kBinCount; ++i)
++		{
++			const float f = (fPeak > 0.0f) ? (hist.bins[i] / fPeak) : 0.0f;
++			const int level = (f <= 0.0f) ? 0 : (int)(logf(1.0f + f * 255.0f) / logf(256.0f) * nRampMax + 0.5f);
++			bar[i] = kRamp[clamp_tpl(level, 0, nRampMax)];
++		}
++		bar[SSceneReferredMeterHistogram::kBinCount] = 0;
++
++		static const char* const kModeNames[3] = { "Average", "CentreWeighted", "Spot" };
++		const char* szMode = kModeNames[min(hist.meteringMode, 2u)];
++
++		sprintf(str, "  meter histogram [%s] %s   %+.0f..%+.0f stops over grey, %.2f/bin",
++		        bar, szMode, hist.logMinStops, hist.logMaxStops,
++		        (hist.logMaxStops - hist.logMinStops) / (float)SSceneReferredMeterHistogram::kBinCount);
++		IRenderAuxText::DrawText(Vec3(5, 115, 1), IRenderAuxText::ASize(1.0f), ColorF(1, 0, 1, 1), eDrawText_800x600 | eDrawText_2D, str);
++
++		// What the CAMERA made of those bins. The band edges and the target EV come back over the
++		// post-effect bus because the reduction lives in the camera, where the percentiles are;
++		// printing them beside the applied EV is what separates "the meter read the wrong thing"
++		// from "the loop has not caught up yet" from "the clamp is holding it".
++		float fBandLow = 0.0f, fBandHigh = 0.0f, fTargetEV = 0.0f;
++		if (CPostEffectsMgr* pPostMgr = PostEffectMgr())
++		{
++			fBandLow = pPostMgr->GetByNameF("Global_User_MeterBandLow");
++			fBandHigh = pPostMgr->GetByNameF("Global_User_MeterBandHigh");
++			fTargetEV = pPostMgr->GetByNameF("Global_User_MeterTargetEV");
++		}
++
++		sprintf(str, "  band %.4g..%.4g (%.0f..%.0f cd/m2) at exposure %.4g -> target EV %.2f, applied EV %.2f%s",
++		        fBandLow, fBandHigh,
++		        fBandLow * RENDERER_LIGHT_UNIT_SCALE, fBandHigh * RENDERER_LIGHT_UNIT_SCALE,
++		        hist.exposureAtCapture, fTargetEV, appliedEV,
++		        (fTargetEV == 0.0f) ? "  [BAND REFUSED - holding]" : "");
++		IRenderAuxText::DrawText(Vec3(5, 135, 1), IRenderAuxText::ASize(1.0f), ColorF(1, 0, 1, 1), eDrawText_800x600 | eDrawText_2D, str);
++		return;
++	}
++
+ 	const float raw = gcpRendD3D->m_fSceneReferredMeterRaw;
+ 	const float exposureAtCapture = gcpRendD3D->m_fSceneReferredMeterExposure;
+ 	const float absolute = gcpRendD3D->m_fSceneReferredMeteredIlluminance;
+@@ -765,14 +822,13 @@ void CToneMappingStage::DisplaySceneReferredMeterInfo(float appliedEV)
+ 	                       ? logf(absolute * RENDERER_LIGHT_UNIT_SCALE * 100.0f / (120.0f * gf_PI)) / logf(2.0f)
+ 	                       : 0.0f;
+ 
+-	char str[256];
+ 	sprintf(str, "  meter raw %.4g / exposure %.4g = %.4g (%.0f lux) -> target EV %.2f, applied EV %.2f%s",
+ 	        raw, exposureAtCapture, absolute, absolute * RENDERER_LIGHT_UNIT_SCALE,
+ 	        targetEV, appliedEV,
+ 	        gcpRendD3D->m_bSceneReferredMeterRejected ? "  [SAMPLE REFUSED - holding]" : "");
+ 	IRenderAuxText::DrawText(Vec3(5, 115, 1), IRenderAuxText::ASize(1.0f), ColorF(1, 0, 1, 1), eDrawText_800x600 | eDrawText_2D, str);
+ 
+-	sprintf(str, "  meter ceiling %.4g (%.0f stops over grey); stock adaptation bypassed (tone map exposure pinned to unity)",
++	sprintf(str, "  LOG-MEAN meter (r_SceneReferredMeterHistogram 0): ceiling %.4g (%.0f stops over grey); stock adaptation bypassed",
+ 	        CRendererResources::GetSceneReferredMeterCeiling(), CRendererResources::kSceneReferredMeterCeilingStops);
+ 	IRenderAuxText::DrawText(Vec3(5, 135, 1), IRenderAuxText::ASize(1.0f), ColorF(1, 0, 1, 1), eDrawText_800x600 | eDrawText_2D, str);
+ }
+diff --git a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp
+index 787211ba..b674448a 100644
+--- a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp
++++ b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp
+@@ -1709,6 +1709,20 @@ void CCinematicCameraComponent::ApplySceneExposure()
+ 	// map only reads it on the scene-referred branch, and publishing it off the switch as well
+ 	// keeps one writer for one number instead of two rules for when it is live.
+ 	gEnv->p3DEngine->SetPostEffectParam("Global_User_SensorClipStops", (float)m_exposure.sensorClipStops);
++
++	// The metering mask the histogram pass accumulates with. An INPUT to the renderer, unlike the
++	// three readouts below it, and published every frame the camera drives: the pass reads it on
++	// the render thread and stamps the mode it used onto the bins it hands back, so a mode change
++	// costs one frame of latency and can never be attributed to the wrong histogram.
++	gEnv->p3DEngine->SetPostEffectParam("Global_User_MeterMode", (float)(uint32)m_exposure.meteringMode);
++
++	// Diagnostics for r_HDRDebug 1 (decisions/s8-metering.md, "Diagnosability"). The camera owns
++	// the reduction, so the renderer cannot print the band's edges unless the camera says what
++	// they were. Published here, once a frame, rather than from inside ComputeSceneReferredEV100,
++	// which is reached more than once per frame.
++	gEnv->p3DEngine->SetPostEffectParam("Global_User_MeterBandLow", m_meterBandLowLum);
++	gEnv->p3DEngine->SetPostEffectParam("Global_User_MeterBandHigh", m_meterBandHighLum);
++	gEnv->p3DEngine->SetPostEffectParam("Global_User_MeterTargetEV", m_meterTargetEV);
+ }
+ 
+ // The camera's identity and its exposure triangle, onto the same bus everything else travels on.
+@@ -1765,6 +1779,14 @@ void CCinematicCameraComponent::RestoreSceneExposure()
+ 
+ 	gEnv->p3DEngine->SetPostEffectParam("Global_User_SceneExposure", m_savedSceneExposure);
+ 	gEnv->p3DEngine->SetPostEffectParam("Global_User_SensorClipStops", m_savedSensorClipStops);
++
++	// Back to the bus defaults rather than to a saved value: nothing but a Cinematic Camera ever
++	// writes these, and the metering readouts describe a measurement that is no longer being made.
++	gEnv->p3DEngine->SetPostEffectParam("Global_User_MeterMode", 1.0f);
++	gEnv->p3DEngine->SetPostEffectParam("Global_User_MeterBandLow", 0.0f);
++	gEnv->p3DEngine->SetPostEffectParam("Global_User_MeterBandHigh", 0.0f);
++	gEnv->p3DEngine->SetPostEffectParam("Global_User_MeterTargetEV", 0.0f);
++
+ 	m_bSceneExposureSaved = false;
+ }
+ 
+@@ -1784,6 +1806,157 @@ void CCinematicCameraComponent::RestoreSceneExposure()
+ //   AutoCompensation = AUTO with exposure compensation only.
+ // Neither can change the aperture's effect on brightness the way Manual does - that is the point
+ // of the distinction, and it is what a camera's mode dial does.
++// Mid grey, and the ISO 12232 saturation-based sensitivity factor 120/S at S = 100. The renderer's
++// twins are CRendererResources::kSceneReferredMidGrey and the 1.2 in
++// ComputeSceneReferredExposureScale() below; both are spelled out here rather than shared through
++// a header because the plugin cannot see the renderer's internals, and both are anchors of the
++// whole pipeline (spec D6) rather than tunables.
++static const float kSceneMidGrey = 0.18f;
++static const float kSensorSaturationFactor = 1.2f;
++
++// The percentile band, and the EV that puts it on mid grey (decisions/s8-metering.md approach A,
++// steps 3-4).
++//
++// WHY A BAND AND NOT A MEAN. For a geometric mean, a fraction f of the frame at V_hot against a
++// background V_bg shifts the answer by exactly f * log2(V_hot / V_bg) - the sensitivity is LINEAR
++// in area fraction. That single line is why the old meter was nearly blind to the sun (0.025 % of
++// a 50 mm frame, 0.0035 stops) and violently sensitive to the sky (50 % of the frame, 2.65 stops
++// at a fabricated albedo). No amount of clamping fixes a bias caused by half the frame being
++// ordinary-bright and wrongly weighted; a percentile is robust to it by construction, because it
++// asks WHERE the weight sits and not HOW MUCH each texel is worth. This is the shape UE's
++// Histogram mode, Frostbite and the Call-of-Duty family all landed on, and a matrix meter is a
++// coarser, cleverer version of the same instinct.
++//
++// WHY 50-90 AND NOT UE'S 10-90. UE's 10/90 exists to make Histogram agree with Basic, i.e. to be
++// unsurprising to people migrating from a mean. We do not want to agree with the mean - the mean
++// is the bug. Pre-4.25 UE defaulted to 80/98.3, deliberately biased at the bright end, and that
++// instinct is the right one for a scene whose subject is sunlit and whose darkest 40 % is shadow
++// detail nobody meters for. 50-90 sits between the two: it discards the shadow half (which is what
++// dragged the airfield's ground below grey) and the top decile (sky, glints, the sun), and lands
++// on the sunlit subject. Both numbers are on the panel precisely so the operator can walk them.
++//
++// THE STRADDLING BINS ARE SPLIT LINEARLY. 32 stops over 64 bins is half a stop per bin, which as a
++// hard quantisation would be visible as steps in the exposure. Interpolating the CDF inside the
++// two bins the band's edges fall in takes it under a tenth of a stop, and it is not optional.
++//
++// Returns false - and the camera then HOLDS its last EV rather than acting - when the band lands
++// entirely inside a saturating bucket (bin 0 or bin 63 are bounds, not values) or when the result
++// leaves the plausibility window. Holding is always the right answer to a meter that has lost its
++// footing; feeding the loop a number it cannot justify is how a runaway starts.
++bool CCinematicCameraComponent::ReduceMeterHistogram(const SSceneReferredMeterHistogram& hist, float& targetEV)
++{
++	const int nBins = SSceneReferredMeterHistogram::kBinCount;
++	const float step = (hist.logMaxStops - hist.logMinStops) / (float)nBins;
++	if (!(step > 0.0f) || !(hist.totalWeight > 0.0f))
++		return false;
++
++	float lo = clamp_tpl((float)m_exposure.meterMinPercent, 0.0f, 100.0f);
++	float hi = clamp_tpl((float)m_exposure.meterMaxPercent, 0.0f, 100.0f);
++	if (hi <= lo)
++	{
++		// An inverted or empty band is an authoring mistake, not a reason to stop metering: fall
++		// back to the whole frame, which is a defensible picture, and say so once.
++		if (!m_bLoggedMeterBandInverted)
++		{
++			m_bLoggedMeterBandInverted = true;
++			CryLog("[CinematicCamera] Metering Band Low (%.0f) is not below Metering Band High (%.0f) - "
++			       "metering the whole frame until they are.", lo, hi);
++		}
++		lo = 0.0f;
++		hi = 100.0f;
++	}
++
++	const float wLo = hist.totalWeight * lo * 0.01f;
++	const float wHi = hist.totalWeight * hi * 0.01f;
++
++	// One walk of the CDF: the weight inside the band, the weighted sum of the sub-interval
++	// centres over it, and the two edges in stops.
++	float acc = 0.0f, bandWeight = 0.0f, bandSum = 0.0f;
++	float loStops = hist.logMinStops, hiStops = hist.logMaxStops;
++	int firstBin = -1, lastBin = -1;
++
++	for (int i = 0; i < nBins; ++i)
++	{
++		const float w = hist.bins[i];
++		if (w <= 0.0f)
++			continue;
++
++		const float a = acc;
++		const float b = acc + w;
++		acc = b;
++
++		const float lower = max(a, wLo);
++		const float upper = min(b, wHi);
++		if (upper <= lower)
++			continue;
++
++		// Where inside this bin the band's slice sits, as a fraction of the bin's width. The bins
++		// are half a stop of log2 luminance each, and the weight is assumed uniform across a bin -
++		// which is the only assumption available and the one that makes the interpolation linear.
++		const float tMid = ((lower + upper) * 0.5f - a) / w;
++		const float centre = hist.logMinStops + ((float)i + tMid) * step;
++
++		const float sliceWeight = upper - lower;
++		bandWeight += sliceWeight;
++		bandSum += sliceWeight * centre;
++
++		if (firstBin < 0)
++		{
++			firstBin = i;
++			loStops = hist.logMinStops + ((float)i + clamp_tpl((wLo - a) / w, 0.0f, 1.0f)) * step;
++		}
++		lastBin = i;
++		hiStops = hist.logMinStops + ((float)i + clamp_tpl((upper - a) / w, 0.0f, 1.0f)) * step;
++	}
++
++	if (bandWeight <= 0.0f || firstBin < 0)
++		return false;
++
++	// A band that resolves entirely inside a saturating bucket has a POSITION and no value: bin 0
++	// means "at or below 14 stops under grey" and bin 63 means "at or above 18 stops over it", and
++	// acting on either would be acting on the edge of the window rather than on the scene.
++	if (firstBin == lastBin && (firstBin == 0 || firstBin == nBins - 1))
++		return false;
++
++	// The band's log-mean, in stops over mid grey, in the EXPOSED units the bins were built in.
++	const float meanStops = bandSum / bandWeight;
++
++	// Undo the pre-exposure that was in force when these bins were measured. The whole histogram
++	// shifts rigidly by that one scalar, which is why this conversion happens once, here, and not
++	// per bin: there is no ordering hazard and no possibility of a half-converted result.
++	const float exposureAtCapture = max(hist.exposureAtCapture, 1e-12f);
++	const float bandAbsolute = (kSceneMidGrey * powf(2.0f, meanStops)) / exposureAtCapture;
++
++	// The plausibility window, in ABSOLUTE engine units of LUMINANCE (1.0 = 10 000 cd/m^2). The
++	// illuminance window the log-mean path uses is the same window scaled by 0.18/pi, since
++	// L = E * rho / pi at rho = 0.18. Outside it the meter has lost its footing and the answer is
++	// to hold, not to drive the camera to a limit.
++	if (!NumberValid(bandAbsolute) || bandAbsolute <= 1e-10f || bandAbsolute >= 1e3f)
++		return false;
++
++	// The EV that lands the band on mid grey.
++	//
++	//   the pre-exposure is  scale = LIGHT_UNIT_SCALE / (1.2 * 2^EV100)   (spec D6)
++	//   we want              L_absolute * scale = 0.18
++	//   therefore            EV100 = log2( L_absolute * LIGHT_UNIT_SCALE / (1.2 * 0.18) )
++	//
++	// This is the SAME number the incident form gives, not a second calibration: substituting
++	// L = E * 0.18 / pi into it returns log2(E * LIGHT_UNIT_SCALE * 100 / (120*pi)) exactly, which
++	// is decisions/s1-exposure-constant.md's C = 120*pi written the other way round. Metering
++	// luminance instead of an albedo-divided illuminance estimate changes WHAT is measured - the
++	// meter is now reflected rather than incident, and the sky/emissive albedo fallback is simply
++	// gone - but not what "correctly exposed" means.
++	targetEV = log2f(bandAbsolute * RENDERER_LIGHT_UNIT_SCALE / (kSensorSaturationFactor * kSceneMidGrey));
++
++	// For r_HDRDebug 1 only. Published from ApplySceneExposure(), which is called once a frame;
++	// this function can be reached more than once and must not write to the bus itself.
++	m_meterBandLowLum = (kSceneMidGrey * powf(2.0f, loStops)) / exposureAtCapture;
++	m_meterBandHighLum = (kSceneMidGrey * powf(2.0f, hiStops)) / exposureAtCapture;
++	m_meterTargetEV = targetEV;
++
++	return true;
++}
++
+ float CCinematicCameraComponent::ComputeSceneReferredEV100()
+ {
+ 	const float manualEV = ComputeManualEV100();
+@@ -1802,19 +1975,41 @@ float CCinematicCameraComponent::ComputeSceneReferredEV100()
+ 	}
+ 
+ 	// ----- AUTO -----------------------------------------------------------------------------
+-	// The meter is the engine's own luminance measure, read back per frame by
+-	// CAutoExposureStage::UpdateSceneReferredMeterReadback() with the pre-exposure that was in
+-	// force for the sampled frame already divided out. So this is an absolute illuminance in
+-	// engine units and the loop does not have to unwind its own output.
++	// Two meters, and exactly one of them publishes on any frame (r_SceneReferredMeterHistogram).
++	//
++	//   HISTOGRAM (default) - 64 bins of log2 LUMINANCE relative to mid grey, accumulated by a
++	//   compute pass with the camera's metering mask, and reduced HERE to the log-mean of a
++	//   percentile band. This is the one that fixes the outdoor picture: the failure it replaces
++	//   was not a wrong constant but a wrong STATISTIC - a whole-frame mean, in which one large
++	//   region (the sky, at a fabricated 0.2 albedo and full area weight) owned the answer and put
++	//   74 700 lux on mid grey when the subject was lit by 100 000.
++	//
++	//   LOG-MEAN (fallback) - the shipped whole-frame geometric mean of the albedo-divided
++	//   illuminance estimate, kept as the A/B reference.
++	//
++	// Both arrive with the pre-exposure of the sampled frame already accounted for by the stage,
++	// so neither loop has to unwind its own output.
++	SSceneReferredMeterHistogram hist;
++	ZeroStruct(hist);
+ 	float meteredIlluminance = 0.0f;
+ 	if (gEnv->pRenderer)
++	{
++		gEnv->pRenderer->EF_Query(EFQ_GetSceneReferredMeterHistogram, hist);
+ 		gEnv->pRenderer->EF_Query(EFQ_GetSceneReferredMeteredIlluminance, meteredIlluminance);
++	}
+ 
+ 	const uint32 frameId = gEnv->nMainFrameID;
+ 	const bool bNewFrame = (frameId != m_autoMeteredFrameId);
+ 	m_autoMeteredFrameId = frameId;
+ 
+-	if (meteredIlluminance > 0.0f && !m_exposure.bAutoLock && bNewFrame)
++	float targetEV = 0.0f;
++	bool bHaveTarget = false;
++
++	if (hist.sampleId != 0 && hist.totalWeight > 0.0f)
++	{
++		bHaveTarget = ReduceMeterHistogram(hist, targetEV);
++	}
++	else if (meteredIlluminance > 0.0f)
+ 	{
+ 		// The incident-meter form, ISO 2720: EV = log2(E * S / C) at S = 100 with C = 120*pi -
+ 		// the constant that puts an 18 % reflector under the metered illuminance on 0.18. The
+@@ -1822,10 +2017,24 @@ float CCinematicCameraComponent::ComputeSceneReferredEV100()
+ 		// a white wall and a black wall under the same light expose the same, which is what a
+ 		// light meter on set does and is steadier than reflected metering under a pan.
+ 		const float kIncidentMeterConstant = 120.0f * gf_PI;
+-		const float targetEV = log2f(meteredIlluminance * RENDERER_LIGHT_UNIT_SCALE * 100.0f / kIncidentMeterConstant);
++		targetEV = log2f(meteredIlluminance * RENDERER_LIGHT_UNIT_SCALE * 100.0f / kIncidentMeterConstant);
++		bHaveTarget = true;
++	}
+ 
++	if (bHaveTarget && !m_exposure.bAutoLock && bNewFrame)
++	{
+ 		const float dt = max(gEnv->pTimer->GetFrameTime(), 0.0f);
+-		const float tau = (float)m_exposure.autoTau;
++
++		// ASYMMETRIC time constants, because the problem is asymmetric and a symmetric tau applied
++		// to it is what made walking out of a hangar a three-second over-exposure
++		// (research/s8-metering.md section 2.5). targetEV ABOVE the current EV means the scene got
++		// brighter and the picture has to DARKEN - a camera stops down at once, and photopic light
++		// adaptation is about a fifth of a second - so that direction gets Auto Darken Time. The
++		// other direction keeps Response Time, because dark adaptation genuinely is slow. 0 on the
++		// darken side means "one time constant for both", the old behaviour.
++		const float darkenTime = (float)m_exposure.autoDarkenTime;
++		const bool bDarkening = (targetEV > m_autoMeteredEV);
++		const float tau = (bDarkening && darkenTime > 0.0f) ? darkenTime : (float)m_exposure.autoTau;
+ 
+ 		if (!m_bAutoMeteredEVValid || tau <= 0.0f || dt <= 0.0f)
+ 		{
+diff --git a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
+index 3a73308c..4196093e 100644
+--- a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
++++ b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
+@@ -90,6 +90,36 @@ static void ReflectType(Schematyc::CTypeDesc<EExposureMode>& desc)
+ 	desc.AddConstant(EExposureMode::AutoBiased,       "AutoBiased",       "Auto + Bias (game)");
+ }
+ 
++// ---------------------------------------------------------------------------
++// Metering pattern
++// ---------------------------------------------------------------------------
++// WHERE in the frame the camera's AUTO mode looks. Scene-referred path only: it is a weight on
++// the metering histogram's accumulation (decisions/s8-metering.md approach A), and the three are
++// the patterns every real body offers, at the sizes the camera industry settled on.
++enum class EMeteringMode : uint32
++{
++	//! The whole frame, uniformly. The A/B reference against the shipped whole-frame log-mean -
++	//! and outdoors, where the sky is half the picture and is not the subject, the pattern that
++	//! most often gets it wrong.
++	Average = 0,
++	//! A smooth radial falloff: full sensitivity at the centre, a quarter of it in the corners.
++	//! The classic answer to the sky problem and the default.
++	CenterWeighted,
++	//! A soft-edged disc 20 % of frame height across, about 1.8 % of frame area. Put it on a grey
++	//! card and the card is mid grey, whatever else is in the picture.
++	Spot
++};
++
++static void ReflectType(Schematyc::CTypeDesc<EMeteringMode>& desc)
++{
++	desc.SetGUID("{7A4E2D18-9C63-4B57-8E20-51D3A9F6C742}"_cry_guid);
++	desc.SetLabel("Metering Mode");
++	desc.SetDefaultValue(EMeteringMode::CenterWeighted);
++	desc.AddConstant(EMeteringMode::Average,        "Average",        "Average");
++	desc.AddConstant(EMeteringMode::CenterWeighted, "CenterWeighted", "Centre-weighted");
++	desc.AddConstant(EMeteringMode::Spot,           "Spot",           "Spot");
++}
++
+ // ---------------------------------------------------------------------------
+ // Diffraction streak model
+ // ---------------------------------------------------------------------------
+@@ -421,6 +451,35 @@ struct SCineExposureParams
+ 			'atau', "AutoExposureTau", "Auto Exposure Response Time",
+ 			"Scene-referred AUTO only: seconds for the metered EV to cover 63 % of a change. "
+ 			"A cut always snaps instantly. 0 = no smoothing at all.", 1.0f);
++		desc.AddMember(&SCineExposureParams::autoDarkenTime,
++			'adkt', "AutoExposureDarkenTime", "Auto Darken Time",
++			"Scene-referred AUTO only: seconds for the metered EV to cover 63 % of a change when "
++			"the scene gets BRIGHTER and the picture therefore has to darken - walking out of a "
++			"hangar into the sun. Half of Response Time by default, because the problem is "
++			"asymmetric and a single time constant cannot serve both halves of it: a real camera "
++			"stops down at once and the eye adapts to light in about a fifth of a second, while "
++			"adapting to dark takes minutes. Response Time still governs the other direction. "
++			"0 = use Response Time for both, which is the old symmetric behaviour.", 0.5f);
++		desc.AddMember(&SCineExposureParams::meteringMode,
++			'mtmd', "MeteringMode", "Metering Mode",
++			"Scene-referred AUTO only: WHERE in the frame the camera meters. Average reads the "
++			"whole frame uniformly; Centre-weighted keeps full sensitivity in the middle and a "
++			"quarter of it in the corners, which is what stops a bright sky from stopping the "
++			"subject down; Spot reads a soft-edged disc a fifth of the frame height across, so "
++			"you can put it on a face or a grey card and let everything else fall where it falls.",
++			EMeteringMode::CenterWeighted);
++		desc.AddMember(&SCineExposureParams::meterMinPercent,
++			'mtlo', "MeterMinPercent", "Metering Band Low",
++			"Scene-referred AUTO only: discard everything below this percentile of metering "
++			"weight before averaging. 50 throws away the darker half of the frame, which is "
++			"shadow detail nobody meters for and which is exactly what drags an outdoor scene "
++			"below mid grey. 0 keeps the whole frame.", 50.0f);
++		desc.AddMember(&SCineExposureParams::meterMaxPercent,
++			'mthi', "MeterMaxPercent", "Metering Band High",
++			"Scene-referred AUTO only: discard everything above this percentile. 90 throws away "
++			"the top decile - sky, glints, the sun itself - so panning past the sun is a "
++			"non-event instead of a stop-down. 100 keeps the whole frame. The camera exposes so "
++			"that the log-mean of what is LEFT between the two lands on mid grey.", 90.0f);
+ 		desc.AddMember(&SCineExposureParams::autoEVMin,
+ 			'aevn', "AutoExposureEVMin", "Auto Exposure EV Min",
+ 			"Scene-referred AUTO only: the brightest the camera will open up to (low EV = open).", -2.0f);
+@@ -444,6 +503,10 @@ struct SCineExposureParams
+ 	Schematyc::Range<-6, 24, 4, 14> neutralEV = 9.0f;
+ 	Schematyc::Range<-3, 3, -3, 3> evCompensation = 0.f;
+ 	Schematyc::Range<0, 10, 0, 5> autoTau = 1.0f;
++	Schematyc::Range<0, 10, 0, 5> autoDarkenTime = 0.5f;
++	EMeteringMode meteringMode = EMeteringMode::CenterWeighted;
++	Schematyc::Range<0, 100, 0, 100> meterMinPercent = 50.0f;
++	Schematyc::Range<0, 100, 0, 100> meterMaxPercent = 90.0f;
+ 	Schematyc::Range<-6, 24, -6, 24> autoEVMin = -2.0f;
+ 	Schematyc::Range<-6, 24, -6, 24> autoEVMax = 20.0f;
+ 	Schematyc::Range<8, 20, 8, 20> sensorClipStops = 14.0f;
+@@ -1199,6 +1262,11 @@ private:
+ 	//! photographic triangle; the two auto modes fall back to it until the AUTO metering loop
+ 	//! lands (see decisions/s1-auto-mode.md part 2).
+ 	float ComputeSceneReferredEV100();
++	//! Reduce the renderer's 64-bin metering histogram to the EV that lands the log-mean of the
++	//! [Metering Band Low, Metering Band High] percentile band on mid grey. False = the band could
++	//! not be trusted (it resolved inside a saturating bucket, or left the plausibility window) and
++	//! the camera must hold its last EV.
++	bool ReduceMeterHistogram(const SSceneReferredMeterHistogram& hist, float& targetEV);
+ 	void ApplyStreaks();
+ 	void RestoreStreaks();
+ 	void ApplyHalation();
+@@ -1341,6 +1409,7 @@ private:
+ 	// by every camera in the level (research/s1-ccam-exposure-today.md section 5, item 13).
+ 	bool m_bLoggedSceneRefResponseIgnored = false;
+ 	bool m_bLoggedSceneRefAutoAsManual    = false;
++	bool m_bLoggedMeterBandInverted       = false;
+ 
+ 	// Scene-referred AUTO state: the smoothed metered EV100 and whether it holds a real sample
+ 	// yet. Invalid means "snap on the next measurement" - the camera-cut behaviour the engine's
+@@ -1352,6 +1421,13 @@ private:
+ 	// write); the smoothing step must advance exactly once, or the response time depends on how
+ 	// many callers there happen to be.
+ 	uint32 m_autoMeteredFrameId  = 0;
++	// What the last histogram reduction resolved to: the absolute luminance at each edge of the
++	// percentile band and the EV it asked for. Nothing is drawn with these - they are published on
++	// the post-effect bus for the r_HDRDebug 1 overlay, so that "the exposure is wrong" stays one
++	// screenshot to diagnose rather than a session of guessing which half of the loop moved.
++	float  m_meterBandLowLum  = 0.f;
++	float  m_meterBandHighLum = 0.f;
++	float  m_meterTargetEV    = 0.f;
+ 	// Edge-trigger state for the effective-T-stop log line, per component for the same reason.
+ 	float m_lastLoggedApertureN     = -1.f;
+ 	float m_lastLoggedTransmission  = -1.f;
+-- 
+2.47.1.windows.1
+

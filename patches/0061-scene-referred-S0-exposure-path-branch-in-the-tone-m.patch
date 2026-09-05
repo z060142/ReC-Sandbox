@@ -1,0 +1,146 @@
+From b477fc0ef1aa3c402209d456d8322b0d2296b4af Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Fri, 28 Aug 2026 06:24:56 +0800
+Subject: [PATCH 061/119] scene-referred S0: exposure-path branch in the tone
+ map (D14)
+
+Third item of Stage S0. r_HDREyeAdaptationMode selects which constant set the tone map reads,
+its engine default is 2 (the legacy Krawczyk path) and in that mode every EV the cinematic
+camera writes is silently ignored - the sample project only works because its .cryproject
+happens to set 1. D14 requires ccam to get the exposure path it needs whatever the cvar says.
+
+Decision: scene-notes/decisions/s0-exposure-path-forcing.md, approach A. Research:
+scene-notes/research/s0-tonemap-stage-flags.md, s0-cvar-gating-pattern.md section 5.3.
+
+- CToneMappingStage::Execute() gains a third branch at both read sites: the static flag
+  (SAMPLE4) and the HDREyeAdaptation constant. They have to agree - handing hdrSetupParams[3],
+  which is (EV min, EV max, EV auto compensation), to the Krawczyk branch, which reads .y/.z as
+  min and max EXPOSURE, gives a silently wrong picture and no crash.
+- The branch is added to featureMask at bit 13 (r_HDRDebug occupies 9-12). Without that the
+  pass is not marked dirty when the switch flips and the old permutation keeps running - the
+  easiest mistake to make in this stage.
+- FOR S0 THE SCENE-REFERRED BRANCH IS DELIBERATELY IDENTICAL TO MODE 1: SAMPLE4 clear, exposure
+  from hdrSetupParams[3], so the picture does not change yet. This item only decides where the
+  exposure comes from, so S1 has exactly one place to replace with the camera's pre-exposure.
+  The comments at both sites say so.
+- DisplayDebugInfo() makes the same three-way choice, so r_HDRDebug 1 reports the exposure the
+  shader is actually using, and labels the readout "Scene-referred EV" when the branch is live.
+- Nothing writes r_HDREyeAdaptationMode: it is global and VF_DUMPTODISK, and a latch on it
+  would be dropped by ClearSavedBaselines() on entering game mode and never restored. The cvar
+  keeps its full meaning for the stock path.
+- ExecuteDebug() (r_HDRDebug > 1) is left alone; it is a separate technique on its own flag
+  axis and is out of scope for S0.
+
+Built clean (0 errors, 0 warnings outside Code/SDKs): CryRenderD3D11, CinematicCamera.
+
+Co-Authored-By: Claude Opus <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01A72MFkdSczncE7au9UVnmu
+---
+ .../GraphicsPipeline/ToneMapping.cpp          | 57 +++++++++++++++++--
+ 1 file changed, 52 insertions(+), 5 deletions(-)
+
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.cpp
+index f7644791..9088099a 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.cpp
+@@ -56,6 +56,20 @@ void CToneMappingStage::Execute()
+ 	bool bApplyDithering = CRenderer::CV_r_HDRDithering && CRenderer::CV_r_PostProcess;
+ 	bool bVignettingEnabled = CRenderer::CV_r_HDRVignetting && CRenderer::CV_r_PostProcess;
+ 
++	// D14 (SceneReferredSpec.md): the scene-referred path takes its exposure from the cinematic
++	// camera and must do so whatever r_HDREyeAdaptationMode says. The engine default is 2, the
++	// legacy Krawczyk path, which reads hdrSetupParams[4] and silently ignores every EV the
++	// camera writes - the sample project only works today because its .cryproject happens to set
++	// 1. Rather than have the plugin write that global VF_DUMPTODISK cvar (ClearSavedBaselines()
++	// would drop the latch on entering game mode and it would never be restored), the stage grows
++	// a third branch and the cvar keeps its full meaning for the stock path.
++	//
++	// FOR S0 THIS BRANCH IS DELIBERATELY IDENTICAL TO MODE 1: the same EV-based exposure out of
++	// hdrSetupParams[3], the same shader permutation. Nothing about the picture changes yet -
++	// this item only decides WHERE the exposure comes from, so that S1 has exactly one place to
++	// replace with the camera's pre-exposure and nothing else has to move.
++	const bool bSceneReferred = CRendererResources::IsSceneReferred();
++
+ 	CShader* pShader = CShaderMan::s_shHDRPostProcess;
+ 	CTexture* pSunShaftsTex = CRendererResources::s_ptexBlack;
+ 	CTexture* pColorChartTex = CRendererResources::s_ptexBlack;
+@@ -71,14 +85,24 @@ void CToneMappingStage::Execute()
+ 			bColorGradingEnabled = false;
+ 	}
+ 
++	// Bit 13: the scene-referred branch. It has to be in the mask or the pass is not marked dirty
++	// when the switch flips and the old permutation keeps running (r_HDRDebug occupies bits 9-12).
+ 	int featureMask = ((int)bSunShaftsEnabled << 1) | ((int)bColorGradingEnabled << 2) | ((int)bBloomEnabled << 3) |
+-	                  ((CRenderer::CV_r_HDREyeAdaptationMode & 0xF) << 5) | ((CRenderer::CV_r_HDRDebug & 0xF) << 9);
++	                  ((CRenderer::CV_r_HDREyeAdaptationMode & 0xF) << 5) | ((CRenderer::CV_r_HDRDebug & 0xF) << 9) |
++	                  ((int)bSceneReferred << 13);
+ 
+ 	if (m_passToneMapping.IsDirty(featureMask, pSunShaftsTex->GetTextureID(), pColorChartTex->GetTextureID(), CRendererResources::s_ptexCurLumTexture->GetTextureID()))
+ 	{
+ 		uint64 rtMask = 0;
+-		if (CRenderer::CV_r_HDREyeAdaptationMode == 2)
++		if (bSceneReferred)
++		{
++			// Scene-referred exposure. S0: the EV path, so SAMPLE4 stays clear exactly as it does
++			// in mode 1 and the shader keeps using ComputeExposure(). S1 replaces this branch.
++		}
++		else if (CRenderer::CV_r_HDREyeAdaptationMode == 2)
++		{
+ 			rtMask |= g_HWSR_MaskBit[HWSR_SAMPLE4];
++		}
+ 		if (bColorGradingEnabled)
+ 			rtMask |= g_HWSR_MaskBit[HWSR_SAMPLE1];
+ 		if (bVignettingEnabled)
+@@ -123,7 +147,22 @@ void CToneMappingStage::Execute()
+ 	Vec4 hdrSetupParams[5];
+ 	gEnv->p3DEngine->GetHDRSetupParams(hdrSetupParams);
+ 
+-	m_passToneMapping.SetConstant(eyeAdaptationName, CRenderer::CV_r_HDREyeAdaptationMode == 2 ? hdrSetupParams[4] : hdrSetupParams[3], eHWSC_Pixel);
++	// The second read site. It must agree with the static flag above: feeding hdrSetupParams[3]
++	// (EV min, EV max, EV auto compensation) to the Krawczyk branch, which reads .y/.z as min and
++	// max EXPOSURE, is a silently wrong picture rather than a crash.
++	Vec4 eyeAdaptationParams;
++	if (bSceneReferred)
++	{
++		// S0: hdrSetupParams[3], the same source as mode 1. S1 replaces this with the camera's
++		// own EV100, at which point the exposure stops being a tone-map term at all.
++		eyeAdaptationParams = hdrSetupParams[3];
++	}
++	else
++	{
++		eyeAdaptationParams = (CRenderer::CV_r_HDREyeAdaptationMode == 2) ? hdrSetupParams[4] : hdrSetupParams[3];
++	}
++
++	m_passToneMapping.SetConstant(eyeAdaptationName, eyeAdaptationParams, eHWSC_Pixel);
+ 	m_passToneMapping.SetConstant(vignetteParamsName, ResolveVignetteParams(), eHWSC_Pixel);
+ 	m_passToneMapping.SetConstant(filmCurveName, hdrSetupParams[0], eHWSC_Pixel);
+ 	m_passToneMapping.SetConstant(colorBalanceName, hdrSetupParams[2], eHWSC_Pixel);
+@@ -270,7 +309,12 @@ void CToneMappingStage::DisplayDebugInfo()
+ 	Vec4 vHDRSetupParams[5];
+ 	gEnv->p3DEngine->GetHDRSetupParams(vHDRSetupParams);
+ 
+-	if (CRenderer::CV_r_HDREyeAdaptationMode == 2)
++	// The same three-way choice as Execute(), or the overlay reports an exposure the shader is
++	// not using. Both formulas below are CPU replicas of FilmMapping() / ComputeExposure() and
++	// have to be kept in step with the shader by hand.
++	const bool bSceneReferred = CRendererResources::IsSceneReferred();
++
++	if (!bSceneReferred && CRenderer::CV_r_HDREyeAdaptationMode == 2)
+ 	{
+ 		// Compute scene key and exposure in the same way as in the tone mapping shader
+ 		float sceneKey = 1.03f - 2.0f / (2.0f + log(fLuminance + 1.0f) / log(2.0f));
+@@ -286,7 +330,10 @@ void CToneMappingStage::DisplayDebugInfo()
+ 		float autoCompensation = (clamp_tpl<float>(sceneKey, 0.1f, 5.2f) - 3.0f) / 2.0f * vHDRSetupParams[3].z;
+ 		float finalExposure = clamp_tpl<float>(exposure - autoCompensation, vHDRSetupParams[3].x, vHDRSetupParams[3].y);
+ 
+-		sprintf(str, "Measured EV: %.1f  Auto-EC: %.1f  Final EV: %.1f", exposure, autoCompensation, finalExposure);
++		// S0: the scene-referred branch computes exactly the same numbers as mode 1; only the
++		// label says where the exposure came from, so a mismatch is visible before S1 moves it.
++		sprintf(str, "%s EV: %.1f  Auto-EC: %.1f  Final EV: %.1f",
++		        bSceneReferred ? "Scene-referred" : "Measured", exposure, autoCompensation, finalExposure);
+ 		IRenderAuxText::DrawText(Vec3(5, 75, 1), IRenderAuxText::ASize(1.0f), ColorF(1, 0, 1, 1), eDrawText_800x600 | eDrawText_2D, str);
+ 	}
+ }
+-- 
+2.47.1.windows.1
+

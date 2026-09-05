@@ -1,0 +1,331 @@
+From 4a06a353c2651c0bed92c60689f2f9836a89e86a Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Fri, 28 Aug 2026 08:56:12 +0800
+Subject: [PATCH 075/119] scene-referred S3: the ACES matrices, and the fp16
+ floor reaches the working space itself
+
+The numbers S3 and S4 are both built on, in one place, plus the one hole S0 left
+in the format floor - the target the working space actually lives in.
+
+CommonMath.cfi gains, in the colour-space block:
+
+  REC709_TO_ACESCG / ACESCG_TO_REC709   linear Rec.709 (D65) <-> ACEScg (AP1, D60),
+                                        Bradford-adapted, 8 decimals
+  Rec709ToACEScg() / ACEScgToRec709()   mul() wrappers
+  ACESCG_LUMINANCE_WEIGHTS              the AP1 Y row, sum exactly 1.0
+  ACEScgLuminance()
+  ACESCCT_* + LinearToACEScct() / ACEScctToLinear()   S4's shaper, scalar and float3
+
+Every digit is an exact double-precision operator parameter read out of OCIO's own
+transform by tools/ocio-bake/verify_matrices.py against PyOpenColorIO 2.5
+(studio-config-v4.0.0_aces-v2.0_ocio-v2.5), not a sampled float32 processor and not
+recalled from memory - four entries of the forward matrix and seven of the inverse
+were wrong in the 7th decimal in the research note's first pass, which is why the
+comment names the script that regenerates them. These are standards (Rec.709, AP1,
+D65, D60, Bradford are each fixed by specification), so there is no parameter in
+them and nothing runtime-settable; the way they go wrong is the bake tool and the
+shader disagreeing, and that is fixed by one source, not by a cbuffer.
+
+Unlike every transfer function beneath them these deliberately carry no saturate().
+The block right below shows why that had to be said out loud: all eight stock
+transfer functions open with one, and none of them is usable on scene-referred data.
+
+The broken Convert_REC709toREC2020 at the end of that block stays exactly as it is
+and gains a comment saying so - it cannot compile (a missing opening paren), it is
+not a matrix multiply even repaired (the commas are the comma operator) and each
+row multiplies a different component. Its coefficients are correct, which is what
+makes it dangerous. Repairing it would be a stock-path source change with no stock
+consumer; the comment points at the working code instead.
+
+Second half: ResolveHDRMainFormat() + UpdateHDRMainFormats(), the same
+max(cvar, sceneReferred ? 2 : 0) shape and the same in-place
+CTexture::ReformatRenderTarget() path S0 gave the seven satellites, now applied to
+$HDRTarget and its three scaled siblings. Those take the high-quality HDR alias and
+are already fp16 at the registered default r_HDRTexFormat 1, so this fires on
+neither path in practice - but $HDRTarget IS the working space, and "r_HDRTexFormat 0"
+would have put the whole scene-referred chain in an unsigned 11:11:10 buffer. 709 ->
+AP1 alone produces no negatives, so S3 by itself would survive; S4's CDL and any LMT
+can, and then the sign bit matters. All four or none, because the scaled pair feeds
+auto exposure, bloom and the shafts.
+
+Build: CryRenderD3D11, CinematicCamera, 0/0.
+
+Co-Authored-By: Claude Opus <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01A72MFkdSczncE7au9UVnmu
+---
+ .../Common/GraphicsPipeline.cpp               |  82 +++++++++++-
+ .../Common/GraphicsPipeline.h                 |   5 +
+ Engine/Shaders/HWScripts/CryFX/CommonMath.cfi | 120 ++++++++++++++++++
+ 3 files changed, 206 insertions(+), 1 deletion(-)
+
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Common/GraphicsPipeline.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Common/GraphicsPipeline.cpp
+index d2d2e5df..b07674a1 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Common/GraphicsPipeline.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Common/GraphicsPipeline.cpp
+@@ -228,6 +228,28 @@ static ETEX_Format ResolveHDRSatelliteFormat()
+ 	return CRendererResources::GetHDRFormat(false, true);
+ }
+ 
++// The same floor for the MAIN HDR target and its three scaled siblings, which take the "high
++// quality" alias and are therefore fp16 already at the registered default r_HDRTexFormat 1 - but
++// R11G11B10F at r_HDRTexFormat 0. That target IS the working space: the 709 -> AP1 conversion
++// writes it in place and every post effect reads it from there, so a user typing
++// "r_HDRTexFormat 0" would put the whole scene-referred chain in an unsigned 11:11:10 buffer.
++// 709 -> AP1 alone produces no negatives (Rec.709's primaries lie inside AP1), so S3 by itself
++// would survive it - but S4's CDL and any LMT legitimately can, and then the sign bit matters.
++//
++// Same shape as the satellites: effective = max(cvar, sceneReferred ? 2 : 0), decided HERE rather
++// than inside CRendererResources::GetHDRFormat(), which is engine-wide. With the switch off this
++// is a straight pass-through to the stock helper, and at the default cvar value it is a no-op on
++// both paths, which is why this costs nothing in practice and closes the hole anyway.
++static ETEX_Format ResolveHDRMainFormat()
++{
++	const int effective = std::max(CRenderer::CV_r_HDRTexFormat, CRendererResources::IsSceneReferred() ? 2 : 0);
++
++	if (effective >= 1)
++		return eTF_R16G16B16A16F;
++
++	return CRendererResources::GetHDRFormat(false, false);
++}
++
+ void CGraphicsPipelineResources::CreateHDRMaps(int resourceWidth, int resourceHeight)
+ {
+ 	m_renderTargetPool.ClearRenderTargetList();
+@@ -237,7 +259,7 @@ void CGraphicsPipelineResources::CreateHDRMaps(int resourceWidth, int resourceHe
+ 	uint32 nHDRTargetFlags = FT_DONT_RELEASE;
+ 	uint32 nHDRTargetFlagsUAV = nHDRTargetFlags | (FT_USAGE_UNORDERED_ACCESS);  // UAV required for tiled deferred shading
+ 
+-	const ETEX_Format nHDRFormat = CRendererResources::GetHDRFormat(false, false); // No alpha, default is HiQ, can be downgraded
++	const ETEX_Format nHDRFormat = ResolveHDRMainFormat();                         // No alpha, default is HiQ, can be downgraded - forced to fp16 on the scene-referred path
+ 	const ETEX_Format nHDRQFormat = ResolveHDRSatelliteFormat();                   // No alpha, default is LoQ, can be upgraded - forced to fp16 on the scene-referred path
+ 	const ETEX_Format nHDRAFormat = CRendererResources::GetHDRFormat(true, false); // With alpha
+ 	
+@@ -521,6 +543,63 @@ void CGraphicsPipelineResources::UpdateHDRSatelliteFormats()
+ 	       (double(sizeAfter) - double(sizeBefore)) / (1024.0 * 1024.0));
+ }
+ 
++// The main HDR target and its three scaled siblings, on exactly the same terms as the satellites
++// above (SceneReferredSpec.md S3): the objects stay alive and only their device texture is
++// swapped, because $HDRTarget is bound as a UAV by CTiledShadingStage behind a caustics / SVO /
++// AO dirty key, as a render target by a dozen stages and as an ESRAM resident by the pipeline
++// itself - releasing it would strand every one of those bindings.
++//
++// All four or none: the scaled pair is produced from the main target by the half- and
++// quarter-resolution downsamples and consumed by auto exposure, bloom and the sun shafts, so a
++// mixed set would put a precision cliff in the middle of the glare chain.
++//
++// At the registered default (r_HDRTexFormat 1) this never fires on either path - the format is
++// already fp16 - so it exists to close the r_HDRTexFormat 0 hole, not to change the normal case.
++void CGraphicsPipelineResources::UpdateHDRMainFormats()
++{
++	const ETEX_Format wanted = ResolveHDRMainFormat();
++
++	CTexture* const mains[] =
++	{
++		m_pTexHDRTarget,
++		m_pTexHDRTargetScaled[0][0],
++		m_pTexHDRTargetScaled[1][0],
++		m_pTexHDRTargetScaled[1][1],
++	};
++
++	uint64 sizeBefore = 0;
++	bool bMismatch = false;
++	for (CTexture* pTex : mains)
++	{
++		if (!pTex)
++			continue;
++
++		sizeBefore += pTex->GetDeviceDataSize();
++		bMismatch |= (pTex->GetDstFormat() != wanted);
++	}
++
++	if (!bMismatch)
++		return;
++
++	uint64 sizeAfter = 0;
++	for (CTexture* pTex : mains)
++	{
++		if (!pTex)
++			continue;
++
++		if (pTex->GetDstFormat() != wanted)
++			pTex->ReformatRenderTarget(wanted);
++
++		sizeAfter += pTex->GetDeviceDataSize();
++	}
++
++	CryLog("[SceneReferred] HDR main targets -> %s at %dx%d; %.1f MiB -> %.1f MiB (%+.1f MiB)",
++	       (wanted == eTF_R16G16B16A16F) ? "R16G16B16A16F" : "R11G11B10F",
++	       m_resourceWidth, m_resourceHeight,
++	       sizeBefore / (1024.0 * 1024.0), sizeAfter / (1024.0 * 1024.0),
++	       (double(sizeAfter) - double(sizeBefore)) / (1024.0 * 1024.0));
++}
++
+ // Re-format the five scaled display targets when the scene-referred switch flips
+ // (SceneReferredSpec.md S2, decisions/s2-sun-shafts.md approach A).
+ //
+@@ -600,6 +679,7 @@ void CGraphicsPipelineResources::Update(EShaderRenderingFlags renderingFlags)
+ 	// for a stage to manage or retire resources - it runs on the render thread, before
+ 	// CompileModifiedRenderObjects() and before Execute(), so nothing is bound yet - and the
+ 	// rain occlusion texture right below is created and released on demand in the same way.
++	UpdateHDRMainFormats();
+ 	UpdateHDRSatelliteFormats();
+ 	UpdateDisplayTargetScaledFormats();
+ 
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Common/GraphicsPipeline.h b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Common/GraphicsPipeline.h
+index 341acdab..0a95cc03 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Common/GraphicsPipeline.h
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Common/GraphicsPipeline.h
+@@ -142,6 +142,11 @@ public:
+ 	void OnCVarsChanged(const CCVarUpdateRecorder& rCVarRecs);
+ 	void Update(EShaderRenderingFlags renderingFlags);
+ 
++	//! Scene-referred pipeline (SceneReferredSpec.md S3): re-format the main HDR target and its
++	//! three scaled siblings when the switch flips. They are already fp16 at the default
++	//! r_HDRTexFormat; this closes the r_HDRTexFormat 0 hole. Render thread, between frames.
++	void UpdateHDRMainFormats();
++
+ 	//! Scene-referred pipeline (SceneReferredSpec.md): re-format the seven low-quality HDR
+ 	//! satellite targets when the switch flips. Render thread, between frames.
+ 	void UpdateHDRSatelliteFormats();
+diff --git a/Engine/Shaders/HWScripts/CryFX/CommonMath.cfi b/Engine/Shaders/HWScripts/CryFX/CommonMath.cfi
+index 16e80bd7..b6046bfb 100644
+--- a/Engine/Shaders/HWScripts/CryFX/CommonMath.cfi
++++ b/Engine/Shaders/HWScripts/CryFX/CommonMath.cfi
+@@ -162,6 +162,117 @@ half3 DecodeColorYCC( half3 encodedCol, const bool useChrominance = true )
+ 	return col * col;
+ }
+ 
++////////////////////////////////////////////////////////////////////////////////////////////////////
++// ACES working space (SceneReferredSpec.md D5, Stage S3)
++//
++// Linear Rec.709 (sRGB primaries, D65) <-> ACEScg (AP1 primaries, ACES D60), chromatic adaptation
++// by BRADFORD. The adaptation is the load-bearing part: without it a neutral grey would come out
++// tinted, because the two spaces do not share a white point. With it, (1,1,1) maps to (1,1,1).
++//
++// These are STANDARDS, not tuning: Rec.709, AP1, D65, D60 and Bradford are each fixed by their
++// own specification, so there is no scene, camera or user parameter in these numbers. They are
++// exact double-precision operator parameters read out of OCIO's own transform, NOT sampled
++// through a float32 processor.
++//
++//   Bradford-adapted, verified against PyOpenColorIO 2.5, tools/ocio-bake/verify_matrices.py
++//   (config ocio://studio-config-latest = studio-config-v4.0.0_aces-v2.0_ocio-v2.5).
++//   Re-run that script if any digit here is ever in doubt; it fails with a per-entry diff.
++//
++// Two properties worth knowing before using them:
++//  1. REC709_TO_ACESCG is entirely NON-NEGATIVE - Rec.709's primaries lie inside AP1 - so no
++//     non-negative Rec.709 colour can produce a negative AP1 component. That is what makes the
++//     spec's "AP1-encoded negatives never appear" a VERIFICATION that the matrix was applied
++//     correctly rather than a hazard of the transform. The inverse IS signed, which is why
++//     anything going back to Rec.709 needs a float buffer.
++//  2. The matrix does not change any colour, only its coordinates: a Rec.709 (1,0,0) becomes
++//     (0.6131, 0.0702, 0.0206). Every threshold that compares against an absolute constant
++//     therefore sees a different number even though the light did not change. Re-deriving those
++//     constants is D11 / Stage S7 and must NOT be mixed into the primaries change.
++//
++// Unlike every transfer function below, these must NEVER acquire a saturate(): they operate on
++// scene-referred values with no upper bound.
++static const float3x3 REC709_TO_ACESCG =
++{
++	 0.61309740f,  0.33952315f,  0.04737945f,
++	 0.07019372f,  0.91635388f,  0.01345240f,
++	 0.02061559f,  0.10956977f,  0.86981463f
++};
++
++static const float3x3 ACESCG_TO_REC709 =
++{
++	 1.70505099f, -0.62179212f, -0.08325887f,
++	-0.13025642f,  1.14080474f, -0.01054832f,
++	-0.02400336f, -0.12896898f,  1.15297233f
++};
++
++float3 Rec709ToACEScg(float3 col)
++{
++	return mul(REC709_TO_ACESCG, col);
++}
++
++float3 ACEScgToRec709(float3 col)
++{
++	return mul(ACESCG_TO_REC709, col);
++}
++
++// The Y row of the AP1 -> CIE XYZ (D60) matrix; the three weights sum to exactly 1.0. This is the
++// luminance of an ACEScg value, and it is NOT GetLuminanceWeights(): compared with Rec.709's
++// (0.2126, 0.7152, 0.0722) red gains about 0.060, green loses 0.041 and blue loses 0.019, so a
++// saturated red source reads roughly 28 % brighter than the 709 weights would say. Applying the
++// 709 weights to AP1 data is the classic silent failure - every threshold and every
++// hue-preserving rescale moves, and nothing errors. Same provenance as the matrices above.
++static const float3 ACESCG_LUMINANCE_WEIGHTS = float3(0.27222872f, 0.67408177f, 0.05368952f);
++
++float ACEScgLuminance(float3 col)
++{
++	return dot(col, ACESCG_LUMINANCE_WEIGHTS);
++}
++
++////////////////////////////////////////////////////////////////////////////////////////////////////
++// ACEScct - the ACES grading log encoding (Stage S4's shaper, defined here so that there is one
++// home for the constants). A pure log curve cannot represent zero, nor the small negatives a
++// wide-gamut grade legitimately produces, so ACEScct replaces the toe with a straight segment
++// that meets the log curve at X_BRK with matching value and slope.
++//
++// Constants read out of OCIO's "CURVE - ACEScct-LOG_to_LINEAR" LogCameraTransform by
++// tools/ocio-bake/verify_matrices.py (base 2, logSideSlope 1/17.52, logSideOffset 9.72/17.52,
++// linSideBreak 2^-7, linearSlope defaulted to the tangent at the break).
++//
++// Landmarks worth remembering: encode(0.18) = 0.41358781 (mid grey), -B/A = -0.00691688 is the
++// most negative linear value the encode still represents, and decode(1.0) = 222.86 - NOT the fp16
++// ceiling. Anything that clamps the shaper output to [0,1] therefore clips at about 223x
++// reference white, roughly +10.3 stops over mid grey.
++#define ACESCCT_X_BRK       0.0078125000f
++#define ACESCCT_Y_BRK       0.1552511416f
++#define ACESCCT_A          10.5402377417f
++#define ACESCCT_B           0.0729055342f
++#define ACESCCT_LOG_OFFSET  9.7200000000f
++#define ACESCCT_LOG_SCALE  17.5200000000f
++
++float LinearToACEScct(float x)
++{
++	return (x < ACESCCT_X_BRK)
++	       ? (ACESCCT_A * x + ACESCCT_B)
++	       : ((log2(x) + ACESCCT_LOG_OFFSET) / ACESCCT_LOG_SCALE);
++}
++
++float3 LinearToACEScct(float3 col)
++{
++	return float3(LinearToACEScct(col.r), LinearToACEScct(col.g), LinearToACEScct(col.b));
++}
++
++float ACEScctToLinear(float y)
++{
++	return (y < ACESCCT_Y_BRK)
++	       ? ((y - ACESCCT_B) / ACESCCT_A)
++	       : exp2(y * ACESCCT_LOG_SCALE - ACESCCT_LOG_OFFSET);
++}
++
++float3 ACEScctToLinear(float3 col)
++{
++	return float3(ACEScctToLinear(col.r), ACEScctToLinear(col.g), ACEScctToLinear(col.b));
++}
++
+ // Gamma-Curve / Transfer-function only (no color-space change and no limited ranges)
+ half3 LinearToSRGB(half3 col)
+ {
+@@ -219,6 +330,15 @@ float3 REC2020ToLinear(float3 col)
+ 	return (col < 0.0812428582986315f) ? col / 4.50f : pow((col + float3(0.09929682680944f, 0.09929682680944f, 0.09929682680944f)) / 1.09929682680944f, 2.4f);
+ }
+ 
++// BROKEN AND UNUSED - left in place deliberately, do not copy it. The opening "float3(" is
++// missing, so it cannot compile; even repaired it is not a matrix multiply (the commas are the
++// comma operator, so each row's three products are never summed) and each row multiplies a
++// different component instead of dotting the whole vector. The coefficients themselves are the
++// correct Rec.709 -> Rec.2020 matrix, which is what makes it dangerous: it looks authoritative.
++// It survives only because nothing references it and the CryFX front end does not emit
++// unreferenced functions. Repairing it would be a stock-path source change with no stock
++// consumer (scene-notes/decisions/s3-working-space.md section 3C); the working colour-matrix
++// code the scene-referred path uses is Rec709ToACEScg() / ACEScgToRec709() above.
+ // The color primaries of sRGB and REC709 are the same, REC2020 has distinct color primaries
+ float3 Convert_REC709toREC2020(half3 col)
+ {
+-- 
+2.47.1.windows.1
+

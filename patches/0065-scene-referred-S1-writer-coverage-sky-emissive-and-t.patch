@@ -1,0 +1,360 @@
+From edc8330d0e07f52e06437859b665fe98800c652d Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Fri, 28 Aug 2026 06:58:47 +0800
+Subject: [PATCH 065/119] scene-referred S1: writer coverage - sky, emissive
+ and the forward/transparent lever
+
+Third item of Stage S1. The five m_fAdaptedSceneScaleLBuffer sites cover deferred lights, the sun,
+sky ambient and the fog light list. Everything else that writes scene colour bypassed them, so with
+item 2 live a stop of aperture moved the lit surfaces and left the sky, emissive meshes, particles,
+water and fog volumes exactly where they were. This closes that.
+
+Decision: scene-notes/decisions/s1-writer-coverage.md, approach A (one per-view exposure constant,
+the UE View.PreExposure shape). Research: scene-notes/research/s1-adapted-scene-scale.md sections
+5 and 7. Worked in the decision's order 1 -> 4 -> 3 -> 2 -> 5; the cbuffer member (2) had to be
+declared before emissive (3) could use it, so it lands in the same commit.
+
+Coverage item 4, sky. CSkyStage::SetSkyParameters() / SetHDRSkyParameters() multiply every
+radiance constant by the latched exposure: the skybox emittance, the procedural day sky's partial
+Mie and Rayleigh in-scattering constants, the night sky base and delta colours, and the moon plus
+both coronae (colour only - the corona .w is a falloff exponent, not a radiance). Every one of them
+is linear in Stars.cfx, so a single multiply per constant is the whole change.
+  Deviation from the decision note, deliberate: the note put this at the CPU fill
+  (S3DEngineCommon::UpdateSkyInfo, Renderer.cpp:4007/4032). The fill runs on the MAIN thread; the
+  sky stage runs on the render thread and can read the value latched for this exact render view,
+  which is the entire point of item 1's latch. The stage also reaches both addends of the skybox
+  emittance, the night sky, the moon and the day sky in one place, which the fill site does not.
+  The 100x scale collision between the two addends is NOT touched (S2): the exposure multiplies
+  their sum, so they move together and their ratio is unchanged.
+
+Coverage item 3, emissive. Illum.cfx and MultiLayeredMaterials.cfx multiply the emittance by the
+per-view exposure. Emissive is never in the G-buffer - emissive objects are re-queued forward and
+drawn additively - so nothing else would ever have applied it. The duplicated (1000.0/10000.0)
+literal in both files becomes one MAT_EMISSIVE_UNIT_SCALE in FXConstantDefs.cfi, matching the
+symbolic form the C++ twin already uses (ShaderResources.h's kKiloScale / RENDERER_LIGHT_UNIT_SCALE).
+
+Coverage item 2, the forward/transparent lever. PS_HDR_RANGE_ADAPT_MAX stops being the literal 1.0
+and becomes a per-view constant: CV_SceneExposure, a new float4 at the end of CBPerViewGlobal in
+both FXConstantDefs.cfi and Include_HLSL_CPP_Shared.h, filled in
+CGraphicsPipeline::GeneratePerViewConstantBuffer() from the same latched value.
+  The member stores exposure MINUS ONE and the macro adds it back:
+  #define PS_HDR_RANGE_ADAPT_MAX (1.0 + CV_SceneExposure.x). That is load-bearing, not a flourish.
+  Off the switch the exposure is 1.0, so the member is 0.0, so a shader whose per-view buffer is
+  not bound reads 1.0 and multiplies by exactly 1.0 instead of blacking the surface out. Off the
+  switch the picture is bit-identical (x * 1.0f is exact in IEEE); what changes is only that a
+  multiply the compiler used to fold away now survives. The 16 multiply sites keep their text
+  verbatim - effect layers, caustics, distance clouds x3, fog volumes x2, the particle imposter,
+  all particles, the ocean, water fog x4, the water volume.
+  The 5 sites that read scene colour BACK out of the HDR or reflection targets and divided the
+  factor out again - Water.cfx:1053/1095, WaterReflectionsPass.cfi:137, WaterVolume.cfx:1147/1235 -
+  now use PS_HDR_RANGE_ADAPT_MAX_SCENE_READ, which is 1.0. That round trip is the old console
+  scheme's semantics and is exactly wrong for a pre-exposure: the value read is already exposed and
+  must not be un-exposed. Off the switch it was 1.0 anyway, so those five fold away exactly as they
+  do today.
+
+Coverage item 5, decals: no site needed, and this settles the research note's open question 4
+without a capture. Deferred decals write albedo/normal/gloss into the G-buffer and are then lit by
+the deferred lights, so they take the exposure through the five sites. Forward (alpha-blended)
+decals are drawn by Illum.cfx's %DECAL permutation - the same pixel shader whose emittance was just
+changed - so they are covered by coverage item 3.
+
+LEFT UNEXPOSED ON PURPOSE (D13, listed in scene-notes/log.md as S1 known breakage): sun shafts
+(their colour is Normalize()d, which decouples them from the sun entirely - a pre-existing bug, S2),
+volumetric clouds (own pipeline, own units), SVOGI (RGBM 4.0 ceiling, 8-bit pools) and the fog
+density tuning (empirical, no unit scale anywhere). They run, they break visibly, and they are
+fixed at the root in S2/S8.
+
+Built clean (0 errors, 0 warnings outside Code/SDKs): CryRenderD3D11, CinematicCamera.
+
+Co-Authored-By: Claude Opus <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01A72MFkdSczncE7au9UVnmu
+---
+ .../Common/Include_HLSL_CPP_Shared.h          |  7 ++++
+ .../Common/GraphicsPipeline.cpp               | 14 +++++++
+ .../XRenderD3D9/GraphicsPipeline/Sky.cpp      | 41 +++++++++++++++----
+ .../HWScripts/CryFX/FXConstantDefs.cfi        | 30 +++++++++++++-
+ Engine/Shaders/HWScripts/CryFX/Illum.cfx      |  6 ++-
+ .../HWScripts/CryFX/MultiLayeredMaterials.cfx |  4 +-
+ Engine/Shaders/HWScripts/CryFX/Water.cfx      |  4 +-
+ .../HWScripts/CryFX/WaterReflectionsPass.cfi  |  2 +-
+ .../Shaders/HWScripts/CryFX/WaterVolume.cfx   |  4 +-
+ 9 files changed, 96 insertions(+), 16 deletions(-)
+
+diff --git a/Code/CryEngine/RenderDll/Common/Include_HLSL_CPP_Shared.h b/Code/CryEngine/RenderDll/Common/Include_HLSL_CPP_Shared.h
+index 52cdcc6a..242e6f66 100644
+--- a/Code/CryEngine/RenderDll/Common/Include_HLSL_CPP_Shared.h
++++ b/Code/CryEngine/RenderDll/Common/Include_HLSL_CPP_Shared.h
+@@ -126,6 +126,13 @@ hlsl_cbuffer_register(PerViewGlobalConstantBuffer, register (b6), 6) //eConstant
+ 
+ 	hlsl_matrix44(CV_ProjMatr);
+ 	hlsl_matrix44(CV_ProjMatrUnjittered);
++
++	// Scene-referred pre-exposure (SceneReferredSpec.md D3). .x = exposure - 1,
++	// .y = 1/exposure - 1, .z/.w reserved. Stored offset by one so that an unbound constant
++	// buffer, and the stock path where the camera publishes unity, both read as exactly 1.0
++	// through the PS_HDR_RANGE_ADAPT_MAX macro. Must stay last, and in step with
++	// Engine/Shaders/HWScripts/CryFX/FXConstantDefs.cfi.
++	hlsl_float4(CV_SceneExposure);
+ };
+ 
+ hlsl_cbuffer_register(VrProjectionConstantBuffer, register (b7), 7) // eConstantBufferShaderSlot_VrProjection
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Common/GraphicsPipeline.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Common/GraphicsPipeline.cpp
+index aa094d0e..fa1c7c79 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Common/GraphicsPipeline.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Common/GraphicsPipeline.cpp
+@@ -1046,6 +1046,20 @@ void CGraphicsPipeline::GeneratePerViewConstantBuffer(const SRenderViewInfo* pVi
+ 
+ 		cb.CV_AnimGenParams = Vec4(animTime * 2.0f, animTime * 0.25f, animTime * 1.0f, animTime * 0.125f);
+ 
++		// Scene-referred pre-exposure, for every writer that bypasses the deferred light lists:
++		// the 16 forward / transparent PS_HDR_RANGE_ADAPT_MAX sites and the emissive term
++		// (decisions/s1-writer-coverage.md approach A, the UE View.PreExposure shape). The value
++		// is the one CD3D9Renderer::LatchSceneReferredExposure() latched for this render view, so
++		// the lights, the sky and the forward passes cannot disagree within a frame.
++		//
++		// Stored MINUS ONE, and the macro adds it back: off the scene-referred path the exposure
++		// is 1.0, so this is 0.0, so a shader whose per-view buffer is not bound still multiplies
++		// by exactly 1.0 instead of blacking out. See FXConstantDefs.cfi.
++		{
++			const float sceneExposure = gcpRendD3D.GetSceneReferredExposure();
++			cb.CV_SceneExposure = Vec4(sceneExposure - 1.0f, (1.0f / sceneExposure) - 1.0f, 0.0f, 0.0f);
++		}
++
+ 		Vec3 pDecalZFightingRemedy;
+ 		{
+ 			const float* mProj = viewInfo.projMatrix.GetData();
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Sky.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Sky.cpp
+index af657f3a..7ac79f28 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Sky.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Sky.cpp
+@@ -138,6 +138,25 @@ void CSkyStage::SetSkyParameters()
+ 	auto threadID = gRenDev->GetRenderThreadID();
+ 	CD3D9Renderer* const RESTRICT_POINTER rd = gcpRendD3D;
+ 
++	// Scene-referred pre-exposure (SceneReferredSpec.md D3, decisions/s1-writer-coverage.md
++	// approach A, coverage item 4). The sky is not a light: none of it passes through the tiled
++	// light lists, so without this the whole sky would sit at its old brightness while every lit
++	// surface moved with the aperture. Every term below is linear in the constant it is scaled
++	// through (Stars.cfx:202/211/220/236), so one multiply per constant is the whole change.
++	//
++	// This is applied HERE rather than in S3DEngineCommon::UpdateSkyInfo() where the research
++	// note put it (Renderer.cpp:4007/4032): the fill runs on the main thread, this runs on the
++	// render thread and can therefore read the value that was latched for this exact render view,
++	// which is the whole point of the latch. It also reaches the two addends of the skybox
++	// emittance together and the night sky, the moon and the procedural day sky in the same
++	// place, which the fill site does not. Exactly 1.0 off the switch.
++	//
++	// NOT fixed here: the 100x scale collision between the two addends at Renderer.cpp:4007
++	// (x RENDERER_LIGHT_UNIT_SCALE/1000) and :4032 (+ GetFinalEmittance(), which is x1000/
++	// RENDERER_LIGHT_UNIT_SCALE). That is an S2 units question; the exposure is applied to the
++	// sum, so both addends move together and their ratio is unchanged.
++	const float sceneExposure = rd->GetSceneReferredExposure();
++
+ 	// Skybox
+ 	{
+ 		static CCryNameR skyBoxParamName("SkyDome_SkyBoxParams");
+@@ -149,7 +168,7 @@ void CSkyStage::SetSkyParameters()
+ 
+ 		static CCryNameR skyBoxExposureName("SkyDome_SkyBoxExposure");
+ 		const Vec3& skyBoxExposure = rd->m_p3DEngineCommon[threadID].m_SkyInfo.m_vSkyBoxEmittance;
+-		m_skyPass.SetConstant(skyBoxExposureName, Vec4(skyBoxExposure, 1.0f), eHWSC_Pixel);
++		m_skyPass.SetConstant(skyBoxExposureName, Vec4(skyBoxExposure * sceneExposure, 1.0f), eHWSC_Pixel);
+ 
+ 		static CCryNameR skyBoxOpacityName("SkyDome_SkyBoxOpacity");
+ 		const Vec3& skyBoxOpacity = rd->m_p3DEngineCommon[threadID].m_SkyInfo.m_vSkyBoxFilter;
+@@ -166,6 +185,11 @@ void CSkyStage::SetHDRSkyParameters()
+ {
+ 	I3DEngine* const p3DEngine = gEnv->p3DEngine;
+ 
++	// Same pre-exposure as the skybox above, applied to every radiance constant of the procedural
++	// sky, the night gradient and the moon. Their absolute scale is a separate (and wrong)
++	// question that S2 settles; what matters here is that they follow the camera.
++	const float sceneExposure = gcpRendD3D->GetSceneReferredExposure();
++
+ 	// Day sky
+ 	{
+ 		static CCryNameR mieName("SkyDome_PartialMieInScatteringConst");
+@@ -174,8 +198,8 @@ void CSkyStage::SetHDRSkyParameters()
+ 		static CCryNameR phaseName("SkyDome_PhaseFunctionConstants");
+ 
+ 		auto renderParams = p3DEngine->GetSkyLightRenderParams();
+-		m_skyPass.SetConstant(mieName, renderParams->m_partialMieInScatteringConst, eHWSC_Pixel);
+-		m_skyPass.SetConstant(rayleighName, renderParams->m_partialRayleighInScatteringConst, eHWSC_Pixel);
++		m_skyPass.SetConstant(mieName, renderParams->m_partialMieInScatteringConst * sceneExposure, eHWSC_Pixel);
++		m_skyPass.SetConstant(rayleighName, renderParams->m_partialRayleighInScatteringConst * sceneExposure, eHWSC_Pixel);
+ 		m_skyPass.SetConstant(sunDirectionName, renderParams->m_sunDirection, eHWSC_Pixel);
+ 		m_skyPass.SetConstant(phaseName, renderParams->m_phaseFunctionConsts, eHWSC_Pixel);
+ 	}
+@@ -193,8 +217,8 @@ void CSkyStage::SetHDRSkyParameters()
+ 		float nightSkyZenithColShift(p3DEngine->GetGlobalParameter(E3DPARAM_NIGHSKY_ZENITH_SHIFT));
+ 		const float minNightSkyZenithGradient(-0.1f);
+ 
+-		Vec4 colBase(nightSkyHorizonCol, 0);
+-		Vec4 colDelta(nightSkyZenithCol - nightSkyHorizonCol, 0);
++		Vec4 colBase(nightSkyHorizonCol * sceneExposure, 0);
++		Vec4 colDelta((nightSkyZenithCol - nightSkyHorizonCol) * sceneExposure, 0);
+ 		Vec4 zenithColShift(1.0f / (nightSkyZenithColShift - minNightSkyZenithGradient), -minNightSkyZenithGradient / (nightSkyZenithColShift - minNightSkyZenithGradient), 0, 0);
+ 
+ 		m_skyPass.SetConstant(nightColBaseName, colBase, eHWSC_Pixel);
+@@ -213,17 +237,18 @@ void CSkyStage::SetHDRSkyParameters()
+ 
+ 		Vec3 nightMoonColor;
+ 		p3DEngine->GetGlobalParameter(E3DPARAM_NIGHSKY_MOON_COLOR, nightMoonColor);
+-		Vec4 moonColor(nightMoonColor, 0);
++		Vec4 moonColor(nightMoonColor * sceneExposure, 0);
+ 
+ 		Vec3 nightMoonInnerCoronaColor;
+ 		p3DEngine->GetGlobalParameter(E3DPARAM_NIGHSKY_MOON_INNERCORONA_COLOR, nightMoonInnerCoronaColor);
+ 		float nightMoonInnerCoronaScale(1.0f + 1000.0f * p3DEngine->GetGlobalParameter(E3DPARAM_NIGHSKY_MOON_INNERCORONA_SCALE));
+-		Vec4 moonInnerCoronaColorScale(nightMoonInnerCoronaColor, nightMoonInnerCoronaScale);
++		// Only the colour takes the exposure - the .w is a falloff exponent, not a radiance.
++		Vec4 moonInnerCoronaColorScale(nightMoonInnerCoronaColor * sceneExposure, nightMoonInnerCoronaScale);
+ 
+ 		Vec3 nightMoonOuterCoronaColor;
+ 		p3DEngine->GetGlobalParameter(E3DPARAM_NIGHSKY_MOON_OUTERCORONA_COLOR, nightMoonOuterCoronaColor);
+ 		float nightMoonOuterCoronaScale(1.0f + 1000.0f * p3DEngine->GetGlobalParameter(E3DPARAM_NIGHSKY_MOON_OUTERCORONA_SCALE));
+-		Vec4 moonOuterCoronaColorScale(nightMoonOuterCoronaColor, nightMoonOuterCoronaScale);
++		Vec4 moonOuterCoronaColorScale(nightMoonOuterCoronaColor * sceneExposure, nightMoonOuterCoronaScale);
+ 
+ 		m_skyPass.SetConstant(moonColorName, moonColor, eHWSC_Pixel);
+ 		m_skyPass.SetConstant(moonInnerScaleName, moonInnerCoronaColorScale, eHWSC_Pixel);
+diff --git a/Engine/Shaders/HWScripts/CryFX/FXConstantDefs.cfi b/Engine/Shaders/HWScripts/CryFX/FXConstantDefs.cfi
+index ffaa32a6..4721896c 100644
+--- a/Engine/Shaders/HWScripts/CryFX/FXConstantDefs.cfi
++++ b/Engine/Shaders/HWScripts/CryFX/FXConstantDefs.cfi
+@@ -103,7 +103,30 @@ cbuffer PerMaterialConstants : register()
+ //=============================================================================
+ //=== Global constants ========================================================
+ 
+-#define PS_HDR_RANGE_ADAPT_MAX 1.0
++// Emissive materials are authored in kcd/m^2 while engine units are 1.0 = 10 000 cd/m^2. One
++// definition, because the same literal used to sit in Illum.cfx, MultiLayeredMaterials.cfx and
++// (as its reciprocal power) in ShaderResources.h, free to drift apart at the first edit.
++#define MAT_EMISSIVE_UNIT_SCALE (1000.0 / 10000.0)
++
++// The scene-referred pre-exposure, as seen by the forward and transparent passes
++// (SceneReferredSpec.md D3, decisions/s1-writer-coverage.md approach A). This used to be the
++// literal 1.0 - a leftover of the CE 3.x L-buffer range-adaptation round trip that nothing ever
++// set - and it is now the lever every writer that bypasses the deferred light lists multiplies by.
++//
++// It is written as 1 + (exposure - 1) rather than as the exposure itself, and that is deliberate:
++// CV_SceneExposure.x holds exposure MINUS ONE, so a shader that runs with the per-view constant
++// buffer unbound - or with the scene-referred path off, where the camera publishes unity - reads
++// exactly 1.0 and multiplies by exactly 1.0. Off the switch the picture is therefore bit-identical
++// (x * 1.0f is exact in IEEE); only the instruction that was folded away at compile time comes
++// back. The 16 multiply sites keep their text unchanged.
++#define PS_HDR_RANGE_ADAPT_MAX (1.0 + CV_SceneExposure.x)
++
++// The five sites that read scene colour BACK out of the HDR or reflection targets used to divide
++// the same factor out again, which is the round-trip semantics of the old console scheme and
++// exactly wrong for a pre-exposure: the value read is already exposed and must not be un-exposed.
++// Off the switch the factor was 1.0 anyway, so this is 1.0 in both cases and the divide keeps
++// folding away at compile time exactly as it does today.
++#define PS_HDR_RANGE_ADAPT_MAX_SCENE_READ 1.0
+ 
+ cbuffer CBPerViewGlobal : register(b6)
+ {
+@@ -145,6 +168,11 @@ cbuffer CBPerViewGlobal : register(b6)
+ 	
+ 	float4x4  CV_ProjMatr;
+ 	float4x4  CV_ProjMatrUnjittered;
++
++	// Scene-referred pre-exposure. .x = exposure - 1, .y = 1/exposure - 1 (both zero when the
++	// scene-referred path is off, so an unbound buffer is unity); .z and .w reserved.
++	// Read through PS_HDR_RANGE_ADAPT_MAX, never directly.
++	float4    CV_SceneExposure;
+ };
+ 
+ cbuffer CBPerPassShadowGen : register(b5)
+diff --git a/Engine/Shaders/HWScripts/CryFX/Illum.cfx b/Engine/Shaders/HWScripts/CryFX/Illum.cfx
+index b2aebc03..0cba3af5 100644
+--- a/Engine/Shaders/HWScripts/CryFX/Illum.cfx
++++ b/Engine/Shaders/HWScripts/CryFX/Illum.cfx
+@@ -650,7 +650,11 @@ pixout IlluminationPS(vert2FragGeneral IN)
+ 
+ 	pixout OUT = (pixout)0;
+ 
+-	half3 emittance = MatEmissiveColor.xyz * MatEmissiveColor.w * (1000.0 / 10000.0);
++	// Emissive is forward-additive and never reaches the deferred light lists, so the
++	// pre-exposure the lights took has to be applied here by hand or an emissive surface stays
++	// at its old brightness while everything around it moves (SceneReferredSpec.md D3).
++	// PS_HDR_RANGE_ADAPT_MAX is exactly 1.0 off the scene-referred path.
++	half3 emittance = MatEmissiveColor.xyz * MatEmissiveColor.w * MAT_EMISSIVE_UNIT_SCALE * PS_HDR_RANGE_ADAPT_MAX;
+ 	const bool bEmissive = GetLuminance(emittance.xyz) > 0;
+ 	if (bEmissive)
+ 	{
+diff --git a/Engine/Shaders/HWScripts/CryFX/MultiLayeredMaterials.cfx b/Engine/Shaders/HWScripts/CryFX/MultiLayeredMaterials.cfx
+index 6e21045a..d47fb120 100644
+--- a/Engine/Shaders/HWScripts/CryFX/MultiLayeredMaterials.cfx
++++ b/Engine/Shaders/HWScripts/CryFX/MultiLayeredMaterials.cfx
+@@ -1114,7 +1114,9 @@ pixout MultiLayeredMaterialsPS(vert2FragGeneral IN)
+ #endif
+     }
+ 
+-    half3 emittance = MatEmissiveColor.xyz * MatEmissiveColor.w * (1000.0 / 10000.0);
++    // Same as Illum.cfx: forward-additive emissive takes the pre-exposure by hand, and the
++    // kcd/m^2 unit scale is the shared MAT_EMISSIVE_UNIT_SCALE instead of a second literal.
++    half3 emittance = MatEmissiveColor.xyz * MatEmissiveColor.w * MAT_EMISSIVE_UNIT_SCALE * PS_HDR_RANGE_ADAPT_MAX;
+     const bool bEmissive = GetLuminance(emittance.xyz) > 0;
+     if (bEmissive)
+         emittance *= GetEmittanceMask(IN.baseTC);
+diff --git a/Engine/Shaders/HWScripts/CryFX/Water.cfx b/Engine/Shaders/HWScripts/CryFX/Water.cfx
+index b6189c32..3ead4247 100644
+--- a/Engine/Shaders/HWScripts/CryFX/Water.cfx
++++ b/Engine/Shaders/HWScripts/CryFX/Water.cfx
+@@ -1050,7 +1050,7 @@ pixout WaterPS(v2f_hs IN)
+ 	half3 cSpecularAcc = DecodeHDRCubemap(cReflCM) * ReflectionScale;
+ #else
+ 	half2 reflNewst = (IN.envTC.xy / IN.envTC.w) + vNormal.xy * ReflectionBumpScale;
+-	half3 cSpecularAcc = oceanReflectionTex.Sample(ssMaterialTrilinearClamp, reflNewst.xy) / PS_HDR_RANGE_ADAPT_MAX;
++	half3 cSpecularAcc = oceanReflectionTex.Sample(ssMaterialTrilinearClamp, reflNewst.xy) / PS_HDR_RANGE_ADAPT_MAX_SCENE_READ;
+ #endif
+ 
+ 
+@@ -1092,7 +1092,7 @@ pixout WaterPS(v2f_hs IN)
+ 	#else
+ 		half3 refractColor = DecodeHDRBuffer( GetTexture2D(refractionTex, ssMaterialTrilinearClamp, MapScreenTC(refrNewst + refrTC * fRefractionMask.x, CV_HPosScale.xy)) ).xyz;
+ 	#endif
+-	refractColor /= PS_HDR_RANGE_ADAPT_MAX;
++	refractColor /= PS_HDR_RANGE_ADAPT_MAX_SCENE_READ;
+ 
+ #if %_RT_FOG && %_RT_VOLUMETRIC_FOG
+ 	half3 fogColor = 0;
+diff --git a/Engine/Shaders/HWScripts/CryFX/WaterReflectionsPass.cfi b/Engine/Shaders/HWScripts/CryFX/WaterReflectionsPass.cfi
+index 436481a2..97100273 100644
+--- a/Engine/Shaders/HWScripts/CryFX/WaterReflectionsPass.cfi
++++ b/Engine/Shaders/HWScripts/CryFX/WaterReflectionsPass.cfi
+@@ -134,7 +134,7 @@ pixout WaterReflPS(v2f_hs IN)
+ 	half3 vReflNorm = normalize( vRefl );
+ 	
+ 	// Blend in screenspace reflections
+-	half4 cSSRefl = ReflectionPassPS(IN, half4(vReflN.xyz, 1)) / PS_HDR_RANGE_ADAPT_MAX;
++	half4 cSSRefl = ReflectionPassPS(IN, half4(vReflN.xyz, 1)) / PS_HDR_RANGE_ADAPT_MAX_SCENE_READ;
+ 	half3 reflectColor = cSSRefl.rgb;
+ 
+ 	// EnvCubeReflMul, RealtimeReflMul
+diff --git a/Engine/Shaders/HWScripts/CryFX/WaterVolume.cfx b/Engine/Shaders/HWScripts/CryFX/WaterVolume.cfx
+index 13973b9e..e4d4abf1 100644
+--- a/Engine/Shaders/HWScripts/CryFX/WaterVolume.cfx
++++ b/Engine/Shaders/HWScripts/CryFX/WaterVolume.cfx
+@@ -1144,7 +1144,7 @@ pixout WaterPS(v2f_hs IN)
+ 		half3
+ 		refractColor   = DecodeHDRBuffer( GetTexture2D(refractionTex, ssMaterialTrilinearClamp, refrNewst + refrTC * fRefractionMask.x) ).xyz;
+ 	#endif
+-	refractColor /= PS_HDR_RANGE_ADAPT_MAX;
++	refractColor /= PS_HDR_RANGE_ADAPT_MAX_SCENE_READ;
+ 
+ #if %_RT_FOG && %_RT_VOLUMETRIC_FOG
+ 	half3 fogColor = 0;
+@@ -1232,7 +1232,7 @@ pixout WaterPS(v2f_hs IN)
+ 	// TODO_VR
+ 	//half3 cSpecularAcc = tex2Dgrad(ReflSampler, NVMultiRes_MapLinearToMultiRes(reflNewst + reflTC * fReflMask) * MultiResUVScaleBias.xy + MultiResUVScaleBias.zw, rayStart.xy * fGlossinessLod * PS_ScreenSize.w * 64, float2(0,0)).rgb;
+ 
+-	cSpecularAcc /= PS_HDR_RANGE_ADAPT_MAX;
++	cSpecularAcc /= PS_HDR_RANGE_ADAPT_MAX_SCENE_READ;
+ #else
+ 	half3 cSpecularAcc = GatherCubemapSpecular(screenTC, IN.vPosWS.xyz - GetWorldViewPos(), vNormal, cSmoothness);
+ #endif
+-- 
+2.47.1.windows.1
+

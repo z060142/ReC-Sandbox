@@ -1,0 +1,158 @@
+From 57023243dc5285a023940d9a3d328574efe549a0 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Sat, 29 Aug 2026 03:46:01 +0800
+Subject: [PATCH 112/119] docs: the EXR tap becomes measurable, and an EXR
+ sequence out of TrackView
+
+CSceneReferredExport had no PROFILE_LABEL_SCOPE at all, so its cost could only be
+inferred: the negative blit was an unnamed copy and the readback's staging copy was
+invisible. SCENE_REFERRED_EXPORT_TAP now wraps everything the exporter does on the GPU
+and SCENE_REFERRED_EXPORT_NEGATIVE names the full-res blit inside it. The GRADED tap
+still has no marker and cannot have one - it is an extra SV_Target1 write inside the
+TONEMAPPING pass, so its cost shows as a widening of TONEMAPPING; the comment says so.
+
+docs/SceneReferredExport.md section 7: how to drive rec_CaptureEXR / rec_CaptureEXRStop
+from a TrackView Console track (CAnimSceneNode::ApplyConsoleKey is a plain
+ExecuteString, so no engine work was needed), that an 8-bit TrackView capture and an
+EXR capture can run in the same playthrough and number independently, and the three
+limits worth knowing before losing a take:
+
+  - the batch-render dialog's per-item cvar list runs BEFORE its ResizeContext, so a
+    rec_CaptureEXR typed there arms and dies on the same frame. Use a Console key.
+  - a non-capture sequence carrying a TimeWarp or FixedTimeStep track zeroes t_FixedStep
+    every frame and will silently take the cadence off an armed export. Not guarded
+    against today, and now written down rather than rediscovered.
+  - e_ScreenShot 1 resizes the pipeline twice and therefore ends an armed capture, and
+    at 4096 square costs about +340 MiB over stock for one nested frame.
+
+Notes: research/s8-output-paths.md, research/s8-perf-and-permutations.md section 2.1.
+
+Co-Authored-By: Claude Opus <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01A72MFkdSczncE7au9UVnmu
+---
+ .../GraphicsPipeline/ToneMapping.cpp          | 11 +++
+ .../docs/SceneReferredExport.md               | 84 +++++++++++++++++++
+ 2 files changed, 95 insertions(+)
+
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.cpp
+index 13d34d38..67168c4f 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.cpp
+@@ -546,11 +546,22 @@ void CToneMappingStage::Execute()
+ 
+ 	if (pExportTex)
+ 	{
++		// The capture's own GPU cost, named so that it can be MEASURED rather than inferred
++		// (research/s8-perf-and-permutations.md section 2.1). Everything the exporter does on the
++		// GPU is inside this scope: the negative blit when there is one, and EndFrame()'s copy to
++		// the ring's staging resource. The GRADED tap has no marker of its own and cannot have
++		// one - it is an extra SV_Target1 write inside the TONEMAPPING pass above, so its cost
++		// shows up as a widening of TONEMAPPING itself. Read the two together.
++		PROFILE_LABEL_SCOPE("SCENE_REFERRED_EXPORT_TAP");
++
+ 		// The negative: $HDRTarget as it entered this pass. Nothing in the tone map writes it, so
+ 		// taking the copy after Execute() is the same frame - and doing it here keeps both taps in
+ 		// one place instead of scattering the capture across the stage.
+ 		if (!bExportGraded)
++		{
++			PROFILE_LABEL_SCOPE("SCENE_REFERRED_EXPORT_NEGATIVE");
+ 			m_passExportNegativeCopy.Execute(m_graphicsPipelineResources.m_pTexHDRTarget, pExportTex);
++		}
+ 
+ 		exporter.EndFrame();
+ 	}
+diff --git a/Code/CryPlugins/CinematicCamera/docs/SceneReferredExport.md b/Code/CryPlugins/CinematicCamera/docs/SceneReferredExport.md
+index f5a50072..f809114b 100644
+--- a/Code/CryPlugins/CinematicCamera/docs/SceneReferredExport.md
++++ b/Code/CryPlugins/CinematicCamera/docs/SceneReferredExport.md
+@@ -214,3 +214,87 @@ The *shape* of the difference names the cause more usefully than its size does:
+ contract, they serve JPEG screenshots and TrackView batch renders, and the byte-identity harness
+ reads TGA written by precisely that code. The EXR capture is a parallel path, so
+ "ccam off → the engine is byte-identical to stock" stays trivially true.
++
++---
++
++## 7. Driving a capture from TrackView
++
++CryMovie never captures anything itself: `CMovieSystem::ControlCapture()` only drives the
++renderer's `capture_frames` family, and that path is 8-bit by contract. To get an **EXR sequence
++out of a TrackView shot**, drive `rec_CaptureEXR*` from the sequence instead. No new code is
++needed for this — the mechanism has been in CryMovie all along.
++
++### 7.1 The recipe — a Console track
++
++1. Select the scene node of the sequence and add a **Console** track.
++2. Put a key at (or just before) the first frame you want, with the command:
++
++   ```
++   rec_CaptureEXR MyShot beauty
++   ```
++
++3. Put a key one frame after the last frame you want, with:
++
++   ```
++   rec_CaptureEXRStop
++   ```
++
++4. Play the sequence in the editor. `CAnimSceneNode::ApplyConsoleKey()` is a plain
++   `ExecuteString`, so the arm and the stop happen exactly on their keys.
++
++The exporter pins `t_FixedStep` to `r_SceneReferredExportFixedStep` (default 1/30) for the duration,
++so the sequence renders at a fixed cadence whatever the frame rate is.
++
++**An 8-bit TrackView capture and an EXR capture can run at the same time.** They number
++independently — the EXR path deliberately does not reuse `capture_frames`' global counter — so one
++playthrough gives you the review JPEGs and the conform EXRs together.
++
++### 7.2 The one interaction that produces a *wrong* file
++
++A TrackView sequence that does **not** carry the capture flag, but does carry a TimeWarp or
++FixedTimeStep track, **zeroes `t_FixedStep` every frame** (`CAnimSceneNode`). Playing such a
++sequence while an EXR capture is armed fights the exporter frame by frame, and the export silently
++loses its cadence — the frames are all there, but they are not evenly spaced in scene time.
++
++This is **not** guarded against today. Do not play an unrelated sequence with a TimeWarp or
++FixedTimeStep track while a capture is armed; if a captured shot's timing looks wrong and nothing
++else explains it, that is the interaction to suspect.
++
++### 7.3 The batch-render dialog: use a Console key, **not** the item's cvar list
++
++TrackView's batch-render dialog lets each render item carry a list of console commands, executed at
++the start of the item. **`rec_CaptureEXR` typed there will arm and die on the same frame.**
++
++`BegCaptureItem()` runs the item's cvar list and *then* calls
++`gEnv->pRenderer->ResizeContext(...)` to set the item's output resolution. The exporter answers a
++changed resolution with
++
++```
++[SceneReferred] capture stopped: the resolution changed under the capture
++```
++
++because its readback ring is allocated at one size and re-allocating mid-sequence can fail
++mid-sequence. That message is correct behaviour, not a bug.
++
++**Put the commands on a Console key inside the sequence instead.** The keys fire after the resize,
++at a resolution that then stays put for the whole item.
++
++Two smaller notes about the batch renderer:
++
++* it enters game mode for the run, so the camera's editor↔game handover must complete before the
++  first captured frame. The dialog's own resolution warm-up happens to cover this.
++* there is **no video encoder in this tree** — the dialog's mp4 option needs an FFMPEG plugin that
++  does not exist here, so every moving-image output from this editor is an image sequence. Which is
++  what a scene-referred pipeline wants anyway: EXR → Resolve.
++
++### 7.4 The same limit applies to `e_ScreenShot 1`
++
++A high-res screenshot resizes the pipeline twice — up and back — and therefore **ends an armed
++capture**, once each way, for the same reason. Take your screenshots outside the sequence. A 4096²
++screenshot also allocates the whole scene-referred working set at 16.8 Mpx, roughly **+340 MiB over
++stock** for the duration of one nested frame; that is where a scene-referred session runs out of
++VRAM and a stock one does not.
++
++`e_ScreenShot 3` / `4` (the terrain minimap) is a different case entirely: it is refused the
++scene-referred path altogether, because a minimap is data and must not carry a camera's exposure,
++white balance, grade and output transform. See `SceneReferredContent.md`.
+-- 
+2.47.1.windows.1
+

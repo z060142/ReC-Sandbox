@@ -1,0 +1,203 @@
+From b372dde2e35f4185dcc2a9171507328c8ae3b148 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Sat, 29 Aug 2026 02:32:27 +0800
+Subject: [PATCH 100/119] fix: the wave glare's source was a DENOISED copy of
+ the frame, and denoising is what a glare source cannot survive
+
+TEST-CHECKLIST F3: at a NIGHT exposure the FFT rays need Streak Amount 110
+(+6 stops) to be barely visible, where round 2 predicted they would be obvious
+at 50. Traced the whole path numerically for a 200 kcd/m2 practical at EV 2
+(pre-exposure 2083, exposed source 41 667 = 17.8 stops over mid grey).
+
+Everything downstream is clean: the threshold's soft knee has no clamp; the
+5-tap source blur's weights sum to exactly 1 and its fp16 peak is 16 790,
+nowhere near overflow; the sprite deposit is a float and carries no DOF-style
+energy-split clamp; the kernel's Parseval normalisation, its 1/u^2 ring and its
+sqrt/k^2 encode are pure geometry and never see a scene unit; the composite has
+no bloom weight left and the ODT puts mid grey at mid grey.
+
+The loss is entirely in the first stage. $HDRTarget 1/2a is built by
+CStableDownsamplePass with firefly suppression on (r_HDRBloomQuality defaults to
+2), and firefly suppression exists to pull a bright OUTLIER down towards its
+block's mean - which is the definition of a glare source. For a lamp covering
+one of a block's four taps: 0.3466 out where the true mean is 10 417, a factor
+of 30 000, 14.9 stops. And 0.3466 is BELOW the threshold (0.18*2^4 = 2.88), so
+at night a small lamp was never extracted at all and no Streak Amount could
+bring it back. A large lamp round-trips exactly, which is why the report is
+"barely visible" and not "never".
+
+Per ray pixel, using the spec's own 0.5 % figure: physical is 0.42, a stop over
+mid grey and obvious; through the old chain it was 1.4e-5, 13.6 stops under
+grey, and +6 stops of gain still left it 7.6 stops under. Round 2's physics was
+right; the path was eating fifteen stops.
+
+Two fixes. The knee moved to the camera's white in item 2 of this round, which
+takes the 1-of-4 case from x30 000 to x11.6. The residual 3.5 stops is the
+filter doing its job, and the glare extraction is the one consumer that must not
+have it done: under the switch the wave glare's threshold pass now reads the
+FULL-RESOLUTION $HDRTarget. The bilinear read at the half-res destination is an
+exact 2x2 box, so it is the same output resolution at one texture read's extra
+bandwidth. $HDRTarget 1/2a still sets the sprite grid.
+
+Deliberately asymmetric: the analytic streaks, the anamorphic flare, halation
+and the front filter keep the half-res copy, because their amounts are creative
+sliders tuned against it and the wave path is the only one whose numbers are
+claimed to be physical. The threshold is still shared. The
+r_HDRDiffractionDebug log line now names which source was read.
+
+decisions/s8-glare-source.md has the full trace and the three approaches not
+taken (kill the suppression outright; a separate unfiltered downsample for the
+whole glare family; raise the default again). DiffractionKernelSpec.md 2.4 is
+corrected: "a game light's HDR value is clamped to a few tens" - the sentence
+that produced the 20 and then 50 default - is no longer true under the switch.
+
+Co-Authored-By: Claude Opus <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01A72MFkdSczncE7au9UVnmu
+---
+ .../XRenderD3D9/GraphicsPipeline/Bloom.cpp    | 48 +++++++++++++++----
+ .../CinematicCamera/DiffractionKernelSpec.md  | 35 +++++++++++++-
+ 2 files changed, 73 insertions(+), 10 deletions(-)
+
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Bloom.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Bloom.cpp
+index 8adb4b29..9c535772 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Bloom.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Bloom.cpp
+@@ -427,11 +427,11 @@ void CBloomStage::ExecuteDiffraction(const SHDRStreaksParams& streakParams, floa
+ 	if (!kernel.IsReady())
+ 		return;
+ 
+-	// $HDRTarget 1/2a is the plain half-resolution HDR downsample of the frame, and it is still
+-	// intact here: the bloom chain above works entirely in the two quarter-res scratch targets
+-	// and the sun shafts stage, which is the other reader, runs later. It is the same texture
+-	// the threshold has always read - what changes is that the thresholded copy now stays at its
+-	// resolution instead of being minified into a quarter-res scratch target.
++	// $HDRTarget 1/2a is the half-resolution HDR downsample of the frame, and it is still intact
++	// here: the bloom chain above works entirely in the two quarter-res scratch targets and the
++	// sun shafts stage, which is the other reader, runs later. It sets the GRID this pass walks
++	// - one candidate sprite per half-res texel - on both paths. What it no longer necessarily
++	// sets is the source the threshold reads; see step 1.
+ 	CTexture* pHalfHDR = m_graphicsPipelineResources.m_pTexHDRTargetScaled[0][0];
+ 	if (!CTexture::IsTextureExist(pHalfHDR))
+ 		return;
+@@ -463,14 +463,43 @@ void CBloomStage::ExecuteDiffraction(const SHDRStreaksParams& streakParams, floa
+ 	// 1. Threshold, the streaks' own technique and their own threshold - one source of glare
+ 	//    sources for the whole family, so a lamp that streaks also stars and halates. 1:1 now
+ 	//    (half-res in, half-res out) rather than the 2:1 minification the quarter-res copy was.
+-	if (m_passDiffractionThreshold.IsDirty(m_pTexDiffractionSourceTemp->GetTextureID()))
++	//
++	//    ON THE SCENE-REFERRED PATH THE SOURCE IS THE FULL-RESOLUTION FRAME, not the half-res
++	//    copy (round-3 item 3, decisions/s8-glare-source.md). $HDRTarget 1/2a is produced by
++	//    CStableDownsamplePass with firefly suppression on (r_HDRBloomQuality defaults to 2),
++	//    and firefly suppression is a filter whose entire purpose is to pull a bright OUTLIER
++	//    down towards its block's mean. A diffraction glare source is, by definition, a bright
++	//    outlier. Feeding one to the other costs three to three and a half stops on a lamp a
++	//    few pixels across even after the knee was moved to the camera's white - and before
++	//    that fix it cost fifteen, which is the F3 report ("even at night it needs 110").
++	//
++	//    The threshold pass writes a half-resolution target and samples bilinearly, so reading
++	//    the full-res target here is an exact 2x2 box downsample taken at the destination texel
++	//    centre: the same resolution, the same cost per output pixel, one extra texture read's
++	//    worth of bandwidth, and the true mean instead of a denoised one.
++	//
++	//    Deliberately asymmetric with the rest of the glare family: the analytic streaks, the
++	//    anamorphic flare, halation and the front filter keep the half-res copy. Their amounts
++	//    are creative sliders that were tuned against it; the wave path is the only one whose
++	//    numbers are claimed to be physical, and it is the only one that can be checked against
++	//    a calculation. The threshold itself is still shared, so a lamp that stars still streaks
++	//    and halates - what differs is how much of the lamp each of them is told about.
++	CTexture* pGlareSrc = pHalfHDR;
++	if (CRendererResources::IsSceneReferredStage(5))
++	{
++		CTexture* pFullHDR = m_graphicsPipelineResources.m_pTexHDRTarget;
++		if (CTexture::IsTextureExist(pFullHDR))
++			pGlareSrc = pFullHDR;
++	}
++
++	if (m_passDiffractionThreshold.IsDirty(m_pTexDiffractionSourceTemp->GetTextureID(), pGlareSrc->GetTextureID()))
+ 	{
+ 		m_passDiffractionThreshold.SetPrimitiveFlags(CRenderPrimitive::eFlags_ReflectShaderConstants_PS);
+ 		m_passDiffractionThreshold.SetPrimitiveType(CRenderPrimitive::ePrim_ProceduralTriangle);
+ 		m_passDiffractionThreshold.SetTechnique(CShaderMan::s_shHDRPostProcess, techStreakThreshold, 0);
+ 		m_passDiffractionThreshold.SetRenderTarget(0, m_pTexDiffractionSourceTemp);
+ 		m_passDiffractionThreshold.SetState(GS_NODEPTHTEST | GS_NOCOLMASK_A);
+-		m_passDiffractionThreshold.SetTexture(0, pHalfHDR);
++		m_passDiffractionThreshold.SetTexture(0, pGlareSrc);
+ 		m_passDiffractionThreshold.SetSampler(0, EDefaultSamplerStates::LinearClamp);
+ 	}
+ 
+@@ -718,9 +747,10 @@ void CBloomStage::ExecuteDiffraction(const SHDRStreaksParams& streakParams, floa
+ 				// energy IS the amount now: the layer is composited straight into the HDR
+ 				// target, so the tone mapper's bloom weight (printed for reference only) no
+ 				// longer stands between the deposit and the screen.
+-				CryLog("[BLOOM] diffraction glare debug=%d energy=%.4g (= resolved gain %.4g, own half-res layer, scene bloom weight %.4g no longer applies) sprite half extent = %.0f x %.0f native px",
++				CryLog("[BLOOM] diffraction glare debug=%d energy=%.4g (= resolved gain %.4g, own half-res layer, scene bloom weight %.4g no longer applies) sprite half extent = %.0f x %.0f native px, threshold source = %s",
+ 				       nDebugMode, fEnergy, streakParams.fWaveAmount, fBloomCompositeWeight,
+-				       fHalfExtentNativeX, fHalfExtentNativeY);
++				       fHalfExtentNativeX, fHalfExtentNativeY,
++				       (pGlareSrc == pHalfHDR) ? "half-res downsample (firefly filtered)" : "full-res HDR target");
+ 			}
+ 		}
+ 	}
+diff --git a/Code/CryPlugins/CinematicCamera/DiffractionKernelSpec.md b/Code/CryPlugins/CinematicCamera/DiffractionKernelSpec.md
+index e54c6707..85557fc3 100644
+--- a/Code/CryPlugins/CinematicCamera/DiffractionKernelSpec.md
++++ b/Code/CryPlugins/CinematicCamera/DiffractionKernelSpec.md
+@@ -227,6 +227,31 @@ streetlight against a dark street, is **1e4–1e6× the rest of the scene**; a g
+ value is clamped to a few tens, so the same physics deposits nothing the display can show. The
+ kernel build logs `E_far` (energy past 20 Airy radii) so this can be read per pupil.
+ 
++> **Corrected 2026-08-29 (scene-referred round 3).** The sentence above — "a game light's HDR
++> value is clamped to a few tens" — is the reason `Streak Amount`'s default was 20 and then 50,
++> and on the scene-referred path it is **no longer true**. A 200 kcd/m² practical at a night
++> exposure arrives in the HDR target at 41 667, seventeen and a half stops over mid grey, and its
++> rays at 0.5 % of the source land about a stop OVER mid grey. The physics deposits plenty.
++>
++> Two things had been eating it, both fixed in round 3 and both documented in
++> `scene-notes/decisions/s8-glare-source.md`:
++>
++> 1. The half-resolution source `$HDRTarget 1/2a` is produced with firefly suppression on
++>    (`r_HDRBloomQuality` 2), and firefly suppression exists to pull bright OUTLIERS down towards
++>    their block's mean — which is exactly what a glare source is. On a lamp a few pixels across
++>    that cost a factor of 30 000, and took the source below the threshold entirely, so no
++>    `Streak Amount` could recover it. Under the switch the wave glare's threshold pass now reads
++>    the FULL-RESOLUTION `$HDRTarget` (the bilinear read at the half-res destination is an exact
++>    2×2 box); `$HDRTarget 1/2a` still sets the sprite grid. The rest of the glare family keeps
++>    the half-res copy — see the decision note for why that asymmetry is deliberate.
++> 2. That filter's compression knee sat at a literal 1.0, display white. It moves to the camera's
++>    white, 14 stops over mid grey (`decisions/s8-fp16-writers.md`).
++>
++> `Streak Amount` keeps its round-2 meaning — gain in stops, ten units per stop, 50 = physical
++> (`decisions/s7-glare-gain.md`) — and 50 is now visible on a night practical, which is what it
++> was always supposed to be. A DAYLIGHT-exposed 200 kcd/m² lamp is still faint at 50 and still
++> wants 130–150; that is physics, not a defect.
++
+ `Streak Amount` is therefore defined as a **source radiance boost**: how much brighter the real
+ source is than the clamped HDR value standing in for it. `1` means "the HDR value IS the true
+ radiance" — physically exact, nearly invisible. `10–100` reproduces the star an actual lamp or
+@@ -234,6 +259,13 @@ sun of that kind would draw. Nothing about the pattern's **shape or falloff** ch
+ those stay physical at every value; only the source's assumed brightness does. Range `0..200`
+ (slider `0..100`), **default 20**. Analytic mode ignores it.
+ 
++**Superseded on the scene-referred path (2026-08-28/29).** There is no clamped HDR value left to
++compensate for, so a linear "boost" over a five-decade quantity is the wrong control.
++`Streak Amount` is read as **gain in stops, ten units per stop, 50 = physical 1.0**
++(`decisions/s7-glare-gain.md`): 0 = off, 100 = +5 stops, 150 = +10. The shipped default stays 50,
++which is now both physical and visible on a night practical — see the corrected note above. Off
++the switch the stored value keeps its original linear meaning exactly.
++
+ Anamorphic squeeze: the iris sits *behind* the cylindrical front group, so its diffraction
+ pattern is formed unsqueezed on the sensor and the desqueeze stretches it horizontally by `S`:
+ sprite x half-extent = `R · S` (the opposite of the front filter, which sits in front of the
+@@ -271,7 +303,8 @@ the convolution of the pattern with the source's own extent, which is what an ex
+ really does - and it is what turns the surviving block into a round blob.
+ 
+ The chain is: threshold (`HDRStreakThreshold`, half-res HDR in, half-res scratch out, 1:1 now
+-rather than the old 2:1 minification) → blur H → blur V → clear the layer → sprites into the
++rather than the old 2:1 minification — **on the scene-referred path the input is the FULL-res
++`$HDRTarget` instead, so the pass is a 2:1 box again**, see the corrected note in §2.4) → blur H → blur V → clear the layer → sprites into the
+ layer → `ExecuteDiffractionComposite()`. The composite is a sibling of the DOF's ghost composite,
+ called from `CStandardGraphicsPipeline::ExecuteHDRPostProcessing` immediately before
+ `CDepthOfFieldStage::ExecuteGhostComposite()`: an additive fullscreen blit
+-- 
+2.47.1.windows.1
+

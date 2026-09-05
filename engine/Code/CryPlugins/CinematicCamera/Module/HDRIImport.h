@@ -1,0 +1,1 @@
+﻿// Copyright 2026 ReC Sandbox. Distributed under the terms in LICENSE.md at the repository root.#pragma once//! Registers / removes the `rec_ImportHDRI` console command.//! Implementation and documentation: HDRIImport.cpp, docs/SceneReferredContent.md section 8.void RegisterHDRIImportCommands();void RemoveHDRIImportCommands();

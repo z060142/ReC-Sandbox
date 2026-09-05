@@ -1,0 +1,212 @@
+From 67f6d69a623d0688b040f0fba23276b13fc8ae06 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Sat, 29 Aug 2026 03:07:59 +0800
+Subject: [PATCH 105/119] fix: SVOGI - the sun goes in at stock units and the
+ exposure comes out at the boundary
+
+The shadow filler that did not follow the aperture. Two faults, one subsystem.
+
+The first is an S2 regression that exists with the exposure out of the picture
+entirely: the sun colour SVOGI injects is GetSunColor(), and S2 made that
+radiometric by moving the 1/PI into the BRDF. 11.90 engine units then go into a
+codec whose ceiling is a hard 4.0 (CommonSVO.cfi EncodeHDR packs a shared
+exponent into an 8-bit alpha), so every injected texel clipped AND hue-shifted
+toward the sun's own chromaticity. 4.0 is not an arbitrary number: CE sized it
+against its own photometric sun of 3.788. Both injection sites - the RSM sun
+constant in the renderer and the DLF_SUN entry in the 3DEngine's TI light list -
+divide the sun back by PI on the scene-referred path, and only the sun; point
+lights never carried the divide on either path.
+
+The second is the exposure. The SVO is a cache, and the aperture spans five
+decades: no 8-bit shared exponent carries that on top of the scene's own range,
+and applying the exposure at injection would put the sun under the codec's 0.25
+floor outdoors and sixteen times over its ceiling indoors. So the whole voxel
+machine - pools, ceiling, pow(L, 1/booster), the [0,8] trace clamps, DiffuseBias,
+every amplifier - keeps seeing exactly the numbers it was tuned against, and the
+pre-exposure is applied where GI meets shading instead: ApplyGI() modes 1 and 2
+(mode 0 excluded, its texture is an occlusion factor, not a radiance), and the
+SVO atmosphere in the fog pass, which is the second output and would otherwise
+have become the new exposure-invariant filler. In mode 1 the multiply lands
+before the specular ratio so numerator and denominator stay in the same units.
+
+e_svoTI_SSDepthTrace is held at 0 on this path - it is the one place SVOGI reads
+an already-exposed buffer back into unexposed voxel maths - and r_HDRDebug 1's
+coverage table now reports SVOGI as reached.
+
+research/s8-svogi-units.md, decisions/s8-svogi-fog-clouds.md item 1 approach A.
+Off the switch every multiply is an exact 1.0 and both divides are not compiled.
+
+Co-Authored-By: Claude Opus <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01A72MFkdSczncE7au9UVnmu
+---
+ Code/CryEngine/Cry3DEngine/SVO/SceneTree.cpp  | 16 +++++++++++++
+ .../RenderDll/XRenderD3D9/D3D_SVO.cpp         | 23 ++++++++++++++++++-
+ .../GraphicsPipeline/ToneMapping.cpp          | 10 ++++----
+ .../HWScripts/CryFX/HDRPostProcess.cfx        |  6 +++++
+ .../Shaders/HWScripts/CryFX/TiledShading.cfi  | 23 ++++++++++++++++---
+ 5 files changed, 69 insertions(+), 9 deletions(-)
+
+diff --git a/Code/CryEngine/Cry3DEngine/SVO/SceneTree.cpp b/Code/CryEngine/Cry3DEngine/SVO/SceneTree.cpp
+index 76ba5103..099f8618 100644
+--- a/Code/CryEngine/Cry3DEngine/SVO/SceneTree.cpp
++++ b/Code/CryEngine/Cry3DEngine/SVO/SceneTree.cpp
+@@ -2488,6 +2488,22 @@ void CSvoEnv::CollectLights()
+ 
+ 					lightTI.vCol.w = (rLight.m_Flags & DLF_CASTSHADOW_MAPS) ? 1.f : 0.f;
+ 
++					// S8, decisions/s8-svogi-fog-clouds.md item 1 A3 - the second of the two sun
++					// injection sites (the first is the RSM one, D3D_SVO.cpp). On the
++					// scene-referred path the sun colour is radiometric (S2 moved the 1/PI into
++					// the BRDF) and is therefore PI times what the SVO's RGBM codec was sized
++					// for: its ceiling is a hard 4.0 and the radiometric sun is 11.90, so every
++					// injected texel would clip and hue-shift. The SVO stays in stock units; the
++					// exposure and the convention are both applied at the OUTPUT instead.
++					// Only DLF_SUN: point lights are unit-less and never carried the divide.
++					// .w is a shadow FLAG here, never a colour - do not touch it.
++					if ((rLight.m_Flags & DLF_SUN) && Get3DEngine()->IsSceneReferredConvention())
++					{
++						lightTI.vCol.x /= gf_PI;
++						lightTI.vCol.y /= gf_PI;
++						lightTI.vCol.z /= gf_PI;
++					}
++
+ 					// set sort value
+ 					if (rLight.m_Flags & DLF_SUN)
+ 					{
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/D3D_SVO.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/D3D_SVO.cpp
+index 37d626f5..341681ea 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/D3D_SVO.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/D3D_SVO.cpp
+@@ -1667,6 +1667,14 @@ void CSvoRenderer::InitCVarValues()
+ 
+ 	INIT_ALL_SVO_CVARS;
+ 	#undef INIT_SVO_CVAR
++
++	// S8, decisions/s8-svogi-fog-clouds.md item 1 A4. The screen-space depth trace is the ONE
++	// place SVOGI reads an already pre-exposed buffer ($HDRTargetPrev, bound at slot 12) back
++	// into voxel-space maths that is deliberately kept in unexposed stock units. Mixing the two
++	// would put the exposure into the trace twice and nowhere consistently. The cvar's default
++	// is already 0 and it is VF_EXPERIMENTAL; on the scene-referred path it is held there.
++	if (CRendererResources::IsSceneReferredLightUnits())
++		e_svoTI_SSDepthTrace = 0.0f;
+ }
+ 
+ CTexture* CSvoRenderer::GetTroposphereMinRT()
+@@ -1841,7 +1849,20 @@ void CSvoRenderer::SetupRsmSunConstants(T& rp)
+ 		(Vec4&)shadowMat.m20 *= shadowsSetup.RecpFarDist;
+ 		rp.SetConstantArray(lightProjParamName, alias_cast<Vec4*>(&shadowMat), 4);
+ 
+-		Vec4 vData(gEnv->p3DEngine->GetSunColor(), e_svoTI_InjectionMultiplier);
++		// S8, decisions/s8-svogi-fog-clouds.md item 1 A3: the SVO is kept entirely in STOCK
++		// light units, and that includes the sun it injects. On the scene-referred path the sun
++		// is radiometric (S2 moved the 1/PI into the BRDF), so GetSunColor() is PI times larger
++		// than the number this codec was built for: 11.90 against a hard RGBM ceiling of 4.0
++		// (CommonSVO.cfi EncodeHDR), which clips AND hue-shifts every injected texel. Dividing
++		// it back restores the 3.788 that CE sized the ceiling against, and it puts the GI
++		// output on the same footing as the direct diffuse term, which now carries
++		// SCENE_BRDF_NORM_FACTOR. Point lights are NOT touched here - they never had the
++		// divide on either path. Off the switch this is the stock expression, untouched.
++		Vec3 rsmSunColor = gEnv->p3DEngine->GetSunColor();
++		if (CRendererResources::IsSceneReferredLightUnits())
++			rsmSunColor /= gf_PI;
++
++		Vec4 vData(rsmSunColor, e_svoTI_InjectionMultiplier);
+ 		rp.SetConstantArray(rsmSunColparamName, (Vec4*)&vData, 1);
+ 		Vec4 vData2(gEnv->p3DEngine->GetSunDirNormalized(), (float)e_svoTI_SunRSMInject);
+ 		rp.SetConstantArray(rsmSunDirparamName, (Vec4*)&vData2, 1);
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.cpp
+index c235728f..f4730a17 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.cpp
+@@ -837,8 +837,8 @@ void CToneMappingStage::DisplaySceneReferredMeterInfo(float appliedEV)
+ //
+ // The exposure is applied on the LIGHT side, at the m_fAdaptedSceneScaleLBuffer sites, the sky
+ // stage, and the per-view CV_SceneExposure that the forward and emissive writers multiply by. A
+-// contributor that goes round all three - SVOGI's own light injection, the legacy fog's inscatter
+-// colour - is exposure-INVARIANT, which does not look like a bug. It looks like the aperture
++// contributor that goes round all three - the legacy fog's inscatter colour, and until S8 batch 1
++// SVOGI's cone-trace result - is exposure-INVARIANT, which does not look like a bug. It looks like the aperture
+ // having no effect on the shadows, because the thing filling the shadows is the one thing not
+ // following, and it is a symptom nothing in the picture explains.
+ //
+@@ -860,11 +860,11 @@ void CToneMappingStage::DisplaySceneReferredCoverage()
+ 	const bool bVFog  = cvarOn("e_VolumetricFog");
+ 
+ 	char str[256];
+-	cry_sprintf(str, "  pre-exposure reaches: sun+lights YES  probes YES (tint; re-bake for PI)  sky YES  forward/emissive YES");
++	cry_sprintf(str, "  pre-exposure reaches: sun+lights YES  probes YES (tint; re-bake for PI)  sky YES  forward/emissive YES  SVOGI %s",
++	            bSvo ? "YES (at ApplyGI + SvoGiFog)" : "YES (off)");
+ 	IRenderAuxText::DrawText(Vec3(5, 155, 1), IRenderAuxText::ASize(1.0f), ColorF(1, 0, 1, 1), eDrawText_800x600 | eDrawText_2D, str);
+ 
+-	cry_sprintf(str, "  NOT reached (S8): SVOGI %s  global fog %s  volumetric fog sun/height %s   | ambient lights: n/a, they modulate",
+-	            bSvo  ? "ON  <- shadow filler, try e_svoTI_Apply 0" : "off",
++	cry_sprintf(str, "  NOT reached (S8): global fog %s  volumetric fog sun/height %s   | ambient lights: n/a, they modulate",
+ 	            bFog  ? "ON  <- try e_Fog 0"                        : "off",
+ 	            bVFog ? "ON"                                        : "off");
+ 	IRenderAuxText::DrawText(Vec3(5, 175, 1), IRenderAuxText::ASize(1.0f), ColorF(1, 0, 1, 1), eDrawText_800x600 | eDrawText_2D, str);
+diff --git a/Engine/Shaders/HWScripts/CryFX/HDRPostProcess.cfx b/Engine/Shaders/HWScripts/CryFX/HDRPostProcess.cfx
+index 5d029f7c..300d5ec7 100644
+--- a/Engine/Shaders/HWScripts/CryFX/HDRPostProcess.cfx
++++ b/Engine/Shaders/HWScripts/CryFX/HDRPostProcess.cfx
+@@ -1751,6 +1751,12 @@ pixout GetSvoGiFog(vert2fragFog IN, pixout OUT)
+ 	OUT.Color = vAir * vAir.a;
+ 	OUT.Color.a = vAir.a;
+ 
++	// S8, decisions/s8-svogi-fog-clouds.md item 1 A2: the SVO's SECOND output. The voxel data is
++	// in stock, unexposed units (see ApplyGI in TiledShading.cfi) so the atmosphere it writes
++	// into the HDR target needs the same pre-exposure the cone-trace result gets at ApplyGI.
++	// Colour only - .a is a transmittance. Exactly 1.0 off the switch.
++	OUT.Color.rgb *= PS_HDR_RANGE_ADAPT_MAX;
++
+ 	OUT.Color.a = saturate(1.0f - OUT.Color.a);
+ 
+ 	return OUT;
+diff --git a/Engine/Shaders/HWScripts/CryFX/TiledShading.cfi b/Engine/Shaders/HWScripts/CryFX/TiledShading.cfi
+index b2bb60ba..6753dc87 100644
+--- a/Engine/Shaders/HWScripts/CryFX/TiledShading.cfi
++++ b/Engine/Shaders/HWScripts/CryFX/TiledShading.cfi
+@@ -105,6 +105,20 @@ float GetClipVolumeWeightBinary(uint nClipVolumeID, uint nLightStencilID)
+ void ApplyGI(inout float3 specularAcc, inout float3 diffuseAcc, float3 diffuseForwAcc, uint2 pixelCoord, float3 surfGloss, float3 surfSpecCol,
+              Texture2D<float4> TexGiDiffuse, Texture2D<float4> TexGiSpecular, SamplerState samplerTrilinearClamp, const int nIntegrMode, float4 fParms)
+ {
++	// S8, decisions/s8-svogi-fog-clouds.md item 1 approach A: THE pre-exposure boundary for
++	// SVOGI. The voxel machine - injection, the 8-bit RGBM pools with their hard 4.0 ceiling,
++	// pow(L, 1/booster), the [0,8] trace clamps - stays entirely in stock, unexposed light units,
++	// because a single 8-bit shared exponent cannot carry the five decades the aperture spans on
++	// top of the scene's own range. The exposure is applied here instead, where GI meets shading,
++	// exactly once. (The SVO's other output, GetSvoGiFog in HDRPostProcess.cfx, carries the same
++	// multiply - miss it and the shadow filler simply moves house.)
++	//
++	// Mode 0 is EXCLUDED on purpose: vSkyLightIrradiance there is an occlusion FACTOR that
++	// multiplies an already-exposed accumulator, not a radiance. Same reasoning as the ambient
++	// light entities of round 1.
++	//
++	// PS_HDR_RANGE_ADAPT_MAX is exactly 1.0 off the switch and on an unbound per-view buffer, so
++	// the stock path multiplies by an exact 1.0 and is bit-identical.
+ 	if(nIntegrMode == 0) // AO only mode
+ 	{
+ 		float4 vSkyLightIrradiance = TexGiDiffuse[pixelCoord];
+@@ -113,14 +127,17 @@ void ApplyGI(inout float3 specularAcc, inout float3 diffuseAcc, float3 diffuseFo
+ 	}
+ 	else if(nIntegrMode == 1) // GI replaces diffuse of env probes and adjusts specular
+ 	{
+-		float3 diffuseIrradiance = TexGiDiffuse[pixelCoord];
++		// Exposed BEFORE the specular ratio below, not after: that ratio divides GI luminance by
++		// the (already exposed) deferred diffuse, so both sides have to be in the same units or
++		// the specular adjustment moves with the aperture.
++		float3 diffuseIrradiance = TexGiDiffuse[pixelCoord].xyz * PS_HDR_RANGE_ADAPT_MAX;
+ 		specularAcc *= lerp(min( 2.f, GetLuminance(diffuseIrradiance) / (GetLuminance(diffuseAcc + diffuseForwAcc) + 0.001)), 1.f, saturate(surfGloss * GetLuminance(surfSpecCol) * fParms.x)) * fParms.z;
+ 		diffuseAcc = diffuseIrradiance;
+ 	}
+ 	else if(nIntegrMode == 2) // Full GI mode
+ 	{
+-		diffuseAcc = TexGiDiffuse[pixelCoord];
+-		specularAcc = TexGiSpecular[pixelCoord];
++		diffuseAcc = TexGiDiffuse[pixelCoord].xyz * PS_HDR_RANGE_ADAPT_MAX;
++		specularAcc = TexGiSpecular[pixelCoord].xyz * PS_HDR_RANGE_ADAPT_MAX;
+ 	}
+ }
+ #endif
+-- 
+2.47.1.windows.1
+

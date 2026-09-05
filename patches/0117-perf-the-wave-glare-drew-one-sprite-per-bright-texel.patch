@@ -1,0 +1,1014 @@
+From a88052c5969a7ae4b61bc67fc3cabd19f768b7c2 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Mon, 31 Aug 2026 10:53:44 +0800
+Subject: [PATCH 117/119] perf: the wave glare drew one sprite per bright
+ texel, and brightness decides how many there are
+
+The reported "brightness up, frame rate down" is a population problem. ExecuteDiffraction emits
+one quad per half-resolution texel and the vertex shader collapses the empty ones, so the
+rasterized sprite count is EXACTLY the number of texels above HDR_Streaks_Threshold - and under
+the scene-referred pre-exposure that threshold is an absolute scene value. A bright sky puts tens
+of thousands of texels over it at once, each drawing a sprite some 160 px across, six spectral
+taps deep. At 1080p with Reach 0.15 that is 1 300 Mpx of blending against 0.24 Mpx for a single
+night practical.
+
+It is not the right picture either: the convolution of a broad bright region with the PSF is a
+veil, not fifty thousand stars. The stars only exist because the deposit is done by point-sampled
+sprites.
+
+r_HDRDiffractionMaxSources (default 256, 0 = unlimited, scene-referred path only) caps it. Three
+small passes - HDRDiffractionSourceStats, HDRDiffractionStatsReduce, HDRDiffractionBudget -
+reduce the thresholded source to one RGBA32F texel holding (cutoff, raw count, count above the
+cutoff, share of the excess below it), the last of them correcting the cutoff from the previous
+frame's count with a multiplicative controller: fast up, slow down, a dead band at [0.8N, N], and
+a 1x1 ping-pong because a pass may not read the target it writes. No CPU round trip anywhere.
+
+The sprite vertex shader reads that one texel and fades a source out over one STOP. Below the
+cutoff it draws no sprite but emits a ONE-TEXEL quad carrying the whole energy the pattern would
+have spread (excess * gain * the deposited glare fraction) into the same layer, at the source's
+own position. A source that loses the budget loses its SHAPE, not its light: turning the budget
+on cannot darken a scene, and the crossfade means nothing pops while panning.
+
+Byte identity is structural, not measured. raw <= N drives the cutoff to zero and a zero cutoff
+is the un-budgeted vertex shader exactly; and the whole thing is gated on IsSceneReferredStage(5),
+so off the switch DiffractionParams3.x is 0 and the branch is never entered.
+
+Measure it, do not guess it. r_HDRDiffractionDebug 3's once-a-second report now LEADS with the
+population, raw count first, and the stats chain runs whenever that mode is on even with the
+budget at 0 - so a scene's real population can be read before deciding what N should be:
+
+  [BLOOM]   SOURCES: raw above threshold = 51234 of the 960 x 540 grid -- one sprite each,
+            162 x 162 half-res px per sprite = 1344.6 Mpx of blending unbudgeted
+  [BLOOM]            budget 256 (r_HDRDiffractionMaxSources): 261 drew a star, cutoff 2.9 =
+            +4.0 stops -- the other 50973 kept their LIGHT (12.4% of the source excess) and
+            lost their shape
+
+The counts are the GPU's own arithmetic over that frame's source and the raw test is literally
+the vertex shader's collapse test. The 1x1 travels back on the existing once-a-second cadence,
+issued in the same frame as the source blit, through the same two-phase staging download - no
+stall, and nothing allocated unless the mode is on.
+
+The analytic streaks do NOT share the extraction and need no budget: they, the anamorphic flare
+and halation are directional stretch blurs whose cost is a fixed number of full-screen passes,
+completely independent of how many texels cleared the threshold. Only the threshold constant is
+shared. The front filter PSF is the one other sparse sprite scatter in the file and has the same
+failure mode at a quarter of the candidate cells; it is deliberately untouched here and should
+reuse this chain when it is done.
+
+Left standing, and recorded: the residual is deposited AT the source rather than spread as a veil
+(the bloom chain has already run by the time ExecuteStreaks is called, so there is no bloom input
+left to add to); sources inside the crossfade drop their residual; the controller is one frame
+behind, so a hard cut into a bright scene overshoots N for two or three frames; and there is no
+blob merge, so a lamp spanning 5x5 texels spends 25 slots. decisions/s8-glare-budget.md carries
+all four with the approach that answers each.
+
+Docs: DiffractionKernelSpec.md gains 3.1 (the budget, the cost table, the three properties, the
+report), the cvar list and two limitations; ConsoleReference gains r_HDRDiffractionMaxSources.
+
+Co-Authored-By: Claude Opus <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01A72MFkdSczncE7au9UVnmu
+---
+ .../RenderDll/Common/RendererCVars.cpp        |  12 +
+ .../RenderDll/Common/RendererCVars.h          |   2 +
+ .../XRenderD3D9/GraphicsPipeline/Bloom.cpp    | 281 +++++++++++++++++-
+ .../XRenderD3D9/GraphicsPipeline/Bloom.h      |  40 +++
+ .../CinematicCamera/DiffractionKernelSpec.md  |  79 ++++-
+ .../CinematicCamera/docs/ConsoleReference.md  |   8 +
+ .../HWScripts/CryFX/HDRPostProcess.cfx        | 250 +++++++++++++++-
+ 7 files changed, 666 insertions(+), 6 deletions(-)
+
+diff --git a/Code/CryEngine/RenderDll/Common/RendererCVars.cpp b/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
+index 1b312344..a2ab8bb5 100644
+--- a/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
++++ b/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
+@@ -192,6 +192,7 @@ int CRendererCVars::CV_r_HDRStreaks;
+ int CRendererCVars::CV_r_HDRHalation;
+ int CRendererCVars::CV_r_HDRDiffractionKernel;
+ int CRendererCVars::CV_r_HDRDiffractionDebug;
++int CRendererCVars::CV_r_HDRDiffractionMaxSources;
+ int CRendererCVars::CV_r_HDRDiffractionKernelSize;
+ float CRendererCVars::CV_r_HDRDiffractionSAWaves;
+ int CRendererCVars::CV_r_HDRVignetting;
+@@ -1318,6 +1319,17 @@ void CRendererCVars::InitCVars()
+ 	               "screen once a second. Modes above 0 also log the energy, the bloom "
+ 	               "composite weight and the sprite's half extent in native pixels.");
+ 
++	REGISTER_CVAR3("r_HDRDiffractionMaxSources", CV_r_HDRDiffractionMaxSources, 256, VF_NULL,
++	               "Wave-optics glare SOURCE BUDGET: the largest number of half-resolution texels "
++	               "that may draw a diffraction sprite in one frame. The pass costs one large "
++	               "sprite per texel above HDR_Streaks_Threshold, so a pre-exposed bright sky can "
++	               "put tens of thousands of them on screen and the frame rate follows the "
++	               "brightness down. Above the budget the dimmest sources lose their STAR but not "
++	               "their LIGHT: the energy their pattern would have spread is deposited at the "
++	               "source instead, so nothing darkens and nothing pops. 0 = unlimited (the "
++	               "pre-budget behaviour). Scene-referred path only. Measure the population with "
++	               "r_HDRDiffractionDebug 3, whose SOURCES line prints the raw count first.");
++
+ 	REGISTER_CVAR3("r_HDRDiffractionKernelSize", CV_r_HDRDiffractionKernelSize, 512, VF_NULL,
+ 	               "Grid the pupil is rastered and transformed on: 512 (default) or 256. 256 is a "
+ 	               "4x cheaper job at half the structural resolution; the pupil stays half the "
+diff --git a/Code/CryEngine/RenderDll/Common/RendererCVars.h b/Code/CryEngine/RenderDll/Common/RendererCVars.h
+index 1ffd1897..4d47789f 100644
+--- a/Code/CryEngine/RenderDll/Common/RendererCVars.h
++++ b/Code/CryEngine/RenderDll/Common/RendererCVars.h
+@@ -256,6 +256,8 @@ public:
+ 	static int   CV_r_HDRDiffractionKernel;
+ 	static int   CV_r_HDRDiffractionDebug;
+ 	static int   CV_r_HDRDiffractionKernelSize;
++	//! Source budget for the wave glare's sparse sprite convolution (decisions/s8-glare-budget.md).
++	static int   CV_r_HDRDiffractionMaxSources;
+ 	static float CV_r_HDRDiffractionSAWaves;
+ 	static int CV_r_HDRVignetting;
+ 	static int CV_r_HDRTexFormat;
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Bloom.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Bloom.cpp
+index 9e51cbc5..dce10d9f 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Bloom.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Bloom.cpp
+@@ -15,6 +15,10 @@ static const int s_nStreakTapCount = 8;
+ // the CPU has to know it to report what it costs - and it costs more than the round-2 comment
+ // admitted, see the report in ExecuteDiffraction.
+ static const float kDiffractionInnerWindowHalfPx = 4.0f;
++// The source budget's first reduction block, in half-resolution texels per axis. Must match
++// nothing in the shader - it is passed as a constant - but it does set how big the tile stats
++// target is: a 1080p half-res grid (960 x 540) reduces to 120 x 68.
++static const int kDiffractionStatsTileSize = 8;
+ // Per tap intensity falloff of the first iteration. Later iterations raise it by the tap
+ // count so the combined falloff stays exponential in distance rather than in iteration.
+ static const float s_fStreakDecay = 0.93f;
+@@ -464,6 +468,7 @@ void CBloomStage::ExecuteDiffraction(const SHDRStreaksParams& streakParams, floa
+ 	static CCryNameR diffParams0Name("DiffractionParams0");
+ 	static CCryNameR diffParams1Name("DiffractionParams1");
+ 	static CCryNameR diffParams2Name("DiffractionParams2");
++	static CCryNameR diffParams3Name("DiffractionParams3");
+ 	static CCryNameR diffSpectrumName("DiffractionSpectrum");
+ 	static CCryNameR diffDebugName("DiffractionDebugParams");
+ 	static CCryNameR diffDebug1Name("DiffractionDebugParams1");
+@@ -725,6 +730,27 @@ void CBloomStage::ExecuteDiffraction(const SHDRStreaksParams& streakParams, floa
+ 	//   3 - the thresholded sources in the corner, plus the brightest excess in the log.
+ 	const int nDebugMode = CRenderer::CV_r_HDRDiffractionDebug;
+ 
++	// The SOURCE BUDGET (decisions/s8-glare-budget.md). This pass costs one large sprite per
++	// texel above the threshold, and under the pre-exposure the threshold is an ABSOLUTE scene
++	// value - so a bright sky puts tens of thousands of them on screen and the frame rate
++	// follows the brightness down. The chain below reduces the source to one texel holding the
++	// energy cutoff that keeps the population at N, plus the counts the report prints.
++	//
++	// It runs when the budget is on AND whenever the debug report is on, because the population
++	// has to be MEASURABLE before anyone can decide what N should be - with the budget off the
++	// chain writes only its own targets and does not move a pixel.
++	const int  nSourceBudget = max(CRenderer::CV_r_HDRDiffractionMaxSources, 0);
++	const bool bBudgetActive = bSceneReferredGlare && (nSourceBudget > 0);
++
++	if (bBudgetActive || nDebugMode == 3)
++		ExecuteDiffractionBudget(pSource, bBudgetActive ? nSourceBudget : 0);
++
++	CTexture* pStatsTex = m_pTexDiffractionStats[m_nDiffractionStatsIndex];
++	// Never in force without its texture: with nothing bound the vertex shader would read a
++	// cutoff out of an unbound view, and an unbound view reads zero on some drivers and rubbish
++	// on others. Zero is harmless, rubbish would delete every star in the frame.
++	const bool bBudgetInForce = bBudgetActive && CTexture::IsTextureExist(pStatsTex);
++
+ 	// The sprite's half extent in NATIVE pixels - the number that says how big the figure is on
+ 	// the screen the user is looking at, as opposed to the half-resolution grid it is
+ 	// rasterized in. This is also the cost dial: the sprite is twice as wide in pixels as it was
+@@ -779,6 +805,9 @@ void CBloomStage::ExecuteDiffraction(const SHDRStreaksParams& streakParams, floa
+ 		report.nSourceH = pGlareSrc->GetHeight();
+ 		report.nGridW = nGridWidth;
+ 		report.nGridH = nGridHeight;
++		report.bBudgetActive = bBudgetInForce;
++		report.nBudget = nSourceBudget;
++		report.fSpriteHalfPx = fRadiusHalfPx;
+ 
+ 		// What the sprite's INNER FADE costs, which the deposited-fraction figure above has never
+ 		// included and which is not small: the kernel texture spans only R_tex * pitch half-res
+@@ -892,6 +921,12 @@ void CBloomStage::ExecuteDiffraction(const SHDRStreaksParams& streakParams, floa
+ 	prim.SetTexture(0, pSource, EDefaultResourceViews::Default, EShaderStage_Vertex);
+ 	prim.SetTexture(1, kernel.GetKernelTexture(), EDefaultResourceViews::Default, EShaderStage_Pixel);
+ 	prim.SetTexture(2, kernel.GetRingTexture(), EDefaultResourceViews::Default, EShaderStage_Pixel);
++	// The budget's one texel, read by the VERTEX shader with the same point sampler as the
++	// source. Always bound, whether the budget is in force or not: DiffractionParams3.x is what
++	// decides whether it is read, and a slot that is sometimes bound is a slot that will one day
++	// be sampled unbound.
++	if (CTexture::IsTextureExist(pStatsTex))
++		prim.SetTexture(3, pStatsTex, EDefaultResourceViews::Default, EShaderStage_Vertex);
+ 	prim.SetSampler(0, EDefaultSamplerStates::PointClamp, EShaderStage_Vertex);
+ 	// TRILINEAR, not LinearClamp: FILTER_LINEAR is built with MaxLOD 0, which would silently
+ 	// pin every SampleLevel to mip 0 and undo the prefiltering the kernel exists for.
+@@ -918,11 +953,22 @@ void CBloomStage::ExecuteDiffraction(const SHDRStreaksParams& streakParams, floa
+ 	// the corner shader (mode 3 draws the sources instead of the kernel). Mode 0 leaves it at
+ 	// zero, which is exactly what it was before the modes existed.
+ 	const Vec4 vDiffParams1(clamp_tpl(streakParams.fDispersion, 0.0f, 1.0f), (float)kernel.GetGridSize(), fMaxLod, (float)nDebugMode);
+-	const Vec4 vDiffParams2(fRadiusNdcX, fRadiusNdcY, fEnergy, 0.0f);
++	// w is the fraction of a source's light the sprite ACTUALLY deposits - the pattern's share of
++	// the pupil, times what the inner fade leaves of it. It is what a source below the budget
++	// deposits into one texel instead of spreading, so the frame's total light does not move
++	// when a star is dropped. Both factors are already computed for the report; this is the one
++	// place they are used for something other than printing.
++	const Vec4 vDiffParams2(fRadiusNdcX, fRadiusNdcY, fEnergy, fGlareFraction * report.fInnerKept);
++	// The residual quad is exactly ONE half-resolution texel: the grid spans 2 in NDC over
++	// nGrid texels, so a half extent of 1/nGrid is half a texel and the quad covers the single
++	// pixel its own centre sits in.
++	const Vec4 vDiffParams3(bBudgetInForce ? 1.0f : 0.0f,
++	                        1.0f / (float)max(nGridWidth, 1), 1.0f / (float)max(nGridHeight, 1), 0.0f);
+ 
+ 	auto& constantManager = prim.GetConstantManager();
+ 	constantManager.BeginNamedConstantUpdate();
+ 	constantManager.SetNamedConstant(diffParams2Name, vDiffParams2, eHWSC_Vertex);
++	constantManager.SetNamedConstant(diffParams3Name, vDiffParams3, eHWSC_Vertex);
+ 	constantManager.SetNamedConstant(diffParams0Name, vDiffParams0, eHWSC_Pixel);
+ 	constantManager.SetNamedConstant(diffParams1Name, vDiffParams1, eHWSC_Pixel);
+ 	constantManager.SetNamedConstantArray(diffSpectrumName, vSpectrum, 6, eHWSC_Pixel);
+@@ -997,6 +1043,126 @@ void CBloomStage::ExecuteDiffraction(const SHDRStreaksParams& streakParams, floa
+ 	m_bDiffractionLayerValid = true;
+ }
+ 
++// The source budget's reduction chain (decisions/s8-glare-budget.md).
++//
++// Three passes and no CPU round trip. Only the first reads the frame - one point read per
++// half-resolution texel, about 0.02 ms at 1080p - and the two after it work on 8 kpx and 256 px.
++//
++//   1. source            -> 8x8 tiles   (raw count, count above the cutoff, summed excess,
++//                                        excess below the cutoff)
++//   2. tiles             -> a fixed 16x16, same four sums, so that
++//   3. 16x16             -> ONE texel, always 256 taps, which also CORRECTS the cutoff from the
++//                           previous frame's count.
++//
++// The 1x1 is ping-ponged because step 3 has to read the previous cutoff in order to correct it,
++// and no pass may read the target it writes. That is also the controller's one frame of lag: the
++// population is measured against last frame's cutoff, so a hard cut to a bright sky overshoots
++// the budget for two or three frames and then settles. The alternative - a histogram, exact in
++// one frame - is three more passes and four more targets for a precision the vertex shader's
++// one-stop crossfade throws away anyway; the note records it as the fallback.
++//
++// N = 0 means "count, but do not budget": the chain still runs so r_HDRDiffractionDebug 3 can
++// report the raw population, and the cutoff decays to zero, which is the un-budgeted pass
++// bit for bit.
++CTexture* CBloomStage::ExecuteDiffractionBudget(CTexture* pSource, int nBudget)
++{
++	if (!CTexture::IsTextureExist(m_pTexDiffractionTileStats) || !CTexture::IsTextureExist(m_pTexDiffractionStatsMid) ||
++	    !CTexture::IsTextureExist(m_pTexDiffractionStats[0]) || !CTexture::IsTextureExist(m_pTexDiffractionStats[1]))
++		return nullptr;
++
++	PROFILE_LABEL_SCOPE("HDR_DIFFRACTION_BUDGET");
++
++	static CCryNameTSCRC techSourceStats("HDRDiffractionSourceStats");
++	static CCryNameTSCRC techStatsReduce("HDRDiffractionStatsReduce");
++	static CCryNameTSCRC techBudget("HDRDiffractionBudget");
++	static CCryNameR statsParams0Name("DiffractionStatsParams0");
++	static CCryNameR statsParams1Name("DiffractionStatsParams1");
++	static CCryNameR budgetParamsName("DiffractionBudgetParams");
++
++	CTexture* pPrev = m_pTexDiffractionStats[m_nDiffractionStatsIndex];
++	m_nDiffractionStatsIndex ^= 1;
++	CTexture* pCur = m_pTexDiffractionStats[m_nDiffractionStatsIndex];
++
++	const int nSrcW  = pSource->GetWidth();
++	const int nSrcH  = pSource->GetHeight();
++	const int nTileW = m_pTexDiffractionTileStats->GetWidth();
++	const int nTileH = m_pTexDiffractionTileStats->GetHeight();
++	const int nMidW  = m_pTexDiffractionStatsMid->GetWidth();
++	const int nMidH  = m_pTexDiffractionStatsMid->GetHeight();
++
++	// 1. Source -> tiles. kDiffractionStatsTileSize is the block, not the target size: the
++	//    target is whatever that many blocks cover.
++	if (m_passDiffractionSourceStats.IsDirty(pSource->GetTextureID(), pPrev->GetTextureID()))
++	{
++		m_passDiffractionSourceStats.SetPrimitiveFlags(CRenderPrimitive::eFlags_ReflectShaderConstants_PS);
++		m_passDiffractionSourceStats.SetPrimitiveType(CRenderPrimitive::ePrim_ProceduralTriangle);
++		m_passDiffractionSourceStats.SetTechnique(CShaderMan::s_shHDRPostProcess, techSourceStats, 0);
++		m_passDiffractionSourceStats.SetRenderTarget(0, m_pTexDiffractionTileStats);
++		m_passDiffractionSourceStats.SetState(GS_NODEPTHTEST);
++		m_passDiffractionSourceStats.SetTexture(0, pSource);
++		m_passDiffractionSourceStats.SetTexture(1, pPrev);
++		m_passDiffractionSourceStats.SetSampler(0, EDefaultSamplerStates::PointClamp);
++		m_passDiffractionSourceStats.SetSampler(1, EDefaultSamplerStates::PointClamp);
++	}
++
++	m_passDiffractionSourceStats.BeginConstantUpdate();
++	m_passDiffractionSourceStats.SetConstant(statsParams0Name,
++	                                         Vec4(1.0f / (float)max(nSrcW, 1), 1.0f / (float)max(nSrcH, 1),
++	                                              (float)kDiffractionStatsTileSize, (float)kDiffractionStatsTileSize), eHWSC_Pixel);
++	m_passDiffractionSourceStats.SetConstant(statsParams1Name,
++	                                         Vec4((float)nSrcW, (float)nSrcH, (float)nTileW, (float)nTileH), eHWSC_Pixel);
++	m_passDiffractionSourceStats.Execute();
++
++	// 2. Tiles -> the fixed 16x16. The block is whatever it takes to cover the tile grid, so
++	//    step 3 is always the same 256 taps at any resolution.
++	const int nReduceX = (nTileW + nMidW - 1) / nMidW;
++	const int nReduceY = (nTileH + nMidH - 1) / nMidH;
++
++	if (m_passDiffractionStatsReduce.IsDirty(m_pTexDiffractionTileStats->GetTextureID()))
++	{
++		m_passDiffractionStatsReduce.SetPrimitiveFlags(CRenderPrimitive::eFlags_ReflectShaderConstants_PS);
++		m_passDiffractionStatsReduce.SetPrimitiveType(CRenderPrimitive::ePrim_ProceduralTriangle);
++		m_passDiffractionStatsReduce.SetTechnique(CShaderMan::s_shHDRPostProcess, techStatsReduce, 0);
++		m_passDiffractionStatsReduce.SetRenderTarget(0, m_pTexDiffractionStatsMid);
++		m_passDiffractionStatsReduce.SetState(GS_NODEPTHTEST);
++		m_passDiffractionStatsReduce.SetTexture(0, m_pTexDiffractionTileStats);
++		m_passDiffractionStatsReduce.SetSampler(0, EDefaultSamplerStates::PointClamp);
++	}
++
++	m_passDiffractionStatsReduce.BeginConstantUpdate();
++	m_passDiffractionStatsReduce.SetConstant(statsParams0Name,
++	                                         Vec4(1.0f / (float)max(nTileW, 1), 1.0f / (float)max(nTileH, 1),
++	                                              (float)nReduceX, (float)nReduceY), eHWSC_Pixel);
++	m_passDiffractionStatsReduce.SetConstant(statsParams1Name,
++	                                         Vec4((float)nTileW, (float)nTileH, (float)nMidW, (float)nMidH), eHWSC_Pixel);
++	m_passDiffractionStatsReduce.Execute();
++
++	// 3. 16x16 -> one texel, and the cutoff with it.
++	if (m_passDiffractionBudget.IsDirty(m_pTexDiffractionStatsMid->GetTextureID(), pPrev->GetTextureID(), pCur->GetTextureID()))
++	{
++		m_passDiffractionBudget.SetPrimitiveFlags(CRenderPrimitive::eFlags_ReflectShaderConstants_PS);
++		m_passDiffractionBudget.SetPrimitiveType(CRenderPrimitive::ePrim_ProceduralTriangle);
++		m_passDiffractionBudget.SetTechnique(CShaderMan::s_shHDRPostProcess, techBudget, 0);
++		m_passDiffractionBudget.SetRenderTarget(0, pCur);
++		m_passDiffractionBudget.SetState(GS_NODEPTHTEST);
++		m_passDiffractionBudget.SetTexture(0, m_pTexDiffractionStatsMid);
++		m_passDiffractionBudget.SetTexture(1, pPrev);
++		m_passDiffractionBudget.SetSampler(0, EDefaultSamplerStates::PointClamp);
++		m_passDiffractionBudget.SetSampler(1, EDefaultSamplerStates::PointClamp);
++	}
++
++	m_passDiffractionBudget.BeginConstantUpdate();
++	m_passDiffractionBudget.SetConstant(statsParams0Name,
++	                                    Vec4(1.0f / (float)max(nMidW, 1), 1.0f / (float)max(nMidH, 1),
++	                                         (float)nMidW, (float)nMidH), eHWSC_Pixel);
++	m_passDiffractionBudget.SetConstant(statsParams1Name,
++	                                    Vec4((float)nMidW, (float)nMidH, 1.0f, 1.0f), eHWSC_Pixel);
++	m_passDiffractionBudget.SetConstant(budgetParamsName, Vec4((float)nBudget, 0.0f, 0.0f, 0.0f), eHWSC_Pixel);
++	m_passDiffractionBudget.Execute();
++
++	return pCur;
++}
++
+ // The readback half of r_HDRDiffractionDebug 3. Split out because it is a small state machine
+ // and has nothing to do with the drawing above.
+ void CBloomStage::UpdateDiffractionSourceReadback(int nDebugMode, CTexture* pSource, const SDiffractionReport& report)
+@@ -1008,6 +1174,7 @@ void CBloomStage::UpdateDiffractionSourceReadback(int nDebugMode, CTexture* pSou
+ 		if (!m_bDiffractionReadbackIssued)
+ 		{
+ 			m_pTexDiffractionReadback.reset();
++			m_pTexDiffractionStatsInFlight.reset();
+ 			m_bDiffractionReadbackStalled = false;
+ 		}
+ 		return;
+@@ -1097,6 +1264,33 @@ void CBloomStage::UpdateDiffractionSourceReadback(int nDebugMode, CTexture* pSou
+ 		};
+ 
+ 		pDevTex->AccessCurrStagingResource(0, false, readbackData);
++
++		// The budget's sixteen bytes travelled on the same cadence and were issued in the same
++		// frame, so if the source's fence has signalled this one has too. Four floats: the
++		// cutoff in force, the RAW population before any budgeting, what survived it, and the
++		// share of the source excess that lost its star. Measured by the GPU over the same
++		// frame's source - the report never estimates the population, it reads it.
++		if (m_pTexDiffractionStatsInFlight)
++		{
++			CDeviceTexture* pStatsDev = m_pTexDiffractionStatsInFlight->GetDevTexture();
++			if (pStatsDev != nullptr && pStatsDev->AccessCurrStagingResource(0, false))
++			{
++				SDiffractionReport& rReport = m_diffractionReportInFlight;
++				const auto statsData = [&rReport](void* pData, uint32 rowPitch, uint32 slicePitch) -> bool
++				{
++					const float* pTexel = static_cast<const float*>(pData);
++					rReport.fCutoff = pTexel[0];
++					rReport.fRawSources = pTexel[1];
++					rReport.fBudgetSources = pTexel[2];
++					rReport.fResidualEnergyFrac = pTexel[3];
++					rReport.bStatsValid = true;
++					return true;
++				};
++				pStatsDev->AccessCurrStagingResource(0, false, statsData);
++			}
++			m_pTexDiffractionStatsInFlight.reset();
++		}
++
+ 		m_bDiffractionReadbackIssued = false;
+ 		// Time the cadence from the REPORT, not from the request, so a slow fence cannot turn
+ 		// this into a per-frame download.
+@@ -1111,6 +1305,19 @@ void CBloomStage::UpdateDiffractionSourceReadback(int nDebugMode, CTexture* pSou
+ 
+ 	m_passDiffractionReadbackCopy.Execute(pSource, m_pTexDiffractionReadback);
+ 	pDevTex->DownloadToStagingResource(0);
++
++	// The budget stats go in the same breath. No blit: this one is our own target and can be
++	// downloaded where it stands.
++	m_pTexDiffractionStatsInFlight.reset();
++	{
++		CTexture* pStatsTex = m_pTexDiffractionStats[m_nDiffractionStatsIndex];
++		if (CTexture::IsTextureExist(pStatsTex) && pStatsTex->GetDevTexture() != nullptr)
++		{
++			pStatsTex->GetDevTexture()->DownloadToStagingResource(0);
++			m_pTexDiffractionStatsInFlight = pStatsTex;
++		}
++	}
++
+ 	m_bDiffractionReadbackIssued = true;
+ 	m_fDiffractionReadbackTime = fNow;
+ 	// The parameters that made the pixels now on their way back from the GPU. Captured here and
+@@ -1151,6 +1358,41 @@ void CBloomStage::PrintDiffractionReport(const SDiffractionReport& report, float
+ 	                           "invisible: below anything the display transform can show";
+ 
+ 	CryLog("[BLOOM] ---- wave glare, once a second (r_HDRDiffractionDebug 3) ----");
++
++	// FIRST, because it is the one number that decides what this pass COSTS. The pass draws one
++	// sprite per source texel and the sprite is large, so the population is the frame time; and
++	// under the pre-exposure the population is a function of how bright the scene is, which is
++	// why brightness and frame rate were found to move together. Raw first, budgeted second: the
++	// raw figure is what the scene really contains and is what N should be argued against.
++	if (report.bStatsValid)
++	{
++		const float fSpriteArea = 4.0f * report.fSpriteHalfPx * report.fSpriteHalfPx;
++		CryLog("[BLOOM]   SOURCES: raw above threshold = %.0f of the %d x %d grid"
++		       " -- one sprite each, %.0f x %.0f half-res px per sprite = %.1f Mpx of blending unbudgeted",
++		       report.fRawSources, report.nGridW, report.nGridH,
++		       2.0f * report.fSpriteHalfPx, 2.0f * report.fSpriteHalfPx,
++		       report.fRawSources * fSpriteArea * 1e-6f);
++		if (report.bBudgetActive)
++		{
++			CryLog("[BLOOM]            budget %d (r_HDRDiffractionMaxSources): %.0f drew a star, cutoff %.4g = %+.1f stops"
++			       " -- the other %.0f kept their LIGHT (%.1f%% of the source excess, deposited at the source) and lost their shape",
++			       report.nBudget, report.fBudgetSources, report.fCutoff, stops(report.fCutoff),
++			       max(report.fRawSources - report.fBudgetSources, 0.0f), report.fResidualEnergyFrac * 100.0f);
++		}
++		else if (report.nBudget <= 0)
++		{
++			CryLog("[BLOOM]            budget OFF (r_HDRDiffractionMaxSources 0) -- every one of them drew a full sprite");
++		}
++		else
++		{
++			CryLog("[BLOOM]            budget %d is SET but not in force: the scene-referred path is off and the budget is"
++			       " scene-referred only -- every one of them drew a full sprite", report.nBudget);
++		}
++	}
++	else
++	{
++		CryLog("[BLOOM]   SOURCES: the budget stats have not come back yet (they land with the second report)");
++	}
+ 	CryLog("[BLOOM]   source peak %.4g exposed = %+.1f stops over mid grey, at (%d, %d) of the %d x %d grid"
+ 	       " -- this is the EXCESS above the threshold, after the 5-tap pre-blur: exactly what one sprite is fed",
+ 	       fMaxExcess, stops(fMaxExcess), nMaxX, nMaxY, report.nGridW, report.nGridH);
+@@ -1236,13 +1478,39 @@ bool CBloomStage::AcquireDiffractionTargets(int halfWidth, int halfHeight)
+ 	m_pTexDiffractionSourceTemp = CTexture::GetOrCreateRenderTarget(("$DiffractionSourceTemp" + id).c_str(), w, h, Clr_Transparent, eTT_2D, flags, eTF_R16G16B16A16F);
+ 	m_pTexDiffractionLayer      = CTexture::GetOrCreateRenderTarget(("$DiffractionLayer" + id).c_str(),      w, h, Clr_Transparent, eTT_2D, flags, eTF_R16G16B16A16F);
+ 
++	// The source budget's stats chain. RGBA32F, and it has to be: the middle two targets carry a
++	// COUNT of up to half a million next to a summed HDR excess, and fp16 runs out of mantissa
++	// at 2048 - it would report a population of "65504" for anything large and be believed.
++	// All four together are under 140 KiB at 1080p.
++	const int nTileW = (w + kDiffractionStatsTileSize - 1) / kDiffractionStatsTileSize;
++	const int nTileH = (h + kDiffractionStatsTileSize - 1) / kDiffractionStatsTileSize;
++	m_pTexDiffractionTileStats = CTexture::GetOrCreateRenderTarget(("$DiffractionTileStats" + id).c_str(),
++	                                                              nTileW, nTileH, Clr_Transparent, eTT_2D, flags, eTF_R32G32B32A32F);
++	m_pTexDiffractionStatsMid  = CTexture::GetOrCreateRenderTarget(("$DiffractionStatsMid" + id).c_str(),
++	                                                              16, 16, Clr_Transparent, eTT_2D, flags, eTF_R32G32B32A32F);
++	// FT_STAGE_READBACK on the 1x1 pair: they are what r_HDRDiffractionDebug 3 brings back so
++	// the population can be read rather than guessed at, and a persistent staging resource is
++	// what makes that download two-phase instead of a stall.
++	const uint32 statsFlags = flags | FT_STAGE_READBACK;
++	m_pTexDiffractionStats[0]  = CTexture::GetOrCreateRenderTarget(("$DiffractionStats0" + id).c_str(),
++	                                                              1, 1, Clr_Transparent, eTT_2D, statsFlags, eTF_R32G32B32A32F);
++	m_pTexDiffractionStats[1]  = CTexture::GetOrCreateRenderTarget(("$DiffractionStats1" + id).c_str(),
++	                                                              1, 1, Clr_Transparent, eTT_2D, statsFlags, eTF_R32G32B32A32F);
++
+ 	if (!CTexture::IsTextureExist(m_pTexDiffractionSource) || !CTexture::IsTextureExist(m_pTexDiffractionSourceTemp) ||
+-	    !CTexture::IsTextureExist(m_pTexDiffractionLayer))
++	    !CTexture::IsTextureExist(m_pTexDiffractionLayer) || !CTexture::IsTextureExist(m_pTexDiffractionTileStats) ||
++	    !CTexture::IsTextureExist(m_pTexDiffractionStatsMid) ||
++	    !CTexture::IsTextureExist(m_pTexDiffractionStats[0]) || !CTexture::IsTextureExist(m_pTexDiffractionStats[1]))
+ 	{
+ 		ReleaseDiffractionTargets();
+ 		return false;
+ 	}
+ 
++	// A cutoff of zero is "no budget", which is the only safe thing for the first frame to read.
++	CClearSurfacePass::Execute(m_pTexDiffractionStats[0], Clr_Transparent);
++	CClearSurfacePass::Execute(m_pTexDiffractionStats[1], Clr_Transparent);
++	m_nDiffractionStatsIndex = 0;
++
+ 	m_diffractionLayerWidth = w;
+ 	m_diffractionLayerHeight = h;
+ 	CryLog("[BLOOM] diffraction glare targets acquired: %d x %d half-res (source, blur scratch, layer)", w, h);
+@@ -1254,6 +1522,15 @@ void CBloomStage::ReleaseDiffractionTargets()
+ 	m_pTexDiffractionSource.reset();
+ 	m_pTexDiffractionSourceTemp.reset();
+ 	m_pTexDiffractionLayer.reset();
++	// Not while a download is in flight: the staging resource is the target of a copy that has
++	// not necessarily retired. The source readback above guards itself the same way.
++	if (!m_pTexDiffractionStatsInFlight)
++	{
++		m_pTexDiffractionTileStats.reset();
++		m_pTexDiffractionStatsMid.reset();
++		m_pTexDiffractionStats[0].reset();
++		m_pTexDiffractionStats[1].reset();
++	}
+ 	m_diffractionLayerWidth = 0;
+ 	m_diffractionLayerHeight = 0;
+ 	m_bDiffractionLayerValid = false;
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Bloom.h b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Bloom.h
+index 71df1ba2..52f66aff 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Bloom.h
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Bloom.h
+@@ -43,6 +43,9 @@ public:
+ 		, m_passDiffractionBlurV(&graphicsPipeline)
+ 		, m_passDiffractionDebug(&graphicsPipeline)
+ 		, m_passDiffractionComposite(&graphicsPipeline)
++		, m_passDiffractionSourceStats(&graphicsPipeline)
++		, m_passDiffractionStatsReduce(&graphicsPipeline)
++		, m_passDiffractionBudget(&graphicsPipeline)
+ 		, m_passDiffractionReadbackCopy(&graphicsPipeline)
+ 		, m_passHalationThreshold(&graphicsPipeline)
+ 		, m_passHalationDown0(&graphicsPipeline)
+@@ -98,10 +101,26 @@ private:
+ 		int   nSourceH = 0;
+ 		int   nGridW = 0;                 //!< the half-res sprite grid, which is what the peak's (x, y) index
+ 		int   nGridH = 0;
++
++		// The source BUDGET (decisions/s8-glare-budget.md). These four come back from the GPU's
++		// own arithmetic over the same frame's source, not from an estimate: the cost of this
++		// pass is one large sprite per texel above the threshold, so the population IS the
++		// performance and it has to be measurable whether the budget is on or off.
++		bool  bStatsValid = false;        //!< the 1x1 stats texel made it back this cycle
++		bool  bBudgetActive = false;      //!< r_HDRDiffractionMaxSources > 0 AND scene-referred
++		int   nBudget = 0;                //!< r_HDRDiffractionMaxSources as it was that frame
++		float fRawSources = 0.0f;         //!< texels over the threshold BEFORE any budgeting
++		float fBudgetSources = 0.0f;      //!< of those, how many still drew a sprite
++		float fResidualEnergyFrac = 0.0f; //!< share of the source excess that lost its star
++		float fCutoff = 0.0f;             //!< the energy cutoff in force, exposed units
++		float fSpriteHalfPx = 0.0f;       //!< sprite half extent in half-res px: population x this squared IS the fill
+ 	};
+ 
+ 	void ExecuteStreaks();
+ 	void ExecuteDiffraction(const SHDRStreaksParams& streakParams, float fBloomCompositeWeight);
++	//! The source budget's reduction chain. Returns the 1x1 stats texture the sprite vertex
++	//! shader must read (never null once the targets exist), after updating this frame's cutoff.
++	CTexture* ExecuteDiffractionBudget(CTexture* pSource, int nBudget);
+ 	void UpdateDiffractionSourceReadback(int nDebugMode, CTexture* pSource, const SDiffractionReport& report);
+ 	//! r_HDRDiffractionDebug 3's once-a-second answer to "why are the rays that bright", in
+ 	//! exposed scene units and stops over mid grey.
+@@ -151,12 +170,29 @@ private:
+ 	CFullscreenPass      m_passDiffractionDebug;
+ 	CFullscreenPass      m_passDiffractionComposite;
+ 
++	// The source BUDGET's reduction chain (decisions/s8-glare-budget.md). Three passes, of which
++	// only the first reads the frame: source -> 8x8 tile stats -> a fixed 16x16 -> one texel
++	// holding (cutoff, raw count, count above the cutoff, share of the excess below it). The
++	// sprite vertex shader samples that one texel; the budget therefore costs no readback and
++	// has no CPU round trip in it. The 1x1 is ping-ponged because the last pass has to read the
++	// PREVIOUS cutoff in order to correct it, and a pass may not read the target it writes.
++	CFullscreenPass      m_passDiffractionSourceStats;
++	CFullscreenPass      m_passDiffractionStatsReduce;
++	CFullscreenPass      m_passDiffractionBudget;
++
+ 	// Half-resolution glare targets: the thresholded (and pre-blurred) source, its separable
+ 	// blur scratch, and the RGBA16F layer the sprites deposit into. Allocated lazily like the
+ 	// halation targets, so Analytic mode and glare off cost nothing.
+ 	_smart_ptr<CTexture> m_pTexDiffractionSource;
+ 	_smart_ptr<CTexture> m_pTexDiffractionSourceTemp;
+ 	_smart_ptr<CTexture> m_pTexDiffractionLayer;
++	// The budget's three stats targets. Tiny (a 1080p half-res grid reduces to 120 x 68), and
++	// RGBA32F because the middle two carry COUNTS of up to half a million alongside a summed
++	// HDR excess - fp16 runs out of both mantissa and range long before that.
++	_smart_ptr<CTexture> m_pTexDiffractionTileStats;   //!< ceil(w/8) x ceil(h/8)
++	_smart_ptr<CTexture> m_pTexDiffractionStatsMid;    //!< fixed 16 x 16, so the last pass is a fixed 256 taps
++	_smart_ptr<CTexture> m_pTexDiffractionStats[2];    //!< 1 x 1 ping-pong, also the readback source
++	int                  m_nDiffractionStatsIndex = 0;
+ 	int                  m_diffractionLayerWidth = 0;
+ 	int                  m_diffractionLayerHeight = 0;
+ 	bool                 m_bDiffractionLayerValid = false;
+@@ -174,6 +210,10 @@ private:
+ 	bool                 m_bDiffractionReadbackIssued = false;
+ 	bool                 m_bDiffractionReadbackStalled = false;
+ 	float                m_fDiffractionReadbackTime = 0.0f;
++	//! The 1x1 budget stats travel back on the SAME cadence and in the same cycle as the source
++	//! blit above - sixteen bytes, issued in the same frame, so if the source's fence has
++	//! signalled this one certainly has. It is what puts a measured population in the report.
++	_smart_ptr<CTexture> m_pTexDiffractionStatsInFlight;
+ 	//! Captured when the download is issued, printed when it lands: the numbers that produced
+ 	//! the peak the GPU is on its way back with.
+ 	SDiffractionReport   m_diffractionReportInFlight;
+diff --git a/Code/CryPlugins/CinematicCamera/DiffractionKernelSpec.md b/Code/CryPlugins/CinematicCamera/DiffractionKernelSpec.md
+index 78acd4b1..9f8c30a2 100644
+--- a/Code/CryPlugins/CinematicCamera/DiffractionKernelSpec.md
++++ b/Code/CryPlugins/CinematicCamera/DiffractionKernelSpec.md
+@@ -432,6 +432,75 @@ pass logs the fraction it actually deposits (tail included, `amount` applied) to
+ the texels a pixel covers and the LOD that follows from it at `λ₀`, so a "no rays" report can
+ be read straight off the log.
+ 
++### 3.1 The source budget — what this pass COSTS, and the ceiling on it
++
++The sprite pass emits one quad per half-resolution texel and the vertex shader collapses the ones
++whose source is empty, so its cost is **exactly the number of texels above `HDR_Streaks_Threshold`
++times the sprite's area**. Under the scene-referred pre-exposure that threshold is an absolute
++scene value, so a bright sky, a large emissive or simply a brighter exposure can move tens of
++thousands of texels over it at once — each drawing a sprite some 160 px across, six spectral taps
++deep. At 1080p, `Reach` 0.15:
++
++| on screen | texels over threshold | half-res px blended |
++|---|---|---|
++| one practical at night | ~9 | 0.24 M |
++| a street of twenty lamps | ~200 | 5 M |
++| a pre-exposed bright sky | 50 000+ | 1 300 M |
++
++That is why the frame rate followed the brightness. It is a population problem, not a shader one:
++the physics of a broad bright region is a *veil*, and drawing it as fifty thousand overlapping
++copies of the same star buys a picture a single blur would have produced.
++
++**`r_HDRDiffractionMaxSources`** (default 256, 0 = unlimited) caps the population. Three small
++passes reduce the thresholded source to one texel holding `(cutoff, raw count, count above the
++cutoff, share of the excess below it)`; the last one corrects the cutoff from the previous
++frame's count with a multiplicative controller, and the sprite vertex shader reads that one texel:
++
++```
++w = smoothstep(cut, 2*cut, E)          one STOP of crossfade, not a hard cut
++w >= 1   full sprite, as before
++w <= 0   NO sprite - one texel carrying E * gain * (deposited glare fraction) instead
++```
++
++Three properties are load bearing:
++
++* **Energy conserving.** A source that loses its star keeps its light: the whole quantity the
++  sprite would have spread is deposited at the source's own position, in the same layer, which is
++  bilinearly upscaled into the HDR target. Turning the budget on cannot darken a scene. (It does
++  not *spread* the residual — the bloom chain has already run by the time this pass is called, so
++  there is no bloom input left to add to. A veiling pass for the residual is the next step.)
++* **No popping.** The crossfade is a stop wide, and the controller is asymmetric (fast up, slow
++  down) with a dead band at `[0.8N, N]`, so a source drifting past the budget while the camera
++  pans fades its rays over several frames.
++* **Bit-identical when it is not needed.** `raw <= N` drives the cutoff to zero, and a zero cutoff
++  is the un-budgeted vertex shader exactly. The budget is gated on `IsSceneReferredStage(5)`, so
++  off the switch the branch is never entered at all.
++
++Worst case is then `N` sprites plus one pixel per remaining source, i.e. bounded by the budget and
++`Reach` rather than by how bright the scene is.
++
++**Measuring it.** `r_HDRDiffractionDebug 3`'s once-a-second report now leads with the population,
++raw first, and the stats chain runs whenever that mode is on even with the budget at 0 — so the
++number can be read before deciding what `N` should be:
++
++```
++[BLOOM]   SOURCES: raw above threshold = 51234 of the 960 x 540 grid -- one sprite each,
++          162 x 162 half-res px per sprite = 1344.6 Mpx of blending unbudgeted
++[BLOOM]            budget 256 (r_HDRDiffractionMaxSources): 261 drew a star, cutoff 2.9 = +4.0
++          stops -- the other 50973 kept their LIGHT (12.4% of the source excess, deposited at
++          the source) and lost their shape
++```
++
++The counts are the GPU's own arithmetic over that frame's source, not an estimate, and the raw
++count uses exactly the vertex shader's collapse test.
++
++**The analytic streaks, the anamorphic flare and halation need no budget and do not have one.**
++They are directional stretch blurs: a fixed number of full-screen passes whose cost is independent
++of how many texels cleared the threshold. Only the threshold *constant* is shared. The **front
++filter PSF** is the one other sparse sprite scatter in the file and has the same failure mode at a
++quarter of the candidate cells; when it is budgeted it should reuse this chain rather than grow
++its own. Full reasoning: `scene-notes/decisions/s8-glare-budget.md`.
++
+ ## 4. Parameters
+ 
+ Component `SCineStreakParams` (Diffraction Streaks): `Mode` (enum Analytic/Wave, default Wave),
+@@ -445,7 +514,8 @@ mask rotation / mask scale / `k_sa` / `N_geo` every frame — expose them from t
+ 
+ Cvars: `r_HDRDiffractionKernel` (1), `r_HDRDiffractionDebug` (0), `r_HDRDiffractionSAWaves`
+ (0.25), `r_HDRDiffractionKernelSize` (512; 256 allowed for a 4× cheaper job at half the
+-structural resolution — same `d = L/2`).
++structural resolution — same `d = L/2`)., `r_HDRDiffractionMaxSources` (256; 0 = unlimited,
++§3.1 — the source budget, scene-referred path only).
+ 
+ Schematyc `szName`s `[A-Za-z0-9_]+`; enum reflection as the other enums in the component.
+ 
+@@ -461,6 +531,13 @@ Schematyc `szName`s `[A-Za-z0-9_]+`; enum reflection as the other enums in the c
+   FFT is the upgrade path.
+ * Spectral sampling at six wavelengths shows slight banding in very long rays; raise `n_λ`
+   if the user sees it.
++* The source budget's residual is deposited AT the source rather than spread as a veil, and
++  sources inside the one-stop crossfade drop their residual entirely (a fraction of a fraction of
++  a percent of the frame). The budget's controller is also one frame behind, so a hard cut into a
++  very bright scene overshoots `N` for two or three frames before it settles.
++* No source MERGE: a lamp that clears the threshold over a 5×5 block spends 25 of the budget's
++  slots. The report's `SOURCES` line is the instrument that will say when that starts to matter;
++  `decisions/s8-glare-budget.md` approach B is the answer when it does.
+ 
+ ## 6. Acceptance (user, by eye)
+ 
+diff --git a/Code/CryPlugins/CinematicCamera/docs/ConsoleReference.md b/Code/CryPlugins/CinematicCamera/docs/ConsoleReference.md
+index 137d1997..d19a2333 100644
+--- a/Code/CryPlugins/CinematicCamera/docs/ConsoleReference.md
++++ b/Code/CryPlugins/CinematicCamera/docs/ConsoleReference.md
+@@ -664,6 +664,14 @@ diagnostics outrank the mask. Kernel parameter changes are logged as
+ | 3 — sources | Draws the pass's own **thresholded and pre-blurred source texture** (the excess above `HDR_Streaks_Threshold`, at half resolution, after the small Gaussian that rounds a lamp's block of texels off — which is what the sprite grid actually reads) into the same corner, at half the frame height and in the frame's own aspect, on a four-decade grey scale lifted clear of the floor: any excess at all reads 0.25, then E = 1 → 0.30, 10 → 0.44, 100 → 0.62, 1000 → 0.81, 10000 → 1.0. The panel is sampled as a **5x5 max over the source's own texel grid** — it is a half-size copy of the pass's half-resolution source, so it still minifies 2:1 and a one-texel source was point-sampled away three times out of four — and it carries a dim floor and a border, so "nothing cleared the threshold" and "the pass never ran" are not the same black rectangle. Once a second it also logs the brightest source on screen, over an asynchronous staging readback (issued one frame, mapped a few frames later — no stall): `[BLOOM] diffraction sources: max excess = 214.0 (threshold 12.0) at (238, 131) half-res`. If that number is small, no amount of pattern work will make rays appear. |
+ | All modes > 0 | The once-per-change `[BLOOM] diffraction glare` log gains a second line with the energy factor (which is now simply `Streak Amount`: the layer is composited straight into the HDR target, so the tone mapper's bloom weight — printed for reference — no longer stands between the deposit and the screen), and the sprite's half extent in **native** pixels, so the whole path from a source's excess to a pixel (`E * energy * I * norm`) is readable off the log. |
+ 
++### r_HDRDiffractionMaxSources
++
++| | |
++| --- | --- |
++| Default | 256 |
++| Purpose | **Source budget** for the wave glare. The sprite pass draws one sprite per half-resolution texel above `HDR_Streaks_Threshold`, and each sprite is some 160 px across, so under the scene-referred pre-exposure a bright sky can put tens of thousands of them on screen and the frame rate follows the brightness down. This is the largest number of texels that may draw a sprite in one frame. Above the budget the dimmest sources lose their **star** but not their **light**: the whole energy their pattern would have spread is deposited at the source instead, so nothing darkens, and a one-stop crossfade at the budget means nothing pops while panning. 0 = unlimited (the pre-budget behaviour). Scene-referred path only; with it off, and whenever the raw population already fits the budget, the pass is bit-identical to the un-budgeted one. |
++| Measuring | `r_HDRDiffractionDebug 3`'s once-a-second report leads with `SOURCES: raw above threshold = N of the W x H grid`, and the counting chain runs even with the budget at 0 - so the real population of a scene can be read before deciding what the budget should be. |
++
+ ### r_HDRDiffractionKernelSize
+ 
+ | | |
+diff --git a/Engine/Shaders/HWScripts/CryFX/HDRPostProcess.cfx b/Engine/Shaders/HWScripts/CryFX/HDRPostProcess.cfx
+index 300d5ec7..657d55b8 100644
+--- a/Engine/Shaders/HWScripts/CryFX/HDRPostProcess.cfx
++++ b/Engine/Shaders/HWScripts/CryFX/HDRPostProcess.cfx
+@@ -448,7 +448,8 @@ float4 FilterPSFPS(v2fFilterPSF IN) : SV_Target
+ 
+ float4 DiffractionParams0;    // (sprite radius in half-res px, kernel texel pitch in the same px, R_tex, 1 / pitch^2)
+ float4 DiffractionParams1;    // (dispersion 0..1, grid size L, max LOD = mip count - 1, r_HDRDiffractionDebug mode)
+-float4 DiffractionParams2;    // (sprite half extent x in NDC, half extent y in NDC, energy per unit of source excess, unused)
++float4 DiffractionParams2;    // (sprite half extent x in NDC, half extent y in NDC, energy per unit of source excess, deposited glare fraction)
++float4 DiffractionParams3;    // (source budget active 0/1, residual quad half extent x in NDC, half extent y in NDC, unused)
+ float4 DiffractionSpectrum[6];// rgb = colour * (l0/l)^2 normalised to white, w = l0 / l
+ float4 DiffractionDebugParams;// (display width fraction, display height fraction, log gain, output scale)
+ float4 DiffractionDebugParams1;// (1 / source width, 1 / source height, unused, unused) - debug pass only
+@@ -456,14 +457,190 @@ float4 DiffractionDebugParams1;// (1 / source width, 1 / source height, unused,
+ Texture2D<float4> HDRDiffraction_Src   : register(t0);  // thresholded + pre-blurred half res source, vertex shader
+ Texture2D<float4> HDRDiffraction_Kernel: register(t1);  // sqrt(|F{pupil}|^2), L x L, R16F
+ Texture2D<float4> HDRDiffraction_Ring  : register(t2);  // sqrt(I) on the kernel's boundary ring, 256 x 1, R16F
++Texture2D<float4> HDRDiffraction_Stats : register(t3);  // 1 x 1 source budget stats, vertex shader
+ SamplerState HDRDiffraction_PClampSampler : register(s0);  // PointClamp
+ SamplerState HDRDiffraction_LClampSampler : register(s1);  // TrilinearClamp - the kernel is mipped
+ SamplerState HDRDiffraction_LWrapSampler  : register(s2);  // LinearWrap - the ring is an angle
+ 
++////////////////////////////////////////////////////////////////////////////////////////////////////
++// The wave glare's SOURCE BUDGET (decisions/s8-glare-budget.md).
++//
++// The sprite pass draws one quad per half-resolution texel and the vertex shader collapses the
++// ones whose source is empty, so its cost is EXACTLY the number of texels above
++// HDR_Streaks_Threshold times the sprite's area. Under the scene-referred pre-exposure that
++// threshold is an absolute scene value, so raising the exposure - or walking outside - can put
++// tens of thousands of texels over it at once, each drawing a sprite the size of a small window.
++// That is the reported "brightness up, frame rate down".
++//
++// These three passes answer, on the GPU and with no CPU round trip, the one question the vertex
++// shader needs: what energy must a source have to be worth a sprite this frame?
++//
++//   1. HDRDiffractionSourceStats   source -> 8x8 tiles: (raw count, count above the cutoff,
++//                                  summed excess, excess below the cutoff)
++//   2. HDRDiffractionStatsReduce   tiles  -> a fixed 16x16 target, the same four sums
++//   3. HDRDiffractionBudget        16x16  -> ONE texel: (cutoff, raw, above, below fraction),
++//                                  the cutoff corrected from the previous frame's count
++//
++// Step 3 is a controller, not a solver: it multiplies the previous cutoff by (count / N)^k and
++// converges in two or three frames. A histogram would give the answer in one frame with no
++// state, and would cost three more passes and four more targets to buy a precision that the
++// vertex shader's one-stop crossfade makes irrelevant - a factor of two in the cutoff is a
++// factor of two in the sprite count, which is the tolerance the budget already has.
++//
++// The cutoff selects the same set a top-N sort would (the N brightest sources are exactly those
++// above the N-th value) without needing a sort, a compaction pass or an append buffer - none of
++// which exist anywhere on this path.
++
++float4 DiffractionStatsParams0;  // (1 / source width, 1 / source height, block width, block height)
++float4 DiffractionStatsParams1;  // (source width, source height, target width, target height)
++float4 DiffractionBudgetParams;  // (budget N, 0 = unlimited, unused, unused, unused)
++
++Texture2D<float4> HDRDiffractionStats_Src  : register(t0);  // the source, or the previous stage's tiles
++Texture2D<float4> HDRDiffractionStats_Prev : register(t1);  // the PREVIOUS frame's 1 x 1 stats
++SamplerState HDRDiffractionStats_PSampler0 : register(s0);  // PointClamp
++SamplerState HDRDiffractionStats_PSampler1 : register(s1);  // PointClamp
++
++// Step 1. One output texel per 8x8 block of source texels. The raw count uses EXACTLY the
++// vertex shader's collapse test, so "raw sources" in the report is the number of sprites the
++// pass would rasterize with no budget at all - not an estimate of it.
++float4 HDRDiffractionSourceStatsPS(vtxOut IN) : SV_Target
++{
++	const float2 vSrcSize    = DiffractionStatsParams1.xy;
++	const float2 vTargetSize = DiffractionStatsParams1.zw;
++	const float2 vInvSrc     = DiffractionStatsParams0.xy;
++	const int2   vBlock      = (int2)DiffractionStatsParams0.zw;
++
++	const int2 vBase = ((int2)floor(IN.baseTC.xy * vTargetSize)) * vBlock;
++
++	// The cutoff this frame's population is measured AGAINST is last frame's - that is the one
++	// frame of lag the controller has, and it is the whole reason step 3 can be a controller.
++	const float fPrevCut = HDRDiffractionStats_Prev.SampleLevel(HDRDiffractionStats_PSampler1, float2(0.5, 0.5), 0).x;
++
++	float4 acc = 0;
++
++	[loop] for (int j = 0; j < vBlock.y; ++j)
++	{
++		[loop] for (int i = 0; i < vBlock.x; ++i)
++		{
++			const int2 p = vBase + int2(i, j);
++			if (p.x >= (int)vSrcSize.x || p.y >= (int)vSrcSize.y)
++				continue;
++
++			const float2 uv = ((float2)p + 0.5) * vInvSrc;
++			const float3 c = HDRDiffractionStats_Src.SampleLevel(HDRDiffractionStats_PSampler0, uv, 0).rgb;
++			if (dot(c, float3(1, 1, 1)) < 1e-4)
++				continue;
++
++			// The threshold pass keeps the source's hue, so the brightest channel is the number
++			// that decides what this source is worth - the same measure the report's peak uses.
++			const float e = max(c.r, max(c.g, c.b));
++			acc.x += 1.0;
++			acc.z += e;
++			if (e >= fPrevCut)
++				acc.y += 1.0;
++			else
++				acc.w += e;
++		}
++	}
++
++	return acc;
++}
++
++// Step 2. Plain block sum of step 1's output into the fixed 16x16 target, so step 3 is always
++// exactly 256 taps whatever the resolution is.
++float4 HDRDiffractionStatsReducePS(vtxOut IN) : SV_Target
++{
++	const float2 vSrcSize    = DiffractionStatsParams1.xy;
++	const float2 vTargetSize = DiffractionStatsParams1.zw;
++	const float2 vInvSrc     = DiffractionStatsParams0.xy;
++	const int2   vBlock      = (int2)DiffractionStatsParams0.zw;
++
++	const int2 vBase = ((int2)floor(IN.baseTC.xy * vTargetSize)) * vBlock;
++
++	float4 acc = 0;
++
++	[loop] for (int j = 0; j < vBlock.y; ++j)
++	{
++		[loop] for (int i = 0; i < vBlock.x; ++i)
++		{
++			const int2 p = vBase + int2(i, j);
++			if (p.x >= (int)vSrcSize.x || p.y >= (int)vSrcSize.y)
++				continue;
++
++			acc += HDRDiffractionStats_Src.SampleLevel(HDRDiffractionStats_PSampler0, ((float2)p + 0.5) * vInvSrc, 0);
++		}
++	}
++
++	return acc;
++}
++
++// Step 3. One texel: sum what is left of the frame, then correct the cutoff.
++float4 HDRDiffractionBudgetPS(vtxOut IN) : SV_Target
++{
++	const int2   vSrcSize = (int2)DiffractionStatsParams1.xy;
++	const float2 vInvSrc  = DiffractionStatsParams0.xy;
++
++	float4 acc = 0;
++	[loop] for (int j = 0; j < vSrcSize.y; ++j)
++	{
++		[loop] for (int i = 0; i < vSrcSize.x; ++i)
++		{
++			acc += HDRDiffractionStats_Src.SampleLevel(HDRDiffractionStats_PSampler0, ((float2)int2(i, j) + 0.5) * vInvSrc, 0);
++		}
++	}
++
++	const float fRaw   = acc.x;
++	const float fAbove = acc.y;
++	const float fSum   = acc.z;
++	const float fBelow = acc.w;
++
++	const float fPrevCut = HDRDiffractionStats_Prev.SampleLevel(HDRDiffractionStats_PSampler1, float2(0.5, 0.5), 0).x;
++	const float fBudget  = DiffractionBudgetParams.x;
++
++	// Below this the cutoff is indistinguishable from off, and holding a denormal one alive would
++	// keep the vertex shader's crossfade running for no reason.
++	const float kMinCut = 1e-6;
++
++	float fCut;
++
++	if (fBudget < 0.5 || fRaw <= fBudget)
++	{
++		// The budget is off, or the whole population fits inside it: DECAY the cutoff rather than
++		// snapping it to zero, so a frame that drops back under the budget fades its stars in over
++		// a few frames instead of switching them on. A scene that has always fitted sits at 0, and
++		// the sprite pass is then bit-identical to the un-budgeted one.
++		fCut = fPrevCut * 0.5;
++		if (fCut < kMinCut)
++			fCut = 0.0;
++	}
++	else if (fPrevCut <= 0.0)
++	{
++		// Bootstrap. Two decades BELOW the mean excess, and climb: starting at the answer would
++		// cull half the frame in a single frame, which is exactly the pop this exists to avoid.
++		fCut = max(0.01 * fSum / max(fRaw, 1.0), kMinCut);
++	}
++	else if (fAbove <= fBudget && fAbove >= 0.8 * fBudget)
++	{
++		// Dead band. Without it the controller hunts around N by a few sources every frame - and
++		// the sources it hunts over are the ones on the crossfade, i.e. it would flicker them.
++		fCut = fPrevCut;
++	}
++	else
++	{
++		// Asymmetric on purpose: react fast when there are too many (that is the frame-rate cliff
++		// arriving) and relax slowly when there are too few (that is only a missing star).
++		const float fRatio = clamp(fAbove / max(fBudget, 1.0), 0.02, 100.0);
++		const float fStep  = (fRatio > 1.0) ? 0.5 : 0.15;
++		fCut = max(fPrevCut * pow(fRatio, fStep), kMinCut);
++	}
++
++	return float4(fCut, fRaw, fAbove, (fSum > 0.0) ? (fBelow / fSum) : 0.0);
++}
++
+ struct v2fDiffraction
+ {
+ 	float4 Position : SV_POSITION;
+-	float4 QuadUV   : TEXCOORD0;  // xy: quad local, 0..1 across the sprite. zw unused.
++	float4 QuadUV   : TEXCOORD0;  // xy: quad local, 0..1 across the sprite. z: 1 = the budget's residual quad. w unused.
+ 	float4 Color    : TEXCOORD1;  // rgb: this source's deposit. a unused.
+ };
+ 
+@@ -487,9 +664,40 @@ v2fDiffraction DiffractionPSFVS(uint nVertexID : SV_VertexID)
+ 		return OUT;
+ 	}
+ 
++	// The SOURCE BUDGET (decisions/s8-glare-budget.md). DiffractionParams3.x is 0 unless the
++	// budget is configured AND the scene-referred path is on, and at 0 not one line of this runs -
++	// which is what keeps the un-budgeted path byte-identical rather than merely equal.
++	float fWeight = 1.0;
++	if (DiffractionParams3.x > 0.5)
++	{
++		const float fCut = HDRDiffraction_Stats.SampleLevel(HDRDiffraction_PClampSampler, float2(0.5, 0.5), 0).x;
++		if (fCut > 0.0)
++		{
++			// One STOP of crossfade, not a hard cut: a source drifting past the budget while the
++			// camera pans loses its rays over several frames instead of switching off. This is the
++			// whole anti-popping mechanism and it costs one smoothstep.
++			const float e = max(cExcess.r, max(cExcess.g, cExcess.b));
++			fWeight = smoothstep(fCut, fCut * 2.0, e);
++		}
++	}
++
++	if (fWeight <= 0.0)
++	{
++		// Below the budget: no sprite - but the LIGHT does not disappear. A single half-res texel
++		// carries the whole energy the pattern would have spread (excess * gain * the deposited
++		// fraction) into the same layer, at the source's own position. The frame's total is
++		// unchanged, so turning the budget on cannot darken a scene, and a source crossing the
++		// budget loses its SHAPE, not its light. The layer is bilinearly upscaled into the HDR
++		// target, so one texel lands as a soft 2x2 native blob on the source itself.
++		OUT.Color.rgb = cExcess * DiffractionParams2.z * DiffractionParams2.w;
++		OUT.Position.xy += g_SpriteQuadVerts[nVertexID % 6].xy * DiffractionParams3.yz;
++		OUT.QuadUV = float4(g_SpriteQuadVerts[nVertexID % 6].xy * 0.5 + 0.5, 1, 0);
++		return OUT;
++	}
++
+ 	// float, not half: the deposit carries the bloom-weight divide (a factor of some 250) on top
+ 	// of an HDR excess, which overflows half long before it overflows anything visible.
+-	OUT.Color.rgb = cExcess * DiffractionParams2.z;
++	OUT.Color.rgb = cExcess * DiffractionParams2.z * fWeight;
+ 
+ 	// The x half extent already carries the anamorphic stretch: the iris sits BEHIND the
+ 	// cylindrical group, so its pattern is formed unsqueezed and the desqueeze widens it.
+@@ -501,6 +709,12 @@ v2fDiffraction DiffractionPSFVS(uint nVertexID : SV_VertexID)
+ 
+ float4 DiffractionPSFPS(v2fDiffraction IN) : SV_Target
+ {
++	// The budget's RESIDUAL deposit (see the vertex shader): one texel carrying the energy this
++	// source's pattern is not going to spread. Flat, no kernel, no windows, no dispersion - it is
++	// an energy being conserved, not a picture being drawn.
++	if (IN.QuadUV.z > 0.5)
++		return float4(IN.Color.rgb, 0.0);
++
+ 	// Quad local in [-1, 1] scaled to the PATTERN's own coordinates. The y flip puts us in the
+ 	// texture space the pupil was rastered in (v down), which is the space the bokeh shape mask
+ 	// is authored in and the space the iris phase is measured in - so a mask's diffraction
+@@ -2224,6 +2438,36 @@ technique HDRDiffractionSourceBlur
+   }
+ }
+ 
++technique HDRDiffractionSourceStats
++{
++  pass p0
++  {
++    VertexShader = FullscreenTriVS() HDRPostProcessVS;
++    PixelShader = HDRDiffractionSourceStatsPS() HDRPostProcessPS;
++    CullMode = None;
++  }
++}
++
++technique HDRDiffractionStatsReduce
++{
++  pass p0
++  {
++    VertexShader = FullscreenTriVS() HDRPostProcessVS;
++    PixelShader = HDRDiffractionStatsReducePS() HDRPostProcessPS;
++    CullMode = None;
++  }
++}
++
++technique HDRDiffractionBudget
++{
++  pass p0
++  {
++    VertexShader = FullscreenTriVS() HDRPostProcessVS;
++    PixelShader = HDRDiffractionBudgetPS() HDRPostProcessPS;
++    CullMode = None;
++  }
++}
++
+ technique HDRDiffractionComposite
+ {
+   pass p0
+-- 
+2.47.1.windows.1
+

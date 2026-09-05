@@ -1,0 +1,591 @@
+From 1f937c32857d988be0ee40ae52935fd4da60aac6 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Fri, 28 Aug 2026 09:29:27 +0800
+Subject: [PATCH 081/119] scene-referred S4: the output transform, and
+ FilmMapping's other half
+
+%_RT_SAMPLE0 - the permutation S2 already claimed for the pre-curve sun-shaft composite - now
+also selects the whole body of FilmMapping. The two halves share the vignette scalar and the
+bloom composite and nothing else.
+
+The scene-referred half, per pixel:
+
+    vignette x bloom composite      (shared; exposure is 1.0, S1 applied it on the light side)
+    Bradford white balance 3x3      (CPU-computed constant, exactly identity when off)
+    ACEScg -> ACEScct               (CommonMath.cfi's analytic shaper)
+    ASC CDL: (in*slope + offset)^power, then saturation about the AP1 luminance
+    LMT 3D fetch (t3)               (skipped when the slot is empty - D10's pure ACES default)
+    ODT 3D fetch (t4)               -> display-encoded [0,1]
+    dither                          (shared, unchanged)
+
+and nothing else: no ComputeExposure (the whole-body #if is what keeps the EV formula and the
+luminance fetch from being evaluated for a value this path throws away), no Hable curve, no sRGB
+encode - the ODT carries it, because the back buffer is R8G8B8A8_UNORM and not sRGB-typed - and
+no colour chart, which D9 skips whole.
+
+- The CDL order is the ASC specification's: slope, then offset, then power on the clamped result,
+  per channel, no cross-channel term; saturation is the ASC's own extension, after the SOP and
+  about the luminance of the graded value. The luminance weights are AP1's, not Rec.709's,
+  because that is the space this happens in.
+- The half-texel inset for an N^3 grid is spelled out in SampleLut3D rather than folded into the
+  call: getting it wrong is a small, uniform, entirely invisible error.
+- The LUT helper lives in HDRPostProcess.cfx and not in PostEffectsLib.cfi. The research note
+  suggested the shared header; there is exactly one consumer, and putting it there would
+  invalidate the compiled form of every shader that includes it for no gain. Noted as a
+  deviation.
+- Six new float4s (SceneWBRow0..2, SceneCDLSlope/Offset/Power) rather than re-purposing
+  HDRMiscParams: DisplayDebugInfo() still prints that block by its old meanings.
+- With no ODT loaded the branch returns the clamped log image - visibly, unmistakably wrong -
+  instead of falling back to the film curve and producing a plausible picture from a broken
+  configuration (D13).
+- White balance is the CAMERA'S setting: a Bradford adaptation FROM the set temperature TOWARDS
+  the neutral one, so 3200 K in daylight reads blue. CCT -> xy is Kim et al.'s cubic on the
+  Planckian locus; tint is a Duv offset perpendicular to it in the CIE 1960 UCS, positive =
+  magenta. The neutral white is 6500 K + tint 0 through THAT SAME locus, not a tabulated D65, so
+  the neutral setting is an exact identity by construction rather than an identity to six
+  decimals.
+- Eight new bus params carry the grade (bypass, WB enable/Kelvin/tint, slope/offset/power,
+  saturation), all neutral by default. Nothing writes them yet - the camera controls are S5.
+
+Also in this commit, because it invalidates the permutation cache anyway: the dead SAMPLE2 set
+is gone. It was written for a vignette gate whose polarity was inverted years ago and that the
+strength constant replaced; nothing has read the flag since. Every cached HDRFinalPass variant is
+invalidated, the stock ones included, and not one pixel moves on either path.
+
+Co-Authored-By: Claude Opus <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01A72MFkdSczncE7au9UVnmu
+---
+ .../Common/PostProcess/PostProcess.cpp        |  33 +++
+ .../Common/PostProcess/PostProcess.h          |  15 +
+ .../GraphicsPipeline/ToneMapping.cpp          | 259 +++++++++++++++++-
+ .../HWScripts/CryFX/HDRPostProcess.cfx        |  98 ++++++-
+ 4 files changed, 398 insertions(+), 7 deletions(-)
+
+diff --git a/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.cpp b/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.cpp
+index 7559aec1..6b9c64c0 100644
+--- a/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.cpp
++++ b/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.cpp
+@@ -410,6 +410,23 @@ int CPostEffectsMgr::Init()
+ 	AddParamFloatNoTransition("Global_User_LutLMT", m_pUserLutLMT, 0.0f);
+ 	AddParamFloatNoTransition("Global_User_LutLMTSize", m_pUserLutLMTSize, 0.0f);
+ 
++	// The camera grading block (SceneReferredSpec.md S5). All neutral by default, so a camera
++	// that publishes nothing gets pure ACES (D10). Read once per frame by the tone map through
++	// GetByName - the same way ResolveVignetteParams() reads the pupil params - because eight
++	// cached pointers to carry eight numbers into one pass is not a trade worth making.
++	//
++	// No transition on any of them: a grade is a decision, not a value to cross-fade. The
++	// renderer inventing a fade between two looks is precisely the kind of surprise the
++	// no-transition params exist to avoid.
++	AddParamFloatNoTransition("Global_User_GradeBypass", m_pUserGradeBypass, 0.0f);
++	AddParamFloatNoTransition("Global_User_GradeWBEnable", m_pUserGradeWBEnable, 0.0f);
++	AddParamFloatNoTransition("Global_User_GradeWBKelvin", m_pUserGradeWBKelvin, 6500.0f);
++	AddParamFloatNoTransition("Global_User_GradeWBTint", m_pUserGradeWBTint, 0.0f);
++	AddParamVec4NoTransition("Global_User_GradeSlope", m_pUserGradeSlope, Vec4(1.0f, 1.0f, 1.0f, 0.0f));
++	AddParamVec4NoTransition("Global_User_GradeOffset", m_pUserGradeOffset, Vec4(0.0f, 0.0f, 0.0f, 0.0f));
++	AddParamVec4NoTransition("Global_User_GradePower", m_pUserGradePower, Vec4(1.0f, 1.0f, 1.0f, 0.0f));
++	AddParamFloatNoTransition("Global_User_GradeSaturation", m_pUserGradeSaturation, 1.0f);
++
+ 	// Register all post processes
+ 	AddEffect(CSunShafts);
+ 	AddEffect(CDepthOfField);
+@@ -523,6 +540,14 @@ void CPostEffectsMgr::Release()
+ 	m_pUserLutODTSize = nullptr;
+ 	m_pUserLutLMT = nullptr;
+ 	m_pUserLutLMTSize = nullptr;
++	m_pUserGradeBypass = nullptr;
++	m_pUserGradeWBEnable = nullptr;
++	m_pUserGradeWBKelvin = nullptr;
++	m_pUserGradeWBTint = nullptr;
++	m_pUserGradeSlope = nullptr;
++	m_pUserGradeOffset = nullptr;
++	m_pUserGradePower = nullptr;
++	m_pUserGradeSaturation = nullptr;
+ 
+ 	std::for_each(m_pEffects.begin(), m_pEffects.end(), container_object_safe_release());
+ 	std::for_each(m_pEffects.begin(), m_pEffects.end(), container_object_safe_delete());
+@@ -567,6 +592,14 @@ void CPostEffectsMgr::Reset(bool bOnSpecChange)
+ 	m_pUserLutODTSize->ResetParam(0.0f);
+ 	m_pUserLutLMT->ResetParam(0.0f);
+ 	m_pUserLutLMTSize->ResetParam(0.0f);
++	m_pUserGradeBypass->ResetParam(0.0f);
++	m_pUserGradeWBEnable->ResetParam(0.0f);
++	m_pUserGradeWBKelvin->ResetParam(6500.0f);
++	m_pUserGradeWBTint->ResetParam(0.0f);
++	m_pUserGradeSlope->ResetParamVec4(Vec4(1.0f, 1.0f, 1.0f, 0.0f));
++	m_pUserGradeOffset->ResetParamVec4(Vec4(0.0f, 0.0f, 0.0f, 0.0f));
++	m_pUserGradePower->ResetParamVec4(Vec4(1.0f, 1.0f, 1.0f, 0.0f));
++	m_pUserGradeSaturation->ResetParam(1.0f);
+ 
+ 	if (bOnSpecChange)
+ 		std::for_each(m_pEffects.begin(), m_pEffects.end(), SContainerPostEffectResetOnSpecChange());
+diff --git a/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.h b/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.h
+index 3a2e0d64..e4c4ca55 100644
+--- a/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.h
++++ b/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.h
+@@ -457,6 +457,14 @@ public:
+ 		, m_pUserLutODTSize(nullptr)
+ 		, m_pUserLutLMT(nullptr)
+ 		, m_pUserLutLMTSize(nullptr)
++		, m_pUserGradeBypass(nullptr)
++		, m_pUserGradeWBEnable(nullptr)
++		, m_pUserGradeWBKelvin(nullptr)
++		, m_pUserGradeWBTint(nullptr)
++		, m_pUserGradeSlope(nullptr)
++		, m_pUserGradeOffset(nullptr)
++		, m_pUserGradePower(nullptr)
++		, m_pUserGradeSaturation(nullptr)
+ 	{
+ 		ClearCache();
+ #ifndef _RELEASE
+@@ -656,6 +664,13 @@ protected:
+ 	// is a mistake the tone map makes visible rather than papering over. Same bus, same
+ 	// single-writer and handover semantics as the two params above.
+ 	CEffectParam*       m_pUserLutODT, * m_pUserLutODTSize, * m_pUserLutLMT, * m_pUserLutLMTSize;
++	// The camera grading block (SceneReferredSpec.md S5): white balance as the camera's SETTING
++	// (Kelvin + tint, 6500/0 = identity), the ASC CDL triple, saturation, and a bypass for the
++	// A/B. Read by name once per frame in CToneMappingStage::Execute(); no cached accessors,
++	// unlike the four LUT params, because eight pointers for eight numbers in one pass is not a
++	// trade worth making.
++	CEffectParam*       m_pUserGradeBypass, * m_pUserGradeWBEnable, * m_pUserGradeWBKelvin, * m_pUserGradeWBTint;
++	CEffectParam*       m_pUserGradeSlope, * m_pUserGradeOffset, * m_pUserGradePower, * m_pUserGradeSaturation;
+ 	CEffectParam*       m_pUserColorC, * m_pUserColorY, * m_pUserColorM, * m_pUserColorK, * m_pUserColorHue;
+ 
+ 	CPostEffectVec      m_pEffects;
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.cpp
+index 0ec3b116..a5bc1411 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.cpp
+@@ -48,6 +48,146 @@ static Vec4 ResolveVignetteParams()
+ // (SceneReferredSpec.md D3/D6, decisions/s1-exposure-constant.md).
+ static const float kSceneReferredUnityEV = 13.0245867f;
+ 
++// ---------------------------------------------------------------------------
++// The camera stage's white balance (SceneReferredSpec.md S5).
++//
++// WB is the CAMERA'S SETTING, not a description of the scene: the scene is lit at whatever it is
++// lit at, and the camera is told what to call white. So the transform is a chromatic adaptation
++// FROM the temperature the camera is set to TOWARDS the neutral setting - which is why 3200 K in
++// daylight comes out blue and 8000 K comes out warm, exactly as a stills camera does.
++//
++// The neutral is 6500 K + tint 0 evaluated through THIS SAME locus, not a tabulated D65. That
++// makes the neutral setting an exact identity by construction (source white == destination white
++// -> the adaptation is the identity matrix to the last bit) instead of an identity to six
++// decimals, which is what "6500 = no-op" has to mean if the switch is to be provable.
++//
++// CCT -> xy is Kim et al.'s cubic fit to the Planckian locus (1667..25000 K), the formula
++// Resolve, Nuke and every camera pipeline use. Tint is a Duv offset perpendicular to the locus
++// in the CIE 1960 UCS, the space Duv is defined in; positive tint is magenta (below the locus),
++// negative is green, matching the sign convention of every grading tool.
++// ---------------------------------------------------------------------------
++namespace
++{
++
++//! AP1 (ACEScg primaries) -> CIE XYZ with the ACES D60 white. Verified against PyOpenColorIO
++//! 2.5 by tools/ocio-bake/verify_matrices.py; the same numbers CommonMath.cfi carries.
++static const Matrix33 kAP1ToXYZ(
++	0.66245418f, 0.13400421f, 0.15618769f,
++	0.27222872f, 0.67408177f, 0.05368952f,
++	-0.00557465f, 0.00406073f, 1.01033910f);
++
++//! Bradford cone response, the chromatic adaptation transform D5 names.
++static const Matrix33 kBradford(
++	0.8951f, 0.2664f, -0.1614f,
++	-0.7502f, 1.7135f, 0.0367f,
++	0.0389f, -0.0685f, 1.0296f);
++
++//! Kim et al. (2002) cubic fit to the Planckian locus.
++static Vec2 CCTToXY(float kelvin)
++{
++	const float T = clamp_tpl(kelvin, 1667.0f, 25000.0f);
++	const float invT = 1.0f / T;
++	const float invT2 = invT * invT;
++	const float invT3 = invT2 * invT;
++
++	const float x = (T <= 4000.0f)
++		? (-0.2661239e9f * invT3 - 0.2343589e6f * invT2 + 0.8776956e3f * invT + 0.179910f)
++		: (-3.0258469e9f * invT3 + 2.1070379e6f * invT2 + 0.2226347e3f * invT + 0.240390f);
++
++	const float x2 = x * x;
++	const float x3 = x2 * x;
++
++	float y;
++	if (T <= 2222.0f)
++		y = -1.1063814f * x3 - 1.34811020f * x2 + 2.18555832f * x - 0.20219683f;
++	else if (T <= 4000.0f)
++		y = -0.9549476f * x3 - 1.37418593f * x2 + 2.09137015f * x - 0.16748867f;
++	else
++		y = 3.0817580f * x3 - 5.87338670f * x2 + 3.75112997f * x - 0.37001483f;
++
++	return Vec2(x, y);
++}
++
++static Vec2 XYToUV1960(const Vec2& xy)
++{
++	const float d = -2.0f * xy.x + 12.0f * xy.y + 3.0f;
++	return Vec2(4.0f * xy.x / d, 6.0f * xy.y / d);
++}
++
++static Vec2 UV1960ToXY(const Vec2& uv)
++{
++	const float d = 2.0f * uv.x - 8.0f * uv.y + 4.0f;
++	return Vec2(3.0f * uv.x / d, 2.0f * uv.y / d);
++}
++
++//! The white point for a (Kelvin, tint) camera setting, as XYZ normalised to Y = 1.
++//! tint is -1..1; full scale is a Duv of 0.03, which is far past anything a shoot uses and
++//! still short of leaving the region the locus fit is valid in.
++static Vec3 CameraWhiteXYZ(float kelvin, float tint)
++{
++	Vec2 xy = CCTToXY(kelvin);
++
++	if (fabsf(tint) > 1e-6f)
++	{
++		// The normal to the locus, taken from a finite difference along it. Duv is signed
++		// positive ABOVE the locus (green); the tint control is signed positive toward magenta,
++		// hence the minus.
++		const Vec2 uv0 = XYToUV1960(CCTToXY(kelvin * 0.999f));
++		const Vec2 uv1 = XYToUV1960(CCTToXY(kelvin * 1.001f));
++		Vec2 tangent(uv1.x - uv0.x, uv1.y - uv0.y);
++		const float len = sqrtf(tangent.x * tangent.x + tangent.y * tangent.y);
++		if (len > 1e-9f)
++		{
++			tangent.x /= len;
++			tangent.y /= len;
++			const Vec2 normal(-tangent.y, tangent.x);
++			Vec2 uv = XYToUV1960(xy);
++			uv.x += normal.x * (-0.03f * tint);
++			uv.y += normal.y * (-0.03f * tint);
++			xy = UV1960ToXY(uv);
++		}
++	}
++
++	const float y = max(xy.y, 1e-6f);
++	return Vec3(xy.x / y, 1.0f, (1.0f - xy.x - xy.y) / y);
++}
++
++//! The Bradford adaptation from white src to white dst, expressed in the working space (AP1).
++//! Returns the identity when the two whites coincide, which is what makes the neutral setting a
++//! true no-op rather than a near-one.
++static Matrix33 ResolveWhiteBalanceMatrix(float kelvin, float tint, bool bEnabled)
++{
++	Matrix33 identity;
++	identity.SetIdentity();
++
++	if (!bEnabled)
++		return identity;
++
++	const Vec3 src = CameraWhiteXYZ(kelvin, tint);
++	const Vec3 dst = CameraWhiteXYZ(6500.0f, 0.0f);
++
++	if (src.IsEquivalent(dst, 1e-9f))
++		return identity;
++
++	const Vec3 coneSrc = kBradford * src;
++	const Vec3 coneDst = kBradford * dst;
++
++	Matrix33 scale;
++	scale.SetIdentity();
++	scale.m00 = coneDst.x / max(coneSrc.x, 1e-9f);
++	scale.m11 = coneDst.y / max(coneSrc.y, 1e-9f);
++	scale.m22 = coneDst.z / max(coneSrc.z, 1e-9f);
++
++	const Matrix33 catXYZ = kBradford.GetInverted() * scale * kBradford;
++
++	// XYZ in, XYZ out; the shader multiplies AP1 values, so the adaptation is conjugated by the
++	// primaries matrix. AP1 (1,1,1) is preserved exactly at the neutral setting because the
++	// adaptation itself is the identity there, whatever the primaries.
++	return kAP1ToXYZ.GetInverted() * catXYZ * kAP1ToXYZ;
++}
++
++} // namespace
++
+ void CToneMappingStage::Execute()
+ {
+ 	FUNCTION_PROFILER_RENDERER();
+@@ -61,7 +201,8 @@ void CToneMappingStage::Execute()
+ 	bool bSunShaftsEnabled = pSunShaftsStage->IsStageActive(EShaderRenderingFlags(0));
+ 	bool bBloomEnabled = pBloomStage->IsStageActive(EShaderRenderingFlags(0));
+ 	bool bApplyDithering = CRenderer::CV_r_HDRDithering && CRenderer::CV_r_PostProcess;
+-	bool bVignettingEnabled = CRenderer::CV_r_HDRVignetting && CRenderer::CV_r_PostProcess;
++	// (r_HDRVignetting used to gate the dead SAMPLE2 flag below and has no reader left; the
++	// vignette strength travels in HDRVignetteParams.x, from r_HDRVignetteAmount.)
+ 
+ 	// D14 (SceneReferredSpec.md): the scene-referred path takes its exposure from the cinematic
+ 	// camera and must do so whatever r_HDREyeAdaptationMode says. The engine default is 2, the
+@@ -77,6 +218,40 @@ void CToneMappingStage::Execute()
+ 	// replace with the camera's pre-exposure and nothing else has to move.
+ 	const bool bSceneReferred = CRendererResources::IsSceneReferred();
+ 
++	// The display chain's two LUTs. ccam parsed the .cube files and uploaded the 3D textures; all
++	// that arrives here is a texture ID, resolved the same way the colour grading stage resolves
++	// its identity chart. A size of 0 means the slot is empty - a legitimate answer for the look
++	// (D10) and a visible mistake for the output transform (D13), and the shader treats them so.
++	CTexture* pLmtTex = CRendererResources::s_ptexWhite3D;
++	CTexture* pOdtTex = CRendererResources::s_ptexWhite3D;
++	float fLmtSize = 0.0f;
++	float fOdtSize = 0.0f;
++	if (bSceneReferred)
++	{
++		if (CPostEffectsMgr* pPostMgr = PostEffectMgr())
++		{
++			const auto resolveLut = [](CEffectParam* pId, CEffectParam* pSize, CTexture*& pTex, float& fSize)
++			{
++				if (!pId || !pSize)
++					return;
++				const int nId = (int)pId->GetParam();
++				const float size = pSize->GetParam();
++				// Both have to be there. A texture that went away under a still-published ID is
++				// the one case that would sample garbage rather than nothing.
++				if (nId <= 0 || size < 2.0f)
++					return;
++				CTexture* pCandidate = CTexture::GetByID(nId);
++				if (!CTexture::IsTextureExist(pCandidate))
++					return;
++				pTex = pCandidate;
++				fSize = size;
++			};
++
++			resolveLut(pPostMgr->GetLutLMTParam(), pPostMgr->GetLutLMTSizeParam(), pLmtTex, fLmtSize);
++			resolveLut(pPostMgr->GetLutODTParam(), pPostMgr->GetLutODTSizeParam(), pOdtTex, fOdtSize);
++		}
++	}
++
+ 	CShader* pShader = CShaderMan::s_shHDRPostProcess;
+ 	CTexture* pSunShaftsTex = CRendererResources::s_ptexBlack;
+ 	CTexture* pColorChartTex = CRendererResources::s_ptexBlack;
+@@ -98,7 +273,8 @@ void CToneMappingStage::Execute()
+ 	                  ((CRenderer::CV_r_HDREyeAdaptationMode & 0xF) << 5) | ((CRenderer::CV_r_HDRDebug & 0xF) << 9) |
+ 	                  ((int)bSceneReferred << 13);
+ 
+-	if (m_passToneMapping.IsDirty(featureMask, pSunShaftsTex->GetTextureID(), pColorChartTex->GetTextureID(), CRendererResources::s_ptexCurLumTexture->GetTextureID()))
++	if (m_passToneMapping.IsDirty(featureMask, pSunShaftsTex->GetTextureID(), pColorChartTex->GetTextureID(), CRendererResources::s_ptexCurLumTexture->GetTextureID(),
++	                              pLmtTex->GetTextureID(), pOdtTex->GetTextureID()))
+ 	{
+ 		uint64 rtMask = 0;
+ 		if (bSceneReferred)
+@@ -118,10 +294,17 @@ void CToneMappingStage::Execute()
+ 		{
+ 			rtMask |= g_HWSR_MaskBit[HWSR_SAMPLE4];
+ 		}
+-		if (bColorGradingEnabled)
++		// D9: the colour chart is part of the stock LDR stage and is skipped whole under the
++		// switch. Not setting the flag rather than binding an identity chart - the fetch and the
++		// lerp go away with it, and the chart pipeline keeps running so that turning ccam off
++		// restores the stock look without a rebuild.
++		if (bColorGradingEnabled && !bSceneReferred)
+ 			rtMask |= g_HWSR_MaskBit[HWSR_SAMPLE1];
+-		if (bVignettingEnabled)
+-			rtMask |= g_HWSR_MaskBit[HWSR_SAMPLE2];
++		// SAMPLE2 used to be set here for vignetting and was read NOWHERE: the gate was inverted
++		// at some point and the strength constant (HDRVignetteParams.x) replaced it entirely.
++		// It cost a permutation axis of this pass for nothing. Removing it invalidates every
++		// cached HDRFinalPass variant, the stock ones included - which S4 does anyway - and
++		// changes no pixel on either path.
+ 		if (bBloomEnabled)
+ 			rtMask |= g_HWSR_MaskBit[HWSR_SAMPLE3];
+ 		if (bSunShaftsEnabled)
+@@ -146,6 +329,20 @@ void CToneMappingStage::Execute()
+ 		m_passToneMapping.SetTexture(7, CRendererResources::s_ptexVignettingMap);
+ 		m_passToneMapping.SetTexture(8, pColorChartTex);
+ 		m_passToneMapping.SetTexture(9, pSunShaftsTex);
++
++		// The display chain's LUTs. Bound unconditionally, because the branch inside the shader
++		// is dynamic (a constant compare, not a permutation) and an unbound Texture3D would be a
++		// hole in the resource set even on the frames the sample is skipped. White3D is the
++		// harmless stand-in: 1x1x1, and never sampled while the size constant says 0.
++		//
++		// s1 is a NEW sampler slot. s0's LinearClamp already clamps on all three axes - every
++		// default sampler state sets address W explicitly - so this is the same state on its own
++		// slot rather than a new state; the 2D fetches keep s0 and the LUT keeps s1, which means
++		// neither can be changed by accident for the other's sake.
++		m_passToneMapping.SetTexture(3, pLmtTex);
++		m_passToneMapping.SetTexture(4, pOdtTex);
++		m_passToneMapping.SetSampler(1, EDefaultSamplerStates::LinearClamp);
++
+ 		m_passToneMapping.SetRequireWorldPos(true);
+ 		m_passToneMapping.SetRequirePerViewConstantBuffer(true);
+ 	}
+@@ -232,6 +429,58 @@ void CToneMappingStage::Execute()
+ 	}
+ 	m_passToneMapping.SetConstant(shaftsSunColName, shaftsSunCol, eHWSC_Pixel);
+ 
++	// The camera grading block (SceneReferredSpec.md S5). Its own six float4s rather than a
++	// re-purposed HDRMiscParams / HDREyeAdaptation: DisplayDebugInfo() still prints those two by
++	// their old meanings and a debug readout that lies costs more than the constants do.
++	//
++	// Neutral by construction when the camera publishes nothing: an identity white balance, a
++	// slope of 1, an offset of 0, a power of 1 and a saturation of 1 leave the chain as
++	// ACEScg -> ACEScct -> (look) -> ODT, which is D10's "pure ACES 2.0" default.
++	{
++		static CCryNameR wbRow0Name("SceneWBRow0");
++		static CCryNameR wbRow1Name("SceneWBRow1");
++		static CCryNameR wbRow2Name("SceneWBRow2");
++		static CCryNameR cdlSlopeName("SceneCDLSlope");
++		static CCryNameR cdlOffsetName("SceneCDLOffset");
++		static CCryNameR cdlPowerName("SceneCDLPower");
++
++		float kelvin = 6500.0f, tint = 0.0f, saturation = 1.0f;
++		bool  bWhiteBalance = false, bBypass = false;
++		Vec4  slope(1.0f, 1.0f, 1.0f, 0.0f), offset(0.0f, 0.0f, 0.0f, 0.0f), power(1.0f, 1.0f, 1.0f, 0.0f);
++
++		if (bSceneReferred)
++		{
++			if (CPostEffectsMgr* pPostMgr = PostEffectMgr())
++			{
++				bBypass = pPostMgr->GetByNameF("Global_User_GradeBypass") > 0.5f;
++				if (!bBypass)
++				{
++					bWhiteBalance = pPostMgr->GetByNameF("Global_User_GradeWBEnable") > 0.5f;
++					kelvin = pPostMgr->GetByNameF("Global_User_GradeWBKelvin");
++					tint = pPostMgr->GetByNameF("Global_User_GradeWBTint");
++					slope = pPostMgr->GetByNameVec4("Global_User_GradeSlope");
++					offset = pPostMgr->GetByNameVec4("Global_User_GradeOffset");
++					power = pPostMgr->GetByNameVec4("Global_User_GradePower");
++					saturation = pPostMgr->GetByNameF("Global_User_GradeSaturation");
++				}
++			}
++		}
++
++		// A slope or power of zero is a black frame with no error anywhere, so the floor is here
++		// and not in the property range: the bus can be written from the console too.
++		slope = Vec4(max(slope.x, 1e-4f), max(slope.y, 1e-4f), max(slope.z, 1e-4f), 0.0f);
++		power = Vec4(max(power.x, 1e-4f), max(power.y, 1e-4f), max(power.z, 1e-4f), 0.0f);
++
++		const Matrix33 wb = ResolveWhiteBalanceMatrix(kelvin, tint, bWhiteBalance && kelvin > 1000.0f);
++
++		m_passToneMapping.SetConstant(wbRow0Name, Vec4(wb.m00, wb.m01, wb.m02, 0.0f), eHWSC_Pixel);
++		m_passToneMapping.SetConstant(wbRow1Name, Vec4(wb.m10, wb.m11, wb.m12, 0.0f), eHWSC_Pixel);
++		m_passToneMapping.SetConstant(wbRow2Name, Vec4(wb.m20, wb.m21, wb.m22, 0.0f), eHWSC_Pixel);
++		m_passToneMapping.SetConstant(cdlSlopeName, Vec4(slope.x, slope.y, slope.z, max(saturation, 0.0f)), eHWSC_Pixel);
++		m_passToneMapping.SetConstant(cdlOffsetName, Vec4(offset.x, offset.y, offset.z, bBypass ? 0.0f : fLmtSize), eHWSC_Pixel);
++		m_passToneMapping.SetConstant(cdlPowerName, Vec4(power.x, power.y, power.z, fOdtSize), eHWSC_Pixel);
++	}
++
+ 	m_passToneMapping.Execute();
+ 
+ 	m_pColorChartTex = pColorChartTex; // Keep a ref count on color chart to make sure it is destroyed after m_passToneMapping
+diff --git a/Engine/Shaders/HWScripts/CryFX/HDRPostProcess.cfx b/Engine/Shaders/HWScripts/CryFX/HDRPostProcess.cfx
+index 9155c9b0..c72e4713 100644
+--- a/Engine/Shaders/HWScripts/CryFX/HDRPostProcess.cfx
++++ b/Engine/Shaders/HWScripts/CryFX/HDRPostProcess.cfx
+@@ -815,11 +815,103 @@ half ComputeExposure(float fIlluminance)
+ 	return (LIGHT_UNIT_SCALE / 1.2f) * rcp(maxLum);
+ }
+ 
++////////////////////////////////////////////////////////////////////////////////////////////////////////////
++// The scene-referred display chain (SceneReferredSpec.md S4/S5, D8, D9, D10).
++//
++// Its own constant block: HDRMiscParams and HDREyeAdaptation are both unread on this branch and
++// could have carried these numbers, but CToneMappingStage::DisplayDebugInfo() still prints their
++// OLD meanings and a debug readout that lies is worse than six float4s.
++////////////////////////////////////////////////////////////////////////////////////////////////////////////
++
++float4 SceneWBRow0;      // Bradford white-balance matrix, in the working space (AP1). Row 0. .w unused.
++float4 SceneWBRow1;      // Row 1. .w unused.
++float4 SceneWBRow2;      // Row 2. .w unused.
++float4 SceneCDLSlope;    // ASC CDL slope.rgb, .w = saturation (1 = neutral)
++float4 SceneCDLOffset;   // ASC CDL offset.rgb, .w = LMT grid size N (0 = no look loaded)
++float4 SceneCDLPower;    // ASC CDL power.rgb, .w = ODT grid size N (0 = no output transform loaded)
++
++Texture3D<float4> lmtTex : register(t3);   // creative look, ACEScct in / ACEScct out
++Texture3D<float4> odtTex : register(t4);   // output transform, ACEScct in / display-encoded out
++SamplerState linearClamp3DSS : register(s1);
++
++// The standard half-texel inset for an N^3 grid: the first and last samples sit at the CENTRES
++// of the outer texels, so the usable range is [0.5/N, 1 - 0.5/N] and an input of 0..1 has to be
++// mapped onto it. Exactly the correction TexColorChart2D makes for its unwrapped strip, one
++// dimension up. Getting it wrong is a small, uniform, entirely invisible error - which is why it
++// is spelled out here instead of being folded into the call.
++float3 SampleLut3D(Texture3D<float4> lut, SamplerState ss, float3 c, float fGridSize)
++{
++	const float fScale = (fGridSize - 1.0) / fGridSize;
++	const float fBias  = 0.5 / fGridSize;
++	return lut.SampleLevel(ss, saturate(c) * fScale + fBias, 0).rgb;
++}
++
+ half3 FilmMapping( in vert2frag IN, in half3 cScene, in half3 cBloom, in half3 vAdaptedLum, in half fVignetting )
+ {
++#if %_RT_SAMPLE0
++
++	// ------------------------------------------------------------------------------------
++	// The scene-referred branch. Nothing in here knows what a display is except the last
++	// fetch, which IS the display transform.
++	//
++	// Whole-body #if rather than an #if inside the function on purpose: ComputeExposure() is
++	// called unconditionally on the stock path, and leaving it above the branch would keep
++	// evaluating the EV formula and reading the luminance texture for a value this path throws
++	// away. The exposure here is exactly 1.0 - S1 applied it on the light side, so the HDR
++	// target arrives already exposed and applying any of it again would expose the frame twice.
++	//
++	// Shared with the stock path and deliberately UNCHANGED: the vignette scalar (a lens
++	// transmission, already in the right place - it multiplies scene-linear light) and the bloom
++	// composite (its form is a look question that belongs with the S7 re-thresholding, not here).
++	// ------------------------------------------------------------------------------------
++	half3 cColor = fVignetting * lerp(cScene, cBloom, saturate(HDRBloomColor));
++
++	// 1. White balance. A Bradford chromatic adaptation from the temperature the CAMERA is set
++	//    to towards the neutral setting, expressed as a 3x3 in the working space and computed on
++	//    the CPU (CToneMappingStage::ResolveWhiteBalanceMatrix). Exactly identity when white
++	//    balance is off or at the neutral setting, so this multiply is a no-op by construction
++	//    and not by approximation. Scene-linear in, scene-linear out.
++	cColor = mul(float3x3(SceneWBRow0.xyz, SceneWBRow1.xyz, SceneWBRow2.xyz), cColor);
++
++	// 2. Linear ACEScg -> ACEScct. The grading space, the LUT domain and the shaper are all the
++	//    same encoding, so this happens once and everything downstream is log.
++	float3 cGrade = LinearToACEScct((float3)cColor);
++
++	// 3. ASC CDL, in the order the ASC specification fixes:
++	//        out = (in * slope + offset) ^ power
++	//    with the power applied to the clamped result (the spec's "negative values are clamped
++	//    to zero before the power function"), per channel and with no cross-channel term.
++	//    Saturation is the ASC's own extension and comes AFTER the SOP, about the luminance of
++	//    the already-graded value - and the luminance weights are AP1's, because that is the
++	//    space this is happening in. Using Rec.709 weights on AP1 data is the classic silent
++	//    failure: the picture is wrong and nothing reports it.
++	cGrade = cGrade * SceneCDLSlope.rgb + SceneCDLOffset.rgb;
++	cGrade = pow(max(cGrade, 0.0), SceneCDLPower.rgb);
++	const float fGradeLuma = dot(cGrade, ACESCG_LUMINANCE_WEIGHTS);
++	cGrade = fGradeLuma + SceneCDLSlope.w * (cGrade - fGradeLuma);
++
++	// 4. The look (LMT), ACEScct in and out. An empty slot is the identity look - D10's "no
++	//    hidden ReC look": with nothing loaded the picture is pure ACES.
++	if (SceneCDLOffset.w > 1.5)
++		cGrade = SampleLut3D(lmtTex, linearClamp3DSS, cGrade, SceneCDLOffset.w);
++
++	// 5. The output transform (ODT), ACEScct in and DISPLAY-ENCODED [0,1] out. The back buffer
++	//    is R8G8B8A8_UNORM and is not sRGB-typed, so the encode has to be inside this LUT; the
++	//    engine's own sRGB curve at the end of the stock branch is what it replaces.
++	//
++	//    With no ODT loaded the picture is deliberately, visibly wrong - the log image, clamped
++	//    - instead of quietly falling back to the film curve. A wrong picture that cannot be
++	//    mistaken for a correct one is what D13 asks for.
++	if (SceneCDLPower.w > 1.5)
++		return (half3)SampleLut3D(odtTex, linearClamp3DSS, cGrade, SceneCDLPower.w);
++
++	return (half3)saturate(cGrade);
++
++#else
++
+ 	// Compute exposure
+ 	half fExposure = ComputeExposure(vAdaptedLum.y);
+-	
++
+ #if %_RT_SAMPLE4
+ 	// Legacy exposure mode
+ 	// Krawczyk scene key estimation adjusted to better fit our range - low (0.05) to high key (0.8) interpolation based on avg scene luminance
+@@ -842,8 +934,10 @@ half3 FilmMapping( in vert2frag IN, in half3 cScene, in half3 cBloom, in half3 v
+ 	
+ 	// Apply gamma correction using exact sRGB curve
+ 	cScene = (cScene < 0.0031308) ? 12.92h * cScene : 1.055h * pow(cScene, 1.0h / 2.4h) - half3(0.055h, 0.055h, 0.055h);
+-	
++
+ 	return cScene;
++
++#endif
+ }
+ 
+ ////////////////////////////////////////////////////////////////////////////////////////////////////////////
+-- 
+2.47.1.windows.1
+

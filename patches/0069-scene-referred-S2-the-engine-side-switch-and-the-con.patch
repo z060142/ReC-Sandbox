@@ -1,0 +1,318 @@
+From 08fef577c9489865952ac11216751077ab7d194d Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Fri, 28 Aug 2026 07:18:49 +0800
+Subject: [PATCH 069/119] scene-referred S2: the engine-side switch and the
+ convention latch
+
+First item of Stage S2. Four unit decisions live inside Cry3DEngine, on the main thread, where
+no renderer cvar can be read - and every one of them is cached until the next time-of-day
+update. This item builds the mirror that carries the switch across that boundary and makes a
+flip of it recompute everything that was cached, with nothing yet keyed on the new state.
+
+Decision: scene-notes/decisions/s2-engine-side-switch.md, approach A. Research:
+scene-notes/research/s2-pi-and-light-units.md section 5, s2-skybox-emittance-collision.md
+section 5.
+
+- E3DPARAM_SCENE_REFERRED, a new I3DEngine global parameter, stored in C3DEngine as a plain bool
+  and read back through IsSceneReferredConvention(). This is exactly how time-of-day state
+  already travels to the renderer (E3DPARAM_*), so nothing new is invented for it, and approach
+  B (an e_SceneReferred cvar) was not needed. Approach C - moving the PI convention out of the
+  3D engine entirely - stays recorded as the long-term direction: it is the cleanest
+  architecture but m_vSunColor has 3DEngine consumers (fog, clouds, SVOGI injection, terrain)
+  that would all need their own divides, and moving a divide is not guaranteed bit-identical.
+
+- ccam publishes it from ApplySceneReferred(), next to the post-effect bus request, and restores
+  it from RestoreSceneReferred() with the rest of the render state. The write goes through the
+  new PublishSceneReferredConvention(), which does the two things the decision note asks for:
+  it only acts ON A FLIP (comparing against the value already in the 3D engine), and on that
+  flip it calls ITimeOfDay::Update(true, true). bForceUpdate is not cosmetic here - it is the
+  call that reaches C3DEngine::SetSkyLightParameters(..., forceImmediateUpdate) and from there
+  CSkyLightManager::FullUpdate(), so the Nishita sky is recomputed in one go instead of
+  crossfading in at ~12 % per frame for eight frames. Without the re-push the sun would keep the
+  old convention until the artist next moved the TOD slider. The flip is logged once.
+
+- The renderer latches the convention beside the exposure.
+  CD3D9Renderer::LatchSceneReferredExposure() now also writes m_fSceneReferredBRDFFactor[render
+  thread] = sceneReferred ? 1/PI : 1.0, read back through GetSceneReferredBRDFFactor(). The
+  hazard is real and is the reason the latch exists: the sun's colour is computed on the main
+  thread while the render thread is a frame behind, so an unlatched flip would put the new sun
+  in front of the old BRDF - one frame PI times too bright - or the reverse. One convention per
+  frame, the same rule the exposure follows.
+
+  Unlike the exposure, the convention is deliberately NOT forced to unity for SHDF_CUBEMAPGEN. A
+  probe must be baked under the convention the scene is lit with; it is the exposure that must
+  not be baked in, not the convention. That is what item 5's _rec suffix exists to record.
+
+Nothing reads the new state yet - item 2 wires the sun, the clouds, the legacy migration and the
+BRDF constant to it - so the picture is unchanged in both paths.
+
+Built clean (0 errors, 0 warnings outside Code/SDKs): Cry3DEngine, CryRenderD3D11,
+CinematicCamera.
+
+Co-Authored-By: Claude Opus <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01A72MFkdSczncE7au9UVnmu
+---
+ Code/CryEngine/Cry3DEngine/3dEngine.cpp       | 13 +++++
+ Code/CryEngine/Cry3DEngine/3dEngine.h         | 12 ++++
+ .../CryCommon/Cry3DEngine/I3DEngine.h         | 13 ++++-
+ .../RenderDll/XRenderD3D9/D3DRendPipeline.cpp | 13 +++++
+ .../RenderDll/XRenderD3D9/DriverD3D.cpp       |  3 +
+ .../RenderDll/XRenderD3D9/DriverD3D.h         | 13 +++++
+ .../Module/CinematicCameraComponent.cpp       | 56 +++++++++++++++++++
+ .../Module/CinematicCameraComponent.h         |  4 ++
+ 8 files changed, 126 insertions(+), 1 deletion(-)
+
+diff --git a/Code/CryEngine/Cry3DEngine/3dEngine.cpp b/Code/CryEngine/Cry3DEngine/3dEngine.cpp
+index 2c08915a..ae9926bc 100644
+--- a/Code/CryEngine/Cry3DEngine/3dEngine.cpp
++++ b/Code/CryEngine/Cry3DEngine/3dEngine.cpp
+@@ -4446,6 +4446,15 @@ void C3DEngine::SetGlobalParameter(E3DEngineParameter param, const Vec3& v)
+ 	case E3DPARAM_SKYBOX_MULTIPLIER:
+ 		m_skyboxMultiplier = v.x;
+ 		break;
++
++	// Scene-referred pipeline (SceneReferredSpec.md S2, decisions/s2-engine-side-switch.md
++	// approach A). A plain store: the caller (the Cinematic Camera) is responsible for forcing
++	// the time-of-day re-evaluation that recomputes everything keyed on it, because the values
++	// it selects are cached in m_vSunColor / E3DPARAM_SKY_SKYBOX_EMITTANCE / the volumetric
++	// cloud globals until the next TOD update.
++	case E3DPARAM_SCENE_REFERRED:
++		m_bSceneReferred = (v.x > 0.5f);
++		break;
+ 	case E3DPARAM_DAY_NIGHT_INDICATOR:
+ 		m_dayNightIndicator = v.x;
+ 		REINST(Set daylight parameter)
+@@ -4722,6 +4731,10 @@ void C3DEngine::GetGlobalParameter(E3DEngineParameter param, Vec3& v)
+ 	case E3DPARAM_SKYBOX_MULTIPLIER:
+ 		v = Vec3(m_skyboxMultiplier, 0, 0);
+ 		break;
++
++	case E3DPARAM_SCENE_REFERRED:
++		v = Vec3(m_bSceneReferred ? 1.0f : 0.0f, 0, 0);
++		break;
+ 	case E3DPARAM_DAY_NIGHT_INDICATOR:
+ 		v = Vec3(m_dayNightIndicator, 0, 0);
+ 		break;
+diff --git a/Code/CryEngine/Cry3DEngine/3dEngine.h b/Code/CryEngine/Cry3DEngine/3dEngine.h
+index 2146c718..429887d4 100644
+--- a/Code/CryEngine/Cry3DEngine/3dEngine.h
++++ b/Code/CryEngine/Cry3DEngine/3dEngine.h
+@@ -836,6 +836,11 @@ public:
+ 	float                 m_oceanFogDensity;
+ 	float                 m_skyboxMultiplier;
+ 	float                 m_dayNightIndicator;
++
++	//! Scene-referred pipeline (SceneReferredSpec.md S2): the 3DEngine-visible mirror of the
++	//! renderer's r_SceneReferred switch, set through E3DPARAM_SCENE_REFERRED. See
++	//! IsSceneReferredConvention().
++	bool                  m_bSceneReferred = false;
+ 	bool                  m_bHeightMapAoEnabled;
+ 	bool                  m_bIntegrateObjectsIntoTerrain;
+ 	bool                  m_supportOfflineProceduralVegetation = false;
+@@ -1083,6 +1088,13 @@ public:
+ 	virtual void                     SetGlobalParameter(E3DEngineParameter param, const Vec3& v);
+ 	using I3DEngine::GetGlobalParameter;
+ 	virtual void                     GetGlobalParameter(E3DEngineParameter param, Vec3& v);
++
++	//! Scene-referred pipeline (SceneReferredSpec.md D4, S2). True while the Cinematic Camera's
++	//! scene-referred path is active, as published through E3DPARAM_SCENE_REFERRED. It selects
++	//! the light-unit convention on the 3DEngine side of the renderer boundary: all lights
++	//! radiometric with the 1/PI in the BRDF, instead of the sun being pre-divided by PI.
++	//! False is the stock engine, byte for byte.
++	bool                             IsSceneReferredConvention() const { return m_bSceneReferred; }
+ 	virtual void                     SetShadowMode(EShadowMode shadowMode) { m_eShadowMode = shadowMode; }
+ 	virtual EShadowMode              GetShadowMode() const                 { return m_eShadowMode; }
+ 	virtual void                     AddPerObjectShadow(IShadowCaster* pCaster, float fConstBias, float fSlopeBias, float fJitter, const Vec3& vBBoxScale, uint nTexSize);
+diff --git a/Code/CryEngine/CryCommon/Cry3DEngine/I3DEngine.h b/Code/CryEngine/CryCommon/Cry3DEngine/I3DEngine.h
+index 8303a461..ac86e6d4 100644
+--- a/Code/CryEngine/CryCommon/Cry3DEngine/I3DEngine.h
++++ b/Code/CryEngine/CryCommon/Cry3DEngine/I3DEngine.h
+@@ -155,7 +155,18 @@ enum E3DEngineParameter
+ 
+ 	E3DPARAM_COLORGRADING_FILTERS_PHOTOFILTER_COLOR,
+ 	E3DPARAM_COLORGRADING_FILTERS_PHOTOFILTER_DENSITY,
+-	E3DPARAM_COLORGRADING_FILTERS_GRAIN
++	E3DPARAM_COLORGRADING_FILTERS_GRAIN,
++
++	//! Scene-referred pipeline (Code/CryPlugins/CinematicCamera/SceneReferredSpec.md, stage S2).
++	//! A 3DEngine-visible mirror of the renderer's r_SceneReferred switch, written by the
++	//! Cinematic Camera once per frame (0 = stock, 1 = scene-referred). The 3D engine cannot
++	//! read renderer cvars, yet four unit decisions live on this side of the boundary and are
++	//! cached until the next time-of-day update: the sun's illuminance-to-radiance divide by PI,
++	//! the volumetric-cloud replication of it, the legacy .tod migration's multiply by PI and
++	//! the Nishita sun-intensity scale. Whoever flips this parameter must force a full
++	//! ITimeOfDay::Update(true, true) in the same call, or those values stay stale.
++	//! Only .x is used, as a boolean (> 0.5).
++	E3DPARAM_SCENE_REFERRED
+ };
+ 
+ enum EShadowMode
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/D3DRendPipeline.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/D3DRendPipeline.cpp
+index bc0c60a4..5c564c5c 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/D3DRendPipeline.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/D3DRendPipeline.cpp
+@@ -604,6 +604,19 @@ void CD3D9Renderer::LatchSceneReferredExposure(uint32 shaderRenderingFlags)
+ 
+ 	m_fSceneReferredExposure[GetRenderThreadID()] = exposure;
+ 	m_fAdaptedSceneScaleLBuffer = exposure;
++
++	// The light-unit convention is latched HERE, next to the exposure, and for the same reason:
++	// one convention per frame (SceneReferredSpec.md D4, decisions/s2-engine-side-switch.md).
++	// The sun's colour is computed on the main thread inside CTimeOfDay::Update while the render
++	// thread is a frame behind, so a flip of the switch could otherwise put the new sun (no
++	// divide by PI) in front of the old BRDF (no 1/PI) - a frame PI times too bright - or the
++	// reverse, a frame PI times too dark.
++	//
++	// Unlike the exposure this is NOT forced to unity for cube-map generation: a probe must be
++	// baked under the same convention the scene is lit with, which is the whole point of the
++	// _rec suffix in decisions/s2-preset-and-probes.md. It is the exposure that must not be
++	// baked in, not the convention.
++	m_fSceneReferredBRDFFactor[GetRenderThreadID()] = CRendererResources::IsSceneReferred() ? (1.0f / gf_PI) : 1.0f;
+ }
+ 
+ // Render thread only scene rendering
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/DriverD3D.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/DriverD3D.cpp
+index 9c48bde9..5fb1e252 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/DriverD3D.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/DriverD3D.cpp
+@@ -126,7 +126,10 @@ void CD3D9Renderer::InitRenderer()
+ 	m_vSceneLuminanceInfo = Vec4(1.f, 1.f, 1.f, 1.f);
+ 	m_fScotopicSceneScale = m_fAdaptedSceneScale = m_fAdaptedSceneScaleLBuffer = 1.0f;
+ 	for (int i = 0; i < RT_COMMAND_BUF_COUNT; i++)
++	{
+ 		m_fSceneReferredExposure[i] = 1.0f;
++		m_fSceneReferredBRDFFactor[i] = 1.0f;
++	}
+ 
+ 	for (int i = 0; i < SHAPE_MAX; i++)
+ 	{
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/DriverD3D.h b/Code/CryEngine/RenderDll/XRenderD3D9/DriverD3D.h
+index 8c7fba9b..c84cbcaa 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/DriverD3D.h
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/DriverD3D.h
+@@ -261,6 +261,12 @@ public:
+ 	//! at sample time through the tint hook - decisions/s1-probe-exposure.md approach A).
+ 	void         LatchSceneReferredExposure(uint32 shaderRenderingFlags);
+ 
++	//! The latched BRDF normalisation factor for the render thread's current frame: 1.0f on the
++	//! stock path, 1/PI on the scene-referred path, where the lights are radiometric and the
++	//! BRDF carries the 1/PI instead (SceneReferredSpec.md D4). Latched with the exposure so a
++	//! frame can never mix a new sun with an old BRDF.
++	float        GetSceneReferredBRDFFactor() const { return m_fSceneReferredBRDFFactor[GetRenderThreadID()]; }
++
+ 	//! The latched pre-exposure for the render thread's current frame. 1.0f off the switch.
+ 	float        GetSceneReferredExposure() const { return m_fSceneReferredExposure[GetRenderThreadID()]; }
+ 	virtual void RT_PostRenderScene(CRenderView* pRenderView) final;
+@@ -719,6 +725,13 @@ public:
+ 	// keeps the value every engine initialiser writes.
+ 	float              m_fSceneReferredExposure[RT_COMMAND_BUF_COUNT];
+ 
++	// The 1/PI that the scene-referred path moves out of the light side and into the BRDF
++	// (SceneReferredSpec.md D4). Latched together with the exposure above, so that one frame
++	// carries exactly one light-unit convention. Exactly 1.0f off the switch, and the shader
++	// constant that carries it is stored offset by one, so the stock path multiplies by an
++	// exact 1.0 and stays bit-identical.
++	float              m_fSceneReferredBRDFFactor[RT_COMMAND_BUF_COUNT];
++
+ 	int                m_MaxAnisotropyLevel;
+ 	SamplerStateHandle m_nMaterialAnisoHighSampler;
+ 	SamplerStateHandle m_nMaterialAnisoLowSampler;
+diff --git a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp
+index b6955bd3..479b5982 100644
+--- a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp
++++ b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp
+@@ -10,6 +10,8 @@
+ #include <CrySchematyc/Env/IEnvRegistrar.h>
+ #include <CryCore/StaticInstanceList.h>
+ #include <CryMath/Angle.h>
++#include <Cry3DEngine/I3DEngine.h>
++#include <Cry3DEngine/ITimeOfDay.h>
+ #include <CryRenderer/IRenderer.h>
+ #include <CryRenderer/IRenderAuxGeom.h>
+ #include <CrySystem/File/ICryPak.h>
+@@ -1184,6 +1186,8 @@ void CCinematicCameraComponent::ApplySceneReferred()
+ 
+ 	gEnv->p3DEngine->SetPostEffectParam("Global_User_SceneReferred",
+ 	                                    m_sceneReferred.bSceneReferred ? 1.0f : 0.0f);
++
++	PublishSceneReferredConvention(m_sceneReferred.bSceneReferred);
+ }
+ 
+ void CCinematicCameraComponent::RestoreSceneReferred()
+@@ -1193,6 +1197,58 @@ void CCinematicCameraComponent::RestoreSceneReferred()
+ 
+ 	gEnv->p3DEngine->SetPostEffectParam("Global_User_SceneReferred", m_savedSceneReferred);
+ 	m_bSceneReferredSaved = false;
++
++	// The engine-side mirror is restored with it, and by the same flip path, so a deactivating
++	// camera leaves the 3D engine on the stock light-unit convention with the time of day
++	// already re-evaluated for it.
++	PublishSceneReferredConvention(m_savedSceneReferred > 0.5f);
++}
++
++// The 3DEngine-visible half of the switch (SceneReferredSpec.md S2,
++// decisions/s2-engine-side-switch.md approach A).
++//
++// Four unit decisions live inside Cry3DEngine, on the main thread, and cannot read a renderer
++// cvar: the sun's divide by PI in ConvertIlluminanceToLightColor(), the volumetric-cloud
++// replication of that divide, the legacy .tod migration's multiply by PI, and the Nishita sky's
++// sun-intensity scale. E3DPARAM_SCENE_REFERRED carries the answer across the boundary. This is
++// the same mechanism the time of day already uses to reach the renderer (E3DPARAM_*), so nothing
++// new is invented for it.
++//
++// Every one of those values is CACHED until the next time-of-day update, and the Nishita sky
++// updates its LUT at about 12 % per frame, so flipping the parameter without a forced
++// re-evaluation would leave the sun at the old convention until the artist next moved the TOD
++// slider, and the sky mid-crossfade for several frames. ITimeOfDay::Update(true, true) is the
++// engine's own "recompute everything now" call: bForceUpdate reaches
++// C3DEngine::SetSkyLightParameters(..., forceImmediateUpdate) and from there
++// CSkyLightManager::FullUpdate(), which recomputes the whole sky dome in one go.
++//
++// The re-push happens only ON A FLIP. Doing it every frame would mean a full Nishita recompute
++// per frame; doing it never would mean a stale sun. Writing to the plain global unconditionally
++// is harmless (it is a bool store), so the flip test is on the value we last published.
++void CCinematicCameraComponent::PublishSceneReferredConvention(bool bSceneReferred)
++{
++	if (!gEnv->p3DEngine)
++		return;
++
++	Vec3 current(0.0f, 0.0f, 0.0f);
++	gEnv->p3DEngine->GetGlobalParameter(E3DPARAM_SCENE_REFERRED, current);
++	const bool bCurrent = (current.x > 0.5f);
++
++	if (bCurrent == bSceneReferred)
++		return;
++
++	gEnv->p3DEngine->SetGlobalParameter(E3DPARAM_SCENE_REFERRED, Vec3(bSceneReferred ? 1.0f : 0.0f, 0.0f, 0.0f));
++
++	if (ITimeOfDay* pTOD = gEnv->p3DEngine->GetTimeOfDay())
++	{
++		// bInterpolate = true keeps the current time of day; bForceUpdate = true is what makes
++		// this a full re-evaluation instead of the usual "only if the time moved" early-out, and
++		// it is also what forces the sky dome's full recompute.
++		pTOD->Update(true, true);
++	}
++
++	CryLog("[SceneReferred] light-unit convention -> %s (time of day re-evaluated, sky dome recomputed)",
++	       bSceneReferred ? "radiometric, 1/PI in the BRDF" : "stock (sun pre-divided by PI)");
+ }
+ 
+ // The pre-exposure itself. It travels on the same bus as the request, in the same save/restore
+diff --git a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
+index 69262cbf..95e8c675 100644
+--- a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
++++ b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
+@@ -1017,6 +1017,10 @@ private:
+ 	//! whole picture, so it has to be visible while the properties are being tuned.
+ 	void ApplySceneReferred();
+ 	void RestoreSceneReferred();
++	//! Mirror the switch into the 3D engine (E3DPARAM_SCENE_REFERRED) and, on a flip, force a
++	//! full time-of-day re-evaluation and sky-dome recompute so nothing stays cached or
++	//! mid-crossfade. See SceneReferredSpec.md S2 / decisions/s2-engine-side-switch.md.
++	void PublishSceneReferredConvention(bool bSceneReferred);
+ 	//! The camera's pre-exposure for this frame, published as a linear scale next to the request
+ 	//! above (Global_User_SceneExposure). Editor-live for the same reason.
+ 	void ApplySceneExposure();
+-- 
+2.47.1.windows.1
+

@@ -1,0 +1,1105 @@
+From deb2f816d32a6ee03053955175d9224186f32779 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Sat, 29 Aug 2026 03:53:42 +0800
+Subject: [PATCH 113/119] feat: rec_ImportHDRI - a measured HDRI becomes a
+ probe with a known absolute luminance
+
+There was no place a calibration could happen. The Resource Compiler applies no scale,
+no gamma and no tone map anywhere on the HDR path - every preset is
+colorspace=linear,linear and CubeMapGen is driven with Degamma 1.0, Scale 1.0 - it
+cannot read .exr at all, and it parses and then discards Radiance's own EXPOSURE= and
+PRIMARIES=. Whatever unit is in the file is the unit in the .dds, and nothing records
+what that unit was.
+
+So the tool writes exactly the artefact the environment-probe bake already writes - a
+16-bit-float TIFF, six faces in a horizontal strip, carrying /preset=HDRCubemap_highQ -
+and then calls the RC on it the way CEnvironmentProbeComponent::Generate() does.
+Everything downstream (the GGX convolution, the 32^2 _diff sibling, BC6UH, the atlas,
+the shader) is unchanged, and no engine, RC or shader code changed for this.
+
+  rec_ImportHDRI <file.hdr|file.exr> <name> [--nits <sky cd/m2>] [--remove-sun]
+
+- .exr through the same static tinyexr the EXR writer already links; its chromaticities
+  attribute is read and ACES2065-1 / ACEScg are converted to linear Rec.709, because
+  BC6UH is UNSIGNED and clips the negatives an AP0 environment carries. No attribute
+  means Rec.709, which is what the spec says, said out loud in the log.
+- .hdr through a Radiance RGBE reader written here (~120 lines: text header, -Y +X
+  resolution line, flat and new-style per-channel RLE scanlines). The RC has a copy of
+  rgbe.c but it lives in a separate tool binary this plugin cannot link. The file's
+  EXPOSURE= is honoured rather than discarded.
+- --nits N scales the image so the SKY - the MEDIAN luminance of the upper hemisphere,
+  sun excluded - reads N cd/m2. A median, for the same reason the exposure meter uses a
+  histogram. Without it the source values are taken to BE cd/m2, logged as the
+  assumption it is.
+- --remove-sun takes every texel above 50x the sky median, refuses if the region is
+  larger than 0.01 sr (that is a sky, not a disc), measures its illuminance and
+  direction, patches it with the surrounding sky's own colour, and prints the lux and
+  the angles to type into the time of day. This is not optional physics: BC6UH tops out
+  at 6.55e8 cd/m2, below the solar disc's 1.5e9, and a 256 face cannot resolve half a
+  degree. The analytic sun re-adds it properly, with shadows and speculars the baked one
+  never had.
+- 4-16x supersampled equirect-to-cube, the sample count taken from the source's own
+  width so an 8K panorama does not alias into a 256 face. The face directions are
+  reproduced from CTexture::DrawSceneToCubeSide's own table and CreateOrientation call,
+  so the face order, up vectors and rolls cannot drift from the renderer's.
+- a <name>_rec_cm.probe.txt sidecar records source, primaries, scale, sky nits and the
+  removed sun. It is the only record of what the numbers mean; a .tif cannot carry one.
+
+docs/SceneReferredContent.md section 8, including the anchors (overcast sky ~2000 nits,
+clear blue 5000-8000), the +Y-centred orientation convention, why the _rec suffix is a
+small deliberate lie, and the warning never to drop a foreign pre-convolved irradiance
+map in as _cm_diff (external tools emit E, the RC's cosine filter emits E/pi - a silent
+1.65 stops).
+
+Notes: scene-notes/decisions/s8-sky-and-probes.md part 2, research/s8-hdri-probes.md.
+
+Co-Authored-By: Claude Opus <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01A72MFkdSczncE7au9UVnmu
+---
+ .../CinematicCamera/Module/CMakeLists.txt     |   8 +
+ .../Module/CinematicCameraPlugin.cpp          |   5 +
+ .../CinematicCamera/Module/HDRIImport.cpp     | 864 ++++++++++++++++++
+ .../CinematicCamera/Module/HDRIImport.h       |   7 +
+ .../docs/SceneReferredContent.md              |  91 ++
+ 5 files changed, 975 insertions(+)
+ create mode 100644 Code/CryPlugins/CinematicCamera/Module/HDRIImport.cpp
+ create mode 100644 Code/CryPlugins/CinematicCamera/Module/HDRIImport.h
+
+diff --git a/Code/CryPlugins/CinematicCamera/Module/CMakeLists.txt b/Code/CryPlugins/CinematicCamera/Module/CMakeLists.txt
+index 04310d13..15d5d64f 100644
+--- a/Code/CryPlugins/CinematicCamera/Module/CMakeLists.txt
++++ b/Code/CryPlugins/CinematicCamera/Module/CMakeLists.txt
+@@ -11,6 +11,9 @@ add_sources("CinematicCamera_uber_0.cpp"
+ 	SOURCE_GROUP "Components"
+ 		"CinematicCameraComponent.h"
+ 		"CinematicCameraComponent.cpp"
++	SOURCE_GROUP "Tools"
++		"HDRIImport.h"
++		"HDRIImport.cpp"
+ )
+ 
+ end_sources()
+@@ -22,3 +25,8 @@ target_include_directories(${THIS_PROJECT}
+ 		"${CRYENGINE_DIR}/Code/CryEngine/CryCommon"
+ 		"${CRYENGINE_DIR}/Code/CryPlugins/CryDefaultEntities/Module"
+ )
++
++# rec_ImportHDRI reads OpenEXR through the same static tinyexr the renderer's EXR writer uses, so
++# there is one copy of the library and one set of codec settings in the build. zlib comes with it
++# as a PUBLIC dependency of that target.
++target_link_libraries(${THIS_PROJECT} PRIVATE tinyexr)
+diff --git a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraPlugin.cpp b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraPlugin.cpp
+index 92acaa28..dc6f61a4 100644
+--- a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraPlugin.cpp
++++ b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraPlugin.cpp
+@@ -1,6 +1,7 @@
+ #include "StdAfx.h"
+ #include "CinematicCameraPlugin.h"
+ #include "CinematicCameraComponent.h"
++#include "HDRIImport.h"
+ 
+ #include <CrySchematyc/Env/IEnvRegistry.h>
+ #include <CrySchematyc/Env/EnvPackage.h>
+@@ -38,6 +39,7 @@ CCinematicCameraPlugin::~CCinematicCameraPlugin()
+ {
+ 	if (gEnv->pConsole)
+ 		gEnv->pConsole->RemoveCommand("ccam_slot");
++	RemoveHDRIImportCommands();
+ 	gEnv->pSystem->GetISystemEventDispatcher()->RemoveListener(this);
+ 	if (gEnv->pSchematyc)
+ 		gEnv->pSchematyc->GetEnvRegistry().DeregisterPackage(CCinematicCameraPlugin::GetCID());
+@@ -53,6 +55,9 @@ bool CCinematicCameraPlugin::Initialize(SSystemGlobalEnvironment& env, const SSy
+ 
+ 	REGISTER_COMMAND("ccam_slot", CmdCcamSlot, VF_NULL, "ccam_slot <1-9>: activate the cinematic camera with that Camera Slot");
+ 
++	// rec_ImportHDRI - the HDRI to environment-probe importer (HDRIImport.cpp).
++	RegisterHDRIImportCommands();
++
+ 	return true;
+ }
+ 
+diff --git a/Code/CryPlugins/CinematicCamera/Module/HDRIImport.cpp b/Code/CryPlugins/CinematicCamera/Module/HDRIImport.cpp
+new file mode 100644
+index 00000000..de8b34a0
+--- /dev/null
++++ b/Code/CryPlugins/CinematicCamera/Module/HDRIImport.cpp
+@@ -0,0 +1,864 @@
++// Copyright 2026 ReC Sandbox. Distributed under the terms in LICENSE.md at the repository root.
++//
++// rec_ImportHDRI - turn a measured equirectangular HDRI into a CRYENGINE environment probe with a
++// KNOWN ABSOLUTE LUMINANCE.
++//
++// Why this exists, and why it is a tool rather than an engine change
++// -------------------------------------------------------------------------------------------
++// The Resource Compiler applies exactly no level change on the HDR path: every HDR preset in
++// rc.ini is `colorspace=linear,linear` and AMD CubeMapGen is driven with Degamma 1.0, Scale 1.0.
++// Whatever unit is in the source file is the unit in the .dds. That is good news for calibration
++// (there is nothing to undo) and bad news for provenance (nothing records what the unit WAS).
++//
++// The RC also cannot read .exr at all, and it parses and then discards Radiance's own EXPOSURE=
++// and PRIMARIES= header fields. So the calibration has to happen before the RC sees anything.
++//
++// This tool therefore writes exactly the artefact the environment-probe bake already writes - a
++// 16-bit-float TIFF with the six cube faces in a horizontal strip, carrying /preset=HDRCubemap_highQ
++// in its Photoshop special-instructions block - and then calls the RC on it the same way
++// CEnvironmentProbeComponent::Generate() does. Everything downstream (the GGX convolution, the
++// 32^2 _diff sibling, BC6UH, the probe atlas, the shader) is unchanged and untouched, and nothing
++// in the engine, the RC or the shaders had to change for any of it.
++// See scene-notes/decisions/s8-sky-and-probes.md part 2 approach B.
++//
++// The sun cannot be stored, and that is not a limitation of this tool
++// -------------------------------------------------------------------------------------------
++// BC6UH tops out at 65 504, which in engine units is 6.55e8 cd/m2 - below the solar disc's
++// 1.5e9 - and a 256^2 face cannot resolve a 0.5-degree disc anyway. So `--remove-sun` measures the
++// sun, removes it, and prints the illuminance and direction to type into the time of day, where the
++// ANALYTIC sun (PARAM_SUN_INTENSITY, in lux, pi-correct on the ReC path) then re-adds it properly.
++// Skipping that step gives a probe with a clipped, hue-shifted, aliased smear where the sun was.
++
++#include "StdAfx.h"
++#include "HDRIImport.h"
++
++#include <CryRenderer/IRenderer.h>
++#include <CrySystem/IConsole.h>
++#include <CrySystem/ConsoleRegistration.h>
++#include <CrySystem/IProjectManager.h>
++#include <CrySystem/File/ICryPak.h>
++// The RC helper is a header-plus-.inl trio with no library behind it; every module that calls the
++// resource compiler instantiates its own copy, exactly as CEnvironmentProbeComponent does.
++#include <CryCore/ToolsHelpers/ResourceCompilerHelper.inl>
++#include <CryCore/ToolsHelpers/EngineSettingsManager.inl>
++#include <CryCore/ToolsHelpers/SettingsManagerHelpers.inl>
++#include <CryString/CryPath.h>
++
++#include <tinyexr.h>
++
++#include <algorithm>
++#include <vector>
++#include <cstdio>
++#include <cstring>
++
++namespace
++{
++
++//////////////////////////////////////////////////////////////////////////////////////////////////
++// The image in memory: linear, float, RGB, equirectangular.
++//////////////////////////////////////////////////////////////////////////////////////////////////
++
++struct SEquirect
++{
++	int                width = 0;
++	int                height = 0;
++	std::vector<float> rgb;   // width * height * 3
++
++	bool  IsValid() const { return width > 1 && height > 1 && rgb.size() == size_t(width) * height * 3; }
++	float* At(int x, int y) { return &rgb[(size_t(y) * width + x) * 3]; }
++	const float* At(int x, int y) const { return &rgb[(size_t(y) * width + x) * 3]; }
++};
++
++// Rec.709 luminance. The probe is stored in Rec.709 by contract (the working-space conversion
++// happens far downstream, inside the frame, and a probe is sampled before it), so this is the
++// right row here and the AP1 one would not be.
++inline float Luminance709(const float* p)
++{
++	return 0.2126f * p[0] + 0.7152f * p[1] + 0.0722f * p[2];
++}
++
++//////////////////////////////////////////////////////////////////////////////////////////////////
++// Radiance .hdr (RGBE) reader.
++//
++// About 120 lines, written here rather than reached for: the RC has its own copy of Bruce Walter's
++// rgbe.c, but it lives inside ResourceCompilerImage, which is a separate tool binary that this
++// plugin cannot link against. The format is trivial - a text header, a resolution line, and
++// scanlines that are either flat 4-byte RGBE or new-style per-channel RLE.
++//////////////////////////////////////////////////////////////////////////////////////////////////
++
++bool ReadLine(FILE* f, char* buf, int cap)
++{
++	int i = 0;
++	for (;;)
++	{
++		const int c = fgetc(f);
++		if (c == EOF)
++			return i > 0 ? (buf[i] = 0, true) : false;
++		if (c == '\n')
++		{
++			buf[i] = 0;
++			return true;
++		}
++		if (i < cap - 1)
++			buf[i++] = (char)c;
++	}
++}
++
++inline void RGBEToFloat(const unsigned char rgbe[4], float* out)
++{
++	if (rgbe[3] == 0)
++	{
++		out[0] = out[1] = out[2] = 0.0f;
++		return;
++	}
++	// ldexp(1, e-136) == 2^(e-128) / 256, the standard Radiance decode.
++	const float f = ldexpf(1.0f, int(rgbe[3]) - (128 + 8));
++	out[0] = rgbe[0] * f;
++	out[1] = rgbe[1] * f;
++	out[2] = rgbe[2] * f;
++}
++
++bool LoadRadianceHDR(const char* szPath, SEquirect& out, float& fFileExposure)
++{
++	FILE* f = fopen(szPath, "rb");
++	if (!f)
++		return false;
++
++	char line[512];
++	fFileExposure = 1.0f;
++
++	if (!ReadLine(f, line, sizeof(line)) || (strncmp(line, "#?", 2) != 0))
++	{
++		fclose(f);
++		CryWarning(VALIDATOR_MODULE_SYSTEM, VALIDATOR_WARNING, "[HDRI] '%s' is not a Radiance file", szPath);
++		return false;
++	}
++
++	bool bRGBEFormat = false;
++	for (;;)
++	{
++		if (!ReadLine(f, line, sizeof(line)))
++		{
++			fclose(f);
++			return false;
++		}
++		if (line[0] == 0)
++			break;                     // the blank line that ends the header
++		if (strncmp(line, "FORMAT=32-bit_rle_rgbe", 22) == 0)
++			bRGBEFormat = true;
++		// The RC parses these two and then throws them away. We honour EXPOSURE, because a file
++		// that carries one is telling us its numbers have already been scaled and a calibration
++		// that ignores it is wrong by exactly that factor.
++		else if (strncmp(line, "EXPOSURE=", 9) == 0)
++			fFileExposure *= (float)atof(line + 9);
++	}
++
++	if (!bRGBEFormat)
++		CryWarning(VALIDATOR_MODULE_SYSTEM, VALIDATOR_WARNING,
++		           "[HDRI] '%s' has no FORMAT=32-bit_rle_rgbe line; decoding as RGBE anyway", szPath);
++
++	// Resolution line. Only the standard -Y H +X W orientation is accepted: every other one is a
++	// flipped or rotated image, and silently importing it upside down is worse than refusing.
++	if (!ReadLine(f, line, sizeof(line)))
++	{
++		fclose(f);
++		return false;
++	}
++	int h = 0, w = 0;
++	if (sscanf(line, "-Y %d +X %d", &h, &w) != 2 || w <= 0 || h <= 0)
++	{
++		fclose(f);
++		CryWarning(VALIDATOR_MODULE_SYSTEM, VALIDATOR_WARNING,
++		           "[HDRI] '%s': unsupported scanline order '%s' (only -Y +X)", szPath, line);
++		return false;
++	}
++
++	out.width = w;
++	out.height = h;
++	out.rgb.assign(size_t(w) * h * 3, 0.0f);
++
++	std::vector<unsigned char> scan(size_t(w) * 4);
++
++	for (int y = 0; y < h; ++y)
++	{
++		unsigned char head[4];
++		if (fread(head, 1, 4, f) != 4)
++		{
++			fclose(f);
++			return false;
++		}
++
++		const bool bNewRLE = (head[0] == 2 && head[1] == 2 && ((int(head[2]) << 8) | head[3]) == w && w >= 8 && w < 32768);
++		if (!bNewRLE)
++		{
++			// Flat (or old-RLE) scanline. The four bytes just read are its first pixel.
++			memcpy(&scan[0], head, 4);
++			if (w > 1 && fread(&scan[4], 1, size_t(w - 1) * 4, f) != size_t(w - 1) * 4)
++			{
++				fclose(f);
++				return false;
++			}
++			for (int x = 0; x < w; ++x)
++				RGBEToFloat(&scan[size_t(x) * 4], out.At(x, y));
++			continue;
++		}
++
++		// New RLE: four separate channel planes, each a run/literal stream.
++		for (int c = 0; c < 4; ++c)
++		{
++			int x = 0;
++			while (x < w)
++			{
++				int count = fgetc(f);
++				if (count == EOF)
++				{
++					fclose(f);
++					return false;
++				}
++				if (count > 128)
++				{
++					const int run = count - 128;
++					const int v = fgetc(f);
++					if (v == EOF || x + run > w)
++					{
++						fclose(f);
++						return false;
++					}
++					for (int i = 0; i < run; ++i)
++						scan[size_t(x++) * 4 + c] = (unsigned char)v;
++				}
++				else
++				{
++					if (count == 0 || x + count > w)
++					{
++						fclose(f);
++						return false;
++					}
++					for (int i = 0; i < count; ++i)
++					{
++						const int v = fgetc(f);
++						if (v == EOF)
++						{
++							fclose(f);
++							return false;
++						}
++						scan[size_t(x++) * 4 + c] = (unsigned char)v;
++					}
++				}
++			}
++		}
++
++		for (int x = 0; x < w; ++x)
++			RGBEToFloat(&scan[size_t(x) * 4], out.At(x, y));
++	}
++
++	fclose(f);
++	return true;
++}
++
++//////////////////////////////////////////////////////////////////////////////////////////////////
++// Colour: everything becomes linear Rec.709 (D65), because that is what a probe must contain.
++//
++// BC6UH is unsigned: it clips negatives to zero. An AP0 or AP1 encoded environment carries values
++// Rec.709 cannot represent without negatives, so storing one unconverted does not merely look
++// wrong, it loses data. The conversion is therefore not optional and there is no "pass through"
++// mode.
++//////////////////////////////////////////////////////////////////////////////////////////////////
++
++enum class EPrimaries { Rec709, ACES_AP0, ACES_AP1 };
++
++const char* PrimariesName(EPrimaries p)
++{
++	switch (p)
++	{
++	case EPrimaries::ACES_AP0: return "ACES2065-1 (AP0)";
++	case EPrimaries::ACES_AP1: return "ACEScg (AP1)";
++	default:                   return "Rec.709";
++	}
++}
++
++// ACES2065-1 -> Rec.709 linear, D60 to D65 by Bradford. The published ACES ODT-adjacent matrix;
++// it agrees with PyOpenColorIO 2.5 to seven digits (tools/ocio-bake/verify_matrices.py).
++const float kAP0ToRec709[9] =
++{
++	2.52168619f, -1.13413099f, -0.38755520f,
++	-0.27647991f, 1.37271909f, -0.09623918f,
++	-0.01538092f, -0.15298721f, 1.16836813f
++};
++
++// ACEScg -> Rec.709 linear, same white-point handling. The transpose of the REC709_TO_ACESCG that
++// CommonMath.cfi and CRendererResources::ToWorkingSpace() use in the other direction.
++const float kAP1ToRec709[9] =
++{
++	1.70505000f, -0.62179000f, -0.08326000f,
++	-0.13026000f, 1.14080000f, -0.01055000f,
++	-0.02400000f, -0.12897000f, 1.15297000f
++};
++
++void ApplyMatrix(SEquirect& img, const float m[9])
++{
++	for (size_t i = 0; i < img.rgb.size(); i += 3)
++	{
++		const float r = img.rgb[i], g = img.rgb[i + 1], b = img.rgb[i + 2];
++		img.rgb[i + 0] = m[0] * r + m[1] * g + m[2] * b;
++		img.rgb[i + 1] = m[3] * r + m[4] * g + m[5] * b;
++		img.rgb[i + 2] = m[6] * r + m[7] * g + m[8] * b;
++	}
++}
++
++// Classify an EXR `chromaticities` attribute. Only the red primary's x and the white point are
++// needed to tell the three apart; the tolerance is loose because these numbers are written by a
++// dozen different tools with different roundings.
++EPrimaries ClassifyChromaticities(const float c[8])
++{
++	auto close = [](float a, float b) { return fabsf(a - b) < 0.01f; };
++	if (close(c[0], 0.7347f) && close(c[2], 0.0000f))
++		return EPrimaries::ACES_AP0;
++	if (close(c[0], 0.7130f) && close(c[2], 0.1650f))
++		return EPrimaries::ACES_AP1;
++	return EPrimaries::Rec709;
++}
++
++bool LoadEXRImage(const char* szPath, SEquirect& out, EPrimaries& primaries)
++{
++	primaries = EPrimaries::Rec709;
++
++	// The chromaticities live in the header, which the simple LoadEXR() wrapper does not expose.
++	// A file with none is assumed to be Rec.709 - that is what the OpenEXR spec says the default
++	// is, and it is said out loud in the log rather than assumed silently.
++	{
++		EXRVersion version;
++		if (ParseEXRVersionFromFile(&version, szPath) == TINYEXR_SUCCESS)
++		{
++			EXRHeader header;
++			InitEXRHeader(&header);
++			const char* err = nullptr;
++			if (ParseEXRHeaderFromFile(&header, &version, szPath, &err) == TINYEXR_SUCCESS)
++			{
++				for (int i = 0; i < header.num_custom_attributes; ++i)
++				{
++					const EXRAttribute& a = header.custom_attributes[i];
++					if (strcmp(a.name, "chromaticities") == 0 && a.size >= 32 && a.value)
++					{
++						float c[8];
++						memcpy(c, a.value, sizeof(c));
++						primaries = ClassifyChromaticities(c);
++						break;
++					}
++				}
++				FreeEXRHeader(&header);
++			}
++			if (err)
++				FreeEXRErrorMessage(err);
++		}
++	}
++
++	float* pRGBA = nullptr;
++	int w = 0, h = 0;
++	const char* err = nullptr;
++	if (LoadEXR(&pRGBA, &w, &h, szPath, &err) != TINYEXR_SUCCESS)
++	{
++		CryWarning(VALIDATOR_MODULE_SYSTEM, VALIDATOR_WARNING, "[HDRI] cannot read '%s': %s", szPath, err ? err : "unknown error");
++		if (err)
++			FreeEXRErrorMessage(err);
++		return false;
++	}
++
++	out.width = w;
++	out.height = h;
++	out.rgb.resize(size_t(w) * h * 3);
++	for (size_t i = 0, n = size_t(w) * h; i < n; ++i)
++	{
++		out.rgb[i * 3 + 0] = pRGBA[i * 4 + 0];
++		out.rgb[i * 3 + 1] = pRGBA[i * 4 + 1];
++		out.rgb[i * 3 + 2] = pRGBA[i * 4 + 2];
++	}
++	free(pRGBA);
++	return true;
++}
++
++//////////////////////////////////////////////////////////////////////////////////////////////////
++// Geometry.
++//
++// CRYENGINE is Z-up. The equirectangular convention adopted here: the CENTRE of the image looks
++// along +Y (the engine's "north"), u increases eastward towards +X, the top row is the zenith
++// (+Z) and the bottom row the nadir. There is no yaw parameter in this first version - rotate the
++// source if the horizon needs turning - and this paragraph is the specification.
++//////////////////////////////////////////////////////////////////////////////////////////////////
++
++void SampleEquirect(const SEquirect& img, const Vec3& dir, float* out)
++{
++	const float theta = acosf(clamp_tpl(dir.z, -1.0f, 1.0f));         // 0 at zenith
++	const float phi = atan2f(dir.x, dir.y);                           // 0 at +Y, +ve towards +X
++
++	float u = 0.5f + phi / (2.0f * gf_PI);
++	float v = theta / gf_PI;
++
++	u = u * img.width - 0.5f;
++	v = clamp_tpl(v * img.height - 0.5f, 0.0f, float(img.height - 1));
++
++	const int x0 = int(floorf(u));
++	const int y0 = int(floorf(v));
++	const float fx = u - x0;
++	const float fy = v - y0;
++
++	auto wrapX = [&](int x) { x %= img.width; return x < 0 ? x + img.width : x; };
++	const int x1 = wrapX(x0 + 1);
++	const int xx0 = wrapX(x0);
++	const int y1 = min(y0 + 1, img.height - 1);
++
++	const float* a = img.At(xx0, y0);
++	const float* b = img.At(x1, y0);
++	const float* c = img.At(xx0, y1);
++	const float* d = img.At(x1, y1);
++
++	for (int i = 0; i < 3; ++i)
++	{
++		const float top = a[i] + (b[i] - a[i]) * fx;
++		const float bot = c[i] + (d[i] - c[i]) * fx;
++		out[i] = top + (bot - top) * fy;
++	}
++}
++
++// The direction a given cube-face texel looks along, reproduced from the bake's own camera setup
++// (CTexture::DrawSceneToCubeSide) rather than re-derived: the table and the CreateOrientation call
++// are the same, so the face order, the up vectors and the rolls cannot drift apart from the
++// renderer's. CE camera space is X right, Y forward, Z up, and a 90-degree square frustum makes a
++// screen point (sx, sy) - sy measured DOWN - look along (sx, 1, -sy).
++Vec3 CubeFaceDirection(int face, float sx, float sy)
++{
++	static const float sCubeVector[6][7] =
++	{
++		{ 1,  0,  0,  0, 0, 1,  -90 },  // +X
++		{ -1, 0,  0,  0, 0, 1,  90  },  // -X
++		{ 0,  1,  0,  0, 0, -1, 0   },  // +Y
++		{ 0,  -1, 0,  0, 0, 1,  0   },  // -Y
++		{ 0,  0,  1,  0, 1, 0,  0   },  // +Z
++		{ 0,  0,  -1, 0, 1, 0,  0   },  // -Z
++	};
++
++	const Vec3 vForward(sCubeVector[face][0], sCubeVector[face][1], sCubeVector[face][2]);
++	const Vec3 vUp(sCubeVector[face][3], sCubeVector[face][4], sCubeVector[face][5]);
++	const Matrix33 matRot = Matrix33::CreateOrientation(vForward, vUp, DEG2RAD(sCubeVector[face][6]));
++
++	return (matRot * Vec3(sx, 1.0f, -sy)).GetNormalized();
++}
++
++//////////////////////////////////////////////////////////////////////////////////////////////////
++// Measurement: the sky's level, and the sun.
++//////////////////////////////////////////////////////////////////////////////////////////////////
++
++// Median luminance of the upper hemisphere, ignoring anything above `fIgnoreAbove` (used to keep
++// the sun out of its own reference). A median and not a mean, for the same reason the exposure
++// meter uses a histogram: one 1e6 texel moves a mean and cannot move a median.
++float UpperHemisphereMedian(const SEquirect& img, float fIgnoreAbove)
++{
++	std::vector<float> lum;
++	lum.reserve(size_t(img.width) * img.height / 8);
++
++	const int yEnd = img.height / 2;              // the top half IS the upper hemisphere
++	const int step = max(1, img.width / 1024);    // 1024 columns is plenty for a median
++	for (int y = 0; y < yEnd; y += step)
++		for (int x = 0; x < img.width; x += step)
++		{
++			const float L = Luminance709(img.At(x, y));
++			if (L < fIgnoreAbove && L >= 0.0f)
++				lum.push_back(L);
++		}
++
++	if (lum.empty())
++		return 0.0f;
++
++	const size_t mid = lum.size() / 2;
++	std::nth_element(lum.begin(), lum.begin() + mid, lum.end());
++	return lum[mid];
++}
++
++struct SSunReport
++{
++	bool  bFound = false;
++	Vec3  dir = Vec3(0, 0, 1);
++	float solidAngle = 0.0f;   // sr
++	float illuminance = 0.0f;  // in the image's own units, per unit solid angle integrated
++	int   pixelCount = 0;
++};
++
++// Find, measure and erase the solar disc.
++//
++// Deliberately simple: every pixel above `fThreshold` counts. A real HDRI's sun is the only thing
++// within two decades of that threshold, and a second bright source (a window, a practical) that
++// genuinely IS that bright should not be removed anyway - which is what the solid-angle ceiling
++// below is for. If the bright region is larger than a sun can be, nothing is touched and the user
++// is told.
++SSunReport RemoveSun(SEquirect& img, float fThreshold, float fMaxSolidAngle, float fReplacement[3])
++{
++	SSunReport report;
++
++	Vec3 sumDir(0, 0, 0);
++	double sumFlux = 0.0;
++	double sumSolid = 0.0;
++
++	const float dPhi = 2.0f * gf_PI / img.width;
++	const float dTheta = gf_PI / img.height;
++
++	std::vector<int> hits;
++
++	for (int y = 0; y < img.height; ++y)
++	{
++		const float theta = (y + 0.5f) * dTheta;
++		const float omega = dPhi * dTheta * sinf(theta);   // the solid angle of one texel
++
++		for (int x = 0; x < img.width; ++x)
++		{
++			const float* p = img.At(x, y);
++			const float L = Luminance709(p);
++			if (L <= fThreshold)
++				continue;
++
++			const float phi = (x + 0.5f) * dPhi - gf_PI;
++			const Vec3 d(sinf(theta) * sinf(phi), sinf(theta) * cosf(phi), cosf(theta));
++
++			sumDir += d * L;
++			sumFlux += double(L) * omega;
++			sumSolid += omega;
++			hits.push_back(y * img.width + x);
++			++report.pixelCount;
++		}
++	}
++
++	if (hits.empty())
++		return report;
++
++	if (sumSolid > fMaxSolidAngle)
++	{
++		CryWarning(VALIDATOR_MODULE_SYSTEM, VALIDATOR_WARNING,
++		           "[HDRI] the bright region covers %.4f sr, more than a sun can (%.4f sr) - it is a sky or a large "
++		           "source, not a solar disc. Nothing removed.", sumSolid, fMaxSolidAngle);
++		return report;
++	}
++
++	report.bFound = true;
++	report.dir = sumDir.GetNormalized();
++	report.solidAngle = (float)sumSolid;
++	report.illuminance = (float)sumFlux;    // L integrated over the disc = illuminance facing it
++
++	for (int idx : hits)
++	{
++		float* p = &img.rgb[size_t(idx) * 3];
++		p[0] = fReplacement[0];
++		p[1] = fReplacement[1];
++		p[2] = fReplacement[2];
++	}
++
++	return report;
++}
++
++//////////////////////////////////////////////////////////////////////////////////////////////////
++// The command.
++//////////////////////////////////////////////////////////////////////////////////////////////////
++
++void CmdImportHDRI(IConsoleCmdArgs* pArgs)
++{
++	if (pArgs->GetArgCount() < 3)
++	{
++		CryLogAlways("rec_ImportHDRI <file.hdr|file.exr> <name> [--nits <sky cd/m2>] [--remove-sun]");
++		CryLogAlways("  Converts an equirectangular HDRI into an environment probe with a known absolute");
++		CryLogAlways("  luminance. Writes textures/cubemaps/<name>_rec_cm.tif and runs the RC on it.");
++		CryLogAlways("  --nits N     scale the image so the SKY (upper-hemisphere median, sun excluded)");
++		CryLogAlways("               reads N cd/m2. Without it the source values are taken to BE cd/m2.");
++		CryLogAlways("  --remove-sun measure and erase the solar disc; put the reported lux and direction");
++		CryLogAlways("               into the time of day, where the analytic sun re-adds it correctly.");
++		return;
++	}
++
++	const string sourceFile = pArgs->GetArg(1);
++	const string outName = pArgs->GetArg(2);
++
++	float fTargetSkyNits = -1.0f;      // <0 = "the source is already in cd/m2"
++	bool  bRemoveSun = false;
++
++	for (int i = 3; i < pArgs->GetArgCount(); ++i)
++	{
++		const string arg = pArgs->GetArg(i);
++		if (arg == "--remove-sun")
++			bRemoveSun = true;
++		else if (arg == "--nits" && (i + 1) < pArgs->GetArgCount())
++			fTargetSkyNits = (float)atof(pArgs->GetArg(++i));
++		else
++			CryWarning(VALIDATOR_MODULE_SYSTEM, VALIDATOR_WARNING, "[HDRI] ignoring unknown argument '%s'", arg.c_str());
++	}
++
++	// ------------------------------------------------------------------ 1. read
++	SEquirect img;
++	EPrimaries primaries = EPrimaries::Rec709;
++	float fFileExposure = 1.0f;
++
++	const string ext = PathUtil::GetExt(sourceFile.c_str());
++	const bool bEXR = (stricmp(ext.c_str(), "exr") == 0);
++
++	if (bEXR)
++	{
++		if (!LoadEXRImage(sourceFile.c_str(), img, primaries))
++			return;
++	}
++	else
++	{
++		if (!LoadRadianceHDR(sourceFile.c_str(), img, fFileExposure))
++		{
++			CryWarning(VALIDATOR_MODULE_SYSTEM, VALIDATOR_WARNING, "[HDRI] cannot read '%s'", sourceFile.c_str());
++			return;
++		}
++	}
++
++	if (!img.IsValid())
++		return;
++
++	// A 2:1 aspect is what "equirectangular" means. Anything else is a cross, a strip or a crop,
++	// and resampling it as a latlong would be silently wrong.
++	if (abs(img.width - img.height * 2) > 2)
++	{
++		CryWarning(VALIDATOR_MODULE_SYSTEM, VALIDATOR_WARNING,
++		           "[HDRI] '%s' is %dx%d, not 2:1 - this tool takes equirectangular panoramas only",
++		           sourceFile.c_str(), img.width, img.height);
++		return;
++	}
++
++	CryLogAlways("[HDRI] '%s': %dx%d, primaries %s%s", sourceFile.c_str(), img.width, img.height,
++	             PrimariesName(primaries), bEXR ? "" : " (Radiance files carry no reliable primaries tag)");
++
++	// ------------------------------------------------------------------ 2. colour and file exposure
++	if (primaries == EPrimaries::ACES_AP0)
++		ApplyMatrix(img, kAP0ToRec709);
++	else if (primaries == EPrimaries::ACES_AP1)
++		ApplyMatrix(img, kAP1ToRec709);
++
++	if (fFileExposure != 1.0f && fFileExposure > 0.0f)
++	{
++		CryLogAlways("[HDRI] honouring the file's EXPOSURE=%g (the RC would have ignored it)", fFileExposure);
++		const float inv = 1.0f / fFileExposure;
++		for (float& v : img.rgb)
++			v *= inv;
++	}
++
++	// Negatives are legal in an AP0 source and illegal in a BC6UH probe, which clips them to zero
++	// anyway. Clip them here, where the count can be reported, instead of silently in the RC.
++	{
++		size_t nNegative = 0;
++		for (float& v : img.rgb)
++		{
++			if (!(v >= 0.0f)) { v = 0.0f; ++nNegative; }        // catches NaN as well
++		}
++		if (nNegative)
++			CryLogAlways("[HDRI] clipped %u negative or non-finite samples to zero (BC6UH is unsigned)", (unsigned)nNegative);
++	}
++
++	// ------------------------------------------------------------------ 3. the sun
++	// Measured BEFORE the absolute scale, so the threshold is relative and the scale can be solved
++	// against a sky the sun is not in.
++	float fSkyMedian = UpperHemisphereMedian(img, FLT_MAX);
++	SSunReport sun;
++
++	if (bRemoveSun)
++	{
++		// 50x the upper-hemisphere median is the sun and nothing else: a clear-sky HDRI's disc is
++		// three to four decades over its sky, and an overcast one has no disc to find.
++		const float fThreshold = fSkyMedian * 50.0f;
++		float replacement[3] = { fSkyMedian, fSkyMedian, fSkyMedian };
++
++		// Fill with the median of the sky ANNULUS rather than a grey of the right luminance, so the
++		// patch keeps the sky's hue where the disc was.
++		{
++			double acc[3] = { 0, 0, 0 };
++			size_t n = 0;
++			const int step = max(1, img.width / 512);
++			for (int y = 0; y < img.height / 2; y += step)
++				for (int x = 0; x < img.width; x += step)
++				{
++					const float* p = img.At(x, y);
++					const float L = Luminance709(p);
++					if (L > fSkyMedian * 0.5f && L < fSkyMedian * 4.0f)
++					{
++						acc[0] += p[0]; acc[1] += p[1]; acc[2] += p[2];
++						++n;
++					}
++				}
++			if (n)
++			{
++				replacement[0] = (float)(acc[0] / n);
++				replacement[1] = (float)(acc[1] / n);
++				replacement[2] = (float)(acc[2] / n);
++			}
++		}
++
++		sun = RemoveSun(img, fThreshold, 0.01f, replacement);
++
++		if (sun.bFound)
++			fSkyMedian = UpperHemisphereMedian(img, FLT_MAX);
++		else if (sun.pixelCount == 0)
++			CryLogAlways("[HDRI] no solar disc above %.4g found - an overcast or interior source, nothing removed", fThreshold);
++	}
++
++	// ------------------------------------------------------------------ 4. the absolute scale
++	// scale takes source units to ENGINE units, where 1.0 = 10 000 cd/m2.
++	float fScale = 1.0f / RENDERER_LIGHT_UNIT_SCALE;
++	if (fTargetSkyNits > 0.0f)
++	{
++		if (fSkyMedian <= 0.0f)
++		{
++			CryWarning(VALIDATOR_MODULE_SYSTEM, VALIDATOR_WARNING, "[HDRI] the upper hemisphere is black; --nits cannot be solved");
++			return;
++		}
++		fScale = (fTargetSkyNits / fSkyMedian) / RENDERER_LIGHT_UNIT_SCALE;
++		CryLogAlways("[HDRI] sky median %.6g source units -> %.1f cd/m2 (factor %.6g)", fSkyMedian, fTargetSkyNits, fTargetSkyNits / fSkyMedian);
++	}
++	else
++	{
++		CryLogAlways("[HDRI] no --nits given: the source values are taken to BE cd/m2 "
++		             "(sky median reads %.1f cd/m2). If that is not what the file means, the probe is uncalibrated.", fSkyMedian);
++	}
++
++	if (sun.bFound)
++	{
++		// The disc's illuminance, in lux, on a plane facing the sun - which is exactly what
++		// PARAM_SUN_INTENSITY means. Elevation is measured from the horizon, azimuth from +Y
++		// towards +X, to match the time of day's own fields.
++		const float sunLux = sun.illuminance * (fScale * RENDERER_LIGHT_UNIT_SCALE);
++		const float elevationDeg = RAD2DEG(asinf(clamp_tpl(sun.dir.z, -1.0f, 1.0f)));
++		const float azimuthDeg = RAD2DEG(atan2f(sun.dir.x, sun.dir.y));
++
++		CryLogAlways("[HDRI] SUN REMOVED: %.0f lux, %.5f sr (%d texels), elevation %.2f deg, azimuth %.2f deg",
++		             sunLux, sun.solidAngle, sun.pixelCount, elevationDeg, azimuthDeg);
++		CryLogAlways("[HDRI]   -> put %.0f into the time of day's Sun Intensity and match the sun's angles.",
++		             sunLux);
++		CryLogAlways("[HDRI]   The probe now carries the SKY only. That is deliberate: BC6UH tops out at "
++		             "6.55e8 cd/m2 and a 256 face cannot resolve a half-degree disc.");
++	}
++
++	// ------------------------------------------------------------------ 5. resample to a cube
++	const int faceSize = 256;   // rc.ini pins EnvironmentProbeHDR to 256 either way
++
++	// Supersamples per axis, from the source's own resolution: one face texel spans
++	// (pi/2)/faceSize radians and one source texel 2*pi/width, so this is "how many source texels
++	// fall inside one output texel", floored at 4 and capped at 16. Undersampling a 8k source into
++	// a 256 face is where an HDRI import aliases.
++	const int ss = clamp_tpl(int(float(img.width) / (4.0f * faceSize) + 0.5f), 4, 16);
++
++	// The BC6UH guard: 10 000 engine units = 1e8 cd/m2, far above any sky and far below the
++	// format's 6.55e8 ceiling, so the clamp can only ever catch a residual the sun removal missed.
++	const float kResidualClamp = 10000.0f;
++
++	const int stripW = faceSize * 6;
++	std::vector<CryHalf4> strip(size_t(stripW) * faceSize);
++
++	size_t nClamped = 0;
++	for (int face = 0; face < 6; ++face)
++	{
++		for (int y = 0; y < faceSize; ++y)
++		{
++			for (int x = 0; x < faceSize; ++x)
++			{
++				float acc[3] = { 0, 0, 0 };
++				for (int sy = 0; sy < ss; ++sy)
++					for (int sx = 0; sx < ss; ++sx)
++					{
++						const float u = 2.0f * ((x + (sx + 0.5f) / ss) / faceSize) - 1.0f;
++						const float v = 2.0f * ((y + (sy + 0.5f) / ss) / faceSize) - 1.0f;
++						float s[3];
++						SampleEquirect(img, CubeFaceDirection(face, u, v), s);
++						acc[0] += s[0]; acc[1] += s[1]; acc[2] += s[2];
++					}
++
++				const float inv = fScale / (ss * ss);
++				float r = acc[0] * inv, g = acc[1] * inv, b = acc[2] * inv;
++				if (r > kResidualClamp || g > kResidualClamp || b > kResidualClamp)
++				{
++					r = min(r, kResidualClamp); g = min(g, kResidualClamp); b = min(b, kResidualClamp);
++					++nClamped;
++				}
++
++				strip[size_t(y) * stripW + face * faceSize + x] = CryHalf4(r, g, b, 1.0f);
++			}
++		}
++	}
++
++	if (nClamped)
++		CryLogAlways("[HDRI] %u of %u face texels hit the 1e8 cd/m2 residual clamp - a source with a sun still in it?",
++		             (unsigned)nClamped, unsigned(size_t(stripW) * faceSize));
++
++	// ------------------------------------------------------------------ 6. write and compile
++	// _rec, because the probe loader warns about a probe with no convention stamp
++	// (decisions/s2-preset-and-probes.md). It is a small lie - an imported HDRI is
++	// convention-INDEPENDENT, it was never lit by our sun - but the alternative is a warning on
++	// every load of a correct asset.
++	string relPath = string("textures/cubemaps/") + outName + "_rec_cm.tif";
++	const string absPath = PathUtil::ToUnixPath(
++	  PathUtil::Make(gEnv->pSystem->GetIProjectManager()->GetCurrentAssetDirectoryAbsolute(), relPath));
++
++	gEnv->pCryPak->MakeDir(PathUtil::GetPathWithoutFilename(absPath));
++
++	if (!gEnv->pRenderer->WriteTIFToDisk(strip.data(), stripW, faceSize, 2, 4, true, "HDRCubemap_highQ", absPath.c_str()))
++	{
++		CryWarning(VALIDATOR_MODULE_SYSTEM, VALIDATOR_ERROR, "[HDRI] could not write '%s'", absPath.c_str());
++		return;
++	}
++
++	// The sidecar. The whole point of the exercise is that the asset knows what its numbers mean;
++	// a .tif cannot carry that, so a text file next to it does. It is the only record of the scale.
++	{
++		const string sidecar = PathUtil::ReplaceExtension(absPath, "probe.txt");
++		if (FILE* f = fopen(sidecar.c_str(), "w"))
++		{
++			fprintf(f, "# ReC Sandbox HDRI probe import\n");
++			fprintf(f, "source          = %s\n", sourceFile.c_str());
++			fprintf(f, "source_primaries= %s\n", PrimariesName(primaries));
++			fprintf(f, "file_exposure   = %g\n", fFileExposure);
++			fprintf(f, "scale_to_engine = %.9g   # 1.0 engine unit = %g cd/m2\n", fScale, (double)RENDERER_LIGHT_UNIT_SCALE);
++			fprintf(f, "sky_median_nits = %.6g\n", fSkyMedian * fScale * RENDERER_LIGHT_UNIT_SCALE);
++			if (sun.bFound)
++			{
++				fprintf(f, "sun_removed     = 1\n");
++				fprintf(f, "sun_lux         = %.6g\n", sun.illuminance * fScale * RENDERER_LIGHT_UNIT_SCALE);
++				fprintf(f, "sun_solid_angle = %.6g\n", sun.solidAngle);
++				fprintf(f, "sun_direction   = %.6f %.6f %.6f\n", sun.dir.x, sun.dir.y, sun.dir.z);
++			}
++			else
++			{
++				fprintf(f, "sun_removed     = 0\n");
++			}
++			fclose(f);
++		}
++	}
++
++	CryLogAlways("[HDRI] wrote '%s' (%dx%d, six faces, fp16)", absPath.c_str(), stripW, faceSize);
++
++	const CResourceCompilerHelper::ERcCallResult result =
++	  CResourceCompilerHelper::CallResourceCompiler(absPath.c_str(), nullptr, nullptr, false,
++	                                               CResourceCompilerHelper::eRcExePath_editor, true, true);
++	if (result == CResourceCompilerHelper::eRcCallResult_success)
++	{
++		CryLogAlways("[HDRI] done. Point an Environment Probe at '%s_rec_cm.dds'; the RC also produced its _diff sibling.",
++		             outName.c_str());
++		CryLogAlways("[HDRI] Do NOT hand-author the _diff cube from an external tool: external convolvers emit E, "
++		             "the RC's cosine filter emits E/pi, and the difference is a silent 1.65 stops.");
++	}
++	else
++	{
++		CryWarning(VALIDATOR_MODULE_SYSTEM, VALIDATOR_WARNING,
++		           "[HDRI] the resource compiler failed on '%s'; the .tif is on disk and can be recompiled by hand", absPath.c_str());
++	}
++}
++
++} // anonymous namespace
++
++void RegisterHDRIImportCommands()
++{
++	REGISTER_COMMAND("rec_ImportHDRI", CmdImportHDRI, VF_NULL,
++	                 "rec_ImportHDRI <file.hdr|file.exr> <name> [--nits <sky cd/m2>] [--remove-sun]\n"
++	                 "Import an equirectangular HDRI as an environment probe with a known absolute luminance.");
++}
++
++void RemoveHDRIImportCommands()
++{
++	if (gEnv->pConsole)
++		gEnv->pConsole->RemoveCommand("rec_ImportHDRI");
++}
+diff --git a/Code/CryPlugins/CinematicCamera/Module/HDRIImport.h b/Code/CryPlugins/CinematicCamera/Module/HDRIImport.h
+new file mode 100644
+index 00000000..80a9df13
+--- /dev/null
++++ b/Code/CryPlugins/CinematicCamera/Module/HDRIImport.h
+@@ -0,0 +1,7 @@
++// Copyright 2026 ReC Sandbox. Distributed under the terms in LICENSE.md at the repository root.
++#pragma once
++
++//! Registers / removes the `rec_ImportHDRI` console command.
++//! Implementation and documentation: HDRIImport.cpp, docs/SceneReferredContent.md section 8.
++void RegisterHDRIImportCommands();
++void RemoveHDRIImportCommands();
+diff --git a/Code/CryPlugins/CinematicCamera/docs/SceneReferredContent.md b/Code/CryPlugins/CinematicCamera/docs/SceneReferredContent.md
+index 4836fb7c..9c805dd9 100644
+--- a/Code/CryPlugins/CinematicCamera/docs/SceneReferredContent.md
++++ b/Code/CryPlugins/CinematicCamera/docs/SceneReferredContent.md
+@@ -423,3 +423,94 @@ the wrong centre.
+   light-volume list.
+ * `e_LightIlluminanceThreshold` still cuts a light off at **40 lux**, which is generous for a
+   daylight scene and far too aggressive for a night one. It is a cvar; lower it for night work.
++
++---
++
++## 8. HDRI — importing a measured environment as a probe
++
++`rec_ImportHDRI` turns an equirectangular `.hdr` or `.exr` into a CRYENGINE environment probe with
++a **known absolute luminance**. It exists because there is no other place the calibration can
++happen: the Resource Compiler applies no scale, no gamma and no tone map on the HDR path
++(`colorspace=linear,linear` everywhere), it cannot read `.exr` at all, and it parses and then
++discards Radiance's own `EXPOSURE=` and `PRIMARIES=` header fields. Whatever unit is in the file is
++the unit in the `.dds`, and nothing records what that unit was.
++
++```
++rec_ImportHDRI <file.hdr|file.exr> <name> [--nits <sky cd/m²>] [--remove-sun]
++```
++
++It writes `<assets>/textures/cubemaps/<name>_rec_cm.tif` — a 16-bit-float TIFF with the six cube
++faces in a horizontal strip, carrying `/preset=HDRCubemap_highQ`, which is *exactly* the artefact
++the environment-probe bake already produces — then runs the RC on it. The 256² specular cube and
++its 32² `_diff` sibling come out of that one call. Nothing in the engine, the RC or the shaders
++changes for any of this.
++
++### 8.1 The absolute scale
++
++| | what happens |
++|---|---|
++| **without `--nits`** | the source pixel values are taken to **be** cd/m². Right for a file you calibrated yourself; wrong, and loudly logged as an assumption, for a vendor HDRI |
++| **with `--nits N`** | the image is scaled so the **sky** — the median luminance of the upper hemisphere, with the sun excluded — reads N cd/m² |
++
++A median rather than a mean, for the same reason the exposure meter uses a histogram: one 10⁶ texel
++moves a mean and cannot move a median. Useful anchors: an overcast sky is roughly 2 000 cd/m², a
++clear blue sky away from the sun 5 000–8 000, and near the horizon at midday 15 000.
++
++A Radiance file that carries its own `EXPOSURE=` is honoured (the RC would have ignored it), and
++the factor is recorded.
++
++### 8.2 The sun has to come out
++
++BC6UH tops out at 65 504, which is 6.55 × 10⁸ cd/m² in engine units — **below the solar disc's
++1.5 × 10⁹** — and a 256² face cannot resolve a half-degree disc in any case. So a probe simply
++cannot hold a sun; leaving one in gives a clipped, hue-shifted, aliased smear.
++
++`--remove-sun` finds every texel above 50 × the sky median, checks the region is smaller than
++0.01 sr (a bright region larger than that is a sky or a big practical, and is left alone with a
++warning), measures it, replaces it with the surrounding sky's own colour, and prints:
++
++```
++[HDRI] SUN REMOVED: 118 400 lux, 0.00007 sr (14 texels), elevation 47.30 deg, azimuth -22.10 deg
++[HDRI]   -> put 118400 into the time of day's Sun Intensity and match the sun's angles.
++```
++
++Type that into the time of day. The **analytic** sun then re-adds the disc properly — in lux,
++π-correct on the ReC path, with real shadows and real specular highlights, which the baked one
++never had.
++
++### 8.3 Colour
++
++A probe must contain **linear Rec.709**, because BC6UH is unsigned: an AP0 or AP1 encoded
++environment carries values Rec.709 cannot represent without negatives, and the format clips those
++to zero. So the conversion is not optional and there is no pass-through mode.
++
++* `.exr`: the file's `chromaticities` attribute is read and classified. ACES2065-1 (AP0) and
++  ACEScg (AP1) are converted; anything else, and any file with no attribute, is treated as Rec.709
++  — which is what the OpenEXR specification says the default is. The verdict is in the log line.
++* `.hdr`: Radiance's `PRIMARIES=` is not read (it is rare and unreliable in practice); the file is
++  treated as Rec.709.
++
++Negative and non-finite samples are clipped to zero here, where the count is reported, instead of
++silently inside the RC.
++
++### 8.4 Orientation, resolution, and what the tool does not do
++
++The convention: the **centre of the image looks along +Y** (the engine's "north"), u increases
++eastward towards +X, the top row is the zenith. There is no yaw argument — rotate the source if the
++horizon needs turning.
++
++Faces are 256², supersampled from the source at 4–16 samples per axis chosen from the source's own
++width, so an 8K panorama does not alias into a 256 face. The residual is clamped at 10 000 engine
++units (10⁸ cd/m²), far above any sky and far below the format's ceiling, so it can only ever catch
++a sun the removal missed — and it says so when it fires.
++
++A `<name>_rec_cm.probe.txt` sidecar records the source, its primaries, the scale to engine units,
++the resulting sky luminance in nits and the sun that was removed. **It is the only record of what
++the numbers mean**; a `.tif` cannot carry one.
++
++The `_rec` suffix is emitted so the probe loader's convention check stays quiet. It is a small lie:
++an imported HDRI is convention-*independent* — it was never lit by our sun — but the alternative is
++a warning on every load of a correct asset.
++
++**Supply the environment, never a pre-convolved irradiance map.** External convolvers emit `E`; the
++RC's cosine-180 filter emits `E/π`, and dropping a foreign `_cm_diff.dds` in is a silent 1.65 stops.
+-- 
+2.47.1.windows.1
+

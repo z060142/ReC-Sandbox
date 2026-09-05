@@ -1,0 +1,246 @@
+From f8713f74ed24e764b67b7889eca8aa801a707722 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Fri, 28 Aug 2026 06:39:29 +0800
+Subject: [PATCH 062/119] scene-referred S0: review fixes - cached request
+ pointer, in-place target reformat
+
+Two follow-ups from the S0 review.
+
+1. IsSceneReferred() no longer resolves the request by name on every call. It ran up to three
+   times a frame (pipeline resource update plus two tone-map sites) and GetByName() is a CRC
+   plus a map lookup behind a one-entry per-thread cache that the other post-effect params keep
+   evicting. CPostEffectsMgr::GetSceneReferredParam() returns the m_pUserSceneReferred already
+   resolved at Init(), so the hot path is a pointer read. Release() deletes the params through
+   the name map and left every cached CEffectParam* dangling; ours is the one read from outside
+   the class, so it is now nulled there. The comment at the read site records that the value is
+   the one CParamFloat::SyncMainWithRender() copied into this thread's slot at the frame
+   boundary - it is the request ccam made for this frame and cannot change under a frame in
+   flight.
+
+2. Dangling-pointer audit of the seven re-formatted targets, and the mechanism changed as a
+   result. All 30 uses across RenderDll were classified (table now in
+   scene-notes/research/s0-hdr-format-selection.md section 6, replacing the open question).
+   Nobody caches a raw CTexture* - every site reads m_graphicsPipelineResources at use time.
+   The hazard is one level down: the binding recorded in a resource set or device render pass,
+   combined with the IsDirty() guards that decide whether a stage re-issues its Set* calls. Ten
+   such (b) sites exist - CToneMappingStage's $HDRFinalBloom slot (key is sun-shafts / chart /
+   luminance IDs), CBloomStage's m_pass2V.IsDirty() which takes no arguments at all, the streak
+   and halation composites, CTiledShadingStage's UAV, CScreenSpaceSSS twice, and
+   CScreenSpaceReflections. Releasing the objects would let the eResourceDestroyed callback NULL
+   those bindings, and nothing would ever set them again.
+
+   Fixing ten sites means editing eight engine stages, which is the opposite of what a
+   byte-identity change should do. So the release was dropped entirely: the new
+   CTexture::ReformatRenderTarget() sets the format and re-runs CreateDeviceTexture(), swapping
+   the device texture underneath the same CTexture object. Every pointer stays valid, and
+   SetDevTexture() raises eDeviceResourceDirty, which both CDeviceResourceSet and
+   CDeviceRenderPass turn into "rebuild your views" rather than "your binding is gone". That is
+   the sanctioned mechanism - it is what OwnDevTexture() exists for. (a), (b) and (c) all become
+   moot, and UpdateHDRSatelliteFormats() no longer calls the create functions at all.
+
+   Our own DOF / ghost / diffraction / FFT glare code holds none of the seven; the only contact
+   is CBloomStage's halation and streak composites, which are in the table.
+
+Built clean (0 errors, 0 warnings outside Code/SDKs): CryRenderD3D11, CinematicCamera.
+
+Co-Authored-By: Claude Opus <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01A72MFkdSczncE7au9UVnmu
+---
+ .../Common/PostProcess/PostProcess.cpp        |  4 ++
+ .../Common/PostProcess/PostProcess.h          |  6 +++
+ .../RenderDll/Common/RendererResources.cpp    |  9 +++-
+ .../RenderDll/Common/Textures/Texture.cpp     | 31 +++++++++++
+ .../RenderDll/Common/Textures/Texture.h       |  6 +++
+ .../Common/GraphicsPipeline.cpp               | 53 +++++++------------
+ 6 files changed, 75 insertions(+), 34 deletions(-)
+
+diff --git a/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.cpp b/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.cpp
+index 90c3ecb7..c96e13be 100644
+--- a/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.cpp
++++ b/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.cpp
+@@ -501,6 +501,10 @@ void CPostEffectsMgr::Release()
+ 	std::for_each(m_pNameIdMap.begin(), m_pNameIdMap.end(), SContainerKeyEffectParamDelete());
+ 	m_pNameIdMap.clear();
+ 
++	// The map owns the params, so every cached CEffectParam* is dangling from here on.
++	// GetSceneReferredParam() is read from outside this class, so at least ours is cleared.
++	m_pUserSceneReferred = nullptr;
++
+ 	std::for_each(m_pEffects.begin(), m_pEffects.end(), container_object_safe_release());
+ 	std::for_each(m_pEffects.begin(), m_pEffects.end(), container_object_safe_delete());
+ 	m_pEffects.clear();
+diff --git a/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.h b/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.h
+index 7787f251..c3894151 100644
+--- a/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.h
++++ b/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.h
+@@ -518,6 +518,12 @@ public:
+ 	// Given a string returns corresponding SEffectParam if exists, else returns null
+ 	CEffectParam* GetByName(const char* pszParam);
+ 
++	//! The scene-referred request, resolved once at Init() instead of by name every frame.
++	//! GetByName() is a CRC plus a map lookup behind a one-entry per-thread cache, and this is
++	//! read from the tone map and from the pipeline resource update on every frame; a member
++	//! read costs nothing. Null before Init() and after Release().
++	CEffectParam* GetSceneReferredParam() const { return m_pUserSceneReferred; }
++
+ 	// Given a string returns containing value if exists, else returns 0
+ 	float GetByNameF(const char* pszParam);
+ 	Vec4  GetByNameVec4(const char* pszParam);
+diff --git a/Code/CryEngine/RenderDll/Common/RendererResources.cpp b/Code/CryEngine/RenderDll/Common/RendererResources.cpp
+index ce04b3d4..f7039620 100644
+--- a/Code/CryEngine/RenderDll/Common/RendererResources.cpp
++++ b/Code/CryEngine/RenderDll/Common/RendererResources.cpp
+@@ -472,7 +472,14 @@ bool CRendererResources::IsSceneReferred()
+ 	if (!pPostMgr)
+ 		return false;
+ 
+-	CEffectParam* pRequest = pPostMgr->GetByName("Global_User_SceneReferred");
++	// Resolved once at CPostEffectsMgr::Init(), not looked up by name here: this runs from the
++	// tone map and from the pipeline resource update on every frame, and GetByName() is a CRC
++	// plus a map lookup behind a one-entry per-thread cache that the other params keep evicting.
++	//
++	// The value read is the one CParamFloat::SyncMainWithRender() copied into this thread's slot
++	// at the frame boundary, so it is the request ccam made for THIS frame and it cannot change
++	// underneath a frame that has already started.
++	CEffectParam* pRequest = pPostMgr->GetSceneReferredParam();
+ 	return pRequest != nullptr && pRequest->GetParam() > 0.5f;
+ }
+ 
+diff --git a/Code/CryEngine/RenderDll/Common/Textures/Texture.cpp b/Code/CryEngine/RenderDll/Common/Textures/Texture.cpp
+index 7e37fd25..a0853b0f 100644
+--- a/Code/CryEngine/RenderDll/Common/Textures/Texture.cpp
++++ b/Code/CryEngine/RenderDll/Common/Textures/Texture.cpp
+@@ -473,6 +473,37 @@ void CTexture::CreateRenderTarget(ETEX_Format eFormat, const ColorF& cClear)
+ 	PostCreate();
+ }
+ 
++// Change an existing render target's format WITHOUT destroying the CTexture object.
++//
++// The alternative - releasing the object and letting GetOrCreateRenderTarget build a new one -
++// looks simpler but is not safe here: the graphics-pipeline stages bind these targets inside
++// IsDirty() guards whose keys do not mention them (CToneMappingStage binds $HDRFinalBloom under
++// a key of sun-shafts / colour-chart / luminance texture IDs; CBloomStage's m_pass2V.IsDirty()
++// takes no arguments at all), so after a destroy-and-recreate the device layer would null their
++// bindings through the eResourceDestroyed callback and nothing would ever set them again.
++//
++// Swapping the device texture underneath the same object avoids that completely: every
++// CTexture* stays valid, and SetDevTexture() raises eDeviceResourceDirty, which marks every
++// resource set and device render pass holding this texture dirty so they rebuild their views.
++// That is the sanctioned path - it is what OwnDevTexture() exists for ("texture-config does
++// change").
++bool CTexture::ReformatRenderTarget(ETEX_Format eFormat)
++{
++	if (eFormat == eTF_Unknown || !(m_eFlags & FT_USAGE_RENDERTARGET))
++		return false;
++
++	m_eSrcFormat = eFormat;
++	SetClosestFormatSupported();
++
++	// Width, height, mip count, array size, flags and clear colour are all left as they are;
++	// only the format moves.
++	SSubresourceData pData(nullptr);
++	CreateDeviceTexture(std::move(pData));
++	PostCreate();
++
++	return true;
++}
++
+ void CTexture::CreateDepthStencil(ETEX_Format eFormat, const ColorF& cClear)
+ {
+ 	if (m_eSrcFormat == eTF_Unknown)
+diff --git a/Code/CryEngine/RenderDll/Common/Textures/Texture.h b/Code/CryEngine/RenderDll/Common/Textures/Texture.h
+index ed73c942..823f9cbb 100644
+--- a/Code/CryEngine/RenderDll/Common/Textures/Texture.h
++++ b/Code/CryEngine/RenderDll/Common/Textures/Texture.h
+@@ -1294,6 +1294,12 @@ public:
+ 
+ 	// Low-level functions calling CreateDeviceTexture()
+ 	void               CreateRenderTarget(ETEX_Format eFormat, const ColorF& cClear);
++	//! Give an EXISTING render target a different format, keeping this CTexture object alive.
++	//! CreateRenderTarget() cannot do it (it only assigns m_eSrcFormat while it is still
++	//! eTF_Unknown, so the format argument of an already-formatted texture is discarded), and
++	//! destroying the object instead would invalidate every CTexture* the pipeline holds.
++	//! Returns false if the texture is not a render target. See SceneReferredSpec.md S0.
++	bool               ReformatRenderTarget(ETEX_Format eFormat);
+ 	void               CreateDepthStencil(ETEX_Format eFormat, const ColorF& cClear);
+ 	void               CreateShaderResource(STexDataPtr&& td);
+ 
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Common/GraphicsPipeline.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Common/GraphicsPipeline.cpp
+index 116f0763..aa094d0e 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Common/GraphicsPipeline.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Common/GraphicsPipeline.cpp
+@@ -452,18 +452,21 @@ void CGraphicsPipelineResources::OnCVarsChanged(const CCVarUpdateRecorder& rCVar
+ 
+ // Re-format the seven HDR satellite targets when the scene-referred switch flips.
+ //
+-// Setting a format at creation time is not enough: r_HDRTexFormat is apply-on-startup in
++// Setting the format at creation time is not enough: r_HDRTexFormat is apply-on-startup in
+ // practice, because the target objects are pre-registered by name in Init() and
+ // CTexture::CreateRenderTarget only assigns m_eSrcFormat when it is still eTF_Unknown - the
+-// format argument of an already-formatted texture is silently discarded. So the objects have
+-// to be destroyed before the create functions can rebuild them, which is the
+-// CPostAAStage::Resize pattern (compare against GetDstFormat(), release, re-create).
++// format argument of an already-formatted texture is silently discarded.
+ //
+-// One deviation from that pattern, and it is load-bearing: PostAA's accumulators do not carry
+-// FT_DONT_RELEASE, ours do, and CTexture::Release() is a NO-OP on an FT_DONT_RELEASE texture
+-// (Texture.h). SAFE_RELEASE here would do nothing at all and the format would never move.
+-// ReleaseForce() clears the flag first, which is what Shutdown() already uses on these exact
+-// targets.
++// The format therefore has to be changed on the LIVE objects. CTexture::ReformatRenderTarget()
++// swaps the device texture underneath the same CTexture, which is the only safe way to do it
++// here: releasing and re-creating the objects (the CPostAAStage::Resize pattern) would leave
++// every stage that binds one of these targets inside an IsDirty() guard with a nulled binding
++// and no reason to ever set it again - CToneMappingStage binds $HDRFinalBloom under a key of
++// sun-shafts / colour-chart / luminance texture IDs, CBloomStage's m_pass2V.IsDirty() takes no
++// arguments at all, CTiledShadingStage's UAV on $SceneTargetR11G11B10F_0 sits behind a caustics
++// / SVO / AO key. Keeping the pointers alive makes all of that irrelevant: SetDevTexture()
++// raises eDeviceResourceDirty and the device layer marks every resource set and render pass
++// that holds the texture dirty, so they rebuild their views by themselves.
+ //
+ // All seven or none: $HDRTargetPrev[] and $SceneTargetR11G11B10F[] are ping-ponged and copied
+ // into each other's roles across passes, so a mixed set would leave a silent precision cliff
+@@ -497,32 +500,16 @@ void CGraphicsPipelineResources::UpdateHDRSatelliteFormats()
+ 	if (!bMismatch)
+ 		return;
+ 
+-	SAFE_RELEASE_FORCE(m_pTexHDRTargetPrev[0]);
+-	SAFE_RELEASE_FORCE(m_pTexHDRTargetPrev[1]);
+-	SAFE_RELEASE_FORCE(m_pTexSceneTargetR11G11B10F[0]);
+-	SAFE_RELEASE_FORCE(m_pTexSceneTargetR11G11B10F[1]);
+-	SAFE_RELEASE_FORCE(m_pTexHDRFinalBloom);
+-	SAFE_RELEASE_FORCE(m_pTexWaterVolumeRefl[0]);
+-	SAFE_RELEASE_FORCE(m_pTexWaterVolumeRefl[1]);
+-
+-	CreateHDRMaps(m_resourceWidth, m_resourceHeight);
+-	CreatePostFXMaps(m_resourceWidth, m_resourceHeight);
+-
+ 	uint64 sizeAfter = 0;
+-	CTexture* const rebuilt[] =
+-	{
+-		m_pTexHDRTargetPrev[0],
+-		m_pTexHDRTargetPrev[1],
+-		m_pTexSceneTargetR11G11B10F[0],
+-		m_pTexSceneTargetR11G11B10F[1],
+-		m_pTexHDRFinalBloom,
+-		m_pTexWaterVolumeRefl[0],
+-		m_pTexWaterVolumeRefl[1],
+-	};
+-	for (CTexture* pTex : rebuilt)
++	for (CTexture* pTex : satellites)
+ 	{
+-		if (pTex)
+-			sizeAfter += pTex->GetDeviceDataSize();
++		if (!pTex)
++			continue;
++
++		if (pTex->GetDstFormat() != wanted)
++			pTex->ReformatRenderTarget(wanted);
++
++		sizeAfter += pTex->GetDeviceDataSize();
+ 	}
+ 
+ 	// Once per flip, not once per frame: the mismatch test above is false on every other frame.
+-- 
+2.47.1.windows.1
+

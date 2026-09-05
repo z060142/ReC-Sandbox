@@ -1,0 +1,389 @@
+From aa8e3090dc21a756270a1dbed226ca7a7f8f39e2 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Sat, 29 Aug 2026 03:37:16 +0800
+Subject: [PATCH 110/119] fix: the previews were being lit in absolute units
+ and shown as if they were not
+
+A ccam ticked in the level made the material editor preview, every asset thumbnail,
+the Character Tool, the Schematyc preview and the 2D viewports scene-referred too:
+CRendererResources::IsSceneReferred() is a device-global question with no pipeline in
+it, and exactly one of the 6-10 pipelines a routine editor session runs owns a tone
+map. The others received the pre-exposure, the 1/PI convention and the fp16 reformats
+with nothing to undo any of it - a white square at an interior camera, black at
+daylight, and the thumbnail then written to disk and cached.
+
+Scene-referred becomes a property of a pipeline that owns a display transform. A new
+virtual CGraphicsPipeline::IsSceneReferredCapable(), true only on
+CStandardGraphicsPipeline, is evaluated once per render view in
+LatchSceneReferredExposure() and published as a render-thread gate that
+IsSceneReferred() ANDs in - so the exposure, the formats, the working space, the ODT,
+the inert LDR stage, the thresholds and the export tap all follow from one chokepoint
+instead of three, and cannot drift apart later. The gate defaults to OPEN, so it can
+only ever take work away from a render, never add it.
+
+The terrain minimap rides the same gate: e_ScreenShot modes 3-6 render through the
+level's own Standard pipeline and must not carry the camera's exposure, sensor clip,
+white balance, CDL and ODT. A minimap is data. e_ScreenShot 1 (high-res) is
+deliberately not in the list - a high-res screenshot IS the picture. The cvar is read
+on the render thread and so the gate is coarse by a frame or two around the bake,
+which is harmless because the bake is modal.
+
+Exposure is per pipeline; the CONVENTION stays global. E3DPARAM_SCENE_REFERRED changes
+the sun's own colour and there is one sun for every view, so withholding the 1/PI from
+a preview would leave it PI times too bright. m_fSceneReferredBRDFFactor and the skybox
+emittance unit in S3DEngineCommon::UpdateSkyInfo (main thread, one m_SkyInfo for every
+view) therefore ask the new un-gated IsSceneReferredRequested*() instead.
+Probe bakes are byte-identical: SHDF_CUBEMAPGEN keeps its own exposure force.
+
+Instrumentation: one CryLogAlways per gate DECISION naming the pipeline and the reason,
+and a first r_HDRDebug 1 line "pipeline: <name> scene-referred: yes/no".
+
+Notes: scene-notes/decisions/s8-preview-gate.md, research/s8-editor-pipelines.md.
+
+Co-Authored-By: Claude Opus <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01A72MFkdSczncE7au9UVnmu
+---
+ Code/CryEngine/RenderDll/Common/Renderer.cpp  |  7 ++-
+ .../RenderDll/Common/RendererResources.cpp    | 61 +++++++++++++++++++
+ .../RenderDll/Common/RendererResources.h      | 23 ++++++-
+ .../RenderDll/XRenderD3D9/D3DRendPipeline.cpp | 53 +++++++++++++++-
+ .../RenderDll/XRenderD3D9/DriverD3D.h         |  2 +-
+ .../Common/GraphicsPipeline.cpp               | 11 +++-
+ .../Common/GraphicsPipeline.h                 | 13 ++++
+ .../GraphicsPipeline/SceneReferredExport.cpp  |  8 +++
+ .../StandardGraphicsPipeline.h                |  4 ++
+ .../GraphicsPipeline/ToneMapping.cpp          | 10 +++
+ 10 files changed, 184 insertions(+), 8 deletions(-)
+
+diff --git a/Code/CryEngine/RenderDll/Common/Renderer.cpp b/Code/CryEngine/RenderDll/Common/Renderer.cpp
+index eb60d808..59eee83a 100644
+--- a/Code/CryEngine/RenderDll/Common/Renderer.cpp
++++ b/Code/CryEngine/RenderDll/Common/Renderer.cpp
+@@ -4042,7 +4042,12 @@ void S3DEngineCommon::UpdateSkyInfo(const SRenderingPassInfo& passInfo)
+ 	// r_HDRDebug 1 prints the resulting emittance in cd/m^2 next to the authored lux, so the
+ 	// times-ten can be confirmed empirically in one look rather than argued about
+ 	// (CToneMappingStage::DisplayDebugInfo).
+-	const float skyEmittanceScale = CRendererResources::IsSceneReferredStage(3) ? 1.0f : (RENDERER_LIGHT_UNIT_SCALE / 1000.0f);
++	// IsSceneReferredRequestedStage() and not IsSceneReferredStage(): S3DEngineCommon::UpdateSkyInfo
++	// runs on the MAIN thread and writes one m_SkyInfo for every view in the frame, so it cannot
++	// have a per-pipeline answer. Like the 1/PI convention next to it, the skybox emittance unit is
++	// a property of the world and stays global under the preview gate
++	// (research/s8-editor-pipelines.md section 4b).
++	const float skyEmittanceScale = CRendererResources::IsSceneReferredRequestedStage(3) ? 1.0f : (RENDERER_LIGHT_UNIT_SCALE / 1000.0f);
+ 	m_SkyInfo.m_vSkyBoxEmittance *= skyEmittanceScale;
+ 
+ 	// Note: this should be deprecated at some point.
+diff --git a/Code/CryEngine/RenderDll/Common/RendererResources.cpp b/Code/CryEngine/RenderDll/Common/RendererResources.cpp
+index 1ea3577d..28e4e241 100644
+--- a/Code/CryEngine/RenderDll/Common/RendererResources.cpp
++++ b/Code/CryEngine/RenderDll/Common/RendererResources.cpp
+@@ -463,7 +463,62 @@ ETEX_Format CRendererResources::GetDisplayFormat()
+ // per-frame, per-camera data and the bus already has the reset/handover semantics for it), and
+ // r_SceneReferred ANDs it away. When this returns false not one line of the scene-referred work
+ // runs and every target, pass and constant keeps its stock value.
++// The pipeline gate (research/s8-editor-pipelines.md, decisions/s8-preview-gate.md). Set once per
++// render view on the render thread by CD3D9Renderer::LatchSceneReferredExposure(), read by every
++// scene-referred site through IsSceneReferred(). Default OPEN so that any render that somehow
++// reaches a gated site without passing the latch behaves exactly as it did before this gate
++// existed - the gate can only ever take work AWAY from a render, never add it.
++static bool        s_bSceneReferredPipelineGate = true;
++static const char* s_szSceneReferredPipelineName = "";
++static bool        s_bSceneReferredGateLogged = false;
++static bool        s_bSceneReferredGateLoggedState = true;
++static std::string s_sSceneReferredGateLoggedName;
++
++void CRendererResources::SetSceneReferredPipelineGate(bool bOpen, const char* szPipelineName, const char* szReason)
++{
++	s_bSceneReferredPipelineGate = bOpen;
++	s_szSceneReferredPipelineName = szPipelineName ? szPipelineName : "";
++
++	// One line per decision, not per frame: the pair (pipeline, verdict) is what a user needs to
++	// see once when a preview stops being pre-exposed, and it is what a bug report needs to carry.
++	// It is only interesting while the camera is actually asking for the path.
++	if (!IsSceneReferredRequested())
++		return;
++
++	if (s_bSceneReferredGateLogged &&
++	    s_bSceneReferredGateLoggedState == bOpen &&
++	    s_sSceneReferredGateLoggedName == s_szSceneReferredPipelineName)
++		return;
++
++	s_bSceneReferredGateLogged = true;
++	s_bSceneReferredGateLoggedState = bOpen;
++	s_sSceneReferredGateLoggedName = s_szSceneReferredPipelineName;
++
++	CryLogAlways("[SceneReferred] pipeline '%s' scene-referred: %s (%s)",
++	             s_szSceneReferredPipelineName, bOpen ? "yes" : "no", szReason ? szReason : "");
++}
++
++bool CRendererResources::IsSceneReferredPipelineGateOpen()
++{
++	return s_bSceneReferredPipelineGate;
++}
++
++const char* CRendererResources::GetSceneReferredPipelineName()
++{
++	return s_szSceneReferredPipelineName;
++}
++
+ bool CRendererResources::IsSceneReferred()
++{
++	// The gate first: it is a plain bool and it is false for every preview, thumbnail and minimap
++	// render, so the common editor case exits here without touching the parameter bus at all.
++	if (!s_bSceneReferredPipelineGate)
++		return false;
++
++	return IsSceneReferredRequested();
++}
++
++bool CRendererResources::IsSceneReferredRequested()
+ {
+ 	if (CRenderer::CV_r_SceneReferred == 0)
+ 		return false;
+@@ -495,6 +550,12 @@ bool CRendererResources::IsSceneReferredStage(int nStage)
+ 	return IsSceneReferred() && CRenderer::CV_r_SceneReferredStage >= nStage;
+ }
+ 
++// The un-gated twin, for the world-shaped decisions. See the header.
++bool CRendererResources::IsSceneReferredRequestedStage(int nStage)
++{
++	return IsSceneReferredRequested() && CRenderer::CV_r_SceneReferredStage >= nStage;
++}
++
+ const float CRendererResources::kSceneReferredMidGrey = 0.18f;
+ 
+ // The luminance weights of the space the HDR target is actually in this frame. One place, because
+diff --git a/Code/CryEngine/RenderDll/Common/RendererResources.h b/Code/CryEngine/RenderDll/Common/RendererResources.h
+index e7990f3c..ee1f7928 100644
+--- a/Code/CryEngine/RenderDll/Common/RendererResources.h
++++ b/Code/CryEngine/RenderDll/Common/RendererResources.h
+@@ -158,11 +158,32 @@ public:
+ 	static ETEX_Format GetDepthFormat();
+ 
+ 	//! The scene-referred path is taken this frame: the Cinematic Camera asked for it on the
+-	//! post-effect parameter bus AND the r_SceneReferred kill switch honours the request.
++	//! post-effect parameter bus AND the r_SceneReferred kill switch honours the request AND the
++	//! render currently in flight is one that owns a display transform (the level viewport / game
++	//! view, not a thumbnail, a material preview or a terrain minimap - see
++	//! research/s8-editor-pipelines.md and SetSceneReferredPipelineGate below).
+ 	//! Everything gated by SceneReferredSpec.md keys on this and on nothing else, so with the
+ 	//! component off or the cvar at 0 the renderer is byte-identical to stock.
+ 	static bool        IsSceneReferred();
+ 
++	//! IsSceneReferred() WITHOUT the pipeline gate: "the camera asked and the cvar agrees",
++	//! regardless of which render is in flight. Reserved for the handful of decisions that are
++	//! properties of the WORLD rather than of a picture - the light-unit convention and its
++	//! siblings - which have exactly one value per frame for every viewport at once. Everything
++	//! else must use IsSceneReferred(); if in doubt, that is the one you want.
++	static bool        IsSceneReferredRequested();
++	static bool        IsSceneReferredRequestedStage(int nStage);
++
++	//! Open or close the pipeline gate for the render view about to be drawn. Called once per
++	//! render view from CD3D9Renderer::LatchSceneReferredExposure(), on the render thread, before
++	//! any stage runs - so every consumer downstream sees one decision for the whole view.
++	//! Logs the decision once per pipeline whenever it changes, naming the pipeline.
++	static void        SetSceneReferredPipelineGate(bool bOpen, const char* szPipelineName, const char* szReason);
++
++	//! The gate's current state and the pipeline that set it, for r_HDRDebug 1.
++	static bool        IsSceneReferredPipelineGateOpen();
++	static const char* GetSceneReferredPipelineName();
++
+ 	//! IsSceneReferred() narrowed to the bisection gate r_SceneReferredStage: true only while the
+ 	//! camera asks for the scene-referred path AND the cvar honours stage items up to nStage.
+ 	//! 0 = the switch alone, 1 = + S0 formats, 2 = + S1 exposure/AUTO, 3 = + S2 light units and
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/D3DRendPipeline.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/D3DRendPipeline.cpp
+index 76220fca..d90ecab9 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/D3DRendPipeline.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/D3DRendPipeline.cpp
+@@ -574,8 +574,48 @@ void CD3D9Renderer::RT_PostRenderScene(CRenderView* pRenderView)
+ // points of the frame (CTiledLightVolumesStage, CRenderView::GetSunLightColor, CClipVolumesStage,
+ // CVolumetricFogStage), and a scalar that is the whole image's brightness must not differ between
+ // them. One read here, one assignment, and every consumer downstream reads the member.
+-void CD3D9Renderer::LatchSceneReferredExposure(uint32 shaderRenderingFlags)
++void CD3D9Renderer::LatchSceneReferredExposure(uint32 shaderRenderingFlags, const CGraphicsPipeline* pPipeline)
+ {
++	// The preview gate, decided once for the whole render view and published before anything reads
++	// it (research/s8-editor-pipelines.md section 4). Two questions, both answered here:
++	//
++	//   1. Does this pipeline own a display transform? Only CStandardGraphicsPipeline does. A
++	//      thumbnail, a material-editor preview, a 2D viewport or the Character Tool would
++	//      otherwise be lit in absolute units and displayed as if they were not - a white or black
++	//      square at a daylight or interior camera respectively.
++	//   2. Is this render an asset rather than a picture? The terrain minimap is rendered through
++	//      the level's own Standard pipeline (e_ScreenShot 3 -> ESST_MAP -> ScreenShotMap ->
++	//      ScreenShotHighRes), so it passes 1 and still must not carry the camera's exposure,
++	//      sensor clip, white balance, CDL and ODT: a minimap is data.
++	//      The cvar is written on the main thread and read here on the render thread, so the gate
++	//      is coarse by one or two frames around the bake - which is harmless, because the bake is
++	//      a modal operation and the frames it brackets are thrown away.
++	//
++	// e_ScreenShot 1 (high-res) is deliberately NOT in this list: a high-res screenshot IS the
++	// picture, and research/s8-output-paths.md section 2.1 confirms it goes through the whole chain
++	// including the ODT.
++	const bool bCapablePipeline = (pPipeline != nullptr) && pPipeline->IsSceneReferredCapable();
++
++	bool bMapScreenShot = false;
++	{
++		static ICVar* pScreenShotCVar = gEnv->pConsole ? gEnv->pConsole->GetCVar("e_ScreenShot") : nullptr;
++		if (pScreenShotCVar)
++		{
++			// 3 = ESST_MAP_DELAYED, 4 = ESST_MAP, 5 = ESST_SWMAP, 6 = ESST_SWMAP_DELAYED
++			// (Cry3DEngine/3DEngineRender.cpp EScreenShotType). Negative values are the
++			// multi-frame variants of the same modes.
++			const int nMode = abs(pScreenShotCVar->GetIVal());
++			bMapScreenShot = (nMode >= 3 && nMode <= 6);
++		}
++	}
++
++	const bool bGateOpen = bCapablePipeline && !bMapScreenShot;
++	CRendererResources::SetSceneReferredPipelineGate(
++	  bGateOpen,
++	  pPipeline ? pPipeline->GetUniqueIdentifierName().c_str() : "<none>",
++	  bMapScreenShot ? "map screenshot - an asset, not a picture" :
++	  bCapablePipeline ? "owns a display transform" : "no display transform (preview / thumbnail)");
++
+ 	float exposure = 1.0f;
+ 
+ 	// Probes are baked at unity exposure and exposed exactly once at sample time, by the tint
+@@ -616,7 +656,14 @@ void CD3D9Renderer::LatchSceneReferredExposure(uint32 shaderRenderingFlags)
+ 	// baked under the same convention the scene is lit with, which is the whole point of the
+ 	// _rec suffix in decisions/s2-preset-and-probes.md. It is the exposure that must not be
+ 	// baked in, not the convention.
+-	m_fSceneReferredBRDFFactor[GetRenderThreadID()] = CRendererResources::IsSceneReferredStage(3) ? (1.0f / gf_PI) : 1.0f;
++	//
++	// For the same reason it is NOT subject to the preview gate above, and asks the un-gated
++	// predicate: E3DPARAM_SCENE_REFERRED changes the sun's own colour on the main thread
++	// (Cry3DEngine/TimeOfDay.cpp), and there is one sun for every view. Withholding the 1/PI from a
++	// preview while the sun keeps its missing divide would leave that preview PI times (1.65 stops)
++	// too bright - the exact failure this latch was built to prevent.
++	// "Exposure is per pipeline, the convention is global" - research/s8-editor-pipelines.md 4b.
++	m_fSceneReferredBRDFFactor[GetRenderThreadID()] = CRendererResources::IsSceneReferredRequestedStage(3) ? (1.0f / gf_PI) : 1.0f;
+ }
+ 
+ // Render thread only scene rendering
+@@ -669,7 +716,7 @@ void CD3D9Renderer::RT_RenderScene(CRenderView* pRenderView)
+ 	// the stock pipeline is unchanged. This is the only place the value is set for a frame; it
+ 	// runs before the graphics pipeline scope below, so it precedes Update() (which builds the
+ 	// per-view constant buffer) and Execute() (which builds the light lists).
+-	LatchSceneReferredExposure(shaderRenderingFlags);
++	LatchSceneReferredExposure(shaderRenderingFlags, pActiveGraphicsPipeline.get());
+ 
+ 	// This scope is the only one allowed to utilize the graphics pipeline
+ 	{
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/DriverD3D.h b/Code/CryEngine/RenderDll/XRenderD3D9/DriverD3D.h
+index c84cbcaa..f0d04275 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/DriverD3D.h
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/DriverD3D.h
+@@ -259,7 +259,7 @@ public:
+ 	//! every consumer in the frame sees one value. Writes 1.0f when the scene-referred path is
+ 	//! not taken and for cube-map generation (probes are baked at unity exposure and exposed once
+ 	//! at sample time through the tint hook - decisions/s1-probe-exposure.md approach A).
+-	void         LatchSceneReferredExposure(uint32 shaderRenderingFlags);
++	void         LatchSceneReferredExposure(uint32 shaderRenderingFlags, const CGraphicsPipeline* pPipeline);
+ 
+ 	//! The latched BRDF normalisation factor for the render thread's current frame: 1.0f on the
+ 	//! stock path, 1/PI on the scene-referred path, where the lights are radiometric and the
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Common/GraphicsPipeline.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Common/GraphicsPipeline.cpp
+index c5eb4c3a..0128c180 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Common/GraphicsPipeline.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Common/GraphicsPipeline.cpp
+@@ -682,8 +682,15 @@ void CGraphicsPipelineResources::Update(EShaderRenderingFlags renderingFlags)
+ 	//
+ 	// The first thing that happens, before any of it: say so. This is the marker that tells the
+ 	// next crash log how far into the flip the frame got, and it is CryLogAlways rather than
+-	// CryLog so that no verbosity setting can swallow it. Once per pipeline per flip - Sandbox
+-	// runs one CGraphicsPipeline per viewport, so a normal editor flip prints this twice.
++	// CryLog so that no verbosity setting can swallow it. Once per pipeline per flip.
++	//
++	// Since the preview gate (research/s8-editor-pipelines.md) IsSceneReferred() is false for every
++	// pipeline that owns no display transform, so a normal editor flip prints "on" for the level
++	// viewport's Standard pipeline only, and the three Update*Formats calls below leave every
++	// preview, thumbnail and 2D viewport on its stock formats - which is also where the ~42 MiB
++	// per pipeline of s8-perf-and-permutations.md section 3.1 stops being paid by widgets that
++	// never bind those targets. Which pipelines were considered, and why each was refused, is the
++	// separate one-line-per-decision log in CRendererResources::SetSceneReferredPipelineGate().
+ 	{
+ 		const int nState = CRendererResources::IsSceneReferred() ? 1 : 0;
+ 		if (nState != m_nSceneReferredLogged)
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Common/GraphicsPipeline.h b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Common/GraphicsPipeline.h
+index 631d5346..26ca025d 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Common/GraphicsPipeline.h
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Common/GraphicsPipeline.h
+@@ -221,6 +221,19 @@ public:
+ 
+ 	virtual bool IsInitialized() const { return m_bInitialized; }
+ 
++	//! Scene-referred pipeline gate (research/s8-editor-pipelines.md section 4).
++	//! Scene-referred is a property of a pipeline that OWNS A DISPLAY TRANSFORM. The pre-exposure
++	//! exists so that the tone map can apply unity; a pipeline with no tone map has nothing to undo
++	//! it with, so it must never receive it. Only CStandardGraphicsPipeline registers
++	//! CToneMappingStage (and with it the working-space conversion, the ODT and the export), so it
++	//! is the only pipeline that answers true. Every Minimum pipeline - asset thumbnails, the
++	//! material editor preview, the Schematyc preview, the 2D viewports - and the CharacterTool
++	//! pipeline (which is deferred-lit but displays through TonemappingMobile's fixed exposure of
++	//! 1.0) takes the stock path instead.
++	//! NOTE this is deliberately NOT the light-unit convention: that one is global, because there
++	//! is one sun for every view (section 4b of the same note).
++	virtual bool IsSceneReferredCapable() const { return false; }
++
+ 	virtual void ShutDown();
+ 
+ 	void GenerateMainViewConstantBuffer()
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/SceneReferredExport.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/SceneReferredExport.cpp
+index 4352e890..d3359adb 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/SceneReferredExport.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/SceneReferredExport.cpp
+@@ -323,6 +323,14 @@ CTexture* CSceneReferredExport::BeginFrame(CGraphicsPipeline& pipeline, int widt
+ 		return nullptr;
+ 	}
+ 
++	// Belt and braces for the m_pOwner claim (research/s8-editor-pipelines.md section 4c item 3):
++	// the exporter is claimed by the first pipeline that runs while armed, and it must never be a
++	// preview or a probe bake. The tap's own IsSceneReferredStage(6) gate already keeps them out
++	// now that it carries the preview gate, but the claim is permanent for the duration of a
++	// capture and the cost of being sure is one virtual call per frame.
++	if (!pipeline.IsSceneReferredCapable())
++		return nullptr;
++
+ 	if (m_pOwner == nullptr)
+ 		m_pOwner = &pipeline;
+ 	if (m_pOwner != &pipeline)
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/StandardGraphicsPipeline.h b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/StandardGraphicsPipeline.h
+index 99fc5af4..cb466346 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/StandardGraphicsPipeline.h
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/StandardGraphicsPipeline.h
+@@ -59,6 +59,10 @@ public:
+ 	void         Execute() final;
+ 	void         ShutDown() final;
+ 
++	//! The one pipeline that owns CToneMappingStage, and therefore the only one the scene-referred
++	//! path may run in. See CGraphicsPipeline::IsSceneReferredCapable().
++	bool         IsSceneReferredCapable() const final { return true; }
++
+ private:
+ 	std::unique_ptr<CStretchRectPass>      m_HDRToFramePass;
+ 	std::unique_ptr<CStretchRectPass>      m_PostToFramePass;
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.cpp
+index 1e11ecc5..13d34d38 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.cpp
+@@ -679,6 +679,16 @@ void CToneMappingStage::DisplayDebugInfo()
+ 	sprintf(str, "Estimated Illuminance (lux): %03d,%03d", illum / 1000, illum % 1000);
+ 	IRenderAuxText::DrawText(Vec3(5, 55, 1), IRenderAuxText::ASize(1.0f), ColorF(1, 0, 1, 1), eDrawText_800x600 | eDrawText_2D, str);
+ 
++	// Which pipeline drew this frame, and whether the preview gate let the scene-referred path run
++	// in it (research/s8-editor-pipelines.md). On the level viewport this reads "yes" and is
++	// unremarkable; the reason it is here is the other case - a user who sees a stock-looking
++	// picture with the camera ticked can tell in one glance whether the gate refused this render
++	// (a minimap bake, a preview) or whether the camera is simply not asking.
++	sprintf(str, "pipeline: %s scene-referred: %s",
++	        CRendererResources::GetSceneReferredPipelineName(),
++	        (CRendererResources::IsSceneReferredPipelineGateOpen() && CRendererResources::IsSceneReferredRequested()) ? "yes" : "no");
++	IRenderAuxText::DrawText(Vec3(5, 15, 1), IRenderAuxText::ASize(1.0f), ColorF(1, 0, 1, 1), eDrawText_800x600 | eDrawText_2D, str);
++
+ 	Vec4 vHDRSetupParams[5];
+ 	gEnv->p3DEngine->GetHDRSetupParams(vHDRSetupParams);
+ 
+-- 
+2.47.1.windows.1
+

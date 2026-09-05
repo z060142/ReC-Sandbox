@@ -1,0 +1,408 @@
+From bdfb8dbf5a4941b26d1bdb6163e58698c72d35fc Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Fri, 28 Aug 2026 09:00:42 +0800
+Subject: [PATCH 076/119] scene-referred S3: the conversion node, and the Prev
+ copy that must precede it
+
+One 3x3 per texel turns the frame into the working space. In place on $HDRTarget's
+UAV, dispatched from ExecuteHDRPostProcessing() between the $HDRTargetPrev copy and
+the depth-of-field stage, only when CRendererResources::IsSceneReferred().
+
+Why that exact line. It is the only window in the frame where every writer of
+Rec.709 scene colour has finished - deferred and forward opaque, sky, ocean
+caustics, volumetric fog, global fog, clouds, water, transparents, half-res
+particles, snow displacement and the rain layer - and nothing has read the target
+for post yet. One line earlier and the rain layer authors 709 into an AP1 target;
+one line later and depth of field has already run on mixed data.
+
+Why in place. Each thread reads and writes only its own texel, so there is no
+cross-texel dependency and no race: no scratch target, no copy-back, no pipeline
+pointer to retarget (m_pTexHDRTarget is read by about fifteen stages, by per-pass
+resource sets and by the ESRAM residency code). The pixel-shader form of the same
+point costs two full-screen passes because a render target cannot be its own shader
+resource. The UAV flag is already there - CTiledShadingStage writes this texture
+through SetOutputUAV - so no plumbing is new. About 0.08 ms at 1080p.
+decisions/s3-working-space.md 1B stays the documented fallback if the typed UAV load
+of R16G16B16A16_FLOAT ever proves unavailable, and the code comment says so.
+
+Why not at the writers. A 3x3 is linear, so additive and alpha blending commute
+with it - anything that blended before this point lands in the same place either
+way. Multiplicative and min/max blends do NOT, and GS_BLSRC_DSTCOL / GS_BLDST_SRCCOL
+are reachable from material shader scripts. Converting after all scene blending
+makes the question moot.
+
+$HDRTargetPrev stays Rec.709 and the copy stays in front of the dispatch, with a
+comment at the copy saying why: it is not a post-chain history, it is the texture
+SSR, the water reflection and the SVOGI bounce bind NEXT frame and consume inside
+the 709 lighting pass. AP1 numbers read as 709 give desaturated, hue-shifted
+reflections and bounce with no error anywhere, and SSR's limiter is a per-channel
+min, which is not basis-invariant.
+
+That leaves exactly one post-conversion consumer of Prev, and it was a real bug:
+motion blur reads $SceneTargetR11G11B10F[0] when depth of field ran and Prev
+otherwise. The first is ACEScg (copied from the converted target), the second is
+Rec.709 - so with DOF off the stock path would composite a 709 history over an AP1
+frame. The copy is now forced under the switch, and the same flag drives the dirty
+key and the texture selection so the three cannot drift apart. Cost: one full-res
+copy in the DOF-off case.
+
+r_SceneReferredDebug (VF_NULL, default 0):
+  1 = skip the conversion, everything else scene-referred stays on. The A/B that
+      separates "the primaries moved" from every other thing this pipeline changed.
+  2 = paint what the conversion could not produce - RED for NaN/Inf, GREEN for a
+      negative channel, at 64x so a marked texel is unmistakable. Both should be
+      impossible: Rec.709's primaries lie inside AP1, so the forward matrix is
+      entirely non-negative. An empty frame is therefore the S3 acceptance test.
+      A marked texel means the frame was already broken upstream, or the matrix is
+      not being applied to what we think it is.
+
+Mode 2 lives in the conversion shader itself, at the conversion point, which leaves
+r_HDRDebug 3 (HDRFinalSceneDebugPS, %_RT_DEBUG1) untouched and doing the same test
+at the END of the chain, after DOF, the glare family and motion blur. Two probes,
+two questions, and the HWSR_DEBUG axis is not disturbed.
+
+RenderDoc marker: SCENE_REFERRED_CONVERT_709_TO_AP1.
+
+Build: CryRenderD3D11, CinematicCamera, 0/0.
+
+Co-Authored-By: Claude Opus <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01A72MFkdSczncE7au9UVnmu
+---
+ .../RenderDll/Common/RendererCVars.cpp        | 16 ++++
+ .../RenderDll/Common/RendererCVars.h          |  1 +
+ .../GraphicsPipeline/MotionBlur.cpp           | 17 +++-
+ .../StandardGraphicsPipeline.cpp              | 91 +++++++++++++++++++
+ .../StandardGraphicsPipeline.h                |  7 ++
+ .../HWScripts/CryFX/HDRPostProcess.cfx        | 72 +++++++++++++++
+ 6 files changed, 201 insertions(+), 3 deletions(-)
+
+diff --git a/Code/CryEngine/RenderDll/Common/RendererCVars.cpp b/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
+index 90e974ff..6c5ce289 100644
+--- a/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
++++ b/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
+@@ -414,6 +414,7 @@ float CRendererCVars::CV_r_DofCatEyeReach;
+ int CRendererCVars::CV_r_DofFieldDebug;
+ int CRendererCVars::CV_r_DofLensModel;
+ int CRendererCVars::CV_r_SceneReferred;
++int CRendererCVars::CV_r_SceneReferredDebug;
+ float CRendererCVars::CV_r_SceneReferredNishitaScale;
+ float CRendererCVars::CV_r_DofLensModelMaxCoC;
+ float CRendererCVars::CV_r_DofLensModelSplatMaxCoC;
+@@ -1688,6 +1689,21 @@ void CRendererCVars::InitCVars()
+ 	               "1 = honour the request (default), 0 = ignore it and always take the stock path, "
+ 	               "which is then byte for byte the engine's own pipeline - render target formats, "
+ 	               "pass list and pixels alike.");
++	REGISTER_CVAR3("r_SceneReferredDebug", CV_r_SceneReferredDebug, 0, VF_NULL,
++	               "DIAGNOSTIC for the Rec.709 -> ACEScg working-space conversion (Stage S3). Only "
++	               "has any effect while the scene-referred path is actually running. "
++	               "0 = off (default). "
++	               "1 = SKIP the conversion, so the post chain runs on Rec.709 data exactly as it "
++	               "does on the stock path while everything else about the scene-referred pipeline "
++	               "stays on - the A/B for 'is this the primaries change or something else'. "
++	               "2 = paint any texel the conversion could not produce: RED for NaN/Inf, GREEN "
++	               "for a negative channel. Both should be impossible - Rec.709's primaries lie "
++	               "inside AP1, so the forward matrix is entirely non-negative - which is what "
++	               "makes an empty frame the S3 acceptance test rather than a hopeful check. A "
++	               "marked texel means the frame was already broken upstream, or the matrix is not "
++	               "being applied to what we think it is. r_HDRDebug 3 runs the same test at the "
++	               "END of the post chain instead, after depth of field, the glare family and "
++	               "motion blur.");
+ 	REGISTER_CVAR3("r_SceneReferredNishitaScale", CV_r_SceneReferredNishitaScale, 1.0f, VF_NULL,
+ 	               "Calibration factor on the procedural (Nishita) sky's sun intensity, applied ONLY "
+ 	               "while the scene-referred path is active. The Nishita dome carries a third, "
+diff --git a/Code/CryEngine/RenderDll/Common/RendererCVars.h b/Code/CryEngine/RenderDll/Common/RendererCVars.h
+index 3efef7e4..bc8cb5a6 100644
+--- a/Code/CryEngine/RenderDll/Common/RendererCVars.h
++++ b/Code/CryEngine/RenderDll/Common/RendererCVars.h
+@@ -415,6 +415,7 @@ public:
+ 	static int   CV_r_DofLensModelDebug;
+ 	static float CV_r_DofLensModelJitter;
+ 	static int   CV_r_SceneReferred;
++	static int   CV_r_SceneReferredDebug;
+ 	static float CV_r_SceneReferredNishitaScale;
+ 	DeclareStaticConstIntCVar(CV_r_nohwgamma, 2);
+ 	DeclareStaticConstIntCVar(CV_r_wireframe, 0);
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/MotionBlur.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/MotionBlur.cpp
+index 28cdc0fc..86d8bf56 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/MotionBlur.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/MotionBlur.cpp
+@@ -49,6 +49,17 @@ void CMotionBlurStage::Execute()
+ 	const bool bDofEnabled = CRenderer::CV_r_dof > 0 &&
+ 	                         m_graphicsPipeline.GetStage<CDepthOfFieldStage>()->HasWrittenHDRTarget();
+ 
++	// Scene-referred pipeline (SceneReferredSpec.md S3): which texture motion blur reads its
++	// history from is a COLOUR SPACE question, not just a "was the target already overwritten"
++	// one. $SceneTargetR11G11B10F[0] is copied from $HDRTarget below, i.e. from the frame the
++	// working-space conversion has already run on - ACEScg. $HDRTargetPrev is deliberately the
++	// LAST pre-conversion frame, Rec.709, because screen-space reflections, the water reflection
++	// and the SVOGI bounce consume it inside the 709 lighting pass. With depth of field off, the
++	// stock path would therefore composite a Rec.709 history over an ACEScg frame - desaturated,
++	// hue-shifted smears, with nothing to report it. Forcing the copy under the switch costs one
++	// full-resolution copy in the depth-of-field-off case and keeps both operands in one space.
++	const bool bCopyHDRTarget = bDofEnabled || CRendererResources::IsSceneReferred();
++
+ 	SRenderViewInfo viewInfo[2];
+ 	m_graphicsPipeline.GenerateViewInfo(viewInfo);
+ 
+@@ -180,12 +191,12 @@ void CMotionBlurStage::Execute()
+ 	{
+ 		PROFILE_LABEL_SCOPE("MOTION VECTOR APPLY");
+ 
+-		if (bDofEnabled)
++		if (bCopyHDRTarget)
+ 		{
+ 			m_passCopy.Execute(m_graphicsPipelineResources.m_pTexHDRTarget, m_graphicsPipelineResources.m_pTexSceneTargetR11G11B10F[0]);
+ 		}
+ 
+-		if (m_passMotionBlur.IsDirty(CRenderer::CV_r_MotionBlurQuality, bDofEnabled))
++		if (m_passMotionBlur.IsDirty(CRenderer::CV_r_MotionBlurQuality, bCopyHDRTarget))
+ 		{
+ 			uint64 rtMask = 0;
+ 			rtMask |= (CRenderer::CV_r_MotionBlurQuality >= 2) ? g_HWSR_MaskBit[HWSR_SAMPLE2] : 0;
+@@ -198,7 +209,7 @@ void CMotionBlurStage::Execute()
+ 			m_passMotionBlur.SetFlags(CPrimitiveRenderPass::ePassFlags_VrProjectionPass);
+ 			m_passMotionBlur.SetRenderTarget(0, m_graphicsPipelineResources.m_pTexHDRTarget);
+ 			m_passMotionBlur.SetState(GS_NODEPTHTEST | GS_BLSRC_ONE | GS_BLDST_ONEMINUSSRCALPHA);
+-			m_passMotionBlur.SetTexture(0, bDofEnabled ? m_graphicsPipelineResources.m_pTexSceneTargetR11G11B10F[0] : m_graphicsPipelineResources.m_pTexHDRTargetPrev[RenderView()->GetCurrentEye()]);
++			m_passMotionBlur.SetTexture(0, bCopyHDRTarget ? m_graphicsPipelineResources.m_pTexSceneTargetR11G11B10F[0] : m_graphicsPipelineResources.m_pTexHDRTargetPrev[RenderView()->GetCurrentEye()]);
+ 			m_passMotionBlur.SetTexture(1, m_graphicsPipelineResources.m_pTexVelocity);
+ 			m_passMotionBlur.SetTexture(2, m_graphicsPipelineResources.m_pTexVelocityTiles[2]);
+ 			m_passMotionBlur.SetSampler(0, EDefaultSamplerStates::LinearClamp);
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/StandardGraphicsPipeline.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/StandardGraphicsPipeline.cpp
+index 6c3fcc5f..4d38b3ed 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/StandardGraphicsPipeline.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/StandardGraphicsPipeline.cpp
+@@ -104,6 +104,8 @@ void CStandardGraphicsPipeline::Init()
+ 	m_LQSubResPass[0].reset(new CStretchRectPass(this));
+ 	m_LQSubResPass[1].reset(new CStretchRectPass(this));
+ 
++	m_SceneReferredConvertPass.reset(new CComputeRenderPass(this));
++
+ 	m_ResolvePass.reset(new CStretchRectPass(this));
+ 	m_DownscalePass.reset(new CDownsamplePass(this));
+ 	m_UpscalePass.reset(new CSharpeningUpsamplePass(this));
+@@ -135,6 +137,8 @@ void CStandardGraphicsPipeline::ShutDown()
+ 	m_LQSubResPass[0].reset();
+ 	m_LQSubResPass[1].reset();
+ 
++	m_SceneReferredConvertPass.reset();
++
+ 	m_ResolvePass.reset();
+ 	m_DownscalePass.reset();
+ 	m_UpscalePass.reset();
+@@ -166,6 +170,78 @@ void CStandardGraphicsPipeline::Update(EShaderRenderingFlags renderingFlags)
+ 	CGraphicsPipeline::Update(renderingFlags);
+ }
+ 
++//////////////////////////////////////////////////////////////////////////
++// The entry to the scene-referred working space (SceneReferredSpec.md D5, Stage S3;
++// scene-notes/decisions/s3-working-space.md approach 1A).
++//
++// WHY HERE. Between the $HDRTargetPrev copy and the depth-of-field stage is the only window in
++// the frame where two things are true at once: every writer of Rec.709 scene colour has finished
++// (deferred and forward opaque, sky, ocean caustics, volumetric fog, global fog, clouds, water,
++// transparents, half-res particles, snow displacement and the rain layer), and nothing has read
++// the target for post yet. Converting earlier would leave the rain layer authoring 709 into an
++// AP1 target; converting later would mean depth of field had already run on mixed data.
++//
++// WHY IN PLACE. Each thread reads and writes only its own texel, so there is no cross-texel
++// dependency and no race: no scratch target, no copy-back and no pipeline pointer to swap. The
++// pixel-shader form of the same point costs TWO full-screen passes, because a render target
++// cannot be its own shader resource. $HDRTarget already carries FT_USAGE_UNORDERED_ACCESS
++// (CTiledShadingStage writes it through SetOutputUAV), so no plumbing is new here.
++//
++// If the typed UAV load of R16G16B16A16_FLOAT ever proves unavailable on some target hardware,
++// the documented fallback is decisions/s3-working-space.md approach 1B: a full-screen pixel pass
++// into $SceneTargetR11G11B10F[0] (which is dead at this point in the frame) and a copy back.
++//
++// WHY NOT AT THE WRITERS. A 3x3 is linear, so additive and alpha blending commute with it and
++// anything that blended before this point lands in the same place either way. Multiplicative and
++// min/max blends do NOT commute, and GS_BLSRC_DSTCOL / GS_BLDST_SRCCOL are reachable from
++// material shader scripts. Converting after all scene blending makes the question moot.
++void CStandardGraphicsPipeline::ExecuteSceneReferredConversion()
++{
++	if (!CRendererResources::IsSceneReferred())
++		return;
++
++	// r_SceneReferredDebug 1: leave the frame in Rec.709 while the rest of the scene-referred
++	// pipeline keeps running. The A/B that separates "the primaries moved" from everything else.
++	if (CRendererCVars::CV_r_SceneReferredDebug == 1)
++		return;
++
++	CTexture* pHDRTarget = m_pipelineResources.m_pTexHDRTarget;
++	if (!CTexture::IsTextureExist(pHDRTarget))
++		return;
++
++	PROFILE_LABEL_SCOPE("SCENE_REFERRED_CONVERT_709_TO_AP1");
++
++	CComputeRenderPass& pass = *m_SceneReferredConvertPass;
++
++	const int width = pHDRTarget->GetWidth();
++	const int height = pHDRTarget->GetHeight();
++
++	if (pass.IsDirty(pHDRTarget->GetTextureID()))
++	{
++		static CCryNameTSCRC techConvert("SceneReferredConvert");
++		pass.SetTechnique(CShaderMan::s_shHDRPostProcess, techConvert, 0);
++		pass.SetOutputUAV(0, pHDRTarget);
++	}
++
++	pass.BeginConstantUpdate();
++	{
++		static CCryNameR paramsName("SceneReferredParams");
++		const Vec4 params((float)width, (float)height, (float)CRendererCVars::CV_r_SceneReferredDebug, 0.0f);
++		pass.SetConstant(paramsName, params);
++	}
++
++	// One thread per texel; the group count is rounded up and the shader discards the padding.
++	const int tile = 8; // must match SCENE_REFERRED_CONVERT_TILE in HDRPostProcess.cfx
++	pass.SetDispatchSize((width + tile - 1) / tile, (height + tile - 1) / tile, 1);
++
++	pass.PrepareResourcesForUse(GetDeviceObjectFactory().GetCoreCommandList());
++
++	{
++		SScopedComputeCommandList computeCommandList(false);
++		pass.Execute(computeCommandList, EShaderStage_All);
++	}
++}
++
+ //////////////////////////////////////////////////////////////////////////
+ void CStandardGraphicsPipeline::ExecuteHDRPostProcessing()
+ {
+@@ -184,10 +260,25 @@ void CStandardGraphicsPipeline::ExecuteHDRPostProcessing()
+ 		GetStage<CRainStage>()->Execute();
+ 
+ 	// Note: MB uses m_pTexHDRTargetPrev to avoid doing another copy, so this should be right before the MB pass
++	//
++	// Scene-referred pipeline: this copy MUST stay in front of the working-space conversion below,
++	// and $HDRTargetPrev must therefore stay Rec.709. It is not a post-chain history - it is the
++	// texture that screen-space reflections (ScreenSpaceReflections.cpp), the water reflection
++	// (Water.cpp) and the SVOGI previous-frame bounce (D3D_SVO.cpp) bind NEXT frame, and all
++	// three consume it INSIDE the 709 lighting pass, before anything in this function runs. Feed
++	// them AP1 numbers read as 709 and reflections and bounce come back desaturated and
++	// hue-shifted, with no error anywhere. SSR's brightness limiter is additionally a PER-CHANNEL
++	// min against the adapted luminance, which is not basis-invariant, so it would silently start
++	// limiting different highlights. The only post-conversion consumer of Prev is motion blur,
++	// and that is handled at the copy in CMotionBlurStage::Execute().
+ 	{
+ 		m_FrameToFramePass->Execute(m_pipelineResources.m_pTexHDRTarget, m_pipelineResources.m_pTexHDRTargetPrev[GetCurrentRenderView()->GetCurrentEye()]);
+ 	}
+ 
++	// Rec.709 -> ACEScg. Everything upstream wrote Rec.709 scene colour; everything downstream
++	// reads the working space.
++	ExecuteSceneReferredConversion();
++
+ 	if (GetStage<CDepthOfFieldStage>()->IsStageActive(m_renderingFlags))
+ 		GetStage<CDepthOfFieldStage>()->Execute();
+ 
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/StandardGraphicsPipeline.h b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/StandardGraphicsPipeline.h
+index eb577883..99fc5af4 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/StandardGraphicsPipeline.h
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/StandardGraphicsPipeline.h
+@@ -5,6 +5,7 @@
+ #include "Common/GraphicsPipeline.h"
+ #include "Common/GraphicsPipelineStateSet.h"
+ #include "Common/Include_HLSL_CPP_Shared.h"
++#include "Common/ComputeRenderPass.h"
+ 
+ class CShadowMapStage;
+ class CSceneGBufferStage;
+@@ -66,6 +67,12 @@ private:
+ 	std::unique_ptr<CStableDownsamplePass> m_HQSubResPass[2];
+ 	std::unique_ptr<CStretchRectPass>      m_LQSubResPass[2];
+ 
++	//! Scene-referred pipeline (SceneReferredSpec.md Stage S3): the Rec.709 -> ACEScg working-space
++	//! entry. One in-place compute dispatch on $HDRTarget's UAV, between the $HDRTargetPrev copy
++	//! and the depth-of-field stage. Never dispatched with the switch off.
++	std::unique_ptr<CComputeRenderPass>    m_SceneReferredConvertPass;
++
+ private:
+ 	void ExecuteHDRPostProcessing();
++	void ExecuteSceneReferredConversion();
+ };
+diff --git a/Engine/Shaders/HWScripts/CryFX/HDRPostProcess.cfx b/Engine/Shaders/HWScripts/CryFX/HDRPostProcess.cfx
+index 9e2a6045..2cbc8650 100644
+--- a/Engine/Shaders/HWScripts/CryFX/HDRPostProcess.cfx
++++ b/Engine/Shaders/HWScripts/CryFX/HDRPostProcess.cfx
+@@ -1658,6 +1658,78 @@ pixout FogPassWithLightningPS(vert2fragFog IN)
+   return OUT;
+ }
+ 
++////////////////////////////////////////////////////////////////////////////////////////////////////
++// Rec.709 -> ACEScg, the entry to the scene-referred working space (SceneReferredSpec.md D5,
++// Stage S3; scene-notes/decisions/s3-working-space.md approach 1A).
++//
++// One 3x3 per texel, in place on $HDRTarget's UAV, dispatched from
++// CStandardGraphicsPipeline::ExecuteHDRPostProcessing() between the $HDRTargetPrev copy and the
++// depth-of-field stage. That is the only window in the frame where every writer of Rec.709 scene
++// colour has finished (deferred, forward opaque, sky, water, fog, clouds, transparents, particles,
++// snow displacement and rain) and nothing has read the target for post yet.
++//
++// In place is race-free because each thread reads and writes ONLY its own texel: no scratch
++// target, no copy-back, no pipeline pointer to swap. It costs one read plus one write of the
++// full-resolution fp16 target, about 0.08 ms at 1080p and 0.33 ms at 4K.
++//
++// The matrix is linear, so everything that BLENDED into the target before this point is
++// unaffected by the move (additive and alpha blending both commute with a 3x3). Multiplicative
++// and min/max blends do NOT commute, and they are reachable from material shader scripts - which
++// is the second reason the conversion sits after all scene blending rather than at the writers.
++//
++// $HDRTargetPrev deliberately stays Rec.709: it is filled by the copy immediately before this
++// dispatch and consumed NEXT frame inside the 709 lighting pass by screen-space reflections,
++// water reflection and the SVOGI bounce. See the comment at the copy site.
++RWTexture2D<float4> SceneReferredTargetUAV : register(u0);
++
++// .xy = target size in texels (the dispatch is padded up to the group size)
++// .z  = r_SceneReferredDebug: 2 paints the texels this pass could not produce
++// .w  = unused
++float4 SceneReferredParams;
++
++#define SCENE_REFERRED_CONVERT_TILE 8
++
++// Debug marker brightness. Far above anything the tone map or the ODT will resolve, so a marked
++// texel is unmistakably a flat primary and cannot be confused with scene content.
++#define SCENE_REFERRED_DEBUG_MARK 64.0
++
++[numthreads(SCENE_REFERRED_CONVERT_TILE, SCENE_REFERRED_CONVERT_TILE, 1)]
++void SceneReferredConvertCS(uint3 DispatchThreadID : SV_DispatchThreadID)
++{
++	const int2 vPixCoord = int2(DispatchThreadID.xy);
++	if (any(vPixCoord >= (int2)SceneReferredParams.xy))
++		return;
++
++	const float4 cSrc = SceneReferredTargetUAV[vPixCoord];
++	float3 cDst = Rec709ToACEScg(cSrc.rgb);
++
++	// r_SceneReferredDebug 2. Rec.709's primaries lie INSIDE AP1, so the forward matrix is
++	// entirely non-negative and a non-negative 709 frame cannot come out of it negative. A
++	// marked texel therefore means one of two things and neither is a property of the transform:
++	// either the frame already carried a NaN/Inf (red) or a negative channel (green) before the
++	// conversion, or the matrix is not being applied to what we think it is. This is the S3
++	// acceptance instrument taken at the conversion point itself; r_HDRDebug 3 is the same test
++	// at the END of the chain, where depth of field, the glare family and motion blur have all
++	// had their turn.
++	if (SceneReferredParams.z > 1.5)
++	{
++		if (any(isnan(cDst)) || any(isinf(cDst)))
++			cDst = float3(SCENE_REFERRED_DEBUG_MARK, 0.0, 0.0);
++		else if (any(cDst < 0.0))
++			cDst = float3(0.0, SCENE_REFERRED_DEBUG_MARK, 0.0);
++	}
++
++	SceneReferredTargetUAV[vPixCoord] = float4(cDst, cSrc.a);
++}
++
++technique SceneReferredConvert
++{
++  pass p0
++  {
++    ComputeShader = SceneReferredConvertCS();
++  }
++}
++
+ //=======================================================
+ // HDR post-processing techniques
+ 
+-- 
+2.47.1.windows.1
+

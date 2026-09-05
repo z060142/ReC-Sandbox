@@ -1,0 +1,512 @@
+From b7d2ef36ac0358d574675988163ae5aff4c9cb22 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Fri, 28 Aug 2026 07:04:33 +0800
+Subject: [PATCH 066/119] scene-referred S1: the camera's AUTO exposure mode
+
+Fourth item of Stage S1. The exposure the camera publishes can now come from a meter instead of
+only from the aperture ring, and the two shipped auto modes finally mean what their names say.
+
+Decision: scene-notes/decisions/s1-auto-mode.md, part 1 approach A (CPU loop on a per-frame
+non-blocking readback) and the part 2 meaning table. Research:
+scene-notes/research/s1-luminance-measure-and-eye-adaptation.md section 6.
+
+Renderer side, CAutoExposureStage::UpdateSceneReferredMeterReadback(), behind IsSceneReferred():
+- Two-phase, non-blocking readback of s_ptexHDRToneMaps[0] (1x1 R16G16F, .y = the geometric-mean
+  illuminance estimate with the G-buffer albedo divided out). The texture already carries
+  FT_STAGE_READBACK, so it owns a persistent staging resource and neither a copy pass nor a
+  texture of our own is needed - the shape is CBloomStage::UpdateDiffractionSourceReadback minus
+  its first two steps. Issued every frame rather than once a second, because this closes an
+  exposure loop and a one-second cadence would be visible as steps. Cost: four bytes and one
+  fence. The blocking one-shot form (what r_HDRDebug 1 uses) is a full pipeline stall and is not
+  acceptable per frame; a five-second stall warning says so out loud if the fence never signals.
+- Engine passes 1 and 2 keep running untouched. Pass 3 (the temporal adaptation) and both
+  ComputeExposure branches are bypassed, NOT stopped: screen-space reflections bind
+  m_pTexHDRMeasuredLuminance and the film grain binds s_ptexCurLumTexture, so stopping the stage
+  would break them. Only the exposure it produces has stopped being consumed (item 2).
+- The pre-exposure is divided out on the renderer side, using the value recorded when the download
+  was ISSUED. That is the whole correctness argument of this item: dividing by the current
+  exposure instead of the sampled frame's turns the meter into a two-frame-delayed feedback loop
+  that oscillates. Doing it here also removes the 2-entry exposure history the decision note asked
+  the camera to keep - the stage knows which frame the sample came from, the camera would have had
+  to guess. Documented deviation, same result, less machinery.
+- Cube-map generation is excluded (it renders at unity and nobody meters it), and leaving the
+  scene-referred path retires the reported value so the camera cannot meter off a stale sample.
+
+The channel to the plugin: EFQ_GetSceneReferredMeteredIlluminance, one new ERenderQueryTypes value
+and one case in CRenderer::EF_QueryImpl. Deviation from the item's brief, which offered
+ICinematicCameraOptics or the post-effect bus: neither is a renderer -> plugin channel. The optics
+interface is what CinematicCamera EXPORTS to other plugins (the phone tracker), and CParamFloat's
+per-thread slots are synchronised main -> render only, so a render-thread write never reaches the
+main thread. EF_Query is CE's own extension point for exactly this and costs two lines.
+
+Camera side:
+- AUTO meters with the incident form, ISO 2720 at S = 100 and C = 120*pi - the same constant item 2
+  adopted, so manual and auto agree by construction: an 18 % reflector under the metered
+  illuminance lands on 0.18 either way. Reflected metering (K = 12.5) is the documented
+  alternative and would read 3/4 of a stop differently; the engine's albedo-divided estimate is a
+  better meter than a real camera's, and the discrepancy would read as a bug.
+- Smoothing is frame-rate independent (1 - exp(-dt/tau)) with the camera's own tau, and snaps
+  instantly on a cut - the component clears its validity flag on Activate(), mirroring what
+  AutoExposure.cpp:165 does for the engine's adaptation. The smoothing step is guarded by the main
+  frame id, because the EV is asked for more than once a frame and the response time must not
+  depend on how many callers there are.
+- Parameter meanings under the switch, exactly the decision's table, with no CRC, name, enum
+  string or default changed: AutoBiased = AUTO with an EV bias of (manual EV100 - Neutral EV), so
+  at the shipped defaults it biases by -0.385 stops and stays nearly transparent as it always did;
+  AutoCompensation = AUTO with exposure compensation only; ExposureResponse = the metering
+  response, the fraction of a measured change the camera follows per tau (it slows the approach,
+  it does not leave a steady-state error, so a level authored at 0.6 still behaves like a camera
+  that does not chase every flicker); NeutralEV = AUTO's reference EV for the bias; Manual is
+  still the pure triangle and now says once that Response and NeutralEV drive the auto modes
+  instead. Off the switch every one of them behaves exactly as before.
+- Four genuinely new controls, new CRCs, Schematyc names [A-Za-z0-9_]+: Auto Exposure Lock
+  (freeze the metered EV, AE lock), Auto Exposure Response Time (tau, default 1 s), Auto Exposure
+  EV Min / EV Max (defaults -2 and 20, applied after the bias). The EV limits are the operator's,
+  not the time of day's, and they are what stops AUTO walking off the end of a scene lit with real
+  light ratios.
+- Before the first measurement, and while the meter is stalled, AUTO exposes as Manual rather than
+  at EV 0 - which would be a white frame.
+
+Built clean (0 errors, 0 warnings outside Code/SDKs): CryRenderD3D11, CinematicCamera.
+
+Co-Authored-By: Claude Opus <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01A72MFkdSczncE7au9UVnmu
+---
+ .../CryCommon/CryRenderer/IRenderer.h         |   9 +-
+ Code/CryEngine/RenderDll/Common/Renderer.cpp  |  11 ++
+ Code/CryEngine/RenderDll/Common/Renderer.h    |   7 ++
+ .../GraphicsPipeline/AutoExposure.cpp         |  96 +++++++++++++++
+ .../GraphicsPipeline/AutoExposure.h           |  13 ++
+ .../Module/CinematicCameraComponent.cpp       | 115 ++++++++++++++----
+ .../Module/CinematicCameraComponent.h         |  40 +++++-
+ 7 files changed, 264 insertions(+), 27 deletions(-)
+
+diff --git a/Code/CryEngine/CryCommon/CryRenderer/IRenderer.h b/Code/CryEngine/CryCommon/CryRenderer/IRenderer.h
+index 4ce6fe89..2bd5d4d6 100644
+--- a/Code/CryEngine/CryCommon/CryRenderer/IRenderer.h
++++ b/Code/CryEngine/CryCommon/CryRenderer/IRenderer.h
+@@ -213,7 +213,14 @@ enum ERenderQueryTypes
+ 	EFQ_GetViewportDownscaleFactor,
+ 	EFQ_ReverseDepthEnabled,
+ 
+-	EFQ_GetLastD3DDebugMessage
++	EFQ_GetLastD3DDebugMessage,
++
++	//! Scene-referred pipeline (SceneReferredSpec.md D2/D7): the engine's luminance measure,
++	//! read back per frame and already divided by the pre-exposure that was in force when the
++	//! sample was captured. A float, in engine units (x RENDERER_LIGHT_UNIT_SCALE = lux), or 0
++	//! when the scene-referred path is off or no readback has completed yet. This is how the
++	//! Cinematic Camera's AUTO mode meters; nothing else reads it.
++	EFQ_GetSceneReferredMeteredIlluminance
+ };
+ 
+ enum class EGraphicsPipelineType
+diff --git a/Code/CryEngine/RenderDll/Common/Renderer.cpp b/Code/CryEngine/RenderDll/Common/Renderer.cpp
+index 1e443519..c3c4d028 100644
+--- a/Code/CryEngine/RenderDll/Common/Renderer.cpp
++++ b/Code/CryEngine/RenderDll/Common/Renderer.cpp
+@@ -2565,6 +2565,17 @@ void CRenderer::EF_QueryImpl(ERenderQueryTypes eQuery, void* pInOut0, uint32 nIn
+ 		}
+ 		break;
+ 
++	case EFQ_GetSceneReferredMeteredIlluminance:
++		{
++			// Scene-referred AUTO metering (SceneReferredSpec.md D2/D7). The value was written by
++			// CAutoExposureStage's non-blocking readback of the 1x1 measure target, with the
++			// pre-exposure that was in force when that sample was captured already divided out -
++			// so the caller gets an absolute illuminance and does not have to keep a history of
++			// its own published exposures to close the loop.
++			WriteQueryResult(pInOut0, nInOutSize0, m_fSceneReferredMeteredIlluminance);
++		}
++		break;
++
+ 	case EFQ_GetMaxRenderObjectsNum:
+ 		{
+ 			WriteQueryResult(pInOut0, nInOutSize0, -1);
+diff --git a/Code/CryEngine/RenderDll/Common/Renderer.h b/Code/CryEngine/RenderDll/Common/Renderer.h
+index 4ab1a911..3bc6eaab 100644
+--- a/Code/CryEngine/RenderDll/Common/Renderer.h
++++ b/Code/CryEngine/RenderDll/Common/Renderer.h
+@@ -1533,6 +1533,13 @@ public:
+ 
+ 	float     m_fogCullDistance;
+ 
++	//! Scene-referred metered illuminance, engine units, pre-exposure already divided out.
++	//! Written by CAutoExposureStage's readback on the render thread, read through
++	//! EFQ_GetSceneReferredMeteredIlluminance on the main thread. One float: a torn read is not
++	//! possible and a one-frame-stale value is far inside the AUTO mode's time constant.
++	//! 0 means "no measurement", which is what the camera treats as "hold the last EV".
++	float     m_fSceneReferredMeteredIlluminance = 0.0f;
++
+ 	enum { nMeshPoolMaxTimeoutCounter = 150 /*150 ms*/};
+ 	int m_nMeshPoolTimeoutCounter;
+ 
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/AutoExposure.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/AutoExposure.cpp
+index c45d62e3..cae5d5c1 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/AutoExposure.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/AutoExposure.cpp
+@@ -172,10 +172,106 @@ void CAutoExposureStage::AdjustExposure()
+ 	m_passAutoExposure.Execute();
+ }
+ 
++// Scene-referred AUTO metering: the CPU half of the camera's exposure loop
++// (SceneReferredSpec.md D2/D7, decisions/s1-auto-mode.md part 1, approach A).
++//
++// Passes 1 and 2 above already produce exactly what a camera's incident meter wants: a 1x1
++// R16G16F whose .y is the geometric-mean illuminance estimate in engine units, albedo divided
++// out. Pass 3 (the temporal adaptation) and both ComputeExposure branches are BYPASSED on this
++// path - not stopped: screen-space reflections bind m_pTexHDRMeasuredLuminance and the film
++// grain binds s_ptexCurLumTexture, so the stage keeps running and only its exposure stops being
++// consumed. Smoothing, limits, lock and compensation move to the camera, in EV, where a camera's
++// controls live.
++//
++// s_ptexHDRToneMaps[0] is created with FT_STAGE_READBACK (RendererResources.cpp), so it already
++// owns a PERSISTENT staging resource: no copy pass and no texture of our own are needed, unlike
++// CBloomStage::UpdateDiffractionSourceReadback, whose two-phase shape this otherwise follows
++// exactly. Cost is four bytes and one fence per frame. The blocking one-shot form
++// DownloadToStagingResource(sub, hook) - what r_HDRDebug 1 uses - is a full pipeline stall and is
++// not acceptable per frame.
++//
++// The pre-exposure is divided out HERE rather than in the camera. The camera would otherwise have
++// to keep a history of the exposures it published and guess which frame the sample came from; the
++// stage knows exactly, because it recorded the value when it issued the download. Getting that
++// wrong turns the meter into a two-frame-delayed feedback loop, which oscillates.
++void CAutoExposureStage::UpdateSceneReferredMeterReadback()
++{
++	CD3D9Renderer* const pRenderer = gcpRendD3D;
++
++	// Cube-map generation renders at unity exposure and is not a view anybody meters.
++	const bool bCubemapGen = (m_graphicsPipeline.GetRenderFlags() & SHDF_CUBEMAPGEN) != 0;
++
++	if (!CRendererResources::IsSceneReferred() || bCubemapGen)
++	{
++		// Leaving the path with a download in flight is fine - the staging resource belongs to the
++		// texture, not to us, and nothing is freed here. Only the reported value is retired, so
++		// the camera cannot keep metering off a sample from before the switch was flipped.
++		m_bMeterReadbackIssued = false;
++		m_bMeterReadbackStalled = false;
++		pRenderer->m_fSceneReferredMeteredIlluminance = 0.0f;
++		return;
++	}
++
++	CTexture* pMeterTex = CRendererResources::s_ptexHDRToneMaps[0];
++	if (!CTexture::IsTextureExist(pMeterTex))
++		return;
++
++	CDeviceTexture* pDevTex = pMeterTex->GetDevTexture();
++	if (pDevTex == nullptr)
++		return;
++
++	const float fNow = gEnv->pTimer->GetAsyncCurTime();
++
++	if (m_bMeterReadbackIssued)
++	{
++		// Not signalled yet: come back next frame. Never block.
++		if (!pDevTex->AccessCurrStagingResource(0, false))
++		{
++			if ((fNow - m_fMeterIssuedTime) > 5.0f && !m_bMeterReadbackStalled)
++			{
++				m_bMeterReadbackStalled = true;
++				CryLogAlways("[SceneReferred] the exposure meter's staging download has not signalled in 5 s - AUTO is holding its last EV");
++			}
++			return;
++		}
++		m_bMeterReadbackStalled = false;
++
++		float fIlluminance = 0.0f;
++		const auto readbackData = [&fIlluminance](void* pData, uint32 rowPitch, uint32 slicePitch) -> bool
++		{
++			// R16G16F: .x is the geometric-mean luminance, .y the illuminance estimate. .y is the
++			// incident-meter quantity and the one the EV path has always used.
++			const CryHalf* pDataHalf = static_cast<const CryHalf*>(pData);
++			fIlluminance = CryConvertHalfToFloat(pDataHalf[1]);
++			return true;
++		};
++		pDevTex->AccessCurrStagingResource(0, false, readbackData);
++		m_bMeterReadbackIssued = false;
++
++		// Divide out the exposure that was applied to the frame this sample was measured on, and
++		// reject anything the measure pass could not produce a sane number for (its own isfinite
++		// filter covers NaNs in the source, not a zero illuminance in a black frame).
++		const float fExposureAtCapture = max(m_fMeterIssuedExposure, 1e-12f);
++		pRenderer->m_fSceneReferredMeteredIlluminance =
++			(fIlluminance > 0.0f && NumberValid(fIlluminance)) ? (fIlluminance / fExposureAtCapture) : 0.0f;
++	}
++
++	if (!m_bMeterReadbackIssued)
++	{
++		// Every frame, unlike the diffraction debug readback: this closes an exposure loop, and a
++		// one-second cadence would be visible as steps.
++		pDevTex->DownloadToStagingResource(0);
++		m_bMeterReadbackIssued = true;
++		m_fMeterIssuedExposure = pRenderer->GetSceneReferredExposure();
++		m_fMeterIssuedTime = fNow;
++	}
++}
++
+ void CAutoExposureStage::Execute()
+ {
+ 	FUNCTION_PROFILER_RENDERER();
+ 
+ 	MeasureLuminance();
+ 	AdjustExposure();
++	UpdateSceneReferredMeterReadback();
+ }
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/AutoExposure.h b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/AutoExposure.h
+index 0687de78..8e74a335 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/AutoExposure.h
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/AutoExposure.h
+@@ -29,9 +29,22 @@ public:
+ private:
+ 	void MeasureLuminance();
+ 	void AdjustExposure();
++	//! Scene-referred AUTO metering (SceneReferredSpec.md D2/D7, decisions/s1-auto-mode.md part 1
++	//! approach A). Two-phase, non-blocking readback of the 1x1 measure target, so the camera can
++	//! run its exposure loop in EV on the CPU where a camera's controls live. Only ever issued on
++	//! the scene-referred path.
++	void UpdateSceneReferredMeterReadback();
+ 
+ private:
+ 	CFullscreenPass m_passLuminanceInitial;
+ 	CFullscreenPass m_passLuminanceIteration[NUM_HDR_TONEMAP_TEXTURES];
+ 	CFullscreenPass m_passAutoExposure;
++
++	// Readback state. m_fMeterIssuedExposure is the pre-exposure that was in force for the frame
++	// whose sample is currently in flight: dividing by THAT, and not by the current one, is what
++	// stops the meter from being a two-frame-delayed feedback loop that oscillates.
++	bool  m_bMeterReadbackIssued  = false;
++	bool  m_bMeterReadbackStalled = false;
++	float m_fMeterIssuedExposure  = 1.0f;
++	float m_fMeterIssuedTime      = 0.0f;
+ };
+diff --git a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp
+index 4339677c..b6955bd3 100644
+--- a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp
++++ b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp
+@@ -247,6 +247,9 @@ void CCinematicCameraComponent::Activate()
+ 		return;
+ 
+ 	m_bCinematicSuspended = false;
++	// A camera change is a cut: the next measurement snaps instead of ramping from the previous
++	// camera's exposure, which is what AutoExposure.cpp:165 does for the engine's own adaptation.
++	m_bAutoMeteredEVValid = false;
+ 
+ 	// Activating the sibling CCameraComponent IS the ownership transfer: it moves the camera
+ 	// manager's active camera, and ResolveActive() picks that up next frame - including the
+@@ -347,6 +350,7 @@ void CCinematicCameraComponent::ClearSavedBaselines()
+ 	m_bLensCharSaved       = false;
+ 	m_bSceneReferredSaved  = false;
+ 	m_bSceneExposureSaved  = false;
++	m_bAutoMeteredEVValid  = false;
+ 	m_bSpriteBokehSaved    = false;
+ 	m_bBokehShapeTexPushed = false;
+ 	m_bMBParamsSaved       = false;
+@@ -1228,33 +1232,100 @@ void CCinematicCameraComponent::RestoreSceneExposure()
+ //
+ // Manual is the pure photographic triangle: aperture, shutter, ISO, transmission, ND and EV
+ // compensation, and nothing else. Exposure Response and Neutral EV, which used to compress the
+-// applied EV around a pivot, have no role here - that compression was a second tone curve, and
+-// under an output transform the S curve belongs to the ODT (spec D11, decisions/s1-auto-mode.md
+-// part 2). They are ignored, with one log line, rather than silently reinterpreted.
++// applied EV around a pivot, have no role there - that compression was a second tone curve, and
++// under an output transform the S curve belongs to the ODT (spec D11).
+ //
+-// AutoBiased and AutoCompensation are metering modes and cannot be honoured until the AUTO
+-// readback loop exists; until then they behave as Manual and say so once.
+-float CCinematicCameraComponent::ComputeSceneReferredEV100() const
+-{
+-	if (m_exposure.exposureMode != EExposureMode::Manual && !m_bLoggedSceneRefAutoAsManual)
+-	{
+-		m_bLoggedSceneRefAutoAsManual = true;
+-		CryLog("[CinematicCamera] Scene Referred: exposure mode '%s' has no metering loop yet and "
+-		       "is exposing as Manual (the aperture/shutter/ISO triangle).",
+-		       (m_exposure.exposureMode == EExposureMode::AutoBiased) ? "AutoBiased" : "AutoCompensation");
++// The two auto modes are the camera's AUTO with the meanings decisions/s1-auto-mode.md part 2
++// gives them, which is what their names have said all along:
++//   AutoBiased       = AUTO with an EV bias of (manual EV100 - Neutral EV). At the shipped
++//                      defaults (f/5.6, 1/50, ISO 400 -> EV100 8.615; Neutral EV 9.0) that is a
++//                      bias of -0.385 stops, so the mode stays very nearly transparent and the
++//                      lens still visibly biases the picture, exactly as before.
++//   AutoCompensation = AUTO with exposure compensation only.
++// Neither can change the aperture's effect on brightness the way Manual does - that is the point
++// of the distinction, and it is what a camera's mode dial does.
++float CCinematicCameraComponent::ComputeSceneReferredEV100()
++{
++	const float manualEV = ComputeManualEV100();
++
++	if (m_exposure.exposureMode == EExposureMode::Manual)
++	{
++		if (fabs_tpl((float)m_exposure.exposureResponse - 1.0f) > 0.001f && !m_bLoggedSceneRefResponseIgnored)
++		{
++			m_bLoggedSceneRefResponseIgnored = true;
++			CryLog("[CinematicCamera] Scene Referred: Exposure Response (%.2f) and Neutral EV (%.1f) do not "
++			       "apply in Manual - exposure is the physical triangle and the tone curve lives in the "
++			       "output transform. They drive the AUTO modes instead.",
++			       (float)m_exposure.exposureResponse, (float)m_exposure.neutralEV);
++		}
++		return manualEV;
+ 	}
+ 
+-	if (m_exposure.exposureMode == EExposureMode::Manual
+-	    && fabs_tpl((float)m_exposure.exposureResponse - 1.0f) > 0.001f
+-	    && !m_bLoggedSceneRefResponseIgnored)
++	// ----- AUTO -----------------------------------------------------------------------------
++	// The meter is the engine's own luminance measure, read back per frame by
++	// CAutoExposureStage::UpdateSceneReferredMeterReadback() with the pre-exposure that was in
++	// force for the sampled frame already divided out. So this is an absolute illuminance in
++	// engine units and the loop does not have to unwind its own output.
++	float meteredIlluminance = 0.0f;
++	if (gEnv->pRenderer)
++		gEnv->pRenderer->EF_Query(EFQ_GetSceneReferredMeteredIlluminance, meteredIlluminance);
++
++	const uint32 frameId = gEnv->nMainFrameID;
++	const bool bNewFrame = (frameId != m_autoMeteredFrameId);
++	m_autoMeteredFrameId = frameId;
++
++	if (meteredIlluminance > 0.0f && !m_exposure.bAutoLock && bNewFrame)
++	{
++		// The incident-meter form, ISO 2720: EV = log2(E * S / C) at S = 100 with C = 120*pi -
++		// the constant that puts an 18 % reflector under the metered illuminance on 0.18. The
++		// engine's measure divides the G-buffer albedo out, so this really is an incident reading:
++		// a white wall and a black wall under the same light expose the same, which is what a
++		// light meter on set does and is steadier than reflected metering under a pan.
++		const float kIncidentMeterConstant = 120.0f * gf_PI;
++		const float targetEV = log2f(meteredIlluminance * RENDERER_LIGHT_UNIT_SCALE * 100.0f / kIncidentMeterConstant);
++
++		const float dt = max(gEnv->pTimer->GetFrameTime(), 0.0f);
++		const float tau = (float)m_exposure.autoTau;
++
++		if (!m_bAutoMeteredEVValid || tau <= 0.0f || dt <= 0.0f)
++		{
++			// Instant snap: first measurement, or a cut (the component clears the valid flag when
++			// it takes over the view). Same behaviour as AutoExposure.cpp:165 - a cut must not ramp.
++			m_autoMeteredEV = targetEV;
++			m_bAutoMeteredEVValid = true;
++		}
++		else
++		{
++			// Frame-rate independent, and scaled by Exposure Response - which under the switch is
++			// the METERING RESPONSE: the fraction of a measured change the camera follows per tau.
++			// It slows the approach, it does not leave a steady-state error, so the name stays
++			// honest and a level authored with 0.6 still behaves like a camera that does not chase
++			// every flicker (decisions/s1-auto-mode.md part 2, research option (c)).
++			const float response = clamp_tpl((float)m_exposure.exposureResponse, 0.0f, 1.0f);
++			const float k = response * (1.0f - expf(-dt / tau));
++			m_autoMeteredEV += (targetEV - m_autoMeteredEV) * k;
++		}
++	}
++	else if (!m_bAutoMeteredEVValid)
+ 	{
+-		m_bLoggedSceneRefResponseIgnored = true;
+-		CryLog("[CinematicCamera] Scene Referred: Exposure Response (%.2f) and Neutral EV (%.1f) are "
+-		       "ignored in Manual - exposure is the physical triangle and the tone curve lives in the "
+-		       "output transform.", (float)m_exposure.exposureResponse, (float)m_exposure.neutralEV);
++		// Nothing measured yet (first frames, or the meter is stalled): expose as if Manual rather
++		// than at EV 0, which would be a white frame.
++		return manualEV;
+ 	}
+ 
+-	return ComputeManualEV100();
++	float ev = m_autoMeteredEV;
++
++	if (m_exposure.exposureMode == EExposureMode::AutoBiased)
++		ev += manualEV - (float)m_exposure.neutralEV;   // EV compensation is already inside manualEV
++	else
++		ev -= (float)m_exposure.evCompensation;         // AutoCompensation: EC only
++
++	// The camera's own EV limits. Unlike the time-of-day window these are the operator's, they
++	// are applied AFTER the bias, and they are what stops AUTO walking off the end of the world
++	// in a scene with real light ratios.
++	const float evMin = min((float)m_exposure.autoEVMin, (float)m_exposure.autoEVMax);
++	const float evMax = max((float)m_exposure.autoEVMin, (float)m_exposure.autoEVMax);
++	return clamp_tpl(clamp_tpl(ev, evMin, evMax), -6.0f, 24.0f);
+ }
+ 
+ // The linear scale the renderer multiplies scene light by, so that a correctly exposed 18 %
+@@ -1283,7 +1354,7 @@ float CCinematicCameraComponent::ComputeSceneReferredEV100() const
+ // meaning ISO. The constant itself only enters when the camera METERS (the AUTO loop); in
+ // Manual the EV comes from the triangle and C is the statement of what 'correctly exposed'
+ // means. C = 120*pi = 376.99 is an implementation detail - the contract is '18 % grey -> 0.18'.
+-float CCinematicCameraComponent::ComputeSceneReferredExposureScale() const
++float CCinematicCameraComponent::ComputeSceneReferredExposureScale()
+ {
+ 	// Only while the component actually asks for the scene-referred path. Off it the renderer
+ 	// latches 1.0 anyway, but publishing 1.0 keeps the bus value honest for anyone reading it.
+diff --git a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
+index 799ea0f8..69262cbf 100644
+--- a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
++++ b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
+@@ -408,13 +408,34 @@ struct SCineExposureParams
+ 		desc.AddMember(&SCineExposureParams::evCompensation,
+ 			'evcp', "EVCompensation", "EV Compensation",
+ 			"EV bias (-3 darker … 0 neutral … +3 brighter). In Manual mode this is a true stop.", 0.0f);
++		// Scene-referred AUTO controls. New members with new CRCs, because they are genuinely new
++		// controls - the shipped parameters keep their names, CRCs and defaults exactly
++		// (research/s1-ccam-exposure-today.md section 5). They do nothing off the switch.
++		desc.AddMember(&SCineExposureParams::bAutoLock,
++			'alck', "AutoExposureLock", "Auto Exposure Lock",
++			"Scene-referred AUTO only: freeze the metered EV where it is, like a camera's AE lock. "
++			"Exposure compensation and the aperture still apply on top.", false);
++		desc.AddMember(&SCineExposureParams::autoTau,
++			'atau', "AutoExposureTau", "Auto Exposure Response Time",
++			"Scene-referred AUTO only: seconds for the metered EV to cover 63 % of a change. "
++			"A cut always snaps instantly. 0 = no smoothing at all.", 1.0f);
++		desc.AddMember(&SCineExposureParams::autoEVMin,
++			'aevn', "AutoExposureEVMin", "Auto Exposure EV Min",
++			"Scene-referred AUTO only: the brightest the camera will open up to (low EV = open).", -2.0f);
++		desc.AddMember(&SCineExposureParams::autoEVMax,
++			'aevx', "AutoExposureEVMax", "Auto Exposure EV Max",
++			"Scene-referred AUTO only: the darkest the camera will stop down to (high EV = closed).", 20.0f);
+ 	}
+ 
+ 	bool bEnableExposure = false;
++	bool bAutoLock = false;
+ 	EExposureMode exposureMode = EExposureMode::AutoBiased;
+ 	Schematyc::Range<0, 1, 0, 1> exposureResponse = 0.6f;
+ 	Schematyc::Range<-6, 24, 4, 14> neutralEV = 9.0f;
+ 	Schematyc::Range<-3, 3, -3, 3> evCompensation = 0.f;
++	Schematyc::Range<0, 10, 0, 5> autoTau = 1.0f;
++	Schematyc::Range<-6, 24, -6, 24> autoEVMin = -2.0f;
++	Schematyc::Range<-6, 24, -6, 24> autoEVMax = 20.0f;
+ };
+ 
+ struct SCineDofParams
+@@ -1002,11 +1023,11 @@ private:
+ 	void RestoreSceneExposure();
+ 	//! The linear scale the renderer must multiply scene light by so that this camera's EV100
+ 	//! renders correctly. 1.0 when the scene-referred path is not requested.
+-	float ComputeSceneReferredExposureScale() const;
++	float ComputeSceneReferredExposureScale();
+ 	//! EV100 the camera is exposing at under the scene-referred path. Manual is the pure
+ 	//! photographic triangle; the two auto modes fall back to it until the AUTO metering loop
+ 	//! lands (see decisions/s1-auto-mode.md part 2).
+-	float ComputeSceneReferredEV100() const;
++	float ComputeSceneReferredEV100();
+ 	void ApplyStreaks();
+ 	void RestoreStreaks();
+ 	void ApplyHalation();
+@@ -1141,8 +1162,19 @@ private:
+ 	// Log-once flags for the parameters whose meaning changes under the scene-referred switch.
+ 	// Per component, not function statics: the statics in ApplyExposureGlobalParam() are shared
+ 	// by every camera in the level (research/s1-ccam-exposure-today.md section 5, item 13).
+-	mutable bool m_bLoggedSceneRefResponseIgnored = false;
+-	mutable bool m_bLoggedSceneRefAutoAsManual    = false;
++	bool m_bLoggedSceneRefResponseIgnored = false;
++	bool m_bLoggedSceneRefAutoAsManual    = false;
++
++	// Scene-referred AUTO state: the smoothed metered EV100 and whether it holds a real sample
++	// yet. Invalid means "snap on the next measurement" - the camera-cut behaviour the engine's
++	// own adaptation has at AutoExposure.cpp:165, which a camera must reproduce or every cut
++	// ramps. Cleared on activation and whenever the component stops driving the render state.
++	float  m_autoMeteredEV       = 0.f;
++	bool   m_bAutoMeteredEVValid = false;
++	// The EV is asked for more than once a frame (the bus publication and the eye-adaptation
++	// write); the smoothing step must advance exactly once, or the response time depends on how
++	// many callers there happen to be.
++	uint32 m_autoMeteredFrameId  = 0;
+ 	// Edge-trigger state for the effective-T-stop log line, per component for the same reason.
+ 	float m_lastLoggedApertureN     = -1.f;
+ 	float m_lastLoggedTransmission  = -1.f;
+-- 
+2.47.1.windows.1
+

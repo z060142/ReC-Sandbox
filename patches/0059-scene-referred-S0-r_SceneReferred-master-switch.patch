@@ -1,0 +1,377 @@
+From f1fc0400a96db9040faf975b000223bafefacfdd Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Fri, 28 Aug 2026 06:18:47 +0800
+Subject: [PATCH 059/119] scene-referred S0: r_SceneReferred master switch
+
+First item of Stage S0 (SceneReferredSpec.md section 6). Adds the one piece of state that
+tells the renderer to take the scene-referred path, with nothing behind it yet: the switch
+is wired, read and documented, and no pass, format or constant changes as a result.
+
+Decision: scene-notes/decisions/s0-master-switch.md, approach A (Pattern A + Pattern B kept
+separate). Research: scene-notes/research/s0-cvar-gating-pattern.md.
+
+- r_SceneReferred (RendererCVars, VF_NULL, default 1) is the user's kill switch, shaped after
+  the r_DepthOfFieldLensModel block: it is never written by code, only honours or refuses a
+  request, and its help string names the spec and states the byte-identity promise. VF_NULL
+  and not VF_DUMPTODISK, like every other ccam cvar, so no forced value can ever be baked
+  into a user config.
+- The request itself is a per-frame parameter on the post-effect bus,
+  Global_User_SceneReferred, registered at manager level next to the other Global_User_*
+  params. The bLensModel precedent, for the same reasons: the bus already carries ccam's
+  single-writer, handover and editor<->game semantics, and EF_ResetPostEffects() clears the
+  request by itself, which is the correct behaviour for per-frame, per-camera state. A cvar
+  written by ccam would have been dropped by ClearSavedBaselines() on entering game mode and
+  stranded the engine off the stock path.
+- CRendererResources::IsSceneReferred() = request && cvar. The later S0 items (fp16 forcing,
+  exposure-path branch) and every later stage key on this and on nothing else.
+- ccam gains a "Scene Referred" property group (Schematyc member name SceneReferred, default
+  false while the pipeline is built stage by stage) plus ApplySceneReferred() /
+  RestoreSceneReferred(). Applied editor-live from ENTITY_EVENT_UPDATE and on property
+  change, under CanDriveRenderState(), latched and restored like every other ccam state, and
+  added to RestoreAllEffects() and ClearSavedBaselines().
+- docs/ConsoleReference.md gains the cvar under Live tuning; README.md gains the property
+  group.
+
+Built clean (0 errors, 0 warnings outside Code/SDKs): CryRenderD3D11, CinematicCamera.
+
+Co-Authored-By: Claude Opus <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01A72MFkdSczncE7au9UVnmu
+---
+ .../Common/PostProcess/PostProcess.cpp        |  4 +++
+ .../Common/PostProcess/PostProcess.h          |  9 +++++
+ .../RenderDll/Common/RendererCVars.cpp        | 11 ++++++
+ .../RenderDll/Common/RendererCVars.h          |  1 +
+ .../RenderDll/Common/RendererResources.cpp    | 18 ++++++++++
+ .../RenderDll/Common/RendererResources.h      |  6 ++++
+ .../Module/CinematicCameraComponent.cpp       | 35 +++++++++++++++++++
+ .../Module/CinematicCameraComponent.h         | 35 +++++++++++++++++++
+ Code/CryPlugins/CinematicCamera/README.md     |  6 ++++
+ .../CinematicCamera/docs/ConsoleReference.md  | 11 ++++++
+ 10 files changed, 136 insertions(+)
+
+diff --git a/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.cpp b/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.cpp
+index 5b0978da..90c3ecb7 100644
+--- a/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.cpp
++++ b/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.cpp
+@@ -393,6 +393,9 @@ int CPostEffectsMgr::Init()
+ 
+ 	AddParamFloat("Global_User_ColorHue", m_pUserColorHue, 0.0f);  // image hue rotation
+ 
++	// The scene-referred request. No transition: it is a switch, not a value to fade.
++	AddParamFloatNoTransition("Global_User_SceneReferred", m_pUserSceneReferred, 0.0f);
++
+ 	// Register all post processes
+ 	AddEffect(CSunShafts);
+ 	AddEffect(CDepthOfField);
+@@ -535,6 +538,7 @@ void CPostEffectsMgr::Reset(bool bOnSpecChange)
+ 	m_pUserColorM->ResetParam(0.0f);
+ 	m_pUserColorK->ResetParam(0.0f);
+ 	m_pUserColorHue->ResetParam(0.0f);
++	m_pUserSceneReferred->ResetParam(0.0f);
+ 
+ 	if (bOnSpecChange)
+ 		std::for_each(m_pEffects.begin(), m_pEffects.end(), SContainerPostEffectResetOnSpecChange());
+diff --git a/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.h b/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.h
+index 64ebeedd..7787f251 100644
+--- a/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.h
++++ b/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.h
+@@ -451,6 +451,7 @@ public:
+ 		, m_pUserColorM(nullptr)
+ 		, m_pUserColorK(nullptr)
+ 		, m_pUserColorHue(nullptr)
++		, m_pUserSceneReferred(nullptr)
+ 	{
+ 		ClearCache();
+ #ifndef _RELEASE
+@@ -612,6 +613,14 @@ protected:
+ 	// CEffectParam *m_pColorC, *m_pColorY, *m_pColorM, *m_pColorK, *m_pColorHue;
+ 
+ 	CEffectParam*       m_pUserBrightness, * m_pUserContrast, * m_pUserSaturation, * m_pUserSharpening;
++	// Scene-referred request (SceneReferredSpec.md). The precedent is SDepthOfFieldParams'
++	// bLensModel: the Cinematic Camera asks for the path on the post-effect parameter bus and
++	// the renderer ANDs the request with the r_SceneReferred kill switch. The bus is used rather
++	// than a cvar because it already carries ccam's single-writer, handover and editor<->game
++	// semantics, and because EF_ResetPostEffects() clears it - which is exactly right for a
++	// per-frame request. Nothing else in the engine writes it, so with the component off the
++	// renderer takes the stock branches. Read through CRendererResources::IsSceneReferred().
++	CEffectParam*       m_pUserSceneReferred;
+ 	CEffectParam*       m_pUserColorC, * m_pUserColorY, * m_pUserColorM, * m_pUserColorK, * m_pUserColorHue;
+ 
+ 	CPostEffectVec      m_pEffects;
+diff --git a/Code/CryEngine/RenderDll/Common/RendererCVars.cpp b/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
+index c431154f..973a6fca 100644
+--- a/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
++++ b/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
+@@ -413,6 +413,7 @@ float CRendererCVars::CV_r_DofCatEyeBarrel;
+ float CRendererCVars::CV_r_DofCatEyeReach;
+ int CRendererCVars::CV_r_DofFieldDebug;
+ int CRendererCVars::CV_r_DofLensModel;
++int CRendererCVars::CV_r_SceneReferred;
+ float CRendererCVars::CV_r_DofLensModelMaxCoC;
+ float CRendererCVars::CV_r_DofLensModelSplatMaxCoC;
+ int CRendererCVars::CV_r_DofLensModelDebug;
+@@ -1676,6 +1677,16 @@ void CRendererCVars::InitCVars()
+ 	               "0 = the bare stratified grid (see the tap copies again for comparison). "
+ 	               "2 = full amplitude with the frame phase FROZEN, for telling tap structure "
+ 	               "apart from TAA ghosting. Default 1.0.");
++	REGISTER_CVAR3("r_SceneReferred", CV_r_SceneReferred, 1, VF_NULL,
++	               "Kill switch for the SCENE-REFERRED pipeline (SceneReferredSpec.md), which keeps "
++	               "everything between the lights and the display transform in scene units - real "
++	               "luminance, no [0,1], no display encoding - so exposure, white balance, grading "
++	               "and every optical effect operate on how much light is in the scene rather than "
++	               "on a picture that has already been squeezed onto a monitor. It runs ONLY when "
++	               "the Cinematic Camera component asks for it (Scene Referred). "
++	               "1 = honour the request (default), 0 = ignore it and always take the stock path, "
++	               "which is then byte for byte the engine's own pipeline - render target formats, "
++	               "pass list and pixels alike.");
+ 	REGISTER_CVAR3("r_DepthOfFieldLensModelDebug", CV_r_DofLensModelDebug, 0, VF_NULL,
+ 	               "DIAGNOSTIC for the lens model. 1 = log the UNCAPPED circle of confusion the thin "
+ 	               "lens is asking for once a second (so the clipping against "
+diff --git a/Code/CryEngine/RenderDll/Common/RendererCVars.h b/Code/CryEngine/RenderDll/Common/RendererCVars.h
+index 72c0de61..b1ab64cd 100644
+--- a/Code/CryEngine/RenderDll/Common/RendererCVars.h
++++ b/Code/CryEngine/RenderDll/Common/RendererCVars.h
+@@ -414,6 +414,7 @@ public:
+ 	static float CV_r_DofLensModelSplatMaxCoC;
+ 	static int   CV_r_DofLensModelDebug;
+ 	static float CV_r_DofLensModelJitter;
++	static int   CV_r_SceneReferred;
+ 	DeclareStaticConstIntCVar(CV_r_nohwgamma, 2);
+ 	DeclareStaticConstIntCVar(CV_r_wireframe, 0);
+ 	DeclareStaticConstIntCVar(CV_r_printmemoryleaks, 0);
+diff --git a/Code/CryEngine/RenderDll/Common/RendererResources.cpp b/Code/CryEngine/RenderDll/Common/RendererResources.cpp
+index b59d6b57..ce04b3d4 100644
+--- a/Code/CryEngine/RenderDll/Common/RendererResources.cpp
++++ b/Code/CryEngine/RenderDll/Common/RendererResources.cpp
+@@ -458,6 +458,24 @@ ETEX_Format CRendererResources::GetDisplayFormat()
+ 	return candidate;
+ }
+ 
++// The component asks; the cvar may refuse. Same shape as the lens model's gate in
++// CDepthOfFieldStage::Execute(): the request travels on the post-effect parameter bus (it is
++// per-frame, per-camera data and the bus already has the reset/handover semantics for it), and
++// r_SceneReferred ANDs it away. When this returns false not one line of the scene-referred work
++// runs and every target, pass and constant keeps its stock value.
++bool CRendererResources::IsSceneReferred()
++{
++	if (CRenderer::CV_r_SceneReferred == 0)
++		return false;
++
++	CPostEffectsMgr* pPostMgr = PostEffectMgr();
++	if (!pPostMgr)
++		return false;
++
++	CEffectParam* pRequest = pPostMgr->GetByName("Global_User_SceneReferred");
++	return pRequest != nullptr && pRequest->GetParam() > 0.5f;
++}
++
+ ETEX_Format CRendererResources::GetDepthFormat()
+ {
+ 	return
+diff --git a/Code/CryEngine/RenderDll/Common/RendererResources.h b/Code/CryEngine/RenderDll/Common/RendererResources.h
+index 2bf6c100..07c4e587 100644
+--- a/Code/CryEngine/RenderDll/Common/RendererResources.h
++++ b/Code/CryEngine/RenderDll/Common/RendererResources.h
+@@ -157,6 +157,12 @@ public:
+ 	static ETEX_Format GetDisplayFormat();
+ 	static ETEX_Format GetDepthFormat();
+ 
++	//! The scene-referred path is taken this frame: the Cinematic Camera asked for it on the
++	//! post-effect parameter bus AND the r_SceneReferred kill switch honours the request.
++	//! Everything gated by SceneReferredSpec.md keys on this and on nothing else, so with the
++	//! component off or the cvar at 0 the renderer is byte-identical to stock.
++	static bool        IsSceneReferred();
++
+ public:
+ 	static bool m_bLoadedSystem;
+ 
+diff --git a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp
+index 6bfe0671..206141d2 100644
+--- a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp
++++ b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp
+@@ -161,6 +161,8 @@ void CCinematicCameraComponent::ProcessEvent(const SEntityEvent& event)
+ 		// finalize hook lets the properties be tuned with immediate feedback.
+ 		ApplyLensCharacter();
+ 		ApplyViewfinder();
++		// The scene-referred switch changes the whole picture, so it is editor-live too.
++		ApplySceneReferred();
+ 		// DOF is a game-mode effect; don't apply in the editor.
+ 		if (!gEnv->IsEditing() && m_dof.bEnableDOF)
+ 			ApplyDOF();
+@@ -194,6 +196,7 @@ void CCinematicCameraComponent::ProcessEvent(const SEntityEvent& event)
+ 		m_pEntity->UpdateComponentEventMask(this);
+ 		ApplyLensCharacter();
+ 		ApplyViewfinder();
++		ApplySceneReferred();
+ 		break;
+ 
+ 	case ENTITY_EVENT_RESET:
+@@ -322,6 +325,7 @@ void CCinematicCameraComponent::RestoreAllEffects()
+ 	RestoreSpriteBokeh();
+ 	RestoreWhiteBalance();
+ 	RestoreLensCharacter();
++	RestoreSceneReferred();
+ 	RestoreViewfinder();
+ 	RestoreStreaks();
+ 	RestoreHalation();
+@@ -338,6 +342,7 @@ void CCinematicCameraComponent::ClearSavedBaselines()
+ 	m_bGrainParamSaved     = false;
+ 	m_bWBParamsSaved       = false;
+ 	m_bLensCharSaved       = false;
++	m_bSceneReferredSaved  = false;
+ 	m_bSpriteBokehSaved    = false;
+ 	m_bBokehShapeTexPushed = false;
+ 	m_bMBParamsSaved       = false;
+@@ -1152,6 +1157,36 @@ void CCinematicCameraComponent::RestoreLensCharacter()
+ 	m_bLensCharSaved = false;
+ }
+ 
++// The scene-referred pipeline switch. Pattern A of the two ccam gating patterns: the component
++// only ASKS, on the post-effect parameter bus, and r_SceneReferred decides whether the renderer
++// listens. Nothing global is written, so a crash or a mode change can never strand the engine
++// off the stock path - EF_ResetPostEffects() clears the request by itself.
++void CCinematicCameraComponent::ApplySceneReferred()
++{
++	// Single writer, as for the lens character: without this every selected cinematic camera,
++	// preview windows included, would fight over the request.
++	if (!CanDriveRenderState())
++		return;
++
++	if (!m_bSceneReferredSaved)
++	{
++		gEnv->p3DEngine->GetPostEffectParam("Global_User_SceneReferred", m_savedSceneReferred);
++		m_bSceneReferredSaved = true;
++	}
++
++	gEnv->p3DEngine->SetPostEffectParam("Global_User_SceneReferred",
++	                                    m_sceneReferred.bSceneReferred ? 1.0f : 0.0f);
++}
++
++void CCinematicCameraComponent::RestoreSceneReferred()
++{
++	if (!m_bSceneReferredSaved)
++		return;
++
++	gEnv->p3DEngine->SetPostEffectParam("Global_User_SceneReferred", m_savedSceneReferred);
++	m_bSceneReferredSaved = false;
++}
++
+ // Viewfinder overlays: frame guides and focus peaking. These are monitor markings, never part
+ // of the picture, so they are editor-live like the lens character and default to editor-only -
+ // a recording made in game mode is clean unless Overlays In Game Mode says otherwise.
+diff --git a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
+index 3f76303c..3dd91852 100644
+--- a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
++++ b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
+@@ -821,6 +821,30 @@ struct SCineViewfinderParams
+ 	bool bOverlaysInGame = false;
+ };
+ 
++// Scene-referred pipeline (SceneReferredSpec.md). Its own group rather than a member of an
++// existing one: the later stages hang exposure, white balance, grade and output parameters off
++// this switch, and none of them belong to the lens or to the stock exposure block.
++struct SCineSceneReferredParams
++{
++	inline bool operator==(const SCineSceneReferredParams& rhs) const { return 0 == memcmp(this, &rhs, sizeof(rhs)); }
++
++	static void ReflectType(Schematyc::CTypeDesc<SCineSceneReferredParams>& desc)
++	{
++		desc.SetGUID("{0B4F1E27-9C3A-4D56-8E71-5A2C6F0D8B93}"_cry_guid);
++		desc.SetLabel("Scene Referred");
++		desc.AddMember(&SCineSceneReferredParams::bSceneReferred,
++			'scnr', "SceneReferred", "Scene Referred",
++			"Ask the renderer for the scene-referred pipeline: everything between the lights and "
++			"the display transform stays in scene units - real luminance, no [0,1], no display "
++			"encoding - so exposure, white balance, grading and the optical effects work on how "
++			"much light is in the scene instead of on a picture already squeezed onto a monitor. "
++			"Gated again by the r_SceneReferred cvar; off = the stock engine pipeline, byte for "
++			"byte. Default off while the pipeline is being built stage by stage.", false);
++	}
++
++	bool bSceneReferred = false;
++};
++
+ class CCinematicCameraComponent final
+ 	: public IEntityComponent
+ 	, public ICinematicCameraOptics
+@@ -844,6 +868,7 @@ public:
+ 			IEntityComponent::EFlags::ClientOnly });
+ 
+ 		desc.AddMember(&CCinematicCameraComponent::m_body, 'gbdy', "CameraBody", "Camera Body", "", SCineBodyParams());
++		desc.AddMember(&CCinematicCameraComponent::m_sceneReferred, 'gscn', "SceneReferred", "Scene Referred", "", SCineSceneReferredParams());
+ 		desc.AddMember(&CCinematicCameraComponent::m_lens, 'glns', "Lens", "Lens", "", SCineLensParams());
+ 		desc.AddMember(&CCinematicCameraComponent::m_anamorphic, 'gana', "Anamorphic", "Anamorphic", "", SCineAnamorphicParams());
+ 		desc.AddMember(&CCinematicCameraComponent::m_exposure, 'gexp', "Exposure", "Exposure", "", SCineExposureParams());
+@@ -962,6 +987,10 @@ private:
+ 	void RestoreSpriteBokeh();
+ 	void ApplyLensCharacter();
+ 	void RestoreLensCharacter();
++	//! Scene-referred request on the post-effect parameter bus. Editor-live: it changes the
++	//! whole picture, so it has to be visible while the properties are being tuned.
++	void ApplySceneReferred();
++	void RestoreSceneReferred();
+ 	void ApplyStreaks();
+ 	void RestoreStreaks();
+ 	void ApplyHalation();
+@@ -980,6 +1009,7 @@ private:
+ 
+ 	// Reflected property groups
+ 	SCineBodyParams m_body;
++	SCineSceneReferredParams m_sceneReferred;
+ 	SCineLensParams m_lens;
+ 	SCineAnamorphicParams m_anamorphic;
+ 	SCineExposureParams m_exposure;
+@@ -1082,6 +1112,11 @@ private:
+ 	float m_savedLetterbox      = 0.f;
+ 	bool  m_bLensCharSaved      = false;
+ 
++	// Scene-referred saved state (Global_User_SceneReferred post param). Unknown to an
++	// unmodified renderer, where the read returns nothing and the write is dropped.
++	float m_savedSceneReferred  = 0.f;
++	bool  m_bSceneReferredSaved = false;
++
+ 	// Sprite bokeh saved state (r_DepthOfFieldMode cvar + Dof_User_BokehShapeTex post param).
+ 	// Unknown to an unmodified renderer, where the read returns nothing and the writes are dropped.
+ 	int    m_savedDofModeCVar  = 1;
+diff --git a/Code/CryPlugins/CinematicCamera/README.md b/Code/CryPlugins/CinematicCamera/README.md
+index c102fb82..a29708d8 100644
+--- a/Code/CryPlugins/CinematicCamera/README.md
++++ b/Code/CryPlugins/CinematicCamera/README.md
+@@ -104,6 +104,12 @@ deliberately keeps its persistence and is never removed.
+ The "Range" column is the hard limit (Schematyc Range); where the slider has a narrower soft
+ range it is noted in brackets.
+ 
++### Scene Referred
++
++| Property | Range | Default | Effect |
++| --- | --- | --- | --- |
++| Scene Referred | bool | false | Ask the renderer for the scene-referred pipeline: everything between the lights and the display transform stays in scene units - real luminance, no `[0,1]`, no display encoding - so exposure, white balance, grading and the optical effects work on how much light is in the scene instead of on a picture already squeezed onto a monitor. Gated again by the `r_SceneReferred` cvar; off = the stock engine pipeline, byte for byte. Default off while the pipeline is being built stage by stage. See [SceneReferredSpec.md](SceneReferredSpec.md). |
++
+ ### Camera Body
+ 
+ | Property | Range | Default | Effect |
+diff --git a/Code/CryPlugins/CinematicCamera/docs/ConsoleReference.md b/Code/CryPlugins/CinematicCamera/docs/ConsoleReference.md
+index a77af48f..9c29dcc7 100644
+--- a/Code/CryPlugins/CinematicCamera/docs/ConsoleReference.md
++++ b/Code/CryPlugins/CinematicCamera/docs/ConsoleReference.md
+@@ -55,6 +55,17 @@ The same switch is exported for other plugins as `CryActivateCinematicCameraSlot
+ 
+ ## Live tuning
+ 
++### r_SceneReferred
++
++| | |
++| --- | --- |
++| Default | 1 |
++| Purpose | Kill switch for the **scene-referred pipeline** ([SceneReferredSpec.md](../SceneReferredSpec.md)), which keeps everything between the lights and the display transform in scene units - real luminance, no `[0,1]`, no display encoding - so exposure, white balance, grading and every optical effect operate on how much light is in the scene rather than on a picture that has already been squeezed onto a monitor. It runs **only** when the Cinematic Camera component asks for it (`Scene Referred`, off by default while the pipeline is built stage by stage). 1 = honour the request. 0 = ignore it and always take the stock path, which is then byte for byte the engine's own pipeline - render target formats, pass list and pixels alike. |
++
++The request itself travels on the post-effect parameter bus (`Global_User_SceneReferred`), not
++on a cvar, so it is per-camera, cleared by a post-effect reset and restored on handover; this
++cvar only decides whether the renderer listens.
++
+ ### r_DepthOfFieldMode
+ 
+ | | |
+-- 
+2.47.1.windows.1
+

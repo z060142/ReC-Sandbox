@@ -1,0 +1,1111 @@
+From 8752ce36bb33ee0a982d937d4b4dc527d72aa048 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Fri, 28 Aug 2026 10:05:40 +0800
+Subject: [PATCH 088/119] scene-referred S6: the tap, and the pixels leaving
+ the GPU without stopping it
+
+The value the spec's chain calls the export point exists only as a shader temporary: after S4 the
+whole display chain - white balance, ACEScct, CDL, LMT, ODT - is evaluated per pixel inside
+HDRFinalPass, so there is no render target holding it. This adds one.
+
+HDRFinalPass grows a second render target under %_RT_SAMPLE2 (the bit S4 freed when it deleted the
+dead vignette gate). FilmMapping hands the graded value back out through an out parameter, taken
+between the LMT fetch and the ODT fetch and converted back to LINEAR ACEScg on the way. The
+inverse shaper is not an operator being undone: the ACEScct encode belongs to the ODT LUT's input
+domain, not to the grade, and an EXR of the log value would be a file no ACES tool could read
+without being told about our private shaper. The round trip that proves S4 needs scene-linear.
+
+A second mode taps $HDRTarget as it enters the tone map - exposed, ACEScg, ungraded, unvignetted,
+un-composited. That is the camera NEGATIVE, and it is a different artefact from the graded frame
+rather than a variant of it: the graded tap is the acceptance instrument (it is the only one for
+which "apply the same ODT elsewhere and compare" tests the output transform instead of every
+operator in front of it), and the negative is what a colourist actually wants.
+
+The readback is the two-phase, fence-carrying kind, over a ring of three FT_STAGE_READBACK
+targets: issue the download after the pass, poll a later frame, never block. The one-shot overload
+the screenshot path uses Maps immediately and stalls the pipeline - tolerable for a screenshot, not
+for 15.8 MiB (1080p) or 63.3 MiB (4K) every frame. A ring of one would mean either a stall or a
+sequence with holes; three is what makes "frame N+1's copy is never waiting on frame N's map" hold
+at a frame rate that varies. The render thread copies the mapped rows out (they are PITCHED, and
+assuming width * 8 is what produces a sheared image) and a low-priority job de-interleaves,
+optionally converts AP1 -> AP0, compresses and writes.
+
+Backpressure is honest: one writer job per ring slot, so the ring bounds the queue. If the ring
+comes round to a slot whose download has not returned or whose writer is still going, the capture
+STOPS and says why. It never drops a frame - a hole in a sequence is invisible until someone tries
+to conform it, which is exactly when it costs the most.
+
+Everything is created on arm and released on disarm, and both the tap and the encoding are latched
+at that moment rather than read per frame: a sequence whose second half means something different
+from its first is a folder of files that look alike and are not.
+
+The stock path is untouched. capture_frames, RT_ReadTexture, SCaptureFormatInfo and
+ICaptureFrameListener are all left exactly as they were, so the byte-identity harness that reads
+TGA out of that code stays valid. With no capture armed the pass binds one render target and the
+shader declares one output, as before. Adding an output to HDRFinalPass does invalidate the shader
+permutation cache once, stock variants included - S4 already did that when it removed SAMPLE2.
+
+Co-Authored-By: Claude Opus <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01A72MFkdSczncE7au9UVnmu
+---
+ .../RenderDll/Common/RendererCVars.cpp        |  41 ++
+ .../RenderDll/Common/RendererCVars.h          |   4 +
+ .../RenderDll/XRenderD3D9/CMakeLists.txt      |   2 +
+ .../RenderDll/XRenderD3D9/D3DSystem.cpp       |   6 +
+ .../GraphicsPipeline/SceneReferredExport.cpp  | 489 ++++++++++++++++++
+ .../GraphicsPipeline/SceneReferredExport.h    | 188 +++++++
+ .../GraphicsPipeline/ToneMapping.cpp          |  40 +-
+ .../GraphicsPipeline/ToneMapping.h            |   8 +-
+ .../XRenderD3D9/core_renderer.waf_files       |   2 +
+ .../HWScripts/CryFX/HDRPostProcess.cfx        |  58 ++-
+ 10 files changed, 828 insertions(+), 10 deletions(-)
+ create mode 100644 Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/SceneReferredExport.cpp
+ create mode 100644 Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/SceneReferredExport.h
+
+diff --git a/Code/CryEngine/RenderDll/Common/RendererCVars.cpp b/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
+index 3e39bed9..f3c0c9a1 100644
+--- a/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
++++ b/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
+@@ -418,6 +418,10 @@ int CRendererCVars::CV_r_SceneReferred;
+ int CRendererCVars::CV_r_SceneReferredDebug;
+ float CRendererCVars::CV_r_SceneReferredNishitaScale;
+ int CRendererCVars::CV_r_SceneReferredExrSelfTest;
++int CRendererCVars::CV_r_SceneReferredExportTap;
++int CRendererCVars::CV_r_SceneReferredExportEncoding;
++int CRendererCVars::CV_r_SceneReferredExportCompression;
++float CRendererCVars::CV_r_SceneReferredExportFixedStep;
+ float CRendererCVars::CV_r_DofLensModelMaxCoC;
+ float CRendererCVars::CV_r_DofLensModelSplatMaxCoC;
+ int CRendererCVars::CV_r_DofLensModelDebug;
+@@ -1727,6 +1731,43 @@ void CRendererCVars::InitCVars()
+ 	               "the ratio that brings it to a real clear-sky diffuse value (about 12 000 lux with "
+ 	               "the sun at 45 degrees). 1.0 = uncalibrated (default), which is the shipped "
+ 	               "behaviour and changes nothing.");
++	REGISTER_CVAR3("r_SceneReferredExportTap", CV_r_SceneReferredExportTap, 0, VF_NULL,
++	               "WHICH frame rec_CaptureEXR writes. "
++	               "0 = GRADED (default): the value HDRFinalPass has right before the output "
++	               "transform - white balance, CDL, look LUT, bloom, sun shafts and vignette all "
++	               "applied - handed back to linear ACEScg. This is the acceptance instrument: it "
++	               "is the only tap for which 'apply the same ODT in Resolve and compare' tests the "
++	               "output transform rather than every operator in front of it. "
++	               "1 = NEGATIVE: the HDR target as it enters the tone map - exposed, in ACEScg, "
++	               "ungraded, unvignetted, un-composited. The file to take into a colour suite when "
++	               "the grade is going to happen there. They are two different artefacts, not two "
++	               "settings of one.");
++	REGISTER_CVAR3("r_SceneReferredExportEncoding", CV_r_SceneReferredExportEncoding, 0, VF_NULL,
++	               "What the exported EXR claims to be. "
++	               "0 = ACES2065-1 (default): AP0 primaries, converted from AP1 on the CPU during "
++	               "the write, with AP0 chromaticities and acesImageContainerFlag. An untagged EXR "
++	               "in an ACES project is ASSUMED to be ACES2065-1, so this file imports correctly "
++	               "with the operator doing nothing at all. "
++	               "1 = ACEScg: the buffer byte for byte, AP1 chromaticities and NO container flag "
++	               "- the flag asserts ST 2065-4 conformance, which is a claim about AP0 data, and "
++	               "putting it on an AP1 file would be a false one. Costs a per-clip input "
++	               "transform in Resolve; right for a comp pipeline that works in AP1.");
++	REGISTER_CVAR3("r_SceneReferredExportCompression", CV_r_SceneReferredExportCompression, 3, VF_NULL,
++	               "EXR compression codec. 0 = none, 1 = RLE, 2 = ZIPS (one scanline per block), "
++	               "3 = ZIP (16 scanlines, the CG default and the default here), 4 = PIZ. ZIP "
++	               "roughly halves the disk rate for a cost that is already on a worker thread. "
++	               "None is for when the disk is fast and the CPU is not, and for reading a file "
++	               "with a hex editor. Lossless compression makes the file size content-dependent, "
++	               "so a frame that suddenly compresses badly is a frame the writer takes longer "
++	               "over - the capture stops rather than dropping it.");
++	REGISTER_CVAR3("r_SceneReferredExportFixedStep", CV_r_SceneReferredExportFixedStep, 1.0f / 30.0f, VF_NULL,
++	               "The frame time rec_CaptureEXR forces while a SEQUENCE is capturing, in seconds; "
++	               "t_FixedStep is saved on start and restored on stop. Outside the editor nothing "
++	               "else locks frame time - capture_frames certainly does not - so without this a "
++	               "sequence has one file per rendered frame at whatever rate the machine managed, "
++	               "and N frames is not N/fps seconds. An EXR sequence is a timed artefact or it "
++	               "cannot be conformed. 0 = do not touch t_FixedStep (and accept that the result "
++	               "has no cadence). Default 0.0333 = 30 fps.");
+ 	REGISTER_CVAR3_CB("r_SceneReferredExrSelfTest", CV_r_SceneReferredExrSelfTest, 0, VF_NULL,
+ 	               "SELF-TEST for the EXR writer behind rec_CaptureEXR (Stage S6). Set it to 1 and "
+ 	               "the renderer writes a 4x4 half EXR into the user folder, reads it back with "
+diff --git a/Code/CryEngine/RenderDll/Common/RendererCVars.h b/Code/CryEngine/RenderDll/Common/RendererCVars.h
+index 1186da59..1003172c 100644
+--- a/Code/CryEngine/RenderDll/Common/RendererCVars.h
++++ b/Code/CryEngine/RenderDll/Common/RendererCVars.h
+@@ -418,6 +418,10 @@ public:
+ 	static int   CV_r_SceneReferredDebug;
+ 	static float CV_r_SceneReferredNishitaScale;
+ 	static int   CV_r_SceneReferredExrSelfTest;
++	static int   CV_r_SceneReferredExportTap;
++	static int   CV_r_SceneReferredExportEncoding;
++	static int   CV_r_SceneReferredExportCompression;
++	static float CV_r_SceneReferredExportFixedStep;
+ 	DeclareStaticConstIntCVar(CV_r_nohwgamma, 2);
+ 	DeclareStaticConstIntCVar(CV_r_wireframe, 0);
+ 	DeclareStaticConstIntCVar(CV_r_printmemoryleaks, 0);
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/CMakeLists.txt b/Code/CryEngine/RenderDll/XRenderD3D9/CMakeLists.txt
+index 16783c56..3763b787 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/CMakeLists.txt
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/CMakeLists.txt
+@@ -820,6 +820,8 @@ add_sources("CryRenderer_uber_6.cpp"
+ 		"GraphicsPipeline/TiledLightVolumes.cpp"
+ 		"GraphicsPipeline/TiledShading.h"
+ 		"GraphicsPipeline/TiledShading.cpp"
++		"GraphicsPipeline/SceneReferredExport.h"
++		"GraphicsPipeline/SceneReferredExport.cpp"
+ 		"GraphicsPipeline/ToneMapping.h"
+ 		"GraphicsPipeline/ToneMapping.cpp"
+ 		"GraphicsPipeline/VolumetricClouds.h"
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/D3DSystem.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/D3DSystem.cpp
+index ee6c56d0..d93d7a99 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/D3DSystem.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/D3DSystem.cpp
+@@ -18,6 +18,7 @@
+ #include <Common/RenderDisplayContext.h>
+ #include <Gpu/Particles/GpuParticleManager.h>
+ #include <GraphicsPipeline/ComputeSkinning.h>
++#include <GraphicsPipeline/SceneReferredExport.h>
+ #include <GraphicsPipeline/Common/SceneRenderPass.h>
+ 
+ #if CRY_PLATFORM_WINDOWS
+@@ -636,6 +637,11 @@ void CD3D9Renderer::ShutDown(bool bReInit)
+ {
+ 	m_bInShutdown = true;
+ 
++	// The EXR capture, if one is running: disarm it, put t_FixedStep back, and WAIT for the writer
++	// jobs. Blocking is correct exactly here - the job manager and the staging textures are about
++	// to go away (the same ordering CDiffractionKernel drains on).
++	CSceneReferredExport::Get().Shutdown();
++
+ 	// Force Flush RT command buffer
+ 	ForceFlushRTCommands();
+ 	PreShutDown();
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/SceneReferredExport.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/SceneReferredExport.cpp
+new file mode 100644
+index 00000000..f2888059
+--- /dev/null
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/SceneReferredExport.cpp
+@@ -0,0 +1,489 @@
++// Copyright 2026 ReC Sandbox. Scene-referred pipeline, stage S6 (SceneReferredSpec.md).
++
++#include "StdAfx.h"
++#include "SceneReferredExport.h"
++
++#include "DriverD3D.h"
++#include "Common/PostProcess/PostProcess.h"
++#include "Common/RendererResources.h"
++
++#include <CryThreading/IJobManager_JobDelegator.h>
++
++// ---------------------------------------------------------------------------------------------
++// The writer job. One per captured frame, low priority, and it owns its payload: the render
++// thread copied the pixels out of the staging map before launching it, precisely so that nothing
++// here touches a D3D resource or a ring slot the GPU is about to reuse.
++// ---------------------------------------------------------------------------------------------
++void SceneReferredExportWriteJobEntry(SSceneReferredExportJob*);
++DECLARE_JOB("SceneReferredExport", TSceneReferredExportJob, SceneReferredExportWriteJobEntry);
++
++void SceneReferredExportWriteJobEntry(SSceneReferredExportJob* pJob)
++{
++	if (!pJob)
++		return;
++
++	pJob->desc.pAttributes = pJob->attributes.empty() ? nullptr : pJob->attributes.data();
++	pJob->desc.numAttributes = (int)pJob->attributes.size();
++
++	WriteEXR(pJob->path.c_str(), pJob->width, pJob->height, pJob->pixels.data(), pJob->width, pJob->desc);
++
++	delete pJob;
++}
++
++namespace
++{
++
++//! AP1 -> AP0, row-major. The standard ACES matrix pair; these are the AP1ToXYZ / XYZToAP0 product
++//! and are fixed by the specification, not tuned. Verified against PyOpenColorIO by
++//! tools/ocio-bake/verify_matrices.py alongside the ones CommonMath.cfi carries.
++const float kAP1ToAP0[9] =
++{
++	 0.6954522414f,  0.1406786965f,  0.1638690622f,
++	 0.0447945634f,  0.8596711185f,  0.0955343182f,
++	-0.0055258826f,  0.0040252103f,  1.0015006723f,
++};
++
++//! AP1 (ACEScg) and AP0 (ACES2065-1) primaries with the ACES white, CIE 1931 xy, in the order the
++//! EXR `chromaticities` attribute wants: rx ry gx gy bx by wx wy.
++const float kChromaticitiesAP1[8] = { 0.713f,   0.293f,   0.165f, 0.830f,  0.128f,  0.044f,   0.32168f, 0.33767f };
++const float kChromaticitiesAP0[8] = { 0.7347f,  0.2653f,  0.0f,   1.0f,    0.0001f, -0.0770f, 0.32168f, 0.33767f };
++
++//! Turn whatever the operator typed into a real, existing directory. A relative folder lands
++//! under the user folder, which is where every other tool in this engine writes; an absolute one
++//! is taken as given.
++string ResolveCaptureFolder(const char* szFolder)
++{
++	string folder = (szFolder && *szFolder) ? szFolder : "CaptureEXR";
++	folder.replace('\\', '/');
++
++	const bool bAbsolute = (folder.size() > 1 && folder[1] == ':') || folder[0] == '/';
++	if (!bAbsolute)
++		folder = string("%USER%/") + folder;
++
++	CryPathString resolved;
++	gEnv->pCryPak->AdjustFileName(folder.c_str(), resolved, ICryPak::FLAGS_PATH_REAL | ICryPak::FLAGS_FOR_WRITING);
++	gEnv->pCryPak->MakeDir(resolved.c_str());
++	return string(resolved.c_str());
++}
++
++float GetBusParam(const char* szName)
++{
++	CPostEffectsMgr* pPostMgr = PostEffectMgr();
++	if (!pPostMgr)
++		return 0.0f;
++	CEffectParam* pParam = pPostMgr->GetByName(szName);
++	return pParam ? pParam->GetParam() : 0.0f;
++}
++
++//! The name a LUT slot is currently holding, or "" when the slot is empty. The texture's name is
++//! the .cube path ccam uploaded it under, so this is where the ODT/LMT provenance comes from
++//! without the renderer needing a string channel of its own.
++string GetLutName(CEffectParam* pId, CEffectParam* pSize)
++{
++	if (!pId || !pSize || pSize->GetParam() < 2.0f)
++		return string();
++	CTexture* pTex = CTexture::GetByID((int)pId->GetParam());
++	return CTexture::IsTextureExist(pTex) ? string(pTex->GetName()) : string();
++}
++
++} // anonymous namespace
++
++CSceneReferredExport& CSceneReferredExport::Get()
++{
++	static CSceneReferredExport s_instance;
++	return s_instance;
++}
++
++CSceneReferredExport::CSceneReferredExport()
++	: m_state(eState_Idle)
++	, m_tap(eSceneReferredExportTap_Graded)
++	, m_encoding(eSceneReferredExportEncoding_ACES2065)
++	, m_frameIndex(0)
++	, m_nextSlot(0)
++	, m_width(0)
++	, m_height(0)
++	, m_pOwner(nullptr)
++	, m_bTimeStepOverridden(false)
++	, m_fSavedFixedStep(0.0f)
++	, m_nSavedJitter(1)
++{}
++
++bool CSceneReferredExport::WantsGradedTap() const
++{
++	return IsArmed() && m_tap == eSceneReferredExportTap_Graded;
++}
++
++bool CSceneReferredExport::StartSequence(const char* szFolder, const char* szPrefix)
++{
++	if (IsArmed())
++	{
++		CryLogAlways("[EXR] a capture is already running - stop it first (rec_CaptureEXRStop)");
++		return false;
++	}
++
++	m_folder = ResolveCaptureFolder(szFolder);
++	m_prefix = (szPrefix && *szPrefix) ? szPrefix : "frame";
++	// The frame counter belongs to the capture, not to a shared console variable. `capture_frames`
++	// is written by ManualFrameStep and by CryMovie as well, so two captures in one session there
++	// continue the same numbering; here every arm starts at zero.
++	m_frameIndex = 0;
++	m_nextSlot = 0;
++	m_tap = clamp_tpl(CRenderer::CV_r_SceneReferredExportTap, 0, 1);
++	m_encoding = clamp_tpl(CRenderer::CV_r_SceneReferredExportEncoding, 0, 1);
++	m_state = eState_Sequence;
++
++	SetFixedStep(true);
++
++	CryLogAlways("[EXR] capture armed: '%s/%s.%%06d.exr'", m_folder.c_str(), m_prefix.c_str());
++	return true;
++}
++
++bool CSceneReferredExport::RequestSingleFrame(const char* szFolder, const char* szPrefix)
++{
++	if (IsArmed())
++	{
++		CryLogAlways("[EXR] a capture is already running - stop it first (rec_CaptureEXRStop)");
++		return false;
++	}
++
++	m_folder = ResolveCaptureFolder(szFolder);
++	m_prefix = (szPrefix && *szPrefix) ? szPrefix : "frame";
++	m_frameIndex = 0;
++	m_nextSlot = 0;
++	m_tap = clamp_tpl(CRenderer::CV_r_SceneReferredExportTap, 0, 1);
++	m_encoding = clamp_tpl(CRenderer::CV_r_SceneReferredExportEncoding, 0, 1);
++	m_state = eState_SingleFrame;
++
++	// No cadence to fix for one frame, so t_FixedStep is left alone.
++	return true;
++}
++
++void CSceneReferredExport::Stop(const char* szReason)
++{
++	if (m_state == eState_Idle)
++		return;
++
++	const int nWritten = m_frameIndex;
++	m_state = eState_Idle;
++	SetFixedStep(false);
++
++	CryLogAlways("[EXR] capture stopped after %d frame%s%s%s", nWritten, (nWritten == 1) ? "" : "s",
++	             (szReason && *szReason) ? ": " : "", (szReason && *szReason) ? szReason : "");
++
++	// The ring is NOT released here - slots may still have a download in flight, and freeing a
++	// staging resource that is the target of an unretired GPU copy is the exact bug Bloom.cpp's
++	// m_bDiffractionReadbackIssued guard exists to avoid. BeginFrame drains and releases.
++}
++
++void CSceneReferredExport::SetFixedStep(bool bEnable)
++{
++	ICVar* pFixedStep = gEnv->pConsole ? gEnv->pConsole->GetCVar("t_FixedStep") : nullptr;
++	ICVar* pJitter = gEnv->pConsole ? gEnv->pConsole->GetCVar("r_DepthOfFieldLensModelJitter") : nullptr;
++
++	if (bEnable)
++	{
++		if (m_bTimeStepOverridden || !pFixedStep)
++			return;
++
++		m_fSavedFixedStep = pFixedStep->GetFVal();
++		m_nSavedJitter = pJitter ? pJitter->GetIVal() : 1;
++
++		const float fStep = max(CRenderer::CV_r_SceneReferredExportFixedStep, 0.0f);
++		if (fStep > 0.0f)
++			pFixedStep->Set(fStep);
++
++		// Jitter mode 2 freezes the lens model's per-frame tap rotation. A sequence in which every
++		// frame carries a different sub-pixel dither is not a sequence, it is noise with a picture
++		// behind it - and it is indistinguishable from TAA ghosting when the result is examined.
++		if (pJitter)
++			pJitter->Set(2);
++
++		m_bTimeStepOverridden = true;
++	}
++	else
++	{
++		if (!m_bTimeStepOverridden)
++			return;
++
++		if (pFixedStep)
++			pFixedStep->Set(m_fSavedFixedStep);
++		if (pJitter)
++			pJitter->Set(m_nSavedJitter);
++
++		m_bTimeStepOverridden = false;
++	}
++}
++
++void CSceneReferredExport::ReleaseRing()
++{
++	for (int i = 0; i < kRingSize; ++i)
++	{
++		if (m_ring[i].bIssued)
++			return; // a download is still in flight; try again next frame
++	}
++
++	for (int i = 0; i < kRingSize; ++i)
++	{
++		if (m_ring[i].jobState.IsRunning())
++			return; // a writer is still going
++		m_ring[i].pTex.reset();
++	}
++
++	m_width = m_height = 0;
++	m_pOwner = nullptr;
++}
++
++void CSceneReferredExport::GatherMetadata(SSceneReferredExportMetadata& out) const
++{
++	out.frameIndex = m_frameIndex;
++	out.renderFrameId = gRenDev ? (int)gRenDev->GetRenderFrameID() : 0;
++	out.engineTime = gEnv->pTimer ? gEnv->pTimer->GetCurrTime() : 0.0f;
++	out.fps = (CRenderer::CV_r_SceneReferredExportFixedStep > 0.0f) ? (1.0f / CRenderer::CV_r_SceneReferredExportFixedStep) : 0.0f;
++
++	// The number that makes the file's absolute scale recoverable. Everything in this pipeline is
++	// built on 1.0 = 10 000 cd/m^2, and the pre-exposure destroys that unless the scale it applied
++	// travels with the frame.
++	out.exposureScale = gcpRendD3D ? gcpRendD3D->GetSceneReferredExposure() : 1.0f;
++
++	out.whiteBalanceK = GetBusParam("Global_User_GradeWBKelvin");
++	out.whiteBalanceTint = GetBusParam("Global_User_GradeWBTint");
++
++	if (CPostEffectsMgr* pPostMgr = PostEffectMgr())
++	{
++		out.odtName = GetLutName(pPostMgr->GetLutODTParam(), pPostMgr->GetLutODTSizeParam());
++		out.lmtName = GetLutName(pPostMgr->GetLutLMTParam(), pPostMgr->GetLutLMTSizeParam());
++
++		const Vec4 slope = pPostMgr->GetByNameVec4("Global_User_GradeSlope");
++		const Vec4 offset = pPostMgr->GetByNameVec4("Global_User_GradeOffset");
++		const Vec4 power = pPostMgr->GetByNameVec4("Global_User_GradePower");
++		const float sat = pPostMgr->GetByNameF("Global_User_GradeSaturation");
++
++		// ASC order, ASC names, one line - the same numbers a .cdl carries, so a human reading the
++		// header can type them into Resolve.
++		out.cdl.Format("slope %g %g %g / offset %g %g %g / power %g %g %g / sat %g",
++		               slope.x, slope.y, slope.z, offset.x, offset.y, offset.z,
++		               power.x, power.y, power.z, sat);
++	}
++}
++
++CTexture* CSceneReferredExport::BeginFrame(CGraphicsPipeline& pipeline, int width, int height)
++{
++	ConsumeCompleted();
++
++	if (m_state == eState_Idle)
++	{
++		ReleaseRing();
++		return nullptr;
++	}
++
++	if (m_pOwner == nullptr)
++		m_pOwner = &pipeline;
++	if (m_pOwner != &pipeline)
++		return nullptr;
++
++	if (width <= 0 || height <= 0)
++		return nullptr;
++
++	if ((m_width != 0 && m_width != width) || (m_height != 0 && m_height != height))
++	{
++		Stop("the resolution changed under the capture");
++		return nullptr;
++	}
++	m_width = width;
++	m_height = height;
++
++	SRingSlot& slot = m_ring[m_nextSlot];
++
++	// The ring has come round to a slot whose download has not been consumed, or whose writer is
++	// still going. Either way the machine cannot keep up, and the honest response is to stop.
++	if (slot.bIssued)
++	{
++		Stop("the readback fell behind - the GPU has not returned an earlier frame");
++		return nullptr;
++	}
++	if (slot.jobState.IsRunning())
++	{
++		Stop("the writer fell behind - the disk cannot keep up with the frame rate");
++		return nullptr;
++	}
++
++	if (!CTexture::IsTextureExist(slot.pTex))
++	{
++		// FT_STAGE_READBACK is what gives the texture a PERSISTENT staging resource, and that is
++		// what makes a two-phase (issue now, map later) download possible at all. The one-shot
++		// overload allocates a temporary and Maps immediately, which under D3D11 is a full
++		// pipeline stall - fine for a screenshot, ruinous at one full-res fp16 frame per frame.
++		const uint32 flags = FT_NOMIPS | FT_DONT_STREAM | FT_USAGE_RENDERTARGET | FT_STAGE_READBACK;
++		// Named per pipeline AND per slot: the editor runs more than one CGraphicsPipeline, and
++		// two of them sharing one texture name is the bug S0 had to fix for the satellite formats.
++		string name;
++		name.Format("$SceneReferredExport%d%s", m_nextSlot, pipeline.GetUniqueIdentifierName().c_str());
++		slot.pTex = CTexture::GetOrCreateRenderTarget(name.c_str(), width, height, Clr_Transparent, eTT_2D, flags, eTF_R16G16B16A16F);
++
++		if (!CTexture::IsTextureExist(slot.pTex))
++		{
++			slot.pTex.reset();
++			Stop("could not create the readback target");
++			return nullptr;
++		}
++	}
++
++	return slot.pTex;
++}
++
++void CSceneReferredExport::EndFrame()
++{
++	if (m_state == eState_Idle)
++		return;
++
++	SRingSlot& slot = m_ring[m_nextSlot];
++	if (!CTexture::IsTextureExist(slot.pTex))
++		return;
++
++	CDeviceTexture* pDevTex = slot.pTex->GetDevTexture();
++	if (!pDevTex)
++	{
++		Stop("the readback target has no device texture");
++		return;
++	}
++
++	GatherMetadata(slot.metadata);
++	// The dot before the frame number is the VFX convention Nuke and Resolve auto-detect as a
++	// sequence, not the engine's own "%s%06d.%s" (DriverD3D.cpp:1258). Getting it wrong means
++	// every import is manual.
++	slot.path.Format("%s/%s.%06d.exr", m_folder.c_str(), m_prefix.c_str(), m_frameIndex);
++
++	pDevTex->DownloadToStagingResource(0);
++	slot.bIssued = true;
++	slot.fIssueTime = gEnv->pTimer->GetAsyncCurTime();
++
++	++m_frameIndex;
++	m_nextSlot = (m_nextSlot + 1) % kRingSize;
++
++	if (m_state == eState_SingleFrame)
++	{
++		m_state = eState_Idle;
++		CryLogAlways("[EXR] single frame requested: '%s'", slot.path.c_str());
++	}
++}
++
++void CSceneReferredExport::ConsumeCompleted()
++{
++	for (int i = 0; i < kRingSize; ++i)
++	{
++		if (m_ring[i].bIssued)
++			ConsumeSlot(m_ring[i]);
++	}
++}
++
++bool CSceneReferredExport::ConsumeSlot(SRingSlot& slot)
++{
++	CDeviceTexture* pDevTex = CTexture::IsTextureExist(slot.pTex) ? slot.pTex->GetDevTexture() : nullptr;
++	if (!pDevTex)
++	{
++		slot.bIssued = false;
++		return false;
++	}
++
++	// Never block. A slot that is not ready simply comes back next frame; the ring is what makes
++	// that free rather than a dropped frame.
++	if (!pDevTex->AccessCurrStagingResource(0, false))
++	{
++		if ((gEnv->pTimer->GetAsyncCurTime() - slot.fIssueTime) > 5.0f)
++		{
++			slot.bIssued = false;
++			Stop("a staging download did not signal in 5 s");
++		}
++		return false;
++	}
++
++	const int width = m_width;
++	const int height = m_height;
++
++	SSceneReferredExportJob* pJob = new SSceneReferredExportJob();
++	pJob->width = width;
++	pJob->height = height;
++	pJob->path = slot.path;
++	pJob->pixels.resize((size_t)width * (size_t)height * 4);
++
++	// The mapped rows are PITCHED, not packed. Assuming width * 8 bytes here is what produces a
++	// sheared image and an hour of confusion.
++	const auto copyOut = [width, height, pJob](void* pData, uint32 rowPitch, uint32 slicePitch) -> bool
++	{
++		const uint8* pRow = static_cast<const uint8*>(pData);
++		CryHalf* pDst = pJob->pixels.data();
++		const size_t rowBytes = (size_t)width * 4 * sizeof(CryHalf);
++		for (int y = 0; y < height; ++y, pRow += rowPitch, pDst += (size_t)width * 4)
++			memcpy(pDst, pRow, rowBytes);
++		return true;
++	};
++
++	pDevTex->AccessCurrStagingResource(0, false, copyOut);
++	slot.bIssued = false;
++
++	// Everything the file will say about itself, decided here on the render thread while the
++	// camera state that produced these pixels is still the current one.
++	const bool bAces2065 = (m_encoding == eSceneReferredExportEncoding_ACES2065);
++	pJob->desc.compression = (EExrCompression)clamp_tpl(CRenderer::CV_r_SceneReferredExportCompression, 0, 4);
++	pJob->desc.bWriteAlpha = false;
++	pJob->desc.bChromaticities = true;
++	memcpy(pJob->desc.chromaticities, bAces2065 ? kChromaticitiesAP0 : kChromaticitiesAP1, sizeof(pJob->desc.chromaticities));
++	// The container flag is a claim of ST 2065-4 conformance, which is a claim about AP0 data. It
++	// goes on the AP0 file and never on the AP1 one.
++	pJob->desc.bAcesImageContainerFlag = bAces2065;
++	pJob->desc.bColorMatrix = bAces2065;
++	if (bAces2065)
++		memcpy(pJob->desc.colorMatrix, kAP1ToAP0, sizeof(pJob->desc.colorMatrix));
++
++	const SSceneReferredExportMetadata& md = slot.metadata;
++	const bool bGraded = (m_tap == eSceneReferredExportTap_Graded);
++
++	std::vector<SExrAttribute>& a = pJob->attributes;
++	a.push_back(SExrAttribute::String("owner", "ReC Sandbox"));
++	// A T1 file and a T2 file look similar and mean completely different things. Anything reading
++	// these has to be able to tell them apart without asking a human.
++	a.push_back(SExrAttribute::String("rec/exportTap", bGraded ? "pre-ODT" : "HDRTarget"));
++	a.push_back(SExrAttribute::String("rec/workingSpace", bAces2065 ? "ACES2065-1" : "ACEScg"));
++	a.push_back(SExrAttribute::String("rec/specVersion", "SceneReferredSpec S6"));
++	a.push_back(SExrAttribute::Int("rec/schemaVersion", 1));
++	a.push_back(SExrAttribute::Int("rec/frameIndex", md.frameIndex));
++	a.push_back(SExrAttribute::Int("rec/renderFrameId", md.renderFrameId));
++	a.push_back(SExrAttribute::Float("rec/engineTime", md.engineTime));
++	if (md.fps > 0.0f)
++		a.push_back(SExrAttribute::Float("rec/fps", md.fps));
++	a.push_back(SExrAttribute::Float("rec/exposureScale", md.exposureScale));
++	a.push_back(SExrAttribute::Float("rec/whiteBalance_K", md.whiteBalanceK));
++	a.push_back(SExrAttribute::Float("rec/whiteBalance_tint", md.whiteBalanceTint));
++	if (!md.odtName.empty())
++		a.push_back(SExrAttribute::String("rec/odt", md.odtName));
++	if (!md.lmtName.empty())
++		a.push_back(SExrAttribute::String("rec/lmt", md.lmtName));
++	if (!md.cdl.empty())
++		a.push_back(SExrAttribute::String("rec/cdl", md.cdl));
++
++	TSceneReferredExportJob job(pJob);
++	job.SetPriorityLevel(JobManager::eLowPriority);
++	job.RegisterJobState(&slot.jobState);
++	job.Run();
++
++	return true;
++}
++
++void CSceneReferredExport::Shutdown()
++{
++	m_state = eState_Idle;
++	SetFixedStep(false);
++
++	for (int i = 0; i < kRingSize; ++i)
++	{
++		// Blocking is correct exactly here and nowhere else: the job manager and the textures are
++		// about to go away (DiffractionKernel.cpp:761 is the same ordering).
++		if (m_ring[i].jobState.IsRunning())
++			gEnv->GetJobManager()->WaitForJob(m_ring[i].jobState);
++		m_ring[i].bIssued = false;
++		m_ring[i].pTex.reset();
++	}
++
++	m_width = m_height = 0;
++	m_pOwner = nullptr;
++}
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/SceneReferredExport.h b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/SceneReferredExport.h
+new file mode 100644
+index 00000000..d27beefe
+--- /dev/null
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/SceneReferredExport.h
+@@ -0,0 +1,188 @@
++// Copyright 2026 ReC Sandbox. Scene-referred pipeline, stage S6 (SceneReferredSpec.md).
++
++#pragma once
++
++#include "Common/GraphicsPipeline.h"
++#include "Common/UtilityPasses.h"
++#include "Common/Textures/Image/ExrImage.h"
++
++#include <CryThreading/IJobManager.h>
++
++class CTexture;
++
++//! What the exported frame holds.
++enum ESceneReferredExportTap
++{
++	//! The graded, pre-ODT value, taken off SV_Target1 of HDRFinalPass: post white balance, post
++	//! CDL, post LMT, post bloom/shafts/vignette composite, and back in linear ACEScg. This is the
++	//! ACCEPTANCE instrument - the only tap for which "apply the same ODT elsewhere and compare"
++	//! is a test of the output transform rather than of every operator in front of it.
++	eSceneReferredExportTap_Graded = 0,
++
++	//! $HDRTarget as it enters the tone map: exposed, converted to ACEScg, ungraded, unvignetted,
++	//! un-composited. The camera NEGATIVE - what a cinematographer actually takes into a DI suite.
++	//! A different artefact from the graded tap, not a variant of it.
++	eSceneReferredExportTap_Negative = 1,
++};
++
++//! The colour the file claims to be.
++enum ESceneReferredExportEncoding
++{
++	//! ACES2065-1: AP0 primaries, ST 2065-4 container. The AP1 -> AP0 matrix runs on the CPU
++	//! during the de-interleave. Default, because an untagged EXR in an ACES project is ASSUMED to
++	//! be ACES2065-1 - the user does nothing and the file is read correctly.
++	eSceneReferredExportEncoding_ACES2065 = 0,
++
++	//! ACEScg: AP1, the buffer byte for byte, `chromaticities` only and NEVER the container flag -
++	//! the flag is a conformance claim about AP0 data and would be a false one here.
++	eSceneReferredExportEncoding_ACEScg = 1,
++};
++
++//! Everything about one captured frame that is not its pixels. Sampled on the render thread at
++//! issue time and carried to the writer job with the pixels, because by the time the job runs the
++//! camera has moved on.
++struct SSceneReferredExportMetadata
++{
++	SSceneReferredExportMetadata()
++		: focalLength(0.0f), tStop(0.0f), iso(0.0f), shutterAngle(0.0f), shutterTime(0.0f)
++		, nd(0.0f), whiteBalanceK(0.0f), whiteBalanceTint(0.0f), ev100(0.0f), exposureScale(1.0f)
++		, frameIndex(0), renderFrameId(0), engineTime(0.0f), fps(0.0f)
++	{}
++
++	string cameraName;
++	string lensName;
++	string odtName;
++	string lmtName;
++	string cdl;
++
++	float  focalLength;
++	float  tStop;
++	float  iso;
++	float  shutterAngle;
++	float  shutterTime;
++	float  nd;
++	float  whiteBalanceK;
++	float  whiteBalanceTint;
++	float  ev100;
++	float  exposureScale;
++
++	int    frameIndex;
++	int    renderFrameId;
++	float  engineTime;
++	float  fps;
++};
++
++//! The capture. One at a time, global, and owned by whichever graphics pipeline's tone map runs
++//! first while it is armed - the editor runs more than one pipeline and a capture that hopped
++//! between them would silently interleave two views into one sequence.
++//!
++//! Deliberately NOT part of the stock capture path: `capture_frames`, `RT_ReadTexture`,
++//! `SCaptureFormatInfo` and `ICaptureFrameListener` are untouched, so the byte-identity harness
++//! that reads TGA out of exactly that code stays valid (research/s6-capture-path.md section 8).
++class CSceneReferredExport
++{
++public:
++	static CSceneReferredExport& Get();
++
++	//! Ring depth. Two would mostly work; three is what makes "frame N+1's copy is never waiting on
++	//! frame N's map" true at a frame rate that varies (SceneDepth.cpp uses a ring for the same
++	//! reason). The cost is one more full-res RGBA16F staging surface while armed, and nothing at
++	//! all while idle - the targets are created on arm and released on disarm.
++	static const int kRingSize = 3;
++
++	//! Arm a sequence. Returns false and logs if one is already running.
++	bool StartSequence(const char* szFolder, const char* szPrefix);
++	//! Arm exactly one frame.
++	bool RequestSingleFrame(const char* szFolder, const char* szPrefix);
++	//! Disarm. Drains the writer jobs and releases the ring. Safe when nothing is armed.
++	void Stop(const char* szReason);
++
++	bool IsArmed() const     { return m_state != eState_Idle; }
++	//! True only while a graded-tap capture is armed: the one condition under which HDRFinalPass
++	//! grows its second render target.
++	bool WantsGradedTap() const;
++
++	// ---- render thread, driven by CToneMappingStage ----
++
++	//! Consume anything the GPU has finished, then hand back the ring slot this frame should be
++	//! written into (nullptr when nothing is armed, the pipeline is not the owner, or the ring is
++	//! saturated). Creates the ring on first use.
++	CTexture* BeginFrame(CGraphicsPipeline& pipeline, int width, int height);
++
++	//! The copy is done (MRT write, or the negative's blit): issue the fence-carrying download.
++	void EndFrame();
++
++	//! Shut everything down - called when the pipeline that owns the capture goes away.
++	void Shutdown();
++
++private:
++	CSceneReferredExport();
++
++	enum EState
++	{
++		eState_Idle = 0,
++		eState_Sequence,
++		eState_SingleFrame,
++	};
++
++	struct SRingSlot
++	{
++		SRingSlot() : bIssued(false), fIssueTime(0.0f) {}
++
++		_smart_ptr<CTexture>         pTex;
++		bool                         bIssued;
++		float                        fIssueTime;
++		SSceneReferredExportMetadata metadata;
++		string                       path;
++
++		//! One writer job per ring slot, so the ring bounds the queue by construction. If a slot's
++		//! job is still running when the ring comes round to it, the disk is not keeping up and the
++		//! capture STOPS and says so - it never drops a frame, because a hole in a sequence is
++		//! invisible until someone tries to conform it.
++		JobManager::SJobState        jobState;
++	};
++
++	void ReleaseRing();
++	void ConsumeCompleted();
++	bool ConsumeSlot(SRingSlot& slot);
++	void GatherMetadata(SSceneReferredExportMetadata& out) const;
++	void SetFixedStep(bool bEnable);
++
++	EState                m_state;
++
++	//! Tap and encoding are LATCHED on arm, not read per frame. Changing either half way through a
++	//! sequence would leave a folder of files that look alike and mean different things, and the
++	//! only clue would be the attributes - which are written at readback time, one to two frames
++	//! after the pixels were produced.
++	int                   m_tap;
++	int                   m_encoding;
++
++	string                m_folder;
++	string                m_prefix;
++	int                   m_frameIndex;
++	int                   m_nextSlot;
++	int                   m_width;
++	int                   m_height;
++	const void*           m_pOwner;
++
++	SRingSlot             m_ring[kRingSize];
++
++	//! t_FixedStep and the lens-model jitter phase, saved on arm and put back on disarm. Nothing
++	//! else locks frame time outside the editor's CryMovie path, so a sequence captured in game
++	//! mode has no cadence at all unless the capture sets it itself.
++	bool                  m_bTimeStepOverridden;
++	float                 m_fSavedFixedStep;
++	int                   m_nSavedJitter;
++
++};
++
++//! The job payload. Owns its pixels; the job frees it.
++struct SSceneReferredExportJob
++{
++	std::vector<CryHalf>         pixels;      //!< interleaved RGBA, packed (already de-pitched)
++	int                          width = 0;
++	int                          height = 0;
++	string                       path;
++	SExrWriteDesc                desc;
++	std::vector<SExrAttribute>   attributes;
++};
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.cpp
+index a5bc1411..fb47f5d7 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.cpp
+@@ -7,6 +7,7 @@
+ #include "SunShafts.h"
+ #include "DepthOfField.h"
+ #include "D3DPostProcess.h"
++#include "SceneReferredExport.h"
+ 
+ #include <Common/RenderDisplayContext.h>
+ 
+@@ -218,6 +219,19 @@ void CToneMappingStage::Execute()
+ 	// replace with the camera's pre-exposure and nothing else has to move.
+ 	const bool bSceneReferred = CRendererResources::IsSceneReferred();
+ 
++	// S6's export tap. The exporter hands back a ring slot to write this frame into, or nullptr
++	// when nothing is armed - which is every frame in normal use, and the whole feature then costs
++	// one branch. Only the GRADED tap changes this pass: it is an extra SV_Target1 write under
++	// %_RT_SAMPLE2. The negative tap is a blit of $HDRTarget after the pass and needs no
++	// permutation at all.
++	CSceneReferredExport& exporter = CSceneReferredExport::Get();
++	CTexture* pExportTex = bSceneReferred
++		? exporter.BeginFrame(m_graphicsPipeline,
++		                      m_graphicsPipelineResources.m_pTexHDRTarget->GetWidth(),
++		                      m_graphicsPipelineResources.m_pTexHDRTarget->GetHeight())
++		: nullptr;
++	const bool bExportGraded = pExportTex && exporter.WantsGradedTap();
++
+ 	// The display chain's two LUTs. ccam parsed the .cube files and uploaded the 3D textures; all
+ 	// that arrives here is a texture ID, resolved the same way the colour grading stage resolves
+ 	// its identity chart. A size of 0 means the slot is empty - a legitimate answer for the look
+@@ -271,10 +285,11 @@ void CToneMappingStage::Execute()
+ 	// when the switch flips and the old permutation keeps running (r_HDRDebug occupies bits 9-12).
+ 	int featureMask = ((int)bSunShaftsEnabled << 1) | ((int)bColorGradingEnabled << 2) | ((int)bBloomEnabled << 3) |
+ 	                  ((CRenderer::CV_r_HDREyeAdaptationMode & 0xF) << 5) | ((CRenderer::CV_r_HDRDebug & 0xF) << 9) |
+-	                  ((int)bSceneReferred << 13);
++	                  ((int)bSceneReferred << 13) | ((int)bExportGraded << 14);
+ 
+ 	if (m_passToneMapping.IsDirty(featureMask, pSunShaftsTex->GetTextureID(), pColorChartTex->GetTextureID(), CRendererResources::s_ptexCurLumTexture->GetTextureID(),
+-	                              pLmtTex->GetTextureID(), pOdtTex->GetTextureID()))
++	                              pLmtTex->GetTextureID(), pOdtTex->GetTextureID(),
++	                              bExportGraded ? pExportTex->GetTextureID() : 0))
+ 	{
+ 		uint64 rtMask = 0;
+ 		if (bSceneReferred)
+@@ -311,11 +326,21 @@ void CToneMappingStage::Execute()
+ 			rtMask |= g_HWSR_MaskBit[HWSR_SAMPLE5];
+ 		if (bApplyDithering)
+ 			rtMask |= g_HWSR_MaskBit[HWSR_SAMPLE6];
++		// SAMPLE2 is the S6 export permutation - the bit S4 freed when it removed the dead
++		// vignette gate. With it clear the shader declares one output and this pass binds one
++		// render target, exactly as it did before S6 existed.
++		if (bExportGraded)
++			rtMask |= g_HWSR_MaskBit[HWSR_SAMPLE2];
+ 
+ 		// TODO: CPostEffectContext::GetDstBackBufferTexture() pre-EnableAltBackBuffer()
+ 		static CCryNameTSCRC techToneMapping("HDRFinalPass");
+ 		m_passToneMapping.SetTechnique(pShader, techToneMapping, rtMask);
+ 		m_passToneMapping.SetRenderTarget(0, m_graphicsPipelineResources.m_pTexDisplayTargetDst);
++		// Slot 1 is the pre-ODT value, bound ONLY while a graded capture is armed: both because
++		// MaxRendertargetCount is 4 and one of them is not free to spend permanently, and because
++		// an unbound SV_Target1 with the permutation still set is the silent failure the
++		// featureMask bit above exists to prevent.
++		m_passToneMapping.SetRenderTarget(1, bExportGraded ? pExportTex : nullptr);
+ 		m_passToneMapping.SetState(GS_NODEPTHTEST);
+ 		m_passToneMapping.SetFlags(CPrimitiveRenderPass::ePassFlags_RequireVrProjectionConstants);
+ 		m_passToneMapping.SetPrimitiveFlags(CRenderPrimitive::eFlags_ReflectShaderConstants);	// Enables reflection constants addition in the shader
+@@ -483,6 +508,17 @@ void CToneMappingStage::Execute()
+ 
+ 	m_passToneMapping.Execute();
+ 
++	if (pExportTex)
++	{
++		// The negative: $HDRTarget as it entered this pass. Nothing in the tone map writes it, so
++		// taking the copy after Execute() is the same frame - and doing it here keeps both taps in
++		// one place instead of scattering the capture across the stage.
++		if (!bExportGraded)
++			m_passExportNegativeCopy.Execute(m_graphicsPipelineResources.m_pTexHDRTarget, pExportTex);
++
++		exporter.EndFrame();
++	}
++
+ 	m_pColorChartTex = pColorChartTex; // Keep a ref count on color chart to make sure it is destroyed after m_passToneMapping
+ }
+ 
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.h b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.h
+index 1f20ea9c..8bf31282 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.h
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.h
+@@ -4,6 +4,7 @@
+ 
+ #include "Common/GraphicsPipelineStage.h"
+ #include "Common/FullscreenPass.h"
++#include "Common/UtilityPasses.h"
+ 
+ class CToneMappingStage : public CGraphicsPipelineStage
+ {
+@@ -13,7 +14,8 @@ public:
+ 	CToneMappingStage(CGraphicsPipeline& graphicsPipeline)
+ 		: CGraphicsPipelineStage(graphicsPipeline)
+ 		, m_passToneMapping(&graphicsPipeline)
+-		, m_passFixedExposureToneMapping(&graphicsPipeline) {}
++		, m_passFixedExposureToneMapping(&graphicsPipeline)
++		, m_passExportNegativeCopy(&graphicsPipeline) {}
+ 
+ 	void Execute();
+ 	void ExecuteDebug();
+@@ -33,4 +35,8 @@ private:
+ 	_smart_ptr<CTexture> m_pColorChartTex;
+ 	CFullscreenPass      m_passToneMapping;
+ 	CFullscreenPass      m_passFixedExposureToneMapping;
++
++	//! S6's negative tap: a straight blit of $HDRTarget into the export ring. The graded tap needs
++	//! no pass at all - it is a second render target on the tone map itself.
++	CStretchRectPass     m_passExportNegativeCopy;
+ };
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/core_renderer.waf_files b/Code/CryEngine/RenderDll/XRenderD3D9/core_renderer.waf_files
+index 09aada5d..f746166d 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/core_renderer.waf_files
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/core_renderer.waf_files
+@@ -442,6 +442,8 @@
+             "GraphicsPipeline/TiledShading.h", 
+             "GraphicsPipeline/TiledShading.cpp", 
+             "GraphicsPipeline/ToneMapping.h", 
++            "GraphicsPipeline/SceneReferredExport.h", 
++            "GraphicsPipeline/SceneReferredExport.cpp", 
+             "GraphicsPipeline/ToneMapping.cpp", 
+             "GraphicsPipeline/VolumetricClouds.h", 
+             "GraphicsPipeline/VolumetricClouds.cpp", 
+diff --git a/Engine/Shaders/HWScripts/CryFX/HDRPostProcess.cfx b/Engine/Shaders/HWScripts/CryFX/HDRPostProcess.cfx
+index 77f3aa50..ad0f33d1 100644
+--- a/Engine/Shaders/HWScripts/CryFX/HDRPostProcess.cfx
++++ b/Engine/Shaders/HWScripts/CryFX/HDRPostProcess.cfx
+@@ -854,8 +854,16 @@ float3 SampleLut3D(Texture3D lut, SamplerState ss, float3 c, float fGridSize)
+ 	return lut.SampleLevel(ss, saturate(c) * fScale + fBias, 0).rgb;
+ }
+ 
+-half3 FilmMapping( in vert2frag IN, in half3 cScene, in half3 cBloom, in half3 vAdaptedLum, in half fVignetting )
++half3 FilmMapping( in vert2frag IN, in half3 cScene, in half3 cBloom, in half3 vAdaptedLum, in half fVignetting, out half3 cExportTap )
+ {
++	// The EXR export tap (SceneReferredSpec.md section 2, S6). Zero on the stock path and on
++	// every frame that is not capturing - the caller only writes it to SV_Target1 under
++	// %_RT_SAMPLE2, so with the flag clear the whole thing is dead code and the compiler
++	// removes it. Declared as an out parameter rather than computed twice because the value
++	// wanted is a shader TEMPORARY: it exists between the LMT fetch and the ODT fetch and
++	// nowhere else.
++	cExportTap = (half3)0;
++
+ #if %_RT_SAMPLE0
+ 
+ 	// ------------------------------------------------------------------------------------
+@@ -903,6 +911,17 @@ half3 FilmMapping( in vert2frag IN, in half3 cScene, in half3 cBloom, in half3 v
+ 	if (SceneCDLOffset.w > 1.5)
+ 		cGrade = SampleLut3D(lmtTex, linearClamp3DSS, cGrade, SceneCDLOffset.w);
+ 
++	// --- EXPORT TAP -------------------------------------------------------------------------
++	// The graded value, back in LINEAR ACEScg. This is the spec's "the buffer here is what gets
++	// written to EXR": everything the camera does (WB, CDL, LMT, and the composites before them)
++	// has happened, and nothing that knows about a display has.
++	//
++	// The inverse shaper is NOT an operator being undone - the ACEScct encode belongs to the ODT
++	// LUT's input domain, not to the grade. An EXR of the log value would be a file no ACES tool
++	// could interpret without being told about our private shaper, and the D12 round trip
++	// (Resolve applies its own ACES 2.0 output transform to this file) needs scene-linear.
++	cExportTap = (half3)ACEScctToLinear(cGrade);
++
+ 	// 5. The output transform (ODT), ACEScct in and DISPLAY-ENCODED [0,1] out. The back buffer
+ 	//    is R8G8B8A8_UNORM and is not sRGB-typed, so the encode has to be inside this LUT; the
+ 	//    engine's own sRGB curve at the end of the stock branch is what it replaces.
+@@ -966,9 +985,9 @@ half4 GetZTargetMS( float2 baseTC, int NumSamples, int nCurrSample )
+ ////////////////////////////////////////////////////////////////////////////////////////////////////////////
+ ////////////////////////////////////////////////////////////////////////////////////////////////////////////
+ 
+-half3 HDRToneMapSample( in vert2frag IN, in half3 vSample, in half3 cBloom, in half3 vAdaptedLum, in half fVignetting)
++half3 HDRToneMapSample( in vert2frag IN, in half3 vSample, in half3 cBloom, in half3 vAdaptedLum, in half fVignetting, out half3 cExportTap)
+ {
+-	vSample = FilmMapping(IN, vSample, cBloom, vAdaptedLum, fVignetting);
++	vSample = FilmMapping(IN, vSample, cBloom, vAdaptedLum, fVignetting, cExportTap);
+ 
+ 	return saturate(vSample);
+ }
+@@ -1019,8 +1038,21 @@ Texture2D sunShaftsTex     : register(t9); // WxH full or half res
+ 
+ SamplerState linearClampSS : register(s0);
+ 
+-pixout HDRFinalScenePS(vert2frag IN)
++// The MRT form of the tone map's output. Slot 1 exists only under %_RT_SAMPLE2 - the S6 export
++// permutation - so with the flag clear this is the stock single-target signature and the pass
++// binds nothing extra (research/s6-capture-path.md section 5, tap T2).
++struct pixoutHDRFinal
++{
++	half4 Color   : SV_Target0;
++#if %_RT_SAMPLE2
++	half4 Export  : SV_Target1;
++#endif
++};
++
++pixoutHDRFinal HDRFinalScenePS(vert2frag IN)
+ {
++	pixoutHDRFinal OUT = (pixoutHDRFinal)0;
++
+ 	float2 ScreenTC = MapViewportToRaster(IN.baseTCScaled.xy);
+ 
+ 	half  fVignetting = 1;
+@@ -1050,7 +1082,10 @@ pixout HDRFinalScenePS(vert2frag IN)
+ 		// DIAGNOSTIC (r_DepthOfFieldFieldDebug): the transmission itself as a grey ramp, so the
+ 		// mechanical falloff can be read off the frame instead of guessed at.
+ 		if (HDRVignetteParams.w > 0.5)
+-			return (pixout)half4((half3)fTransmission, 1.0f);
++		{
++			OUT.Color = half4((half3)fTransmission, 1.0f);
++			return OUT;
++		}
+ 	}
+ 
+ #if %_RT_SAMPLE3
+@@ -1075,7 +1110,15 @@ pixout HDRFinalScenePS(vert2frag IN)
+ 	vSample += sunShaftsTex.Sample(linearClampSS, ScreenTC.xy).rgb * SunShafts_SunCol.rgb;
+ #endif
+ 
+-	half3 oSample = HDRToneMapSample( IN, vSample, cBloom, vAdaptedLum, fVignetting);
++	half3 cExportTap;
++	half3 oSample = HDRToneMapSample( IN, vSample, cBloom, vAdaptedLum, fVignetting, cExportTap);
++
++	// The graded, pre-ODT, scene-linear value goes out on slot 1 while a graded-mode capture is
++	// armed. Alpha carries 1 so a reader that keeps four channels gets an opaque frame; the
++	// writer only takes RGB.
++#if %_RT_SAMPLE2
++	OUT.Export = half4(cExportTap, 1.0f);
++#endif
+ 
+ 	// Apply merged post processes
+ 	// The stock composite, untouched, and now only reachable off the scene-referred permutation.
+@@ -1091,7 +1134,8 @@ pixout HDRFinalScenePS(vert2frag IN)
+ 	ApplyRandomDithering(oSample, IN.WPos.xy);
+ #endif
+ 
+-	return (pixout)half4(oSample, 1.0f);
++	OUT.Color = half4(oSample, 1.0f);
++	return OUT;
+ }
+ 
+ pixout HDRFinalSceneDebugPS(vert2frag IN)
+-- 
+2.47.1.windows.1
+

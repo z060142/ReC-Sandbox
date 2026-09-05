@@ -1,0 +1,245 @@
+From 60e20283b88f9c3fe9eb300d5e9c2e8ec404fb1e Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Fri, 28 Aug 2026 22:15:26 +0800
+Subject: [PATCH 097/119] fix: ambient light entities were pre-exposed, and
+ r_HDRDebug 1 now says which contributors the exposure reaches
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Follow-up report from the first runtime test: with the switch on, the aperture
+moves sunlit surfaces and barely moves shadowed ones. Audited every contributor
+against the three delivery routes the pre-exposure has - the
+m_fAdaptedSceneScaleLBuffer sites, CSkyStage's own multiplies, and the per-view
+CV_SceneExposure the forward/emissive writers read. Full table in
+scene-notes/research/s8-exposure-coverage.md.
+
+One real bug, fixed here. TiledLightVolumes.cpp applied the latched scale to
+EVERY light list, ambient lights (list 1) included. In TiledShading.cfi an
+ambient light is not an emitter:
+
+    dirFactor = lightColor > 1 ? NdotL * lightOccl : saturate(PdotL);
+    lightTerm = lerp(1, lightColor, attenuation * filter * dirFactor);
+    diffuseAcc *= lightTerm;  specularAcc *= lightTerm;
+
+a MODULATOR over an accumulator that already carries the pre-exposure. Exposing
+its colour does two wrong things at once: it applies the exposure a second time
+inside the lerp, and it moves the `lightColor > 1` decision boundary, so at a
+daylight pre-exposure of 0.29 a brightening ambient of 1.5 arrives as 0.44 and
+silently flips to the darkening branch. FXConstantDefs.cfi's SCENE_BRDF_NORM_FACTOR
+comment had already reasoned this out and claimed ambient lights were guarded in
+TiledLightVolumes.cpp; they were not. List 1 now takes an intensity scale of
+exactly 1.0. Probes keep theirs - their cube is baked at unity, so the tint
+multiply exposes it exactly once. Off the switch the scale is 1.0 in both
+branches, so the stock picture is bit-identical.
+
+The likely shadow filler is NOT that, and is not fixed here because it is S8's:
+SVOGI. ApplyGI() in integration modes 1 and 2 REPLACES the pre-exposed probe
+diffuse (and in mode 2 the specular) with the GI buffers, and D3D_SVO.cpp carries
+no scene-referred code at all - so with GI on, every bit of indirect diffuse is
+exposure-invariant while the sun tracks the aperture, which is the symptom
+exactly. Global fog's inscatter is the second candidate, on the same footing.
+Both need a units decision (the voxel pool's RGBM 4.0 cap; where in the fog chain
+the multiply belongs), not a one-liner, and D13 says let them break visibly.
+
+So the frame says which is which. r_HDRDebug 1 gains two coverage lines computed
+from live switch and cvar state - what the pre-exposure reaches, what it does not
+and is currently ON, with the cvar to switch each off named inline. A cross means
+"still on the S8 list", not "broken". This exists because an exposure-invariant
+shadow filler looks like nothing at all in the picture: the aperture simply stops
+working in the dark half of the frame, and there is no other clue.
+
+Also corrected, no code: the checklist's C2 expectation. Lowering the camera's WB
+Kelvin under daylight correctly makes the picture COOLER - the number says what
+the camera is told the illuminant IS, so telling a daylight scene "the light is
+tungsten" makes it correct the other way. The acceptance is that clipped
+highlights stay neutral, not that the picture warms. SceneReferredSpec.md section
+8 item 3 and the §7 acceptance line, and docs/SceneReferredLook.md's symptom
+table, now say so; README already had it right.
+
+Co-Authored-By: Claude Opus <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01A72MFkdSczncE7au9UVnmu
+---
+ .../GraphicsPipeline/TiledLightVolumes.cpp    | 22 ++++++++++-
+ .../GraphicsPipeline/ToneMapping.cpp          | 38 +++++++++++++++++++
+ .../GraphicsPipeline/ToneMapping.h            |  1 +
+ .../CinematicCamera/SceneReferredSpec.md      | 10 ++++-
+ .../docs/SceneReferredCalibration.md          | 12 ++++++
+ .../CinematicCamera/docs/SceneReferredLook.md |  2 +-
+ 6 files changed, 81 insertions(+), 4 deletions(-)
+
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/TiledLightVolumes.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/TiledLightVolumes.cpp
+index a600edbc..219a3690 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/TiledLightVolumes.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/TiledLightVolumes.cpp
+@@ -821,7 +821,27 @@ void CTiledLightVolumesStage::GenerateLightList()
+ 			lightInfo.depthBoundsVS = Vec2(posVS.z - volumeSize, posVS.z + volumeSize) * invCameraFar;
+ 			lightShadeInfo.posRad = Vec4(pos.x, pos.y, pos.z, volumeSize);
+ 			lightShadeInfo.attenuationParams = Vec2(renderLight.m_fAttenuationBulbSize, renderLight.m_fAreaHeight * 0.5f);
+-			float intensityScale = rd->m_fAdaptedSceneScaleLBuffer;
++			// Ambient lights (list 1) are the one entry here whose colour is not a radiance.
++			// TiledShading.cfi's ambient branch does
++			//     lightTerm = lerp(1, lightColor, attenuation * filter * dirFactor);
++			//     diffuseAcc *= lightTerm;  specularAcc *= lightTerm;
++			// - a MODULATOR over an accumulator that already carries the pre-exposure - and it
++			// picks darkening vs brightening with `lightColor > 1`. Pre-exposing it therefore does
++			// two wrong things at once: it applies the exposure a second time inside the lerp, and
++			// it moves the 1.0 decision boundary, so at a daylight pre-exposure of 0.29 a
++			// brightening ambient of 1.5 arrives as 0.44 and silently flips to the darkening
++			// branch. FXConstantDefs.cfi's SCENE_BRDF_NORM_FACTOR comment already stated that
++			// ambient lights are excluded on exactly this ground - "multiplicative tints, not
++			// radiance" - and said they were guarded HERE. They were not. They are now.
++			//
++			// Off the scene-referred path m_fAdaptedSceneScaleLBuffer is 1.0 and this is a
++			// multiply by an exact 1.0 in both branches, so the stock picture is bit-identical.
++			//
++			// Probes (list 0) keep the scale: their cube map is baked at unity exposure
++			// (SHDF_CUBEMAPGEN forces it) and the tint multiply is what exposes the sample,
++			// exactly once - decisions/s1-probe-exposure.md.
++			const bool bAmbientLightList = (lightListIdx == 1);
++			float intensityScale = bAmbientLightList ? 1.0f : rd->m_fAdaptedSceneScaleLBuffer;
+ 			lightShadeInfo.color = Vec4(renderLight.m_Color.r * intensityScale,
+ 			                            renderLight.m_Color.g * intensityScale,
+ 			                            renderLight.m_Color.b * intensityScale,
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.cpp
+index 4388d4a3..b2404e8c 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.cpp
+@@ -702,6 +702,7 @@ void CToneMappingStage::DisplayDebugInfo()
+ 		IRenderAuxText::DrawText(Vec3(5, 75, 1), IRenderAuxText::ASize(1.0f), ColorF(1, 0, 1, 1), eDrawText_800x600 | eDrawText_2D, str);
+ 
+ 		DisplaySceneReferredMeterInfo(appliedEV);
++		DisplaySceneReferredCoverage();
+ 	}
+ 	else
+ 	{
+@@ -757,6 +758,43 @@ void CToneMappingStage::DisplaySceneReferredMeterInfo(float appliedEV)
+ 	IRenderAuxText::DrawText(Vec3(5, 135, 1), IRenderAuxText::ASize(1.0f), ColorF(1, 0, 1, 1), eDrawText_800x600 | eDrawText_2D, str);
+ }
+ 
++// WHICH contributors the pre-exposure actually reaches (SceneReferredSpec.md D3, S8).
++//
++// The exposure is applied on the LIGHT side, at the m_fAdaptedSceneScaleLBuffer sites, the sky
++// stage, and the per-view CV_SceneExposure that the forward and emissive writers multiply by. A
++// contributor that goes round all three - SVOGI's own light injection, the legacy fog's inscatter
++// colour - is exposure-INVARIANT, which does not look like a bug. It looks like the aperture
++// having no effect on the shadows, because the thing filling the shadows is the one thing not
++// following, and it is a symptom nothing in the picture explains.
++//
++// So the frame says so itself, computed from the live switch and cvar state rather than from a
++// comment that can go stale. A cross does not mean broken; it means "this one is still on the S8
++// list, and if the shadows do not respond, it is this".
++void CToneMappingStage::DisplaySceneReferredCoverage()
++{
++	const auto cvarOn = [](const char* szName) -> bool
++	{
++		ICVar* pVar = gEnv->pConsole ? gEnv->pConsole->GetCVar(szName) : nullptr;
++		return pVar != nullptr && pVar->GetIVal() != 0;
++	};
++
++	// Only what is actually contributing to THIS frame is listed: a line full of crosses for
++	// features that are switched off would send the reader chasing the wrong one.
++	const bool bSvo   = cvarOn("e_svoTI_Apply") && cvarOn("e_svoTI_Active");
++	const bool bFog   = cvarOn("e_Fog");
++	const bool bVFog  = cvarOn("e_VolumetricFog");
++
++	char str[256];
++	cry_sprintf(str, "  pre-exposure reaches: sun+lights YES  probes YES (tint; re-bake for PI)  sky YES  forward/emissive YES");
++	IRenderAuxText::DrawText(Vec3(5, 155, 1), IRenderAuxText::ASize(1.0f), ColorF(1, 0, 1, 1), eDrawText_800x600 | eDrawText_2D, str);
++
++	cry_sprintf(str, "  NOT reached (S8): SVOGI %s  global fog %s  volumetric fog sun/height %s   | ambient lights: n/a, they modulate",
++	            bSvo  ? "ON  <- shadow filler, try e_svoTI_Apply 0" : "off",
++	            bFog  ? "ON  <- try e_Fog 0"                        : "off",
++	            bVFog ? "ON"                                        : "off");
++	IRenderAuxText::DrawText(Vec3(5, 175, 1), IRenderAuxText::ASize(1.0f), ColorF(1, 0, 1, 1), eDrawText_800x600 | eDrawText_2D, str);
++}
++
+ // The skybox unit readout (SceneReferredSpec.md S2, decisions/s2-sky-scale.md).
+ //
+ // The decision note asks for the times-ten at Renderer.cpp:4007 to be PROVEN before it is
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.h b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.h
+index d9590cd4..717d1680 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.h
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.h
+@@ -28,6 +28,7 @@ public:
+ 	//! Renderer.cpp:4007 (SceneReferredSpec.md S2, decisions/s2-sky-scale.md).
+ 	void DisplaySkyboxUnitInfo();
+ 	void DisplaySceneReferredMeterInfo(float appliedEV);
++	void DisplaySceneReferredCoverage();
+ 
+ 	bool IsDebugInfoEnabled() const { return CRendererCVars::CV_r_HDRDebug == 1 && !RenderView()->IsRecursive(); }
+ 	bool IsDebugDrawEnabled() const { return CRendererCVars::CV_r_HDRDebug > 1 && !RenderView()->IsRecursive(); }
+diff --git a/Code/CryPlugins/CinematicCamera/SceneReferredSpec.md b/Code/CryPlugins/CinematicCamera/SceneReferredSpec.md
+index af057fde..7ce3c8b4 100644
+--- a/Code/CryPlugins/CinematicCamera/SceneReferredSpec.md
++++ b/Code/CryPlugins/CinematicCamera/SceneReferredSpec.md
+@@ -208,7 +208,8 @@ the Hable curve and the sRGB encode are being fed AP1 values as if they were Rec
+ - ccam: White Balance (Kelvin, tint), CDL (slope/offset/power/saturation), LMT `.cube` slot,
+   ODT selection; all in scene units, all live (per-frame LUT rebuild).
+ - `.cdl` import/export is a stretch goal here (cheap, high interchange value).
+-- Acceptance: WB 5600 K → 3200 K keeps clipped highlights neutral; saturation push does not hue
++- Acceptance: WB 5600 K → 3200 K keeps clipped highlights neutral (and, under daylight, cools the
++  picture - camera WB semantics, see §8 item 3); saturation push does not hue
+   shift; CDL values round-trip with Resolve.
+ - **Status: DONE (2026-08-28), except the `.cdl` stretch goal.** ccam grew "Grade" (bypass, ASC
+   CDL slope/offset/power, saturation), "Look" (LMT path) and "Output" (ODT path), and White
+@@ -304,7 +305,12 @@ sensor/film model; Program Monitor.
+ 1. ccam off → engine byte-identical to stock (RenderDoc/screenshot diff clean).
+ 2. Open the aperture 3 stops → clouds outside the window gain detail instead of staying white;
+    close 3 stops → shadows keep content.
+-3. WB 5600 K → 3200 K → highlights stay white, the picture warms as a whole; no global tint.
++3. WB 5600 K → 3200 K under DAYLIGHT → the picture goes **cooler**, and clipped highlights stay
++   neutral. That direction is the acceptance, not the warmth: these are CAMERA white-balance
++   semantics, the same as a stills camera's. The Kelvin number says what the camera is told the
++   illuminant IS, so telling a daylight scene "the light is tungsten" makes it correct the other
++   way and the picture reads blue. Warming a daylight shot means dialling the number UP. The real
++   test is that the highlights do not take a global tint.
+ 4. Push saturation hard → red lights stay red, blue sky stays blue; no yellow/orange or cyan drift.
+ 5. Sun glare / sun shafts follow aperture and ND continuously; nothing appears suddenly at one stop.
+ 6. Export EXR → Resolve with the same ODT → same picture as the engine.
+diff --git a/Code/CryPlugins/CinematicCamera/docs/SceneReferredCalibration.md b/Code/CryPlugins/CinematicCamera/docs/SceneReferredCalibration.md
+index a45d648e..541d47ba 100644
+--- a/Code/CryPlugins/CinematicCamera/docs/SceneReferredCalibration.md
++++ b/Code/CryPlugins/CinematicCamera/docs/SceneReferredCalibration.md
+@@ -19,6 +19,8 @@ Scene-referred EV: ...  (metered EV: ...)  pre-exposure x...
+ Skybox: authored N lux -> renderer N cd/m2 (implies N lux, ratio N.NNx)
+   meter raw R / exposure X = A (N lux) -> target EV T, applied EV E
+   meter ceiling C (14 stops over grey); stock adaptation bypassed (...)
++  pre-exposure reaches: sun+lights YES  probes YES  sky YES  forward/emissive YES
++  NOT reached (S8): SVOGI ...  global fog ...  volumetric fog sun/height ...
+ ```
+ 
+ * **Estimated Illuminance** is a whole-frame average read back from the engine's luminance-measure
+@@ -39,6 +41,16 @@ Skybox: authored N lux -> renderer N cd/m2 (implies N lux, ratio N.NNx)
+     Min/Max, or Auto Exposure Lock is on.
+   * `[SAMPLE REFUSED - holding]` means the measurement fell outside the plausibility window and
+     AUTO is holding its last EV rather than acting on it.
++* The two **coverage** lines say which contributors the pre-exposure actually reaches, computed
++  from the live switch and cvar state. A cross does not mean broken - it means "still on the S8
++  list". They exist for one symptom: *the aperture moves the sunlit surfaces and barely moves the
++  shadows*. That happens when the thing filling the shadows is the one thing not following the
++  exposure, and nothing in the picture explains it. SVOGI is the usual culprit (in integration
++  modes 1 and 2 it REPLACES the pre-exposed probe diffuse rather than adding to it), global fog is
++  the next. The A/B is two lines: `e_svoTI_Apply 0` and `e_Fog 0`; if the shadows start following
++  the aperture after either, that one is the filler. `e_VolumetricFog` requires a restart and
++  cannot be tested live. Ambient light ENTITIES are marked n/a on purpose: their colour modulates
++  an already-exposed accumulator, so exposing it would apply the exposure twice.
+ * **meter ceiling** is where the meter saturates, in pre-exposed units and in stops above mid
+   grey. A texel brighter than this reads as exactly this - an incident meter's dome saturates, and
+   so does this one. It is what stops a sun disc past fp16's range from being read as black; see
+diff --git a/Code/CryPlugins/CinematicCamera/docs/SceneReferredLook.md b/Code/CryPlugins/CinematicCamera/docs/SceneReferredLook.md
+index 524f6158..a1f8cddf 100644
+--- a/Code/CryPlugins/CinematicCamera/docs/SceneReferredLook.md
++++ b/Code/CryPlugins/CinematicCamera/docs/SceneReferredLook.md
+@@ -154,7 +154,7 @@ Resolve, and it is live - the picture moves as you drag.
+ 
+ | want | reach for |
+ | --- | --- |
+-| the shot is too warm / too cool | **White Balance -> Color Temperature** (and **Tint** for green/magenta) |
++| the shot is too warm / too cool | **White Balance -> Color Temperature** (and **Tint** for green/magenta). Camera semantics: the number is what the camera is told the illuminant IS, so a shot reads *cooler* as you dial the Kelvin DOWN and warmer as you dial it up - the opposite of a "colour temperature" slider on a finished image. What the transform guarantees is that clipped highlights stay neutral either way. |
+ | lift the shadows | **Offset**, a small positive number |
+ | more contrast in the mids | **Power** above 1 (or **Slope** above 1 for the highlight end) |
+ | a colour cast to remove | **Offset**, per channel |
+-- 
+2.47.1.windows.1
+

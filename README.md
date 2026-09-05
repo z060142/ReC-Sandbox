@@ -17,6 +17,25 @@ What exists today, both still being refined:
   ARCore pose moves the camera as a handheld 6DoF rig, and on-screen faders drive focus, zoom
   and aperture.
 
+## Branch `scene-referred` (experimental preview)
+
+This branch carries the scene-referred rendering path: with the camera's **Scene Referred**
+switch on, lighting is pre-exposed from the camera's own exposure (T-stop, shutter, ISO, ND,
+or the camera's AUTO metering), the post chain works in ACEScg (AP1) fp16 without clamps, white
+balance / ASC CDL / a Look LUT are applied in scene units, and the picture reaches the screen
+through an ACES 2.0 output transform baked by OpenColorIO. The same pre-display buffer can be
+written to OpenEXR (ACES2065-1 container) for grading in DaVinci Resolve or Nuke. With the
+switch off the engine renders exactly as stock.
+
+Status: works, under active testing on real scenes; D3D11 only; stock content needs re-lighting
+in physical units (see `docs/SceneReferredContent.md`). Besides the plugin and the renderer it
+touches `Cry3DEngine` (time-of-day light units, procedural sky), `CryEntitySystem` and
+`CryDefaultEntities` (environment-probe bake convention), so build and deploy those too.
+User docs: `docs/SceneReferredContent.md` (light units, physical preset, probes, HDRI import),
+`SceneReferredCalibration.md`, `SceneReferredLook.md` (LUTs, grading), `SceneReferredExport.md`
+(EXR capture and the Resolve round trip). The baked ACES 2.0 LUTs live under
+`engine/Code/CryPlugins/CinematicCamera/Assets/ODT/`; `tools/ocio-bake/` regenerates them.
+
 ## Layout
 
 | Path | What it is |
@@ -24,7 +43,7 @@ What exists today, both still being refined:
 | `engine/` | The modified and added CRYENGINE files, in engine tree layout: the two plugins under `Code/CryPlugins/`, the renderer changes under `Code/CryEngine/RenderDll/`, and the shaders under `Engine/Shaders/`. `DELETED_FILES.txt` lists files removed from the stock tree. |
 | `patches/` | The same changes as a numbered patch series (one patch per step) and `full.patch`, one cumulative diff against pristine 5.7.1. |
 | `docs/` | User documentation: the two plugin READMEs (parameters, workflow) and the console reference (commands and cvars). |
-| `tools/` | RenderDoc Python scripts used to measure the GPU cost of the added passes. |
+| `tools/` | RenderDoc Python scripts used to measure the GPU cost of the added passes; `ocio-bake/` (ACES 2.0 LUT baking), `exr-check/` (EXR vs screenshot comparison), `bitcompare.py` (byte-identity check). |
 | `MANIFEST.md` | Which revision this snapshot corresponds to and the list of changed files. |
 | `LICENSE.md` | License terms (see below). |
 

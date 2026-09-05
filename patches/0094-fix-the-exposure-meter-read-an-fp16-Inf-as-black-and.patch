@@ -1,0 +1,431 @@
+From e45ddaf1e5fa88dc7ff2077eb676bc2c7204f3a6 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Fri, 28 Aug 2026 22:03:25 +0800
+Subject: [PATCH 094/119] fix: the exposure meter read an fp16 Inf as black,
+ and AUTO ratcheted itself into the sun
+
+The first runtime test reported AUTO exposure "stacking infinitely and then
+exploding" whenever the sun came into view. The S1 research had flagged the
+pre-exposure bookkeeping as the thing that turns a meter into an oscillator, so
+that was audited first and came back clean, all four ways
+(scene-notes/research/s8-auto-exposure-runaway.md section 1):
+
+  - the frame-of-origin exposure IS the one used - one download in flight at a
+    time, recorded at issue, consumed at read;
+  - the direction is right - a brighter meter raises EV and LOWERS the scale;
+  - the smoothing is in EV space and the snap-on-cut is armed only by Activate()
+    and ENTITY_EVENT_RESET, never per frame;
+  - the stock adaptation is not steering anything in parallel - the tone map's
+    exposure is pinned to unity by a constant, and pass 3 survives only because
+    SSR and the film grain bind its textures. There is one loop, not two.
+
+The sign error is in the NaN filter. HDRSampleLumInitialPS answers a non-finite
+texel with 0, which is right when a non-finite texel is a bug. Under the switch
+it is not a bug: the HDR target holds PRE-EXPOSED scene radiance, and a sun disc
+at ~1.6e5 engine units sits within one stop of fp16's 65504 at a daylight
+exposure. One stop over and those texels are legitimately +Inf. Answered with 0
+in a LOG mean, each one contributes log(1e-6) = -13.8 nats; a few hundred sun
+pixels drag the geometric-mean illuminance to ~1e-6, the camera meters EV -18.5,
+clamps to Auto EV Min, and publishes a pre-exposure five orders of magnitude too
+large - which pushes MORE of the frame past fp16, which zeroes more taps. One
+ratchet per readback, ending pinned at the EV floor with the frame blown white.
+That is the reported "infinite accumulation then explosion" exactly, and 1e-6 is
+a perfectly finite, perfectly positive, perfectly wrong number that the existing
+NumberValid guard had no reason to refuse.
+
+Fix (decisions/s8-meter-saturation.md, approach A of three): the meter saturates
+instead of zeroing. SCENE_METER_CEILING - 0.18 * 2^14, i.e. fourteen stops above
+mid grey - is published per view in CV_SceneExposure.w, and a tap above it, Inf
+included, reads as exactly it. An incident meter's dome saturates for the same
+reason: past that point a texel is a specular or solar highlight and says nothing
+about how much light falls ON the scene. Read as very bright it pushes EV UP,
+which is negative feedback and converges. The ceiling is exposure-relative by
+construction because 0.18 is the anchor the pre-exposure guarantees, so it never
+needs re-tuning; and it bounds the meter's own fp16 arithmetic (2949 luminance,
+51473 illuminance, both inside 65504), which closes a second, quieter overflow in
+the R16G16F meter target. .w is NOT stored minus one - 0 is the meaningful "off",
+so an unbound buffer and the stock path both land on the stock filter and the
+branch folds away.
+
+Second line of defence, in the readback: an absolute plausibility window on the
+divided-out illuminance (1e-9 .. 1e4 engine units, i.e. far under a moonless
+night and far over the sun). Outside it, AUTO holds its last EV instead of acting.
+Deliberately does not catch a value that merely clipped.
+
+Diagnosability, because this cost a runtime test to find: r_HDRDebug 1 gains two
+lines laying the whole loop out - raw meter reading, the pre-exposure it is
+divided by, the absolute illuminance that comes out, the target EV that implies,
+the applied EV, whether the sample was refused, and the ceiling in force. The
+existing "metered EV" on the line above was also wrong: it was computed from the
+meter texture, which is still EXPOSED, so the gap it printed was the applied
+exposure rather than the exposure error. It now reads the absolute value the
+camera is actually fed.
+
+docs/SceneReferredCalibration.md section 0 and docs/ConsoleReference.md document
+how to read the new lines.
+
+Co-Authored-By: Claude Opus <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01A72MFkdSczncE7au9UVnmu
+---
+ Code/CryEngine/RenderDll/Common/Renderer.h    | 11 ++++
+ .../RenderDll/Common/RendererResources.cpp    | 13 +++++
+ .../RenderDll/Common/RendererResources.h      | 11 ++++
+ .../GraphicsPipeline/AutoExposure.cpp         | 21 +++++++-
+ .../Common/GraphicsPipeline.cpp               |  7 ++-
+ .../GraphicsPipeline/ToneMapping.cpp          | 52 ++++++++++++++++++-
+ .../GraphicsPipeline/ToneMapping.h            |  1 +
+ .../CinematicCamera/docs/ConsoleReference.md  |  6 ++-
+ .../docs/SceneReferredCalibration.md          | 21 +++++++-
+ .../HWScripts/CryFX/FXConstantDefs.cfi        | 17 +++++-
+ .../HWScripts/CryFX/HDRPostProcess.cfx        | 28 +++++++++-
+ 11 files changed, 177 insertions(+), 11 deletions(-)
+
+diff --git a/Code/CryEngine/RenderDll/Common/Renderer.h b/Code/CryEngine/RenderDll/Common/Renderer.h
+index 3bc6eaab..f1c7b9b6 100644
+--- a/Code/CryEngine/RenderDll/Common/Renderer.h
++++ b/Code/CryEngine/RenderDll/Common/Renderer.h
+@@ -1540,6 +1540,17 @@ public:
+ 	//! 0 means "no measurement", which is what the camera treats as "hold the last EV".
+ 	float     m_fSceneReferredMeteredIlluminance = 0.0f;
+ 
++	//! The same measurement before the division, and the pre-exposure it was divided BY. Nothing
++	//! reads these but the r_HDRDebug 1 overlay: without them a runaway AUTO loop cannot be told
++	//! apart from a runaway SCENE, because the only number the camera ever sees is the quotient.
++	//! Written beside the value above, on the render thread, from the frame that produced it.
++	float     m_fSceneReferredMeterRaw = 0.0f;
++	float     m_fSceneReferredMeterExposure = 1.0f;
++	//! Set when the sample was refused (non-finite, non-positive, or outside the plausibility
++	//! window) so the overlay can say "holding" instead of printing a stale number as if it were
++	//! live.
++	bool      m_bSceneReferredMeterRejected = false;
++
+ 	enum { nMeshPoolMaxTimeoutCounter = 150 /*150 ms*/};
+ 	int m_nMeshPoolTimeoutCounter;
+ 
+diff --git a/Code/CryEngine/RenderDll/Common/RendererResources.cpp b/Code/CryEngine/RenderDll/Common/RendererResources.cpp
+index d62ffc7c..b17e4ead 100644
+--- a/Code/CryEngine/RenderDll/Common/RendererResources.cpp
++++ b/Code/CryEngine/RenderDll/Common/RendererResources.cpp
+@@ -497,6 +497,19 @@ bool CRendererResources::IsSceneReferredStage(int nStage)
+ 
+ const float CRendererResources::kSceneReferredMidGrey = 0.18f;
+ 
++const float CRendererResources::kSceneReferredMeterCeilingStops = 14.0f;
++
++float CRendererResources::GetSceneReferredMeterCeiling()
++{
++	// Gated on stage 2, the exposure stage: the ceiling only means anything once the pre-exposure
++	// is what put absolute scene radiance in the HDR target. Zero off it, which is what the
++	// shader reads as "stock NaN filter, unchanged".
++	if (!IsSceneReferredStage(2))
++		return 0.0f;
++
++	return kSceneReferredMidGrey * powf(2.0f, kSceneReferredMeterCeilingStops);
++}
++
+ // D11's one line of arithmetic, in one place, so that seven effects cannot each grow their own
+ // slightly different idea of what a threshold means. The apply sites call this and store the
+ // result; nothing downstream - no shader, no constant layout, no serialised default - knows the
+diff --git a/Code/CryEngine/RenderDll/Common/RendererResources.h b/Code/CryEngine/RenderDll/Common/RendererResources.h
+index 9381c45b..4f450713 100644
+--- a/Code/CryEngine/RenderDll/Common/RendererResources.h
++++ b/Code/CryEngine/RenderDll/Common/RendererResources.h
+@@ -195,6 +195,17 @@ public:
+ 	//! grey" a meaning the renderer can act on rather than a figure of speech.
+ 	static const float kSceneReferredMidGrey;
+ 
++	//! The exposure meter's saturation point, in stops above mid grey, and the pre-exposed
++	//! luminance that works out to. A real incident meter's dome saturates; so does this one, and
++	//! for the same reason - past about fourteen stops over the exposure anchor a texel is a
++	//! specular or solar highlight whose exact value says nothing about how much light is falling
++	//! on the scene. It is also what keeps the meter's own fp16 arithmetic finite: 0.18*2^14 is
++	//! 2949 and the illuminance estimate derived from it is 51473, both comfortably inside the
++	//! 65504 that R16G16F and the pre-exposed HDR target can hold.
++	//! Only ever consulted on the scene-referred path; 0 is published off it.
++	static const float kSceneReferredMeterCeilingStops;
++	static float       GetSceneReferredMeterCeiling();
++
+ 	//! A highlight-extraction threshold, in whatever unit is in force this frame
+ 	//! (SceneReferredSpec.md D11, Stage S7).
+ 	//!
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/AutoExposure.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/AutoExposure.cpp
+index 79c7e980..e72eb60f 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/AutoExposure.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/AutoExposure.cpp
+@@ -218,6 +218,9 @@ void CAutoExposureStage::UpdateSceneReferredMeterReadback()
+ 		m_bMeterReadbackIssued = false;
+ 		m_bMeterReadbackStalled = false;
+ 		pRenderer->m_fSceneReferredMeteredIlluminance = 0.0f;
++		pRenderer->m_fSceneReferredMeterRaw = 0.0f;
++		pRenderer->m_fSceneReferredMeterExposure = 1.0f;
++		pRenderer->m_bSceneReferredMeterRejected = false;
+ 		return;
+ 	}
+ 
+@@ -261,8 +264,22 @@ void CAutoExposureStage::UpdateSceneReferredMeterReadback()
+ 		// reject anything the measure pass could not produce a sane number for (its own isfinite
+ 		// filter covers NaNs in the source, not a zero illuminance in a black frame).
+ 		const float fExposureAtCapture = max(m_fMeterIssuedExposure, 1e-12f);
+-		pRenderer->m_fSceneReferredMeteredIlluminance =
+-			(fIlluminance > 0.0f && NumberValid(fIlluminance)) ? (fIlluminance / fExposureAtCapture) : 0.0f;
++		const float fAbsolute = fIlluminance / fExposureAtCapture;
++
++		// The plausibility window, in ABSOLUTE engine units (1.0 = 10 000 lux here, the same
++		// LIGHT_UNIT_SCALE the luminance side uses). The lower bound is well below a moonless
++		// overcast night (~1e-3 lux = 1e-7) and the upper bound well above the sun's own
++		// illuminance at zenith (~120 000 lux = 12); anything outside is not a scene, it is the
++		// meter having lost its footing, and the right answer is to HOLD the last EV rather than
++		// to feed the camera a number that will drive it to a limit. This is the last line of
++		// defence behind the shader's ceiling, not a substitute for it: a value that merely
++		// clipped would still be inside the window and would still be acted on, correctly.
++		const bool bSane = NumberValid(fAbsolute) && fAbsolute > 1e-9f && fAbsolute < 1e4f;
++
++		pRenderer->m_fSceneReferredMeteredIlluminance = bSane ? fAbsolute : 0.0f;
++		pRenderer->m_fSceneReferredMeterRaw = fIlluminance;
++		pRenderer->m_fSceneReferredMeterExposure = fExposureAtCapture;
++		pRenderer->m_bSceneReferredMeterRejected = !bSane;
+ 	}
+ 
+ 	if (!m_bMeterReadbackIssued)
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Common/GraphicsPipeline.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Common/GraphicsPipeline.cpp
+index 0bcbaaaf..aee529b4 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Common/GraphicsPipeline.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Common/GraphicsPipeline.cpp
+@@ -1238,7 +1238,12 @@ void CGraphicsPipeline::GeneratePerViewConstantBuffer(const SRenderViewInfo* pVi
+ 		{
+ 			const float sceneExposure = gcpRendD3D.GetSceneReferredExposure();
+ 			const float brdfFactor = gcpRendD3D.GetSceneReferredBRDFFactor();
+-			cb.CV_SceneExposure = Vec4(sceneExposure - 1.0f, (1.0f / sceneExposure) - 1.0f, brdfFactor - 1.0f, 0.0f);
++			// .w is the exposure meter's saturation luminance (SCENE_METER_CEILING). NOT offset
++			// by one: 0 is the meaningful "stock" value here, which is what an unbound buffer
++			// reads and what the stock path publishes, so the branch in HDRSampleLumInitialPS
++			// folds away off the switch.
++			const float meterCeiling = CRendererResources::GetSceneReferredMeterCeiling();
++			cb.CV_SceneExposure = Vec4(sceneExposure - 1.0f, (1.0f / sceneExposure) - 1.0f, brdfFactor - 1.0f, meterCeiling);
+ 		}
+ 
+ 		// The luminance weights of the space the HDR target is in this frame (SceneReferredSpec.md
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.cpp
+index bcda8096..4388d4a3 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.cpp
+@@ -688,10 +688,20 @@ void CToneMappingStage::DisplayDebugInfo()
+ 		// 0.18), so the gap between the two IS the exposure error - which is what AUTO drives to 0.
+ 		const float scale = gcpRendD3D->GetSceneReferredExposure();
+ 		const float appliedEV = logf(RENDERER_LIGHT_UNIT_SCALE / (1.2f * max(scale, 1e-12f))) / logf(2.0f);
+-		const float meteredEV = logf(max(fIlluminance, 1e-12f) * RENDERER_LIGHT_UNIT_SCALE * 100.0f / (120.0f * gf_PI)) / logf(2.0f);
++
++		// The metered EV has to be computed from the ABSOLUTE illuminance the AUTO loop is
++		// actually fed - m_fSceneReferredMeteredIlluminance, with the pre-exposure of the sampled
++		// frame already divided out - and NOT from fIlluminance, which is what the meter texture
++		// holds and is therefore still exposed. Printing the exposed one made the gap between
++		// "metered" and "applied" read as an exposure error of exactly the applied exposure,
++		// which is the one thing this overlay exists to rule out.
++		const float absoluteIllum = gcpRendD3D->m_fSceneReferredMeteredIlluminance;
++		const float meteredEV = logf(max(absoluteIllum, 1e-12f) * RENDERER_LIGHT_UNIT_SCALE * 100.0f / (120.0f * gf_PI)) / logf(2.0f);
+ 
+ 		sprintf(str, "Scene-referred EV: %.2f  (metered EV: %.2f)  pre-exposure x%.4g", appliedEV, meteredEV, scale);
+ 		IRenderAuxText::DrawText(Vec3(5, 75, 1), IRenderAuxText::ASize(1.0f), ColorF(1, 0, 1, 1), eDrawText_800x600 | eDrawText_2D, str);
++
++		DisplaySceneReferredMeterInfo(appliedEV);
+ 	}
+ 	else
+ 	{
+@@ -707,6 +717,46 @@ void CToneMappingStage::DisplayDebugInfo()
+ 	DisplaySkyboxUnitInfo();
+ }
+ 
++// The AUTO exposure loop, laid out end to end (SceneReferredSpec.md D2/D7).
++//
++// The loop is a feed-FORWARD chain, not a feedback one: the meter samples a pre-exposed frame,
++// the stage divides out the exposure that was in force for THAT frame, and the camera converts an
++// absolute illuminance into an EV. Every one of those four numbers has to be visible, because a
++// runaway can start at any of them and they are indistinguishable from the picture:
++//
++//   raw          the meter texture as it came back - PRE-EXPOSED engine units. Collapsing to
++//                ~1e-6 here is the signature of taps being read as black (the fp16 Inf case the
++//                measure pass's ceiling now prevents).
++//   /exposure    the pre-exposure recorded when THAT download was issued. If this does not track
++//                the applied scale one frame behind, the bookkeeping is wrong and the loop will
++//                oscillate or ratchet.
++//   = absolute   what the camera is actually fed. It should barely move when the aperture does;
++//                if it moves WITH the exposure, the division is not working.
++//   target EV    what that absolute illuminance asks for, at C = 120*pi.
++//   applied EV   what the camera settled on: the smoothed EV plus the mode's bias, after the
++//                Auto EV Min/Max clamp. target and applied converging is the loop working;
++//                applied pinned at a limit while target sits far away is the loop having lost.
++void CToneMappingStage::DisplaySceneReferredMeterInfo(float appliedEV)
++{
++	const float raw = gcpRendD3D->m_fSceneReferredMeterRaw;
++	const float exposureAtCapture = gcpRendD3D->m_fSceneReferredMeterExposure;
++	const float absolute = gcpRendD3D->m_fSceneReferredMeteredIlluminance;
++	const float targetEV = (absolute > 0.0f)
++	                       ? logf(absolute * RENDERER_LIGHT_UNIT_SCALE * 100.0f / (120.0f * gf_PI)) / logf(2.0f)
++	                       : 0.0f;
++
++	char str[256];
++	sprintf(str, "  meter raw %.4g / exposure %.4g = %.4g (%.0f lux) -> target EV %.2f, applied EV %.2f%s",
++	        raw, exposureAtCapture, absolute, absolute * RENDERER_LIGHT_UNIT_SCALE,
++	        targetEV, appliedEV,
++	        gcpRendD3D->m_bSceneReferredMeterRejected ? "  [SAMPLE REFUSED - holding]" : "");
++	IRenderAuxText::DrawText(Vec3(5, 115, 1), IRenderAuxText::ASize(1.0f), ColorF(1, 0, 1, 1), eDrawText_800x600 | eDrawText_2D, str);
++
++	sprintf(str, "  meter ceiling %.4g (%.0f stops over grey); stock adaptation bypassed (tone map exposure pinned to unity)",
++	        CRendererResources::GetSceneReferredMeterCeiling(), CRendererResources::kSceneReferredMeterCeilingStops);
++	IRenderAuxText::DrawText(Vec3(5, 135, 1), IRenderAuxText::ASize(1.0f), ColorF(1, 0, 1, 1), eDrawText_800x600 | eDrawText_2D, str);
++}
++
+ // The skybox unit readout (SceneReferredSpec.md S2, decisions/s2-sky-scale.md).
+ //
+ // The decision note asks for the times-ten at Renderer.cpp:4007 to be PROVEN before it is
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.h b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.h
+index 8bf31282..d9590cd4 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.h
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.h
+@@ -27,6 +27,7 @@ public:
+ 	//! uses it, and the illuminance that implies. The empirical check for the times-ten at
+ 	//! Renderer.cpp:4007 (SceneReferredSpec.md S2, decisions/s2-sky-scale.md).
+ 	void DisplaySkyboxUnitInfo();
++	void DisplaySceneReferredMeterInfo(float appliedEV);
+ 
+ 	bool IsDebugInfoEnabled() const { return CRendererCVars::CV_r_HDRDebug == 1 && !RenderView()->IsRecursive(); }
+ 	bool IsDebugDrawEnabled() const { return CRendererCVars::CV_r_HDRDebug > 1 && !RenderView()->IsRecursive(); }
+diff --git a/Code/CryPlugins/CinematicCamera/docs/ConsoleReference.md b/Code/CryPlugins/CinematicCamera/docs/ConsoleReference.md
+index cbdff69a..f74cf3e7 100644
+--- a/Code/CryPlugins/CinematicCamera/docs/ConsoleReference.md
++++ b/Code/CryPlugins/CinematicCamera/docs/ConsoleReference.md
+@@ -184,7 +184,11 @@ Two existing cvars change what they mean while the switch is on:
+ - **`r_HDRDebug 1`** prints a scene-referred line instead of the measured-EV line - the EV100 the
+   camera actually applied, the EV the meter read (ISO 2720 incident form, C = 120*pi), and the raw
+   pre-exposure scale. The gap between the two EVs is the exposure error, which is what the
+-  camera's AUTO mode drives to zero.
++  camera's AUTO mode drives to zero. Two further lines lay the AUTO loop out end to end - the raw
++  meter reading, the pre-exposure it is divided by, the absolute illuminance that comes out, the
++  target EV that implies and the EV the camera settled on, plus the meter's saturation ceiling.
++  That is the line to screenshot if AUTO ever misbehaves; `docs/SceneReferredCalibration.md`
++  section 0 says how to read it.
+   It also gains a **skybox unit line** on both paths: the authored "Skybox / Intensity (lux)", the
+   emittance the renderer is actually using in cd/m2, and the illuminance that implies
+   (`E = pi * L`). With correct units the ratio reads `1.00x`; on the stock path a textured skybox
+diff --git a/Code/CryPlugins/CinematicCamera/docs/SceneReferredCalibration.md b/Code/CryPlugins/CinematicCamera/docs/SceneReferredCalibration.md
+index a4634f63..a45d648e 100644
+--- a/Code/CryPlugins/CinematicCamera/docs/SceneReferredCalibration.md
++++ b/Code/CryPlugins/CinematicCamera/docs/SceneReferredCalibration.md
+@@ -10,13 +10,15 @@ or into a `.env` preset.
+ 
+ ## 0. The instrument
+ 
+-`r_HDRDebug 1` draws four lines in the top-left corner:
++`r_HDRDebug 1` draws six lines in the top-left corner:
+ 
+ ```
+ Average Luminance (cd/m2): ...
+ Estimated Illuminance (lux): ...
+ Scene-referred EV: ...  (metered EV: ...)  pre-exposure x...
+ Skybox: authored N lux -> renderer N cd/m2 (implies N lux, ratio N.NNx)
++  meter raw R / exposure X = A (N lux) -> target EV T, applied EV E
++  meter ceiling C (14 stops over grey); stock adaptation bypassed (...)
+ ```
+ 
+ * **Estimated Illuminance** is a whole-frame average read back from the engine's luminance-measure
+@@ -26,7 +28,22 @@ Skybox: authored N lux -> renderer N cd/m2 (implies N lux, ratio N.NNx)
+   time-of-day panel, recovered exactly. `implies` is the illuminance a uniform sky of the
+   luminance the renderer is actually using would deliver on a horizontal surface, `E = pi * L`.
+   With correct units the two are equal and `ratio` reads `1.00x`.
+-* The last line appends `[no sky texture: term unused]` when the sky material has no diffuse
++* **meter raw / exposure = absolute** is the AUTO loop laid out end to end. `raw` is the meter
++  texture as it came back, in PRE-EXPOSED units; `exposure` is the pre-exposure that was in force
++  for the frame that sample was measured on, recorded when the download was issued; `absolute` is
++  the quotient, and it is the only number the camera ever sees. Reading it:
++  * `absolute` should barely move when you change the aperture. If it moves WITH the exposure, the
++    division is not working and the loop is a feedback loop.
++  * `raw` collapsing towards zero while the picture is bright means taps are being read as black.
++  * `target EV` far from `applied EV` and not closing means the camera is pinned at Auto EV
++    Min/Max, or Auto Exposure Lock is on.
++  * `[SAMPLE REFUSED - holding]` means the measurement fell outside the plausibility window and
++    AUTO is holding its last EV rather than acting on it.
++* **meter ceiling** is where the meter saturates, in pre-exposed units and in stops above mid
++  grey. A texel brighter than this reads as exactly this - an incident meter's dome saturates, and
++  so does this one. It is what stops a sun disc past fp16's range from being read as black; see
++  `scene-notes/decisions/s8-meter-saturation.md`.
++* The Skybox line appends `[no sky texture: term unused]` when the sky material has no diffuse
+   texture. In that state the skybox path is not drawn at all and the numbers are informational
+   only — this is exactly why the times-ten went unnoticed in stock CRYENGINE.
+ 
+diff --git a/Engine/Shaders/HWScripts/CryFX/FXConstantDefs.cfi b/Engine/Shaders/HWScripts/CryFX/FXConstantDefs.cfi
+index dbf1f4e3..00523c98 100644
+--- a/Engine/Shaders/HWScripts/CryFX/FXConstantDefs.cfi
++++ b/Engine/Shaders/HWScripts/CryFX/FXConstantDefs.cfi
+@@ -146,6 +146,17 @@ cbuffer PerMaterialConstants : register()
+ // TiledLightVolumes.cpp and TiledShading.cfi, and none of them call DiffuseBRDF/SpecularBRDF.
+ #define SCENE_BRDF_NORM_FACTOR (1.0 + CV_SceneExposure.z)
+ 
++// The exposure meter's saturation point, in PRE-EXPOSED scene units: the luminance above which
++// the incident meter stops caring how bright a texel is. 0 on the stock path, where the meter's
++// input never carries absolute scene radiance and the stock NaN filter is right as it stands, so
++// every use of this is behind an `if (SCENE_METER_CEILING > 0)` that folds away.
++//
++// NOT stored minus one: zero is the meaningful "off" here, and an unbound per-view buffer reading
++// 0 lands on the stock behaviour, which is the same safe default the other two get from their
++// offset. Set from LIGHT_METER_CEILING_STOPS above mid grey in
++// CGraphicsPipeline::GeneratePerViewConstantBuffer().
++#define SCENE_METER_CEILING (CV_SceneExposure.w)
++
+ cbuffer CBPerViewGlobal : register(b6)
+ {
+ 	float4x4  CV_ViewProjZeroMatr;
+@@ -188,8 +199,10 @@ cbuffer CBPerViewGlobal : register(b6)
+ 	float4x4  CV_ProjMatrUnjittered;
+ 
+ 	// Scene-referred constants, all stored MINUS ONE so an unbound buffer reads unity.
+-	// .x = exposure - 1, .y = 1/exposure - 1, .z = BRDF normalisation factor - 1, .w reserved.
+-	// Read through PS_HDR_RANGE_ADAPT_MAX and SCENE_BRDF_NORM_FACTOR, never directly.
++	// .x = exposure - 1, .y = 1/exposure - 1, .z = BRDF normalisation factor - 1.
++	// .w is the exposure meter's saturation luminance and is NOT offset - 0 means "stock".
++	// Read through PS_HDR_RANGE_ADAPT_MAX, SCENE_BRDF_NORM_FACTOR and SCENE_METER_CEILING,
++	// never directly.
+ 	float4    CV_SceneExposure;
+ 
+ 	// The luminance weights of whatever space the HDR target is in this frame, stored as the
+diff --git a/Engine/Shaders/HWScripts/CryFX/HDRPostProcess.cfx b/Engine/Shaders/HWScripts/CryFX/HDRPostProcess.cfx
+index ad0f33d1..75cdf004 100644
+--- a/Engine/Shaders/HWScripts/CryFX/HDRPostProcess.cfx
++++ b/Engine/Shaders/HWScripts/CryFX/HDRPostProcess.cfx
+@@ -757,8 +757,32 @@ float2 HDRSampleLumInitialPS(vtxOut IN) : SV_Target
+ 		half3 cTex = GetTexture2D(HDRLum_Targ, HDRLum_LClampSampler, SampleTC).rgb;
+ 		half  fLum = all(isfinite(cTex)) ? GetWorkingLuminance(cTex) : 0;  // Filter out nans
+ 
+-		vLumInfo.x += log(fLum + 1e-6);                      // Luminance
+-		vLumInfo.y += log(fLum / baseColorLum * PI + 1e-6);  // Illuminance
++		// Scene-referred: an Inf here is not a bug, so it must not be read as black.
++		//
++		// SCENE_METER_CEILING is 0 on the stock path and the branch below is dead, byte for byte.
++		// Under the switch the HDR target holds PRE-EXPOSED scene radiance, and a sun disc at a
++		// daylight exposure sits within a stop or two of fp16's 65504 - one stop of over-exposure
++		// and those texels are +Inf, legitimately. The stock filter answers Inf with 0, which in
++		// a LOG mean is log(1e-6) = -13.8 nats per tap: a handful of sun pixels drag the
++		// geometric-mean illuminance to ~1e-6, the camera meters EV ~ -18, the pre-exposure scale
++		// jumps by four orders of magnitude, MORE texels overflow to Inf, and the loop ratchets
++		// one step per readback until it is pinned at Auto EV Min with the frame blown white.
++		// Positive feedback out of a sign error, not out of the exposure bookkeeping.
++		//
++		// So clamp instead of zero, at a ceiling expressed in stops above mid grey - the one
++		// anchor the pre-exposure guarantees (0.18). A tap brighter than that is a specular or
++		// solar highlight whose exact value an incident meter has no opinion about; reading it as
++		// "very bright" pushes EV UP, which is negative feedback and converges. The ceiling also
++		// keeps the geometric mean itself inside fp16, which the R16G16F meter target needs.
++		if (SCENE_METER_CEILING > 0)
++			fLum = all(isfinite(cTex)) ? min(fLum, SCENE_METER_CEILING) : SCENE_METER_CEILING;
++
++		half fIllum = fLum / baseColorLum * PI;
++		if (SCENE_METER_CEILING > 0)
++			fIllum = min(fIllum, SCENE_METER_CEILING * (PI / 0.18));
++
++		vLumInfo.x += log(fLum + 1e-6);       // Luminance
++		vLumInfo.y += log(fIllum + 1e-6);     // Illuminance
+ 	}
+ 
+ 	return fCenterWeight * fRecipSampleCount * vLumInfo;
+-- 
+2.47.1.windows.1
+

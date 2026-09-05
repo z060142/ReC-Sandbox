@@ -1,0 +1,449 @@
+From 36b9ed9b6a00430c1afb0ecde756a322d812af32 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Fri, 28 Aug 2026 09:04:39 +0800
+Subject: [PATCH 077/119] scene-referred S3: the luminance weights follow the
+ buffer, and the clamp audit comes back empty
+
+GetLuminance() is dot(colour, (0.2126, 0.7152, 0.0722)) - the Rec.709 Y row.
+Applied to ACEScg data it is not luminance. Red loses about 28 % of what it is
+worth, so a saturated red lamp reads dimmer than it is, sits below the glare
+threshold, and spec S3's own acceptance case ("a saturated red light bloomed and
+pushed +2 stops stays red") fails silently. Every threshold, every hue-preserving
+rescale and the metered EV move with it.
+
+CBPerViewGlobal gains CV_SceneLuminanceWeightsDelta beside CV_SceneExposure, and
+CommonMath.cfi gains GetWorkingLuminanceWeights() / GetWorkingLuminance() on top of
+it. A per-view CONSTANT and not a static flag, deliberately: the DOF gather
+evaluates this inside a 121-tap loop and the firefly filter thirteen times per
+texel, and a flag would double the permutation count of every one of those
+techniques to carry three floats. The compiler hoists the fetch out of both loops.
+
+Stored as the DELTA from Rec.709 rather than as the weights, which is the same trick
+CV_SceneExposure uses and matters more here: a pass that does not bind the per-view
+buffer would read (0,0,0) and compute a luminance of zero. As a delta it reads
+(0,0,0) and gets the stock answer. On the stock path the delta is an exact 0.0, so
+the addition is bit-identical.
+
+A separate name and not a switch inside GetLuminanceWeights(): two thirds of that
+function's call sites read the G-buffer, do shading-time energy conservation, or run
+after the display transform, and Rec.709 is still right in all of them.
+
+Sites moved, all of them between the conversion point and the tone map:
+  PostEffects.cfx:305-353 + :356-364   the stable downsample's firefly reweight,
+                                        13 taps and 5 inverses
+  HDRPostProcess.cfx:750               the exposure meter - the EV-defining site
+  HDRPostProcess.cfx:833               the tone map's saturation pivot
+  DepthOfField.cfx:435                 bokeh splat highlight extraction
+  DepthOfField.cfx:756                 ghost source extraction
+  DepthOfField.cfx:1105-1109           the gather/splat hand-over - same weights as
+                                        :435 or the two stop summing to the original
+                                        energy
+
+Explicitly NOT moved: HDRPostProcess.cfx:743 and :746. The audit lists them next to
+:750, but they read the G-BUFFER - albedo and reflectance never enter the working
+space. Also not moved: SMAA's luma edge detection, the photo filter, the cloud and
+fog reprojection tonemaps (they run before the conversion point) and SSR's limiter
+(it reads Prev, which stays 709). And NOT the glare threshold constants - that is
+D11 / Stage S7, and mixing a primaries change with a re-thresholding makes the
+screen unreadable.
+
+Two passes had never bound the per-view buffer and now do: CStableDownsamplePass
+and CAutoExposureStage's initial luminance pass. The tone map, both DOF splat
+primitives and the layer downscale already did.
+
+The gate is a third predicate, CRendererResources::IsSceneReferredWorkingSpace() =
+IsSceneReferred() && r_SceneReferredDebug != 1. It has to be: with the debug A/B
+skipping the conversion, IsSceneReferred() alone would leave Rec.709 data being
+measured with AP1 weights, and the A/B would compare two different mistakes.
+
+The other half of this item - lift every colour-data saturate/clamp between the HDR
+target and the tone map - was walked site by site and comes back EMPTY. Every
+candidate is already handled somewhere else: the R11G11B10F copies by S0's fp16
+floor, the shafts' UNORM wall by S2, the glare soft knee is a threshold and belongs
+to S7, :838's max(c,0) is harmless while 709 is a subset of AP1 and belongs to S4
+with the CDL, and :841/:844/:871 are the display wall itself. Our own effects clamp
+nothing but masks - PostEffects.cfx:295-370 contains not one saturate, clamp, min or
+max - which is the lens model having been written scene-referred from the start.
+Recorded in research/s3-luminance-and-saturates.md section 9 rather than left as an
+absence, along with the one thing still worth watching: the per-channel max
+accumulations in the DOF gather are legal but not basis-invariant.
+
+Build: CryRenderD3D11, CinematicCamera, 0/0.
+
+Co-Authored-By: Claude Opus <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01A72MFkdSczncE7au9UVnmu
+---
+ .../Common/Include_HLSL_CPP_Shared.h          |  6 ++++
+ .../RenderDll/Common/RendererResources.cpp    | 10 ++++++
+ .../RenderDll/Common/RendererResources.h      |  7 ++++
+ .../GraphicsPipeline/AutoExposure.cpp         |  9 +++++
+ .../Common/GraphicsPipeline.cpp               | 24 +++++++++++++
+ .../GraphicsPipeline/Common/UtilityPasses.cpp |  8 +++++
+ .../StandardGraphicsPipeline.cpp              | 11 +++---
+ Engine/Shaders/HWScripts/CryFX/CommonMath.cfi | 26 ++++++++++++++
+ .../Shaders/HWScripts/CryFX/DepthOfField.cfx  | 14 ++++----
+ .../HWScripts/CryFX/FXConstantDefs.cfi        |  8 +++++
+ .../HWScripts/CryFX/HDRPostProcess.cfx        |  4 +--
+ .../Shaders/HWScripts/CryFX/PostEffects.cfx   | 36 +++++++++----------
+ 12 files changed, 130 insertions(+), 33 deletions(-)
+
+diff --git a/Code/CryEngine/RenderDll/Common/Include_HLSL_CPP_Shared.h b/Code/CryEngine/RenderDll/Common/Include_HLSL_CPP_Shared.h
+index a7bfccb7..3860a006 100644
+--- a/Code/CryEngine/RenderDll/Common/Include_HLSL_CPP_Shared.h
++++ b/Code/CryEngine/RenderDll/Common/Include_HLSL_CPP_Shared.h
+@@ -134,6 +134,12 @@ hlsl_cbuffer_register(PerViewGlobalConstantBuffer, register (b6), 6) //eConstant
+ 	// through the PS_HDR_RANGE_ADAPT_MAX macro. Must stay last, and in step with
+ 	// Engine/Shaders/HWScripts/CryFX/FXConstantDefs.cfi.
+ 	hlsl_float4(CV_SceneExposure);
++
++	// Scene-referred working-space luminance weights (SceneReferredSpec.md S3), stored as the
++	// DELTA from the Rec.709 weights (0.2126, 0.7152, 0.0722) so that a pass which does not bind
++	// this buffer adds zero and keeps the stock answer. .w unused. Must stay last, and in step
++	// with Engine/Shaders/HWScripts/CryFX/FXConstantDefs.cfi.
++	hlsl_float4(CV_SceneLuminanceWeightsDelta);
+ };
+ 
+ hlsl_cbuffer_register(VrProjectionConstantBuffer, register (b7), 7) // eConstantBufferShaderSlot_VrProjection
+diff --git a/Code/CryEngine/RenderDll/Common/RendererResources.cpp b/Code/CryEngine/RenderDll/Common/RendererResources.cpp
+index c4246398..b77c2408 100644
+--- a/Code/CryEngine/RenderDll/Common/RendererResources.cpp
++++ b/Code/CryEngine/RenderDll/Common/RendererResources.cpp
+@@ -483,6 +483,16 @@ bool CRendererResources::IsSceneReferred()
+ 	return pRequest != nullptr && pRequest->GetParam() > 0.5f;
+ }
+ 
++// The working space of the HDR TARGET, which is a third question again: the scene-referred path
++// can be running while r_SceneReferredDebug 1 deliberately leaves the buffer in Rec.709 for an
++// A/B. Everything that reads the target's CONTENTS - the per-view luminance weights, and any
++// future consumer that has to know which primaries it is looking at - keys on this, so the A/B
++// stays coherent instead of measuring 709 data with AP1 weights.
++bool CRendererResources::IsSceneReferredWorkingSpace()
++{
++	return IsSceneReferred() && CRenderer::CV_r_SceneReferredDebug != 1;
++}
++
+ // The LIGHT-UNIT convention, which is a different question from "is the scene-referred pipeline
+ // running" and has to be answered by a different authority (SceneReferredSpec.md D4,
+ // decisions/s2-engine-side-switch.md).
+diff --git a/Code/CryEngine/RenderDll/Common/RendererResources.h b/Code/CryEngine/RenderDll/Common/RendererResources.h
+index b9e0d38a..a0efb516 100644
+--- a/Code/CryEngine/RenderDll/Common/RendererResources.h
++++ b/Code/CryEngine/RenderDll/Common/RendererResources.h
+@@ -170,6 +170,13 @@ public:
+ 	//! and the two must never disagree. Use IsSceneReferred() for everything else.
+ 	static bool        IsSceneReferredLightUnits();
+ 
++	//! True while the HDR target actually holds ACEScg (AP1) rather than Rec.709 - i.e. the
++	//! scene-referred path is running AND r_SceneReferredDebug is not skipping the working-space
++	//! conversion (SceneReferredSpec.md S3). Anything whose correctness depends on the CONTENTS of
++	//! the HDR target - the luminance weights above all - must ask this and not IsSceneReferred(),
++	//! or the debug A/B would leave Rec.709 data being measured with AP1 weights.
++	static bool        IsSceneReferredWorkingSpace();
++
+ public:
+ 	static bool m_bLoadedSystem;
+ 
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/AutoExposure.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/AutoExposure.cpp
+index cae5d5c1..a44fe2d3 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/AutoExposure.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/AutoExposure.cpp
+@@ -61,6 +61,15 @@ void CAutoExposureStage::MeasureLuminance()
+ 			m_passLuminanceInitial.SetRenderTarget(0, CRendererResources::s_ptexHDRToneMaps[curTexture]);
+ 			m_passLuminanceInitial.SetState(GS_NODEPTHTEST);
+ 			m_passLuminanceInitial.SetFlags(CPrimitiveRenderPass::ePassFlags_RequireVrProjectionConstants);
++			// Scene-referred pipeline (SceneReferredSpec.md S3): this pass is the EV-defining
++			// site - GetWorkingLuminance() at HDRPostProcess.cfx:750 is what feeds
++			// ComputeExposure - and the weights it needs live in the per-view constant buffer,
++			// which stock CE did not bind here. Without this the meter would keep measuring AP1
++			// data with Rec.709 weights and every exposure would be quietly wrong on the
++			// scene-referred path. Off the switch the delta is an exact 0.0, so the pixels are
++			// unchanged; only the binding appears. Note the two OTHER GetLuminance calls in the
++			// same shader (:743, :746) read the G-BUFFER and deliberately stay Rec.709.
++			m_passLuminanceInitial.SetRequirePerViewConstantBuffer(true);
+ 
+ 			m_passLuminanceInitial.SetTexture(0, m_graphicsPipelineResources.m_pTexHDRTargetScaled[1][0]);
+ 			m_passLuminanceInitial.SetTexture(1, m_graphicsPipelineResources.m_pTexSceneNormalsMap);
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Common/GraphicsPipeline.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Common/GraphicsPipeline.cpp
+index b07674a1..9fefac4c 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Common/GraphicsPipeline.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Common/GraphicsPipeline.cpp
+@@ -1224,6 +1224,30 @@ void CGraphicsPipeline::GeneratePerViewConstantBuffer(const SRenderViewInfo* pVi
+ 			cb.CV_SceneExposure = Vec4(sceneExposure - 1.0f, (1.0f / sceneExposure) - 1.0f, brdfFactor - 1.0f, 0.0f);
+ 		}
+ 
++		// The luminance weights of the space the HDR target is in this frame (SceneReferredSpec.md
++		// S3). Rec.709's (0.2126, 0.7152, 0.0722) on the stock path; the AP1 Y row once the
++		// working-space conversion runs. Compared with 709, red gains about 0.060, green loses
++		// 0.041 and blue loses 0.019, so a saturated red source reads roughly 28 % brighter than
++		// the 709 weights would say - which is exactly the S3 acceptance case: with the wrong
++		// weights a red lamp sits below the glare threshold and the test fails silently.
++		//
++		// Published as a DELTA from Rec.709 and added back in GetWorkingLuminanceWeights(), for
++		// the same reason CV_SceneExposure is stored minus one: not every pass between the
++		// conversion point and the tone map binds this buffer, and one that does not must fall
++		// back to the stock weights rather than to zero. On the stock path the delta is an exact
++		// 0.0 and the addition is bit-identical.
++		//
++		// Gated on IsSceneReferredWorkingSpace() and not on IsSceneReferred(): this follows what
++		// is actually IN the buffer, so r_SceneReferredDebug 1 (skip the conversion) keeps the
++		// weights on Rec.709 too and the A/B stays coherent.
++		{
++			static const Vec3 kRec709Y(0.2126f, 0.7152f, 0.0722f);
++			static const Vec3 kAP1Y(0.27222872f, 0.67408177f, 0.05368952f);
++
++			const Vec3 wanted = CRendererResources::IsSceneReferredWorkingSpace() ? kAP1Y : kRec709Y;
++			cb.CV_SceneLuminanceWeightsDelta = Vec4(wanted - kRec709Y, 0.0f);
++		}
++
+ 		Vec3 pDecalZFightingRemedy;
+ 		{
+ 			const float* mProj = viewInfo.projMatrix.GetData();
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Common/UtilityPasses.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Common/UtilityPasses.cpp
+index 18014955..c10c025a 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Common/UtilityPasses.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Common/UtilityPasses.cpp
+@@ -444,6 +444,14 @@ void CStableDownsamplePass::Execute(CTexture* pSrcRT, CTexture* pDestRT, bool bK
+ 	m_pass.SetRenderTarget(0, pDestRT);
+ 	m_pass.SetTechnique(CShaderMan::s_shPostEffects, techName, bKillFireflies ? g_HWSR_MaskBit[HWSR_SAMPLE0] : 0);
+ 	m_pass.SetState(GS_NODEPTHTEST);
++	// Scene-referred pipeline (SceneReferredSpec.md S3): the firefly suppression inside
++	// DownsampleStable is a luminance reweight (x / (1 + L) over thirteen taps, and its inverse
++	// over five blocks), so it needs the weights of the space the HDR target is actually in. They
++	// arrive in the per-view constant buffer, which stock CE did not bind on this pass. Off the
++	// switch the delta is an exact 0.0 and the pixels do not move. Worth knowing: the inverse is
++	// singular at L = 1 and the singular set MOVES with the weights - a saturated blue reaches it
++	// later in AP1, a green sooner. Pre-existing hazard, re-tested at the new weights.
++	m_pass.SetRequirePerViewConstantBuffer(true);
+ 	m_pass.SetTextureSamplerPair(0, pSrcRT, EDefaultSamplerStates::LinearClamp);
+ 	m_pass.BeginConstantUpdate();
+ 	m_pass.Execute();
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/StandardGraphicsPipeline.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/StandardGraphicsPipeline.cpp
+index 4d38b3ed..0ba6340a 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/StandardGraphicsPipeline.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/StandardGraphicsPipeline.cpp
+@@ -197,12 +197,11 @@ void CStandardGraphicsPipeline::Update(EShaderRenderingFlags renderingFlags)
+ // material shader scripts. Converting after all scene blending makes the question moot.
+ void CStandardGraphicsPipeline::ExecuteSceneReferredConversion()
+ {
+-	if (!CRendererResources::IsSceneReferred())
+-		return;
+-
+-	// r_SceneReferredDebug 1: leave the frame in Rec.709 while the rest of the scene-referred
+-	// pipeline keeps running. The A/B that separates "the primaries moved" from everything else.
+-	if (CRendererCVars::CV_r_SceneReferredDebug == 1)
++	// IsSceneReferredWorkingSpace() is IsSceneReferred() minus r_SceneReferredDebug 1, which
++	// leaves the frame in Rec.709 while the rest of the scene-referred pipeline keeps running -
++	// the A/B that separates "the primaries moved" from everything else this pipeline changed.
++	// The per-view luminance weights follow the same gate, so the A/B is coherent.
++	if (!CRendererResources::IsSceneReferredWorkingSpace())
+ 		return;
+ 
+ 	CTexture* pHDRTarget = m_pipelineResources.m_pTexHDRTarget;
+diff --git a/Engine/Shaders/HWScripts/CryFX/CommonMath.cfi b/Engine/Shaders/HWScripts/CryFX/CommonMath.cfi
+index b6046bfb..fa1c05c5 100644
+--- a/Engine/Shaders/HWScripts/CryFX/CommonMath.cfi
++++ b/Engine/Shaders/HWScripts/CryFX/CommonMath.cfi
+@@ -135,6 +135,32 @@ half GetLuminance( half3 color )
+ 	return dot( color, GetLuminanceWeights() );
+ }
+ 
++// The luminance weights of the space the HDR TARGET is in - Rec.709 on the stock path, ACEScg
++// (AP1) once the scene-referred working-space conversion has run (SceneReferredSpec.md S3).
++//
++// This is a SEPARATE name and not a switch inside GetLuminanceWeights() on purpose: two thirds of
++// that function's call sites read the G-buffer, do shading-time energy conservation or run after
++// the display transform, and Rec.709 is still the right answer in every one of them. Only the
++// handful of sites that sit between the conversion point and the tone map may move - the
++// exposure meter, the firefly filter in the stable downsample, the tone map's saturation pivot
++// and the lens model's highlight extraction. Getting that classification wrong in either
++// direction is a wrong picture with no error message.
++//
++// A per-view constant rather than a shader permutation: the DOF gather evaluates this inside a
++// 121-tap loop and the firefly filter thirteen times per texel, and a static flag would double
++// the permutation count of every one of those techniques to carry three floats. The value is a
++// DELTA from Rec.709, so a pass that does not bind the per-view buffer still gets Rec.709 rather
++// than zero, and on the stock path the delta is an exact 0.0.
++half3 GetWorkingLuminanceWeights()
++{
++	return GetLuminanceWeights() + (half3)CV_SceneLuminanceWeightsDelta.xyz;
++}
++
++half GetWorkingLuminance( half3 color )
++{
++	return dot( color, GetWorkingLuminanceWeights() );
++}
++
+ half3 EncodeColorYCC( half3 col )
+ {
+ 	half3 encodedCol;
+diff --git a/Engine/Shaders/HWScripts/CryFX/DepthOfField.cfx b/Engine/Shaders/HWScripts/CryFX/DepthOfField.cfx
+index e0a009b2..812b4d6c 100644
+--- a/Engine/Shaders/HWScripts/CryFX/DepthOfField.cfx
++++ b/Engine/Shaders/HWScripts/CryFX/DepthOfField.cfx
+@@ -432,7 +432,7 @@ v2fBokehQuad DofBokehRefVS(uint nVertexID : SV_VertexID)
+ 	half3 cExcess = 0;
+ 	[unroll] for (int i = 0; i < 4; i++)
+ 	{
+-		const half fLum = GetLuminance(vQuad[i].rgb);
++		const half fLum = GetWorkingLuminance(vQuad[i].rgb);
+ 		// Quadratic knee across [threshold - knee, threshold + knee], linear above. A wide
+ 		// knee is what stops highlights popping as the aperture or focus sweeps past them.
+ 		half fSoft = clamp(fLum - fThreshold + fKnee, 0, 2 * fKnee);
+@@ -753,7 +753,7 @@ v2fBokehQuad DofBokehGhostVS(uint nVertexID : SV_VertexID)
+ 	half3 cExcess = 0;
+ 	[unroll] for (int i = 0; i < 4; i++)
+ 	{
+-		const half fLum = GetLuminance(vQuad[i].rgb);
++		const half fLum = GetWorkingLuminance(vQuad[i].rgb);
+ 		half fSoft = clamp(fLum - fThreshold + fKnee, 0, 2 * fKnee);
+ 		fSoft = (fSoft * fSoft) / (4 * fKnee);
+ 		const half fExcess = max(fSoft, fLum - fThreshold);
+@@ -1102,11 +1102,11 @@ OutDownscaleDof DownscaleDofPS(vtxOutDownscaleDof IN)
+ 		const float fHandOver  = vDofBokehHighlight.w * smoothstep(fFadeFull * 0.333, fFadeFull, fCocHere);
+ 
+ 		// Per sample, before the average: see LensHighlightExcess.
+-		const float fL  = GetLuminance(c.rgb);
+-		const float fL0 = GetLuminance(c0.rgb);
+-		const float fL1 = GetLuminance(c1.rgb);
+-		const float fL2 = GetLuminance(c2.rgb);
+-		const float fL3 = GetLuminance(c3.rgb);
++		const float fL  = GetWorkingLuminance(c.rgb);
++		const float fL0 = GetWorkingLuminance(c0.rgb);
++		const float fL1 = GetWorkingLuminance(c1.rgb);
++		const float fL2 = GetWorkingLuminance(c2.rgb);
++		const float fL3 = GetWorkingLuminance(c3.rgb);
+ 		// Hue preserving, exactly like the sprite's: the texel rescaled so its luminance is
+ 		// what is left after the sprite's share is removed.
+ 		c.rgb  *= (fL  - fHandOver * LensHighlightExcess(fL,  fThreshold, fKnee)) / max(fL,  1e-4);
+diff --git a/Engine/Shaders/HWScripts/CryFX/FXConstantDefs.cfi b/Engine/Shaders/HWScripts/CryFX/FXConstantDefs.cfi
+index 08a5ebd8..dbf1f4e3 100644
+--- a/Engine/Shaders/HWScripts/CryFX/FXConstantDefs.cfi
++++ b/Engine/Shaders/HWScripts/CryFX/FXConstantDefs.cfi
+@@ -191,6 +191,14 @@ cbuffer CBPerViewGlobal : register(b6)
+ 	// .x = exposure - 1, .y = 1/exposure - 1, .z = BRDF normalisation factor - 1, .w reserved.
+ 	// Read through PS_HDR_RANGE_ADAPT_MAX and SCENE_BRDF_NORM_FACTOR, never directly.
+ 	float4    CV_SceneExposure;
++
++	// The luminance weights of whatever space the HDR target is in this frame, stored as the
++	// DELTA from Rec.709 for exactly the reason CV_SceneExposure is stored minus one: a pass that
++	// does not bind the per-view constant buffer reads zero, adds zero, and gets Rec.709 - the
++	// stock answer - instead of a black frame or, far worse, a silently wrong luminance. On the
++	// stock path the delta is an exact 0.0, so the addition is bit-identical.
++	// .w reserved. Read through GetWorkingLuminanceWeights(), never directly.
++	float4    CV_SceneLuminanceWeightsDelta;
+ };
+ 
+ cbuffer CBPerPassShadowGen : register(b5)
+diff --git a/Engine/Shaders/HWScripts/CryFX/HDRPostProcess.cfx b/Engine/Shaders/HWScripts/CryFX/HDRPostProcess.cfx
+index 2cbc8650..9155c9b0 100644
+--- a/Engine/Shaders/HWScripts/CryFX/HDRPostProcess.cfx
++++ b/Engine/Shaders/HWScripts/CryFX/HDRPostProcess.cfx
+@@ -747,7 +747,7 @@ float2 HDRSampleLumInitialPS(vtxOut IN) : SV_Target
+ 			baseColorLum = 0.2;
+ 		
+ 		half3 cTex = GetTexture2D(HDRLum_Targ, HDRLum_LClampSampler, SampleTC).rgb;
+-		half  fLum = all(isfinite(cTex)) ? GetLuminance(cTex) : 0;  // Filter out nans
++		half  fLum = all(isfinite(cTex)) ? GetWorkingLuminance(cTex) : 0;  // Filter out nans
+ 
+ 		vLumInfo.x += log(fLum + 1e-6);                      // Luminance
+ 		vLumInfo.y += log(fLum / baseColorLum * PI + 1e-6);  // Illuminance
+@@ -830,7 +830,7 @@ half3 FilmMapping( in vert2frag IN, in half3 cScene, in half3 cBloom, in half3 v
+ 	half3 cColor = fVignetting * fExposure * lerp(cScene, cBloom, saturate(HDRBloomColor));
+ 
+ 	// hdr color grading
+-	half fLuminance = GetLuminance(cColor);
++	half fLuminance = GetWorkingLuminance(cColor);
+ 	cColor = fLuminance + HDRColorBalance.a * ( cColor - fLuminance );	// saturation
+ 	cColor *= HDRColorBalance.rgb;	// color balance
+ 
+diff --git a/Engine/Shaders/HWScripts/CryFX/PostEffects.cfx b/Engine/Shaders/HWScripts/CryFX/PostEffects.cfx
+index c8a09518..ed09f0c8 100644
+--- a/Engine/Shaders/HWScripts/CryFX/PostEffects.cfx
++++ b/Engine/Shaders/HWScripts/CryFX/PostEffects.cfx
+@@ -302,53 +302,53 @@ pixout DownsampleStablePS(vtxOutTexToTex IN)
+ 	half3 tex;
+ 	
+ 	tex = GetTexture2D(Tx2Tx_Source, Tx2Tx_Sampler, IN.baseTC.xy + float2(-2, -2) * TexSize).rgb;
+-	if (bKillFireflies) tex /= 1 + GetLuminance(tex);
++	if (bKillFireflies) tex /= 1 + GetWorkingLuminance(tex);
+ 	blockTL += tex;
+ 	
+ 	tex = GetTexture2D(Tx2Tx_Source, Tx2Tx_Sampler, IN.baseTC.xy + float2( 0, -2) * TexSize).rgb;
+-	if (bKillFireflies) tex /= 1 + GetLuminance(tex);
++	if (bKillFireflies) tex /= 1 + GetWorkingLuminance(tex);
+ 	blockTL += tex; blockTR += tex;
+ 	
+ 	tex = GetTexture2D(Tx2Tx_Source, Tx2Tx_Sampler, IN.baseTC.xy + float2( 2, -2) * TexSize).rgb;
+-	if (bKillFireflies) tex /= 1 + GetLuminance(tex);
++	if (bKillFireflies) tex /= 1 + GetWorkingLuminance(tex);
+ 	blockTR += tex;
+ 	
+ 	tex = GetTexture2D(Tx2Tx_Source, Tx2Tx_Sampler, IN.baseTC.xy + float2(-2,  0) * TexSize).rgb;
+-	if (bKillFireflies) tex /= 1 + GetLuminance(tex);
++	if (bKillFireflies) tex /= 1 + GetWorkingLuminance(tex);
+ 	blockTL += tex; blockBL += tex;
+ 	
+ 	tex = GetTexture2D(Tx2Tx_Source, Tx2Tx_Sampler, IN.baseTC.xy + float2( 0,  0) * TexSize).rgb;
+-	if (bKillFireflies) tex /= 1 + GetLuminance(tex);
++	if (bKillFireflies) tex /= 1 + GetWorkingLuminance(tex);
+ 	blockTL += tex; blockTR += tex; blockBR += tex; blockBL += tex;
+ 	
+ 	tex = GetTexture2D(Tx2Tx_Source, Tx2Tx_Sampler, IN.baseTC.xy + float2( 2,  0) * TexSize).rgb;
+-	if (bKillFireflies) tex /= 1 + GetLuminance(tex);
++	if (bKillFireflies) tex /= 1 + GetWorkingLuminance(tex);
+ 	blockTR += tex; blockBR += tex;
+ 	
+ 	tex = GetTexture2D(Tx2Tx_Source, Tx2Tx_Sampler, IN.baseTC.xy + float2(-2,  2) * TexSize).rgb;
+-	if (bKillFireflies) tex /= 1 + GetLuminance(tex);
++	if (bKillFireflies) tex /= 1 + GetWorkingLuminance(tex);
+ 	blockBL += tex;
+ 	
+ 	tex = GetTexture2D(Tx2Tx_Source, Tx2Tx_Sampler, IN.baseTC.xy + float2( 0,  2) * TexSize).rgb;
+-	if (bKillFireflies) tex /= 1 + GetLuminance(tex);
++	if (bKillFireflies) tex /= 1 + GetWorkingLuminance(tex);
+ 	blockBL += tex; blockBR += tex;
+ 	
+ 	tex = GetTexture2D(Tx2Tx_Source, Tx2Tx_Sampler, IN.baseTC.xy + float2( 2,  2) * TexSize).rgb;
+-	if (bKillFireflies) tex /= 1 + GetLuminance(tex);
++	if (bKillFireflies) tex /= 1 + GetWorkingLuminance(tex);
+ 	blockBR += tex;
+ 	
+ 	half3 blockCC = 0;
+ 	tex = GetTexture2D(Tx2Tx_Source, Tx2Tx_Sampler, IN.baseTC.xy + float2(-1, -1) * TexSize).rgb;
+-	if (bKillFireflies) tex /= 1 + GetLuminance(tex);
++	if (bKillFireflies) tex /= 1 + GetWorkingLuminance(tex);
+ 	blockCC += tex;
+ 	tex = GetTexture2D(Tx2Tx_Source, Tx2Tx_Sampler, IN.baseTC.xy + float2( 1, -1) * TexSize).rgb;
+-	if (bKillFireflies) tex /= 1 + GetLuminance(tex);
++	if (bKillFireflies) tex /= 1 + GetWorkingLuminance(tex);
+ 	blockCC += tex;
+ 	tex = GetTexture2D(Tx2Tx_Source, Tx2Tx_Sampler, IN.baseTC.xy + float2( 1,  1) * TexSize).rgb;
+-	if (bKillFireflies) tex /= 1 + GetLuminance(tex);
++	if (bKillFireflies) tex /= 1 + GetWorkingLuminance(tex);
+ 	blockCC += tex;
+ 	tex = GetTexture2D(Tx2Tx_Source, Tx2Tx_Sampler, IN.baseTC.xy + float2(-1,  1) * TexSize).rgb;
+-	if (bKillFireflies) tex /= 1 + GetLuminance(tex);
++	if (bKillFireflies) tex /= 1 + GetWorkingLuminance(tex);
+ 	blockCC += tex;
+ 	
+ 	blockTL /= 4; blockTR /= 4; blockBR /= 4; blockBL /= 4; blockCC /= 4;
+@@ -356,11 +356,11 @@ pixout DownsampleStablePS(vtxOutTexToTex IN)
+ 	if (bKillFireflies) 
+ 	{
+ 		// Convert back to uncompressed/linear range
+-		blockTL /= (1 - GetLuminance(blockTL));
+-		blockTR /= (1 - GetLuminance(blockTR));
+-		blockBR /= (1 - GetLuminance(blockBR));
+-		blockBL /= (1 - GetLuminance(blockBL));
+-		blockCC /= (1 - GetLuminance(blockCC));
++		blockTL /= (1 - GetWorkingLuminance(blockTL));
++		blockTR /= (1 - GetWorkingLuminance(blockTR));
++		blockBR /= (1 - GetWorkingLuminance(blockBR));
++		blockBL /= (1 - GetWorkingLuminance(blockBL));
++		blockCC /= (1 - GetWorkingLuminance(blockCC));
+ 	}
+ 	
+ 	OUT.Color.rgb = 0.5 * blockCC + 0.125 * (blockTL + blockTR + blockBR + blockBL);
+-- 
+2.47.1.windows.1
+

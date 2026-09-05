@@ -1,0 +1,399 @@
+From 4fc0a60e6e0b834d2fccccb4402ff054c5525d95 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Sat, 29 Aug 2026 03:43:46 +0800
+Subject: [PATCH 111/119] fix: area lights fell off as the fourth power of
+ distance, and the rectangle was 2pi over its own disc
+
+CE multiplies the LTC form factor - which already contains the inverse square, E ~ A
+cos cos / d^2 - by GetPhysicalLightAttenuation's (r/d)^2 and by the CPU's matching
+x121. Two inverse squares: an area light is 1.0 stop under a point light of the same
+value at 2 m and 5.6 stops under it at 10 m, and the only way to make one look right
+is to enlarge it until its area happens to cancel the distance. That is the user's
+own G3 diagnosis, and it is correct.
+
+Three separate defects, all on the ReC path only, all byte-identical off it:
+
+1. The double falloff. TiledShading.cfi's deferred and forward area branches take a
+   new GetAreaLightFadeout() - the radius fadeout ONLY - instead of the full physical
+   attenuation. The fadeout is kept and must be: it is what makes the light reach
+   exactly zero at its clip radius instead of popping at the tile boundary.
+
+2. The per-shape LTC normalisation. LTC_Rectangle ends at len*scale, and by Lambert's
+   polygon formula len = 2E - twice the cosine-weighted solid angle; LTC_Disk ends at
+   formFactor*scale, which is E/PI exactly. S2's single SCENE_BRDF_NORM_FACTOR
+   therefore left the rectangle 1 stop hot and the disc 1.65 stops dark, and the two
+   shapes 2.65 stops apart from each other. AreaLightLTC_GGX now applies 1/(2PI) to
+   the rectangle and exactly 1.0 to the disc, so both deliver E/PI - the same quantity
+   DiffuseBRDF delivers. LTCTex_2.w is the horizon clip and hides neither constant.
+
+3. The value's semantics. TiledLightVolumes.cpp gives DLF_AREA (1+bulb)^2 / A instead
+   of the point light's intensityMul, so an area light at Diffuse Multiplier v now
+   delivers exactly the illuminance a POINT light at v delivers, at the same distance,
+   at any panel size and either shape. That is Frostbite's L = PHI/(A*PI) and UE's and
+   HDRP's default rect mode: resize the softbox and the brightness holds, only the
+   shadows soften. Luminance (nits) semantics is the same code with the division
+   removed, and is what a per-light unit enum would select later.
+
+The cull radius follows: the radiation radius itself is already right, because the /A
+here and the *A in the form factor cancel, but every distance in the system is measured
+from the light's ORIGIN while an area light emits from a surface - so posRad.w gains
+the emitting half-diagonal, on the render thread where the switch is visible rather
+than in CryCommon's ComputeEffectiveRadius(), which also drives shadow allocation.
+
+Two stock area-light bugs fixed under the same gate: the specular cosine used an
+UNNORMALISED centre vector (saturate() killed it beyond a metre), and that centre was
+built from raw world components, so a rotated rectangle got the wrong one.
+
+New shader macro SCENE_REFERRED_LIGHT_UNITS - CV_SceneExposure.z < 0, exact on both
+paths - because the per-shape constant is not a scaling of 1/PI.
+
+docs/SceneReferredContent.md section 7 declares what every light type's authored number
+means today and on the ReC path, with a fixture table (a 100 W bulb is 0.0105, a 2 kW
+HMI open face is 1.45) and the known inconsistencies left standing: volumetric fog and
+ambient area lights use the legacy nearest-point model, particles are not lit by area
+lights at all, and e_LightIlluminanceThreshold still cuts at 40 lux.
+
+Notes: scene-notes/decisions/s8-light-units.md, research/s8-light-units.md.
+
+Co-Authored-By: Claude Opus <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01A72MFkdSczncE7au9UVnmu
+---
+ .../GraphicsPipeline/TiledLightVolumes.cpp    | 68 +++++++++++++++++
+ .../docs/SceneReferredContent.md              | 73 ++++++++++++++++++
+ .../HWScripts/CryFX/FXConstantDefs.cfi        |  8 ++
+ .../Shaders/HWScripts/CryFX/TiledShading.cfi  | 17 ++++-
+ Engine/Shaders/HWScripts/CryFX/shadeLib.cfi   | 75 ++++++++++++++++---
+ 5 files changed, 228 insertions(+), 13 deletions(-)
+
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/TiledLightVolumes.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/TiledLightVolumes.cpp
+index 219a3690..5f853dc6 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/TiledLightVolumes.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/TiledLightVolumes.cpp
+@@ -814,7 +814,35 @@ void CTiledLightVolumesStage::GenerateLightList()
+ 			// Setup standard parameters
+ 			float mipFactor = (cameraPosition - renderLight.m_Origin).GetLengthSquared() / max(0.001f, renderLight.m_fRadius * renderLight.m_fRadius);
+ 			bool isAreaLight = (renderLight.m_Flags & DLF_AREA) != 0;
++
++			// The area-light convention gate. Read from the LATCHED BRDF factor and not from the
++			// cvar or the bus, for the same reason the sun's PI undo does: this is the exact value
++			// the shaders will see for this frame, so the CPU half of the area-light fix and the
++			// GPU half cannot end up on opposite sides of a flip within one frame.
++			const bool bSceneReferredLightUnits = (rd->GetSceneReferredBRDFFactor() < 1.0f);
+ 			float volumeSize = (lightListIdx == 0) ? renderLight.m_ProbeExtents.len() : renderLight.m_fRadius;
++
++			// The cull radius, made area-aware on the scene-referred path
++			// (decisions/s8-light-units.md, research §6 (c) item 4).
++			//
++			// SRenderLight::ComputeEffectiveRadius() solves R = sqrt(I/threshold) with
++			// I = colour * (1+bulb)^2, and after the area-light fix above that is EXACTLY the
++			// intensity an area light now delivers - the /A here and the *A the LTC form factor
++			// carries cancel - so the radius itself needs no correction. What it does not know is
++			// that an area light emits from a SURFACE while every distance in this system is
++			// measured from the light's origin: a receiver one metre from the near edge of a
++			// 4 x 4 m panel is 2.8 m from its centre, and both the shader's reach test
++			// (`length(lightVec) < posRad.w`) and the fadeout that now carries the whole
++			// attenuation would cut it off early. Adding the emitting half-diagonal restores the
++			// same reach the light had before its own size was taken into account.
++			//
++			// Done here and not in SRenderLight::ComputeEffectiveRadius(): that one lives in
++			// CryCommon, runs on the main thread in three different DLLs, and drives shadow-frustum
++			// allocation as well as shading. This is the render-thread copy that only the tiled
++			// shading reads, and it is where the switch is already visible.
++			if (isAreaLight && bSceneReferredLightUnits)
++				volumeSize += 0.5f * sqrtf(renderLight.m_fAreaWidth * renderLight.m_fAreaWidth +
++				                           renderLight.m_fAreaHeight * renderLight.m_fAreaHeight);
+ 			Vec3 pos = renderLight.GetPosition();
+ 			lightInfo.posRad = Vec4(pos, volumeSize);
+ 			Vec4 posVS = Vec4(pos, 1) * matView;
+@@ -918,6 +946,46 @@ void CTiledLightVolumesStage::GenerateLightList()
+ 					// Solve I * 1 / (1 + d/lightsize)^2 = 1
+ 					float intensityMul = 1.0f + 1.0f / lightShadeInfo.attenuationParams.x;
+ 					intensityMul *= intensityMul;
++
++					// Area lights, on the scene-referred path only (decisions/s8-light-units.md
++					// part 2, approach II - INTENSITY semantics).
++					//
++					// The stock number above is the CPU twin of GetPhysicalLightAttenuation's
++					// (r/d)^2: together they are (1+r)^2/d^2, the point light's inverse square with
++					// the bulb radius as the reference distance. An area light gets its OWN 1/d^2
++					// from the LTC form factor, so multiplying it by that pair as well is what
++					// makes CE's area lights fall off as the fourth power of distance and sit
++					// 5.6 stops under a point light at 10 m (research/s8-light-units.md section 1.3).
++					// The shader drops the (r/d)^2 for area lights under the same gate; this is the
++					// other half - the CPU factor becomes the light's own emitting AREA instead.
++					//
++					// What the value then means: (1+r)^2 is kept, so a rectangle at Diffuse
++					// Multiplier v delivers exactly the illuminance a POINT light at v delivers, at
++					// the same distance. Dividing by the area is Frostbite's L = PHI/(A*PI) and
++					// UE/HDRP's Lumens-mode rect: resizing the panel keeps its brightness and only
++					// softens its shadows, which is what "resize the softbox" means to a gaffer.
++					// Luminance (nits) semantics is the same code with this division removed, and
++					// is what a `Nits` unit enum would select later.
++					//
++					// Areas: a rectangle of Width x Height is exactly Width*Height. A disc is NOT -
++					// TiledLightVolumes' own packing below applies a SECOND x0.5 to the half
++					// extents (`* areaWidth * 0.5f`), so a Width=1 disc has radius 0.25 and area
++					// PI/16, 5.1x less than the rectangle of the same authored size. That factor is
++					// left exactly as it is, because the editor gizmo draws the same 0.25 and
++					// fixing one without the other desyncs the helper from the light; dividing by
++					// the area the shader actually integrates is what makes the two shapes agree.
++					if (isAreaLight && bSceneReferredLightUnits)
++					{
++						const float w = max(renderLight.m_fAreaWidth, 0.001f);
++						const float h = max(renderLight.m_fAreaHeight, 0.001f);
++						const float area = (renderLight.m_nAreaShape == 1)
++						                   ? (w * h)                               // rectangle
++						                   : (gf_PI * (w * 0.25f) * (h * 0.25f));  // disc / ellipse
++
++						const float bulb = lightShadeInfo.attenuationParams.x;
++						intensityMul = ((1.0f + bulb) * (1.0f + bulb)) / area;
++					}
++
+ 					lightShadeInfo.color.x *= intensityMul;
+ 					lightShadeInfo.color.y *= intensityMul;
+ 					lightShadeInfo.color.z *= intensityMul;
+diff --git a/Code/CryPlugins/CinematicCamera/docs/SceneReferredContent.md b/Code/CryPlugins/CinematicCamera/docs/SceneReferredContent.md
+index f31c0df9..4836fb7c 100644
+--- a/Code/CryPlugins/CinematicCamera/docs/SceneReferredContent.md
++++ b/Code/CryPlugins/CinematicCamera/docs/SceneReferredContent.md
+@@ -350,3 +350,76 @@ Point the camera at a fixed bright practical and sweep the T-stop from T1 to T16
+ ghosts and bokeh sprites should fade *continuously* — the whole picture gets darker and the effects
+ follow it. Nothing should appear or vanish at one particular stop. That step is exactly what an
+ absolute threshold under a moving exposure produces, and its absence is the acceptance test.
++
++---
++
++## 7. What a light's number actually means (Stage S8, D4)
++
++Only two things in CRYENGINE 5.7 ship with a real photometric unit: the sun's
++`PARAM_SUN_INTENSITY`, which is **lux**, and a material's `Emittance`, which is **kcd/m²**
++(1.0 = 1 000 nits). Nothing else — no light component property carries a unit, a tooltip or a
++range that means anything. This section writes down what the numbers do mean, and what the
++scene-referred path changes about them.
++
++The one engine-wide constant behind all of it: **1.0 engine unit = 10 000 lux, or 10 000 cd/m²,
++depending on which side of the BRDF you are standing** (`RENDERER_LIGHT_UNIT_SCALE`).
++
++### 7.1 The table
++
++| Light type | The authored number | What it means on the **stock** path | What it means on the **ReC** path |
++|---|---|---|---|
++| **Sun** | `PARAM_SUN_INTENSITY` (time of day) | **Illuminance in lux.** Correct, and the anchor everything else is calibrated against. Default 119 000 lux ≈ clear midday | unchanged (the ÷π moves into the BRDF; the number is the same lux) |
++| **Point light** | `Diffuse Multiplier` × `Color` | **Luminous intensity**, in units of `10⁴/(1+r)²` cd where `r` is the Attenuation Bulb Size. At the default 0.1 m bulb, **1.0 = 12 100 cd**. Equivalently: 10 000 lux measured 1 m *from the bulb surface* | unchanged. What changes is only that the 1/π now sits in the BRDF, so every local light delivers 1.65 stops less than it used to — one convention, applied to all of them |
++| **Projector / spot** | same | the same **on-axis intensity**, and it is **independent of the cone angle**. Narrowing the beam does not concentrate the energy — the cone only masks. (This is Frostbite's deliberate choice, not a CE accident; UE does divide by the cone solid angle, and that is the difference to expect when converting content) | unchanged |
++| **Area light — rectangle** | same | **No unit.** The LTC form factor behaves as a surface *luminance* (double the panel, double the light), and the engine then multiplies it by a point light's `(1+r)²/d²` as well — so the value is `nits · lux`, which is not a photometric quantity, and the light falls off as **d⁻⁴**. It is also `2π` (2.65 stops) hotter than its own disc for the same value | **The same luminous intensity as a point light.** A rectangle at `Diffuse Multiplier = v` delivers the same illuminance, at the same distance, as a point light at `v`. Falloff is inverse-square. Resizing the panel keeps its brightness and only softens its shadows |
++| **Area light — disc / ellipse** | same | as the rectangle, minus 2.65 stops (the missing `2π`), and its emitting radius is `Width/4`, not `Width/2` — so a `Width = Height = 1` disc is **7.6 stops** under a 1 × 1 rectangle | identical to the rectangle: same value, same distance, same reading. The `Width/4` radius is unchanged, because the editor gizmo draws the same figure; dividing by the area the shader actually integrates is what makes the two shapes agree |
++| **Ambient light** | `Diffuse Multiplier` × `Color` | **Dimensionless**, and correctly so — it is a multiplicative tint over the accumulator, with its own decision boundary at 1.0. Ambient *area* lights use a different, legacy shading model | unchanged, and deliberately excluded from every part of the scene-referred light work |
++| **Environment probe** | `Diffuse`/`Specular Multiplier` | **Dimensionless gain** over a baked absolute radiance. The cube itself carries engine units inherited from the scene it was baked in | unchanged. See section 4 for the bake convention |
++| **Emissive material** | `Emittance` colour × strength | **Luminance in kcd/m²**: 1.0 = 1 000 cd/m². Correct | unchanged |
++| **Fog volume emission** | emission colour | **kcd/m²**, same as emissive. Correct | unchanged |
++
++### 7.2 Reading the table for real fixtures
++
++Because a point light's `1.0` is 12 100 cd — roughly 150 000 lumens, a stadium lamp — every real
++practical lives near the bottom of the slider. At the default 0.1 m bulb:
++
++| Fixture | Photometry | `Diffuse Multiplier` |
++|---|---|---|
++| 100 W tungsten bulb | 1 600 lm → 127 cd | **0.0105** |
++| 1 000 lm LED panel | Φ/π = 318 cd on axis | **0.0263** |
++| 2 kW HMI, open face | 220 000 lm → 17 507 cd | **1.45** |
++| 2 kW HMI in a 30° Fresnel | ≈ 1.03 Mcd | **85** |
++| *(reference)* sun | 119 000 lux | `PARAM_SUN_INTENSITY 119000` |
++
++On the ReC path the same numbers are valid for an area light of any size and either shape — which
++is the whole point of section 7.1's last two rows.
++
++### 7.3 What this changes about existing content
++
++Under `Scene Referred`, area lights that already exist will look different, and by a lot:
++
++* a 1 × 1 m rectangle is **1 stop darker at 1 m, 2.2 stops brighter at 3 m, 5.6 stops brighter at
++  10 m** than it was — the d⁻⁴ is gone;
++* a rectangle is **1 stop darker** and a disc **1.65 stops brighter** relative to a point light,
++  because each shape now carries its own correct LTC normalisation instead of one shared `1/π`;
++* a panel that is not 1 × 1 changes by the ratio of its area to 1 m²: a 2 × 2 loses 2 stops, a
++  0.5 × 0.5 gains 2 — that is the size-invariance being switched on, and it is what makes the
++  number mean an intensity.
++
++This is a deliberate, documented, path-dependent change, exactly like the 1.65-stop shift on point
++lights. The stock path is untouched, byte for byte.
++
++Two long-standing engine bugs in the area-light specular are also fixed, on the ReC path only: the
++cosine term used an *unnormalised* vector (so it saturated to 1.0 for any light more than about a
++metre away), and the light centre was taken from raw world components, so a *rotated* rectangle got
++the wrong centre.
++
++### 7.4 Known inconsistencies, recorded rather than hidden
++
++* **Volumetric fog** lights area sources with the engine's *legacy* nearest-point-on-rectangle
++  model, not LTC. An area light's contribution to fog therefore does not follow the fix above.
++* **Ambient area lights** use that same legacy model and are excluded by design.
++* **Particles** are not lit by area or ambient light entities at all — they never enter the
++  light-volume list.
++* `e_LightIlluminanceThreshold` still cuts a light off at **40 lux**, which is generous for a
++  daylight scene and far too aggressive for a night one. It is a cvar; lower it for night work.
+diff --git a/Engine/Shaders/HWScripts/CryFX/FXConstantDefs.cfi b/Engine/Shaders/HWScripts/CryFX/FXConstantDefs.cfi
+index 49e6f6f1..8fbc487a 100644
+--- a/Engine/Shaders/HWScripts/CryFX/FXConstantDefs.cfi
++++ b/Engine/Shaders/HWScripts/CryFX/FXConstantDefs.cfi
+@@ -146,6 +146,14 @@ cbuffer PerMaterialConstants : register()
+ // TiledLightVolumes.cpp and TiledShading.cfi, and none of them call DiffuseBRDF/SpecularBRDF.
+ #define SCENE_BRDF_NORM_FACTOR (1.0 + CV_SceneExposure.z)
+ 
++// "Are we on the scene-referred light-unit convention?" as a boolean, from the same slot. .z is
++// stored minus one, so it is an EXACT 0.0 on the stock path and 1/PI - 1 = -0.6817 on the
++// scene-referred one; a comparison against zero is therefore exact and folds away with the
++// constant. Needed where a site wants something other than "multiply by the BRDF factor" - the
++// area lights' per-shape normalisation is not a scaling of 1/PI, it is a different constant per
++// shape (decisions/s8-light-units.md part 2).
++#define SCENE_REFERRED_LIGHT_UNITS (CV_SceneExposure.z < 0.0)
++
+ // The exposure meter's saturation point, in PRE-EXPOSED scene units: the luminance above which
+ // the incident meter stops caring how bright a texel is. 0 on the stock path, where the meter's
+ // input never carries absolute scene radiance and the stock NaN filter is right as it stands, so
+diff --git a/Engine/Shaders/HWScripts/CryFX/TiledShading.cfi b/Engine/Shaders/HWScripts/CryFX/TiledShading.cfi
+index 6753dc87..346b85db 100644
+--- a/Engine/Shaders/HWScripts/CryFX/TiledShading.cfi
++++ b/Engine/Shaders/HWScripts/CryFX/TiledShading.cfi
+@@ -283,7 +283,12 @@ void TiledForwardShading(in ForwardShadingAttribs attribs, inout float3 diffuseA
+ 			lightParams.lightVec = normalize(lightVec);
+ 			lightParams.illuminance = Fwd_TiledLightsShadeInfo[lightShadeInfoIdx].color.rgb;
+ 			
+-			float attenuation = GetPhysicalLightAttenuation( length( lightVec ), rcp(posRad.w), Fwd_TiledLightsShadeInfo[lightShadeInfoIdx].attenuationParams.x );
++			// The forward twin of the deferred site below: an area light on the scene-referred path
++			// keeps only the radius fadeout, because the LTC form factor Illum/Glass/HumanSkin/
++			// Terrain/MultiLayeredMaterials multiply this illuminance by already carries its 1/d^2.
++			float attenuation = (lightType == LIGHT_TYPE_REGULAR_AREA && SCENE_REFERRED_LIGHT_UNITS)
++			                    ? GetAreaLightFadeout( length( lightVec ), rcp(posRad.w) )
++			                    : GetPhysicalLightAttenuation( length( lightVec ), rcp(posRad.w), Fwd_TiledLightsShadeInfo[lightShadeInfoIdx].attenuationParams.x );
+ 			lightParams.illuminance *= attenuation;
+ 			
+ 			const float clipVolumeWeight = 1;
+@@ -976,7 +981,15 @@ void TiledDeferredShadingCS( uint3 GroupID : SV_GroupID,
+ 			{
+ 				const float clipVolumeBlendWeight = CalcClipVolumeBlendWeight(clipVolumeStencilID, clipVolumeData, clipVolumeBlendFactor, TiledLightsShadeInfo[lightIndex].stencilID);
+ 				lightVecAreaSpec = lightVec;
+-				attenuation = GetPhysicalLightAttenuation( length( lightVec ), rcp(lightAtt), TiledLightsShadeInfo[lightIndex].attenuationParams.x ) * clipVolumeBlendWeight;
++				// Area lights keep only the radius fadeout on the scene-referred path: their own
++				// inverse square is already inside the LTC form factor, and applying this one as
++				// well is CE's d^-4 area light (decisions/s8-light-units.md part 2). Ambient area
++				// lights are NOT here - they take the legacy nearest-point model in the branch
++				// above and are excluded from every part of this change.
++				if (lightType == LIGHT_TYPE_REGULAR_AREA && SCENE_REFERRED_LIGHT_UNITS)
++					attenuation = GetAreaLightFadeout( length( lightVec ), rcp(lightAtt) ) * clipVolumeBlendWeight;
++				else
++					attenuation = GetPhysicalLightAttenuation( length( lightVec ), rcp(lightAtt), TiledLightsShadeInfo[lightIndex].attenuationParams.x ) * clipVolumeBlendWeight;
+ 
+ 				lightVec = normalize( lightVec );
+ 			}
+diff --git a/Engine/Shaders/HWScripts/CryFX/shadeLib.cfi b/Engine/Shaders/HWScripts/CryFX/shadeLib.cfi
+index 2166aadb..3e59616b 100644
+--- a/Engine/Shaders/HWScripts/CryFX/shadeLib.cfi
++++ b/Engine/Shaders/HWScripts/CryFX/shadeLib.cfi
+@@ -206,6 +206,21 @@ half GetPhysicalLightAttenuation(half fDist, half fInvRadius, half fAttenuationB
+ 	return fAttenuation;
+ }
+ 
++// The area-light half of GetPhysicalLightAttenuation, for the scene-referred path only
++// (decisions/s8-light-units.md part 2). An area light gets its own inverse square from the LTC
++// form factor - E ~ A*cos*cos/d^2 - so the (r/d)^2 above is a SECOND one, and CE's area lights
++// therefore fall off as d^-4: 1.0 stop under a point light at 2 m, 5.6 stops at 10 m.
++//
++// The radius fadeout is kept, and must be: it is what makes the light reach exactly zero at its
++// clip radius, and without it an area light pops at the tile boundary (research §4 trade-off 3).
++// Squared, exactly as the stock function squares it, so the two agree at the boundary.
++half GetAreaLightFadeout(half fDist, half fInvRadius)
++{
++	const half radius = 1 / fInvRadius;
++	half fadeoutFactor = saturate((radius - fDist) * (fInvRadius / 0.2h));
++	return fadeoutFactor * fadeoutFactor;
++}
++
+ half GetSpotAttenuation(half fPdotL, half fCosAngle, half fRadius)
+ {
+ 	// Compute cosine of spot direction and light.
+@@ -703,8 +718,8 @@ float3 LTC_Disk(float3 N, float3 P, float3x3 mat, float3 points[4],
+         float v = 0.5f * sqrt(tr + 2.0f * det);
+         float e_max = (u + v);
+         float e_min = (u - v);
+-        float e_max2 = e_max * e_max; // e_max�     
+-        float e_min2 = e_min * e_min; // e_min�
++        float e_max2 = e_max * e_max; // e_max�     
++        float e_min2 = e_min * e_min; // e_min�
+ 
+         float3 V1_, V2_;
+ 
+@@ -792,6 +807,21 @@ void AreaLightLTC_GGX(float3 N, float3 V, float Gloss, float3 SpecCol, float3 po
+ 
+ 	// Early out
+     float3 center = float3((points[0].x + points[1].x) / 2, points[0].y, (points[0].z + points[2].z) / 2) - position;
++
++    // Two stock defects in that one line, fixed on the scene-referred path only because fixing
++    // them changes the stock picture (research/s8-light-units.md section 1.3, "two further defects"):
++    //
++    //  1. It takes RAW WORLD COMPONENTS, so it is the true centre only for an axis-aligned light.
++    //     A rotated rectangle gets the wrong centre. All four corners are packed for both shapes
++    //     (TiledLightVolumes.cpp builds the disc's quad from the same +-ex +-ey), so their mean is
++    //     the centre for a rectangle and for a disc alike, at any orientation.
++    //  2. `center` is NOT normalised - it is the vector to the light in metres - and the cosine
++    //     term below is a saturate() of its dot with N. Beyond about a metre that saturates to 1.0
++    //     for every light, so the area SPECULAR cosine is silently dead at any working distance and
++    //     wrong inside it.
++    if (SCENE_REFERRED_LIGHT_UNITS)
++        center = normalize((points[0] + points[1] + points[2] + points[3]) * 0.25f - position);
++
+     float3 lightNormal = cross(points[1] - points[0], points[3] - points[0]);
+     bool behindLight = dot(points[0] - position, lightNormal) < 0.0f;  
+ 
+@@ -823,15 +853,38 @@ void AreaLightLTC_GGX(float3 N, float3 V, float Gloss, float3 SpecCol, float3 po
+     float cosTheta_i = saturate(dot(center, N));
+     outSpecular *= cosTheta_i * SpecCol * F_G.x + (1.0 - SpecCol) * F_G.y;
+ 
+-    // SceneReferredSpec.md D4. The LTC integrators return a bare form factor - LTC_Rectangle ends
+-    // at `sum = len * scale` and LTC_Disk at `sum = formFactor * scale`, with no 1/PI (and no
+-    // 1/(2PI)) anywhere - so this path carries the same missing normalisation as DiffuseBRDF and
+-    // SpecularBRDF and must receive the same constant, or area lights sit 1.65 stops above point
+-    // lights on the scene-referred path. Applied once here, after the Fresnel/cosine term, so all
+-    // six callers (Illum, Glass, HumanSkin, Terrain, MultiLayeredMaterials, TiledShading's
+-    // deferred branch) are covered by one multiply. Exactly 1.0 off the switch.
+-    outDiffuse  *= SCENE_BRDF_NORM_FACTOR;
+-    outSpecular *= SCENE_BRDF_NORM_FACTOR;
++    // SceneReferredSpec.md D4, corrected by decisions/s8-light-units.md part 2.
++    //
++    // S2 applied a single SCENE_BRDF_NORM_FACTOR here, on the assumption that the LTC integrators
++    // return the same bare form factor DiffuseBRDF/SpecularBRDF do. They do not, and they do not
++    // agree with each other either:
++    //
++    //   LTC_Rectangle ends at `sum = len * scale`, and IntegrateEdgeVec returns theta*u_hat, so by
++    //   Lambert's polygon formula len = |vsum| = 2E - twice the cosine-weighted solid angle.
++    //   (Sanity check: a full hemisphere gives E = PI and len = 2*PI.) Heitz's reference LTC
++    //   divides by 2*PI to land on E/PI; CE does not divide at all.
++    //
++    //   LTC_Disk ends at `sum = formFactor * scale`, and formFactor = L1*L2*rsqrt((1+L1^2)(1+L2^2))
++    //   is the classic disc form factor, which IS E/PI exactly (hemisphere limit: formFactor -> 1
++    //   against E = PI).
++    //
++    // So CE's rectangle emits 2*PI - 2.65 stops - more than its own disc for the same authored
++    // value and the same subtended geometry, and the single 1/PI left the rectangle 1 stop hot and
++    // the disc 1.65 stops dark against a point light. The correct per-shape constant that takes
++    // both to E/PI, the same quantity DiffuseBRDF delivers, is 1/(2*PI) for the rectangle and
++    // exactly 1.0 for the disc. LTCTex_2.w is the horizon-clipping factor and is 1 for an
++    // unclipped polygon, so it is not hiding either constant.
++    //
++    // Applied once here, after the Fresnel/cosine term, so all six callers (Illum, Glass,
++    // HumanSkin, Terrain, MultiLayeredMaterials, TiledShading's deferred branch) are covered by
++    // one multiply. Exactly 1.0 off the switch, in both branches.
++    float areaNormFactor = 1.0;
++    if (SCENE_REFERRED_LIGHT_UNITS)
++        // 1/(2*PI) as a literal, not 0.5/PI: Common.cfi's PI is 3.1415, three digits short.
++        areaNormFactor = (shape == AREALIGHT_TYPE_RECTANGLE) ? 0.15915494 : 1.0;
++
++    outDiffuse  *= areaNormFactor;
++    outSpecular *= areaNormFactor;
+ }
+ 
+ // Diffuse BRDFs
+-- 
+2.47.1.windows.1
+

@@ -1,0 +1,172 @@
+From 1acdef48c198488016993235925f4dea0702a64e Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Sun, 30 Aug 2026 13:49:56 +0800
+Subject: [PATCH 115/119] fix: Sensor Clip lands inside the range the display
+ can actually show
+
+Round 3 test J2 reported that Sensor Clip 10 / 14 / 18 all look the same.
+They do, and the diagnosis found why: the wiring is correct at every step,
+but the ODT LUT's sampler does saturate() on its ACEScct input, and
+ACEScctToLinear(1.0) = 222.86 = +10.30 stops over mid grey. Everything
+brighter than that is one texel. Every clip value at or above 10.3 stops is
+bit-identical on screen, so under the old 8..20 range most of the property
+did nothing the user could see, and the default sat 3.7 stops inside the
+dead zone.
+
+'sclp' was introduced by 552318c6 (2026-08-29). It is ours, not a stock
+CRYENGINE parameter, so its default is ours to change.
+
+- Range<8,20,8,20> default 14 -> Range<4,12,4,12> default 8. Real cinema
+  sensors hold 6-8 stops above 18 % grey (ARRI ALEV III ~7.4, Sony Venice
+  ~7.5); the advertised "14+ stops" is the sensor's TOTAL range, most of it
+  below grey. 8 is a real sensor and sits 2.3 stops inside the LUT domain,
+  so it is visible.
+- ToneMapping.cpp: the console clamp 4..24 becomes 4..16. 0.18 * 2^18.5 =
+  65504 is the last finite half, so above 18.5 stops the shader's (half3)
+  cast makes the level +Inf and the min() is silently dead - the clip reads
+  as on and does nothing. The property cannot reach that, but the bus is
+  writable from the console.
+- Tooltip, README and ConsoleReference: drop the "14 matches the exposure
+  meter's ceiling" rationale. It conflated two quantities that share a unit:
+  kSceneReferredMeterCeilingStops is the METERING range, not a full well.
+  They now say what the number means - stops over mid grey at which the
+  sensor saturates, real sensors 6-8, above ~10 the display transform
+  already shows white.
+- SceneReferredLook.md gains a section on the LUT's domain being the
+  pipeline's de-facto upper clip, and a troubleshooting row for it.
+
+No shader change; the min() in HDRPostProcess.cfx was never the problem.
+The clip's other consumer, the EXR export tap, is upstream of the ODT LUT
+and carries the clipped value faithfully at any setting - a high clip is
+invisible on the monitor, not meaningless in the negative.
+
+Co-Authored-By: Claude Opus <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01A72MFkdSczncE7au9UVnmu
+---
+ .../GraphicsPipeline/ToneMapping.cpp            | 11 +++++++++--
+ .../Module/CinematicCameraComponent.h           | 17 ++++++++++-------
+ Code/CryPlugins/CinematicCamera/README.md       |  2 +-
+ .../CinematicCamera/docs/ConsoleReference.md    |  6 ++++--
+ .../CinematicCamera/docs/SceneReferredLook.md   | 11 +++++++++++
+ 5 files changed, 35 insertions(+), 12 deletions(-)
+
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.cpp
+index 67168c4f..6d6f31d6 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.cpp
+@@ -529,9 +529,16 @@ void CToneMappingStage::Execute()
+ 
+ 		// 0.18 is the one anchor the pre-exposure guarantees (spec D6), so "N stops over grey"
+ 		// is exposure-relative by construction and needs no re-tuning per scene or per lens.
+-		// Clamped to the range the property offers, and to a level that stays well inside fp16.
++		//
++		// The ceiling is 16 and not 24 because the shader casts this level to half before the
++		// min: 0.18 * 2^18.5 = 65504 is the last finite half, and one stop above that the
++		// constant arrives as +Inf and the min() is silently dead - the clip would read as
++		// "on" and do nothing. 16 keeps two and a half stops of margin under that edge. The
++		// property only offers 4..12; this guard is for the console, which can write the bus
++		// directly. (Above ~10.3 stops nothing reaches the display anyway - that is where the
++		// ODT LUT's ACEScct domain ends - but the EXR tap upstream of the LUT still carries it.)
+ 		const float fSensorClipLevel = (fSensorClipStops > 0.5f)
+-		                               ? 0.18f * powf(2.0f, clamp_tpl(fSensorClipStops, 4.0f, 24.0f))
++		                               ? 0.18f * powf(2.0f, clamp_tpl(fSensorClipStops, 4.0f, 16.0f))
+ 		                               : 0.0f;
+ 
+ 		m_passToneMapping.SetConstant(wbRow0Name, Vec4(wb.m00, wb.m01, wb.m02, fSensorClipLevel), eHWSC_Pixel);
+diff --git a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
+index 4196093e..d2715830 100644
+--- a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
++++ b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
+@@ -488,12 +488,15 @@ struct SCineExposureParams
+ 			"Scene-referred AUTO only: the darkest the camera will stop down to (high EV = closed).", 20.0f);
+ 		desc.AddMember(&SCineExposureParams::sensorClipStops,
+ 			'sclp', "SensorClipStops", "Sensor Clip (stops over grey)",
+-			"Scene-referred only: the sensor's full well. Highlights are clipped per channel at "
+-			"this many stops above mid grey, AFTER the white balance, so a clipped highlight stays "
+-			"white at every colour temperature instead of taking the balance's tint. 14 matches "
+-			"the exposure meter's own ceiling. Lower = a smaller, earlier-clipping sensor (more "
+-			"white sky), higher = more highlight headroom. The lens effects upstream - bloom, "
+-			"glare, depth of field - are deliberately NOT clipped: the lens sees the real light.", 14.0f);
++			"Scene-referred only: the stops over mid grey at which the sensor saturates. "
++			"Highlights are clipped per channel at this level, AFTER the white balance, so a "
++			"clipped highlight stays white at every colour temperature instead of taking the "
++			"balance's tint. Real sensors hold 6-8 stops over grey (the advertised '14+ stops' "
++			"is the TOTAL range, most of it BELOW grey). Above about 10 the display transform "
++			"has already turned everything white on its own, so higher values are visible only "
++			"in the EXR negative. Lower = a smaller, earlier-clipping sensor (more flat white "
++			"sky). The lens effects upstream - bloom, glare, depth of field - are deliberately "
++			"NOT clipped: the lens sees the real light.", 8.0f);
+ 	}
+ 
+ 	bool bEnableExposure = false;
+@@ -509,7 +512,7 @@ struct SCineExposureParams
+ 	Schematyc::Range<0, 100, 0, 100> meterMaxPercent = 90.0f;
+ 	Schematyc::Range<-6, 24, -6, 24> autoEVMin = -2.0f;
+ 	Schematyc::Range<-6, 24, -6, 24> autoEVMax = 20.0f;
+-	Schematyc::Range<8, 20, 8, 20> sensorClipStops = 14.0f;
++	Schematyc::Range<4, 12, 4, 12> sensorClipStops = 8.0f;
+ };
+ 
+ struct SCineDofParams
+diff --git a/Code/CryPlugins/CinematicCamera/README.md b/Code/CryPlugins/CinematicCamera/README.md
+index 4f091ed0..19298ba6 100644
+--- a/Code/CryPlugins/CinematicCamera/README.md
++++ b/Code/CryPlugins/CinematicCamera/README.md
+@@ -233,7 +233,7 @@ is deliberately inert (above).
+ | Metering Band High | 0-100 % | 90 | **Scene Referred only.** Discard everything above this percentile. 90 throws away the top decile - sky, glints, the sun itself - so panning past the sun is a non-event instead of a stop-down. 100 keeps everything. The camera exposes so that the log-mean of what is **left** between the two lands on mid grey. Deliberately not Unreal's 10/90, which exists to make its histogram agree with its mean; the mean is the thing this replaces. |
+ | Auto Exposure EV Min | -6 to 24 | -2.0 | **Scene Referred only.** The brightest the camera will open up to (low EV = open). |
+ | Auto Exposure EV Max | -6 to 24 | 20.0 | **Scene Referred only.** The darkest the camera will stop down to (high EV = closed). |
+-| Sensor Clip (stops over grey) | 8-20 | 14.0 | **Scene Referred only.** The sensor's full well. Highlights are clipped per channel at this many stops above mid grey, **after** the white balance, so a clipped highlight stays white at every colour temperature instead of taking the balance's tint - which is what every RAW converter does and why a blown sky in a real camera is white and not blue. 14 matches the exposure meter's own ceiling. Lower = a smaller, earlier-clipping sensor (more flat white sky); higher = highlight colour and structure a long way up. The lens effects upstream - bloom, glare, diffraction, depth of field - are deliberately **not** clipped: the lens sees the real light, so a sun a hundred thousand times over the clip still throws a flare that says so. |
++| Sensor Clip (stops over grey) | 4-12 | 8.0 | **Scene Referred only.** The stops over mid grey at which the sensor saturates. Highlights are clipped per channel at this level, **after** the white balance, so a clipped highlight stays white at every colour temperature instead of taking the balance's tint - which is what every RAW converter does and why a blown sky in a real camera is white and not blue. Real cinema sensors hold **6-8 stops over grey** (ARRI ALEV III about 7.4, Sony Venice about 7.5; the advertised "14+ stops" is the sensor's TOTAL range, most of it *below* grey). Above about **10** the display transform has already turned everything white on its own - the ODT LUT's ACEScct domain ends at +10.3 stops - so higher values change only the EXR negative, never the picture. Lower = a smaller, earlier-clipping sensor (more flat white sky); higher = highlight colour and structure further up, until the display transform runs out. The lens effects upstream - bloom, glare, diffraction, depth of field - are deliberately **not** clipped: the lens sees the real light, so a sun a hundred thousand times over the clip still throws a flare that says so. |
+ 
+ ### Depth Of Field
+ 
+diff --git a/Code/CryPlugins/CinematicCamera/docs/ConsoleReference.md b/Code/CryPlugins/CinematicCamera/docs/ConsoleReference.md
+index 2549aece..d458dab4 100644
+--- a/Code/CryPlugins/CinematicCamera/docs/ConsoleReference.md
++++ b/Code/CryPlugins/CinematicCamera/docs/ConsoleReference.md
+@@ -261,8 +261,10 @@ can never be proved complete.
+ 
+ 2^15 rather than 2^16: 65536 is not representable in fp16, so a writer clamped "at 2^16" would
+ still store `Inf`. 2^15 leaves one doubling of headroom for the blends that follow. In stops it is
+-17.5 over mid grey, against the camera's own **Sensor Clip** at 14 - so the buffer can hold three
+-and a half stops more than the picture can ever show. Setting this to 0 is the way to *see* the
++17.5 over mid grey, against the camera's own **Sensor Clip** at 8 - so the buffer can hold nine and
++a half stops more than the sensor keeps, and seven more than the display transform can show at all
++(its ACEScct LUT domain ends at +10.3 stops over grey). That headroom is for the lens, which runs
++upstream of both and does need the real number. Setting this to 0 is the way to *see* the
+ overflow it exists to prevent (a flat white "bun" where the sun should be, and sun shafts over the
+ whole screen).
+ 
+diff --git a/Code/CryPlugins/CinematicCamera/docs/SceneReferredLook.md b/Code/CryPlugins/CinematicCamera/docs/SceneReferredLook.md
+index a1f8cddf..bcb31cda 100644
+--- a/Code/CryPlugins/CinematicCamera/docs/SceneReferredLook.md
++++ b/Code/CryPlugins/CinematicCamera/docs/SceneReferredLook.md
+@@ -53,6 +53,16 @@ Code/CryPlugins/CinematicCamera/Assets/ODT/
+     lmt_identity_33.cube                  a pass-through look, for proving the plumbing
+ ```
+ 
++### The LUT's domain is the real upper clip
++
++Everything the ODT sees is ACEScct, and `ACEScctToLinear(1.0) = 222.86` - **+10.3 stops over mid
++grey**. The 3D LUT is sampled with a `saturate()` on its input, so every scene value above that
++lands on the same corner texel: one flat display white, per channel. That is a property of the
++shaper, not of the tonescale, and it sets a hard ceiling on what any control upstream can express
++on screen. In particular **Sensor Clip** above ~10 stops is invisible in the picture (it still
++shapes the EXR tap, which is taken before the LUT). If highlight separation above +10.3 stops is
++ever wanted on the display, the lever is the **shaper range** of the baked cube, not the sensor.
++
+ ### Installing them
+ 
+ The plugin resolves a LUT path through the pak system: **first as given**, relative to the
+@@ -190,6 +200,7 @@ effects.
+ | a global colour cast that will not go away | **Tint** or **Offset** left off neutral; or a look LUT still in the slot |
+ | the whole picture is too bright or too dark | that is exposure, not grading - the **Exposure** group, and `r_HDRDebug 1` for the applied and metered EV |
+ | a stock slider does nothing | expected; see section 5 |
++| **Sensor Clip** changes nothing at high values | expected above ~10 stops - the ODT LUT's domain ends at +10.3 and clips there first. Work in 4-8, where a real sensor lives |
+ | it looks different from before the switch | expected; the level is lit for one path or the other. See [SceneReferredContent.md](SceneReferredContent.md) |
+ 
+ `r_SceneReferredDebug 1` skips the working-space conversion so you can A/B the primaries change on
+-- 
+2.47.1.windows.1
+

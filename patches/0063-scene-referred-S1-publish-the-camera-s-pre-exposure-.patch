@@ -1,0 +1,376 @@
+From c553113d0b62950397239bb3afcd53ab2da0abd4 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Fri, 28 Aug 2026 06:47:29 +0800
+Subject: [PATCH 063/119] scene-referred S1: publish the camera's pre-exposure
+ and latch it once per render view
+
+First item of Stage S1. It builds the road the exposure travels on - bus parameter, render-thread
+latch, the five m_fAdaptedSceneScaleLBuffer sites - and deliberately drives 1.0 down it, so the
+picture is byte-identical to S0. Item 2 puts the real number in and drops the tone map's own
+ComputeExposure() in the same commit, because changing either one alone is a frame of double (or
+zero) exposure.
+
+Decision: scene-notes/decisions/s1-exposure-publication.md, approach A (the post-effect bus).
+Research: scene-notes/research/s1-adapted-scene-scale.md sections 1, 2 and 6.
+
+- Global_User_SceneExposure, an AddParamFloatNoTransition next to S0's Global_User_SceneReferred.
+  Default and reset value 1.0f, not 0.0f: a missing publication has to be a no-op. Resolved once
+  at Init() and read through CPostEffectsMgr::GetSceneExposureParam(), the same shape S0's review
+  gave the request, and nulled in Release() with it. No transition, because blending two exposures
+  on the way to a new value is a fade the camera never asked for.
+
+- Approach A verified rather than assumed, which was the open item in the decision note.
+  CParamFloat holds one value per command buffer (m_threadSafeData[RT_COMMAND_BUF_COUNT]) and
+  CParamFloat::SyncMainWithRender() copies fill -> process at the frame boundary. So the value the
+  render thread reads is the one ccam published for that frame and it cannot move under a frame in
+  flight. Approach B (E3DPARAM + S3DEngineCommon) was not needed.
+
+- The latch is CD3D9Renderer::LatchSceneReferredExposure(), called from RT_RenderScene() at the
+  point where the engine already resets m_fAdaptedSceneScaleLBuffer to 1.0f, immediately before
+  the graphics-pipeline scope - so it precedes CGraphicsPipeline::Update() (which builds the
+  per-view constant buffer that item 3 will use) and Execute() (which builds the light lists).
+  It writes m_fSceneReferredExposure[GetRenderThreadID()] and assigns
+  m_fAdaptedSceneScaleLBuffer from it. Off the switch it writes the same 1.0f the line above it
+  just wrote, so the stock path is unchanged; the five consumer sites are not edited at all.
+  A per-view latch, not a per-frame one, is also what stereo and the editor's extra viewports
+  need: one value for the whole view, no live bus read from inside a stage. That is the hazard the
+  research note documents - the sun and the tiled lights are packed in CTiledLightVolumesStage
+  while the fog lights are packed in CVolumetricFogStage, and a scalar that is the whole image's
+  brightness must not differ between them.
+
+- Probes: decisions/s1-probe-exposure.md approach A is implemented here rather than left to S2,
+  because it is one line at the latch. SHDF_CUBEMAPGEN forces the exposure to 1.0, so cube maps
+  always store unexposed radiance in engine units and the tint multiply the hook already performs
+  exposes them exactly once at sample time. Without it the factor would be squared, and BC6UH is
+  unsigned so nothing could carry a compensation back in. This supersedes spec D3's "exclude
+  probes from the hook" wording; the spec text is amended in item 5.
+
+- Published values are validated at the latch (finite, positive, clamped to [1e-12, 1e12]): a zero
+  scale would black the frame out with no error anywhere and an infinity would poison the
+  luminance measure. No reachable EV100 in [-6, 24] comes near either end.
+
+- ccam gains ApplySceneExposure() / RestoreSceneExposure() and
+  ComputeSceneReferredExposureScale(), wired into ENTITY_EVENT_UPDATE and
+  ENTITY_EVENT_COMPONENT_PROPERTY_CHANGED next to ApplySceneReferred() (editor-live: with the
+  scene-referred path on, the exposure is the picture), and into RestoreAllEffects() and
+  ClearSavedBaselines(). ComputeSceneReferredExposureScale() returns 1.0f in this commit.
+
+Built clean (0 errors, 0 warnings outside Code/SDKs): CryRenderD3D11, CinematicCamera.
+
+Co-Authored-By: Claude Opus <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01A72MFkdSczncE7au9UVnmu
+---
+ .../Common/PostProcess/PostProcess.cpp        |  7 +++
+ .../Common/PostProcess/PostProcess.h          | 11 ++++
+ .../RenderDll/XRenderD3D9/D3DRendPipeline.cpp | 52 +++++++++++++++++++
+ .../RenderDll/XRenderD3D9/DriverD3D.cpp       |  2 +
+ .../RenderDll/XRenderD3D9/DriverD3D.h         | 21 ++++++++
+ .../Module/CinematicCameraComponent.cpp       | 43 +++++++++++++++
+ .../Module/CinematicCameraComponent.h         | 12 +++++
+ 7 files changed, 148 insertions(+)
+
+diff --git a/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.cpp b/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.cpp
+index c96e13be..0fafc1c7 100644
+--- a/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.cpp
++++ b/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.cpp
+@@ -396,6 +396,11 @@ int CPostEffectsMgr::Init()
+ 	// The scene-referred request. No transition: it is a switch, not a value to fade.
+ 	AddParamFloatNoTransition("Global_User_SceneReferred", m_pUserSceneReferred, 0.0f);
+ 
++	// The pre-exposure that goes with it: a linear scale in engine units, 1.0 = unexposed.
++	// No transition either - blending two exposures on the way to a new value would be the
++	// renderer inventing a fade the camera never asked for.
++	AddParamFloatNoTransition("Global_User_SceneExposure", m_pUserSceneExposure, 1.0f);
++
+ 	// Register all post processes
+ 	AddEffect(CSunShafts);
+ 	AddEffect(CDepthOfField);
+@@ -504,6 +509,7 @@ void CPostEffectsMgr::Release()
+ 	// The map owns the params, so every cached CEffectParam* is dangling from here on.
+ 	// GetSceneReferredParam() is read from outside this class, so at least ours is cleared.
+ 	m_pUserSceneReferred = nullptr;
++	m_pUserSceneExposure = nullptr;
+ 
+ 	std::for_each(m_pEffects.begin(), m_pEffects.end(), container_object_safe_release());
+ 	std::for_each(m_pEffects.begin(), m_pEffects.end(), container_object_safe_delete());
+@@ -543,6 +549,7 @@ void CPostEffectsMgr::Reset(bool bOnSpecChange)
+ 	m_pUserColorK->ResetParam(0.0f);
+ 	m_pUserColorHue->ResetParam(0.0f);
+ 	m_pUserSceneReferred->ResetParam(0.0f);
++	m_pUserSceneExposure->ResetParam(1.0f);
+ 
+ 	if (bOnSpecChange)
+ 		std::for_each(m_pEffects.begin(), m_pEffects.end(), SContainerPostEffectResetOnSpecChange());
+diff --git a/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.h b/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.h
+index c3894151..7cc530c5 100644
+--- a/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.h
++++ b/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.h
+@@ -452,6 +452,7 @@ public:
+ 		, m_pUserColorK(nullptr)
+ 		, m_pUserColorHue(nullptr)
+ 		, m_pUserSceneReferred(nullptr)
++		, m_pUserSceneExposure(nullptr)
+ 	{
+ 		ClearCache();
+ #ifndef _RELEASE
+@@ -524,6 +525,10 @@ public:
+ 	//! read costs nothing. Null before Init() and after Release().
+ 	CEffectParam* GetSceneReferredParam() const { return m_pUserSceneReferred; }
+ 
++	//! The scene-referred pre-exposure scale for this frame, resolved once at Init() for the same
++	//! reason as the request above. Null before Init() and after Release().
++	CEffectParam* GetSceneExposureParam() const { return m_pUserSceneExposure; }
++
+ 	// Given a string returns containing value if exists, else returns 0
+ 	float GetByNameF(const char* pszParam);
+ 	Vec4  GetByNameVec4(const char* pszParam);
+@@ -627,6 +632,12 @@ protected:
+ 	// per-frame request. Nothing else in the engine writes it, so with the component off the
+ 	// renderer takes the stock branches. Read through CRendererResources::IsSceneReferred().
+ 	CEffectParam*       m_pUserSceneReferred;
++	// The scene-referred pre-exposure the Cinematic Camera published for this frame: a LINEAR
++	// scale in engine units (1.0 = unexposed), not an EV. It travels next to the request above
++	// and for the same reasons; the renderer latches it once per render view
++	// (CD3D9Renderer::LatchSceneReferredExposure) and no stage ever reads it live.
++	// Its default and reset value is 1.0f, not 0.0f: a missing publication must be a no-op.
++	CEffectParam*       m_pUserSceneExposure;
+ 	CEffectParam*       m_pUserColorC, * m_pUserColorY, * m_pUserColorM, * m_pUserColorK, * m_pUserColorHue;
+ 
+ 	CPostEffectVec      m_pEffects;
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/D3DRendPipeline.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/D3DRendPipeline.cpp
+index 0ab04c5d..bc0c60a4 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/D3DRendPipeline.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/D3DRendPipeline.cpp
+@@ -561,6 +561,51 @@ void CD3D9Renderer::RT_PostRenderScene(CRenderView* pRenderView)
+ 	m_maskRenderPhaseLog[m_SceneRecurseCount - 1] |= eRP_PostRenderScene;
+ }
+ 
++// Scene-referred pre-exposure, latched once per render view (SceneReferredSpec.md D3,
++// decisions/s1-exposure-publication.md approach A).
++//
++// The Cinematic Camera computes the exposure on the MAIN thread, after ITimeOfDay::Update(), and
++// publishes it as a linear scale on the post-effect parameter bus. CParamFloat keeps one slot per
++// command buffer and SyncMainWithRender() copies fill -> process at the frame boundary, so the
++// value this reads is the one ccam asked for for THIS frame and it cannot move underneath a frame
++// already in flight. That is the property the bus was chosen for.
++//
++// It still has to be latched: the five m_fAdaptedSceneScaleLBuffer consumers run at different
++// points of the frame (CTiledLightVolumesStage, CRenderView::GetSunLightColor, CClipVolumesStage,
++// CVolumetricFogStage), and a scalar that is the whole image's brightness must not differ between
++// them. One read here, one assignment, and every consumer downstream reads the member.
++void CD3D9Renderer::LatchSceneReferredExposure(uint32 shaderRenderingFlags)
++{
++	float exposure = 1.0f;
++
++	// Probes are baked at unity exposure and exposed exactly once at sample time, by the tint
++	// multiply the hook already performs on the cubemap's light colour. Exposing the capture too
++	// would square the factor, and BC6UH cannot carry a compensating value back in - so cube-map
++	// generation always renders unexposed radiance in engine units, whatever the camera is doing.
++	// decisions/s1-probe-exposure.md approach A; it supersedes spec D3's "exclude probes from the
++	// hook" wording.
++	const bool bCubemapGen = (shaderRenderingFlags & SHDF_CUBEMAPGEN) != 0;
++
++	if (!bCubemapGen && CRendererResources::IsSceneReferred())
++	{
++		if (CPostEffectsMgr* pPostMgr = PostEffectMgr())
++		{
++			if (CEffectParam* pExposure = pPostMgr->GetSceneExposureParam())
++			{
++				// A zero or negative scale would black the frame out with no error anywhere, and
++				// an infinity would poison the luminance measure; the window is wide enough that
++				// no reachable EV100 in [-6, 24] comes near either end.
++				const float published = pExposure->GetParam();
++				if (published > 0.0f && NumberValid(published))
++					exposure = clamp_tpl(published, 1e-12f, 1e12f);
++			}
++		}
++	}
++
++	m_fSceneReferredExposure[GetRenderThreadID()] = exposure;
++	m_fAdaptedSceneScaleLBuffer = exposure;
++}
++
+ // Render thread only scene rendering
+ void CD3D9Renderer::RT_RenderScene(CRenderView* pRenderView)
+ {
+@@ -606,6 +651,13 @@ void CD3D9Renderer::RT_RenderScene(CRenderView* pRenderView)
+ 	m_vSceneLuminanceInfo = Vec4(1.0f, 1.0f, 1.0f, 1.0f);
+ 	m_fAdaptedSceneScale  = m_fAdaptedSceneScaleLBuffer = m_fScotopicSceneScale = 1.0f;
+ 
++	// ...and immediately re-assign the L-buffer scale from the camera's pre-exposure for this
++	// frame. Off the scene-referred path this writes the same 1.0f the line above just wrote, so
++	// the stock pipeline is unchanged. This is the only place the value is set for a frame; it
++	// runs before the graphics pipeline scope below, so it precedes Update() (which builds the
++	// per-view constant buffer) and Execute() (which builds the light lists).
++	LatchSceneReferredExposure(shaderRenderingFlags);
++
+ 	// This scope is the only one allowed to utilize the graphics pipeline
+ 	{
+ 		CRY_ASSERT(shaderRenderingFlags & SHDF_ALLOWHDR);
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/DriverD3D.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/DriverD3D.cpp
+index 741f5ea4..9c48bde9 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/DriverD3D.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/DriverD3D.cpp
+@@ -125,6 +125,8 @@ void CD3D9Renderer::InitRenderer()
+ 	m_CharCBAllocated = 0;
+ 	m_vSceneLuminanceInfo = Vec4(1.f, 1.f, 1.f, 1.f);
+ 	m_fScotopicSceneScale = m_fAdaptedSceneScale = m_fAdaptedSceneScaleLBuffer = 1.0f;
++	for (int i = 0; i < RT_COMMAND_BUF_COUNT; i++)
++		m_fSceneReferredExposure[i] = 1.0f;
+ 
+ 	for (int i = 0; i < SHAPE_MAX; i++)
+ 	{
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/DriverD3D.h b/Code/CryEngine/RenderDll/XRenderD3D9/DriverD3D.h
+index bc1ba785..8c7fba9b 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/DriverD3D.h
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/DriverD3D.h
+@@ -252,6 +252,17 @@ public:
+ 	virtual void RT_Reset() final;
+ 	virtual void RT_PreRenderScene(CRenderView* pRenderView) final;
+ 	virtual void RT_RenderScene(CRenderView* pRenderView) final;
++
++	//! Copy the frame's scene-referred exposure request off the post-effect bus into
++	//! m_fSceneReferredExposure[render thread] and assign m_fAdaptedSceneScaleLBuffer from it.
++	//! Called once per render view from RT_RenderScene(), before the graphics pipeline scope, so
++	//! every consumer in the frame sees one value. Writes 1.0f when the scene-referred path is
++	//! not taken and for cube-map generation (probes are baked at unity exposure and exposed once
++	//! at sample time through the tint hook - decisions/s1-probe-exposure.md approach A).
++	void         LatchSceneReferredExposure(uint32 shaderRenderingFlags);
++
++	//! The latched pre-exposure for the render thread's current frame. 1.0f off the switch.
++	float        GetSceneReferredExposure() const { return m_fSceneReferredExposure[GetRenderThreadID()]; }
+ 	virtual void RT_PostRenderScene(CRenderView* pRenderView) final;
+ 
+ 	virtual void RT_ReleaseRenderResources(uint32 nFlags) final;
+@@ -698,6 +709,16 @@ public:
+ 	float              m_fAdaptedSceneScale;
+ 	float              m_fAdaptedSceneScaleLBuffer;
+ 
++	// Scene-referred pre-exposure (SceneReferredSpec.md D3, decisions/s1-exposure-publication.md
++	// approach A). The linear scale the Cinematic Camera published on the post-effect bus for
++	// THIS frame, latched once per render view on the render thread by
++	// LatchSceneReferredExposure() and never read live from the bus by a stage: the five
++	// m_fAdaptedSceneScaleLBuffer sites run at different points of the frame (tiled lights vs
++	// volumetric fog) and a value that moved between them would tear the image's brightness.
++	// Exactly 1.0f whenever CRendererResources::IsSceneReferred() is false, so the stock path
++	// keeps the value every engine initialiser writes.
++	float              m_fSceneReferredExposure[RT_COMMAND_BUF_COUNT];
++
+ 	int                m_MaxAnisotropyLevel;
+ 	SamplerStateHandle m_nMaterialAnisoHighSampler;
+ 	SamplerStateHandle m_nMaterialAnisoLowSampler;
+diff --git a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp
+index 206141d2..6add58ba 100644
+--- a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp
++++ b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp
+@@ -163,6 +163,7 @@ void CCinematicCameraComponent::ProcessEvent(const SEntityEvent& event)
+ 		ApplyViewfinder();
+ 		// The scene-referred switch changes the whole picture, so it is editor-live too.
+ 		ApplySceneReferred();
++		ApplySceneExposure();
+ 		// DOF is a game-mode effect; don't apply in the editor.
+ 		if (!gEnv->IsEditing() && m_dof.bEnableDOF)
+ 			ApplyDOF();
+@@ -197,6 +198,7 @@ void CCinematicCameraComponent::ProcessEvent(const SEntityEvent& event)
+ 		ApplyLensCharacter();
+ 		ApplyViewfinder();
+ 		ApplySceneReferred();
++		ApplySceneExposure();
+ 		break;
+ 
+ 	case ENTITY_EVENT_RESET:
+@@ -326,6 +328,7 @@ void CCinematicCameraComponent::RestoreAllEffects()
+ 	RestoreWhiteBalance();
+ 	RestoreLensCharacter();
+ 	RestoreSceneReferred();
++	RestoreSceneExposure();
+ 	RestoreViewfinder();
+ 	RestoreStreaks();
+ 	RestoreHalation();
+@@ -343,6 +346,7 @@ void CCinematicCameraComponent::ClearSavedBaselines()
+ 	m_bWBParamsSaved       = false;
+ 	m_bLensCharSaved       = false;
+ 	m_bSceneReferredSaved  = false;
++	m_bSceneExposureSaved  = false;
+ 	m_bSpriteBokehSaved    = false;
+ 	m_bBokehShapeTexPushed = false;
+ 	m_bMBParamsSaved       = false;
+@@ -1187,6 +1191,45 @@ void CCinematicCameraComponent::RestoreSceneReferred()
+ 	m_bSceneReferredSaved = false;
+ }
+ 
++// The pre-exposure itself. It travels on the same bus as the request, in the same save/restore
++// latch, and it is published every frame the component can drive render state - including in the
++// editor, because with the scene-referred path on the exposure IS the picture.
++//
++// S1 item 1 publishes UNITY and nothing else: this commit is the plumbing (bus parameter, the
++// render-thread latch, the five m_fAdaptedSceneScaleLBuffer sites), so the picture must not move
++// yet. Item 2 replaces the body of ComputeSceneReferredExposureScale() with the real
++// 1 / L_sat(EV100) and drops the tone map's own ComputeExposure() on the same path, which is the
++// only way to change the two together without a frame of double exposure.
++void CCinematicCameraComponent::ApplySceneExposure()
++{
++	// Single writer, exactly as for the request.
++	if (!CanDriveRenderState())
++		return;
++
++	if (!m_bSceneExposureSaved)
++	{
++		gEnv->p3DEngine->GetPostEffectParam("Global_User_SceneExposure", m_savedSceneExposure);
++		m_bSceneExposureSaved = true;
++	}
++
++	gEnv->p3DEngine->SetPostEffectParam("Global_User_SceneExposure", ComputeSceneReferredExposureScale());
++}
++
++void CCinematicCameraComponent::RestoreSceneExposure()
++{
++	if (!m_bSceneExposureSaved)
++		return;
++
++	gEnv->p3DEngine->SetPostEffectParam("Global_User_SceneExposure", m_savedSceneExposure);
++	m_bSceneExposureSaved = false;
++}
++
++// The scale the renderer multiplies scene light by. Unity for now - see ApplySceneExposure().
++float CCinematicCameraComponent::ComputeSceneReferredExposureScale() const
++{
++	return 1.0f;
++}
++
+ // Viewfinder overlays: frame guides and focus peaking. These are monitor markings, never part
+ // of the picture, so they are editor-live like the lens character and default to editor-only -
+ // a recording made in game mode is clean unless Overlays In Game Mode says otherwise.
+diff --git a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
+index 3dd91852..a69d5ed3 100644
+--- a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
++++ b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
+@@ -991,6 +991,13 @@ private:
+ 	//! whole picture, so it has to be visible while the properties are being tuned.
+ 	void ApplySceneReferred();
+ 	void RestoreSceneReferred();
++	//! The camera's pre-exposure for this frame, published as a linear scale next to the request
++	//! above (Global_User_SceneExposure). Editor-live for the same reason.
++	void ApplySceneExposure();
++	void RestoreSceneExposure();
++	//! The linear scale the renderer must multiply scene light by so that this camera's EV100
++	//! renders correctly. 1.0 when the scene-referred path is not requested.
++	float ComputeSceneReferredExposureScale() const;
+ 	void ApplyStreaks();
+ 	void RestoreStreaks();
+ 	void ApplyHalation();
+@@ -1117,6 +1124,11 @@ private:
+ 	float m_savedSceneReferred  = 0.f;
+ 	bool  m_bSceneReferredSaved = false;
+ 
++	// Pre-exposure saved state (Global_User_SceneExposure post param). Same story: unknown to an
++	// unmodified renderer. The neutral value is 1.0, not 0.
++	float m_savedSceneExposure  = 1.f;
++	bool  m_bSceneExposureSaved = false;
++
+ 	// Sprite bokeh saved state (r_DepthOfFieldMode cvar + Dof_User_BokehShapeTex post param).
+ 	// Unknown to an unmodified renderer, where the read returns nothing and the writes are dropped.
+ 	int    m_savedDofModeCVar  = 1;
+-- 
+2.47.1.windows.1
+

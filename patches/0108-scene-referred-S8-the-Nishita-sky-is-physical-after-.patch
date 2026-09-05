@@ -1,0 +1,404 @@
+From d79cd7b7a586bbd0c9c2218b30e51ed0310e432e Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Sat, 29 Aug 2026 03:19:26 +0800
+Subject: [PATCH 108/119] scene-referred S8: the Nishita sky is physical after
+ all, and 0.37 is derived
+
+The note this replaces said the procedural sky's scale could not be reconciled
+with the photometric one from source. It can. The model's phase functions are
+normalised to mean 1 over the sphere and pair exactly with a 4*PI*K extinction,
+so K is a scattering coefficient over 4*PI and the integral the engine evaluates
+is the single-scattering integral with nothing missing. Its output therefore
+carries whatever unit the sun intensity carries, and the renderer reads that
+output as an engine radiance - so 1.0 of the dome is 10 000 cd/m2 like everything
+else, and the "Sun intensity multiplier" is in units of 10 000 lux of
+top-of-atmosphere illuminance. The shipped 50 asserts 500 000 lux against a
+physical 133 000: 1.91 stops hot, and that one number is the whole discrepancy.
+The scattering coefficients are 2.37x hot in all three channels at once, so the
+dome's hue was always right and only its level was wrong.
+
+r_SceneReferredNishitaScale therefore defaults to 0.37 = 12 000 / 32 000, and the
+anchor is illuminance rather than zenith luminance because that is what
+r_HDRDebug 1 measures, what lights the scene, what a probe bake integrates, and
+what flattens the sun/shade ratio when it is too high. The residual - a zenith
+about 1.9 stops under a bright-hazy sky - is the single-scattering model's own
+error and is documented rather than tuned away, because the two anchors are 1.9
+stops apart and one scalar cannot satisfy both.
+
+The cvar also gains an on-change callback that forces a full dome recompute.
+Without it the factor is consumed only when the time of day pushes a new
+condition, and the dome is then rebuilt at 0.12 PER CENT of its texels per frame
+- two texels, about 1024 frames, seventeen seconds - so typing a value at the
+console would appear to do nothing and the calibration loop would be unusable.
+
+And the sky pass gets a ceiling of its own, r_SceneReferredSkyPeakLuminance,
+default 1.6e9 cd/m2: the physical solar disc, converted to engine units and
+pre-exposed on the CPU, held under the writer clamp. The writer clamp is a fixed
+number in EXPOSED units, so the real-world luminance it stands for moves with the
+aperture - 1.1e9 cd/m2 at midday, 1.6e5 at night - which is right as an overflow
+guard and wrong as physics. It bounds an approximation and says so: the dome has
+no sun sprite, what reads as the sun is the Mie lobe, and capping that at disc
+radiance still spreads disc luminance over degrees.
+
+The calibration doc's section 2 is rewritten around the derivation, the
+measurement that confirms it, the probe staleness the _rec stamp does not catch,
+and the trap that a probe's Diffuse multiplier scales its BLEND WEIGHT, not its
+brightness. ReC_Physical.env deliberately keeps the shipped multiplier of 50: the
+preset-side equivalent is 18.5 with the cvar at 1.0, and doing both would be 1.4
+stops dark.
+
+research/s8-nishita-sky.md, decisions/s8-sky-and-probes.md part 1 approach A.
+
+Co-Authored-By: Claude Opus <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01A72MFkdSczncE7au9UVnmu
+---
+ .../RenderDll/Common/RendererCVars.cpp        | 70 ++++++++++++---
+ .../RenderDll/Common/RendererCVars.h          |  1 +
+ .../RenderDll/Common/RendererResources.cpp    | 21 +++++
+ .../RenderDll/Common/RendererResources.h      |  7 ++
+ .../XRenderD3D9/GraphicsPipeline/Sky.cpp      | 12 +++
+ .../docs/SceneReferredCalibration.md          | 85 +++++++++++++++++--
+ Engine/Shaders/HWScripts/CryFX/SkyCommon.cfi  |  4 +
+ Engine/Shaders/HWScripts/CryFX/Stars.cfx      |  9 +-
+ 8 files changed, 190 insertions(+), 19 deletions(-)
+
+diff --git a/Code/CryEngine/RenderDll/Common/RendererCVars.cpp b/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
+index c4c2ee3d..e45e9bbd 100644
+--- a/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
++++ b/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
+@@ -419,6 +419,7 @@ int CRendererCVars::CV_r_SceneReferred;
+ int CRendererCVars::CV_r_SceneReferredDebug;
+ int CRendererCVars::CV_r_SceneReferredStage;
+ float CRendererCVars::CV_r_SceneReferredNishitaScale;
++float CRendererCVars::CV_r_SceneReferredSkyPeakLuminance;
+ float CRendererCVars::CV_r_SceneReferredWriterClamp;
+ int CRendererCVars::CV_r_SceneReferredMeterHistogram;
+ int CRendererCVars::CV_r_SceneReferredExrSelfTest;
+@@ -725,6 +726,27 @@ static void OnChange_CV_r_SceneReferredExrSelfTest(ICVar* pCVar)
+ 		ExrSelfTest();
+ }
+ 
++//! r_SceneReferredNishitaScale: the factor is consumed in CSkyLightManager::SetSkyDomeCondition,
++//! which only runs when the time of day actually pushes a NEW condition - and even then the dome
++//! is rebuilt incrementally at e_SkyUpdateRate, 0.12 PER CENT of its 64x32 texels per frame. That
++//! is two texels a frame, about 1024 frames, roughly 17 seconds. Without this callback, typing a
++//! new value at the console does nothing at all until some other TOD parameter happens to move,
++//! and then crossfades for a quarter of a minute - which reads as "the cvar is broken" and makes
++//! the calibration loop of docs/SceneReferredCalibration.md 2 unusable.
++//!
++//! ITimeOfDay::Update(bInterpolate, bForceUpdate) is the route: bForceUpdate reaches
++//! SetSkyLightParameters(..., forceImmediateUpdate) and from there CSkyLightManager::FullUpdate(),
++//! which computes the whole dome in one go. This is the same mechanism the convention flip already
++//! uses (CCinematicCameraComponent::PublishSceneReferredConvention).
++static void OnChange_CV_r_SceneReferredNishitaScale(ICVar* /*pCVar*/)
++{
++	if (!gEnv || !gEnv->p3DEngine)
++		return;
++
++	if (ITimeOfDay* pTOD = gEnv->p3DEngine->GetTimeOfDay())
++		pTOD->Update(true, true);
++}
++
+ // ---------------------------------------------------------------------------------------------
+ // The EXR capture's user surface (SceneReferredSpec.md S6 item 3). Commands rather than a cvar,
+ // because arming a capture takes arguments and because `capture_frames` has already demonstrated
+@@ -1770,17 +1792,45 @@ void CRendererCVars::InitCVars()
+ 	               "being applied to what we think it is. r_HDRDebug 3 runs the same test at the "
+ 	               "END of the post chain instead, after depth of field, the glare family and "
+ 	               "motion blur.");
+-	REGISTER_CVAR3("r_SceneReferredNishitaScale", CV_r_SceneReferredNishitaScale, 1.0f, VF_NULL,
++	REGISTER_CVAR3_CB("r_SceneReferredNishitaScale", CV_r_SceneReferredNishitaScale, 0.37f, VF_NULL,
+ 	               "Calibration factor on the procedural (Nishita) sky's sun intensity, applied ONLY "
+-	               "while the scene-referred path is active. The Nishita dome carries a third, "
+-	               "undocumented brightness scale that cannot be reconciled with the photometric one "
+-	               "from source - RENDERER_LIGHT_UNIT_SCALE appears nowhere in the SkyLight files - so "
+-	               "the honest answer is to measure it rather than derive it. The procedure is in "
+-	               "Code/CryPlugins/CinematicCamera/docs/SceneReferredCalibration.md: put an 18 % patch "
+-	               "under a Nishita-only sky, read the illuminance off r_HDRDebug 1, and set this to "
+-	               "the ratio that brings it to a real clear-sky diffuse value (about 12 000 lux with "
+-	               "the sun at 45 degrees). 1.0 = uncalibrated (default), which is the shipped "
+-	               "behaviour and changes nothing.");
++	               "while the scene-referred path is active. The dome is NOT unitless: its phase "
++	               "functions are normalised to mean 1 over the sphere and pair exactly with a 4*PI "
++	               "extinction, so 1.0 of its output is 10 000 cd/m2 like everything else and the "
++	               "'Sun intensity multiplier' is implicitly in units of 10 000 lux of "
++	               "top-of-atmosphere illuminance. The shipped 50 therefore asserts 500 000 lux "
++	               "against a physical 133 000 - 1.9 stops hot. Anchored on ILLUMINANCE, because "
++	               "that is what r_HDRDebug 1 measures, what lights the scene and what a probe bake "
++	               "integrates, the default is 12 000 / 32 000 = 0.37: it takes the dome's predicted "
++	               "sky illuminance at a 45-degree sun from about 32 000 lux to a physical 12 000, "
++	               "and its zenith to about 2 100 cd/m2. The residual - a zenith about 1.9 stops "
++	               "under a bright-hazy 8 000 - is the single-scattering model's own error, not this "
++	               "constant's, and it is documented rather than tuned away. 1.0 restores the shipped "
++	               "dome. Changing this forces a full dome recompute; the derivation and the "
++	               "confirming measurement are in "
++	               "Code/CryPlugins/CinematicCamera/docs/SceneReferredCalibration.md 2. "
++	               "NOTE: every environment probe baked under the dome is stale by exactly this "
++	               "factor and the _rec stamp does not catch it - re-bake.",
++	               OnChange_CV_r_SceneReferredNishitaScale);
++
++	REGISTER_CVAR3("r_SceneReferredSkyPeakLuminance", CV_r_SceneReferredSkyPeakLuminance, 1.6e9f, VF_NULL,
++	               "The physical solar-disc luminance, in cd/m2, used as the sky pass's ceiling on "
++	               "the scene-referred path. 1.6e9 is the disc above the atmosphere; at the ground "
++	               "it is about 1.5e9. 0 = off, and the sky then falls back to "
++	               "r_SceneReferredWriterClamp alone. "
++	               "Why a second ceiling: the writer clamp is expressed in EXPOSED units, so the "
++	               "real-world luminance it implies moves with the aperture - 1.1e9 cd/m2 at a "
++	               "midday EV, 1.6e5 at a night one. That is correct as an overflow guard and wrong "
++	               "as physics, and 'anything expressed against a fixed number in exposed units is a "
++	               "display-referred number in disguise' is the fault this pipeline keeps finding. "
++	               "This one is converted to engine units and pre-exposed on the CPU, so the disc "
++	               "means the same real brightness at every aperture, and the writer clamp is still "
++	               "applied on top so the format is never overrun. "
++	               "It bounds an APPROXIMATION and should be read as one: the dome has no sun sprite "
++	               "at all - what looks like the sun IS the Mie forward-scattering lobe, whose peak "
++	               "is unbounded in the 'Sun anisotropy factor' by construction - so capping it at "
++	               "disc radiance still spreads solar-disc luminance over degrees. The real cure is "
++	               "a physical asymmetry factor plus a real sun sprite.");
+ 	REGISTER_CVAR3("r_SceneReferredWriterClamp", CV_r_SceneReferredWriterClamp, 32768.0f, VF_NULL,
+ 	               "The ceiling every scene-referred WRITER is held to, in exposed engine units, "
+ 	               "and the ceiling the 709->AP1 conversion enforces on the whole HDR target. "
+diff --git a/Code/CryEngine/RenderDll/Common/RendererCVars.h b/Code/CryEngine/RenderDll/Common/RendererCVars.h
+index d106405b..8fdbda85 100644
+--- a/Code/CryEngine/RenderDll/Common/RendererCVars.h
++++ b/Code/CryEngine/RenderDll/Common/RendererCVars.h
+@@ -418,6 +418,7 @@ public:
+ 	static int   CV_r_SceneReferredDebug;
+ 	static int   CV_r_SceneReferredStage;
+ 	static float CV_r_SceneReferredNishitaScale;
++	static float CV_r_SceneReferredSkyPeakLuminance;
+ 	static float CV_r_SceneReferredWriterClamp;
+ 	static int   CV_r_SceneReferredMeterHistogram;
+ 	static int   CV_r_SceneReferredExrSelfTest;
+diff --git a/Code/CryEngine/RenderDll/Common/RendererResources.cpp b/Code/CryEngine/RenderDll/Common/RendererResources.cpp
+index 8fe017db..1ea3577d 100644
+--- a/Code/CryEngine/RenderDll/Common/RendererResources.cpp
++++ b/Code/CryEngine/RenderDll/Common/RendererResources.cpp
+@@ -535,6 +535,27 @@ float CRendererResources::GetSceneReferredWriterClamp()
+ 	return max(CRenderer::CV_r_SceneReferredWriterClamp, 0.0f);
+ }
+ 
++float CRendererResources::GetSceneReferredSkyPeakClamp(float sceneExposure)
++{
++	const float writerClamp = GetSceneReferredWriterClamp();
++
++	// Same stage-2 gate as the writer clamp, by construction: off the switch that returns 0 and
++	// so does this, which is what the sky shader reads as "stock NaN filter, unchanged".
++	if (!IsSceneReferredStage(2))
++		return 0.0f;
++
++	const float peakNits = max(CRenderer::CV_r_SceneReferredSkyPeakLuminance, 0.0f);
++	if (peakNits <= 0.0f)
++		return writerClamp;
++
++	// cd/m2 -> engine units -> exposed. Doing the pre-exposure HERE is the whole point: the
++	// resulting number moves with the aperture in exposed units precisely so that the physical
++	// luminance it stands for does NOT (research/s8-nishita-sky.md 5.5).
++	const float peakExposed = (peakNits / RENDERER_LIGHT_UNIT_SCALE) * max(sceneExposure, 0.0f);
++
++	return (writerClamp > 0.0f) ? min(peakExposed, writerClamp) : peakExposed;
++}
++
+ // D11's one line of arithmetic, in one place, so that seven effects cannot each grow their own
+ // slightly different idea of what a threshold means. The apply sites call this and store the
+ // result; nothing downstream - no shader, no constant layout, no serialised default - knows the
+diff --git a/Code/CryEngine/RenderDll/Common/RendererResources.h b/Code/CryEngine/RenderDll/Common/RendererResources.h
+index 99b0b390..e7990f3c 100644
+--- a/Code/CryEngine/RenderDll/Common/RendererResources.h
++++ b/Code/CryEngine/RenderDll/Common/RendererResources.h
+@@ -219,6 +219,13 @@ public:
+ 	//! "no clamp" - the branches fold away and the stock path is byte-identical.
+ 	static float       GetSceneReferredWriterClamp();
+ 
++	//! The sky pass's ceiling for a given pre-exposure, in EXPOSED engine units. The physical
++	//! solar disc (r_SceneReferredSkyPeakLuminance, cd/m2) converted to engine units and
++	//! pre-exposed, then held under the writer clamp so the fp16 format can never be overrun.
++	//! Unlike the bare writer clamp this means the same real-world luminance at every aperture.
++	//! 0 off the switch, and the plain writer clamp when the peak cvar is 0.
++	static float       GetSceneReferredSkyPeakClamp(float sceneExposure);
++
+ 	//! A highlight-extraction threshold, in whatever unit is in force this frame
+ 	//! (SceneReferredSpec.md D11, Stage S7).
+ 	//!
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Sky.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Sky.cpp
+index 7ac79f28..405ba768 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Sky.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Sky.cpp
+@@ -157,6 +157,18 @@ void CSkyStage::SetSkyParameters()
+ 	// sum, so both addends move together and their ratio is unchanged.
+ 	const float sceneExposure = rd->GetSceneReferredExposure();
+ 
++	// The sky pass's own ceiling (S8, research/s8-nishita-sky.md 5.5). The physical solar disc,
++	// converted to engine units and pre-exposed on the CPU, held under the writer clamp. It
++	// REPLACES the bare SCENE_WRITER_CLAMP in SkyPassPS: the writer clamp is a fixed number in
++	// EXPOSED units, so the real-world luminance it stands for moves with the aperture, which is
++	// right for an overflow guard and wrong for a sun. 0 off the switch, and the shader's branch
++	// then folds away exactly as it did before.
++	{
++		static CCryNameR skyPeakClampName("SkyDome_ScenePeakClamp");
++		const float skyPeakClamp = CRendererResources::GetSceneReferredSkyPeakClamp(sceneExposure);
++		m_skyPass.SetConstant(skyPeakClampName, Vec4(skyPeakClamp, 0.0f, 0.0f, 0.0f), eHWSC_Pixel);
++	}
++
+ 	// Skybox
+ 	{
+ 		static CCryNameR skyBoxParamName("SkyDome_SkyBoxParams");
+diff --git a/Code/CryPlugins/CinematicCamera/docs/SceneReferredCalibration.md b/Code/CryPlugins/CinematicCamera/docs/SceneReferredCalibration.md
+index 7afb5697..5d166530 100644
+--- a/Code/CryPlugins/CinematicCamera/docs/SceneReferredCalibration.md
++++ b/Code/CryPlugins/CinematicCamera/docs/SceneReferredCalibration.md
+@@ -115,11 +115,51 @@ light meter pointed at the ground reads. Only the times-ten was wrong.
+ 
+ ## 2. The Nishita sky scale (`r_SceneReferredNishitaScale`)
+ 
+-**Why it needs measuring.** The procedural sky is a third brightness system. `m_sunIntensity` has
+-no documented unit and `RENDERER_LIGHT_UNIT_SCALE` appears in none of the `SkyLight*` files, so
+-its relationship to the photometric skybox path cannot be read out of the source. The engine
+-authors' own comment on the neighbouring line ("scale mie and rayleigh scattering for more
+-convenient editing in the time of day dialog") says plainly that these numbers were tuned by eye.
++**This section used to say the scale could not be derived from source. That was wrong, and the
++correction is the point of the rewrite.** The Nishita model is physically formed: its phase
++functions are normalised to mean 1 over the sphere and pair exactly with a `4*PI*K` extinction, so
++`K` is a scattering coefficient divided by `4*PI` and the integral the engine evaluates is the
++single-scattering integral with no missing normalisation. Its output therefore carries whatever
++unit `m_sunIntensity` carries, and the renderer reads that output as an engine radiance:
++
++> **1.0 of the Nishita output = 10 000 cd/m2, and the `Sky Light / Sun intensity multiplier` is
++> implicitly in units of 10 000 lux of top-of-atmosphere normal illuminance.**
++
++**The shipped 50 therefore asserts E0 = 500 000 lux against a physical 133 000 - it is 1.91 stops
++hot**, and that single number is the whole of the discrepancy. The scattering coefficients are a
++separate matter: `beta_R` is 2.37x too large in all three channels at once, so the dome's HUE is
++right and only its level is wrong.
++
++**What the derivation predicts, sun at 45 degrees, shipped defaults.**
++
++| quantity | predicted | anchor | residual |
++|---|---|---|---|
++| zenith luminance | 5 700 cd/m2 | 8 000 (bright hazy) | -0.49 stops |
++| sky illuminance, horizontal | ~32 000 lux | 12 000 (clear sky) | +1.4 stops |
++
++The two anchors are 1.9 stops apart and one scalar cannot satisfy both. That gap is the model's
++own honest error, not an arithmetic mistake: single scattering underfills the zenith while the
++`1/cos` horizon brightening overfills the horizon, and a real sky saturates near the horizon
++because of multiple scattering, aerosol extinction and ground reflection. It belongs in this
++document, not in the constant.
++
++**The anchor is ILLUMINANCE, and the shipped default is `r_SceneReferredNishitaScale = 0.37`**
++= `12 000 / 32 000`. Three reasons: `r_HDRDebug 1` measures illuminance and only illuminance;
++illuminance is what lights the scene and what a probe bake integrates; and an over-bright sky
++illuminance is exactly what flattens the sun/shade ratio the S2 acceptance test measures. The
++resulting dome has a zenith of about 2 100 cd/m2 and a sky illuminance of 12 000 lux, with an
++implied E0 of 185 000 lux - still 0.48 stops hot, which is the single-scattering deficit being
++paid for openly.
++
++For the record, the alternatives: anchoring on 15 000 lux gives 0.47; anchoring on a zenith of
++8 000 cd/m2 gives 1.40 and puts the illuminance 1.9 stops over; leaving it at 1.0 is 0.5 stops
++dark at the zenith and 1.4 stops hot in illuminance - defensible, and strictly better than a
++guessed constant, if the measurement below cannot be run.
++
++**The prediction is not a substitute for the measurement.** The steps below carry perhaps
++0.3 stops of uncertainty either way. Run them. If step C lands within 0.3 stops of 32 000 lux the
++derivation is confirmed; if it does not, suspect the column-integral approximation first and the
++horizon integral second, and the derivation - not the measurement - is what is wrong.
+ 
+ **Test level.**
+ 
+@@ -136,7 +176,14 @@ convenient editing in the time of day dialog") says plainly that these numbers w
+ | A | Sun only: `Skybox / Opacity = 0`, `Sky Light / Sun intensity multiplier = 0` | Estimated Illuminance | `Sun intensity (lux) x cos(elevation)` within a few percent |
+ | B | Skybox only, uniform white 1.0 texture, sun 0 | Estimated Illuminance | `Skybox intensity (lux)`. This is section 1's proof again, from the other side. |
+ | C | Nishita only: skybox opacity 0, sun intensity 0, sun elevation 45 deg | Estimated Illuminance | some value `E_nishita` |
+-| D | — | — | set `r_SceneReferredNishitaScale = E_target / E_nishita` |
++| D | — | — | set `r_SceneReferredNishitaScale = E_target / E_nishita`, i.e. `12 000 / E_nishita`. The prediction says `E_nishita` is about 32 000 lux and therefore about 0.37, which is the shipped default. |
++
++**The cvar is live.** Changing `r_SceneReferredNishitaScale` forces a full dome recompute through
++`ITimeOfDay::Update(true, true)` -> `CSkyLightManager::FullUpdate()`. Without that it would appear
++inert: the factor is consumed only when the time of day pushes a NEW condition, and even then the
++dome is rebuilt at `e_SkyUpdateRate` = 0.12 **per cent** of its 2 048 texels per frame - two texels
++a frame, about 1 024 frames, roughly 17 seconds. Each measurement iteration is therefore one
++console line, not a seventeen-second wait.
+ 
+ **Choosing `E_target`.** The Nishita dome is a clear-sky atmosphere model, so the honest target is
+ the real clear-sky diffuse illuminance at the same sun elevation: with the sun at 45 degrees,
+@@ -152,6 +199,17 @@ the right answer is a time-of-day curve authored by the user, not a single const
+ of the target at 45 degrees. A daylight ReC preset shows a measured sun/shade ratio of at least
+ 10 stops — measurable as `E_sunlit / E_shadow` on two patches of the same 18 % material.
+ 
++**The sun disc, and why it has its own ceiling.** The dome has no sun sprite - what reads as the
++sun IS the Mie forward-scattering lobe, and its peak is unbounded in the `Sun anisotropy factor`
++by construction. At the shipped `g = -0.997` the peak is about 9.1e7 cd/m2, four stops UNDER the
++real solar disc; at the slider's limit `-0.9999` it is 8.2e10, fifty times over, and that is the
++`+Inf` the writer clamp exists for. `r_SceneReferredSkyPeakLuminance` (default **1.6e9 cd/m2**,
++the disc above the atmosphere) caps the sky pass in UNEXPOSED terms, so the disc means the same
++real brightness at every aperture; `r_SceneReferredWriterClamp` is still applied on top so the
++fp16 target can never be overrun. Read it as a bound on an approximation: capping the Mie lobe at
++disc radiance still spreads solar-disc luminance over degrees. The real cure is a physical
++asymmetry factor plus a real sun sprite, which is a content change and is not shipped.
++
+ **Known limitation, not a bug to fix here.** The Nishita sun intensity does not fade at night: the
+ dawn/dusk fade computed in `CTimeOfDay::UpdateEnvLighting` is unconditionally overwritten a few
+ lines later. Fixing it would change the stock path's night sky, so it is left alone. If the ReC
+@@ -187,7 +245,20 @@ camera across the sun and watch for highlight crawl before signing the value off
+ Write measured values into:
+ 
+ * `r_SceneReferredNishitaScale` — into the project's `.cryproject` or the ReC preset's
+-  documentation, not into code.
++  documentation, not into code. **The correction is carried exactly once.** The equivalent
++  content-only route is to set the preset's `Sky Light / Sun intensity multiplier` to
++  `0.37 x 50 = 18.5` and leave the cvar at 1.0; doing BOTH is 1.4 stops dark. `ReC_Physical.env`
++  deliberately keeps the shipped 50 so that the cvar's default lands correctly on every preset,
++  ours included.
++* **Re-bake every probe after changing it.** The dome reaches lighting through exactly three
++  routes - its own pixels, the volumetric-cloud atmospheric tint, and probes baked while it is
++  visible - and a probe baked before the change is stale by exactly the factor. The `_rec`
++  filename stamp does **not** catch this: it encodes the PI / light-unit convention, not the sky
++  scale. There is no mechanism; it is a discipline.
++* **Never use a probe's `Diffuse multiplier` as a luminance calibration.** It scales the light
++  colour's ALPHA, and alpha becomes the probe's blend weight in the tiled shading attenuation -
++  not its brightness. A probe that needs a trim needs an rgb-only multiplier, which does not
++  exist yet.
+ * Sky and sun lux — into the `.env` preset (`ReC_Physical.env`), never into `default.env` and
+   never into `EnvironmentPreset.cpp`, whose defaults and ranges are shared with the stock path.
+ * The residuals and the date — into `scene-notes/research/s2-*.md`, so the next session does not
+diff --git a/Engine/Shaders/HWScripts/CryFX/SkyCommon.cfi b/Engine/Shaders/HWScripts/CryFX/SkyCommon.cfi
+index 71ea373f..fc3e9d72 100644
+--- a/Engine/Shaders/HWScripts/CryFX/SkyCommon.cfi
++++ b/Engine/Shaders/HWScripts/CryFX/SkyCommon.cfi
+@@ -29,6 +29,10 @@ float  SkyDome_StarIntensity;
+ float4 SkyDome_SkyBoxParams; // x: angle, y: stretching, z: multiplier
+ float4 SkyDome_SkyBoxExposure; // rgb: exposure color, a: exposure strength
+ float4 SkyDome_SkyBoxOpacity; // rgb: opacity filter, a: opacity strength
++// S8: .x = the sky pass's output ceiling in EXPOSED engine units - the physical solar disc
++// converted and pre-exposed on the CPU, held under r_SceneReferredWriterClamp (Sky.cpp).
++// 0 off the scene-referred path, and the clamp in SkyPassPS is then not taken.
++float4 SkyDome_ScenePeakClamp;
+ 
+ //////////////////////////////////////////////////////////////////////////
+ // per pass textures
+diff --git a/Engine/Shaders/HWScripts/CryFX/Stars.cfx b/Engine/Shaders/HWScripts/CryFX/Stars.cfx
+index 84c371f8..38a6dcab 100644
+--- a/Engine/Shaders/HWScripts/CryFX/Stars.cfx
++++ b/Engine/Shaders/HWScripts/CryFX/Stars.cfx
+@@ -260,12 +260,17 @@ pixout SkyPassPS(vtxOut IN)
+ 	// A min() rather than a saturate: everything below the ceiling is untouched, so the sun is
+ 	// still a very bright disc with a soft falloff, which is what it should be. NaN is caught
+ 	// separately because min(NaN, c) is not specified to return c.
+-	if (SCENE_WRITER_CLAMP > 0)
++	// S8: the ceiling is now SkyDome_ScenePeakClamp, not the bare writer clamp. Same guard, same
++	// gate (it is 0 off the switch and the writer clamp's own value when the peak cvar is off),
++	// but the number it holds is the PHYSICAL solar disc converted to engine units and
++	// pre-exposed, so the sun means the same real brightness at every aperture instead of getting
++	// dimmer as the camera opens up. research/s8-nishita-sky.md 5.5.
++	if (SkyDome_ScenePeakClamp.x > 0)
+ 	{
+ 		// min() already answers +Inf with the ceiling (IEEE: min(inf, c) = c), which is the right
+ 		// answer for a scattering peak that ran away. NaN is a different failure and reads black.
+ 		const half3 cSky = OUT.Color.rgb;
+-		OUT.Color.rgb = any(isnan(cSky)) ? (half3)0 : min(cSky, (half3)SCENE_WRITER_CLAMP);
++		OUT.Color.rgb = any(isnan(cSky)) ? (half3)0 : min(cSky, (half3)SkyDome_ScenePeakClamp.x);
+ 	}
+ 
+ 	return OUT;
+-- 
+2.47.1.windows.1
+

@@ -1,0 +1,712 @@
+From 037b36418631e39237712b8545c1549dd6df1320 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Fri, 28 Aug 2026 10:54:55 +0800
+Subject: [PATCH 092/119] fix: the scene-referred conversion pass never
+ allocated its shader reflection - the RenderThread crash on the first tick of
+ the checkbox
+
+The editor died on the RenderThread every time the Cinematic Camera's Scene
+Referred checkbox was ticked: EXCEPTION_ACCESS_VIOLATION reading address 0x4
+(twice) or 0x8 (once), no resolvable module, no .dmp.
+
+ROOT CAUSE - StandardGraphicsPipeline.cpp:107
+
+    m_SceneReferredConvertPass.reset(new CComputeRenderPass(this));
+
+CComputeRenderPass's flags default to eFlags_None. Without
+eFlags_ReflectConstantBuffersFromShader, BeginConstantUpdate()
+(ComputeRenderPass.cpp:122-136) does nothing at all - no Compile(), no
+AllocateShaderReflection() - so m_pShaderReflection stays null. The
+SetConstant("SceneReferredParams", ...) that follows in
+ExecuteSceneReferredConversion() lands in
+SDeviceObjectHelpers::CShaderConstantManager::SetNamedConstantArray
+(DeviceObjectHelpers.cpp:444), whose first act after a CRY_ASSERT - compiled out
+in Profile - is to read m_pShaderReflection->bValid.
+
+SShaderReflection is { int bufferCount; bool bValid; array<SBufferUpdateContext,2>
+bufferUpdateContexts; } (DeviceObjectHelpers.h:495-508): bValid sits at offset +4
+and bufferUpdateContexts[0] at +8. That is the reported fault address to the byte,
+and the 0x8 run is the same null pointer one member further on.
+
+Every other compute pass in the tree that names a constant passes the flag
+(TiledShading.cpp:16, VolumetricFog.cpp:157, ComputeSkinning.cpp:84, D3D_SVO.h:15).
+The S3 conversion is the only one that did not, and 2026-08-28 was the first time
+it ever ran.
+
+EVIDENCE
+
+The session log (S:\Crytek\crytek\cryengine-57-lts\5.7.1\editor.log, 10:31:15 -
+NOT the project folder's editor.log, which is the accumulated crash file) shows
+the flip completing and the S0/S2 reformats completing for both Sandbox graphics
+pipelines before the crash:
+
+    [SceneReferred] light-unit convention -> radiometric, 1/PI in the BRDF
+    [SceneReferred] HDR satellite targets  -> R16G16B16A16F at  374x205
+    [SceneReferred] scaled display targets -> R16G16B16A16F at  374x205
+    [SceneReferred] HDR satellite targets  -> R16G16B16A16F at 1498x822
+    [SceneReferred] scaled display targets -> R16G16B16A16F at 1498x822
+
+There is no "HDR main targets" line because those are already fp16 at the default
+r_HDRTexFormat, exactly as designed; and there is no "stock LDR post stage inert
+(D9)" line, so the frame died after the reformats and before the tone map. That is
+precisely where the conversion pass sits. S0's ReformatRenderTarget decision was
+not the culprit; the notes are corrected to say so.
+
+ALSO FIXED
+
+- DeviceObjectHelpers.cpp: SetNamedConstantArray returns false on a null
+  reflection instead of faulting. The same read is reachable in stock code when
+  Compile() bails out on a failed resource-set update before
+  AllocateShaderReflection() runs. Every other failure path in that file drops the
+  constant; this one crashed.
+
+- Texture.cpp, CTexture::ReformatRenderTarget(): two real bugs found in the audit,
+  neither of them the crash.
+  (a) It went straight to CreateDeviceTexture() and let SetDevTexture() drop the
+      old device texture - but SetDevTexture() calls Release() on a device texture
+      that FT_DONT_RELEASE has marked SetNoDelete(true), so the D3D resource was
+      freed and the CDeviceTexture object leaked on every flip, per pipeline. It
+      now follows CTexture::Invalidate(): ReleaseDeviceTexture(true) first, which
+      raises eDeviceResourceDirty and not eResourceDestroyed, so bindings still
+      rebuild and the CTexture* still never moves - the whole reason the swap
+      approach was chosen over release-and-recreate is untouched.
+  (b) It did not test for a target that exists as an object but has no device
+      texture. Sandbox reaches that state routinely: one
+      CGraphicsPipelineResources per viewport, material editor and thumbnail
+      renderer. It now writes the format fields, so the target is born fp16 when
+      the pool does create it, and returns without touching the device.
+  It also Clear()s after the create, as SRenderTargetPool::CreateRenderTargetList()
+  does. A reformat is a creation.
+
+r_SceneReferredStage (VF_NULL, default 99)
+
+The bisection gate. IsSceneReferred() stays the master; IsSceneReferredStage(n) is
+the master ANDed with the stage, evaluated at the sites that already read the
+master, so at the default it costs one integer compare and nothing moves.
+
+  0 switch only | 1 +S0 formats | 2 +S1 exposure/AUTO | 3 +S2 units and shafts
+  4 +S3 conversion | 5 +S4/S5/S7 display transform and grade | 6 +S6 export
+
+Stage 3 is additionally enforced in
+CCinematicCameraComponent::PublishSceneReferredConvention(), because Cry3DEngine's
+four light-unit sites read E3DPARAM_SCENE_REFERRED and cannot see a renderer cvar.
+The tone map splits its single gate into three (exposure at 2, the HDRFinalPass
+SAMPLE0 permutation at 3 because the shader ties the sun-shaft composite and the
+output transform to one flag, the LUTs and colour-chart skip at 5) and the
+eye-adaptation mode 2 branch is now also guarded against the pinned exposure
+constant. Documented in docs/ConsoleReference.md.
+
+And one CryLogAlways at the very top of CGraphicsPipelineResources::Update(),
+before any resource is touched, once per graphics pipeline per flip, so the next
+crash log says how far the frame got.
+
+CryRenderD3D11 and CinematicCamera build 0 error 0 warning. No shader changed.
+
+Co-Authored-By: Claude Opus <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01A72MFkdSczncE7au9UVnmu
+---
+ .../Common/PostProcess/PostEffects.cpp        |  2 +-
+ Code/CryEngine/RenderDll/Common/Renderer.cpp  |  2 +-
+ .../RenderDll/Common/RendererCVars.cpp        | 18 ++++++++
+ .../RenderDll/Common/RendererCVars.h          |  1 +
+ .../RenderDll/Common/RendererResources.cpp    | 28 ++++++++++++-
+ .../RenderDll/Common/RendererResources.h      |  7 ++++
+ .../RenderDll/Common/Textures/Texture.cpp     | 39 +++++++++++++++++-
+ .../RenderDll/XRenderD3D9/D3DRendPipeline.cpp |  4 +-
+ .../DeviceManager/DeviceObjectHelpers.cpp     | 10 +++++
+ .../GraphicsPipeline/AutoExposure.cpp         |  2 +-
+ .../Common/GraphicsPipeline.cpp               | 23 +++++++++--
+ .../Common/GraphicsPipeline.h                 |  4 ++
+ .../GraphicsPipeline/MotionBlur.cpp           |  2 +-
+ .../XRenderD3D9/GraphicsPipeline/PostAA.cpp   |  2 +-
+ .../GraphicsPipeline/PostEffects.cpp          |  2 +-
+ .../StandardGraphicsPipeline.cpp              | 14 ++++++-
+ .../GraphicsPipeline/SunShafts.cpp            |  2 +-
+ .../GraphicsPipeline/ToneMapping.cpp          | 34 +++++++++++----
+ .../Module/CinematicCameraComponent.cpp       | 14 +++++++
+ .../CinematicCamera/docs/ConsoleReference.md  | 41 +++++++++++++++++++
+ 20 files changed, 226 insertions(+), 25 deletions(-)
+
+diff --git a/Code/CryEngine/RenderDll/Common/PostProcess/PostEffects.cpp b/Code/CryEngine/RenderDll/Common/PostProcess/PostEffects.cpp
+index d5fd734f..9dac9a5e 100644
+--- a/Code/CryEngine/RenderDll/Common/PostProcess/PostEffects.cpp
++++ b/Code/CryEngine/RenderDll/Common/PostProcess/PostEffects.cpp
+@@ -216,7 +216,7 @@ SHDRStreaksParams CHDRStreaks::GetParams() const
+ 	// levels open looking right, the slider still spans 0-200 (= 0 to 4x physical), and no default
+ 	// and no CRC moves.
+ 	params.fWaveAmount = clamp_tpl(m_pWaveAmount->GetParam(), 0.0f, 200.0f);
+-	if (CRendererResources::IsSceneReferred())
++	if (CRendererResources::IsSceneReferredStage(5))
+ 		params.fWaveAmount /= 50.0f;
+ 	params.fWaveReach = clamp_tpl(m_pWaveReach->GetParam(), 0.02f, 1.0f);
+ 	params.fDispersion = clamp_tpl(m_pDispersion->GetParam(), 0.0f, 1.0f);
+diff --git a/Code/CryEngine/RenderDll/Common/Renderer.cpp b/Code/CryEngine/RenderDll/Common/Renderer.cpp
+index c5283977..74f8ec6b 100644
+--- a/Code/CryEngine/RenderDll/Common/Renderer.cpp
++++ b/Code/CryEngine/RenderDll/Common/Renderer.cpp
+@@ -4033,7 +4033,7 @@ void S3DEngineCommon::UpdateSkyInfo(const SRenderingPassInfo& passInfo)
+ 	// r_HDRDebug 1 prints the resulting emittance in cd/m^2 next to the authored lux, so the
+ 	// times-ten can be confirmed empirically in one look rather than argued about
+ 	// (CToneMappingStage::DisplayDebugInfo).
+-	const float skyEmittanceScale = CRendererResources::IsSceneReferred() ? 1.0f : (RENDERER_LIGHT_UNIT_SCALE / 1000.0f);
++	const float skyEmittanceScale = CRendererResources::IsSceneReferredStage(3) ? 1.0f : (RENDERER_LIGHT_UNIT_SCALE / 1000.0f);
+ 	m_SkyInfo.m_vSkyBoxEmittance *= skyEmittanceScale;
+ 
+ 	// Note: this should be deprecated at some point.
+diff --git a/Code/CryEngine/RenderDll/Common/RendererCVars.cpp b/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
+index 9693e3c9..cfb61839 100644
+--- a/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
++++ b/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
+@@ -417,6 +417,7 @@ int CRendererCVars::CV_r_DofFieldDebug;
+ int CRendererCVars::CV_r_DofLensModel;
+ int CRendererCVars::CV_r_SceneReferred;
+ int CRendererCVars::CV_r_SceneReferredDebug;
++int CRendererCVars::CV_r_SceneReferredStage;
+ float CRendererCVars::CV_r_SceneReferredNishitaScale;
+ int CRendererCVars::CV_r_SceneReferredExrSelfTest;
+ int CRendererCVars::CV_r_SceneReferredExportTap;
+@@ -1731,6 +1732,23 @@ void CRendererCVars::InitCVars()
+ 	               "1 = honour the request (default), 0 = ignore it and always take the stock path, "
+ 	               "which is then byte for byte the engine's own pipeline - render target formats, "
+ 	               "pass list and pixels alike.");
++	REGISTER_CVAR3("r_SceneReferredStage", CV_r_SceneReferredStage, 99, VF_NULL,
++	               "BISECTION switch for the scene-referred pipeline. r_SceneReferred is the master "
++	               "kill switch; this one honours the camera's request only up to a given stage, so "
++	               "that a bad frame can be walked back to the single item that causes it without "
++	               "rebuilding anything. Set it BEFORE ticking Scene Referred on the component, then "
++	               "raise it one step at a time. "
++	               "0 = the switch and nothing else: the request is published and logged, the whole "
++	               "renderer stays stock. "
++	               "1 = + S0, the fp16 floor on the HDR targets (render-target formats move). "
++	               "2 = + S1, the camera's pre-exposure and the AUTO metering. "
++	               "3 = + S2, the radiometric light-unit convention (1/PI in the BRDF, sun not "
++	               "pre-divided, sky scale) and the fp16 sun-shaft working set. "
++	               "4 = + S3, the Rec.709 -> ACEScg working-space conversion. "
++	               "5 = + S4/S5/S7, the output transform and the camera grade: the ODT and look "
++	               "LUTs, the inert stock LDR stage, and thresholds read as stops above mid grey. "
++	               "6 = + S6, the EXR export tap. "
++	               "99 = everything (default). Values above 6 all mean the same thing.");
+ 	REGISTER_CVAR3("r_SceneReferredDebug", CV_r_SceneReferredDebug, 0, VF_NULL,
+ 	               "DIAGNOSTIC for the Rec.709 -> ACEScg working-space conversion (Stage S3). Only "
+ 	               "has any effect while the scene-referred path is actually running. "
+diff --git a/Code/CryEngine/RenderDll/Common/RendererCVars.h b/Code/CryEngine/RenderDll/Common/RendererCVars.h
+index 1003172c..b7048ac0 100644
+--- a/Code/CryEngine/RenderDll/Common/RendererCVars.h
++++ b/Code/CryEngine/RenderDll/Common/RendererCVars.h
+@@ -416,6 +416,7 @@ public:
+ 	static float CV_r_DofLensModelJitter;
+ 	static int   CV_r_SceneReferred;
+ 	static int   CV_r_SceneReferredDebug;
++	static int   CV_r_SceneReferredStage;
+ 	static float CV_r_SceneReferredNishitaScale;
+ 	static int   CV_r_SceneReferredExrSelfTest;
+ 	static int   CV_r_SceneReferredExportTap;
+diff --git a/Code/CryEngine/RenderDll/Common/RendererResources.cpp b/Code/CryEngine/RenderDll/Common/RendererResources.cpp
+index 909615eb..d62ffc7c 100644
+--- a/Code/CryEngine/RenderDll/Common/RendererResources.cpp
++++ b/Code/CryEngine/RenderDll/Common/RendererResources.cpp
+@@ -483,6 +483,18 @@ bool CRendererResources::IsSceneReferred()
+ 	return pRequest != nullptr && pRequest->GetParam() > 0.5f;
+ }
+ 
++// The bisection gate. IsSceneReferred() stays the master - nothing runs without it - and this
++// narrows the request to the stage items at or below r_SceneReferredStage, so that a bad frame
++// (or a crash) can be walked back to one item from the console instead of from a rebuild.
++//
++// Deliberately a plain AND of the master and the stage number, evaluated at the same sites the
++// master is already read, so at the default (99) every call is exactly IsSceneReferred() and the
++// stock path is untouched either way.
++bool CRendererResources::IsSceneReferredStage(int nStage)
++{
++	return IsSceneReferred() && CRenderer::CV_r_SceneReferredStage >= nStage;
++}
++
+ const float CRendererResources::kSceneReferredMidGrey = 0.18f;
+ 
+ // D11's one line of arithmetic, in one place, so that seven effects cannot each grow their own
+@@ -491,7 +503,10 @@ const float CRendererResources::kSceneReferredMidGrey = 0.18f;
+ // difference.
+ float CRendererResources::ResolveThreshold(float stored)
+ {
+-	if (!IsSceneReferred())
++	// Stage 5 on the bisection gate: reading the same stored number as stops above mid grey is
++	// part of the camera-grade half of the pipeline (S7), and below that stage every threshold
++	// keeps its absolute engine-unit meaning exactly as on the stock path.
++	if (!IsSceneReferredStage(5))
+ 		return max(stored, 0.0f);
+ 
+ 	return kSceneReferredMidGrey * powf(2.0f, clamp_tpl(stored, -6.0f, 16.0f));
+@@ -504,7 +519,9 @@ float CRendererResources::ResolveThreshold(float stored)
+ // stays coherent instead of measuring 709 data with AP1 weights.
+ bool CRendererResources::IsSceneReferredWorkingSpace()
+ {
+-	return IsSceneReferred() && CRenderer::CV_r_SceneReferredDebug != 1;
++	// Stage 4 on the bisection gate: the working-space conversion is S3, and below that stage the
++	// HDR target still holds Rec.709 whatever else is running.
++	return IsSceneReferredStage(4) && CRenderer::CV_r_SceneReferredDebug != 1;
+ }
+ 
+ // The LIGHT-UNIT convention, which is a different question from "is the scene-referred pipeline
+@@ -550,6 +567,13 @@ bool CRendererResources::IsSceneReferredLightUnits()
+ 	if (!gEnv->p3DEngine)
+ 		return false;
+ 
++	// Stage 3 on the bisection gate. The 3D engine's own four decision sites read
++	// E3DPARAM_SCENE_REFERRED directly and cannot see a renderer cvar, so the stage is enforced
++	// where the parameter is PUBLISHED instead - CCinematicCameraComponent::ApplySceneReferred()
++	// withholds it below stage 3 - and the test here is the renderer-side half of the same gate.
++	if (CRenderer::CV_r_SceneReferredStage < 3)
++		return false;
++
+ 	Vec3 v(0.0f, 0.0f, 0.0f);
+ 	gEnv->p3DEngine->GetGlobalParameter(E3DPARAM_SCENE_REFERRED, v);
+ 	return v.x > 0.5f;
+diff --git a/Code/CryEngine/RenderDll/Common/RendererResources.h b/Code/CryEngine/RenderDll/Common/RendererResources.h
+index 77acaa3d..9381c45b 100644
+--- a/Code/CryEngine/RenderDll/Common/RendererResources.h
++++ b/Code/CryEngine/RenderDll/Common/RendererResources.h
+@@ -163,6 +163,13 @@ public:
+ 	//! component off or the cvar at 0 the renderer is byte-identical to stock.
+ 	static bool        IsSceneReferred();
+ 
++	//! IsSceneReferred() narrowed to the bisection gate r_SceneReferredStage: true only while the
++	//! camera asks for the scene-referred path AND the cvar honours stage items up to nStage.
++	//! 0 = the switch alone, 1 = + S0 formats, 2 = + S1 exposure/AUTO, 3 = + S2 light units and
++	//! sun shafts, 4 = + S3 working space, 5 = + S4/S5/S7 display transform and grade,
++	//! 6 = + S6 export. The default (99) makes every one of these identical to IsSceneReferred().
++	static bool        IsSceneReferredStage(int nStage);
++
+ 	//! True while the 3D engine is emitting radiometric light values - i.e. while the sun is NOT
+ 	//! pre-divided by PI and the 1/PI belongs in the BRDF (SceneReferredSpec.md D4). Read from
+ 	//! E3DPARAM_SCENE_REFERRED, the engine-side mirror of the switch, and NOT from the post-effect
+diff --git a/Code/CryEngine/RenderDll/Common/Textures/Texture.cpp b/Code/CryEngine/RenderDll/Common/Textures/Texture.cpp
+index a0853b0f..3711663b 100644
+--- a/Code/CryEngine/RenderDll/Common/Textures/Texture.cpp
++++ b/Code/CryEngine/RenderDll/Common/Textures/Texture.cpp
+@@ -495,12 +495,47 @@ bool CTexture::ReformatRenderTarget(ETEX_Format eFormat)
+ 	m_eSrcFormat = eFormat;
+ 	SetClosestFormatSupported();
+ 
+-	// Width, height, mip count, array size, flags and clear colour are all left as they are;
+-	// only the format moves.
++	// A target that has been REGISTERED but not yet device-created has nothing to swap. Sandbox
++	// reaches this state routinely: every viewport, the material editor and the thumbnail renderer
++	// build their own CGraphicsPipelineResources, and a target whose pool entry has not run yet
++	// (or whose creation failed) sits there at 0x0 with m_pDevTexture == nullptr. Handing that to
++	// CreateDeviceTexture() would ask CDeviceTexture::Create() for a zero-sized resource.
++	//
++	// Setting the format fields above and returning is the right answer rather than a no-op:
++	// CreateRenderTarget() only assigns m_eSrcFormat while it is still eTF_Unknown, so the format
++	// written here is the one the target will be born with when the pool does create it.
++	if (!m_pDevTexture || m_nWidth <= 0 || m_nHeight <= 0)
++		return false;
++
++	// Release the old device texture BEFORE creating the new one, which is what
++	// CTexture::Invalidate() does for the identical case (a live render target whose format or
++	// size changed) and what SPostEffectsUtils::GetOrCreateRenderTarget() relies on. The first
++	// version of this function went straight to CreateDeviceTexture() and let SetDevTexture()
++	// drop the old one on the way past - but SetDevTexture() calls Release() on a device texture
++	// that FT_DONT_RELEASE has marked SetNoDelete(true), so the D3D resource was freed and the
++	// CDeviceTexture object was leaked on every flip of the switch. RT_ReleaseDeviceTexture()
++	// accounts for the memory, clears the owner and raises eDeviceResourceDirty - NOT
++	// eResourceDestroyed - so every resource set and render pass holding this CTexture rebuilds
++	// its views and no invalidation callback is dropped. The CTexture* itself never moves, which
++	// is the property the stages' IsDirty() guards depend on.
++	if (m_eFlags & FT_FORCE_MIPS)
++		m_nMips = 1;
++
++	ReleaseDeviceTexture(true);
++
++	// Same mip recomputation CreateRenderTarget() performs; width, height, array size, flags and
++	// clear colour are all left as they are and only the format moves.
++	m_nMips = (m_eFlags & FT_FORCE_MIPS) ? CTexture::CalcNumMips(m_nWidth, m_nHeight) : m_nMips;
++
+ 	SSubresourceData pData(nullptr);
+ 	CreateDeviceTexture(std::move(pData));
+ 	PostCreate();
+ 
++	// A freshly created target holds whatever the driver left in it. The pool clears every target
++	// it creates for exactly this reason; a reformat is a creation.
++	if (!(m_eFlags & FT_FAILED))
++		Clear();
++
+ 	return true;
+ }
+ 
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/D3DRendPipeline.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/D3DRendPipeline.cpp
+index 5c564c5c..76220fca 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/D3DRendPipeline.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/D3DRendPipeline.cpp
+@@ -586,7 +586,7 @@ void CD3D9Renderer::LatchSceneReferredExposure(uint32 shaderRenderingFlags)
+ 	// hook" wording.
+ 	const bool bCubemapGen = (shaderRenderingFlags & SHDF_CUBEMAPGEN) != 0;
+ 
+-	if (!bCubemapGen && CRendererResources::IsSceneReferred())
++	if (!bCubemapGen && CRendererResources::IsSceneReferredStage(2))
+ 	{
+ 		if (CPostEffectsMgr* pPostMgr = PostEffectMgr())
+ 		{
+@@ -616,7 +616,7 @@ void CD3D9Renderer::LatchSceneReferredExposure(uint32 shaderRenderingFlags)
+ 	// baked under the same convention the scene is lit with, which is the whole point of the
+ 	// _rec suffix in decisions/s2-preset-and-probes.md. It is the exposure that must not be
+ 	// baked in, not the convention.
+-	m_fSceneReferredBRDFFactor[GetRenderThreadID()] = CRendererResources::IsSceneReferred() ? (1.0f / gf_PI) : 1.0f;
++	m_fSceneReferredBRDFFactor[GetRenderThreadID()] = CRendererResources::IsSceneReferredStage(3) ? (1.0f / gf_PI) : 1.0f;
+ }
+ 
+ // Render thread only scene rendering
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/DeviceManager/DeviceObjectHelpers.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/DeviceManager/DeviceObjectHelpers.cpp
+index 5655fb1a..b065fe95 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/DeviceManager/DeviceObjectHelpers.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/DeviceManager/DeviceObjectHelpers.cpp
+@@ -445,6 +445,16 @@ bool SDeviceObjectHelpers::CShaderConstantManager::SetNamedConstantArray(const C
+ {
+ 	CRY_ASSERT(m_pShaderReflection, "Flag eFlags_ReflectConstantBuffersFromShader might be required for pass");
+ 
++	// The assert above is compiled out in Profile and Release, and the very next line then reads
++	// bValid at offset +4 of a null pointer - which is exactly the RenderThread access violation
++	// at address 0x4 that the scene-referred conversion pass produced on 2026-08-28 when it was
++	// built without eFlags_ReflectConstantBuffersFromShader. The flag is fixed at the call site;
++	// this turns the whole CLASS of that mistake (and the reachable case where Compile() bails out
++	// on a failed resource-set update before AllocateShaderReflection() ever runs) from a hard
++	// crash into a dropped constant, which is what every other failure path in this file does.
++	if (!m_pShaderReflection)
++		return false;
++
+ 	if (m_pShaderReflection->bValid && m_isConstantUpdateEnabled)
+ 	{
+ 		static_assert(MaxReflectedBuffers == 2, "Fixme: the following statement works for MaxReflectedBuffers==2");
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/AutoExposure.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/AutoExposure.cpp
+index a44fe2d3..79c7e980 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/AutoExposure.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/AutoExposure.cpp
+@@ -210,7 +210,7 @@ void CAutoExposureStage::UpdateSceneReferredMeterReadback()
+ 	// Cube-map generation renders at unity exposure and is not a view anybody meters.
+ 	const bool bCubemapGen = (m_graphicsPipeline.GetRenderFlags() & SHDF_CUBEMAPGEN) != 0;
+ 
+-	if (!CRendererResources::IsSceneReferred() || bCubemapGen)
++	if (!CRendererResources::IsSceneReferredStage(2) || bCubemapGen)
+ 	{
+ 		// Leaving the path with a download in flight is fine - the staging resource belongs to the
+ 		// texture, not to us, and nothing is freed here. Only the reported value is retired, so
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Common/GraphicsPipeline.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Common/GraphicsPipeline.cpp
+index 9fefac4c..0bcbaaaf 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Common/GraphicsPipeline.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Common/GraphicsPipeline.cpp
+@@ -220,7 +220,7 @@ void CGraphicsPipelineResources::CreateDepthMaps(int resourceWidth, int resource
+ // straight pass-through to the stock helper, so the stock formats are bit-for-bit unchanged.
+ static ETEX_Format ResolveHDRSatelliteFormat()
+ {
+-	const int effective = std::max(CRenderer::CV_r_HDRTexFormat, CRendererResources::IsSceneReferred() ? 2 : 0);
++	const int effective = std::max(CRenderer::CV_r_HDRTexFormat, CRendererResources::IsSceneReferredStage(1) ? 2 : 0);
+ 
+ 	if (effective >= 2)
+ 		return eTF_R16G16B16A16F;
+@@ -242,7 +242,7 @@ static ETEX_Format ResolveHDRSatelliteFormat()
+ // both paths, which is why this costs nothing in practice and closes the hole anyway.
+ static ETEX_Format ResolveHDRMainFormat()
+ {
+-	const int effective = std::max(CRenderer::CV_r_HDRTexFormat, CRendererResources::IsSceneReferred() ? 2 : 0);
++	const int effective = std::max(CRenderer::CV_r_HDRTexFormat, CRendererResources::IsSceneReferredStage(1) ? 2 : 0);
+ 
+ 	if (effective >= 1)
+ 		return eTF_R16G16B16A16F;
+@@ -625,7 +625,7 @@ void CGraphicsPipelineResources::UpdateHDRMainFormats()
+ // the SSAO albedo downsample and the snow velocity passes that share them.
+ void CGraphicsPipelineResources::UpdateDisplayTargetScaledFormats()
+ {
+-	const ETEX_Format wanted = CRendererResources::IsSceneReferred()
++	const ETEX_Format wanted = CRendererResources::IsSceneReferredStage(3)
+ 	                           ? eTF_R16G16B16A16F
+ 	                           : CRendererResources::GetLDRFormat(true);
+ 
+@@ -679,6 +679,23 @@ void CGraphicsPipelineResources::Update(EShaderRenderingFlags renderingFlags)
+ 	// for a stage to manage or retire resources - it runs on the render thread, before
+ 	// CompileModifiedRenderObjects() and before Execute(), so nothing is bound yet - and the
+ 	// rain occlusion texture right below is created and released on demand in the same way.
++	//
++	// The first thing that happens, before any of it: say so. This is the marker that tells the
++	// next crash log how far into the flip the frame got, and it is CryLogAlways rather than
++	// CryLog so that no verbosity setting can swallow it. Once per pipeline per flip - Sandbox
++	// runs one CGraphicsPipeline per viewport, so a normal editor flip prints this twice.
++	{
++		const int nState = CRendererResources::IsSceneReferred() ? 1 : 0;
++		if (nState != m_nSceneReferredLogged)
++		{
++			m_nSceneReferredLogged = nState;
++			CryLogAlways("[SceneReferred] request flipped -> %s, pipeline '%s' (stage gate r_SceneReferredStage %d, %dx%d)",
++			             nState ? "on" : "off",
++			             m_graphicsPipeline.GetUniqueIdentifierName().c_str(),
++			             CRenderer::CV_r_SceneReferredStage, m_resourceWidth, m_resourceHeight);
++		}
++	}
++
+ 	UpdateHDRMainFormats();
+ 	UpdateHDRSatelliteFormats();
+ 	UpdateDisplayTargetScaledFormats();
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Common/GraphicsPipeline.h b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Common/GraphicsPipeline.h
+index 0a95cc03..631d5346 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Common/GraphicsPipeline.h
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Common/GraphicsPipeline.h
+@@ -156,6 +156,10 @@ public:
+ 	//! borrowed working set and are UNORM in stock CE. Render thread, between frames.
+ 	void UpdateDisplayTargetScaledFormats();
+ 
++	//! Scene-referred pipeline: the last state this pipeline logged the switch in, so the flip is
++	//! announced once per pipeline and not once per frame. -1 = nothing logged yet.
++	int m_nSceneReferredLogged = -1;
++
+ 	void PrepareRainOcclusionMaps();
+ 	void CreateRainOcclusionMaps(int resourceWidth, int resourceHeight);
+ 	void DestroyRainOcclusionMaps();
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/MotionBlur.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/MotionBlur.cpp
+index 86d8bf56..eb5f3476 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/MotionBlur.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/MotionBlur.cpp
+@@ -58,7 +58,7 @@ void CMotionBlurStage::Execute()
+ 	// stock path would therefore composite a Rec.709 history over an ACEScg frame - desaturated,
+ 	// hue-shifted smears, with nothing to report it. Forcing the copy under the switch costs one
+ 	// full-resolution copy in the depth-of-field-off case and keeps both operands in one space.
+-	const bool bCopyHDRTarget = bDofEnabled || CRendererResources::IsSceneReferred();
++	const bool bCopyHDRTarget = bDofEnabled || CRendererResources::IsSceneReferredStage(4);
+ 
+ 	SRenderViewInfo viewInfo[2];
+ 	m_graphicsPipeline.GenerateViewInfo(viewInfo);
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/PostAA.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/PostAA.cpp
+index eb10064a..01081500 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/PostAA.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/PostAA.cpp
+@@ -417,7 +417,7 @@ void CPostAAStage::DoFinalComposition(CTexture*& pCurrRT, CTexture* pDestRT, uin
+ 	// The viewfinder overlays, the lens-optics composite, the squeeze/letterbox remap and the
+ 	// lateral chromatic aberration all stay: they are ours, or they are geometry rather than
+ 	// grading.
+-	const bool bSceneReferred = CRendererResources::IsSceneReferred();
++	const bool bSceneReferred = CRendererResources::IsSceneReferredStage(5);
+ 
+ 	// Calculate grain amount
+ 	CEffectParam* pParamGrainAmount = PostEffectMgr()->GetByName("FilterGrain_Amount");
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/PostEffects.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/PostEffects.cpp
+index 4f6c8d02..d474b0c0 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/PostEffects.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/PostEffects.cpp
+@@ -231,7 +231,7 @@ void CPostEffectStage::Execute()
+ 	// itself keeps running, so turning the camera off restores the stock look immediately instead
+ 	// of after a chart rebuild. Everything that is not stock grading (the vision modes, screen
+ 	// effects, HUD, PostAA and its final blit) runs exactly as before.
+-	const bool bSceneReferred = CRendererResources::IsSceneReferred();
++	const bool bSceneReferred = CRendererResources::IsSceneReferredStage(5);
+ 	if (bSceneReferred != m_bLoggedSceneReferredSkips)
+ 	{
+ 		m_bLoggedSceneReferredSkips = bSceneReferred;
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/StandardGraphicsPipeline.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/StandardGraphicsPipeline.cpp
+index 737b3bee..994f0850 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/StandardGraphicsPipeline.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/StandardGraphicsPipeline.cpp
+@@ -104,7 +104,19 @@ void CStandardGraphicsPipeline::Init()
+ 	m_LQSubResPass[0].reset(new CStretchRectPass(this));
+ 	m_LQSubResPass[1].reset(new CStretchRectPass(this));
+ 
+-	m_SceneReferredConvertPass.reset(new CComputeRenderPass(this));
++	// eFlags_ReflectConstantBuffersFromShader is NOT optional here, and its absence was the crash
++	// of 2026-08-28 (EXCEPTION_ACCESS_VIOLATION reading 0x4 on the RenderThread, first frame after
++	// the Scene Referred checkbox was ticked). Without the flag CComputeRenderPass never calls
++	// SDeviceObjectHelpers::CShaderConstantManager::AllocateShaderReflection(), so
++	// m_pShaderReflection stays null; BeginConstantUpdate() then does nothing at all and
++	// SetConstant() walks straight into SetNamedConstantArray(), whose first act is to read
++	// m_pShaderReflection->bValid - offset +4 of a null pointer (DeviceObjectHelpers.h:505-507,
++	// DeviceObjectHelpers.cpp:448). The CRY_ASSERT above that read is compiled out in Profile, so
++	// the only symptom is the access violation. Every other compute pass in the tree that names a
++	// constant sets this flag (TiledShading.cpp:16, VolumetricFog.cpp:157, ComputeSkinning.cpp:84,
++	// CSvoComputePass in D3D_SVO.h:15); ExecuteSceneReferredConversion() names SceneReferredParams,
++	// so it must too.
++	m_SceneReferredConvertPass.reset(new CComputeRenderPass(this, CComputeRenderPass::eFlags_ReflectConstantBuffersFromShader));
+ 
+ 	m_ResolvePass.reset(new CStretchRectPass(this));
+ 	m_DownscalePass.reset(new CDownsamplePass(this));
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/SunShafts.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/SunShafts.cpp
+index f6091b70..6094f3b5 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/SunShafts.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/SunShafts.cpp
+@@ -37,7 +37,7 @@ int CSunShaftsStage::GetDownscaledTargetsIndex()
+ 	// never filled and the shafts are built from stale or uninitialised data. That is a stock
+ 	// bug (research/s2-sun-shafts.md section 2); fixing it would change the stock path at medium
+ 	// quality, so it is left alone and only the scene-referred path steps around it.
+-	if (CRendererResources::IsSceneReferred())
++	if (CRendererResources::IsSceneReferredStage(3))
+ 		return 0;
+ 
+ 	return gRenDev->EF_GetRenderQuality() >= eRQ_High ? 0 : 1;
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.cpp
+index fb47f5d7..bcda8096 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.cpp
+@@ -217,7 +217,19 @@ void CToneMappingStage::Execute()
+ 	// hdrSetupParams[3], the same shader permutation. Nothing about the picture changes yet -
+ 	// this item only decides WHERE the exposure comes from, so that S1 has exactly one place to
+ 	// replace with the camera's pre-exposure and nothing else has to move.
+-	const bool bSceneReferred = CRendererResources::IsSceneReferred();
++	// Three gates, not one, because the bisection cvar r_SceneReferredStage has to be able to
++	// stop between them (r_SceneReferredStage documentation in RendererCVars.cpp):
++	//   bSceneReferred      - stage 3. THE HDRFinalPass permutation bit (SAMPLE0). It selects the
++	//                         additive pre-curve sun-shaft composite (S2) AND the body of the
++	//                         output transform (S4) in one flag, because the shader ties them; it
++	//                         is therefore raised at the earlier of the two stages and the LUTs
++	//                         below simply report size 0 until stage 5.
++	//   bSceneReferredExp   - stage 2. The pre-exposure is already in the data, so the tone map
++	//                         must apply none of its own (S1).
++	//   bSceneReferredLook  - stage 5. The ODT and look LUTs and the colour-chart skip (S4/S5/D9).
++	const bool bSceneReferred = CRendererResources::IsSceneReferredStage(3);
++	const bool bSceneReferredExp = CRendererResources::IsSceneReferredStage(2);
++	const bool bSceneReferredLook = CRendererResources::IsSceneReferredStage(5);
+ 
+ 	// S6's export tap. The exporter hands back a ring slot to write this frame into, or nullptr
+ 	// when nothing is armed - which is every frame in normal use, and the whole feature then costs
+@@ -225,7 +237,7 @@ void CToneMappingStage::Execute()
+ 	// %_RT_SAMPLE2. The negative tap is a blit of $HDRTarget after the pass and needs no
+ 	// permutation at all.
+ 	CSceneReferredExport& exporter = CSceneReferredExport::Get();
+-	CTexture* pExportTex = bSceneReferred
++	CTexture* pExportTex = CRendererResources::IsSceneReferredStage(6)
+ 		? exporter.BeginFrame(m_graphicsPipeline,
+ 		                      m_graphicsPipelineResources.m_pTexHDRTarget->GetWidth(),
+ 		                      m_graphicsPipelineResources.m_pTexHDRTarget->GetHeight())
+@@ -240,7 +252,7 @@ void CToneMappingStage::Execute()
+ 	CTexture* pOdtTex = CRendererResources::s_ptexWhite3D;
+ 	float fLmtSize = 0.0f;
+ 	float fOdtSize = 0.0f;
+-	if (bSceneReferred)
++	if (bSceneReferredLook)
+ 	{
+ 		if (CPostEffectsMgr* pPostMgr = PostEffectMgr())
+ 		{
+@@ -285,7 +297,8 @@ void CToneMappingStage::Execute()
+ 	// when the switch flips and the old permutation keeps running (r_HDRDebug occupies bits 9-12).
+ 	int featureMask = ((int)bSunShaftsEnabled << 1) | ((int)bColorGradingEnabled << 2) | ((int)bBloomEnabled << 3) |
+ 	                  ((CRenderer::CV_r_HDREyeAdaptationMode & 0xF) << 5) | ((CRenderer::CV_r_HDRDebug & 0xF) << 9) |
+-	                  ((int)bSceneReferred << 13) | ((int)bExportGraded << 14);
++	                  ((int)bSceneReferred << 13) | ((int)bExportGraded << 14) |
++	                  ((int)bSceneReferredExp << 15) | ((int)bSceneReferredLook << 16);
+ 
+ 	if (m_passToneMapping.IsDirty(featureMask, pSunShaftsTex->GetTextureID(), pColorChartTex->GetTextureID(), CRendererResources::s_ptexCurLumTexture->GetTextureID(),
+ 	                              pLmtTex->GetTextureID(), pOdtTex->GetTextureID(),
+@@ -305,15 +318,19 @@ void CToneMappingStage::Execute()
+ 			// free. One extra permutation of one fullscreen pass.
+ 			rtMask |= g_HWSR_MaskBit[HWSR_SAMPLE0];
+ 		}
+-		else if (CRenderer::CV_r_HDREyeAdaptationMode == 2)
++		else if (!bSceneReferredExp && CRenderer::CV_r_HDREyeAdaptationMode == 2)
+ 		{
++			// !bSceneReferredExp as well: between stages 2 and 3 the exposure constant below is
++			// already pinned to unity, and the Krawczyk branch reads .y/.z as min and max
++			// EXPOSURE rather than as an EV window - a silently wrong picture. Below stage 2
++			// nothing has moved and this is the stock test.
+ 			rtMask |= g_HWSR_MaskBit[HWSR_SAMPLE4];
+ 		}
+ 		// D9: the colour chart is part of the stock LDR stage and is skipped whole under the
+ 		// switch. Not setting the flag rather than binding an identity chart - the fetch and the
+ 		// lerp go away with it, and the chart pipeline keeps running so that turning ccam off
+ 		// restores the stock look without a rebuild.
+-		if (bColorGradingEnabled && !bSceneReferred)
++		if (bColorGradingEnabled && !bSceneReferredLook)
+ 			rtMask |= g_HWSR_MaskBit[HWSR_SAMPLE1];
+ 		// SAMPLE2 used to be set here for vignetting and was read NOWHERE: the gate was inverted
+ 		// at some point and the strength constant (HDRVignetteParams.x) replaced it entirely.
+@@ -388,7 +405,7 @@ void CToneMappingStage::Execute()
+ 	// (EV min, EV max, EV auto compensation) to the Krawczyk branch, which reads .y/.z as min and
+ 	// max EXPOSURE, is a silently wrong picture rather than a crash.
+ 	Vec4 eyeAdaptationParams;
+-	if (bSceneReferred)
++	if (bSceneReferredExp)
+ 	{
+ 		// S1: the exposure is already IN the data. It was applied on the light side, at the five
+ 		// m_fAdaptedSceneScaleLBuffer sites and their companions, from the value the camera
+@@ -649,7 +666,8 @@ void CToneMappingStage::DisplayDebugInfo()
+ 	// The same three-way choice as Execute(), or the overlay reports an exposure the shader is
+ 	// not using. Both formulas below are CPU replicas of FilmMapping() / ComputeExposure() and
+ 	// have to be kept in step with the shader by hand.
+-	const bool bSceneReferred = CRendererResources::IsSceneReferred();
++	// The exposure gate (stage 2), matching the branch Execute() actually took.
++	const bool bSceneReferred = CRendererResources::IsSceneReferredStage(2);
+ 
+ 	if (!bSceneReferred && CRenderer::CV_r_HDREyeAdaptationMode == 2)
+ 	{
+diff --git a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp
+index 18f21ef3..d1a9f408 100644
+--- a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp
++++ b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp
+@@ -1614,6 +1614,20 @@ void CCinematicCameraComponent::PublishSceneReferredConvention(bool bSceneReferr
+ 	if (!gEnv->p3DEngine)
+ 		return;
+ 
++	// The bisection gate, enforced HERE because the four decision sites inside Cry3DEngine read
++	// E3DPARAM_SCENE_REFERRED directly and cannot see a renderer cvar. Withholding the parameter
++	// below stage 3 leaves the engine on the stock light-unit convention, which is exactly what
++	// "r_SceneReferredStage 2" is supposed to mean. The renderer-side half of the same gate is in
++	// CRendererResources::IsSceneReferredLightUnits().
++	if (bSceneReferred)
++	{
++		if (ICVar* pStage = gEnv->pConsole ? gEnv->pConsole->GetCVar("r_SceneReferredStage") : nullptr)
++		{
++			if (pStage->GetIVal() < 3)
++				bSceneReferred = false;
++		}
++	}
++
+ 	Vec3 current(0.0f, 0.0f, 0.0f);
+ 	gEnv->p3DEngine->GetGlobalParameter(E3DPARAM_SCENE_REFERRED, current);
+ 	const bool bCurrent = (current.x > 0.5f);
+diff --git a/Code/CryPlugins/CinematicCamera/docs/ConsoleReference.md b/Code/CryPlugins/CinematicCamera/docs/ConsoleReference.md
+index 36f082b8..cbdff69a 100644
+--- a/Code/CryPlugins/CinematicCamera/docs/ConsoleReference.md
++++ b/Code/CryPlugins/CinematicCamera/docs/ConsoleReference.md
+@@ -100,6 +100,47 @@ The camera's pre-exposure travels beside it on the same bus (`Global_User_SceneE
+ linear scale in engine units. Stage S1 adds no cvar of its own: the exposure is a camera
+ property, not a renderer setting, and `r_SceneReferred 0` switches all of it off at once.
+ 
++### r_SceneReferredStage
++
++| | |
++| --- | --- |
++| Default | 99 (everything) |
++| Purpose | **Bisection** switch for the scene-referred pipeline. `r_SceneReferred` is the master kill switch; this one honours the camera's request only up to a given stage, so a bad frame - or a crash - can be walked back to the one item that causes it without rebuilding anything. |
++
++Set it **before** ticking `Scene Referred` on the component, then raise it one step at a time.
++
++| Value | What is honoured |
++| --- | --- |
++| `0` | The switch and nothing else. The request is published and logged, the whole renderer stays stock. |
++| `1` | `+ S0` - the fp16 floor on the HDR render targets. Render target formats move. |
++| `2` | `+ S1` - the camera's pre-exposure and the AUTO metering. |
++| `3` | `+ S2` - the radiometric light-unit convention (1/pi in the BRDF, sun not pre-divided, sky scale) and the fp16 sun-shaft working set. |
++| `4` | `+ S3` - the Rec.709 to ACEScg working-space conversion. |
++| `5` | `+ S4 / S5 / S7` - the output transform and the camera grade: the ODT and look LUTs, the inert stock LDR stage, thresholds read as stops above mid grey. |
++| `6` | `+ S6` - the EXR export tap. |
++| `99` | Everything. Any value above 6 means the same thing. |
++
++Every gate is a plain AND with the master switch, evaluated where the master was already read, so
++at the default this cvar costs one integer compare and changes nothing.
++
++Two notes on where the boundaries actually fall. Stage 3 raises the `HDRFinalPass` permutation bit
++that selects **both** the additive sun-shaft composite (S2) and the body of the output transform
++(S4), because the shader ties them to one static flag; the LUT slots simply report a size of 0
++until stage 5, so the transform runs in its identity form in between. And stage 3 is also enforced
++inside the camera component, not only in the renderer: the four light-unit decisions that live in
++`Cry3DEngine` read `E3DPARAM_SCENE_REFERRED` and cannot see a renderer cvar, so below stage 3 the
++component simply does not publish it.
++
++When the switch flips, the renderer prints one line **per graphics pipeline** before it touches
++anything:
++
++```
++[SceneReferred] request flipped -> on, pipeline '' (stage gate r_SceneReferredStage 99, 1498x822)
++```
++
++Sandbox builds one graphics pipeline per viewport, so a normal editor flip prints this twice. It
++is the marker that says how far into the flip a frame got.
++
+ ### r_SceneReferredDebug
+ 
+ | | |
+-- 
+2.47.1.windows.1
+

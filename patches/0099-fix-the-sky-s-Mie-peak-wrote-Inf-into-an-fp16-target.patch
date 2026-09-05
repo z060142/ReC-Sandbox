@@ -1,0 +1,549 @@
+From 21dd71c710fe9600979330820603abffcfba6de1 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Sat, 29 Aug 2026 02:26:57 +0800
+Subject: [PATCH 099/119] fix: the sky's Mie peak wrote Inf into an fp16
+ target, and the bloom's firefly knee turned the sun into a flat bun
+
+TEST-CHECKLIST F2/F5: with the sun in frame, one level shows a flat white
+"bun"-shaped halo and the airfield shows sun shafts over the whole screen.
+Three faults, one origin.
+
+1. THE WRITER. The procedural sky has no sun sprite - what reads as the sun IS
+the Mie phase function, pow(miePart_g2_1 + miePart_g_2 * cosine, -1.5), whose
+base collapses towards (1-g)^2 as the view meets the sun and whose peak is
+unbounded by construction. Stock CE never noticed: the tone map's exposure
+divided it down first. Under the pre-exposure it is multiplied up, and at a
+daylight EV the disc lands past fp16's 65504. Every writer that can do this is
+now clamped at its output - the sky pass (which also answers NaN with black),
+and the emissive term in Illum.cfx and MultiLayeredMaterials.cfx, where kcd/m2
+times a night pre-exposure is the same story. New cvar
+r_SceneReferredWriterClamp (default 2^15 = 32768, 0 = off; 2^16 is not
+representable in fp16 and would still store Inf), published in
+CV_SceneLuminanceWeightsDelta.w as SCENE_WRITER_CLAMP, 0 off the switch so
+every branch folds away. ExecuteSceneReferredConversion enforces the same
+ceiling on the whole target - NaN to 0, Inf and anything over to the ceiling -
+because it is the last pass before anything AVERAGES the buffer, and the writer
+list can never be proved complete. It sits in the else of r_SceneReferredDebug
+2 so that instrument still shows what arrives broken.
+
+2. THE BUN is a per-pass clamp, and it is the bloom downsample's firefly
+suppression: Karis's x/(1+L) with its asymptote at a literal 1.0, a number that
+meant display white. Under the pre-exposure every tap over about ten compresses
+into the same sliver below 1 and comes back at the same brightness, so the sun,
+its halo and the sky around it are one flat plateau. The knee moves to the
+camera's white (SCENE_METER_CEILING, 14 stops over grey; 1.0 and bit-identical
+off the switch). Said out loud in the note: on the ReC path this stops being a
+denoiser and becomes an overflow guard.
+
+3. THE SHAFTS. The mask writes skyVisibility * dot(sceneCol, 1.32) and the
+composite multiplies it by the sun's exposed radiance - so the mask has to be
+dimensionless, and on the stock path it was, by accident, because the UNORM
+working set saturated it at 1. S2 made that set fp16 and the saturation went
+with it. The mask is bounded at mid grey again (the one level the pre-exposure
+pins), the pass now binds the per-view constant buffer, and the composited
+shaft radiance is capped at the camera's white - a bound on an approximation,
+labelled as one: shafts are atmospheric and the sensor clip is their real
+limit, but their amount slider is a display fraction with no calibration behind
+it.
+
+decisions/s8-fp16-writers.md and the round-3 addendum to
+decisions/s2-sun-shafts.md carry the approaches not taken.
+
+Co-Authored-By: Claude Opus <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01A72MFkdSczncE7au9UVnmu
+---
+ .../RenderDll/Common/RendererCVars.cpp        | 17 +++++
+ .../RenderDll/Common/RendererCVars.h          |  1 +
+ .../RenderDll/Common/RendererResources.cpp    | 11 ++++
+ .../RenderDll/Common/RendererResources.h      |  7 +++
+ .../Common/GraphicsPipeline.cpp               |  6 +-
+ .../StandardGraphicsPipeline.cpp              |  6 +-
+ .../GraphicsPipeline/SunShafts.cpp            |  7 +++
+ .../HWScripts/CryFX/FXConstantDefs.cfi        | 28 ++++++++-
+ .../HWScripts/CryFX/HDRPostProcess.cfx        | 45 +++++++++++++-
+ Engine/Shaders/HWScripts/CryFX/Illum.cfx      |  8 +++
+ .../HWScripts/CryFX/MultiLayeredMaterials.cfx |  8 +++
+ .../Shaders/HWScripts/CryFX/PostEffects.cfx   | 62 +++++++++++++------
+ Engine/Shaders/HWScripts/CryFX/Stars.cfx      | 24 +++++++
+ Engine/Shaders/HWScripts/CryFX/Sunshafts.cfx  | 19 +++++-
+ 14 files changed, 224 insertions(+), 25 deletions(-)
+
+diff --git a/Code/CryEngine/RenderDll/Common/RendererCVars.cpp b/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
+index 49b5eb87..10e2c66a 100644
+--- a/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
++++ b/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
+@@ -419,6 +419,7 @@ int CRendererCVars::CV_r_SceneReferred;
+ int CRendererCVars::CV_r_SceneReferredDebug;
+ int CRendererCVars::CV_r_SceneReferredStage;
+ float CRendererCVars::CV_r_SceneReferredNishitaScale;
++float CRendererCVars::CV_r_SceneReferredWriterClamp;
+ int CRendererCVars::CV_r_SceneReferredExrSelfTest;
+ int CRendererCVars::CV_r_SceneReferredExportTap;
+ int CRendererCVars::CV_r_SceneReferredExportEncoding;
+@@ -1779,6 +1780,22 @@ void CRendererCVars::InitCVars()
+ 	               "the ratio that brings it to a real clear-sky diffuse value (about 12 000 lux with "
+ 	               "the sun at 45 degrees). 1.0 = uncalibrated (default), which is the shipped "
+ 	               "behaviour and changes nothing.");
++	REGISTER_CVAR3("r_SceneReferredWriterClamp", CV_r_SceneReferredWriterClamp, 32768.0f, VF_NULL,
++	               "The ceiling every scene-referred WRITER is held to, in exposed engine units, "
++	               "and the ceiling the 709->AP1 conversion enforces on the whole HDR target. "
++	               "Applied only while the scene-referred path is active (stage 2 and up). "
++	               "The reason is the format, not the picture: the HDR target is fp16 and tops "
++	               "out at 65504, so a writer that can produce more - the procedural sky's Mie "
++	               "forward-scattering peak goes to infinity as you look into the sun, and an "
++	               "emissive material in kcd/m2 at a night pre-exposure is not far behind - puts "
++	               "an Inf in the buffer. From there every downstream average, blur and threshold "
++	               "is poisoned: bloom returns a flat plateau, the sun-shafts mask saturates over "
++	               "the whole screen and the exposure meter reads black. 32768 is 2^15, one "
++	               "doubling of headroom under fp16's limit so that the blends that follow still "
++	               "have somewhere to go, and about 17.5 stops over mid grey - far above the "
++	               "sensor's own clip (14 stops by default), so nothing the picture can show is "
++	               "affected. 0 disables the clamp and the guard, which is the way to see the "
++	               "overflow this exists to prevent.");
+ 	REGISTER_CVAR3("r_SceneReferredExportTap", CV_r_SceneReferredExportTap, 0, VF_NULL,
+ 	               "WHICH frame rec_CaptureEXR writes. "
+ 	               "0 = GRADED (default): the value HDRFinalPass has right before the output "
+diff --git a/Code/CryEngine/RenderDll/Common/RendererCVars.h b/Code/CryEngine/RenderDll/Common/RendererCVars.h
+index b7048ac0..4048567d 100644
+--- a/Code/CryEngine/RenderDll/Common/RendererCVars.h
++++ b/Code/CryEngine/RenderDll/Common/RendererCVars.h
+@@ -418,6 +418,7 @@ public:
+ 	static int   CV_r_SceneReferredDebug;
+ 	static int   CV_r_SceneReferredStage;
+ 	static float CV_r_SceneReferredNishitaScale;
++	static float CV_r_SceneReferredWriterClamp;
+ 	static int   CV_r_SceneReferredExrSelfTest;
+ 	static int   CV_r_SceneReferredExportTap;
+ 	static int   CV_r_SceneReferredExportEncoding;
+diff --git a/Code/CryEngine/RenderDll/Common/RendererResources.cpp b/Code/CryEngine/RenderDll/Common/RendererResources.cpp
+index b17e4ead..14dcb9cc 100644
+--- a/Code/CryEngine/RenderDll/Common/RendererResources.cpp
++++ b/Code/CryEngine/RenderDll/Common/RendererResources.cpp
+@@ -510,6 +510,17 @@ float CRendererResources::GetSceneReferredMeterCeiling()
+ 	return kSceneReferredMidGrey * powf(2.0f, kSceneReferredMeterCeilingStops);
+ }
+ 
++float CRendererResources::GetSceneReferredWriterClamp()
++{
++	// Stage 2, the exposure stage: before the pre-exposure exists there is nothing that can
++	// overflow that did not overflow in stock CE, and a clamp there would be a change to the
++	// stock picture for no reason.
++	if (!IsSceneReferredStage(2))
++		return 0.0f;
++
++	return max(CRenderer::CV_r_SceneReferredWriterClamp, 0.0f);
++}
++
+ // D11's one line of arithmetic, in one place, so that seven effects cannot each grow their own
+ // slightly different idea of what a threshold means. The apply sites call this and store the
+ // result; nothing downstream - no shader, no constant layout, no serialised default - knows the
+diff --git a/Code/CryEngine/RenderDll/Common/RendererResources.h b/Code/CryEngine/RenderDll/Common/RendererResources.h
+index 4f450713..ca7f6868 100644
+--- a/Code/CryEngine/RenderDll/Common/RendererResources.h
++++ b/Code/CryEngine/RenderDll/Common/RendererResources.h
+@@ -206,6 +206,13 @@ public:
+ 	static const float kSceneReferredMeterCeilingStops;
+ 	static float       GetSceneReferredMeterCeiling();
+ 
++	//! The ceiling every scene-referred writer is held to and the 709->AP1 conversion enforces,
++	//! in exposed engine units (r_SceneReferredWriterClamp, default 2^15). A FORMAT bound, not a
++	//! look: the HDR target is fp16 and an Inf in it poisons every average downstream.
++	//! 0 off the switch, and 0 when the cvar is set to 0, which is what the shaders read as
++	//! "no clamp" - the branches fold away and the stock path is byte-identical.
++	static float       GetSceneReferredWriterClamp();
++
+ 	//! A highlight-extraction threshold, in whatever unit is in force this frame
+ 	//! (SceneReferredSpec.md D11, Stage S7).
+ 	//!
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Common/GraphicsPipeline.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Common/GraphicsPipeline.cpp
+index aee529b4..6003744a 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Common/GraphicsPipeline.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Common/GraphicsPipeline.cpp
+@@ -1267,7 +1267,11 @@ void CGraphicsPipeline::GeneratePerViewConstantBuffer(const SRenderViewInfo* pVi
+ 			static const Vec3 kAP1Y(0.27222872f, 0.67408177f, 0.05368952f);
+ 
+ 			const Vec3 wanted = CRendererResources::IsSceneReferredWorkingSpace() ? kAP1Y : kRec709Y;
+-			cb.CV_SceneLuminanceWeightsDelta = Vec4(wanted - kRec709Y, 0.0f);
++			// .w is the writer clamp (SCENE_WRITER_CLAMP), not a weight. It lives in this float4
++			// because it is the only spare slot in the per-view block that reads 0 on an unbound
++			// buffer, and 0 is exactly "no clamp" - the same argument that put the meter ceiling
++			// in CV_SceneExposure.w. See decisions/s8-fp16-writers.md.
++			cb.CV_SceneLuminanceWeightsDelta = Vec4(wanted - kRec709Y, CRendererResources::GetSceneReferredWriterClamp());
+ 		}
+ 
+ 		Vec3 pDecalZFightingRemedy;
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/StandardGraphicsPipeline.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/StandardGraphicsPipeline.cpp
+index 994f0850..b87e12c1 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/StandardGraphicsPipeline.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/StandardGraphicsPipeline.cpp
+@@ -237,7 +237,11 @@ void CStandardGraphicsPipeline::ExecuteSceneReferredConversion()
+ 	pass.BeginConstantUpdate();
+ 	{
+ 		static CCryNameR paramsName("SceneReferredParams");
+-		const Vec4 params((float)width, (float)height, (float)CRendererCVars::CV_r_SceneReferredDebug, 0.0f);
++		// .w is the writer ceiling this pass enforces on the whole target (item 2 of the round-3
++		// fixes, decisions/s8-fp16-writers.md): the last point before anything downstream
++		// AVERAGES the buffer, so it is where a non-finite texel has to stop.
++		const Vec4 params((float)width, (float)height, (float)CRendererCVars::CV_r_SceneReferredDebug,
++		                  CRendererResources::GetSceneReferredWriterClamp());
+ 		pass.SetConstant(paramsName, params);
+ 	}
+ 
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/SunShafts.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/SunShafts.cpp
+index 6094f3b5..28ae6b1d 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/SunShafts.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/SunShafts.cpp
+@@ -83,6 +83,13 @@ void CSunShaftsStage::Execute()
+ 			uint64 rtMask = g_HWSR_MaskBit[HWSR_SAMPLE0];
+ 			m_passShaftsMask.SetPrimitiveFlags(CRenderPrimitive::eFlags_ReflectShaderConstants_VS);
+ 			m_passShaftsMask.SetPrimitiveType(CRenderPrimitive::ePrim_ProceduralTriangle);
++			// The mask's brightness term is bounded by mid grey on the scene-referred path
++			// (decisions/s2-sun-shafts.md, round-3 addendum), and mid grey is only a meaningful
++			// level because the pre-exposure put it there - so the pass has to read
++			// SCENE_METER_CEILING out of the per-view constant buffer to know whether it is on
++			// that path at all. Stock CE did not bind this buffer here; off the switch the
++			// constant is 0, the branch takes the stock arm and the pixels do not move.
++			m_passShaftsMask.SetRequirePerViewConstantBuffer(true);
+ 			m_passShaftsMask.SetTechnique(pShader, techMaskGen, rtMask);
+ 			m_passShaftsMask.SetRenderTarget(0, pFinalRT);
+ 			m_passShaftsMask.SetState(GS_NODEPTHTEST);
+diff --git a/Engine/Shaders/HWScripts/CryFX/FXConstantDefs.cfi b/Engine/Shaders/HWScripts/CryFX/FXConstantDefs.cfi
+index 00523c98..49e6f6f1 100644
+--- a/Engine/Shaders/HWScripts/CryFX/FXConstantDefs.cfi
++++ b/Engine/Shaders/HWScripts/CryFX/FXConstantDefs.cfi
+@@ -157,6 +157,30 @@ cbuffer PerMaterialConstants : register()
+ // CGraphicsPipeline::GeneratePerViewConstantBuffer().
+ #define SCENE_METER_CEILING (CV_SceneExposure.w)
+ 
++// Mid grey in the scene-referred working space. THE anchor of the whole pipeline
++// (SceneReferredSpec.md D6): the pre-exposure is defined so that an 18 % patch lands exactly
++// here, which is what lets every threshold, ceiling and clip in the chain be expressed in stops
++// rather than in engine units nobody can reason about. The C++ twin is
++// CRendererResources::kSceneReferredMidGrey.
++#define SCENE_MID_GREY (0.18)
++
++// The ceiling every scene-referred WRITER is held to, in exposed scene units
++// (r_SceneReferredWriterClamp, default 2^15 = 32768, about 17.5 stops over mid grey). 0 = no
++// clamp, which is what the stock path and an unbound per-view buffer read, so every use of this
++// sits behind an `if (SCENE_WRITER_CLAMP > 0)` that folds away.
++//
++// This is a FORMAT bound and not a look. The HDR target is fp16 and stops at 65504; a writer
++// that can exceed it - the procedural sky's Mie forward-scattering peak, which diverges as the
++// view direction meets the sun, or an emissive material in kcd/m2 at a night pre-exposure -
++// leaves an Inf in the buffer, and from there every average, blur and threshold downstream is
++// poisoned. The sensor's own clip (FilmMapping step 1b, 14 stops over grey by default) sits
++// three and a half stops BELOW this, so nothing the picture can show is touched by it.
++//
++// It rides in CV_SceneLuminanceWeightsDelta.w rather than in a float4 of its own for the reason
++// the meter ceiling rides in CV_SceneExposure.w: it is the only spare slot in the per-view block
++// whose unbound value, 0, is already the correct "off".
++#define SCENE_WRITER_CLAMP (CV_SceneLuminanceWeightsDelta.w)
++
+ cbuffer CBPerViewGlobal : register(b6)
+ {
+ 	float4x4  CV_ViewProjZeroMatr;
+@@ -210,7 +234,9 @@ cbuffer CBPerViewGlobal : register(b6)
+ 	// does not bind the per-view constant buffer reads zero, adds zero, and gets Rec.709 - the
+ 	// stock answer - instead of a black frame or, far worse, a silently wrong luminance. On the
+ 	// stock path the delta is an exact 0.0, so the addition is bit-identical.
+-	// .w reserved. Read through GetWorkingLuminanceWeights(), never directly.
++	// .w is NOT a weight: it is the scene-referred writer clamp (SCENE_WRITER_CLAMP above), and
++	// 0 - what an unbound buffer reads - is its "off". Read the xyz through
++	// GetWorkingLuminanceWeights() and the w through SCENE_WRITER_CLAMP, never directly.
+ 	float4    CV_SceneLuminanceWeightsDelta;
+ };
+ 
+diff --git a/Engine/Shaders/HWScripts/CryFX/HDRPostProcess.cfx b/Engine/Shaders/HWScripts/CryFX/HDRPostProcess.cfx
+index 2da6eb26..331e4b70 100644
+--- a/Engine/Shaders/HWScripts/CryFX/HDRPostProcess.cfx
++++ b/Engine/Shaders/HWScripts/CryFX/HDRPostProcess.cfx
+@@ -1160,7 +1160,27 @@ pixoutHDRFinal HDRFinalScenePS(vert2frag IN)
+ 	// (CToneMappingStage::Execute), not the unit-length hue vector the stock path uses, so the
+ 	// shafts follow T-stop, ND and time of day continuously.
+ #if %_RT_SAMPLE0 && %_RT_SAMPLE5
+-	vSample += sunShaftsTex.Sample(linearClampSS, ScreenTC.xy).rgb * SunShafts_SunCol.rgb;
++	{
++		half3 cShafts = sunShaftsTex.Sample(linearClampSS, ScreenTC.xy).rgb * SunShafts_SunCol.rgb;
++
++		// A second bound, on the composited radiance this time (decisions/s2-sun-shafts.md,
++		// round-3 addendum). The mask is a visibility in [0,1] now, but the constant it
++		// multiplies is the SUN's exposed radiance - four to five stops over anything else in
++		// the frame - times a shaft amount that was authored as a display fraction and has no
++		// physical calibration behind it. Screen-space shafts are an approximation of single
++		// scattering; there is no equation here that would stop a mis-set amount from painting
++		// six stops of white over a third of the picture, and from there through the bloom
++		// chain over all of it.
++		//
++		// The ceiling is the level the camera calls white. The atmosphere near the sun really
++		// can be brighter than that - but the sensor cannot record it, so letting it through
++		// buys no picture and costs the whole frame. Off the switch this is 0 and the line is
++		// unreachable, since the branch is inside the scene-referred permutation anyway.
++		if (SCENE_METER_CEILING > 0)
++			cShafts = min(cShafts, (half3)SCENE_METER_CEILING);
++
++		vSample += cShafts;
++	}
+ #endif
+ 
+ 	half3 cExportTap;
+@@ -1883,7 +1903,8 @@ RWTexture2D<float4> SceneReferredTargetUAV : register(u0);
+ 
+ // .xy = target size in texels (the dispatch is padded up to the group size)
+ // .z  = r_SceneReferredDebug: 2 paints the texels this pass could not produce
+-// .w  = unused
++// .w  = the writer ceiling (r_SceneReferredWriterClamp) enforced on the whole target here.
++//       0 = no guard, which is what the stock path never reaches anyway.
+ float4 SceneReferredParams;
+ 
+ #define SCENE_REFERRED_CONVERT_TILE 8
+@@ -1917,6 +1938,26 @@ void SceneReferredConvertCS(uint3 DispatchThreadID : SV_DispatchThreadID)
+ 		else if (any(cDst < 0.0))
+ 			cDst = float3(0.0, SCENE_REFERRED_DEBUG_MARK, 0.0);
+ 	}
++	else if (SceneReferredParams.w > 0.0)
++	{
++		// The one gate every scene writer has to pass (decisions/s8-fp16-writers.md). Each
++		// writer is clamped where it is, but a writer we have not found - or a blend of several
++		// that individually behaved - can still leave a non-finite texel here, and this pass is
++		// the last point at which the whole target is walked before anything AVERAGES it. One
++		// Inf inside a bloom downsample block, a glare threshold pass or the exposure meter's
++		// log mean takes the whole block, the whole frame or the whole exposure loop with it,
++		// which is the round-2 runaway all over again.
++		//
++		// NaN reads as black: it carries no information and the alternatives all spread it.
++		// Inf and anything over the ceiling read as the ceiling: they DO carry information -
++		// "brighter than this buffer can say" - and the sensor clip in the tone map is three
++		// and a half stops below it, so nothing visible is lost.
++		//
++		// Deliberately in the else of the debug branch: r_SceneReferredDebug 2 exists to SHOW
++		// the texels that arrive broken, and a guard that silently repaired them first would
++		// make the instrument lie.
++		cDst = any(isnan(cDst)) ? (float3)0.0 : min(cDst, (float3)SceneReferredParams.w);
++	}
+ 
+ 	SceneReferredTargetUAV[vPixCoord] = float4(cDst, cSrc.a);
+ }
+diff --git a/Engine/Shaders/HWScripts/CryFX/Illum.cfx b/Engine/Shaders/HWScripts/CryFX/Illum.cfx
+index 0cba3af5..4fbbb91c 100644
+--- a/Engine/Shaders/HWScripts/CryFX/Illum.cfx
++++ b/Engine/Shaders/HWScripts/CryFX/Illum.cfx
+@@ -655,6 +655,14 @@ pixout IlluminationPS(vert2FragGeneral IN)
+ 	// at its old brightness while everything around it moves (SceneReferredSpec.md D3).
+ 	// PS_HDR_RANGE_ADAPT_MAX is exactly 1.0 off the scene-referred path.
+ 	half3 emittance = MatEmissiveColor.xyz * MatEmissiveColor.w * MAT_EMISSIVE_UNIT_SCALE * PS_HDR_RANGE_ADAPT_MAX;
++	// Scene-referred writer clamp (decisions/s8-fp16-writers.md): the emittance is authored in
++	// kcd/m2 and multiplied by the pre-exposure, so a bright practical at a NIGHT exposure - the
++	// pre-exposure there is of the order of 2000 - can pass fp16's 65504 on its own. An Inf here
++	// poisons the bloom, the glare source and the exposure meter for the whole frame. A ceiling
++	// 17.5 stops over mid grey is three and a half stops above anything the sensor can record.
++	if (SCENE_WRITER_CLAMP > 0)
++		emittance = min(emittance, (half3)SCENE_WRITER_CLAMP);
++
+ 	const bool bEmissive = GetLuminance(emittance.xyz) > 0;
+ 	if (bEmissive)
+ 	{
+diff --git a/Engine/Shaders/HWScripts/CryFX/MultiLayeredMaterials.cfx b/Engine/Shaders/HWScripts/CryFX/MultiLayeredMaterials.cfx
+index d47fb120..8cdbd956 100644
+--- a/Engine/Shaders/HWScripts/CryFX/MultiLayeredMaterials.cfx
++++ b/Engine/Shaders/HWScripts/CryFX/MultiLayeredMaterials.cfx
+@@ -1117,6 +1117,14 @@ pixout MultiLayeredMaterialsPS(vert2FragGeneral IN)
+     // Same as Illum.cfx: forward-additive emissive takes the pre-exposure by hand, and the
+     // kcd/m^2 unit scale is the shared MAT_EMISSIVE_UNIT_SCALE instead of a second literal.
+     half3 emittance = MatEmissiveColor.xyz * MatEmissiveColor.w * MAT_EMISSIVE_UNIT_SCALE * PS_HDR_RANGE_ADAPT_MAX;
++    // Scene-referred writer clamp (decisions/s8-fp16-writers.md): the emittance is authored in
++    // kcd/m2 and multiplied by the pre-exposure, so a bright practical at a NIGHT exposure - the
++    // pre-exposure there is of the order of 2000 - can pass fp16's 65504 on its own. An Inf here
++    // poisons the bloom, the glare source and the exposure meter for the whole frame. A ceiling
++    // 17.5 stops over mid grey is three and a half stops above anything the sensor can record.
++    if (SCENE_WRITER_CLAMP > 0)
++    	emittance = min(emittance, (half3)SCENE_WRITER_CLAMP);
++
+     const bool bEmissive = GetLuminance(emittance.xyz) > 0;
+     if (bEmissive)
+         emittance *= GetEmittanceMask(IN.baseTC);
+diff --git a/Engine/Shaders/HWScripts/CryFX/PostEffects.cfx b/Engine/Shaders/HWScripts/CryFX/PostEffects.cfx
+index ed09f0c8..2b6ca79d 100644
+--- a/Engine/Shaders/HWScripts/CryFX/PostEffects.cfx
++++ b/Engine/Shaders/HWScripts/CryFX/PostEffects.cfx
+@@ -297,58 +297,82 @@ pixout DownsampleStablePS(vtxOutTexToTex IN)
+ #endif
+ 	
+ 	const float2 TexSize = 1 / (PS_ScreenSize.xy * 2);
+-	
++
++	// THE FLAT WHITE "BUN" (decisions/s8-fp16-writers.md section 3). The firefly suppression
++	// below is Karis's weighted average: each tap is compressed by x / (1 + L), the block is
++	// averaged, and the average is expanded again by x / (1 - L). That pair is an exact inverse
++	// ONLY when the taps are equal; what it really does is pull outliers towards the block mean,
++	// which is the whole point of it. But the compression's asymptote is a hard 1.0, in a buffer
++	// where 1.0 used to be roughly display white - so under the pre-exposure, where a lit sky is
++	// a few tenths and the sun disc is 1e4 to 1e6, EVERY tap over about ten compresses into the
++	// same sliver below 1 and comes back out at the same brightness. The sun, its halo and the
++	// sky around it become one flat plateau, and its outline is the "bun". Worse, when a whole
++	// block is that bright the expansion divides by (1 - L) with L a hair under 1 and the result
++	// is enormous, which is what feeds the screen back through the bloom composite.
++	//
++	// The fix is to put the knee where the camera's white is instead of at a literal 1.0:
++	// x / (1 + L/K), inverse x / (1 - L/K), with K = the exposure meter's ceiling, 14 stops over
++	// mid grey. K = 1 off the switch, so the stock path is the stock arithmetic, bit for bit.
++	//
++	// Consequence, stated plainly: on the scene-referred path this stops being a denoiser and
++	// becomes an overflow guard. A specular sparkle at three stops over grey is now passed
++	// through untouched where stock CE would have pulled it down. That is the right trade here -
++	// the pipeline's whole premise is that a bright thing is allowed to be bright - and highlight
++	// flicker is already a known, separate item (TAA, STRUCTURE.md section 2).
++	const half fFireflyKnee    = (SCENE_METER_CEILING > 0) ? (half)SCENE_METER_CEILING : (half)1.0;
++	const half fFireflyKneeRcp = (half)1.0 / fFireflyKnee;
++
+ 	half3 blockTL = 0, blockTR = 0, blockBR = 0, blockBL = 0;
+ 	half3 tex;
+ 	
+ 	tex = GetTexture2D(Tx2Tx_Source, Tx2Tx_Sampler, IN.baseTC.xy + float2(-2, -2) * TexSize).rgb;
+-	if (bKillFireflies) tex /= 1 + GetWorkingLuminance(tex);
++	if (bKillFireflies) tex /= 1 + GetWorkingLuminance(tex) * fFireflyKneeRcp;
+ 	blockTL += tex;
+ 	
+ 	tex = GetTexture2D(Tx2Tx_Source, Tx2Tx_Sampler, IN.baseTC.xy + float2( 0, -2) * TexSize).rgb;
+-	if (bKillFireflies) tex /= 1 + GetWorkingLuminance(tex);
++	if (bKillFireflies) tex /= 1 + GetWorkingLuminance(tex) * fFireflyKneeRcp;
+ 	blockTL += tex; blockTR += tex;
+ 	
+ 	tex = GetTexture2D(Tx2Tx_Source, Tx2Tx_Sampler, IN.baseTC.xy + float2( 2, -2) * TexSize).rgb;
+-	if (bKillFireflies) tex /= 1 + GetWorkingLuminance(tex);
++	if (bKillFireflies) tex /= 1 + GetWorkingLuminance(tex) * fFireflyKneeRcp;
+ 	blockTR += tex;
+ 	
+ 	tex = GetTexture2D(Tx2Tx_Source, Tx2Tx_Sampler, IN.baseTC.xy + float2(-2,  0) * TexSize).rgb;
+-	if (bKillFireflies) tex /= 1 + GetWorkingLuminance(tex);
++	if (bKillFireflies) tex /= 1 + GetWorkingLuminance(tex) * fFireflyKneeRcp;
+ 	blockTL += tex; blockBL += tex;
+ 	
+ 	tex = GetTexture2D(Tx2Tx_Source, Tx2Tx_Sampler, IN.baseTC.xy + float2( 0,  0) * TexSize).rgb;
+-	if (bKillFireflies) tex /= 1 + GetWorkingLuminance(tex);
++	if (bKillFireflies) tex /= 1 + GetWorkingLuminance(tex) * fFireflyKneeRcp;
+ 	blockTL += tex; blockTR += tex; blockBR += tex; blockBL += tex;
+ 	
+ 	tex = GetTexture2D(Tx2Tx_Source, Tx2Tx_Sampler, IN.baseTC.xy + float2( 2,  0) * TexSize).rgb;
+-	if (bKillFireflies) tex /= 1 + GetWorkingLuminance(tex);
++	if (bKillFireflies) tex /= 1 + GetWorkingLuminance(tex) * fFireflyKneeRcp;
+ 	blockTR += tex; blockBR += tex;
+ 	
+ 	tex = GetTexture2D(Tx2Tx_Source, Tx2Tx_Sampler, IN.baseTC.xy + float2(-2,  2) * TexSize).rgb;
+-	if (bKillFireflies) tex /= 1 + GetWorkingLuminance(tex);
++	if (bKillFireflies) tex /= 1 + GetWorkingLuminance(tex) * fFireflyKneeRcp;
+ 	blockBL += tex;
+ 	
+ 	tex = GetTexture2D(Tx2Tx_Source, Tx2Tx_Sampler, IN.baseTC.xy + float2( 0,  2) * TexSize).rgb;
+-	if (bKillFireflies) tex /= 1 + GetWorkingLuminance(tex);
++	if (bKillFireflies) tex /= 1 + GetWorkingLuminance(tex) * fFireflyKneeRcp;
+ 	blockBL += tex; blockBR += tex;
+ 	
+ 	tex = GetTexture2D(Tx2Tx_Source, Tx2Tx_Sampler, IN.baseTC.xy + float2( 2,  2) * TexSize).rgb;
+-	if (bKillFireflies) tex /= 1 + GetWorkingLuminance(tex);
++	if (bKillFireflies) tex /= 1 + GetWorkingLuminance(tex) * fFireflyKneeRcp;
+ 	blockBR += tex;
+ 	
+ 	half3 blockCC = 0;
+ 	tex = GetTexture2D(Tx2Tx_Source, Tx2Tx_Sampler, IN.baseTC.xy + float2(-1, -1) * TexSize).rgb;
+-	if (bKillFireflies) tex /= 1 + GetWorkingLuminance(tex);
++	if (bKillFireflies) tex /= 1 + GetWorkingLuminance(tex) * fFireflyKneeRcp;
+ 	blockCC += tex;
+ 	tex = GetTexture2D(Tx2Tx_Source, Tx2Tx_Sampler, IN.baseTC.xy + float2( 1, -1) * TexSize).rgb;
+-	if (bKillFireflies) tex /= 1 + GetWorkingLuminance(tex);
++	if (bKillFireflies) tex /= 1 + GetWorkingLuminance(tex) * fFireflyKneeRcp;
+ 	blockCC += tex;
+ 	tex = GetTexture2D(Tx2Tx_Source, Tx2Tx_Sampler, IN.baseTC.xy + float2( 1,  1) * TexSize).rgb;
+-	if (bKillFireflies) tex /= 1 + GetWorkingLuminance(tex);
++	if (bKillFireflies) tex /= 1 + GetWorkingLuminance(tex) * fFireflyKneeRcp;
+ 	blockCC += tex;
+ 	tex = GetTexture2D(Tx2Tx_Source, Tx2Tx_Sampler, IN.baseTC.xy + float2(-1,  1) * TexSize).rgb;
+-	if (bKillFireflies) tex /= 1 + GetWorkingLuminance(tex);
++	if (bKillFireflies) tex /= 1 + GetWorkingLuminance(tex) * fFireflyKneeRcp;
+ 	blockCC += tex;
+ 	
+ 	blockTL /= 4; blockTR /= 4; blockBR /= 4; blockBL /= 4; blockCC /= 4;
+@@ -356,11 +380,11 @@ pixout DownsampleStablePS(vtxOutTexToTex IN)
+ 	if (bKillFireflies) 
+ 	{
+ 		// Convert back to uncompressed/linear range
+-		blockTL /= (1 - GetWorkingLuminance(blockTL));
+-		blockTR /= (1 - GetWorkingLuminance(blockTR));
+-		blockBR /= (1 - GetWorkingLuminance(blockBR));
+-		blockBL /= (1 - GetWorkingLuminance(blockBL));
+-		blockCC /= (1 - GetWorkingLuminance(blockCC));
++		blockTL /= (1 - GetWorkingLuminance(blockTL) * fFireflyKneeRcp);
++		blockTR /= (1 - GetWorkingLuminance(blockTR) * fFireflyKneeRcp);
++		blockBR /= (1 - GetWorkingLuminance(blockBR) * fFireflyKneeRcp);
++		blockBL /= (1 - GetWorkingLuminance(blockBL) * fFireflyKneeRcp);
++		blockCC /= (1 - GetWorkingLuminance(blockCC) * fFireflyKneeRcp);
+ 	}
+ 	
+ 	OUT.Color.rgb = 0.5 * blockCC + 0.125 * (blockTL + blockTR + blockBR + blockBL);
+diff --git a/Engine/Shaders/HWScripts/CryFX/Stars.cfx b/Engine/Shaders/HWScripts/CryFX/Stars.cfx
+index 7407a188..84c371f8 100644
+--- a/Engine/Shaders/HWScripts/CryFX/Stars.cfx
++++ b/Engine/Shaders/HWScripts/CryFX/Stars.cfx
+@@ -244,6 +244,30 @@ pixout SkyPassPS(vtxOut IN)
+ 	}
+ #endif
+ 
++	// Scene-referred writer clamp (decisions/s8-fp16-writers.md). THE sky writer that can leave
++	// an Inf in the fp16 HDR target, and the origin of both round-2 reports: the flat white
++	// "bun" around the sun and the full-screen sun shafts.
++	//
++	// The day-sky gradient has no sun sprite. What you see as the sun IS the Mie phase function,
++	//   miePhase = (1 + cos^2) * pow(miePart_g2_1 + miePart_g_2 * cosine, -1.5)
++	// whose base goes to pow(miePart, -2/3) * (1 - g)^2 as the view direction meets the sun
++	// direction, and with the Mie asymmetry g close to 1 that is a very small number raised to
++	// -1.5. The peak is unbounded by construction - a real forward-scattering lobe is - and
++	// stock CE never noticed, because the tone map's exposure divided it down before anything
++	// looked at it. Under the pre-exposure it is multiplied UP instead, and at a daylight EV the
++	// disc lands far past 65504.
++	//
++	// A min() rather than a saturate: everything below the ceiling is untouched, so the sun is
++	// still a very bright disc with a soft falloff, which is what it should be. NaN is caught
++	// separately because min(NaN, c) is not specified to return c.
++	if (SCENE_WRITER_CLAMP > 0)
++	{
++		// min() already answers +Inf with the ceiling (IEEE: min(inf, c) = c), which is the right
++		// answer for a scattering peak that ran away. NaN is a different failure and reads black.
++		const half3 cSky = OUT.Color.rgb;
++		OUT.Color.rgb = any(isnan(cSky)) ? (half3)0 : min(cSky, (half3)SCENE_WRITER_CLAMP);
++	}
++
+ 	return OUT;
+ }
+ 
+diff --git a/Engine/Shaders/HWScripts/CryFX/Sunshafts.cfx b/Engine/Shaders/HWScripts/CryFX/Sunshafts.cfx
+index 3d4eebf9..7ce78d15 100644
+--- a/Engine/Shaders/HWScripts/CryFX/Sunshafts.cfx
++++ b/Engine/Shaders/HWScripts/CryFX/Sunshafts.cfx
+@@ -144,7 +144,24 @@ pixout SunShaftsMaskGenPS(vtxOut IN)
+     half3 sceneCol = GetTexture2D(SSHFTM_Target, SSHFTM_PCSampler, sampleUV); // comes straight from hdr scaled target
+ 	
+     // cheaper and looks nicer
+-    OUT.Color.xyz *= dot(sceneCol, 0.33 * 4);
++    //
++    // Scene-referred: this term is a VISIBILITY, not a radiance, and it has to be bounded
++    // (decisions/s2-sun-shafts.md, round-3 addendum). The composite in HDRFinalPass already
++    // multiplies the blurred mask by the sun's own EXPOSED radiance times the shaft amount, so
++    // whatever this pass returns is a dimensionless "how much bright sky does the ray path see".
++    // On the stock path that was true by accident: the working set was R10G10B10A2 UNORM, so
++    // 1.32 * (R + G + B) saturated at 1.0 for anything brighter than a dim sky and the mask was
++    // effectively sky coverage. S2 made the working set fp16 and the saturation went with it -
++    // the mask now returns tens for a lit sky and thousands where the sun's Mie peak is, the
++    // composite squares the sun into the frame, and the result is the report: shafts covering
++    // the whole screen.
++    //
++    // The bound is mid grey: the mask is full wherever the source is at least an 18 % patch,
++    // which is the one level the pre-exposure pins (D6) and therefore holds at every EV, every
++    // time of day and every lens. It restores exactly what the UNORM working set used to do,
++    // in a unit that means something.
++    const half fSceneBright = dot(sceneCol, 0.33 * 4);
++    OUT.Color.xyz *= (SCENE_METER_CEILING > 0) ? saturate(fSceneBright / SCENE_MID_GREY) : fSceneBright;
+ 
+     return OUT;
+ }
+-- 
+2.47.1.windows.1
+

@@ -1,0 +1,120 @@
+From 020ca8448d3f866835861961e570233d7a0dda12 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Fri, 28 Aug 2026 09:08:55 +0800
+Subject: [PATCH 078/119] scene-referred S3: the boundary audit - who reads
+ what, on which side of the conversion
+
+No behaviour change. The conversion point is only correct if nothing downstream of
+it expects Rec.709 and nothing upstream of it has already been converted, and that
+is a claim about pass ORDER that has to be walked rather than assumed. It was
+walked, in CStandardGraphicsPipeline::Execute() order, and the result is recorded
+both in scene-notes/STRUCTURE.md section 7b (the full table) and as comments at the
+three sites in the code where the next person will actually be standing.
+
+The finding that mattered: the conversion runs inside ExecuteHDRPostProcessing(),
+called at :562, and EVERY forward and transparent pass - transparents below water,
+the water stage, transparents above water, the depth fixup and the half-resolution
+particles - is at :526 to :537. They have all finished. No forward blend ever lands
+709 colour in an AP1 target, and refraction is safe for a second reason as well:
+CSceneRenderPass::ResolvePass() re-fills $SceneTarget from the still-709 HDR target
+immediately before each refractive draw.
+
+The three readers the whole design turns on - SSR (:446), the water reflection
+(:528) and the SVOGI previous-frame bounce, inside lighting - all bind
+$HDRTargetPrev, all run before :562, and all therefore read the Rec.709 frame the
+copy handed them. Nothing had to be reordered and no reader needed a conversion of
+its own.
+
+Sites now carrying a comment saying which space they are in and why:
+  CSnowStage::Execute()          the ONE post-conversion writer of 709-authored
+                                 colour. Near-achromatic, small error, left to break
+                                 visibly per D13. S8 list. (CRainStage and the
+                                 deferred snow displacement are both on the correct
+                                 side, which is worth saying because it looks
+                                 accidental.)
+  CLensOpticsStage::Execute()    not a consumer of the working space at all - it
+                                 OVERWRITES $SceneTargetR11G11B10F[0] from the flare
+                                 textures without reading it, and the result is
+                                 composited in the LDR PostAA stage after the tone
+                                 map. Display-referred on both paths; it becomes
+                                 D9's problem in S4, not S3's.
+  CDepthOfFieldStage's copy      $HDRTarget -> $SceneTarget is AP1 to AP1. It does
+                                 leave $SceneTarget in AP1 for the rest of the
+                                 frame, which only a shader reading it WITHOUT
+                                 triggering a resolve would ever see - and that read
+                                 was already stale in stock CE.
+
+STRUCTURE.md section 7b also records what S3 deliberately did NOT fix, so none of it
+gets mistaken for a defect later: the 709-authored CPU tints (anamorphic, halation,
+the six-wavelength diffraction spectrum, the ghost tint and its hue rotation) now
+multiply AP1 data and each wants its own visible commit; every absolute threshold
+now compares against a different number, which is D11 / S7; r_HDRDebug 2 sRGB-encodes
+AP1 through a 709 curve; the flip frame still leaves $HDRTargetPrev undefined for one
+frame; and the tone map itself is now being fed AP1 values by a Hable curve and an
+sRGB encode that both think they are looking at Rec.709 - which is the expected
+intermediate state until S4 replaces them with the ODT.
+
+Build: CryRenderD3D11, CinematicCamera, 0/0.
+
+Co-Authored-By: Claude Opus <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01A72MFkdSczncE7au9UVnmu
+---
+ .../XRenderD3D9/GraphicsPipeline/DepthOfField.cpp   | 10 ++++++++++
+ .../GraphicsPipeline/StandardGraphicsPipeline.cpp   | 13 +++++++++++++
+ 2 files changed, 23 insertions(+)
+
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DepthOfField.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DepthOfField.cpp
+index 61dab438..2bac13a8 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DepthOfField.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DepthOfField.cpp
+@@ -674,6 +674,16 @@ void CDepthOfFieldStage::Execute()
+ 	Vec4 vDofParams1 = Vec4(CRenderer::CV_r_dofMinZ + dofParams.vMinZParams.x, CRenderer::CV_r_dofMinZScale + dofParams.vMinZParams.y, fNearestDofScaleBoost, vFocus.w);
+ 
+ 	// For better blending later
++	//
++	// Scene-referred pipeline (SceneReferredSpec.md S3): both ends of this copy are ACEScg - the
++	// source is the already-converted HDR target and the only consumer is this stage's own
++	// composite. What it also does, on both paths, is leave $SceneTarget holding the LAST thing
++	// written to it for the rest of the frame. $SceneTarget is addressable by name from material
++	// shader scripts (ShaderTemplate.cpp) as the refraction source, but every refractive draw
++	// happens in the forward transparent block, which CSceneRenderPass::ResolvePass re-fills from
++	// the Rec.709 HDR target immediately before, and which finishes long before the conversion
++	// point. So refraction reads 709 on both paths; only a shader that read $SceneTarget WITHOUT
++	// triggering a resolve would see a stale frame, and that read was already stale in stock CE.
+ 	m_passCopySceneTarget.Execute(m_graphicsPipelineResources.m_pTexHDRTarget, m_graphicsPipelineResources.m_pTexSceneTarget);
+ 
+ 	static CCryNameR dofFocusParam0Name("vDofParamsFocus0");
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/StandardGraphicsPipeline.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/StandardGraphicsPipeline.cpp
+index 0ba6340a..737b3bee 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/StandardGraphicsPipeline.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/StandardGraphicsPipeline.cpp
+@@ -284,6 +284,12 @@ void CStandardGraphicsPipeline::ExecuteHDRPostProcessing()
+ 	if (GetStage<CMotionBlurStage>()->IsStageActive(m_renderingFlags))
+ 		GetStage<CMotionBlurStage>()->Execute();
+ 
++	// Scene-referred pipeline: this is the ONE writer that lands on the far side of the
++	// working-space conversion with Rec.709-authored colour. Snow is near-achromatic, so the
++	// error is small, and per SceneReferredSpec.md D13 it is left to break visibly rather than
++	// switched off. (CRainStage above sits on the correct side: it writes before the copy, so it
++	// is converted along with everything else. CSnowStage::ExecuteDeferredSnowDisplacement()
++	// likewise runs before ExecuteHDRPostProcessing().) S8 breakage list.
+ 	if (GetStage<CSnowStage>()->IsStageActive(m_renderingFlags))
+ 		GetStage<CSnowStage>()->Execute();
+ 
+@@ -339,6 +345,13 @@ void CStandardGraphicsPipeline::ExecuteHDRPostProcessing()
+ 	GetStage<CDepthOfFieldStage>()->ExecuteGhostComposite();
+ 
+ 	// writes m_graphicsPipelineResources.m_pTexSceneTargetR11G11B10F[0]
++	//
++	// Scene-referred pipeline: this is NOT a consumer of the working space, despite writing a
++	// target that motion blur filled with ACEScg a few passes ago - it overwrites it wholesale
++	// from the flare textures and never reads it. The result is composited in the LDR PostAA
++	// stage, i.e. after the tone map, so the flares stay display-referred on both paths and the
++	// primaries change cannot reach them. (They become D9's problem in S4, when the whole stock
++	// LDR stage is skipped under the camera, not S3's.)
+ 	if (GetStage<CLensOpticsStage>()->IsStageActive(m_renderingFlags))
+ 		GetStage<CLensOpticsStage>()->Execute();
+ 
+-- 
+2.47.1.windows.1
+

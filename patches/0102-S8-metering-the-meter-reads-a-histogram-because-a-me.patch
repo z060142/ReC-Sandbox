@@ -1,0 +1,829 @@
+From 353be58196c9304acdcd4cdfb1a4b50974a64a7b Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Sat, 29 Aug 2026 02:56:36 +0800
+Subject: [PATCH 102/119] S8 metering: the meter reads a histogram, because a
+ mean cannot survive a sky
+
+decisions/s8-metering.md approach A, part 1: the renderer half.
+
+A new compute pass in CAutoExposureStage bins the quarter-res exposed HDR
+source - the same texture the stock measure pass reads, after the round-3
+firefly-knee fix - into a 64-bin log2 luminance histogram, 8x8 groups,
+groupshared bins, one global InterlockedAdd per bin per group. The window is
+-14 to +18 stops relative to MID GREY, half a stop per bin, which is only
+possible because the pre-exposure anchors 0.18: it needs no per-scene tuning at
+any time of day, which is the one thing UE's absolute HistogramLogMin/Max
+cannot do. Bins 0 and 63 saturate, so an Inf gets a POSITION and no magnitude
+and the percentile band can ignore it entirely - the runaway of round 2 becomes
+structurally impossible rather than clamped away.
+
+What is metered CHANGES, and it is stated in the shader. The stock pass divides
+the G-buffer albedo out to estimate illuminance and fabricates rho = 0.2 for
+every pixel with no albedo - sky, emissive, everything forward-rendered. That
+fabrication is calibrated for midday sun and over-reads by 1.6 to 3.2 stops
+otherwise, times the sky's share of the frame. This pass meters luminance, so
+the fallback no longer exists and NO LONGER MATTERS: the meter is now a
+reflected meter, and what keeps the calibration is the target, not the
+quantity. An 18 % card under the light still lands on 0.18 by D6, so
+C = 120*pi from s1-exposure-constant.md holds unchanged.
+
+Metering Mode rides the post-effect bus as the accumulation weight: Average,
+CenterWeighted (a smooth radial falloff, 100 % centre to 25 % corner) and Spot
+(a soft-edged disc a fifth of the frame height across). The falloff is smooth
+because a hard edge makes the exposure step as content crosses it.
+
+The readback is the two-phase path we already had, with a new decode. The
+histogram accumulates into a 64x1 TEXTURE and not a CGpuBuffer, because
+DownloadToStagingResource lives on CDeviceTexture and has no buffer twin
+anywhere in this tree. ETEX_Format has no uint entry, so the target is eTF_R32F
+with FT_USAGE_UAV_RWTEXTURE - which makes the resource R32_TYPELESS - plus a
+hand-built DXGI_FORMAT_R32_UINT view, exactly as m_pTexLinearDepthFixupUAV
+already does. 256 bytes and one fence a frame instead of four bytes and one
+fence; the latency is unchanged and invisible against tau.
+
+r_SceneReferredMeterHistogram (default 1) keeps the shipped whole-frame
+log-mean alive at 0 as a runtime A/B and as the fallback if the compute pass
+ever misbehaves - which is also why the meter's 14-stop ceiling stays in the
+shader. It no longer touches the metering that ships.
+
+EFQ_GetSceneReferredMeterHistogram hands the bins to the camera by value, with
+the pre-exposure of the sampled frame and the window travelling beside them so
+no consumer has to keep a second copy of either in step.
+
+Co-Authored-By: Claude Opus <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01A72MFkdSczncE7au9UVnmu
+---
+ .../CryCommon/CryRenderer/IRenderer.h         |  38 ++-
+ .../Common/PostProcess/PostProcess.cpp        |  12 +
+ .../Common/PostProcess/PostProcess.h          |   6 +
+ Code/CryEngine/RenderDll/Common/Renderer.cpp  |   9 +
+ Code/CryEngine/RenderDll/Common/Renderer.h    |   9 +
+ .../RenderDll/Common/RendererCVars.cpp        |  14 ++
+ .../RenderDll/Common/RendererCVars.h          |   1 +
+ .../RenderDll/Common/RendererResources.cpp    |  14 ++
+ .../RenderDll/Common/RendererResources.h      |   6 +
+ .../GraphicsPipeline/AutoExposure.cpp         | 228 +++++++++++++++++-
+ .../GraphicsPipeline/AutoExposure.h           |  32 +++
+ .../Common/GraphicsPipeline.cpp               |   3 +-
+ .../HWScripts/CryFX/HDRPostProcess.cfx        | 171 +++++++++++++
+ 13 files changed, 535 insertions(+), 8 deletions(-)
+
+diff --git a/Code/CryEngine/CryCommon/CryRenderer/IRenderer.h b/Code/CryEngine/CryCommon/CryRenderer/IRenderer.h
+index 2bd5d4d6..158a5458 100644
+--- a/Code/CryEngine/CryCommon/CryRenderer/IRenderer.h
++++ b/Code/CryEngine/CryCommon/CryRenderer/IRenderer.h
+@@ -220,7 +220,43 @@ enum ERenderQueryTypes
+ 	//! sample was captured. A float, in engine units (x RENDERER_LIGHT_UNIT_SCALE = lux), or 0
+ 	//! when the scene-referred path is off or no readback has completed yet. This is how the
+ 	//! Cinematic Camera's AUTO mode meters; nothing else reads it.
+-	EFQ_GetSceneReferredMeteredIlluminance
++	EFQ_GetSceneReferredMeteredIlluminance,
++
++	//! Scene-referred pipeline (SceneReferredSpec.md D2/D7, decisions/s8-metering.md approach A):
++	//! the camera's 64-bin log2 luminance histogram of the last frame that came back, as an
++	//! SSceneReferredMeterHistogram BY VALUE. This is what the Cinematic Camera's AUTO mode
++	//! actually meters from; nothing else reads it.
++	EFQ_GetSceneReferredMeterHistogram
++};
++
++//! The metering histogram the renderer reads back once a frame for the Cinematic Camera's AUTO
++//! mode (SceneReferredSpec.md D2/D7, decisions/s8-metering.md approach A).
++//!
++//! The bins hold accumulated METERING WEIGHT, not texel counts: a texel at full weight contributes
++//! 256 and one the metering mask half-rejects contributes 128, so every percentile query is a
++//! ratio against totalWeight and no consumer has to know the quantisation. Bin i covers
++//!
++//!     log2(L_exposed / 0.18) in [ logMinStops + i*step , logMinStops + (i+1)*step ),
++//!     step = (logMaxStops - logMinStops) / kBinCount
++//!
++//! i.e. STOPS ABOVE MID GREY in the frame's own exposed units. Bins 0 and kBinCount-1 are
++//! saturating buckets: a percentile that resolves inside either is a bound, not a value.
++//!
++//! To get back to absolute scene luminance, divide by exposureAtCapture - the pre-exposure that
++//! was in force for the frame this sample was measured on, which the renderer recorded when it
++//! issued the download. The whole histogram shifts rigidly by that one scalar, so percentiles and
++//! log-means may all be computed in exposed units and converted once, at the end.
++struct SSceneReferredMeterHistogram
++{
++	enum { kBinCount = 64 };
++
++	float  bins[kBinCount];      //!< accumulated metering weight per bin
++	float  totalWeight;          //!< sum of the bins; 0 means "no measurement, hold the last EV"
++	float  exposureAtCapture;    //!< the pre-exposure applied to the frame these bins came from
++	float  logMinStops;          //!< lower edge of bin 0, in stops relative to mid grey
++	float  logMaxStops;          //!< upper edge of the top bin, same units
++	uint32 sampleId;             //!< increments once per completed readback; 0 = never measured
++	uint32 meteringMode;         //!< the mask the accumulation actually used (0 Avg, 1 Centre, 2 Spot)
+ };
+ 
+ enum class EGraphicsPipelineType
+diff --git a/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.cpp b/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.cpp
+index b35e1e62..39f96cb0 100644
+--- a/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.cpp
++++ b/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.cpp
+@@ -450,6 +450,18 @@ int CPostEffectsMgr::Init()
+ 	AddParamFloatNoTransition("Global_User_CamND", m_pUserCamND, 0.0f);
+ 	AddParamFloatNoTransition("Global_User_CamEV100", m_pUserCamEV100, 0.0f);
+ 
++	// The camera's metering (decisions/s8-metering.md approach A). MeterMode is an INPUT to the
++	// renderer - the mask CAutoExposureStage's histogram pass accumulates with - and defaults to
++	// 1, Centre-weighted, so a frame in which the camera has not published yet still meters the
++	// way the camera would ask for. The other three are OUTPUTS of the camera's own reduction,
++	// published back only so r_HDRDebug 1 can print what the band actually resolved to; nothing
++	// draws with them. No transition on any of them: a metering mask is a switch, and fading a
++	// diagnostic readout would make it lie.
++	AddParamFloatNoTransition("Global_User_MeterMode", m_pUserMeterMode, 1.0f);
++	AddParamFloatNoTransition("Global_User_MeterBandLow", m_pUserMeterBandLow, 0.0f);
++	AddParamFloatNoTransition("Global_User_MeterBandHigh", m_pUserMeterBandHigh, 0.0f);
++	AddParamFloatNoTransition("Global_User_MeterTargetEV", m_pUserMeterTargetEV, 0.0f);
++
+ 	// Register all post processes
+ 	AddEffect(CSunShafts);
+ 	AddEffect(CDepthOfField);
+diff --git a/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.h b/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.h
+index 42225e9b..fc3f8b9a 100644
+--- a/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.h
++++ b/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.h
+@@ -743,6 +743,12 @@ protected:
+ 	CEffectParam*       m_pUserCamName, * m_pUserLensName;
+ 	CEffectParam*       m_pUserCamFocal, * m_pUserCamTStop, * m_pUserCamISO, * m_pUserCamShutter;
+ 	CEffectParam*       m_pUserCamND, * m_pUserCamEV100;
++
++	//! The camera's metering, published for the histogram pass and for the r_HDRDebug 1 overlay
++	//! (decisions/s8-metering.md approach A). MeterMode is the accumulation mask the compute pass
++	//! reads; the other three are what the camera MADE of the bins it got back, printed by the
++	//! overlay so that a metering complaint stays one screenshot to diagnose.
++	CEffectParam*       m_pUserMeterMode, * m_pUserMeterBandLow, * m_pUserMeterBandHigh, * m_pUserMeterTargetEV;
+ 	CEffectParam*       m_pUserColorC, * m_pUserColorY, * m_pUserColorM, * m_pUserColorK, * m_pUserColorHue;
+ 
+ 	CPostEffectVec      m_pEffects;
+diff --git a/Code/CryEngine/RenderDll/Common/Renderer.cpp b/Code/CryEngine/RenderDll/Common/Renderer.cpp
+index 74f8ec6b..eb60d808 100644
+--- a/Code/CryEngine/RenderDll/Common/Renderer.cpp
++++ b/Code/CryEngine/RenderDll/Common/Renderer.cpp
+@@ -2576,6 +2576,15 @@ void CRenderer::EF_QueryImpl(ERenderQueryTypes eQuery, void* pInOut0, uint32 nIn
+ 		}
+ 		break;
+ 
++	case EFQ_GetSceneReferredMeterHistogram:
++		{
++			// By value, ~280 bytes once a frame. A pointer would be cheaper and would also hand a
++			// plugin a reference into render-thread state with no lifetime rule attached; the copy
++			// is the whole reason the camera can reduce it at its leisure on the main thread.
++			WriteQueryResult(pInOut0, nInOutSize0, m_sceneReferredMeterHistogram);
++		}
++		break;
++
+ 	case EFQ_GetMaxRenderObjectsNum:
+ 		{
+ 			WriteQueryResult(pInOut0, nInOutSize0, -1);
+diff --git a/Code/CryEngine/RenderDll/Common/Renderer.h b/Code/CryEngine/RenderDll/Common/Renderer.h
+index f1c7b9b6..2565a9c3 100644
+--- a/Code/CryEngine/RenderDll/Common/Renderer.h
++++ b/Code/CryEngine/RenderDll/Common/Renderer.h
+@@ -1551,6 +1551,15 @@ public:
+ 	//! live.
+ 	bool      m_bSceneReferredMeterRejected = false;
+ 
++	//! The 64-bin metering histogram of the last readback that completed (S8,
++	//! decisions/s8-metering.md approach A). Written by CAutoExposureStage on the render thread,
++	//! read through EFQ_GetSceneReferredMeterHistogram on the main thread and by the r_HDRDebug 1
++	//! overlay on the render thread. Same discipline as the scalar above: a one-frame-stale copy
++	//! is far inside the camera's time constant, and a torn read can only mix two adjacent frames'
++	//! bins, which moves a percentile by less than the quantisation. sampleId lets the camera see
++	//! whether a NEW measurement has arrived rather than re-acting on the same one.
++	SSceneReferredMeterHistogram m_sceneReferredMeterHistogram = {};
++
+ 	enum { nMeshPoolMaxTimeoutCounter = 150 /*150 ms*/};
+ 	int m_nMeshPoolTimeoutCounter;
+ 
+diff --git a/Code/CryEngine/RenderDll/Common/RendererCVars.cpp b/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
+index 10e2c66a..c4c2ee3d 100644
+--- a/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
++++ b/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
+@@ -420,6 +420,7 @@ int CRendererCVars::CV_r_SceneReferredDebug;
+ int CRendererCVars::CV_r_SceneReferredStage;
+ float CRendererCVars::CV_r_SceneReferredNishitaScale;
+ float CRendererCVars::CV_r_SceneReferredWriterClamp;
++int CRendererCVars::CV_r_SceneReferredMeterHistogram;
+ int CRendererCVars::CV_r_SceneReferredExrSelfTest;
+ int CRendererCVars::CV_r_SceneReferredExportTap;
+ int CRendererCVars::CV_r_SceneReferredExportEncoding;
+@@ -1796,6 +1797,19 @@ void CRendererCVars::InitCVars()
+ 	               "sensor's own clip (14 stops by default), so nothing the picture can show is "
+ 	               "affected. 0 disables the clamp and the guard, which is the way to see the "
+ 	               "overflow this exists to prevent.");
++	REGISTER_CVAR3("r_SceneReferredMeterHistogram", CV_r_SceneReferredMeterHistogram, 1, VF_NULL,
++	               "HOW the Cinematic Camera's AUTO mode meters, while the scene-referred path is "
++	               "active (stage 2 and up). "
++	               "1 = the 64-bin log2 LUMINANCE histogram (default): a compute pass over the "
++	               "quarter-res exposed frame bins every texel by how many stops it sits above or "
++	               "below mid grey, weighted by the camera's Metering Mode, and the camera takes "
++	               "the log-mean of a percentile band of it. Robust by construction to one large "
++	               "region owning the average, which a mean is not - an outdoor sky is half the "
++	               "frame and it is not the subject. "
++	               "0 = the shipped whole-frame log-mean of the albedo-divided illuminance "
++	               "estimate, kept as the A/B reference and as the fallback if the compute pass "
++	               "ever misbehaves. On 0 the camera's Metering Mode and metering band do nothing "
++	               "and the meter's own 14-stop ceiling is back in force.");
+ 	REGISTER_CVAR3("r_SceneReferredExportTap", CV_r_SceneReferredExportTap, 0, VF_NULL,
+ 	               "WHICH frame rec_CaptureEXR writes. "
+ 	               "0 = GRADED (default): the value HDRFinalPass has right before the output "
+diff --git a/Code/CryEngine/RenderDll/Common/RendererCVars.h b/Code/CryEngine/RenderDll/Common/RendererCVars.h
+index 4048567d..d106405b 100644
+--- a/Code/CryEngine/RenderDll/Common/RendererCVars.h
++++ b/Code/CryEngine/RenderDll/Common/RendererCVars.h
+@@ -419,6 +419,7 @@ public:
+ 	static int   CV_r_SceneReferredStage;
+ 	static float CV_r_SceneReferredNishitaScale;
+ 	static float CV_r_SceneReferredWriterClamp;
++	static int   CV_r_SceneReferredMeterHistogram;
+ 	static int   CV_r_SceneReferredExrSelfTest;
+ 	static int   CV_r_SceneReferredExportTap;
+ 	static int   CV_r_SceneReferredExportEncoding;
+diff --git a/Code/CryEngine/RenderDll/Common/RendererResources.cpp b/Code/CryEngine/RenderDll/Common/RendererResources.cpp
+index 14dcb9cc..8fe017db 100644
+--- a/Code/CryEngine/RenderDll/Common/RendererResources.cpp
++++ b/Code/CryEngine/RenderDll/Common/RendererResources.cpp
+@@ -497,6 +497,20 @@ bool CRendererResources::IsSceneReferredStage(int nStage)
+ 
+ const float CRendererResources::kSceneReferredMidGrey = 0.18f;
+ 
++// The luminance weights of the space the HDR target is actually in this frame. One place, because
++// two of them would eventually disagree: the per-view constant buffer publishes this to every
++// pixel shader in the chain (as a DELTA from Rec.709, see GeneratePerViewConstantBuffer), and the
++// metering histogram's compute pass needs the same row without a per-view binding of its own.
++Vec3 CRendererResources::GetWorkingLuminanceWeights()
++{
++	static const Vec3 kRec709Y(0.2126f, 0.7152f, 0.0722f);
++	static const Vec3 kAP1Y(0.27222872f, 0.67408177f, 0.05368952f);
++
++	// IsSceneReferredWorkingSpace() and not IsSceneReferred(): this follows what is IN the buffer,
++	// so r_SceneReferredDebug 1 (skip the conversion) keeps the weights on Rec.709 as well.
++	return CRendererResources::IsSceneReferredWorkingSpace() ? kAP1Y : kRec709Y;
++}
++
+ const float CRendererResources::kSceneReferredMeterCeilingStops = 14.0f;
+ 
+ float CRendererResources::GetSceneReferredMeterCeiling()
+diff --git a/Code/CryEngine/RenderDll/Common/RendererResources.h b/Code/CryEngine/RenderDll/Common/RendererResources.h
+index ca7f6868..99b0b390 100644
+--- a/Code/CryEngine/RenderDll/Common/RendererResources.h
++++ b/Code/CryEngine/RenderDll/Common/RendererResources.h
+@@ -195,6 +195,12 @@ public:
+ 	//! grey" a meaning the renderer can act on rather than a figure of speech.
+ 	static const float kSceneReferredMidGrey;
+ 
++	//! The luminance weights of the space the HDR target holds this frame: Rec.709 before the
++	//! working-space conversion, the AP1 Y row after it. The per-view constant buffer publishes
++	//! this to the pixel shaders (as a delta from 709); the metering histogram's compute pass,
++	//! which has no per-view binding, reads it from here.
++	static Vec3        GetWorkingLuminanceWeights();
++
+ 	//! The exposure meter's saturation point, in stops above mid grey, and the pre-exposed
+ 	//! luminance that works out to. A real incident meter's dome saturates; so does this one, and
+ 	//! for the same reason - past about fourteen stops over the exposure anchor a texel is a
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/AutoExposure.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/AutoExposure.cpp
+index e72eb60f..1b7e784a 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/AutoExposure.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/AutoExposure.cpp
+@@ -3,6 +3,16 @@
+ #include "StdAfx.h"
+ #include "AutoExposure.h"
+ 
++#include "Common/PostProcess/PostProcessUtils.h"
++#include "Common/RendererResources.h"
++
++// The metering histogram's window, in stops relative to mid grey. The C++ twin of
++// SCENE_METER_HIST_LOG_MIN / _MAX in HDRPostProcess.cfx, and the only place the CPU is allowed to
++// know it: the value travels to the camera inside SSceneReferredMeterHistogram so that a third
++// copy cannot drift out of step with these two.
++static const float kMeterHistogramLogMin = -14.0f;
++static const float kMeterHistogramLogMax =  18.0f;
++
+ 
+ void GetSampleOffsets_Downscale4x4Bilinear(uint32 width, uint32 height, Vec4 avSampleOffsets[])
+ {
+@@ -217,17 +227,29 @@ void CAutoExposureStage::UpdateSceneReferredMeterReadback()
+ 		// the camera cannot keep metering off a sample from before the switch was flipped.
+ 		m_bMeterReadbackIssued = false;
+ 		m_bMeterReadbackStalled = false;
+-		pRenderer->m_fSceneReferredMeteredIlluminance = 0.0f;
+-		pRenderer->m_fSceneReferredMeterRaw = 0.0f;
+-		pRenderer->m_fSceneReferredMeterExposure = 1.0f;
+-		pRenderer->m_bSceneReferredMeterRejected = false;
++		RetireSceneReferredMeter();
+ 		return;
+ 	}
+ 
+-	CTexture* pMeterTex = CRendererResources::s_ptexHDRToneMaps[0];
++	// WHICH meter is running this frame. The histogram (default) is the one the camera acts on;
++	// r_SceneReferredMeterHistogram 0 falls back to the shipped whole-frame log-mean, which stays
++	// in the tree as the A/B reference and as the fallback if the compute pass ever misbehaves
++	// (decisions/s8-metering.md approach B). Exactly one of the two publishes at a time, so the
++	// camera can tell which number it is being handed.
++	const bool bHistogram = m_bMeterHistogramValid;
++	CTexture* pMeterTex = bHistogram ? m_pTexMeterHistogram.get() : CRendererResources::s_ptexHDRToneMaps[0];
+ 	if (!CTexture::IsTextureExist(pMeterTex))
+ 		return;
+ 
++	// A flip between the two while a download is in flight retires the sample rather than
++	// decoding it with the wrong reader. One frame of holding, at a switch nobody flips in play.
++	if (m_bMeterReadbackIssued && m_bMeterIssuedHistogram != bHistogram)
++	{
++		m_bMeterReadbackIssued = false;
++		m_bMeterReadbackStalled = false;
++		RetireSceneReferredMeter();
++	}
++
+ 	CDeviceTexture* pDevTex = pMeterTex->GetDevTexture();
+ 	if (pDevTex == nullptr)
+ 		return;
+@@ -248,6 +270,51 @@ void CAutoExposureStage::UpdateSceneReferredMeterReadback()
+ 		}
+ 		m_bMeterReadbackStalled = false;
+ 
++		if (m_bMeterIssuedHistogram)
++		{
++			// 64 x uint32 in the single row of a 64x1 R32-typeless target. The texture's ETEX_Format
++			// says R32F, which is a lie the engine's format list forces on us (it has no uint
++			// entry); the UAV the shader wrote through is a typed R32_UINT view of the same
++			// typeless resource, so the BYTES are the counts and only the reinterpretation is new.
++			SSceneReferredMeterHistogram hist;
++			ZeroStruct(hist);
++
++			const auto readbackBins = [&hist](void* pData, uint32 rowPitch, uint32 slicePitch) -> bool
++			{
++				const uint32* pBins = static_cast<const uint32*>(pData);
++				for (int i = 0; i < SSceneReferredMeterHistogram::kBinCount; ++i)
++					hist.bins[i] = (float)pBins[i];
++				return true;
++			};
++			pDevTex->AccessCurrStagingResource(0, false, readbackBins);
++			m_bMeterReadbackIssued = false;
++
++			float fTotal = 0.0f;
++			for (int i = 0; i < SSceneReferredMeterHistogram::kBinCount; ++i)
++				fTotal += hist.bins[i];
++
++			// The window has to travel with the bins: it is a compile-time constant in the shader,
++			// but the camera must not have to keep a second copy of it in step by hand.
++			hist.totalWeight = fTotal;
++			hist.exposureAtCapture = max(m_fMeterIssuedExposure, 1e-12f);
++			hist.logMinStops = kMeterHistogramLogMin;
++			hist.logMaxStops = kMeterHistogramLogMax;
++			hist.meteringMode = m_nMeterIssuedMode;
++			// Zero total means the dispatch found nothing to bin (a frame of pure NaN, or a
++			// resolution of zero). sampleId stays 0 and the camera reads that as "no measurement,
++			// hold the last EV" - the same rule the scalar meter has always had.
++			hist.sampleId = (fTotal > 0.0f) ? ++m_nMeterSampleId : 0;
++
++			pRenderer->m_sceneReferredMeterHistogram = hist;
++			// The scalar meter is not being computed on this path; publishing a stale value would
++			// let the camera fall back to it silently.
++			pRenderer->m_fSceneReferredMeteredIlluminance = 0.0f;
++			pRenderer->m_fSceneReferredMeterRaw = 0.0f;
++			pRenderer->m_fSceneReferredMeterExposure = hist.exposureAtCapture;
++			pRenderer->m_bSceneReferredMeterRejected = (fTotal <= 0.0f);
++		}
++		else
++		{
+ 		float fIlluminance = 0.0f;
+ 		const auto readbackData = [&fIlluminance](void* pData, uint32 rowPitch, uint32 slicePitch) -> bool
+ 		{
+@@ -280,6 +347,10 @@ void CAutoExposureStage::UpdateSceneReferredMeterReadback()
+ 		pRenderer->m_fSceneReferredMeterRaw = fIlluminance;
+ 		pRenderer->m_fSceneReferredMeterExposure = fExposureAtCapture;
+ 		pRenderer->m_bSceneReferredMeterRejected = !bSane;
++		// Same argument the other way round: on the log-mean path there is no live histogram, and
++		// a stale one would keep the camera on the band it computed before the flip.
++		ZeroStruct(pRenderer->m_sceneReferredMeterHistogram);
++		}
+ 	}
+ 
+ 	if (!m_bMeterReadbackIssued)
+@@ -288,11 +359,158 @@ void CAutoExposureStage::UpdateSceneReferredMeterReadback()
+ 		// one-second cadence would be visible as steps.
+ 		pDevTex->DownloadToStagingResource(0);
+ 		m_bMeterReadbackIssued = true;
++		m_bMeterIssuedHistogram = bHistogram;
+ 		m_fMeterIssuedExposure = pRenderer->GetSceneReferredExposure();
+ 		m_fMeterIssuedTime = fNow;
+ 	}
+ }
+ 
++// The retirement rule, in one place. Every published meter number goes to its "no measurement"
++// value, which the camera reads as "hold the last EV" rather than as a scene that just went black.
++void CAutoExposureStage::RetireSceneReferredMeter()
++{
++	CD3D9Renderer* const pRenderer = gcpRendD3D;
++
++	pRenderer->m_fSceneReferredMeteredIlluminance = 0.0f;
++	pRenderer->m_fSceneReferredMeterRaw = 0.0f;
++	pRenderer->m_fSceneReferredMeterExposure = 1.0f;
++	pRenderer->m_bSceneReferredMeterRejected = false;
++	ZeroStruct(pRenderer->m_sceneReferredMeterHistogram);
++}
++
++// The 64x1 accumulation target (decisions/s8-metering.md approach A, "the readback is the code we
++// already wrote").
++//
++// It is a TEXTURE and not a CGpuBuffer for one concrete reason: DownloadToStagingResource lives on
++// CDeviceTexture and has no CDeviceBuffer twin anywhere in this tree, so a buffer histogram would
++// need a copy pass and a staging texture of its own. 64 uints is 256 bytes, one fence a frame.
++//
++// The format is the awkward part. CRYENGINE's ETEX_Format list has no unsigned-integer entry at
++// all, and InterlockedAdd needs an R32_UINT typed UAV. The way through is the one the linear-depth
++// fixup target already takes (GraphicsPipeline.cpp, m_pTexLinearDepthFixupUAV): create the texture
++// as eTF_R32F with FT_USAGE_UAV_RWTEXTURE, which makes the underlying resource R32_TYPELESS, then
++// build a DXGI_FORMAT_R32_UINT view of it by hand. The declared texture format is then a polite
++// fiction that nothing reads - the shader writes uints and the CPU decodes uints.
++bool CAutoExposureStage::EnsureMeterHistogramTexture()
++{
++	if (CTexture::IsTextureExist(m_pTexMeterHistogram))
++		return true;
++
++	const uint32 flags = FT_NOMIPS | FT_DONT_STREAM | FT_USAGE_RENDERTARGET
++	                     | FT_USAGE_UNORDERED_ACCESS | FT_USAGE_UAV_RWTEXTURE | FT_STAGE_READBACK;
++	const std::string id = m_graphicsPipeline.GetUniqueIdentifierName();
++
++	m_pTexMeterHistogram = CTexture::GetOrCreateRenderTarget(("$SceneReferredMeterHistogram" + id).c_str(),
++	                                                         SSceneReferredMeterHistogram::kBinCount, 1,
++	                                                         Clr_Transparent, eTT_2D, flags, eTF_R32F);
++
++	if (!CTexture::IsTextureExist(m_pTexMeterHistogram) || m_pTexMeterHistogram->GetDevTexture() == nullptr)
++	{
++		m_pTexMeterHistogram.reset();
++		CryLogAlways("[SceneReferred] the metering histogram target could not be created - AUTO falls back to the log-mean meter");
++		return false;
++	}
++
++	const SResourceView typedUAV = SResourceView::UnorderedAccessView(DXGI_FORMAT_R32_UINT, 0, -1, 0,
++	                                                                  SResourceView::eUAV_ReadWrite);
++	m_meterHistogramUAV = m_pTexMeterHistogram->GetDevTexture()->GetOrCreateResourceViewHandle(typedUAV);
++
++	CryLog("[SceneReferred] metering histogram armed: %d bins, %.1f to %.1f stops over mid grey, %.3f stops per bin",
++	       (int)SSceneReferredMeterHistogram::kBinCount, kMeterHistogramLogMin, kMeterHistogramLogMax,
++	       (kMeterHistogramLogMax - kMeterHistogramLogMin) / (float)SSceneReferredMeterHistogram::kBinCount);
++	return true;
++}
++
++// Clear the bins, then bin the frame (decisions/s8-metering.md approach A, steps 1-2).
++//
++// The source is m_pTexHDRTargetScaled[1][0] - the SAME quarter-res copy the stock measure pass
++// reads, taken at the same point in the frame, so the two meters are looking at the same pixels
++// and the r_SceneReferredMeterHistogram 0/1 A/B means something. It is the copy AFTER the round-3
++// firefly-knee change (decisions/s8-fp16-writers.md): the knee's asymptote is now the camera's
++// white rather than a literal 1.0, so a sunlit texel arrives at its real value instead of being
++// squeezed into the sliver below display white, which is what made the old downsample useless as
++// a measurement of anything bright.
++//
++// Only ever dispatched on the scene-referred path. Off it the pass does not exist as far as the
++// command list is concerned, which is what keeps the stock pipeline byte-identical.
++void CAutoExposureStage::ExecuteMeterHistogram()
++{
++	m_bMeterHistogramValid = false;
++
++	const bool bCubemapGen = (m_graphicsPipeline.GetRenderFlags() & SHDF_CUBEMAPGEN) != 0;
++	if (!CRendererResources::IsSceneReferredStage(2) || bCubemapGen)
++		return;
++	if (CRenderer::CV_r_SceneReferredMeterHistogram == 0)
++		return;
++
++	CTexture* pSource = m_graphicsPipelineResources.m_pTexHDRTargetScaled[1][0];
++	if (!CTexture::IsTextureExist(pSource))
++		return;
++	if (!EnsureMeterHistogramTexture())
++		return;
++
++	PROFILE_LABEL_SCOPE("SCENE_REFERRED_METER_HISTOGRAM");
++
++	// The camera's metering mode, published on the post-effect bus beside the pre-exposure. Read
++	// here rather than passed down from ccam so that the mask the accumulation used travels back
++	// to the camera with the bins - one authority, one frame.
++	float fMode = 0.0f;
++	if (CPostEffectsMgr* pPostMgr = PostEffectMgr())
++		fMode = pPostMgr->GetByNameF("Global_User_MeterMode");
++	const uint32 nMode = (uint32)clamp_tpl((int)(fMode + 0.5f), 0, 2);
++
++	const int width = pSource->GetWidth();
++	const int height = pSource->GetHeight();
++
++	{
++		// The bins are accumulated with InterlockedAdd, so they have to start at zero every frame.
++		// ClearUAV on the typed view, not a render-target clear: the RTV would be R32_FLOAT and
++		// would write float zeroes, which happen to be the same bits but by accident rather than
++		// by contract.
++		CDeviceCommandListRef commandList = GetDeviceObjectFactory().GetCoreCommandList();
++		const ColorI cClear(0, 0, 0, 0);
++		commandList.GetComputeInterface()->ClearUAV(
++			m_pTexMeterHistogram->GetDevTexture()->LookupUAV(m_meterHistogramUAV), cClear);
++	}
++
++	CComputeRenderPass& pass = m_passMeterHistogram;
++
++	if (pass.IsDirty(pSource->GetTextureID(), m_pTexMeterHistogram->GetTextureID()))
++	{
++		static CCryNameTSCRC techHistogram("SceneReferredMeterHistogram");
++		pass.SetTechnique(CShaderMan::s_shHDRPostProcess, techHistogram, 0);
++		pass.SetTexture(0, pSource);
++		pass.SetOutputUAV(0, m_pTexMeterHistogram.get(), m_meterHistogramUAV);
++	}
++
++	pass.BeginConstantUpdate();
++	{
++		static CCryNameR paramsName("MeterHistParams");
++		static CCryNameR weightsName("MeterHistWeights");
++
++		pass.SetConstant(paramsName, Vec4((float)width, (float)height, (float)nMode, 0.0f));
++
++		// The luminance weights of the space the source is actually in this frame. A compute pass
++		// has no per-view constant buffer binding in this renderer, so GetWorkingLuminance() is
++		// out of reach and the row is passed in whole rather than as the per-view delta.
++		const Vec3 weights = CRendererResources::GetWorkingLuminanceWeights();
++		pass.SetConstant(weightsName, Vec4(weights.x, weights.y, weights.z, 0.0f));
++	}
++
++	const int tile = 8; // must match SCENE_METER_HIST_TILE in HDRPostProcess.cfx
++	pass.SetDispatchSize((width + tile - 1) / tile, (height + tile - 1) / tile, 1);
++
++	pass.PrepareResourcesForUse(GetDeviceObjectFactory().GetCoreCommandList());
++
++	{
++		SScopedComputeCommandList computeCommandList(false);
++		pass.Execute(computeCommandList, EShaderStage_All);
++	}
++
++	m_nMeterIssuedMode = nMode;
++	m_bMeterHistogramValid = true;
++}
++
+ void CAutoExposureStage::Execute()
+ {
+ 	FUNCTION_PROFILER_RENDERER();
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/AutoExposure.h b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/AutoExposure.h
+index 8e74a335..bfc0780e 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/AutoExposure.h
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/AutoExposure.h
+@@ -4,6 +4,7 @@
+ 
+ #include "Common/GraphicsPipelineStage.h"
+ #include "Common/FullscreenPass.h"
++#include "Common/ComputeRenderPass.h"
+ 
+ class CAutoExposureStage : public CGraphicsPipelineStage
+ {
+@@ -14,6 +15,7 @@ public:
+ 		: CGraphicsPipelineStage(graphicsPipeline)
+ 		, m_passLuminanceInitial(&graphicsPipeline)
+ 		, m_passAutoExposure(&graphicsPipeline)
++		, m_passMeterHistogram(&graphicsPipeline, CComputeRenderPass::eFlags_ReflectConstantBuffersFromShader)
+ 	{
+ 		for (auto& pass : m_passLuminanceIteration)
+ 			pass.SetGraphicsPipeline(&graphicsPipeline);
+@@ -35,10 +37,33 @@ private:
+ 	//! the scene-referred path.
+ 	void UpdateSceneReferredMeterReadback();
+ 
++	//! The camera's metering histogram (S8, decisions/s8-metering.md approach A): a 64-bin log2
++	//! luminance histogram of the quarter-res exposed frame, accumulated with the camera's
++	//! metering mask into a 64x1 uint UAV. Clears and dispatches; the readback above then hands
++	//! the bins to the camera, which takes the log-mean of a percentile band of them.
++	void ExecuteMeterHistogram();
++
++	//! Creates the 64x1 accumulation target on demand and returns false if it could not be had.
++	bool EnsureMeterHistogramTexture();
++
++	//! Drops every published meter value so the camera cannot keep metering off a sample from
++	//! before the switch was flipped, or from the other metering path.
++	void RetireSceneReferredMeter();
++
+ private:
+ 	CFullscreenPass m_passLuminanceInitial;
+ 	CFullscreenPass m_passLuminanceIteration[NUM_HDR_TONEMAP_TEXTURES];
+ 	CFullscreenPass m_passAutoExposure;
++	CComputeRenderPass m_passMeterHistogram;
++
++	// The histogram's accumulation target: 64x1, R32 typeless underneath (FT_USAGE_UAV_RWTEXTURE),
++	// bound through a DXGI_FORMAT_R32_UINT typed UAV so InterlockedAdd is legal, and carrying
++	// FT_STAGE_READBACK so the two-phase download below needs no copy pass and no staging
++	// resource of its own. The engine's ETEX_Format list has no uint entry, which is why the view
++	// is built by hand - the precedent is m_pTexLinearDepthFixupUAV in GraphicsPipeline.cpp.
++	_smart_ptr<CTexture> m_pTexMeterHistogram;
++	ResourceViewHandle   m_meterHistogramUAV = EDefaultResourceViews::UnorderedAccess;
++	bool                 m_bMeterHistogramValid = false;
+ 
+ 	// Readback state. m_fMeterIssuedExposure is the pre-exposure that was in force for the frame
+ 	// whose sample is currently in flight: dividing by THAT, and not by the current one, is what
+@@ -47,4 +72,11 @@ private:
+ 	bool  m_bMeterReadbackStalled = false;
+ 	float m_fMeterIssuedExposure  = 1.0f;
+ 	float m_fMeterIssuedTime      = 0.0f;
++	// WHICH texture the download in flight belongs to, recorded at issue time: flipping
++	// r_SceneReferredMeterHistogram mid-flight must not decode 64 uints as two CryHalfs or the
++	// reverse. Also the metering mask the dispatch that produced it actually used.
++	bool   m_bMeterIssuedHistogram = false;
++	uint32 m_nMeterHistogramMode   = 0;
++	uint32 m_nMeterIssuedMode      = 0;
++	uint32 m_nMeterSampleId        = 0;
+ };
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Common/GraphicsPipeline.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Common/GraphicsPipeline.cpp
+index 6003744a..c5eb4c3a 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Common/GraphicsPipeline.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Common/GraphicsPipeline.cpp
+@@ -1264,9 +1264,8 @@ void CGraphicsPipeline::GeneratePerViewConstantBuffer(const SRenderViewInfo* pVi
+ 		// weights on Rec.709 too and the A/B stays coherent.
+ 		{
+ 			static const Vec3 kRec709Y(0.2126f, 0.7152f, 0.0722f);
+-			static const Vec3 kAP1Y(0.27222872f, 0.67408177f, 0.05368952f);
+ 
+-			const Vec3 wanted = CRendererResources::IsSceneReferredWorkingSpace() ? kAP1Y : kRec709Y;
++			const Vec3 wanted = CRendererResources::GetWorkingLuminanceWeights();
+ 			// .w is the writer clamp (SCENE_WRITER_CLAMP), not a weight. It lives in this float4
+ 			// because it is the only spare slot in the per-view block that reads 0 on an unbound
+ 			// buffer, and 0 is exactly "no clamp" - the same argument that put the meter ceiling
+diff --git a/Engine/Shaders/HWScripts/CryFX/HDRPostProcess.cfx b/Engine/Shaders/HWScripts/CryFX/HDRPostProcess.cfx
+index 331e4b70..5d029f7c 100644
+--- a/Engine/Shaders/HWScripts/CryFX/HDRPostProcess.cfx
++++ b/Engine/Shaders/HWScripts/CryFX/HDRPostProcess.cfx
+@@ -1970,6 +1970,177 @@ technique SceneReferredConvert
+   }
+ }
+ 
++////////////////////////////////////////////////////////////////////////////////////////////////////
++// The camera's metering histogram (SceneReferredSpec.md D2/D7, decisions/s8-metering.md approach A).
++//
++// A 64-bin log2 LUMINANCE histogram of the quarter-res exposed HDR source - the same texture the
++// stock measure pass reads - accumulated with a metering weight and read back per frame. The
++// camera then takes the log-mean of a percentile band of it instead of the log-mean of the whole
++// frame, which is the one statistic that is robust to "one large region owns the average".
++//
++// WHAT IS METERED, AND THE SEMANTIC CHANGE THAT COMES WITH IT.
++//
++// The stock measure pass does not meter luminance. It divides the G-buffer albedo out and
++// multiplies by PI to estimate the ILLUMINANCE falling on each surface, which makes it an
++// incident meter - and for pixels with no G-buffer albedo (sky, emissive, every forward-rendered
++// pixel) it FABRICATES an albedo of 0.2. That fabrication is calibrated for midday sun and
++// over-reads by 1.6 to 3.2 stops in low sun, overcast and open shade, weighted by the sky's share
++// of the frame, which outdoors is most of it: on an airfield frame it put 74 700 lux on mid grey
++// when the subject was lit by 100 000 and collapsed the whole picture into a 2.5-stop band below
++// mid grey (research/s8-metering.md section 2.3).
++//
++// This pass meters LUMINANCE. There is no albedo, no PI and no fabricated 0.2, so the sky and
++// emissive fallback no longer exists and NO LONGER MATTERS. The meter now behaves like a real
++// camera's REFLECTED meter: it measures the light coming back off the scene. What keeps the
++// calibration is the target, not the quantity - the camera places the band's log-mean on 0.18, and
++// by spec D6 a correctly exposed 18 % card under the light lands on exactly 0.18. So an 18 % card
++// filling the frame makes the two meters agree exactly, and the incident-form constant C = 120*PI
++// of decisions/s1-exposure-constant.md still holds, because "put the metered value on 0.18 in
++// exposed units" IS that constant written the other way round (the algebra is spelled out in
++// CCinematicCameraComponent::ComputeSceneReferredEV100). What we do NOT inherit is a real body's
++// K = 12.5 calibration, which corresponds to about 12-13 % reflectance and is the origin of the
++// well-known third-of-a-stop grey-card discrepancy; ours is anchored on 18 % because the
++// pre-exposure guarantees 18 %.
++//
++// THE BIN MAPPING. Bin i covers
++//
++//     log2(L_exposed / 0.18)  in  [ -14 + i*0.5 , -14 + (i+1)*0.5 )
++//
++// i.e. 64 bins of half a stop each, from 14 stops BELOW mid grey to 18 stops ABOVE it. Bins 0 and
++// 63 are saturating buckets. The window is relative to mid grey rather than absolute, which is
++// only possible because the pre-exposure anchors 0.18 (spec D6): it is therefore permanently
++// centred on the interesting part of the scene at every time of day and with every lens and needs
++// no per-scene tuning - the one thing UE's absolute HistogramLogMin/Max cannot do, and the reason
++// Epic had to ship an "Extend default luminance range" project setting when they went physical.
++// The upper edge sits above the writer clamp's 17.5 stops on purpose, so a texel that hit the
++// clamp still has a bin to land in; the lower edge is 14 stops down, which covers a scene's own
++// range plus the tracking error during a seven-stop indoor-to-outdoor transition.
++//
++// WEIGHT QUANTISATION. Weights are accumulated as uint(w * 256), so a full-weight texel counts 256
++// and the CPU never has to divide - it works in those integer units throughout and only ever forms
++// ratios. At quarter res (480x270 at 1080p) the worst case is 129 600 * 256 = 33 million, far
++// inside uint32.
++//
++// COST. One texel per thread, 8x8 groups, 64 groupshared bins per group and one global atomic per
++// bin per group: 2 025 groups x 64 = 129 600 global atomics at 1080p, 0.02-0.05 ms. An order of
++// magnitude under the bloom that runs on the same texture one pass later.
++Texture2D<float4>  MeterHistSource : register(t0);
++RWTexture2D<uint>  MeterHistogram  : register(u0);
++
++// .x/.y = source size in texels (the dispatch is padded up to the group size)
++// .z    = metering mode: 0 Average, 1 CenterWeighted, 2 Spot
++// .w    = unused
++float4 MeterHistParams;
++// .xyz = the luminance weights of the space the HDR target is in this frame (Rec.709 before the
++//        working-space conversion, AP1 after it). Passed explicitly rather than read through
++//        GetWorkingLuminance(), because that lives in the per-view constant buffer and a compute
++//        pass in this renderer has no established binding for it.
++float4 MeterHistWeights;
++
++#define SCENE_METER_HIST_TILE     8
++#define SCENE_METER_HIST_BINS     64
++#define SCENE_METER_HIST_LOG_MIN  (-14.0)
++#define SCENE_METER_HIST_LOG_MAX  ( 18.0)
++#define SCENE_METER_HIST_WEIGHT_Q 256.0
++
++groupshared uint g_MeterHistBins[SCENE_METER_HIST_BINS];
++
++// The metering mask. A real body offers exactly this family of choices and has since the 1980s;
++// the sizes are the ones the camera industry settled on.
++//
++//   Average        - the whole frame, uniformly. The A/B reference against the shipped log-mean.
++//   CenterWeighted - a smooth radial falloff, full sensitivity at the centre and a quarter of it
++//                    in the corners. The classic, cheap and predictable answer to "the sky is half
++//                    the frame and it is not the subject". Default.
++//   Spot           - a disc 20 % of frame height across (about 1.8 % of frame area, inside the
++//                    camera-standard 1.5-3 %), soft-edged. Put it on a grey card and the card is
++//                    mid grey, whatever else is in the picture.
++//
++// The falloff is smooth rather than a hard circle on purpose: a hard edge makes the meter step as
++// content crosses it, and a step in the metering weight is a step in the exposure.
++float MeteringWeight(float2 uv, float2 size, float mode)
++{
++	if (mode < 0.5)
++		return 1.0;
++
++	// Frame-shaped coordinates, so a circle stays a circle on a wide frame instead of becoming an
++	// ellipse.
++	const float aspect = size.x / max(size.y, 1.0);
++	const float2 d = (uv - 0.5) * float2(aspect, 1.0);
++
++	if (mode < 1.5)
++	{
++		// Normalised so r = 1 at the corner. The normalisation only sets how fast the falloff
++		// runs; this one gives the classic 100 % centre / 25 % corner split.
++		const float r = saturate(length(d) / (0.5 * sqrt(aspect * aspect + 1.0)));
++		return lerp(1.0, 0.25, smoothstep(0.0, 1.0, r));
++	}
++
++	const float spotRadius = 0.10;  // 20 % of frame height across
++	return 1.0 - smoothstep(spotRadius * 0.9, spotRadius * 1.1, length(d));
++}
++
++[numthreads(SCENE_METER_HIST_TILE, SCENE_METER_HIST_TILE, 1)]
++void SceneReferredMeterHistogramCS(uint3 DispatchThreadID : SV_DispatchThreadID, uint GroupIndex : SV_GroupIndex)
++{
++	if (GroupIndex < SCENE_METER_HIST_BINS)
++		g_MeterHistBins[GroupIndex] = 0;
++
++	GroupMemoryBarrierWithGroupSync();
++
++	const int2 vPixCoord = int2(DispatchThreadID.xy);
++	const int2 vSize = (int2)MeterHistParams.xy;
++
++	if (all(vPixCoord < vSize))
++	{
++		const float3 cSrc = MeterHistSource[vPixCoord].rgb;
++
++		// A NaN carries no information and is dropped - no bin and no weight, so it cannot move
++		// the percentiles in either direction. An Inf DOES carry information, "brighter than this
++		// buffer can say", so it goes in the top bin: it gets a POSITION and no magnitude, which
++		// is the whole reason a histogram is immune to the runaway a log mean was not
++		// (research/s8-auto-exposure-runaway.md). The band then discards it as an outlier instead
++		// of being dragged by it, which is also why this pass needs no meter ceiling of its own.
++		if (!any(isnan(cSrc)))
++		{
++			const float fLum = max(dot(max(cSrc, 0.0), MeterHistWeights.xyz), 0.0);
++			const float fLogL = isfinite(fLum)
++			                    ? log2(max(fLum, 1e-8) / SCENE_MID_GREY)
++			                    : SCENE_METER_HIST_LOG_MAX;
++
++			const float fBinScale = SCENE_METER_HIST_BINS / (SCENE_METER_HIST_LOG_MAX - SCENE_METER_HIST_LOG_MIN);
++			const uint nBin = (uint)clamp(floor((fLogL - SCENE_METER_HIST_LOG_MIN) * fBinScale),
++			                              0.0, SCENE_METER_HIST_BINS - 1.0);
++
++			const float2 uv = (float2(vPixCoord) + 0.5) / float2(vSize);
++			const uint nWeight = (uint)(saturate(MeteringWeight(uv, float2(vSize), MeterHistParams.z))
++			                            * SCENE_METER_HIST_WEIGHT_Q + 0.5);
++
++			if (nWeight > 0)
++				InterlockedAdd(g_MeterHistBins[nBin], nWeight);
++		}
++	}
++
++	GroupMemoryBarrierWithGroupSync();
++
++	// One global atomic per bin per group instead of one per texel: 64 x 2 025 rather than
++	// 129 600 contended adds on 64 addresses.
++	if (GroupIndex < SCENE_METER_HIST_BINS)
++	{
++		const uint nLocal = g_MeterHistBins[GroupIndex];
++		if (nLocal > 0)
++			InterlockedAdd(MeterHistogram[int2(GroupIndex, 0)], nLocal);
++	}
++}
++
++technique SceneReferredMeterHistogram
++{
++  pass p0
++  {
++    ComputeShader = SceneReferredMeterHistogramCS();
++  }
++}
++
+ //=======================================================
+ // HDR post-processing techniques
+ 
+-- 
+2.47.1.windows.1
+

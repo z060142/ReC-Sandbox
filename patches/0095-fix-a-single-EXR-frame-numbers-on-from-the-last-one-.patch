@@ -1,0 +1,231 @@
+From d31f28b5c819aabaae47cdf35e009e90f412367e Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Fri, 28 Aug 2026 22:07:31 +0800
+Subject: [PATCH 095/119] fix: a single EXR frame numbers on from the last one
+ instead of re-writing frame.000000.exr
+
+rec_CaptureEXRFrame reset m_frameIndex to 0 on every arm, the same as
+StartSequence, so every single-frame capture in a session overwrote
+frame.000000.exr. That is right for a sequence - one artefact, first frame is
+frame zero by definition - and wrong for a single frame, which is something you
+take repeatedly while looking at something and then want to compare.
+
+The counter is now session-lifetime and per destination, and it is only a HINT:
+the disk is asked. FirstFreeIndex() scans <folder>/<name>.%06d.exr upwards from
+the remembered index and takes the first that does not exist, so a file deleted
+between two captures gets its number back, and files left over from a PREVIOUS
+session are not silently overwritten - neither of which a counter alone can know.
+Changing folder or name starts a fresh scan. Sequences are untouched.
+
+The command's arguments are also reversed, to [name] [folder]. What you want to
+say about a single frame is what it is - rec_CaptureEXRFrame dusk_wide - not
+where it goes, and the folder is the default nearly always; with the sequence
+order the name was unreachable without typing the folder first. The asymmetry
+with rec_CaptureEXR is deliberate and is called out in the command help,
+docs/SceneReferredExport.md and docs/ConsoleReference.md.
+
+Co-Authored-By: Claude Opus <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01A72MFkdSczncE7au9UVnmu
+---
+ .../RenderDll/Common/RendererCVars.cpp        | 20 ++++++++--
+ .../GraphicsPipeline/SceneReferredExport.cpp  | 37 ++++++++++++++++++-
+ .../GraphicsPipeline/SceneReferredExport.h    | 16 +++++++-
+ .../CinematicCamera/docs/ConsoleReference.md  |  8 +++-
+ .../docs/SceneReferredExport.md               | 12 +++++-
+ 5 files changed, 85 insertions(+), 8 deletions(-)
+
+diff --git a/Code/CryEngine/RenderDll/Common/RendererCVars.cpp b/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
+index cfb61839..49b5eb87 100644
+--- a/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
++++ b/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
+@@ -741,11 +741,15 @@ static void Cmd_CaptureEXRStop(IConsoleCmdArgs* pArgs)
+ 	CSceneReferredExport::Get().Stop("stopped from the console");
+ }
+ 
++// NAME FIRST, folder second - the opposite of rec_CaptureEXR, deliberately. Taking one frame is
++// something you do repeatedly while looking at something, and what you want to say about it is
++// what it is ("rec_CaptureEXRFrame dusk_wide"), not where it goes; the folder is the default
++// nearly always. Making the name reachable without also typing the folder is the whole point.
+ static void Cmd_CaptureEXRFrame(IConsoleCmdArgs* pArgs)
+ {
+-	const char* szFolder = (pArgs && pArgs->GetArgCount() > 1) ? pArgs->GetArg(1) : "";
+-	const char* szPrefix = (pArgs && pArgs->GetArgCount() > 2) ? pArgs->GetArg(2) : "";
+-	CSceneReferredExport::Get().RequestSingleFrame(szFolder, szPrefix);
++	const char* szName   = (pArgs && pArgs->GetArgCount() > 1) ? pArgs->GetArg(1) : "";
++	const char* szFolder = (pArgs && pArgs->GetArgCount() > 2) ? pArgs->GetArg(2) : "";
++	CSceneReferredExport::Get().RequestSingleFrame(szFolder, szName);
+ }
+ 
+ static void OnChange_CV_r_HDRTexFormat(ICVar* pCVar)
+@@ -3298,7 +3302,15 @@ void CRendererCVars::InitCVars()
+ 	                 "abandoned.");
+ 	REGISTER_COMMAND("rec_CaptureEXRFrame", &Cmd_CaptureEXRFrame, VF_NULL,
+ 	                 "Write exactly ONE scene-referred EXR and disarm.\n"
+-	                 "Usage: rec_CaptureEXRFrame [folder] [prefix]\n"
++	                 "Usage: rec_CaptureEXRFrame [name] [folder]\n"
++	                 "  name   - default 'frame'. NAME FIRST here, unlike rec_CaptureEXR: taking single "
++	                 "frames is something you do repeatedly while looking at something, and what you want to "
++	                 "say about one is what it is, not where it goes.\n"
++	                 "  folder - as rec_CaptureEXR. Default 'CaptureEXR' under the user folder.\n"
++	                 "Numbering CONTINUES for the whole session, per destination: the first free "
++	                 "<name>.%06d.exr is used, so repeated captures are consecutive and files already on disk "
++	                 "- from this session or a previous one - are never overwritten. A sequence still starts "
++	                 "at zero; it is one artefact.\n"
+ 	                 "Same settings as rec_CaptureEXR, but t_FixedStep is left alone - one frame "
+ 	                 "has no cadence to fix.");
+ 	REGISTER_COMMAND("r_PrecacheShaderList", &ShadersPrecacheList, VF_NULL, "");
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/SceneReferredExport.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/SceneReferredExport.cpp
+index 653c5c5d..4352e890 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/SceneReferredExport.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/SceneReferredExport.cpp
+@@ -148,7 +148,26 @@ bool CSceneReferredExport::RequestSingleFrame(const char* szFolder, const char*
+ 
+ 	m_folder = ResolveCaptureFolder(szFolder);
+ 	m_prefix = (szPrefix && *szPrefix) ? szPrefix : "frame";
+-	m_frameIndex = 0;
++
++	// A SINGLE frame numbers consecutively for the whole session, which is the one place this
++	// differs from a sequence. A sequence is one artefact and starts at zero by definition; single
++	// frames are taken one at a time while something is being looked at, and re-writing
++	// frame.000000.exr every time makes the command useless for exactly that.
++	//
++	// The counter is a hint, not the answer: the disk is asked. That way a file deleted between
++	// two captures gets its number back, and files left over from a previous session are not
++	// silently overwritten - neither of which a counter on its own can know. The key is the
++	// destination, so switching folder or name starts a fresh scan.
++	const string key = m_folder + "/" + m_prefix;
++	if (key != m_singleFrameKey)
++	{
++		m_singleFrameKey = key;
++		m_singleFrameNext = 0;
++	}
++
++	m_frameIndex = FirstFreeIndex(m_folder, m_prefix, m_singleFrameNext);
++	m_singleFrameNext = m_frameIndex + 1;
++
+ 	m_nextSlot = 0;
+ 	m_tap = clamp_tpl(CRenderer::CV_r_SceneReferredExportTap, 0, 1);
+ 	m_encoding = clamp_tpl(CRenderer::CV_r_SceneReferredExportEncoding, 0, 1);
+@@ -158,6 +177,22 @@ bool CSceneReferredExport::RequestSingleFrame(const char* szFolder, const char*
+ 	return true;
+ }
+ 
++int CSceneReferredExport::FirstFreeIndex(const string& folder, const string& prefix, int nStartAt)
++{
++	// FLAGS_PATH_REAL: the folder is already an absolute, adjusted path from ResolveCaptureFolder,
++	// and FLAGS_NEVER_IN_PAK because a capture destination is a disk folder - a name that happens
++	// to exist inside a .pak must not count as taken.
++	const int nMax = 1000000;   // the format is %06d; past this the name is not unique anyway
++	for (int i = max(nStartAt, 0); i < nMax; ++i)
++	{
++		string path;
++		path.Format("%s/%s.%06d.exr", folder.c_str(), prefix.c_str(), i);
++		if (!gEnv->pCryPak->IsFileExist(path.c_str(), ICryPak::eFileLocation_OnDisk))
++			return i;
++	}
++	return max(nStartAt, 0);
++}
++
+ void CSceneReferredExport::Stop(const char* szReason)
+ {
+ 	if (m_state == eState_Idle)
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/SceneReferredExport.h b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/SceneReferredExport.h
+index d27beefe..05388d6d 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/SceneReferredExport.h
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/SceneReferredExport.h
+@@ -92,7 +92,9 @@ public:
+ 
+ 	//! Arm a sequence. Returns false and logs if one is already running.
+ 	bool StartSequence(const char* szFolder, const char* szPrefix);
+-	//! Arm exactly one frame.
++	//! Arm exactly one frame. Unlike a sequence, the numbering CONTINUES across calls: single
++	//! frames are taken one at a time all session long and every one of them landing on
++	//! frame.000000.exr makes the command useless for the thing it exists for.
+ 	bool RequestSingleFrame(const char* szFolder, const char* szPrefix);
+ 	//! Disarm. Drains the writer jobs and releases the ring. Safe when nothing is armed.
+ 	void Stop(const char* szReason);
+@@ -148,6 +150,12 @@ private:
+ 	void GatherMetadata(SSceneReferredExportMetadata& out) const;
+ 	void SetFixedStep(bool bEnable);
+ 
++	//! The first index for which <folder>/<prefix>.%06d.exr does not exist on disk, searched from
++	//! nStartAt upwards. The session counter is only a HINT into this: files deleted between two
++	//! captures should be reused, and files left over from a previous session must not be
++	//! overwritten, and neither is knowable from a counter alone.
++	static int FirstFreeIndex(const string& folder, const string& prefix, int nStartAt);
++
+ 	EState                m_state;
+ 
+ 	//! Tap and encoding are LATCHED on arm, not read per frame. Changing either half way through a
+@@ -161,6 +169,12 @@ private:
+ 	string                m_prefix;
+ 	int                   m_frameIndex;
+ 	int                   m_nextSlot;
++
++	//! Where the NEXT single frame should start looking for a free number, and the folder/prefix
++	//! that number belongs to. Session-lifetime (this is a function-local static singleton), reset
++	//! to 0 whenever the destination changes, and only ever a starting point for the disk scan.
++	string                m_singleFrameKey;
++	int                   m_singleFrameNext = 0;
+ 	int                   m_width;
+ 	int                   m_height;
+ 	const void*           m_pOwner;
+diff --git a/Code/CryPlugins/CinematicCamera/docs/ConsoleReference.md b/Code/CryPlugins/CinematicCamera/docs/ConsoleReference.md
+index f74cf3e7..38890671 100644
+--- a/Code/CryPlugins/CinematicCamera/docs/ConsoleReference.md
++++ b/Code/CryPlugins/CinematicCamera/docs/ConsoleReference.md
+@@ -58,7 +58,7 @@ The same switch is exported for other plugins as `CryActivateCinematicCameraSlot
+ ```
+ rec_CaptureEXR [folder] [prefix]
+ rec_CaptureEXRStop
+-rec_CaptureEXRFrame [folder] [prefix]
++rec_CaptureEXRFrame [name] [folder]
+ ```
+ 
+ Write the scene-referred frame to OpenEXR - half float, ACES primaries, with the camera's own
+@@ -71,6 +71,12 @@ created if it does not exist (default `CaptureEXR`). Files are `<prefix>.%06d.ex
+ counter belongs to the capture and starts at zero on every arm; it is **not** `capture_frames`,
+ which `ManualFrameStep` and CryMovie also write, and none of the stock capture path is touched.
+ 
++`rec_CaptureEXRFrame` differs in two ways, both because a single frame is not a sequence. Its
++arguments are **name first, folder second** - what you want to say about one frame is what it is,
++not where it goes - and its **numbering continues for the whole session**: it uses the first free
++`<name>.%06d.exr` in that destination, so repeated captures are consecutive and nothing already on
++disk is overwritten. Delete a file and its number is reused.
++
+ Nothing is written unless the camera's **Scene Referred** path is running - off it there is no
+ pre-ODT buffer to tap.
+ 
+diff --git a/Code/CryPlugins/CinematicCamera/docs/SceneReferredExport.md b/Code/CryPlugins/CinematicCamera/docs/SceneReferredExport.md
+index daf4d341..f5a50072 100644
+--- a/Code/CryPlugins/CinematicCamera/docs/SceneReferredExport.md
++++ b/Code/CryPlugins/CinematicCamera/docs/SceneReferredExport.md
+@@ -32,7 +32,7 @@ being told about our private shaper.
+ ```
+ rec_CaptureEXR [folder] [prefix]     start a sequence
+ rec_CaptureEXRStop                   stop it
+-rec_CaptureEXRFrame [folder] [prefix]  write exactly one frame and disarm
++rec_CaptureEXRFrame [name] [folder]   write exactly one frame and disarm
+ ```
+ 
+ * `folder` — relative paths land under the **user folder**
+@@ -42,6 +42,16 @@ rec_CaptureEXRFrame [folder] [prefix]  write exactly one frame and disarm
+   Resolve auto-detect as a sequence rather than as a folder of stills.
+ * The frame counter belongs to the capture and starts at zero on every arm. It is **not**
+   `capture_frames`, which `ManualFrameStep` and CryMovie also write.
++* **`rec_CaptureEXRFrame` takes its arguments the other way round: name first, folder second.**
++  Taking single frames is something you do repeatedly while looking at something, and what you
++  want to say about one is what it is (`rec_CaptureEXRFrame dusk_wide`), not where it goes - the
++  folder is the default nearly always. Making the name reachable without also typing the folder is
++  the point of the asymmetry.
++* **A single frame's numbering continues for the whole session**, per destination: the command
++  uses the first free `<name>.%06d.exr`, so repeated captures come out `frame.000000.exr`,
++  `frame.000001.exr`, ... and nothing already on disk - from this session or a previous one - is
++  overwritten. Delete a file and its number is reused. A *sequence* still starts at zero, because
++  a sequence is one artefact and its first frame is frame zero by definition.
+ 
+ Nothing is written unless the Cinematic Camera's **Scene Referred** path is actually running —
+ off it there is no pre-ODT buffer to tap.
+-- 
+2.47.1.windows.1
+

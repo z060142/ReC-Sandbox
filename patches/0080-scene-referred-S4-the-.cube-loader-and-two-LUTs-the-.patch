@@ -1,0 +1,586 @@
+From 1724ec22fa5403aa4bc46b7dce86699fb024c4c2 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Fri, 28 Aug 2026 09:23:27 +0800
+Subject: [PATCH 080/119] scene-referred S4: the .cube loader, and two LUTs the
+ camera owns
+
+The display chain needs two 3D LUTs - the creative look (LMT) and the output transform (ODT) -
+and D8 puts both on the camera rather than in the renderer. The public IRenderer surface decides
+the split: a plugin can create and refresh a 3D texture from CPU data (UploadToVideoMemory3D /
+UpdateTextureInVideoMemory, the pair Cry3DEngine's SVO brick pools already use from outside the
+renderer), but nothing in IRenderer can bind a texture to a pass or dispatch compute. So ccam
+parses, converts and uploads; the renderer only samples.
+
+- A Resolve-dialect .cube parser: comments, TITLE, LUT_3D_SIZE, optional DOMAIN_MIN/MAX, N^3
+  triplets with the red index varying fastest. LUT_1D_SIZE, a missing size, a short grid and a
+  non-unit domain are each refused with a message that says what is wrong; the shaper is analytic
+  in the shader, so the file's domain is ACEScct [0,1] by construction and a cube on another
+  domain is not a display transform for this chain.
+- fp16 RGBA on the CPU before the upload: the upload path does not convert formats (source and
+  destination must resolve to the same typeless DXGI format) and there is no three-channel fp16
+  texture format. One mip, FT_NOMIPS | FT_DONT_STREAM | FT_STATE_CLAMP, repeat = false.
+- Two slots, keyed on the requested path. On the common frame the work is one string compare; a
+  path change reloads, a size change re-creates the texture rather than refreshing it in place,
+  and a parse failure leaves the slot EMPTY rather than stale. Errors are logged once per path.
+- Path resolution goes through ICryPak, first as given (relative to the project's asset
+  directory) and then under %ENGINE%, so one string works in the editor and in the launcher
+  whichever tree the Assets/ODT folder was installed into.
+- Two new ccam property groups: "Look" (LMT File, empty = identity, D10) and "Output" (ODT File,
+  default Assets/ODT/odt_srgb_100nit_aces2_65.cube). Plain reflected strings - a .cube is not a
+  texture asset, so there is no resource picker to reuse.
+- Four new post-effect bus params carry the result to the renderer: Global_User_LutODT / -Size
+  and Global_User_LutLMT / -Size. Texture IDs travel as floats because the bus has no integer
+  channel and an ID is far below the 2^24 a float represents exactly. Cached accessors on
+  CPostEffectsMgr, like the scene-referred request and the pre-exposure beside them.
+
+Nothing reads the LUTs yet: the tone map's output-transform branch is the next commit. Off the
+switch not one line of this runs, and with the switch on but no consumer the picture is unchanged.
+
+Co-Authored-By: Claude Opus <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01A72MFkdSczncE7au9UVnmu
+---
+ .../Common/PostProcess/PostProcess.cpp        |  17 +
+ .../Common/PostProcess/PostProcess.h          |  18 +
+ .../Module/CinematicCameraComponent.cpp       | 318 ++++++++++++++++++
+ .../Module/CinematicCameraComponent.h         |  62 ++++
+ 4 files changed, 415 insertions(+)
+
+diff --git a/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.cpp b/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.cpp
+index 0fafc1c7..7559aec1 100644
+--- a/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.cpp
++++ b/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.cpp
+@@ -401,6 +401,15 @@ int CPostEffectsMgr::Init()
+ 	// renderer inventing a fade the camera never asked for.
+ 	AddParamFloatNoTransition("Global_User_SceneExposure", m_pUserSceneExposure, 1.0f);
+ 
++	// The display chain's LUT slots (SceneReferredSpec.md D8): renderer texture IDs and grid
++	// sizes, published by ccam after it has parsed the .cube files. Floats carrying integers -
++	// the bus has no int channel and a texture ID is far below the 2^24 a float represents
++	// exactly. No transition: fading between two texture IDs is meaningless.
++	AddParamFloatNoTransition("Global_User_LutODT", m_pUserLutODT, 0.0f);
++	AddParamFloatNoTransition("Global_User_LutODTSize", m_pUserLutODTSize, 0.0f);
++	AddParamFloatNoTransition("Global_User_LutLMT", m_pUserLutLMT, 0.0f);
++	AddParamFloatNoTransition("Global_User_LutLMTSize", m_pUserLutLMTSize, 0.0f);
++
+ 	// Register all post processes
+ 	AddEffect(CSunShafts);
+ 	AddEffect(CDepthOfField);
+@@ -510,6 +519,10 @@ void CPostEffectsMgr::Release()
+ 	// GetSceneReferredParam() is read from outside this class, so at least ours is cleared.
+ 	m_pUserSceneReferred = nullptr;
+ 	m_pUserSceneExposure = nullptr;
++	m_pUserLutODT = nullptr;
++	m_pUserLutODTSize = nullptr;
++	m_pUserLutLMT = nullptr;
++	m_pUserLutLMTSize = nullptr;
+ 
+ 	std::for_each(m_pEffects.begin(), m_pEffects.end(), container_object_safe_release());
+ 	std::for_each(m_pEffects.begin(), m_pEffects.end(), container_object_safe_delete());
+@@ -550,6 +563,10 @@ void CPostEffectsMgr::Reset(bool bOnSpecChange)
+ 	m_pUserColorHue->ResetParam(0.0f);
+ 	m_pUserSceneReferred->ResetParam(0.0f);
+ 	m_pUserSceneExposure->ResetParam(1.0f);
++	m_pUserLutODT->ResetParam(0.0f);
++	m_pUserLutODTSize->ResetParam(0.0f);
++	m_pUserLutLMT->ResetParam(0.0f);
++	m_pUserLutLMTSize->ResetParam(0.0f);
+ 
+ 	if (bOnSpecChange)
+ 		std::for_each(m_pEffects.begin(), m_pEffects.end(), SContainerPostEffectResetOnSpecChange());
+diff --git a/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.h b/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.h
+index 7cc530c5..3a2e0d64 100644
+--- a/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.h
++++ b/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.h
+@@ -453,6 +453,10 @@ public:
+ 		, m_pUserColorHue(nullptr)
+ 		, m_pUserSceneReferred(nullptr)
+ 		, m_pUserSceneExposure(nullptr)
++		, m_pUserLutODT(nullptr)
++		, m_pUserLutODTSize(nullptr)
++		, m_pUserLutLMT(nullptr)
++		, m_pUserLutLMTSize(nullptr)
+ 	{
+ 		ClearCache();
+ #ifndef _RELEASE
+@@ -529,6 +533,15 @@ public:
+ 	//! reason as the request above. Null before Init() and after Release().
+ 	CEffectParam* GetSceneExposureParam() const { return m_pUserSceneExposure; }
+ 
++	//! The display chain's two LUTs, as renderer texture IDs plus their grid sizes
++	//! (SceneReferredSpec.md D8). ccam parses the .cube files and uploads the 3D textures; the
++	//! tone map resolves these IDs with CTexture::GetByID. Resolved once at Init() for the same
++	//! reason as the two above - the tone map reads all four every frame.
++	CEffectParam* GetLutODTParam() const     { return m_pUserLutODT; }
++	CEffectParam* GetLutODTSizeParam() const { return m_pUserLutODTSize; }
++	CEffectParam* GetLutLMTParam() const     { return m_pUserLutLMT; }
++	CEffectParam* GetLutLMTSizeParam() const { return m_pUserLutLMTSize; }
++
+ 	// Given a string returns containing value if exists, else returns 0
+ 	float GetByNameF(const char* pszParam);
+ 	Vec4  GetByNameVec4(const char* pszParam);
+@@ -638,6 +651,11 @@ protected:
+ 	// (CD3D9Renderer::LatchSceneReferredExposure) and no stage ever reads it live.
+ 	// Its default and reset value is 1.0f, not 0.0f: a missing publication must be a no-op.
+ 	CEffectParam*       m_pUserSceneExposure;
++	// The display chain's LUT slots: renderer texture ID and grid size per role (ODT, LMT).
++	// Zero means "no LUT in this slot" - an empty LMT is the identity look (D10), an empty ODT
++	// is a mistake the tone map makes visible rather than papering over. Same bus, same
++	// single-writer and handover semantics as the two params above.
++	CEffectParam*       m_pUserLutODT, * m_pUserLutODTSize, * m_pUserLutLMT, * m_pUserLutLMTSize;
+ 	CEffectParam*       m_pUserColorC, * m_pUserColorY, * m_pUserColorM, * m_pUserColorK, * m_pUserColorHue;
+ 
+ 	CPostEffectVec      m_pEffects;
+diff --git a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp
+index 479b5982..4ed508ea 100644
+--- a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp
++++ b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp
+@@ -166,6 +166,7 @@ void CCinematicCameraComponent::ProcessEvent(const SEntityEvent& event)
+ 		// The scene-referred switch changes the whole picture, so it is editor-live too.
+ 		ApplySceneReferred();
+ 		ApplySceneExposure();
++		ApplyDisplayLuts();
+ 		// DOF is a game-mode effect; don't apply in the editor.
+ 		if (!gEnv->IsEditing() && m_dof.bEnableDOF)
+ 			ApplyDOF();
+@@ -201,6 +202,7 @@ void CCinematicCameraComponent::ProcessEvent(const SEntityEvent& event)
+ 		ApplyViewfinder();
+ 		ApplySceneReferred();
+ 		ApplySceneExposure();
++		ApplyDisplayLuts();
+ 		break;
+ 
+ 	case ENTITY_EVENT_RESET:
+@@ -334,6 +336,7 @@ void CCinematicCameraComponent::RestoreAllEffects()
+ 	RestoreLensCharacter();
+ 	RestoreSceneReferred();
+ 	RestoreSceneExposure();
++	RestoreDisplayLuts();
+ 	RestoreViewfinder();
+ 	RestoreStreaks();
+ 	RestoreHalation();
+@@ -1167,6 +1170,321 @@ void CCinematicCameraComponent::RestoreLensCharacter()
+ 	m_bLensCharSaved = false;
+ }
+ 
++// ---------------------------------------------------------------------------
++// The display chain's two .cube files (SceneReferredSpec.md D8,
++// decisions/s4-display-transform.md section 2A).
++//
++// The plugin owns the LUTs and the renderer only samples them. That split is forced by the
++// public surface: IRenderer can create and refresh a 3D texture from CPU data
++// (UploadToVideoMemory3D / UpdateTextureInVideoMemory, the same pair Cry3DEngine's SVO brick
++// pools use from outside the renderer), but nothing in IRenderer can dispatch compute or bind a
++// texture to a pass. So ccam parses, converts and uploads; it publishes the resulting texture
++// IDs on the post-effect bus; the tone map resolves them with CTexture::GetByID, exactly as the
++// colour grading stage already does for the identity chart.
++//
++// The file dialect is Resolve's: an ASCII comment block, TITLE, LUT_3D_SIZE, optional
++// DOMAIN_MIN / DOMAIN_MAX, then N^3 triplets with the RED index varying fastest. No embedded 1D
++// shaper - the linear -> ACEScct encode is analytic in the shader - so the parser stays a
++// tokenizer and nothing here has to know what ACES is.
++// ---------------------------------------------------------------------------
++namespace
++{
++
++struct SCubeLut
++{
++	int                size = 0;
++	Vec3               domainMin = Vec3(0.0f, 0.0f, 0.0f);
++	Vec3               domainMax = Vec3(1.0f, 1.0f, 1.0f);
++	std::vector<float> rgb;      // size^3 * 3, red fastest
++};
++
++// ICryPak, first as given (relative to the project's asset directory), then under %ENGINE%.
++// The plugin's Assets folder can be installed into either tree - a project keeps its looks with
++// its levels, an engine-wide install makes the shipped ODTs available to every project - and a
++// path written in the editor has to keep working in the launcher whichever one was used.
++FILE* OpenLutFile(const char* szPath, string& usedPath)
++{
++	if (!szPath || !szPath[0] || !gEnv->pCryPak)
++		return nullptr;
++
++	usedPath = szPath;
++	if (FILE* pFile = gEnv->pCryPak->FOpen(usedPath.c_str(), "rb"))
++		return pFile;
++
++	usedPath = string("%ENGINE%/") + szPath;
++	return gEnv->pCryPak->FOpen(usedPath.c_str(), "rb");
++}
++
++bool ParseCubeFile(const char* szPath, SCubeLut& out, string& error)
++{
++	string usedPath;
++	FILE* pFile = OpenLutFile(szPath, usedPath);
++	if (!pFile)
++	{
++		error = "file not found (tried the project asset directory and %ENGINE%)";
++		return false;
++	}
++
++	gEnv->pCryPak->FSeek(pFile, 0, SEEK_END);
++	const size_t nSize = (size_t)gEnv->pCryPak->FTell(pFile);
++	gEnv->pCryPak->FSeek(pFile, 0, SEEK_SET);
++
++	std::vector<char> text;
++	text.resize(nSize + 1);
++	const size_t nRead = (nSize > 0) ? gEnv->pCryPak->FReadRaw(text.data(), 1, nSize, pFile) : 0;
++	gEnv->pCryPak->FClose(pFile);
++
++	if (nSize == 0 || nRead != nSize)
++	{
++		error = "unreadable or empty";
++		return false;
++	}
++	text[nSize] = '\0';
++
++	int nExpectedEntries = 0;
++
++	// Line oriented: the format has no continuations, so a stray token on its own line is a
++	// malformed file rather than something to recover from.
++	char* pCursor = text.data();
++	char* const pEnd = text.data() + nSize;
++	while (pCursor < pEnd)
++	{
++		char* pLine = pCursor;
++		while (pCursor < pEnd && *pCursor != '\n' && *pCursor != '\r')
++			++pCursor;
++		while (pCursor < pEnd && (*pCursor == '\n' || *pCursor == '\r'))
++			*pCursor++ = '\0';
++		*pEnd = '\0';
++
++		while (*pLine == ' ' || *pLine == '\t')
++			++pLine;
++		if (*pLine == '\0' || *pLine == '#')
++			continue;
++
++		if (!strnicmp(pLine, "TITLE", 5))
++			continue;
++
++		if (!strnicmp(pLine, "LUT_1D_SIZE", 11))
++		{
++			error = "LUT_1D_SIZE - a 1D curve is not a display transform, this slot wants a 3D cube";
++			return false;
++		}
++
++		if (!strnicmp(pLine, "LUT_3D_SIZE", 11))
++		{
++			out.size = atoi(pLine + 11);
++			// 2 is the smallest grid that interpolates at all; 129^3 fp16 RGBA is already 34 MiB,
++			// far past anything a display transform needs, and a good place to refuse.
++			if (out.size < 2 || out.size > 129)
++			{
++				error.Format("LUT_3D_SIZE %d out of range (2..129)", out.size);
++				return false;
++			}
++			nExpectedEntries = out.size * out.size * out.size;
++			out.rgb.reserve((size_t)nExpectedEntries * 3);
++			continue;
++		}
++
++		if (!strnicmp(pLine, "DOMAIN_MIN", 10))
++		{
++			sscanf(pLine + 10, "%f %f %f", &out.domainMin.x, &out.domainMin.y, &out.domainMin.z);
++			continue;
++		}
++
++		if (!strnicmp(pLine, "DOMAIN_MAX", 10))
++		{
++			sscanf(pLine + 10, "%f %f %f", &out.domainMax.x, &out.domainMax.y, &out.domainMax.z);
++			continue;
++		}
++
++		float r = 0.0f, g = 0.0f, b = 0.0f;
++		if (sscanf(pLine, "%f %f %f", &r, &g, &b) != 3)
++		{
++			error.Format("unparsable line '%.32s'", pLine);
++			return false;
++		}
++		if (out.size == 0)
++		{
++			error = "sample data before LUT_3D_SIZE";
++			return false;
++		}
++		out.rgb.push_back(r);
++		out.rgb.push_back(g);
++		out.rgb.push_back(b);
++	}
++
++	if (out.size == 0)
++	{
++		error = "no LUT_3D_SIZE";
++		return false;
++	}
++	if ((int)(out.rgb.size() / 3) != nExpectedEntries)
++	{
++		error.Format("%d samples for a %d^3 grid (expected %d)", (int)(out.rgb.size() / 3), out.size, nExpectedEntries);
++		return false;
++	}
++
++	// DOMAIN_MIN/MAX describe the INPUT range the grid covers, and the shader's input is ACEScct
++	// clamped to [0,1] by construction (the shaper is analytic - decisions/s4-display-transform.md
++	// section 1A). Rather than carry a per-file input rescale into a per-pixel path, a cube that
++	// declares another domain is refused with a message that says why: it is not a display
++	// transform for this chain.
++	const bool bUnitDomain =
++		fabsf(out.domainMin.x) < 1e-6f && fabsf(out.domainMin.y) < 1e-6f && fabsf(out.domainMin.z) < 1e-6f &&
++		fabsf(out.domainMax.x - 1.0f) < 1e-6f && fabsf(out.domainMax.y - 1.0f) < 1e-6f && fabsf(out.domainMax.z - 1.0f) < 1e-6f;
++	if (!bUnitDomain)
++	{
++		error.Format("DOMAIN [%g %g %g]..[%g %g %g] - this chain feeds the LUT ACEScct in [0,1]; re-bake the cube on a unit domain",
++		             out.domainMin.x, out.domainMin.y, out.domainMin.z, out.domainMax.x, out.domainMax.y, out.domainMax.z);
++		return false;
++	}
++
++	return true;
++}
++
++// One slot per role. The texture survives a path change when the grid size is unchanged (the
++// upload is then an in-place refresh of the same ID) and a parse failure leaves the slot EMPTY
++// rather than stale: a picture that is visibly wrong beats one that is quietly wrong (D13).
++struct SLutSlot
++{
++	string requested;             //!< the path this slot was last asked for, failures included
++	int    texId  = 0;
++	int    size   = 0;
++	bool   loaded = false;
++};
++
++SLutSlot s_lutODT;
++SLutSlot s_lutLMT;
++
++void ClearLutSlot(SLutSlot& slot)
++{
++	if (slot.texId > 0 && gEnv && gEnv->pRenderer)
++		gEnv->pRenderer->RemoveTexture((unsigned int)slot.texId);
++	slot.texId = 0;
++	slot.size = 0;
++	slot.loaded = false;
++}
++
++//! Load the file at szPath into slot if it is not already there. Cheap on every frame but the
++//! first after a change: the only work on the common path is one string compare.
++void EnsureLutSlot(SLutSlot& slot, const char* szPath, const char* szCacheName, const char* szRole)
++{
++	const char* szWanted = szPath ? szPath : "";
++
++	if (slot.requested == szWanted)
++		return;
++
++	slot.requested = szWanted;
++
++	if (!szWanted[0])
++	{
++		// An empty path is a legitimate answer for the LMT slot (identity look, D10) and a
++		// mistake for the ODT slot. The loader does not judge; the tone map does.
++		ClearLutSlot(slot);
++		return;
++	}
++
++	SCubeLut lut;
++	string error;
++	if (!ParseCubeFile(szWanted, lut, error))
++	{
++		// Once per path, not once per frame: the requested string is only re-tested on change.
++		CryLog("[SceneReferred] %s LUT '%s' NOT loaded: %s", szRole, szWanted, error.c_str());
++		ClearLutSlot(slot);
++		return;
++	}
++
++	// fp16 RGBA on the CPU. The upload path does NOT convert formats - source and destination
++	// have to resolve to the same typeless DXGI format - and there is no three-channel fp16
++	// texture format, so the alpha channel is the price of admission (25 % of 2.2 MiB at 65^3).
++	const int nEntries = lut.size * lut.size * lut.size;
++	std::vector<CryHalf> halfData;
++	halfData.resize((size_t)nEntries * 4);
++	const CryHalf one = CryConvertFloatToHalf(1.0f);
++	for (int i = 0; i < nEntries; ++i)
++	{
++		halfData[(size_t)i * 4 + 0] = CryConvertFloatToHalf(lut.rgb[(size_t)i * 3 + 0]);
++		halfData[(size_t)i * 4 + 1] = CryConvertFloatToHalf(lut.rgb[(size_t)i * 3 + 1]);
++		halfData[(size_t)i * 4 + 2] = CryConvertFloatToHalf(lut.rgb[(size_t)i * 3 + 2]);
++		halfData[(size_t)i * 4 + 3] = one;
++	}
++
++	// A different grid size needs a different texture: UploadToVideoMemory3D with an existing Id
++	// refreshes the contents in place and does not re-describe the resource.
++	if (slot.texId > 0 && slot.size != lut.size)
++	{
++		gEnv->pRenderer->RemoveTexture((unsigned int)slot.texId);
++		slot.texId = 0;
++	}
++
++	// repeat = false -> FT_STATE_CLAMP, which is what a LUT wants on all three axes.
++	// FT_DONT_STREAM is forced by the upload path anyway and is stated here so the intent is on
++	// the page. One mip: the update path walks the whole chain and would read past a
++	// single-level buffer if it were told there were more.
++	const int nNewId = (int)gEnv->pRenderer->UploadToVideoMemory3D(
++		(unsigned char*)halfData.data(), lut.size, lut.size, lut.size,
++		eTF_R16G16B16A16F, eTF_R16G16B16A16F, /*nummipmap*/ 1, /*repeat*/ false,
++		FILTER_LINEAR, slot.texId, szCacheName,
++		FT_NOMIPS | FT_DONT_STREAM | FT_STATE_CLAMP);
++
++	if (nNewId <= 0)
++	{
++		CryLog("[SceneReferred] %s LUT '%s' NOT uploaded (the renderer returned no texture)", szRole, szWanted);
++		slot.texId = 0;
++		slot.size = 0;
++		slot.loaded = false;
++		return;
++	}
++
++	slot.texId = nNewId;
++	slot.size = lut.size;
++	slot.loaded = true;
++
++	CryLog("[SceneReferred] %s LUT '%s' loaded: %d^3, texture id %d", szRole, szWanted, lut.size, nNewId);
++}
++
++} // namespace
++
++// The two LUT slots, refreshed and published every frame. "Published" is two numbers per slot on
++// the post-effect bus - the renderer texture ID and the grid size - because the grid size is what
++// the shader's half-texel inset is computed from and a 33^3 LMT next to a 65^3 ODT has to work.
++//
++// Nothing here is gated on m_sceneReferred: loading a cube costs one string compare per frame
++// once it is loaded, and having the texture ready before the switch is flipped means the first
++// scene-referred frame is already correct.
++void CCinematicCameraComponent::ApplyDisplayLuts()
++{
++	if (!CanDriveRenderState() || !gEnv->pRenderer)
++		return;
++
++	EnsureLutSlot(s_lutODT, m_output.odtFile.c_str(), "$ccamODT", "ODT");
++	EnsureLutSlot(s_lutLMT, m_look.lmtFile.c_str(), "$ccamLMT", "LMT");
++
++	gEnv->p3DEngine->SetPostEffectParam("Global_User_LutODT",     (float)s_lutODT.texId);
++	gEnv->p3DEngine->SetPostEffectParam("Global_User_LutODTSize", (float)s_lutODT.size);
++	gEnv->p3DEngine->SetPostEffectParam("Global_User_LutLMT",     (float)s_lutLMT.texId);
++	gEnv->p3DEngine->SetPostEffectParam("Global_User_LutLMTSize", (float)s_lutLMT.size);
++}
++
++void CCinematicCameraComponent::RestoreDisplayLuts()
++{
++	// The bus is cleared first, so the renderer stops referring to the IDs before they die; the
++	// textures then go with the camera. There is nothing to save and restore here - off the
++	// scene-referred path nothing reads these params, and the stock path never had them.
++	if (gEnv && gEnv->p3DEngine)
++	{
++		gEnv->p3DEngine->SetPostEffectParam("Global_User_LutODT",     0.0f);
++		gEnv->p3DEngine->SetPostEffectParam("Global_User_LutODTSize", 0.0f);
++		gEnv->p3DEngine->SetPostEffectParam("Global_User_LutLMT",     0.0f);
++		gEnv->p3DEngine->SetPostEffectParam("Global_User_LutLMTSize", 0.0f);
++	}
++
++	ClearLutSlot(s_lutODT);
++	ClearLutSlot(s_lutLMT);
++	s_lutODT.requested.clear();
++	s_lutLMT.requested.clear();
++}
++
+ // The scene-referred pipeline switch. Pattern A of the two ccam gating patterns: the component
+ // only ASKS, on the post-effect parameter bus, and r_SceneReferred decides whether the renderer
+ // listens. Nothing global is written, so a crash or a mode change can never strand the engine
+diff --git a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
+index 95e8c675..b7fef576 100644
+--- a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
++++ b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
+@@ -5,6 +5,8 @@
+ #include <CrySchematyc/Reflection/TypeDesc.h>
+ #include <CrySchematyc/Env/IEnvRegistrar.h>
+ #include <CrySchematyc/ResourceTypes.h>
++// CSharedString: the reflected string type behind the two .cube path properties (Look / Output).
++#include <CrySchematyc/Utils/SharedString.h>
+ #include <Cry3DEngine/I3DEngine.h>
+ 
+ #include <vector>
+@@ -866,6 +868,56 @@ struct SCineSceneReferredParams
+ 	bool bSceneReferred = false;
+ };
+ 
++// The look slot (LMT) and the output transform (ODT), the two .cube files of the display chain
++// (SceneReferredSpec.md S4/S5, D8). Both are plain asset paths rather than a resource picker:
++// a .cube is not a texture asset the RC knows about, so there is no selector to reuse, and the
++// files ship with the plugin. Paths are resolved through ICryPak - first as given (relative to
++// the project's asset directory), then under %ENGINE% - so the same string works in the editor
++// and in the launcher whichever tree the file was installed into.
++struct SCineLookParams
++{
++	inline bool operator==(const SCineLookParams& rhs) const { return lmtFile == rhs.lmtFile; }
++
++	static void ReflectType(Schematyc::CTypeDesc<SCineLookParams>& desc)
++	{
++		desc.SetGUID("{3A0C6D18-5E47-4B92-9C31-7F6E2D840A15}"_cry_guid);
++		desc.SetLabel("Look");
++		desc.AddMember(&SCineLookParams::lmtFile,
++			'lmtf', "LMTFile", "LMT File",
++			"Creative look, as a Resolve .cube in ACEScct - the Look Modification Transform. It "
++			"is applied AFTER the CDL and BEFORE the output transform, so it grades scene data "
++			"and not a picture. Empty = identity (pure ACES, no house look: SceneReferredSpec.md "
++			"D10). Author it in Resolve on an ACEScct timeline and export a 33-cube; "
++			"Assets/ODT/lmt_identity_33.cube is the pass-through reference.",
++			Schematyc::CSharedString());
++	}
++
++	// Keep last: operator== compares the string by value.
++	Schematyc::CSharedString lmtFile;
++};
++
++struct SCineOutputParams
++{
++	inline bool operator==(const SCineOutputParams& rhs) const { return odtFile == rhs.odtFile; }
++
++	static void ReflectType(Schematyc::CTypeDesc<SCineOutputParams>& desc)
++	{
++		desc.SetGUID("{6B2E9F40-18D7-4C63-A5B8-0E914C7D25AF}"_cry_guid);
++		desc.SetLabel("Output");
++		desc.AddMember(&SCineOutputParams::odtFile,
++			'odtf', "ODTFile", "ODT File",
++			"Output transform, as a Resolve .cube in ACEScct baked by tools/ocio-bake from the "
++			"ACES 2.0 studio config. THE one place in the chain that knows a display exists. "
++			"The default is the ACES 2.0 SDR 100 nit sRGB view; swapping this file changes only "
++			"what the monitor shows, never the scene data. Empty or unreadable = the picture goes "
++			"deliberately, visibly wrong (a clamped encode) rather than silently falling back.",
++			Schematyc::CSharedString("Assets/ODT/odt_srgb_100nit_aces2_65.cube"));
++	}
++
++	// Keep last: operator== compares the string by value.
++	Schematyc::CSharedString odtFile;
++};
++
+ class CCinematicCameraComponent final
+ 	: public IEntityComponent
+ 	, public ICinematicCameraOptics
+@@ -902,6 +954,8 @@ public:
+ 		desc.AddMember(&CCinematicCameraComponent::m_streaks, 'gstk', "DiffractionStreaks", "Diffraction Streaks", "", SCineStreaksParams());
+ 		desc.AddMember(&CCinematicCameraComponent::m_filter, 'gflt', "FrontFilter", "Front Filter", "", SCineFilterParams());
+ 		desc.AddMember(&CCinematicCameraComponent::m_viewfinder, 'gvfd', "Viewfinder", "Viewfinder", "", SCineViewfinderParams());
++		desc.AddMember(&CCinematicCameraComponent::m_look, 'glok', "Look", "Look", "", SCineLookParams());
++		desc.AddMember(&CCinematicCameraComponent::m_output, 'gout', "Output", "Output", "", SCineOutputParams());
+ 	}
+ 
+ 	static void Register(Schematyc::CEnvRegistrationScope& componentScope);
+@@ -1021,6 +1075,12 @@ private:
+ 	//! full time-of-day re-evaluation and sky-dome recompute so nothing stays cached or
+ 	//! mid-crossfade. See SceneReferredSpec.md S2 / decisions/s2-engine-side-switch.md.
+ 	void PublishSceneReferredConvention(bool bSceneReferred);
++	//! Load (or reload) the two display-chain .cube files into fp16 3D textures and publish their
++	//! renderer texture IDs on the post-effect bus, so the tone map's output-transform branch can
++	//! resolve them with CTexture::GetByID. Editor-live: a path change reloads on the next frame,
++	//! everything else is a member read. See SceneReferredSpec.md D8.
++	void ApplyDisplayLuts();
++	void RestoreDisplayLuts();
+ 	//! The camera's pre-exposure for this frame, published as a linear scale next to the request
+ 	//! above (Global_User_SceneExposure). Editor-live for the same reason.
+ 	void ApplySceneExposure();
+@@ -1063,6 +1123,8 @@ private:
+ 	SCineStreaksParams m_streaks;
+ 	SCineFilterParams m_filter;
+ 	SCineViewfinderParams m_viewfinder;
++	SCineLookParams m_look;
++	SCineOutputParams m_output;
+ 
+ 	// Zoom motor state: eased focal length chasing the quantised target.
+ 	float  m_focalMotorMm      = 0.0f;
+-- 
+2.47.1.windows.1
+

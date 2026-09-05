@@ -1,0 +1,300 @@
+From f8a798da744c72226800f90566f9e35e8bccab4f Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Fri, 28 Aug 2026 07:30:55 +0800
+Subject: [PATCH 072/119] scene-referred S2: sun shafts that carry the sun
+
+Fourth item of Stage S2. Sun shafts are the clearest case in the engine of an effect built
+entirely around a display-referred assumption: a mask that clips to a silhouette, a colour whose
+magnitude is thrown away, and a composite that blends against the remaining headroom of a
+finished picture. Under a pre-exposure they are the one thing in the frame that does not follow
+the aperture. D13 forbids turning them off, so they are rebuilt in scene units instead.
+
+Decision: scene-notes/decisions/s2-sun-shafts.md, approach A. Research:
+scene-notes/research/s2-sun-shafts.md.
+
+- The working set goes fp16 under the switch. $DisplayTarget 1/2a, 1/4a, 1/8 and their two Temp
+  siblings are re-formatted through the same CTexture::ReformatRenderTarget() path S0 built for
+  the HDR satellites, with the same all-or-none rule - they are ping-ponged AND addressable by
+  name from content-side shader scripts as $backbufferscaled_d2 / _d4 / _d8, so a mixed set
+  would be a silent precision cliff content could stumble into. nLDRPFormat is untouched, so
+  with the switch off SSAO's albedo downsample, the snow velocity passes and the legacy
+  PostEffects paths that share these targets are bit-for-bit stock.
+
+  MEMORY COST of the fp16 working set: R10G10B10A2 is 4 B/px, RGBA16F is 8. For the whole set of
+  five, about +5 MiB at 1080p and +21 MiB at 4K, PER GRAPHICS PIPELINE - Sandbox pays it again
+  for every extra viewport. The shaft pair alone is +4 MiB / +17 MiB of that. Bandwidth is about
+  +40 MB/frame at 1080p and +158 MB/frame at 4K across the three shaft passes, i.e. 0.2-2.4 % of
+  a typical discrete GPU. The fp16 working set is cheap; it was the format's content
+  compatibility that made it a decision. Logged once per flip like the HDR satellites.
+
+  This is the one place the implementation follows the task and the decision note rather than the
+  research note, which preferred a dedicated fp16 pair so the shared UNORM targets never move.
+  Re-formatting the shared set is safe here because it only ever happens under the switch, and it
+  keeps one mechanism instead of two.
+
+- sunColor.Normalize() is skipped on the scene-referred path. It keeps only the sun's hue as a
+  unit vector, so a white sun is (0.577, 0.577, 0.577) at every time of day and shaft brightness
+  is the amount slider and nothing else. That is a workaround for the UNORM target, not a
+  rendering decision. The scene-referred path uses the sun's real radiance times the latched
+  pre-exposure - E3DPARAM_SUN_COLOR is the UNEXPOSED sun, the pre-exposure lives one level down
+  in CRenderView::GetSunLightColor(), which this call does not go through - so the shafts now
+  follow T-stop, ND and time of day continuously. The SunShafts_* parameters keep their meaning
+  exactly: the amount is the fraction of the sun the shafts carry. Its useful VALUE changes, from
+  a display fraction to a scattering coefficient of order 0.01-0.05; the calibration is written
+  up in docs/SceneReferredCalibration.md section 3.
+
+- The composite moves before the tone curve. HDRFinalPass now carries BOTH composites, selected
+  by %_RT_SAMPLE0 - the scene-referred permutation of this pass, claimed here and reused by S4
+  for the output transform, which is exactly why S1 pinned the exposure with a constant instead
+  of spending this bit. The stock composite is textually untouched and simply unreachable when
+  SAMPLE0 is set. The new one adds the shafts into the scene sample BEFORE FilmMapping, and adds
+  them plainly: the stock (1 - oSample) headroom term has no meaning in scene-referred space,
+  where there is no "1.0 white" to have headroom against, and scattering is physically additive
+  anyway. The visible consequence, which D13 says to let show, is that shafts are no longer
+  suppressed over bright regions.
+
+- GetDownscaledTargetsIndex() is pinned to half resolution under the switch. At eRQ_Medium and
+  below the stock code selects index 1, whose HDR source target is never filled when bloom and
+  auto-exposure are both off, because the quarter-res downsample does not list the shafts stage
+  among its triggers. That is a stock bug; fixing it would change the stock path at medium
+  quality, so the scene-referred path steps around it instead.
+
+Known breakage carried forward, not hidden: the blur's chained gain (8 taps of weights summing
+to 4.5, divided by 8 and multiplied by 2, twice) is an amplification of 1.2656x that UNORM used
+to clip away and fp16 no longer does, and the mask (linearDepth * 1.32 * (R+G+B)) stops being a
+silhouette and becomes a real luminance image - shafts now track what is actually bright, which
+is the desired behaviour and also the biggest visual change. Neither is normalised here; both are
+now explicit, documented gains to be calibrated against the picture. Shafts also have no sky
+test, so bright geometry near the sun's screen position still makes rays, and more strongly than
+before. And the composite now lands before the temporal resolve, so a moving camera must be
+checked for highlight crawl before this is signed off.
+
+Built clean (0 errors, 0 warnings outside Code/SDKs): CryRenderD3D11.
+
+Co-Authored-By: Claude Opus <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01A72MFkdSczncE7au9UVnmu
+---
+ .../Common/GraphicsPipeline.cpp               | 74 +++++++++++++++++++
+ .../Common/GraphicsPipeline.h                 |  5 ++
+ .../GraphicsPipeline/SunShafts.cpp            | 10 +++
+ .../GraphicsPipeline/ToneMapping.cpp          | 34 ++++++++-
+ .../HWScripts/CryFX/HDRPostProcess.cfx        | 19 ++++-
+ 5 files changed, 140 insertions(+), 2 deletions(-)
+
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Common/GraphicsPipeline.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Common/GraphicsPipeline.cpp
+index 1d0b47b6..d2d2e5df 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Common/GraphicsPipeline.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Common/GraphicsPipeline.cpp
+@@ -521,6 +521,79 @@ void CGraphicsPipelineResources::UpdateHDRSatelliteFormats()
+ 	       (double(sizeAfter) - double(sizeBefore)) / (1024.0 * 1024.0));
+ }
+ 
++// Re-format the five scaled display targets when the scene-referred switch flips
++// (SceneReferredSpec.md S2, decisions/s2-sun-shafts.md approach A).
++//
++// $DisplayTarget 1/2a, 1/4a, 1/8 and their two Temp siblings are R10G10B10A2 UNORM - hard
++// clamped to [0,1] with 2 bits of alpha. That is the format the sun-shaft stage borrows, and it
++// is the reason the whole shaft effect is display-referred: the mask
++// (linearDepth * 1.32 * (R+G+B), Sunshafts.cfx) clips to white for any pixel above about a
++// quarter of a mid-grey sunlit surface, so the shaft source is a binary silhouette rather than a
++// luminance image, and the shaft colour has to be Normalize()d to survive at all. On the
++// scene-referred path the shafts carry the sun's real exposed radiance, which needs a target
++// that can hold it.
++//
++// Same mechanism as the HDR satellites above and for the same reason - the objects stay alive,
++// only their device texture is swapped - and the same all-or-none rule: the three Scaled targets
++// and the two Temps are ping-ponged and are also addressable BY NAME from content-side shader
++// scripts as $backbufferscaled_d2 / _d4 / _d8, so a mixed set would be a silent precision cliff
++// that content could stumble into.
++//
++// $DisplayTarget and $DisplayTargetDst are deliberately NOT in this set. Those are the tone
++// map's output, still display-referred by design, and moving them is S4's problem (the PostAA
++// history, the LDR post stage and the swap chain all key off that format). nLDRPFormat itself is
++// untouched, so with the switch off every one of these targets is bit-for-bit stock, including
++// the SSAO albedo downsample and the snow velocity passes that share them.
++void CGraphicsPipelineResources::UpdateDisplayTargetScaledFormats()
++{
++	const ETEX_Format wanted = CRendererResources::IsSceneReferred()
++	                           ? eTF_R16G16B16A16F
++	                           : CRendererResources::GetLDRFormat(true);
++
++	CTexture* const scaled[] =
++	{
++		m_pTexDisplayTargetScaled[0],
++		m_pTexDisplayTargetScaled[1],
++		m_pTexDisplayTargetScaled[2],
++		m_pTexDisplayTargetScaledTemp[0],
++		m_pTexDisplayTargetScaledTemp[1],
++	};
++
++	uint64 sizeBefore = 0;
++	bool bMismatch = false;
++	for (CTexture* pTex : scaled)
++	{
++		if (!pTex)
++			continue;
++
++		sizeBefore += pTex->GetDeviceDataSize();
++		bMismatch |= (pTex->GetDstFormat() != wanted);
++	}
++
++	if (!bMismatch)
++		return;
++
++	uint64 sizeAfter = 0;
++	for (CTexture* pTex : scaled)
++	{
++		if (!pTex)
++			continue;
++
++		if (pTex->GetDstFormat() != wanted)
++			pTex->ReformatRenderTarget(wanted);
++
++		sizeAfter += pTex->GetDeviceDataSize();
++	}
++
++	// Once per flip. Roughly +5 MiB at 1080p and +21 MiB at 4K for the whole set, per graphics
++	// pipeline; the shaft pair alone is about +4 MiB and +17 MiB of that.
++	CryLog("[SceneReferred] scaled display targets -> %s at %dx%d; %.1f MiB -> %.1f MiB (%+.1f MiB)",
++	       (wanted == eTF_R16G16B16A16F) ? "R16G16B16A16F" : "R10G10B10A2",
++	       m_resourceWidth, m_resourceHeight,
++	       sizeBefore / (1024.0 * 1024.0), sizeAfter / (1024.0 * 1024.0),
++	       (double(sizeAfter) - double(sizeBefore)) / (1024.0 * 1024.0));
++}
++
+ void CGraphicsPipelineResources::Update(EShaderRenderingFlags renderingFlags)
+ {
+ 	// Scene-referred pipeline: pick up a flip of the switch. Update() is the sanctioned place
+@@ -528,6 +601,7 @@ void CGraphicsPipelineResources::Update(EShaderRenderingFlags renderingFlags)
+ 	// CompileModifiedRenderObjects() and before Execute(), so nothing is bound yet - and the
+ 	// rain occlusion texture right below is created and released on demand in the same way.
+ 	UpdateHDRSatelliteFormats();
++	UpdateDisplayTargetScaledFormats();
+ 
+ 	const auto shouldApplyOcclusion = gcpRendD3D->m_bDeferredRainOcclusionEnabled && CRendererCVars::IsRainEnabled();
+ 
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Common/GraphicsPipeline.h b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Common/GraphicsPipeline.h
+index be99fcdc..341acdab 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Common/GraphicsPipeline.h
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Common/GraphicsPipeline.h
+@@ -146,6 +146,11 @@ public:
+ 	//! satellite targets when the switch flips. Render thread, between frames.
+ 	void UpdateHDRSatelliteFormats();
+ 
++	//! Scene-referred pipeline (SceneReferredSpec.md S2): re-format the three scaled display
++	//! targets and their two Temp siblings when the switch flips. They are the sun-shaft stage's
++	//! borrowed working set and are UNORM in stock CE. Render thread, between frames.
++	void UpdateDisplayTargetScaledFormats();
++
+ 	void PrepareRainOcclusionMaps();
+ 	void CreateRainOcclusionMaps(int resourceWidth, int resourceHeight);
+ 	void DestroyRainOcclusionMaps();
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/SunShafts.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/SunShafts.cpp
+index eb112e0d..f6091b70 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/SunShafts.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/SunShafts.cpp
+@@ -30,6 +30,16 @@ void CSunShaftsStage::Init()
+ 
+ int CSunShaftsStage::GetDownscaledTargetsIndex()
+ {
++	// Scene-referred pipeline: pin to half resolution. At eRQ_Medium and below the stock code
++	// picks index 1 and the mask pass then samples $HDRTargetScaled 1/4, but the quarter-res
++	// downsample in CStandardGraphicsPipeline::ExecuteHDRPostProcessing does NOT list the
++	// sun-shafts stage among its triggers - so with bloom and auto-exposure off that target is
++	// never filled and the shafts are built from stale or uninitialised data. That is a stock
++	// bug (research/s2-sun-shafts.md section 2); fixing it would change the stock path at medium
++	// quality, so it is left alone and only the scene-referred path steps around it.
++	if (CRendererResources::IsSceneReferred())
++		return 0;
++
+ 	return gRenDev->EF_GetRenderQuality() >= eRQ_High ? 0 : 1;
+ }
+ 
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.cpp
+index a74847b2..0ec3b116 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.cpp
+@@ -105,6 +105,14 @@ void CToneMappingStage::Execute()
+ 		{
+ 			// Scene-referred exposure. S0: the EV path, so SAMPLE4 stays clear exactly as it does
+ 			// in mode 1 and the shader keeps using ComputeExposure(). S1 replaces this branch.
++			//
++			// S2 claims SAMPLE0 as THE scene-referred permutation of HDRFinalPass. It selects the
++			// additive, pre-curve sun-shaft composite instead of the stock post-saturate headroom
++			// blend (decisions/s2-sun-shafts.md approach A) and it is the same bit S4's output
++			// transform will branch the body of FilmMapping on, which is why it is spent here and
++			// not on the exposure - S1 pinned that with a constant precisely so this bit stayed
++			// free. One extra permutation of one fullscreen pass.
++			rtMask |= g_HWSR_MaskBit[HWSR_SAMPLE0];
+ 		}
+ 		else if (CRenderer::CV_r_HDREyeAdaptationMode == 2)
+ 		{
+@@ -194,7 +202,31 @@ void CToneMappingStage::Execute()
+ 		Vec4 sunShaftParams[2];
+ 		pSunShaftsStage->GetCompositionParams(sunShaftParams[0], sunShaftParams[1]);
+ 		Vec3 sunColor = gEnv->p3DEngine->GetSunColor();
+-		sunColor.Normalize();
++
++		// Normalize() throws the sun's magnitude away and keeps only its hue as a unit vector, so
++		// on the stock path a white sun is (0.577, 0.577, 0.577) whatever the time of day, and
++		// shaft brightness is SunShafts_RaysAmount and nothing else. That is a workaround for the
++		// UNORM working set, not a rendering decision (research/s2-sun-shafts.md section 3): with
++		// unclamped HDR sun values, multiplying a [0,1] mask by the raw sun colour would saturate
++		// instantly and make the amount slider useless.
++		//
++		// The scene-referred path has an fp16 working set and composites before the tone curve,
++		// so the magnitude can be kept - and must be, or the shafts are the one thing in the
++		// frame that does not follow the aperture. The amount keeps its meaning exactly: it is
++		// the fraction of the sun that the shafts carry. Its useful VALUE changes, because it is
++		// now a scattering coefficient rather than a display fraction; see
++		// docs/SceneReferredCalibration.md section 3.
++		//
++		// E3DPARAM_SUN_COLOR is the UNEXPOSED sun: the pre-exposure is applied one level down, in
++		// CRenderView::GetSunLightColor(), which this does not go through. So the latched scale is
++		// applied here by hand - the same value the lights used this frame - and the shafts then
++		// follow T-stop, ND and the whole exposure triangle continuously, like everything else in
++		// the frame.
++		if (!bSceneReferred)
++			sunColor.Normalize();
++		else
++			sunColor *= gcpRendD3D->GetSceneReferredExposure();
++
+ 		sunColor.SetLerp(Vec3(sunShaftParams[0].x, sunShaftParams[0].y, sunShaftParams[0].z), sunColor, sunShaftParams[1].w);
+ 		shaftsSunCol = Vec4(sunColor * sunShaftParams[1].z, 1);
+ 	}
+diff --git a/Engine/Shaders/HWScripts/CryFX/HDRPostProcess.cfx b/Engine/Shaders/HWScripts/CryFX/HDRPostProcess.cfx
+index c4deae7b..9e2a6045 100644
+--- a/Engine/Shaders/HWScripts/CryFX/HDRPostProcess.cfx
++++ b/Engine/Shaders/HWScripts/CryFX/HDRPostProcess.cfx
+@@ -957,10 +957,27 @@ pixout HDRFinalScenePS(vert2frag IN)
+ 
+ 	half3 vAdaptedLum = luminanceTex.Load(int3(0, 0, 0));
+ 	half3 vSample = hdrTex.Load(int3(IN.WPos.xy, 0));
++
++	// Sun shafts, scene-referred composite (SceneReferredSpec.md S2, decisions/s2-sun-shafts.md
++	// approach A). SAMPLE0 is the scene-referred permutation of this pass; SAMPLE5 still means
++	// "shafts are present". BEFORE the tone curve, so the shafts are scene radiance like
++	// everything else and S4's output transform sees them, and ADDITIVE, because the stock
++	// blend's (1 - oSample) headroom term has no meaning in scene-referred space - there is no
++	// "1.0 white" to have headroom against. Physically scattering IS additive; the visible
++	// consequence is that shafts are no longer suppressed over bright regions.
++	//
++	// The constant it multiplies by is the sun's own exposed radiance times the shaft amount
++	// (CToneMappingStage::Execute), not the unit-length hue vector the stock path uses, so the
++	// shafts follow T-stop, ND and time of day continuously.
++#if %_RT_SAMPLE0 && %_RT_SAMPLE5
++	vSample += sunShaftsTex.Sample(linearClampSS, ScreenTC.xy).rgb * SunShafts_SunCol.rgb;
++#endif
++
+ 	half3 oSample = HDRToneMapSample( IN, vSample, cBloom, vAdaptedLum, fVignetting);
+ 
+ 	// Apply merged post processes
+-#if %_RT_SAMPLE5
++	// The stock composite, untouched, and now only reachable off the scene-referred permutation.
++#if !%_RT_SAMPLE0 && %_RT_SAMPLE5
+ 	oSample += sunShaftsTex.Sample(linearClampSS, ScreenTC.xy) * SunShafts_SunCol * (1 - oSample); // Blend in ldr sunshafts	
+ #endif
+ 
+-- 
+2.47.1.windows.1
+

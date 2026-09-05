@@ -1,0 +1,157 @@
+From 9c3cf4d7ff2c71bfea0c8db172f3c7f27e704174 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Fri, 28 Aug 2026 09:31:30 +0800
+Subject: [PATCH 082/119] scene-referred S4: the stock LDR stage goes inert
+ (D9)
+
+With the scene-referred pipeline running, everything the stock engine does AFTER the display
+transform is grading a picture that has already been squeezed onto a monitor. It can only
+redistribute code values that survived the transform, which is exactly the "JPEG feel" this
+pipeline exists to get away from. D9 skips the whole stage; after the ODT only dither remains.
+
+Skipped at the STAGE level rather than by driving parameters to neutral - a neutral pass still
+costs a full-screen read and a write, and a nulled parameter is a silent lie to anyone reading
+the value back:
+
+- CPostEffectStage::Execute() does not preprocess Sharpening, Blurring or UberGamePostProcess
+  (vignette, saturation, artefacts).
+- CPostAAStage::DoFinalComposition() drops the film grain, the sharpening flag and the flare
+  colour-chart re-grade. The pass itself is not skippable - with the post-effect stage active it
+  is the only path from the display target to the back buffer - so what is gated is the work
+  inside it.
+- The tone map already does not set the colour chart flag (previous commit).
+
+CColorGradingStage keeps running: it is cached and cheap, and leaving it alive means turning the
+camera off restores the stock look immediately instead of after a chart rebuild.
+
+What still runs: PostAA and SMAA, the final blit, dither, EFSLIST_AFTER_HDRPOSTPROCESS, the HUD,
+and all of ours - the viewfinder overlays, the lens-optics composite, the squeeze/letterbox remap
+and the lateral chromatic aberration. None of our effects sits after the ODT, so nothing had to
+move; the one that composites late (lens optics) is display-referred by construction and is
+listed as breakage for S7 rather than moved here.
+
+One line in the log per flip of the switch says which stock effects have gone inert, because a
+user reaching for a slider that does nothing deserves an explanation in the log rather than a
+mystery.
+
+Co-Authored-By: Claude Opus <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01A72MFkdSczncE7au9UVnmu
+---
+ .../XRenderD3D9/GraphicsPipeline/PostAA.cpp   | 21 +++++++++--
+ .../GraphicsPipeline/PostEffects.cpp          | 36 +++++++++++++++++++
+ .../GraphicsPipeline/PostEffects.h            |  3 ++
+ 3 files changed, 57 insertions(+), 3 deletions(-)
+
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/PostAA.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/PostAA.cpp
+index ef38e712..eb10064a 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/PostAA.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/PostAA.cpp
+@@ -404,15 +404,30 @@ void CPostAAStage::DoFinalComposition(CTexture*& pCurrRT, CTexture* pDestRT, uin
+ 	Vec4 hdrSetupParams[5];
+ 	gEnv->p3DEngine->GetHDRSetupParams(hdrSetupParams);
+ 
++	// D9 (SceneReferredSpec.md): the three stock LDR operations that live inside this composition
++	// pass are inert while the scene-referred pipeline runs. The pass itself is NOT skippable -
++	// with the post-effect stage active it is the only path from the display target to the back
++	// buffer - so what is gated here is the work inside it, not the pass.
++	//
++	//   film grain  - an overlay blend pivoting on 0.5, only defined on [0,1]. Comes back before
++	//                 the ODT as a sensor effect in S7.
++	//   sharpening  - sqrt(saturate(lerp(taps^2, c^2))), a gamma-space operator by construction.
++	//   flare chart - the same 8-bit display-referred chart the tone map no longer applies.
++	//
++	// The viewfinder overlays, the lens-optics composite, the squeeze/letterbox remap and the
++	// lateral chromatic aberration all stay: they are ours, or they are geometry rather than
++	// grading.
++	const bool bSceneReferred = CRendererResources::IsSceneReferred();
++
+ 	// Calculate grain amount
+ 	CEffectParam* pParamGrainAmount = PostEffectMgr()->GetByName("FilterGrain_Amount");
+ 	CEffectParam* pParamArtifactsGrain = PostEffectMgr()->GetByName("FilterArtifacts_Grain");
+ 	const float paramGrainAmount = max(pParamGrainAmount->GetParam(), pParamArtifactsGrain->GetParam());
+ 	const float environmentGrainAmount = hdrSetupParams[1].w * CRenderer::CV_r_HDRGrainAmount;
+-	const float grainAmount = max(paramGrainAmount, environmentGrainAmount);
++	const float grainAmount = bSceneReferred ? 0.0f : max(paramGrainAmount, environmentGrainAmount);
+ 
+ 	uint64 rtMask = 0;
+-	if (aaMode & (eAT_SMAA_2TX_MASK | eAT_TSAA_MASK))
++	if ((aaMode & (eAT_SMAA_2TX_MASK | eAT_TSAA_MASK)) && !bSceneReferred)
+ 		rtMask |= g_HWSR_MaskBit[HWSR_SAMPLE2];
+ 	if (CRenderer::CV_r_colorRangeCompression)
+ 		rtMask |= g_HWSR_MaskBit[HWSR_SAMPLE4];
+@@ -429,7 +444,7 @@ void CPostAAStage::DoFinalComposition(CTexture*& pCurrRT, CTexture* pDestRT, uin
+ 
+ 	CTexture* pColorChartTex = CRendererResources::s_ptexBlack;
+ 	auto* pColorGradingStage = m_graphicsPipeline.GetStage<CColorGradingStage>();
+-	if (CRenderer::CV_r_FlaresEnableColorGrading && pColorGradingStage)
++	if (CRenderer::CV_r_FlaresEnableColorGrading && pColorGradingStage && !bSceneReferred)
+ 	{
+ 		if (CTexture* pColorChartTexTentative = pColorGradingStage->GetColorChart())
+ 		{
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/PostEffects.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/PostEffects.cpp
+index c441d22e..4f6c8d02 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/PostEffects.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/PostEffects.cpp
+@@ -216,9 +216,45 @@ void CPostEffectStage::Execute()
+ 	CPostEffectDebugVec& activeParams = m_pPostMgr->GetActiveEffectsParamsDebug();
+ #endif
+ 
++	// D9 (SceneReferredSpec.md): with the scene-referred pipeline running, the stock LDR grading
++	// stage is skipped whole. It operates on a picture that has already been squeezed onto a
++	// monitor - it can only redistribute code values that survived the display transform - and
++	// that is precisely the "JPEG feel" the whole pipeline exists to get away from.
++	//
++	// Skipped at the STAGE level, by not preprocessing the effect at all, rather than by driving
++	// its parameters to neutral: a neutral pass still costs a full-screen read and a write, and a
++	// nulled parameter is a silent lie to anyone reading the value back.
++	//
++	// What is skipped here: sharpening, blurring and the uber post process (vignette, saturation,
++	// grain, artefacts). The colour chart is skipped in two other places - the tone map does not
++	// set its flag and PostAA does not re-grade the flares through it - but CColorGradingStage
++	// itself keeps running, so turning the camera off restores the stock look immediately instead
++	// of after a chart rebuild. Everything that is not stock grading (the vision modes, screen
++	// effects, HUD, PostAA and its final blit) runs exactly as before.
++	const bool bSceneReferred = CRendererResources::IsSceneReferred();
++	if (bSceneReferred != m_bLoggedSceneReferredSkips)
++	{
++		m_bLoggedSceneReferredSkips = bSceneReferred;
++		if (bSceneReferred)
++			CryLog("[SceneReferred] stock LDR post stage inert (D9): colour chart, saturation/contrast/brightness, "
++			       "uber vignette, sharpening, blurring, film grain, flare re-grade. PostAA, HUD, the final blit and dither still run.");
++		else
++			CryLog("[SceneReferred] stock LDR post stage restored");
++	}
++
+ 	for (CPostEffectItor pItor = m_pPostMgr->GetEffects().begin(), pItorEnd = m_pPostMgr->GetEffects().end(); pItor != pItorEnd; ++pItor)
+ 	{
+ 		CPostEffect* pCurrEffect = (*pItor);
++
++		if (bSceneReferred)
++		{
++			const auto skipId = pCurrEffect->GetID();
++			if (skipId == EPostEffectID::Sharpening ||
++			    skipId == EPostEffectID::Blurring ||
++			    skipId == EPostEffectID::UberGamePostProcess)
++				continue;
++		}
++
+ 		if (pCurrEffect->Preprocess(viewInfo))
+ 		{
+ 			const auto id = pCurrEffect->GetID();
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/PostEffects.h b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/PostEffects.h
+index 454a13bb..df7007bf 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/PostEffects.h
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/PostEffects.h
+@@ -104,6 +104,9 @@ private:
+ 	CPostEffectContext m_context;
+ 
+ 	CStretchRectPass   m_passCopyScreenToTex;
++	//! Last state of the scene-referred switch, so the "which stock effects are inert" line is
++	//! logged once per flip and not once per frame (SceneReferredSpec.md D9).
++	bool               m_bLoggedSceneReferredSkips = false;
+ #ifndef _RELEASE
+ 	CFullscreenPass    m_passAntialiasingDebug;
+ #endif
+-- 
+2.47.1.windows.1
+

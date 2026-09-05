@@ -1,0 +1,253 @@
+From f07f3c20cca0fb5f7993781219a85fe42dce93af Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Fri, 28 Aug 2026 22:12:40 +0800
+Subject: [PATCH 096/119] fix: the wave glare's amount spans stops, not a 4x
+ window - S7 read the pre-exposure as making sources brighter
+
+The first runtime test found the analytic streaks working and the FFT glare gone
+(TEST-CHECKLIST C4). Investigated before touching a number
+(scene-notes/decisions/s7-glare-gain.md section 1): the path is NOT broken. Both
+models share GetParams(), ResolveThreshold(), the same HDRStreakThreshold pass on
+the same half-res fp16 source, the same Active flag and the same sprite/composite
+plumbing. The kernel is a CPU FFT of the PUPIL - polygon, mask, barrel, spherical
+aberration - so neither its normalisation nor its E_far tail can be mis-scaled by
+an exposure change, and fNorm = 1/pitch^2 is pure geometry. What differs is
+amplitude, and only the wave path pays the second factor:
+
+  threshold 4.0 absolute -> 4 STOPS over grey (2.88): both models, ~5x
+  amount divided by 50:                              wave only, 50x
+
+270x against 5x is exactly "one still shows, the other is gone".
+
+S7's premise was the error. "With the pre-exposure in place the sources are real
+again, so the 50 is not needed" reads the pre-exposure as making sources
+brighter; at a daylight exposure it DIVIDES by 3.4. The 50 came off and nothing
+gave it back, and the surviving stored/50 mapping spanned 0 to 4x physical - which
+cannot reach any case where 1x is not enough.
+
+And 1x genuinely is not enough, correctly. A 200 kcd/m^2 practical (20.0 engine
+units) at EV100 14.8: L_sat = 34 231, pre-exposure 0.292, exposed source 5.84 =
+5.0 stops over grey; against the 4-stop threshold the excess is 2.96, the rays
+take half a percent of it, and 0.0148 spread over a couple of thousand pixels is
+some fifteen stops under mid grey. Nobody sees a sunstar off a desk lamp at noon.
+The same lamp at a night exposure, or the sun four decades brighter, needs nothing
+added at all. So the physics is not what wants changing - the control is.
+
+Streak Amount under the switch is now GAIN IN STOPS, ten slider units per stop:
+
+  0 -> off    50 -> physical (0 stops)    100 -> +5    150 -> +10    200 -> +15
+
+The physical point does not move, so the shipped default, every saved level and
+every CRC keep their meaning; the dial reads in stops like every neighbouring
+control on this camera; and the range covers the five decades the physics spans.
+Zero stays a hard off (the stage skips the pass) rather than flooring at 2^-5.
+Approaches B (widen the divisor), C (raise the default instead - that belongs to
+a lens preset, not to the engine) and D (auto-normalise - removes the exposure
+dependence the whole pipeline exists to create) are on the page and rejected.
+
+The once-per-change [BLOOM] line now prints the RESOLVED gain and its stops rather
+than a number whose meaning depends on which mapping is in force. README,
+docs/SceneReferredContent.md 6.3 and the component tooltip carry the worked
+example and say out loud that 1x physical on a daylight-exposed 200 kcd/m^2 source
+is faint by nature - so the next reader does not take a correct picture for a
+broken one, which is what happened here.
+
+Co-Authored-By: Claude Opus <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01A72MFkdSczncE7au9UVnmu
+---
+ .../Common/PostProcess/PostEffects.cpp        | 35 ++++++++++++++-----
+ .../XRenderD3D9/GraphicsPipeline/Bloom.cpp    | 13 +++++--
+ .../Module/CinematicCameraComponent.h         | 11 ++++--
+ Code/CryPlugins/CinematicCamera/README.md     | 16 ++++++++-
+ .../docs/SceneReferredContent.md              | 35 ++++++++++++++-----
+ 5 files changed, 87 insertions(+), 23 deletions(-)
+
+diff --git a/Code/CryEngine/RenderDll/Common/PostProcess/PostEffects.cpp b/Code/CryEngine/RenderDll/Common/PostProcess/PostEffects.cpp
+index 9dac9a5e..f774a4aa 100644
+--- a/Code/CryEngine/RenderDll/Common/PostProcess/PostEffects.cpp
++++ b/Code/CryEngine/RenderDll/Common/PostProcess/PostEffects.cpp
+@@ -208,16 +208,35 @@ SHDRStreaksParams CHDRStreaks::GetParams() const
+ 	params.pFilterPSFTex = const_cast<CTexture*>(static_cast<CParamTexture*>(m_pFilterPSFTex)->GetParamTexture());
+ 
+ 	params.nMode = (m_pMode->GetParam() > 0.5f) ? 1 : 0;
+-	// Streak Amount goes back to being a physical fraction (D11). The shipped default of 50 was a
+-	// compensation for lights that arrived clamped and unexposed: at 1 the wave model deposits the
+-	// pupil's actual diffracted energy, and 50 was what made that visible against sources whose
+-	// real brightness had already been thrown away. With the pre-exposure in place the sources are
+-	// real again, so the stored number is divided by 50 - a stored 50 IS the physical 1.0, saved
+-	// levels open looking right, the slider still spans 0-200 (= 0 to 4x physical), and no default
+-	// and no CRC moves.
++	// Streak Amount under the switch is GAIN IN STOPS on the diffracted energy, ten units of the
++	// slider per stop, with the shipped 50 sitting on the physical 1.0
++	// (decisions/s7-glare-gain.md approach A; it supersedes S7's stored/50).
++	//
++	// The physics does not move - the pattern's shape, falloff and dispersion are the pupil's at
++	// every value - but the RANGE has to. A 200 kcd/m^2 practical at a daylight EV100 of 14.8 is
++	// 5.8 in exposed units, about 5 stops over grey; against a 4-stop threshold that is an excess
++	// of 3.0, of which the rays carry half a percent, spread over a couple of thousand pixels:
++	// some fifteen stops under mid grey. That is CORRECT - nobody sees a sunstar off a 200
++	// kcd/m^2 lamp in daylight - and the old stored/50 mapping spanned 0 to 4x physical, which
++	// cannot reach the cases where it is not correct (the sun, or that same lamp at a night
++	// exposure) from anywhere on the slider. S7's premise was the error: it read the pre-exposure
++	// as making sources brighter, when at a daylight exposure it divides by 3.4.
++	//
++	//   0 -> off      50 -> physical (0 stops)      100 -> +5      150 -> +10      200 -> +15
++	//
++	// Ten per stop is chosen so the dial reads as stops, the unit every neighbouring control on
++	// this camera is already in. 50 keeps its meaning exactly, so no default, no saved level and
++	// no CRC moves.
+ 	params.fWaveAmount = clamp_tpl(m_pWaveAmount->GetParam(), 0.0f, 200.0f);
+ 	if (CRendererResources::IsSceneReferredStage(5))
+-		params.fWaveAmount /= 50.0f;
++	{
++		// Zero stays a hard OFF, as it is for every other amount in the glare family - the stage
++		// skips the whole pass on it. Without the guard the exponential would floor at 2^-5 and a
++		// slider at zero would still cost a sprite pass.
++		params.fWaveAmount = (params.fWaveAmount < 0.5f)
++		                     ? 0.0f
++		                     : powf(2.0f, (params.fWaveAmount - 50.0f) / 10.0f);
++	}
+ 	params.fWaveReach = clamp_tpl(m_pWaveReach->GetParam(), 0.02f, 1.0f);
+ 	params.fDispersion = clamp_tpl(m_pDispersion->GetParam(), 0.0f, 1.0f);
+ 
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Bloom.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Bloom.cpp
+index 21e8880c..8adb4b29 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Bloom.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Bloom.cpp
+@@ -696,8 +696,15 @@ void CBloomStage::ExecuteDiffraction(const SHDRStreaksParams& streakParams, floa
+ 			s_lastDispersion = streakParams.fDispersion;
+ 			s_lastN = pDofStage->GetDiffractionNGeo();
+ 			s_lastDebug = nDebugMode;
+-			CryLog("[BLOOM] diffraction glare amount=%.2f reach=%.2f disp=%.2f N=%.1f -> pitch=%.3f half-px/texel (%.1f texels/px) lod=%.1f of %.0f sprite=%.0f half-px (%.0f texels, %.0f native px) core=%.2f window: outer 0.8-1.0 R, inner 4 half-px (%.0f texels) deposited glare fraction=%.3f norm=%.3g",
+-			       streakParams.fWaveAmount, streakParams.fWaveReach, streakParams.fDispersion,
++			// The amount is the RESOLVED gain, not the stored slider: under the scene-referred
++			// switch the slider is read as stops (ten units per stop, 50 = physical), so the
++			// number that matters here is 2^stops and the number the user typed is not
++			// recoverable from it without saying which mapping was in force.
++			// decisions/s7-glare-gain.md.
++			CryLog("[BLOOM] diffraction glare gain=%.4g (%.1f stops over physical) reach=%.2f disp=%.2f N=%.1f -> pitch=%.3f half-px/texel (%.1f texels/px) lod=%.1f of %.0f sprite=%.0f half-px (%.0f texels, %.0f native px) core=%.2f window: outer 0.8-1.0 R, inner 4 half-px (%.0f texels) deposited glare fraction=%.3f norm=%.3g",
++			       streakParams.fWaveAmount,
++			       (streakParams.fWaveAmount > 0.0f) ? (logf(streakParams.fWaveAmount) / logf(2.0f)) : -99.0f,
++			       streakParams.fWaveReach, streakParams.fDispersion,
+ 			       pDofStage->GetDiffractionNGeo(), fPitchHalfPx, 1.0f / fPitchHalfPx, fLodRef, fMaxLod,
+ 			       fRadiusHalfPx, fSpriteRadiusTexels, fHalfExtentNativeY,
+ 			       kernel.GetCoreFraction(), fInnerWindowTexels, fGlareFraction * streakParams.fWaveAmount, fNorm);
+@@ -711,7 +718,7 @@ void CBloomStage::ExecuteDiffraction(const SHDRStreaksParams& streakParams, floa
+ 				// energy IS the amount now: the layer is composited straight into the HDR
+ 				// target, so the tone mapper's bloom weight (printed for reference only) no
+ 				// longer stands between the deposit and the screen.
+-				CryLog("[BLOOM] diffraction glare debug=%d energy=%.4g (= amount %.2f, own half-res layer, scene bloom weight %.4g no longer applies) sprite half extent = %.0f x %.0f native px",
++				CryLog("[BLOOM] diffraction glare debug=%d energy=%.4g (= resolved gain %.4g, own half-res layer, scene bloom weight %.4g no longer applies) sprite half extent = %.0f x %.0f native px",
+ 				       nDebugMode, fEnergy, streakParams.fWaveAmount, fBloomCompositeWeight,
+ 				       fHalfExtentNativeX, fHalfExtentNativeY);
+ 			}
+diff --git a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
+index 6164a99b..3e6ad63e 100644
+--- a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
++++ b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
+@@ -641,9 +641,14 @@ struct SCineStreaksParams
+ 			"actually is, so 10-100 reproduces the sunstar a real source of that kind shows. The "
+ 			"pattern's SHAPE and falloff stay physical at every value. Analytic ignores this: "
+ 			"there the f-number ramp still owns the amount. "
+-			"WITH SCENE REFERRED ON the lights are no longer clamped, so the compensation is not "
+-			"needed and the effective amount is this value divided by 50: the shipped 50 IS the "
+-			"physical 1.0, and the slider spans 0 to 4x physical.",
++			"WITH SCENE REFERRED ON the sources carry their real brightness and this becomes GAIN "
++			"IN STOPS: ten on the slider is one stop, and the shipped 50 sits exactly on the "
++			"physical 1.0. So 0 = off, 50 = physical, 100 = +5 stops, 150 = +10, 200 = +15. The "
++			"range is that wide because the physics needs it - a 200 kcd/m2 practical at a "
++			"daylight exposure puts its rays some fifteen stops under mid grey, which is right "
++			"(nobody sees a sunstar off a desk lamp at noon), while the same lamp at a night "
++			"exposure needs nothing added at all. For rays off an ordinary daylight practical, "
++			"try 130-150.",
+ 			50.0f);
+ 		desc.AddMember(&SCineStreaksParams::reach,
+ 			'stRc', "StreakReach", "Streak Reach",
+diff --git a/Code/CryPlugins/CinematicCamera/README.md b/Code/CryPlugins/CinematicCamera/README.md
+index 6c5b5ea4..efa999c5 100644
+--- a/Code/CryPlugins/CinematicCamera/README.md
++++ b/Code/CryPlugins/CinematicCamera/README.md
+@@ -338,7 +338,7 @@ per path, with the reason.
+ | Enable Diffraction Streaks | bool | true | Grow sunstars out of very bright sources the way a real iris diffracts light off its blade edges: invisible wide open, appearing around f/8, sharp by f/16. |
+ | Blade Rotation (deg) | 0-360 | 0 | Phase of the iris, rotating the whole set of rays. Rays are spread evenly, so the pattern repeats every 360 / ray count degrees. This same rotation also turns the bokeh polygon — one iris, one orientation. |
+ | Streak Model | Analytic / Wave | **Wave** | Which model computes the sunstar. **Wave optics** transforms the real pupil — blade count, blade curvature, shape mask, spherical aberration — into its diffraction pattern, so 9 blades give 18 rays and stopping down lengthens them by itself. **Analytic** paints the older line pairs with a hand-tuned f-number ramp; keep it for an A/B or when the wave kernel is switched off. |
+-| Streak Amount | 0-200 (slider 0-100) | **50** | How much brighter the real source is than the clamped HDR value standing in for it — a **source radiance boost**, not a style knob. 1 takes the HDR value as the true radiance: physically exact, and nearly invisible, because the rays carry only ~0.5 % of the light spread over hundreds of pixels. 10–100 reproduces the sunstar a real lamp or the sun of that kind draws; the pattern's shape and falloff stay physical at every value. **Wave only**: in Analytic the f-number ramp still owns the amount. **With Scene Referred on the lights are no longer clamped**, so the effective amount is this value divided by 50 - the shipped 50 IS the physical 1.0 and the slider spans 0 to 4x physical. |
++| Streak Amount | 0-200 (slider 0-100) | **50** | How much brighter the real source is than the clamped HDR value standing in for it — a **source radiance boost**, not a style knob. 1 takes the HDR value as the true radiance: physically exact, and nearly invisible, because the rays carry only ~0.5 % of the light spread over hundreds of pixels. 10–100 reproduces the sunstar a real lamp or the sun of that kind draws; the pattern's shape and falloff stay physical at every value. **Wave only**: in Analytic the f-number ramp still owns the amount. **With Scene Referred on this is read as GAIN IN STOPS**, ten units of the slider per stop, with the shipped 50 sitting exactly on the physical 1.0: 0 = off, 50 = physical, 100 = +5 stops, 150 = +10, 200 = +15. The pattern's shape, falloff and dispersion stay the pupil's at every value. The range is that wide because the physics demands it - see the note below the table. |
+ | Streak Reach | 0-1 | 0.35 | How far the rays are drawn, as a fraction of frame height. This is where the faint far-field tail is **cut off**, not how bright it is: a cost and coverage choice, not a property of the lens. **Wave only.** |
+ | Streak Dispersion | 0-1 | 1.0 | Spread of the rays' rainbow. Every wavelength diffracts to a different size, which is why a real ray runs blue near the source and red at the tip. 0 = one white pattern at 550 nm. **Wave only.** |
+ 
+@@ -792,6 +792,20 @@ the true source is than that clamped value — with **50** as the default and 10
+ range (entities saved before that default changed keep their saved value). It scales the
+ source, never the pattern: shape and falloff stay physical throughout.
+ 
++**Under Scene Referred the sources are no longer clamped, and the amount becomes gain in stops.**
++Ten units of the slider is one stop; the shipped 50 sits on the physical 1.0, so 100 is +5 stops,
++150 is +10 and 200 is +15. That range is not generosity, it is what the arithmetic needs. A
++200 kcd/m² practical at a daylight EV100 of 14.8 is 5.8 in exposed units — about 5 stops over mid
++grey — and against the default 4-stop threshold that is an excess of 3.0, of which the rays carry
++half a percent, spread over a couple of thousand pixels: roughly **fifteen stops under mid grey**.
++That is not a bug. **1× physical on a daylight-exposed 200 kcd/m² source is faint by nature** —
++nobody sees a sunstar off a desk lamp at noon. The *same lamp at a night exposure* is another
++matter entirely: the pre-exposure is ten stops larger, the excess is enormous, and the star is
++there at 1× with nothing added. So is the sun, which is four decades brighter again. The gain is
++for the cases in between, and for the ones you simply want louder; the pattern's shape, falloff
++and dispersion are the pupil's at every setting. To see rays off an ordinary daylight practical,
++try **130–150**. Details and the alternatives considered: `scene-notes/decisions/s7-glare-gain.md`.
++
+ What that buys, none of it authored:
+ 
+ - **Ray count is the pupil's, not a formula.** 8 blades -> 8 rays, 3 -> 6, 9 -> 18, with the
+diff --git a/Code/CryPlugins/CinematicCamera/docs/SceneReferredContent.md b/Code/CryPlugins/CinematicCamera/docs/SceneReferredContent.md
+index 856ca29b..61c2f997 100644
+--- a/Code/CryPlugins/CinematicCamera/docs/SceneReferredContent.md
++++ b/Code/CryPlugins/CinematicCamera/docs/SceneReferredContent.md
+@@ -290,19 +290,38 @@ under real light ratios those are many stops above grey.
+ 
+ ### 6.3 `Streak Amount`
+ 
+-Not a threshold, but the same story. The shipped default of **50** was a compensation for lights
+-that arrived clamped and unexposed: at 1 the wave model deposits the pupil's *actual* diffracted
+-energy — about 7 % of the source into the whole pattern and half a percent into the rays — and that
+-is invisible when the source itself has already had its real brightness thrown away.
++Not a threshold, but the same story — and the one place S7 got the direction wrong. The shipped
++default of **50** was a compensation for lights that arrived clamped and unexposed: at 1 the wave
++model deposits the pupil's *actual* diffracted energy — about 7 % of the source into the whole
++pattern and half a percent into the rays.
+ 
+-With the pre-exposure in place the sources are real, so under the switch the effective amount is
++S7 divided the stored value by 50 on the grounds that "with the pre-exposure in place the sources
++are real again". Real, yes; **brighter, no.** At a daylight exposure the pre-exposure *divides* by
++about 3.4. The 50 was removed and nothing gave it back, and the whole slider then spanned 0 to 4×
++physical — which cannot reach any case where 1× is not enough. The first runtime test found
++exactly that: the analytic streaks (which never paid the ÷50) still drew, and the wave glare had
++vanished.
++
++Under the switch the amount is therefore **gain in stops**, ten units of the slider per stop:
+ 
+ ```
+-effective = stored / 50
++stored < 0.5  ->  off
++otherwise     ->  gain = 2 ^ ((stored - 50) / 10)
+ ```
+ 
+-A stored 50 is therefore the physical 1.0, saved levels open looking right, and the slider still
+-spans 0–200 = 0 to 4× physical. The default does not move.
++0 = off, **50 = physical (0 stops)**, 100 = +5, 150 = +10, 200 = +15. The physical point does not
++move, so no default, no saved level and no CRC changes; the dial reads in stops like every
++neighbouring control; and the range now covers the five decades the physics actually spans.
++
++**Worked example, so the numbers are on the page.** A 200 kcd/m² practical (20.0 engine units) at
++EV100 14.8: `L_sat = 1.2·2^14.8 = 34 231 cd/m²`, pre-exposure `10000/34231 = 0.292`, exposed source
++`5.84` = 5.0 stops over grey. Against the 4-stop threshold (0.18·2⁴ = 2.88) the excess is 2.96; the
++rays take half a percent of it, 0.0148 in total, spread over a couple of thousand pixels — about
++**fifteen stops under mid grey**. Invisible, and correct: nobody sees a sunstar off a desk lamp at
++noon. Take the same lamp to a night exposure and the pre-exposure is ten stops larger, the excess
++is enormous and the star is there at 1× with nothing added; the sun is four decades brighter again.
++For an ordinary daylight practical, 130–150 is where the rays come back.
++See `scene-notes/decisions/s7-glare-gain.md`.
+ 
+ ### 6.4 There is no bloom threshold
+ 
+-- 
+2.47.1.windows.1
+

@@ -1,0 +1,254 @@
+From 552318c634c9991646ac673dde550882de5e92d5 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Sat, 29 Aug 2026 02:16:49 +0800
+Subject: [PATCH 098/119] fix: the sensor has a full well - highlights clip per
+ channel after the white balance, so a blown neutral stays neutral
+
+TEST-CHECKLIST F6: white balance 5600 -> 3200 K turns the CLIPPED highlights blue.
+The Bradford matrix is right; what is missing is a sensor. With nothing clipping
+between the lights and the ODT, a sky 10^5 over mid grey keeps its channel RATIO
+through a per-channel white-balance gain, and the ODT carries that ratio to the
+display. Every RAW converter clips at a white level AFTER the WB multipliers for
+exactly this reason.
+
+FilmMapping's scene-referred branch gains step 1b, immediately after the Bradford
+matrix and before the ACEScct encode: c = min(c, 0.18 * 2^N) per channel, one
+common level for the three. N is a new ccam property, "Sensor Clip (stops over
+grey)" ('sclp', Exposure group, 8..20, default 14) - the same 14 the exposure
+meter's ceiling uses, so meter saturation and picture saturation agree. It travels
+on the bus as Global_User_SensorClipStops (no transition, default 0 = off) and
+reaches the shader in the previously unused SceneWBRow0.w, because the clip
+belongs to the step those rows carry. Not gated by Bypass Grade: the sensor is not
+a creative decision.
+
+The lens effects upstream stay UNCLIPPED on purpose - bloom, glare, diffraction
+and DOF see the true radiance, because a sun 10^5 over the clip must throw a 10^5
+flare. The EXR tap is downstream of the clip and inherits it, which is what makes
+a capture match the picture.
+
+decisions/s8-sensor-clip.md records the two approaches not taken: clipping in
+"sensor native" units before the WB (no such space exists here, and it would need
+highlight reconstruction to undo the tint it creates), and a soft shoulder (does
+not fix the tint, and puts a second tone curve in front of the ODT's).
+
+Co-Authored-By: Claude Opus <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01A72MFkdSczncE7au9UVnmu
+---
+ .../Common/PostProcess/PostProcess.cpp        |  7 +++++
+ .../Common/PostProcess/PostProcess.h          |  6 ++++
+ .../GraphicsPipeline/ToneMapping.cpp          | 21 ++++++++++++-
+ .../Module/CinematicCameraComponent.cpp       |  7 +++++
+ .../Module/CinematicCameraComponent.h         | 12 +++++++
+ .../HWScripts/CryFX/HDRPostProcess.cfx        | 31 ++++++++++++++++++-
+ 6 files changed, 82 insertions(+), 2 deletions(-)
+
+diff --git a/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.cpp b/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.cpp
+index 722d52a7..b35e1e62 100644
+--- a/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.cpp
++++ b/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.cpp
+@@ -401,6 +401,13 @@ int CPostEffectsMgr::Init()
+ 	// renderer inventing a fade the camera never asked for.
+ 	AddParamFloatNoTransition("Global_User_SceneExposure", m_pUserSceneExposure, 1.0f);
+ 
++	// The sensor's saturation level, in stops above mid grey (decisions/s8-sensor-clip.md). The
++	// lens effects upstream stay unclipped - the lens sees the true radiance - and the clip lands
++	// in the tone map right after the white balance. 0 = off, so a camera that publishes nothing
++	// (and every stock frame) behaves exactly as before. No transition: a sensor does not fade
++	// into a different full-well.
++	AddParamFloatNoTransition("Global_User_SensorClipStops", m_pUserSensorClipStops, 0.0f);
++
+ 	// The display chain's LUT slots (SceneReferredSpec.md D8): renderer texture IDs and grid
+ 	// sizes, published by ccam after it has parsed the .cube files. Floats carrying integers -
+ 	// the bus has no int channel and a texture ID is far below the 2^24 a float represents
+diff --git a/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.h b/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.h
+index 31be3119..42225e9b 100644
+--- a/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.h
++++ b/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.h
+@@ -512,6 +512,7 @@ public:
+ 		, m_pUserColorHue(nullptr)
+ 		, m_pUserSceneReferred(nullptr)
+ 		, m_pUserSceneExposure(nullptr)
++		, m_pUserSensorClipStops(nullptr)
+ 		, m_pUserLutODT(nullptr)
+ 		, m_pUserLutODTSize(nullptr)
+ 		, m_pUserLutLMT(nullptr)
+@@ -719,6 +720,11 @@ protected:
+ 	// (CD3D9Renderer::LatchSceneReferredExposure) and no stage ever reads it live.
+ 	// Its default and reset value is 1.0f, not 0.0f: a missing publication must be a no-op.
+ 	CEffectParam*       m_pUserSceneExposure;
++	// The sensor's full-well, in stops above mid grey (decisions/s8-sensor-clip.md). The tone map
++	// turns it into 0.18 * 2^N and clips each channel there, immediately AFTER the white balance,
++	// so a clipped neutral stays neutral whatever the WB gains are - the trodden path of every RAW
++	// converter. 0 = no clip, which is what the stock path and an unpublishing camera read.
++	CEffectParam*       m_pUserSensorClipStops;
+ 	// The display chain's LUT slots: renderer texture ID and grid size per role (ODT, LMT).
+ 	// Zero means "no LUT in this slot" - an empty LMT is the identity look (D10), an empty ODT
+ 	// is a mistake the tone map makes visible rather than papering over. Same bus, same
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.cpp
+index b2404e8c..09cd2f1c 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.cpp
+@@ -490,10 +490,22 @@ void CToneMappingStage::Execute()
+ 		bool  bWhiteBalance = false, bBypass = false;
+ 		Vec4  slope(1.0f, 1.0f, 1.0f, 0.0f), offset(0.0f, 0.0f, 0.0f, 0.0f), power(1.0f, 1.0f, 1.0f, 0.0f);
+ 
++		// The sensor's full-well, in stops above mid grey, resolved to the linear level the
++		// shader clips at (decisions/s8-sensor-clip.md). It rides in SceneWBRow0.w because it
++		// belongs to the same step: the clip happens immediately after the white-balance matrix
++		// those three rows carry, and for the reason that matters - a highlight clipped BEFORE
++		// the WB gains comes out of them coloured, which is the "3200 K turns the sky blue"
++		// report. Clipped after them, at one common level per channel, it stays neutral.
++		//
++		// Deliberately NOT under bBypass: bypassing the grade turns off WB/CDL/LMT, which are
++		// creative decisions. The sensor is not one of them.
++		float fSensorClipStops = 0.0f;
++
+ 		if (bSceneReferred)
+ 		{
+ 			if (CPostEffectsMgr* pPostMgr = PostEffectMgr())
+ 			{
++				fSensorClipStops = pPostMgr->GetByNameF("Global_User_SensorClipStops");
+ 				bBypass = pPostMgr->GetByNameF("Global_User_GradeBypass") > 0.5f;
+ 				if (!bBypass)
+ 				{
+@@ -515,7 +527,14 @@ void CToneMappingStage::Execute()
+ 
+ 		const Matrix33 wb = ResolveWhiteBalanceMatrix(kelvin, tint, bWhiteBalance && kelvin > 1000.0f);
+ 
+-		m_passToneMapping.SetConstant(wbRow0Name, Vec4(wb.m00, wb.m01, wb.m02, 0.0f), eHWSC_Pixel);
++		// 0.18 is the one anchor the pre-exposure guarantees (spec D6), so "N stops over grey"
++		// is exposure-relative by construction and needs no re-tuning per scene or per lens.
++		// Clamped to the range the property offers, and to a level that stays well inside fp16.
++		const float fSensorClipLevel = (fSensorClipStops > 0.5f)
++		                               ? 0.18f * powf(2.0f, clamp_tpl(fSensorClipStops, 4.0f, 24.0f))
++		                               : 0.0f;
++
++		m_passToneMapping.SetConstant(wbRow0Name, Vec4(wb.m00, wb.m01, wb.m02, fSensorClipLevel), eHWSC_Pixel);
+ 		m_passToneMapping.SetConstant(wbRow1Name, Vec4(wb.m10, wb.m11, wb.m12, 0.0f), eHWSC_Pixel);
+ 		m_passToneMapping.SetConstant(wbRow2Name, Vec4(wb.m20, wb.m21, wb.m22, 0.0f), eHWSC_Pixel);
+ 		m_passToneMapping.SetConstant(cdlSlopeName, Vec4(slope.x, slope.y, slope.z, max(saturation, 0.0f)), eHWSC_Pixel);
+diff --git a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp
+index 73d8b819..787211ba 100644
+--- a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp
++++ b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp
+@@ -1699,10 +1699,16 @@ void CCinematicCameraComponent::ApplySceneExposure()
+ 	if (!m_bSceneExposureSaved)
+ 	{
+ 		gEnv->p3DEngine->GetPostEffectParam("Global_User_SceneExposure", m_savedSceneExposure);
++		gEnv->p3DEngine->GetPostEffectParam("Global_User_SensorClipStops", m_savedSensorClipStops);
+ 		m_bSceneExposureSaved = true;
+ 	}
+ 
+ 	gEnv->p3DEngine->SetPostEffectParam("Global_User_SceneExposure", ComputeSceneReferredExposureScale());
++
++	// The sensor's full well (decisions/s8-sensor-clip.md). Published unconditionally: the tone
++	// map only reads it on the scene-referred branch, and publishing it off the switch as well
++	// keeps one writer for one number instead of two rules for when it is live.
++	gEnv->p3DEngine->SetPostEffectParam("Global_User_SensorClipStops", (float)m_exposure.sensorClipStops);
+ }
+ 
+ // The camera's identity and its exposure triangle, onto the same bus everything else travels on.
+@@ -1758,6 +1764,7 @@ void CCinematicCameraComponent::RestoreSceneExposure()
+ 		return;
+ 
+ 	gEnv->p3DEngine->SetPostEffectParam("Global_User_SceneExposure", m_savedSceneExposure);
++	gEnv->p3DEngine->SetPostEffectParam("Global_User_SensorClipStops", m_savedSensorClipStops);
+ 	m_bSceneExposureSaved = false;
+ }
+ 
+diff --git a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
+index 3e6ad63e..3a73308c 100644
+--- a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
++++ b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
+@@ -427,6 +427,14 @@ struct SCineExposureParams
+ 		desc.AddMember(&SCineExposureParams::autoEVMax,
+ 			'aevx', "AutoExposureEVMax", "Auto Exposure EV Max",
+ 			"Scene-referred AUTO only: the darkest the camera will stop down to (high EV = closed).", 20.0f);
++		desc.AddMember(&SCineExposureParams::sensorClipStops,
++			'sclp', "SensorClipStops", "Sensor Clip (stops over grey)",
++			"Scene-referred only: the sensor's full well. Highlights are clipped per channel at "
++			"this many stops above mid grey, AFTER the white balance, so a clipped highlight stays "
++			"white at every colour temperature instead of taking the balance's tint. 14 matches "
++			"the exposure meter's own ceiling. Lower = a smaller, earlier-clipping sensor (more "
++			"white sky), higher = more highlight headroom. The lens effects upstream - bloom, "
++			"glare, depth of field - are deliberately NOT clipped: the lens sees the real light.", 14.0f);
+ 	}
+ 
+ 	bool bEnableExposure = false;
+@@ -438,6 +446,7 @@ struct SCineExposureParams
+ 	Schematyc::Range<0, 10, 0, 5> autoTau = 1.0f;
+ 	Schematyc::Range<-6, 24, -6, 24> autoEVMin = -2.0f;
+ 	Schematyc::Range<-6, 24, -6, 24> autoEVMax = 20.0f;
++	Schematyc::Range<8, 20, 8, 20> sensorClipStops = 14.0f;
+ };
+ 
+ struct SCineDofParams
+@@ -1322,6 +1331,9 @@ private:
+ 	// Pre-exposure saved state (Global_User_SceneExposure post param). Same story: unknown to an
+ 	// unmodified renderer. The neutral value is 1.0, not 0.
+ 	float m_savedSceneExposure  = 1.f;
++	// The sensor clip travels with the pre-exposure (same Apply/Restore, same saved flag): it is
++	// the other half of "what the sensor did with the light", and it is meaningless without it.
++	float m_savedSensorClipStops = 0.f;
+ 	bool  m_bSceneExposureSaved = false;
+ 
+ 	// Log-once flags for the parameters whose meaning changes under the scene-referred switch.
+diff --git a/Engine/Shaders/HWScripts/CryFX/HDRPostProcess.cfx b/Engine/Shaders/HWScripts/CryFX/HDRPostProcess.cfx
+index 75cdf004..2da6eb26 100644
+--- a/Engine/Shaders/HWScripts/CryFX/HDRPostProcess.cfx
++++ b/Engine/Shaders/HWScripts/CryFX/HDRPostProcess.cfx
+@@ -855,7 +855,10 @@ half ComputeExposure(float fIlluminance)
+ // OLD meanings and a debug readout that lies is worse than six float4s.
+ ////////////////////////////////////////////////////////////////////////////////////////////////////////////
+ 
+-float4 SceneWBRow0;      // Bradford white-balance matrix, in the working space (AP1). Row 0. .w unused.
++float4 SceneWBRow0;      // Bradford white-balance matrix, in the working space (AP1). Row 0.
++                         // .w = the sensor's saturation level in LINEAR working-space units
++                         //      (0.18 * 2^N), 0 = no clip. It rides here because the clip happens
++                         //      immediately after this matrix; see FilmMapping step 1b.
+ float4 SceneWBRow1;      // Row 1. .w unused.
+ float4 SceneWBRow2;      // Row 2. .w unused.
+ float4 SceneCDLSlope;    // ASC CDL slope.rgb, .w = saturation (1 = neutral)
+@@ -913,6 +916,28 @@ half3 FilmMapping( in vert2frag IN, in half3 cScene, in half3 cBloom, in half3 v
+ 	//    and not by approximation. Scene-linear in, scene-linear out.
+ 	cColor = mul(float3x3(SceneWBRow0.xyz, SceneWBRow1.xyz, SceneWBRow2.xyz), cColor);
+ 
++	// 1b. SENSOR SATURATION - the full well (decisions/s8-sensor-clip.md).
++	//
++	//     Every RAW converter clips the highlights per channel at ONE common level and does it
++	//     AFTER the white-balance gains, for one reason: the gains are per channel, so a neutral
++	//     highlight that was already clipped comes out of them tinted by the inverse of the
++	//     illuminant - which is exactly the "white balance 5600 -> 3200 K turns the clipped sky
++	//     blue" report. Clipped here, at a level the three channels share, a clipped neutral
++	//     stays neutral at every colour temperature, and only the highlights that were NOT
++	//     clipped take the WB's colour, which is what a camera does.
++	//
++	//     This is the SENSOR, not the lens. Everything upstream - bloom, glare, diffraction,
++	//     depth of field - runs on the unclipped radiance on purpose: the lens sees the light
++	//     that is really there, and a sun a hundred thousand times over the clip level must
++	//     still throw a hundred-thousand-times flare. The clip is the last thing before the
++	//     grading space because it is the last thing before the picture becomes a picture.
++	//
++	//     0 = off, which is what the stock path and an unpublishing camera read, so the branch
++	//     folds away and nothing changes. Negatives are left alone (min, not clamp): they are
++	//     legal AP1 values and the ODT's own domain handling owns them.
++	if (SceneWBRow0.w > 0.0)
++		cColor = min(cColor, (half3)SceneWBRow0.w);
++
+ 	// 2. Linear ACEScg -> ACEScct. The grading space, the LUT domain and the shaper are all the
+ 	//    same encoding, so this happens once and everything downstream is log.
+ 	float3 cGrade = LinearToACEScct((float3)cColor);
+@@ -940,6 +965,10 @@ half3 FilmMapping( in vert2frag IN, in half3 cScene, in half3 cBloom, in half3 v
+ 	// written to EXR": everything the camera does (WB, CDL, LMT, and the composites before them)
+ 	// has happened, and nothing that knows about a display has.
+ 	//
++	// The clip of step 1b is upstream of this point, so the tap carries it too - the EXR is a
++	// file of what the SENSOR recorded, and a capture whose highlights ran past the full well
++	// would not match the picture the ODT shows. There is deliberately no second clip here.
++	//
+ 	// The inverse shaper is NOT an operator being undone - the ACEScct encode belongs to the ODT
+ 	// LUT's input domain, not to the grade. An EXR of the log value would be a file no ACES tool
+ 	// could interpret without being told about our private shaper, and the D12 round trip
+-- 
+2.47.1.windows.1
+

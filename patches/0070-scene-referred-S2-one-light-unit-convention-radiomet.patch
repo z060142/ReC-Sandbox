@@ -1,0 +1,411 @@
+From 37de825409bc2817b7d2ef84548f2ef2c4ac8526 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Fri, 28 Aug 2026 07:23:31 +0800
+Subject: [PATCH 070/119] scene-referred S2: one light-unit convention -
+ radiometric lights, 1/PI in the BRDF
+
+Second item of Stage S2, and the one that changes what a scene looks like. CRYENGINE omits the
+1/PI from BOTH of its lobes - the Burley diffuse (albedo/PI * scatterL * scatterV) and the GGX
+NDF (alpha^2 / (PI * denom^2)) - and pays for it by pre-dividing the sun and the skybox on the
+light side, while local lights are left alone. The sun is correct today, every point light is
+1.65 stops hot relative to it, and four separate places undo the divide by hand. This item makes
+the scene-referred path use one convention: every light radiometric, the 1/PI where the physics
+has it.
+
+Decision: scene-notes/decisions/s2-pi-unification.md, approach A. Research:
+scene-notes/research/s2-pi-and-light-units.md.
+
+- ConvertIlluminanceToLightColor() takes the divide as a PARAMETER instead of branching on the
+  switch, which is a deliberate refinement of the decision note's one-line summary and the one
+  place this item departs from it. The two call sites mean two different things by that divide,
+  and the research says so at s2-pi-and-light-units.md section 1.2 and
+  s2-skybox-emittance-collision.md section 4.1: for the SUN it is a BRDF compensation and must
+  move with the 1/PI; for the SKYBOX it is the E = PI * L conversion of a uniform hemisphere,
+  which is what makes the authored "Intensity (lux)" mean the number a light meter pointed at
+  the ground would read. Making the helper itself branch would have silently multiplied the sky
+  by PI and made the preset in item 5 lie about its own units. The skybox therefore keeps its
+  divide on both paths; its real unit error is the times-ten at Renderer.cpp:4007, which is
+  item 3. The decision note has been corrected.
+
+- All four manual undos are gated. Three are renderer-side (D3DHWShader.cpp's two volumetric-fog
+  scattering colours and VolumetricFog.cpp's sun constant) and one is the forward replication in
+  TimeOfDay.cpp that recomputes the sun for the volumetric clouds - ungated in stock CE, missed
+  by the audit, and the one that desyncs the clouds from the sun by PI if it moves alone.
+  r_VolumetricFogSunLightCorrection keeps its full meaning and its content-compatibility role;
+  only the body is skipped.
+
+- The renderer undos ask CRendererResources::IsSceneReferredLightUnits(), a NEW gate that reads
+  E3DPARAM_SCENE_REFERRED and not the post-effect bus. That is not a shortcut: the sun colour
+  they are correcting was computed under the engine-side mirror and is cached there until the
+  next time-of-day update, so the correction has to be on the same clock as the number. Asking
+  the bus would mean asking a different clock and getting a PI-wrong frame on every flip.
+
+- The BRDF factor is ONE per-view constant, CV_SceneExposure.z, stored minus one exactly like
+  the exposure in .x so that an unbound constant buffer and the stock path both read exactly
+  1.0. It reaches the shaders as SCENE_BRDF_NORM_FACTOR and lands in the two places that were
+  already multiplying by a constant at that point: SpecularBRDF's NormalizationFactor (which the
+  5-argument overload was passing a literal 1.0f to) and BurleyBRDF's energyFactor. Cost: zero
+  ALU, ZERO new permutations. A static flag would have doubled Illum, Terrain, HumanSkin, Glass,
+  MultiLayeredMaterials, Vegetation and TiledShading to save nothing.
+
+- The legacy .tod migration loses its times-PI on the scene-referred path. The multiply there is
+  not part of the file-format conversion - it is the inverse of the divide that
+  ConvertIlluminanceToLightColor is about to apply - so with no divide there must be no
+  multiply. BEHAVIOUR CHOSEN, and it is path-dependent by nature: the migration runs at LOAD
+  time, normally before any camera has activated, so a pre-3.8.2 .tod loaded in a stock session
+  and then viewed on the ReC path reads PI times too bright. Gating it is still right (the
+  alternative is wrong on both paths, and Editor/asset_thumbnail.tod would go PI-squared wrong),
+  and the remedy - re-save the preset with the camera active, or author a .env - goes in item
+  5's docs.
+
+Deliberately untouched, per the decision's guard list: ambient lights (DLF_AMBIENT, a
+multiplicative tint, and the TiledLightVolumes.cpp:893 / TiledShading.cfi:840 guards already
+separate them), environment probes (a cosine-weighted cubemap is already E/PI and never enters a
+BRDF), emissive materials (radiance by definition), and the times-121 / divided-by-121 bulb round
+trip with its CPU twin GetIntensityScale() - folding PI into that would desync culling radii from
+shading. None of the three call DiffuseBRDF or SpecularBRDF, which is what makes the single
+constant safe.
+
+Known breakage carried forward, not hidden (D13): area lights go through AreaLightLTC_GGX, which
+never calls SpecularBRDF, so they do NOT receive the 1/PI and are now 1.65 stops hot relative to
+point lights on this path; research section 6 question 1 (whether LTCTex_2.w already carries the
+missing 1/(2PI)) has to be measured before that is corrected. OrenNayarBRDF is defined but called
+by nothing, so it needs no gate today.
+
+Content consequence, which is not gateable and is the point of D1: on the scene-referred path
+every existing point, projector and area light reads 1.65 stops darker and the sun is unchanged,
+so any level opened with the camera active looks different by design. Documented in item 5.
+
+Built clean (0 errors, 0 warnings outside Code/SDKs): Cry3DEngine, CryRenderD3D11,
+CinematicCamera.
+
+Co-Authored-By: Claude Opus <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01A72MFkdSczncE7au9UVnmu
+---
+ Code/CryEngine/Cry3DEngine/TimeOfDay.cpp      | 56 +++++++++++++++++--
+ .../Common/Include_HLSL_CPP_Shared.h          |  3 +-
+ .../RenderDll/Common/RendererResources.cpp    | 20 +++++++
+ .../RenderDll/Common/RendererResources.h      |  7 +++
+ .../RenderDll/XRenderD3D9/D3DHWShader.cpp     | 14 ++++-
+ .../Common/GraphicsPipeline.cpp               | 12 +++-
+ .../GraphicsPipeline/VolumetricFog.cpp        |  7 ++-
+ .../HWScripts/CryFX/FXConstantDefs.cfi        | 24 +++++++-
+ Engine/Shaders/HWScripts/CryFX/shadeLib.cfi   | 11 +++-
+ 9 files changed, 139 insertions(+), 15 deletions(-)
+
+diff --git a/Code/CryEngine/Cry3DEngine/TimeOfDay.cpp b/Code/CryEngine/Cry3DEngine/TimeOfDay.cpp
+index 2e2a59c3..cb3b500d 100644
+--- a/Code/CryEngine/Cry3DEngine/TimeOfDay.cpp
++++ b/Code/CryEngine/Cry3DEngine/TimeOfDay.cpp
+@@ -371,7 +371,18 @@ void MigrateLegacyData(CEnvironmentPreset& preset, bool bSunIntensity)
+ 
+ 			float hdrMult = powf(HDRDynamicMultiplier, hdrPower);
+ 			float sunColorLum = sunColorR * 0.2126f + sunColorG * 0.7152f + sunColorB * 0.0722f;
+-			float sunIntensity = sunMult * sunColorLum * hdrMult * 10000.0f * gf_PI;
++
++			// The times-PI here is not part of the file-format conversion; it is the inverse of
++			// the divide that ConvertIlluminanceToLightColor() is about to apply, so that a
++			// pre-3.8.2 file reproduces its old engine-unit sun after the round trip. With the
++			// scene-referred convention there is no divide to invert, so there must be no
++			// multiply either. This one is genuinely PATH-DEPENDENT: the migration runs at LOAD
++			// time, which is normally before any cinematic camera has activated, so a legacy
++			// .tod loaded into a stock session and then viewed on the ReC path reads PI times
++			// too bright. Documented in docs/SceneReferredContent.md; the remedy is to re-save
++			// the preset (or author a .env) with the camera active.
++			const bool bSceneReferredUnits = Cry3DEngineBase::Get3DEngine()->IsSceneReferredConvention();
++			float sunIntensity = sunMult * sunColorLum * hdrMult * 10000.0f * (bSceneReferredUnits ? 1.0f : gf_PI);
+ 
+ 			varSunIntensity->GetSpline(0)->InsertKey(anim_time, sunIntensity);
+ 		}
+@@ -460,13 +471,35 @@ bool LoadPresetFromXML(CEnvironmentPreset& pPreset, const string& presetName)
+ 	return true;
+ }
+ 
+-Vec3 ConvertIlluminanceToLightColor(float illuminance, Vec3 colorRGB)
++// The divide by PI is a PARAMETER, because the two call sites mean two different things by it -
++// a distinction the original single helper hid, and one that SceneReferredSpec.md D4 forces into
++// the open (research/s2-pi-and-light-units.md section 1.2, s2-skybox-emittance-collision.md
++// section 4.1).
++//
++//   * The SUN. Here the divide is a BRDF compensation: CE's Burley diffuse and GGX specular both
++//     omit their 1/PI, so the sun is pre-divided to make E/PI * albedo * NdotL come out right.
++//     On the scene-referred path the 1/PI moves into the BRDF where it belongs, and this divide
++//     must go with it - which is what bDividePi = false is for.
++//
++//   * The SKYBOX. Here the divide is NOT a compensation at all: the skybox is drawn as an
++//     emitter and never enters a BRDF. It is the illuminance-to-luminance conversion for a
++//     uniform hemisphere, E = PI * L, which is what turns the authored "Intensity (lux)" - the
++//     number a light meter pointed at the ground would read - into the radiance the sky shader
++//     writes. It is correct on BOTH paths and stays.
++//
++// So this helper never branches on the switch itself; its callers say which of the two they
++// mean. Folding the two back together is what made the collision at Renderer.cpp:4007 invisible
++// for so long.
++Vec3 ConvertIlluminanceToLightColor(float illuminance, Vec3 colorRGB, bool bDividePi)
+ {
+ 	illuminance /= RENDERER_LIGHT_UNIT_SCALE;
+ 
+ 	ColorF color(colorRGB);
+ 	color.adjust_luminance(illuminance);
+ 
++	if (!bDividePi)
++		return color.toVec3();
++
+ 	// Divide by PI as this is not done in the BRDF at the moment
+ 	Vec3 finalColor = color.toVec3() / gf_PI;
+ 
+@@ -1173,7 +1206,11 @@ void CTimeOfDay::UpdateEnvLighting(bool forceUpdate)
+ 	// set sun, sky, and fog color
+ 	const Vec3 sunColor(GetValue(PARAM_SUN_COLOR));
+ 	const float sunIntensityLux(GetValue(PARAM_SUN_INTENSITY).x * sunMultiplier);
+-	const Vec3 sunEmission(ConvertIlluminanceToLightColor(sunIntensityLux, sunColor));
++	// D4: radiometric on the scene-referred path (the 1/PI is in the BRDF), photometric-with-a-
++	// pre-divide on the stock path. Everything downstream of E3DPARAM_SUN_COLOR follows this
++	// choice, which is why the manual undos below and in the renderer are gated on the same flag.
++	const bool bSceneReferredUnits = p3DEngine->IsSceneReferredConvention();
++	const Vec3 sunEmission(ConvertIlluminanceToLightColor(sunIntensityLux, sunColor, !bSceneReferredUnits));
+ 	p3DEngine->SetSunColor(sunEmission);
+ 	p3DEngine->SetGlobalParameter(E3DPARAM_SUN_SPECULAR_MULTIPLIER, Vec3(sunSpecMultiplier, 0, 0));
+ 	p3DEngine->SetSkyBrightness(skyBrightMultiplier);
+@@ -1185,7 +1222,10 @@ void CTimeOfDay::UpdateEnvLighting(bool forceUpdate)
+ 	p3DEngine->SetGlobalParameter(E3DPARAM_SKY_SKYBOX_STRETCHING, skyboxStretch);
+ 	const Vec3 skyboxColor(GetValue(PARAM_SKYBOX_COLOR));
+ 	const float skyboxIntensityLux(GetValue(PARAM_SKYBOX_INTENSITY).x * sunMultiplier);
+-	const Vec3 skyboxEmmission(ConvertIlluminanceToLightColor(skyboxIntensityLux, skyboxColor));
++	// Unconditionally divided by PI on BOTH paths: this one is the E = PI * L conversion for a
++	// uniform sky hemisphere, not a BRDF compensation (see the helper's comment). The skybox's
++	// unit error is the times-ten at Renderer.cpp:4007, and it is fixed there.
++	const Vec3 skyboxEmmission(ConvertIlluminanceToLightColor(skyboxIntensityLux, skyboxColor, true));
+ 	p3DEngine->SetGlobalParameter(E3DPARAM_SKY_SKYBOX_EMITTANCE, skyboxEmmission);
+ 	const Vec3 skyboxFilter(GetValue(PARAM_SKYBOX_FILTER));
+ 	const float skyboxOpacity(GetValue(PARAM_SKYBOX_OPACITY).x);
+@@ -1316,7 +1356,13 @@ void CTimeOfDay::UpdateEnvLighting(bool forceUpdate)
+ 		const Vec3 volCloudScatteringMulti = Vec3(GetValue(PARAM_VOLCLOUD_MULTI_SCATTERING_ATTENUATION).x, GetValue(PARAM_VOLCLOUD_MULTI_SCATTERING_PRESERVATION).x, GetValue(PARAM_VOLCLOUD_POWDER_EFFECT).x);
+ 		p3DEngine->SetGlobalParameter(E3DPARAM_VOLCLOUD_SCATTERING_MULTI, volCloudScatteringMulti);
+ 
+-		const float sunIntensityOriginal = (sunIntensityLux / RENDERER_LIGHT_UNIT_SCALE) / gf_PI; // divided by pi to match to GetSunColor(), it's also divided by pi in ConvertIlluminanceToLightColor().
++		// The fourth PI site, and a forward replication rather than an undo: the clouds recompute
++		// the sun's engine value from lux and deliberately re-apply the divide so that it matches
++		// GetSunColor(). It therefore has to follow GetSunColor()'s convention exactly, or the
++		// clouds desync from the sun by PI. Ungated in stock CE; gated here.
++		const float sunIntensityOriginal = bSceneReferredUnits
++		                                   ? (sunIntensityLux / RENDERER_LIGHT_UNIT_SCALE)
++		                                   : (sunIntensityLux / RENDERER_LIGHT_UNIT_SCALE) / gf_PI; // divided by pi to match to GetSunColor(), it's also divided by pi in ConvertIlluminanceToLightColor().
+ 		const float sunIntensityCustomSun = cloudShadingMultipliers.x * cloudShadingCustomSunColorMult;
+ 		const float sunIntensityCloudAtmosphere = Lerp(sunIntensityOriginal, sunIntensityCustomSun, cloudShadingCustomSunColorInfluence);
+ 		const float atmosphericScatteringMultiplier = GetValue(PARAM_VOLCLOUD_ATMOSPHERIC_SCATTERING).x;
+diff --git a/Code/CryEngine/RenderDll/Common/Include_HLSL_CPP_Shared.h b/Code/CryEngine/RenderDll/Common/Include_HLSL_CPP_Shared.h
+index 242e6f66..a7bfccb7 100644
+--- a/Code/CryEngine/RenderDll/Common/Include_HLSL_CPP_Shared.h
++++ b/Code/CryEngine/RenderDll/Common/Include_HLSL_CPP_Shared.h
+@@ -128,7 +128,8 @@ hlsl_cbuffer_register(PerViewGlobalConstantBuffer, register (b6), 6) //eConstant
+ 	hlsl_matrix44(CV_ProjMatrUnjittered);
+ 
+ 	// Scene-referred pre-exposure (SceneReferredSpec.md D3). .x = exposure - 1,
+-	// .y = 1/exposure - 1, .z/.w reserved. Stored offset by one so that an unbound constant
++	// .y = 1/exposure - 1,
++	// .z = BRDF normalisation factor - 1 (0 stock, 1/PI - 1 scene-referred, D4), .w reserved. Stored offset by one so that an unbound constant
+ 	// buffer, and the stock path where the camera publishes unity, both read as exactly 1.0
+ 	// through the PS_HDR_RANGE_ADAPT_MAX macro. Must stay last, and in step with
+ 	// Engine/Shaders/HWScripts/CryFX/FXConstantDefs.cfi.
+diff --git a/Code/CryEngine/RenderDll/Common/RendererResources.cpp b/Code/CryEngine/RenderDll/Common/RendererResources.cpp
+index f7039620..c4246398 100644
+--- a/Code/CryEngine/RenderDll/Common/RendererResources.cpp
++++ b/Code/CryEngine/RenderDll/Common/RendererResources.cpp
+@@ -483,6 +483,26 @@ bool CRendererResources::IsSceneReferred()
+ 	return pRequest != nullptr && pRequest->GetParam() > 0.5f;
+ }
+ 
++// The LIGHT-UNIT convention, which is a different question from "is the scene-referred pipeline
++// running" and has to be answered by a different authority (SceneReferredSpec.md D4,
++// decisions/s2-engine-side-switch.md).
++//
++// The sun colour these callers are correcting was computed inside CTimeOfDay::UpdateEnvLighting
++// under E3DPARAM_SCENE_REFERRED, and it is cached there until the next time-of-day update. Asking
++// the post-effect bus instead would be asking a different clock: the bus value changes the frame
++// ccam publishes it, the sun's value changes only when the time of day is re-evaluated. Reading
++// the same global that produced the number keeps the correction and the number in lockstep, which
++// is the entire point of the manual undos this gates.
++bool CRendererResources::IsSceneReferredLightUnits()
++{
++	if (!gEnv->p3DEngine)
++		return false;
++
++	Vec3 v(0.0f, 0.0f, 0.0f);
++	gEnv->p3DEngine->GetGlobalParameter(E3DPARAM_SCENE_REFERRED, v);
++	return v.x > 0.5f;
++}
++
+ ETEX_Format CRendererResources::GetDepthFormat()
+ {
+ 	return
+diff --git a/Code/CryEngine/RenderDll/Common/RendererResources.h b/Code/CryEngine/RenderDll/Common/RendererResources.h
+index 07c4e587..b9e0d38a 100644
+--- a/Code/CryEngine/RenderDll/Common/RendererResources.h
++++ b/Code/CryEngine/RenderDll/Common/RendererResources.h
+@@ -163,6 +163,13 @@ public:
+ 	//! component off or the cvar at 0 the renderer is byte-identical to stock.
+ 	static bool        IsSceneReferred();
+ 
++	//! True while the 3D engine is emitting radiometric light values - i.e. while the sun is NOT
++	//! pre-divided by PI and the 1/PI belongs in the BRDF (SceneReferredSpec.md D4). Read from
++	//! E3DPARAM_SCENE_REFERRED, the engine-side mirror of the switch, and NOT from the post-effect
++	//! bus: this is the authority that produced the sun colour the callers are about to correct,
++	//! and the two must never disagree. Use IsSceneReferred() for everything else.
++	static bool        IsSceneReferredLightUnits();
++
+ public:
+ 	static bool m_bLoadedSystem;
+ 
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/D3DHWShader.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/D3DHWShader.cpp
+index c40b4e38..147260f6 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/D3DHWShader.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/D3DHWShader.cpp
+@@ -1303,8 +1303,13 @@ NO_INLINE Vec4 sGetVolumetricFogScatteringColor()
+ 	Vec3 sunColor = pEng->GetSunColor();
+ 	sunColor = sunColor.CompMul(fogAlbedo);
+ 
+-	if (CRenderer::CV_r_VolumetricFogSunLightCorrection == 1)
++	if (CRenderer::CV_r_VolumetricFogSunLightCorrection == 1 && !CRendererResources::IsSceneReferredLightUnits())
+ 	{
++		// SceneReferredSpec.md D4: on the scene-referred path the sun is NOT divided by PI at
++		// the source (the 1/PI moved into the BRDF), so there is nothing to reconstruct and
++		// multiplying here would make the fog PI times too bright. The cvar keeps its full
++		// meaning - and its content-compatibility role - for the stock path; only the body is
++		// skipped. decisions/s2-pi-unification.md approach A.
+ 		// reconstruct vanilla sun color because it's divided by pi in ConvertIlluminanceToLightColor().
+ 		sunColor *= gf_PI;
+ 	}
+@@ -1328,8 +1333,13 @@ NO_INLINE Vec4 sGetVolumetricFogScatteringSecondaryColor()
+ 	Vec3 sunColor = pEng->GetSunColor();
+ 	sunColor = sunColor.CompMul(fogAlbedo);
+ 
+-	if (CRenderer::CV_r_VolumetricFogSunLightCorrection == 1)
++	if (CRenderer::CV_r_VolumetricFogSunLightCorrection == 1 && !CRendererResources::IsSceneReferredLightUnits())
+ 	{
++		// SceneReferredSpec.md D4: on the scene-referred path the sun is NOT divided by PI at
++		// the source (the 1/PI moved into the BRDF), so there is nothing to reconstruct and
++		// multiplying here would make the fog PI times too bright. The cvar keeps its full
++		// meaning - and its content-compatibility role - for the stock path; only the body is
++		// skipped. decisions/s2-pi-unification.md approach A.
+ 		// reconstruct vanilla sun color because it's divided by pi in ConvertIlluminanceToLightColor().
+ 		sunColor *= gf_PI;
+ 	}
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Common/GraphicsPipeline.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Common/GraphicsPipeline.cpp
+index fa1c7c79..1d0b47b6 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Common/GraphicsPipeline.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Common/GraphicsPipeline.cpp
+@@ -1055,9 +1055,19 @@ void CGraphicsPipeline::GeneratePerViewConstantBuffer(const SRenderViewInfo* pVi
+ 		// Stored MINUS ONE, and the macro adds it back: off the scene-referred path the exposure
+ 		// is 1.0, so this is 0.0, so a shader whose per-view buffer is not bound still multiplies
+ 		// by exactly 1.0 instead of blacking out. See FXConstantDefs.cfi.
++		//
++		// .z carries the OTHER scene-referred constant, on exactly the same terms: the BRDF
++		// normalisation factor of SceneReferredSpec.md D4 - 1.0 on the stock path, 1/PI on the
++		// scene-referred one, where the lights are radiometric and the 1/PI that CE omits from
++		// both lobes has to come back somewhere. A per-view CONSTANT and not a static flag,
++		// deliberately: a flag would double the permutation count of Illum, Terrain, HumanSkin,
++		// Glass, MultiLayeredMaterials, Vegetation and TiledShading to save nothing, because
++		// both BRDF sites already multiply by a value at that point. Stored minus one for the
++		// unbound-buffer reason above.
+ 		{
+ 			const float sceneExposure = gcpRendD3D.GetSceneReferredExposure();
+-			cb.CV_SceneExposure = Vec4(sceneExposure - 1.0f, (1.0f / sceneExposure) - 1.0f, 0.0f, 0.0f);
++			const float brdfFactor = gcpRendD3D.GetSceneReferredBRDFFactor();
++			cb.CV_SceneExposure = Vec4(sceneExposure - 1.0f, (1.0f / sceneExposure) - 1.0f, brdfFactor - 1.0f, 0.0f);
+ 		}
+ 
+ 		Vec3 pDecalZFightingRemedy;
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/VolumetricFog.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/VolumetricFog.cpp
+index cc8cd5fd..689a3172 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/VolumetricFog.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/VolumetricFog.cpp
+@@ -2068,8 +2068,13 @@ void CVolumetricFogStage::ExecuteInjectInscatteringLight(const SScopedComputeCom
+ 
+ 	Vec3 sunColor;
+ 	gEnv->p3DEngine->GetGlobalParameter(E3DPARAM_SUN_COLOR, sunColor);
+-	if (CRendererCVars::CV_r_VolumetricFogSunLightCorrection == 1)
++	if (CRendererCVars::CV_r_VolumetricFogSunLightCorrection == 1 && !CRendererResources::IsSceneReferredLightUnits())
+ 	{
++		// SceneReferredSpec.md D4: on the scene-referred path the sun is NOT divided by PI at
++		// the source (the 1/PI moved into the BRDF), so there is nothing to reconstruct and
++		// multiplying here would make the fog PI times too bright. The cvar keeps its full
++		// meaning - and its content-compatibility role - for the stock path; only the body is
++		// skipped. decisions/s2-pi-unification.md approach A.
+ 		// reconstruct vanilla sun color because it's divided by pi in ConvertIlluminanceToLightColor().
+ 		sunColor *= gf_PI;
+ 	}
+diff --git a/Engine/Shaders/HWScripts/CryFX/FXConstantDefs.cfi b/Engine/Shaders/HWScripts/CryFX/FXConstantDefs.cfi
+index 4721896c..08a5ebd8 100644
+--- a/Engine/Shaders/HWScripts/CryFX/FXConstantDefs.cfi
++++ b/Engine/Shaders/HWScripts/CryFX/FXConstantDefs.cfi
+@@ -128,6 +128,24 @@ cbuffer PerMaterialConstants : register()
+ // folding away at compile time exactly as it does today.
+ #define PS_HDR_RANGE_ADAPT_MAX_SCENE_READ 1.0
+ 
++// The 1/PI that CRYENGINE omits from BOTH of its lobes - the Burley diffuse (which is defined as
++// albedo/PI * scatterL * scatterV) and the GGX NDF (alpha^2 / (PI * denom^2)) - and compensates
++// for by pre-dividing the sun on the light side instead. The scene-referred path makes every
++// light radiometric and puts the 1/PI back where the physics has it (SceneReferredSpec.md D4,
++// decisions/s2-pi-unification.md approach A), which is a pure algebraic shuffle for the sun and
++// closes the 1.65-stop gap for every local light.
++//
++// Same offset-by-one trick as the exposure above and for the same two reasons: an unbound
++// per-view constant buffer reads 0 and therefore multiplies by exactly 1.0 instead of darkening
++// the surface to nothing, and off the switch the multiply is by an exact 1.0, which is
++// bit-identical in IEEE. Zero extra ALU: both consumers already multiply by a value there.
++//
++// NOT for ambient lights (they are multiplicative tints, not radiance), NOT for environment
++// probes (a cosine-weighted cubemap is already E/PI and never enters a BRDF) and NOT for
++// emissive materials (radiance by definition). Those three are guarded where they are, in
++// TiledLightVolumes.cpp and TiledShading.cfi, and none of them call DiffuseBRDF/SpecularBRDF.
++#define SCENE_BRDF_NORM_FACTOR (1.0 + CV_SceneExposure.z)
++
+ cbuffer CBPerViewGlobal : register(b6)
+ {
+ 	float4x4  CV_ViewProjZeroMatr;
+@@ -169,9 +187,9 @@ cbuffer CBPerViewGlobal : register(b6)
+ 	float4x4  CV_ProjMatr;
+ 	float4x4  CV_ProjMatrUnjittered;
+ 
+-	// Scene-referred pre-exposure. .x = exposure - 1, .y = 1/exposure - 1 (both zero when the
+-	// scene-referred path is off, so an unbound buffer is unity); .z and .w reserved.
+-	// Read through PS_HDR_RANGE_ADAPT_MAX, never directly.
++	// Scene-referred constants, all stored MINUS ONE so an unbound buffer reads unity.
++	// .x = exposure - 1, .y = 1/exposure - 1, .z = BRDF normalisation factor - 1, .w reserved.
++	// Read through PS_HDR_RANGE_ADAPT_MAX and SCENE_BRDF_NORM_FACTOR, never directly.
+ 	float4    CV_SceneExposure;
+ };
+ 
+diff --git a/Engine/Shaders/HWScripts/CryFX/shadeLib.cfi b/Engine/Shaders/HWScripts/CryFX/shadeLib.cfi
+index 23f5086e..7734879d 100644
+--- a/Engine/Shaders/HWScripts/CryFX/shadeLib.cfi
++++ b/Engine/Shaders/HWScripts/CryFX/shadeLib.cfi
+@@ -426,7 +426,10 @@ half3 SpecularBRDF(half3 N, half3 V, half3 L, half m, half3 f0, half Normalizati
+ half3 SpecularBRDF(half3 N, half3 V, half3 L, half Gloss, half3 SpecCol)
+ {
+ 	half m = max(SmoothnessToRoughness( Gloss ), 0.001);  // Prevent highlights from getting too tiny without area lights
+-	return SpecularBRDF(N, V, L, m, SpecCol, 1.0f);
++	// The GGX NDF is alpha^2 / (PI * denom^2) and the line above writes alpha^2 / denom^2, so the
++	// missing 1/PI rides in on NormalizationFactor. 1.0 on the stock path (bit-identical to the
++	// literal that was here), 1/PI on the scene-referred one. SceneReferredSpec.md D4.
++	return SpecularBRDF(N, V, L, m, SpecCol, SCENE_BRDF_NORM_FACTOR);
+ }
+ 
+ ////////////////////////////////////////////////////////////////////////////
+@@ -860,7 +863,11 @@ half BurleyBRDF(half3 NdotL, half3 NdotV, half3 VdotH, half roughness)
+ 	
+ 	// Burley BRDF with renormalization to conserve energy
+ 	half energyBias = 0.5 * roughness;
+-	half energyFactor = lerp(1, 1 / 1.51, roughness);
++	// The Disney/Burley diffuse is albedo/PI * scatterL * scatterV; CRYENGINE omits the 1/PI and
++	// pre-divides the sun instead. On the scene-referred path the 1/PI comes back here, folded
++	// into a constant that was already being multiplied - zero extra instructions.
++	// SceneReferredSpec.md D4.
++	half energyFactor = lerp(1, 1 / 1.51, roughness) * SCENE_BRDF_NORM_FACTOR;
+ 	half fd90 = energyBias + 2.0 * VdotH * VdotH * roughness;
+ 	half scatterL = lerp(1, fd90, Pow5(1 - NdotL));
+ 	half scatterV = lerp(1, fd90, Pow5(1 - NdotV));
+-- 
+2.47.1.windows.1
+

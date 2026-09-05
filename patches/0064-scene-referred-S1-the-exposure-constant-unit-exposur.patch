@@ -1,0 +1,405 @@
+From 2bf9c9187928c40dc3a2fd8beb6c1dd4aba24968 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Fri, 28 Aug 2026 06:53:25 +0800
+Subject: [PATCH 064/119] scene-referred S1: the exposure constant, unit
+ exposure in the tone map, Manual as a pure triangle
+
+Second item of Stage S1. The pre-exposure road built in item 1 now carries the real number, and
+the tone map stops applying an exposure of its own in the same commit - either half alone is a
+frame of double or zero exposure.
+
+Decisions: scene-notes/decisions/s1-exposure-constant.md approach A (constant) and approach A
+(meter form); s1-auto-mode.md part 2 (parameter meanings). Research:
+scene-notes/research/s1-exposure-model.md, s1-ccam-exposure-today.md section 5.
+
+- ccam publishes scale = LIGHT_UNIT_SCALE / (1.2 * 2^EV100). The saturation-based film
+  sensitivity model is unchanged from CE's own tone mapper and from Frostbite: L_sat =
+  (78/(q*S)) * N^2/t = 1.2 * 2^EV100 cd/m2 at ISO 100 with q = 0.65, and engine units are
+  1.0 = 10 000 cd/m2, so that scale maps L_sat to 1.0. The derivation of the calibration constant
+  is written out at the function: with C = 120*pi and S = 100 a correctly metered scene gives
+  2^EV100 = E*100/(120*pi), hence L_sat = E/pi, and an 18 % Lambertian reflector at L = 0.18*E/pi
+  lands on exactly 0.18 - the ACES convention the ODT's input domain assumes (D6). The 1.2 is left
+  exact because it is 120/S, so ISO keeps meaning ISO; CE's shipped C = 330 is a real dome-receptor
+  value that puts mid grey at 0.158 and it stays untouched on the stock path. C only enters where
+  the camera METERS, so it appears in this commit as the debug overlay's reference EV and comes
+  into force with the AUTO loop in item 4. The research note's numbers were confirmed, not changed.
+
+- The tone map's scene-referred branch is pinned to unit exposure by a CONSTANT, not a shader
+  edit: ComputeExposure() returns (LIGHT_UNIT_SCALE/1.2) * 2^-EV100 with EV100 clamped to
+  [HDREyeAdaptation.x, .y], so collapsing that window onto EV_unity = log2(LIGHT_UNIT_SCALE/1.2) =
+  13.0245867 makes it exactly 1 whatever the meter reports, and .z = 0 removes the :807 scene-key
+  tilt with it. HDRFinalPass has exactly one free static flag (SAMPLE0) and S4 needs it for the
+  output transform, so spending a permutation to save four ALU would be paying twice. Off the
+  switch not one constant moves and HDRPostProcess.cfx is not touched at all.
+
+- The :807 tilt is forced to 0 on the ccam path in both places it can act: the constant above, and
+  ccam's own write of E3DPARAM_HDR_EYEADAPTATION_PARAMS (v.z = 0), which today Manual mode silently
+  inherits from the time of day at 1.5 - up to +-2 stops of invisible per-scene drift on top of a
+  "manual" exposure. That write is no longer what makes the picture, but the EV triple is still
+  read by the particle system's ExposureValue domain, so it is kept meaningful: v.x = v.y = the
+  camera's EV100.
+
+- Serialisation is untouched. No CRC, member name, enum string or default changed. Under the
+  switch Manual is the pure triangle - Exposure Response and Neutral EV are ignored, with one
+  CryLog line, because compressing the applied EV around a pivot is a second tone curve and the S
+  curve belongs to the output transform (D11). AutoBiased and AutoCompensation have no metering
+  loop yet, so FOR THIS ITEM they expose as Manual and log once; item 4 gives them the meanings in
+  the decision table (AUTO with EV bias = manualEV - NeutralEV, and AUTO with EC). Off the switch
+  all three modes behave exactly as they always did.
+
+- With Scene Referred requested the camera owns the exposure whether or not Enable Exposure
+  Control is ticked: the tone map applies unity on that path, so a camera that published nothing
+  would render raw scene radiance and the frame would be black. Off the switch the tick keeps its
+  old meaning exactly.
+
+- The duplicated stops arithmetic is unified. ComputeApertureShutterStops() = log2(T^2/t) is now
+  the one definition of what the aperture and shutter let through (transmission and bokeh-mask
+  blocking included); ComputeManualEV100() and the film-grain light term both call it instead of
+  computing it separately, so grain and exposure can no longer drift.
+
+- The effective-T-stop diagnostic's edge-trigger state moved from function statics to per-component
+  members, as did the two new log-once flags: statics are shared by every cinematic camera in the
+  level.
+
+- r_HDRDebug 1 grows a scene-referred branch that reports what actually happened - the applied
+  EV100 recovered from the latched pre-exposure, the metered EV at C = 120*pi, and the raw scale.
+  The gap between the two EVs is the exposure error, which is exactly the quantity AUTO will drive
+  to zero.
+
+Built clean (0 errors, 0 warnings outside Code/SDKs): CryRenderD3D11, CinematicCamera.
+
+Co-Authored-By: Claude Opus <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01A72MFkdSczncE7au9UVnmu
+---
+ .../GraphicsPipeline/ToneMapping.cpp          |  46 +++++-
+ .../Module/CinematicCameraComponent.cpp       | 139 +++++++++++++++---
+ .../Module/CinematicCameraComponent.h         |  18 +++
+ 3 files changed, 173 insertions(+), 30 deletions(-)
+
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.cpp
+index 9088099a..ddcc419e 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.cpp
+@@ -41,6 +41,13 @@ static Vec4 ResolveVignetteParams()
+ 	return Vec4(fAmount, vFieldPupil.x, vFieldPupil.y, (CRenderer::CV_r_DofFieldDebug > 0) ? 1.0f : 0.0f);
+ }
+ 
++// The EV100 at which CE's ComputeExposure() returns exactly 1.0:
++//     exposure = (LIGHT_UNIT_SCALE / 1.2) * 2^-EV100 == 1  <=>  EV100 = log2(LIGHT_UNIT_SCALE / 1.2)
++// = log2(10000 / 1.2) = 13.0245867. Used to pin the tone map to unit exposure on the
++// scene-referred path, where the exposure has already been applied to the scene data
++// (SceneReferredSpec.md D3/D6, decisions/s1-exposure-constant.md).
++static const float kSceneReferredUnityEV = 13.0245867f;
++
+ void CToneMappingStage::Execute()
+ {
+ 	FUNCTION_PROFILER_RENDERER();
+@@ -153,9 +160,22 @@ void CToneMappingStage::Execute()
+ 	Vec4 eyeAdaptationParams;
+ 	if (bSceneReferred)
+ 	{
+-		// S0: hdrSetupParams[3], the same source as mode 1. S1 replaces this with the camera's
+-		// own EV100, at which point the exposure stops being a tone-map term at all.
+-		eyeAdaptationParams = hdrSetupParams[3];
++		// S1: the exposure is already IN the data. It was applied on the light side, at the five
++		// m_fAdaptedSceneScaleLBuffer sites and their companions, from the value the camera
++		// published (CD3D9Renderer::LatchSceneReferredExposure), so the tone map must apply none
++		// of its own or the frame is exposed twice.
++		//
++		// ComputeExposure() is made to return exactly 1 instead of being branched around. Its
++		// result is (LIGHT_UNIT_SCALE / 1.2) * 2^-EV100 with EV100 clamped to [.x, .y], so
++		// collapsing the window onto EV_unity = log2(LIGHT_UNIT_SCALE / 1.2) = 13.0246 makes it
++		// unity whatever the meter reports, and .z = 0 removes the :807 scene-key tilt with it.
++		// This is a constant, not a shader edit: HDRFinalPass has exactly one free static flag
++		// (SAMPLE0) and S4 needs it for the output transform, so spending a permutation here to
++		// save four ALU would be paying twice. Off the switch not one constant moves.
++		//
++		// The engine's measure passes keep running - SSR and the film grain bind their textures -
++		// only their exposure is no longer consumed.
++		eyeAdaptationParams = Vec4(kSceneReferredUnityEV, kSceneReferredUnityEV, 0.0f, 1.0f);
+ 	}
+ 	else
+ 	{
+@@ -323,6 +343,21 @@ void CToneMappingStage::DisplayDebugInfo()
+ 		sprintf(str, "Exposure: %.2f  SceneKey: %.2f", exposure, sceneKey);
+ 		IRenderAuxText::DrawText(Vec3(5, 75, 1), IRenderAuxText::ASize(1.0f), ColorF(1, 0, 1, 1), eDrawText_800x600 | eDrawText_2D, str);
+ 	}
++	else if (bSceneReferred)
++	{
++		// On this path the printed numbers must describe the pre-exposure the camera actually
++		// applied, not a formula the shader no longer evaluates. The latched scale is the one the
++		// light sites used this frame; its EV100 is the inverse of the saturation-based mapping,
++		// EV100 = log2(LIGHT_UNIT_SCALE / (1.2 * scale)). The metered EV is printed beside it with
++		// C = 120*pi (the constant that puts an 18 % reflector under the metered illuminance on
++		// 0.18), so the gap between the two IS the exposure error - which is what AUTO drives to 0.
++		const float scale = gcpRendD3D->GetSceneReferredExposure();
++		const float appliedEV = logf(RENDERER_LIGHT_UNIT_SCALE / (1.2f * max(scale, 1e-12f))) / logf(2.0f);
++		const float meteredEV = logf(max(fIlluminance, 1e-12f) * RENDERER_LIGHT_UNIT_SCALE * 100.0f / (120.0f * gf_PI)) / logf(2.0f);
++
++		sprintf(str, "Scene-referred EV: %.2f  (metered EV: %.2f)  pre-exposure x%.4g", appliedEV, meteredEV, scale);
++		IRenderAuxText::DrawText(Vec3(5, 75, 1), IRenderAuxText::ASize(1.0f), ColorF(1, 0, 1, 1), eDrawText_800x600 | eDrawText_2D, str);
++	}
+ 	else
+ 	{
+ 		float exposure = log(fIlluminance * RENDERER_LIGHT_UNIT_SCALE * 100.0f / 330.0f) / log(2.0f);
+@@ -330,10 +365,7 @@ void CToneMappingStage::DisplayDebugInfo()
+ 		float autoCompensation = (clamp_tpl<float>(sceneKey, 0.1f, 5.2f) - 3.0f) / 2.0f * vHDRSetupParams[3].z;
+ 		float finalExposure = clamp_tpl<float>(exposure - autoCompensation, vHDRSetupParams[3].x, vHDRSetupParams[3].y);
+ 
+-		// S0: the scene-referred branch computes exactly the same numbers as mode 1; only the
+-		// label says where the exposure came from, so a mismatch is visible before S1 moves it.
+-		sprintf(str, "%s EV: %.1f  Auto-EC: %.1f  Final EV: %.1f",
+-		        bSceneReferred ? "Scene-referred" : "Measured", exposure, autoCompensation, finalExposure);
++		sprintf(str, "Measured EV: %.1f  Auto-EC: %.1f  Final EV: %.1f", exposure, autoCompensation, finalExposure);
+ 		IRenderAuxText::DrawText(Vec3(5, 75, 1), IRenderAuxText::ASize(1.0f), ColorF(1, 0, 1, 1), eDrawText_800x600 | eDrawText_2D, str);
+ 	}
+ }
+diff --git a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp
+index 6add58ba..4339677c 100644
+--- a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp
++++ b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp
+@@ -917,8 +917,6 @@ void CCinematicCameraComponent::RestoreExposure()
+ // ---------------------------------------------------------------------------
+ float CCinematicCameraComponent::ComputeFilmGrain01() const
+ {
+-	const float N   = max((float)m_lens.aperture, 0.7f);
+-	const float t   = 1.0f / (float)max((int)m_body.shutterDenominator, 1);
+ 	const float iso = (float)max((int)m_body.iso, 25);
+ 
+ 	// Early onset plus an explosive top end: a gentle sub-linear term makes grain readable
+@@ -933,9 +931,11 @@ float CCinematicCameraComponent::ComputeFilmGrain01() const
+ 	const float g = clamp_tpl(gainStops / 8.0f, 0.0f, 1.0f);
+ 	const float base = 0.25f * powf(g, 1.2f) + powf(g, 3.5f);
+ 
+-	// The mask past its crossover eats light exactly like glass losses do.
+-	const float transmission = clamp_tpl((float)m_lens.transmission, 0.25f, 1.0f) * ComputeMaskTransmission();
+-	const float lightStops = log2f((transmission * t / (N * N)) / ((1.0f / 50.0f) / (5.6f * 5.6f))) - (float)(int)m_lens.ndFilterStops;
++	// The mask past its crossover eats light exactly like glass losses do - through
++	// ComputeApertureShutterStops(), the same term the exposure uses, so grain and exposure
++	// cannot drift apart. The reference is f/5.6 at 1/50 s, i.e. log2(5.6^2 * 50) stops.
++	const float referenceStops = log2f(5.6f * 5.6f * 50.0f);
++	const float lightStops = referenceStops - ComputeApertureShutterStops() - (float)(int)m_lens.ndFilterStops;
+ 	const float lowLightBoost = clamp_tpl(powf(2.0f, -lightStops * 0.35f), 0.6f, 2.2f);
+ 
+ 	return clamp_tpl(base * lowLightBoost, 0.0f, 1.5f);
+@@ -1224,10 +1224,74 @@ void CCinematicCameraComponent::RestoreSceneExposure()
+ 	m_bSceneExposureSaved = false;
+ }
+ 
+-// The scale the renderer multiplies scene light by. Unity for now - see ApplySceneExposure().
++// EV100 the camera exposes at while it owns the exposure.
++//
++// Manual is the pure photographic triangle: aperture, shutter, ISO, transmission, ND and EV
++// compensation, and nothing else. Exposure Response and Neutral EV, which used to compress the
++// applied EV around a pivot, have no role here - that compression was a second tone curve, and
++// under an output transform the S curve belongs to the ODT (spec D11, decisions/s1-auto-mode.md
++// part 2). They are ignored, with one log line, rather than silently reinterpreted.
++//
++// AutoBiased and AutoCompensation are metering modes and cannot be honoured until the AUTO
++// readback loop exists; until then they behave as Manual and say so once.
++float CCinematicCameraComponent::ComputeSceneReferredEV100() const
++{
++	if (m_exposure.exposureMode != EExposureMode::Manual && !m_bLoggedSceneRefAutoAsManual)
++	{
++		m_bLoggedSceneRefAutoAsManual = true;
++		CryLog("[CinematicCamera] Scene Referred: exposure mode '%s' has no metering loop yet and "
++		       "is exposing as Manual (the aperture/shutter/ISO triangle).",
++		       (m_exposure.exposureMode == EExposureMode::AutoBiased) ? "AutoBiased" : "AutoCompensation");
++	}
++
++	if (m_exposure.exposureMode == EExposureMode::Manual
++	    && fabs_tpl((float)m_exposure.exposureResponse - 1.0f) > 0.001f
++	    && !m_bLoggedSceneRefResponseIgnored)
++	{
++		m_bLoggedSceneRefResponseIgnored = true;
++		CryLog("[CinematicCamera] Scene Referred: Exposure Response (%.2f) and Neutral EV (%.1f) are "
++		       "ignored in Manual - exposure is the physical triangle and the tone curve lives in the "
++		       "output transform.", (float)m_exposure.exposureResponse, (float)m_exposure.neutralEV);
++	}
++
++	return ComputeManualEV100();
++}
++
++// The linear scale the renderer multiplies scene light by, so that a correctly exposed 18 %
++// reflector lands on 0.18 in the HDR target (spec D6, decisions/s1-exposure-constant.md
++// approach A).
++//
++// The saturation-based film sensitivity model, unchanged from CE's own tone mapper and from
++// Frostbite: the luminance that just saturates the sensor is
++//
++//     L_sat = (78 / (q * S)) * N^2 / t = (120 / S) * 2^EV100   cd/m^2,   q = 0.65
++//
++// which at S = ISO 100 is L_sat = 1.2 * 2^EV100. Scene values are engine units, 1.0 = 10 000
++// cd/m^2, so a value v is L = v * LIGHT_UNIT_SCALE and the scale that maps L_sat to 1.0 is
++//
++//     scale = LIGHT_UNIT_SCALE / (1.2 * 2^EV100).
++//
++// Where 0.18 comes in: a correctly metered camera reads EV100 = log2(E * S / C) from the scene
++// illuminance E, C being the ISO 2720 incident-meter constant. We adopt C = 120*pi (CE's shader
++// ships C = 330, a real dome-receptor value, which puts mid grey at 0.158). With C = 120*pi and
++// S = 100,
++//
++//     2^EV100 = E * 100 / (120*pi)  =>  L_sat = 1.2 * E * 100 / (120*pi) = E / pi,
++//
++// and a Lambertian 18 % reflector under that illuminance has L = 0.18 * E / pi, so
++// L / L_sat = 0.18 exactly. The 1.2 is left alone deliberately: it is 120/S, so ISO keeps
++// meaning ISO. The constant itself only enters when the camera METERS (the AUTO loop); in
++// Manual the EV comes from the triangle and C is the statement of what 'correctly exposed'
++// means. C = 120*pi = 376.99 is an implementation detail - the contract is '18 % grey -> 0.18'.
+ float CCinematicCameraComponent::ComputeSceneReferredExposureScale() const
+ {
+-	return 1.0f;
++	// Only while the component actually asks for the scene-referred path. Off it the renderer
++	// latches 1.0 anyway, but publishing 1.0 keeps the bus value honest for anyone reading it.
++	if (!m_sceneReferred.bSceneReferred)
++		return 1.0f;
++
++	const float ev100 = ComputeSceneReferredEV100();
++	return RENDERER_LIGHT_UNIT_SCALE / (1.2f * powf(2.0f, ev100));
+ }
+ 
+ // Viewfinder overlays: frame guides and focus peaking. These are monitor markings, never part
+@@ -1717,20 +1781,28 @@ void CCinematicCameraComponent::RestoreHalation()
+ // Manual exposure: the standard photographic equation.
+ //     EV100 = log2(N^2 / t) - log2(ISO / 100)
+ // EV compensation is subtracted so +1 EV means one stop brighter, matching a real camera.
+-float CCinematicCameraComponent::ComputeManualEV100() const
++// The stops of light the aperture and the shutter let through: log2(T^2 / t), where
++// T^2 = N^2 / transmission. Radiometry follows the T-stop, not the f-stop, so glass losses
++// darken the image exactly like a real lens while geometry (DOF, bokeh, diffraction) stays on N.
++// A shape mask past its crossover is a smaller hole with part of it blocked off: it darkens the
++// image through the same term, while N (the iris) keeps driving the renderer's domain call.
++//
++// This is the one definition. The exposure and the film-grain light term used to compute it
++// separately, which meant a change to one silently desynchronised the other.
++float CCinematicCameraComponent::ComputeApertureShutterStops() const
+ {
+ 	const float N = max((float)m_lens.aperture, 0.7f);
+ 	const float t = 1.0f / (float)max((int)m_body.shutterDenominator, 1);
+-	const float iso = (float)max((int)m_body.iso, 1);
+-
+-	// Radiometry follows the T-stop, not the f-stop: T^2 = N^2 / transmission, so glass
+-	// losses darken the image exactly like a real lens while geometry (DOF, bokeh,
+-	// diffraction) stays on N.
+-	// A shape mask past its crossover is a smaller hole with part of it blocked off: it darkens
+-	// the image through the same term, while N (the iris) keeps driving the renderer's domain call.
+ 	const float transmission = clamp_tpl((float)m_lens.transmission, 0.25f, 1.0f) * ComputeMaskTransmission();
+ 
+-	const float ev100 = log2f(N * N / (transmission * t)) - log2f(iso / 100.0f) - (float)m_exposure.evCompensation + (float)(int)m_lens.ndFilterStops;
++	return log2f(N * N / (transmission * t));
++}
++
++float CCinematicCameraComponent::ComputeManualEV100() const
++{
++	const float iso = (float)max((int)m_body.iso, 1);
++
++	const float ev100 = ComputeApertureShutterStops() - log2f(iso / 100.0f) - (float)m_exposure.evCompensation + (float)(int)m_lens.ndFilterStops;
+ 	return clamp_tpl(ev100, -6.0f, 24.0f);
+ }
+ 
+@@ -1771,15 +1843,15 @@ void CCinematicCameraComponent::ApplyExposureGlobalParam()
+ 	if (!CanDriveRenderState())
+ 		return;
+ 
+-	// Diagnostic: report the effective T-stop whenever the lens changes.
++	// Diagnostic: report the effective T-stop whenever the lens changes. The edge-trigger state is
++	// per component - function statics would be shared by every cinematic camera in the level.
+ 	{
+-		static float s_lastN = -1.0f, s_lastTrans = -1.0f;
+ 		const float N = max((float)m_lens.aperture, 0.7f);
+ 		const float trans = clamp_tpl((float)m_lens.transmission, 0.25f, 1.0f) * ComputeMaskTransmission();
+-		if (fabs_tpl(N - s_lastN) > 0.05f || fabs_tpl(trans - s_lastTrans) > 0.005f)
++		if (fabs_tpl(N - m_lastLoggedApertureN) > 0.05f || fabs_tpl(trans - m_lastLoggedTransmission) > 0.005f)
+ 		{
+-			s_lastN = N;
+-			s_lastTrans = trans;
++			m_lastLoggedApertureN = N;
++			m_lastLoggedTransmission = trans;
+ 			if (m_lens.bUseSpriteBokeh && !m_lens.bokehShapeTex.value.empty())
+ 				CryLog("[CinematicCamera] f/%.1f with mask f/%.1f (iris/mask radius %.2f, tint %.0f%%) -> effective transmission %.2f, T%.1f, CoC from f/%.1f",
+ 				       N, (float)m_lens.maskAperture, (float)m_lens.maskAperture / N, (float)m_lens.maskOpenArea * 100.0f, trans, N / sqrtf(trans), GetGeometricAperture());
+@@ -1788,7 +1860,12 @@ void CCinematicCameraComponent::ApplyExposureGlobalParam()
+ 		}
+ 	}
+ 
+-	if (!m_exposure.bEnableExposure)
++	// With the scene-referred path requested the camera ALWAYS owns the exposure, whether or not
++	// Enable Exposure Control is ticked: the tone map applies unit exposure on that path, so a
++	// camera that published nothing would render raw scene radiance and the frame would be black.
++	// Off the switch the tick keeps its old meaning exactly.
++	const bool bSceneReferred = m_sceneReferred.bSceneReferred;
++	if (!m_exposure.bEnableExposure && !bSceneReferred)
+ 	{
+ 		RestoreExposure();
+ 		return;
+@@ -1805,7 +1882,23 @@ void CCinematicCameraComponent::ApplyExposureGlobalParam()
+ 		m_bExpParamsSaved    = true;
+ 	}
+ 
+-	if (m_exposure.exposureMode == EExposureMode::AutoBiased)
++	if (bSceneReferred)
++	{
++		// The camera owns the exposure outright: it is applied on the light side and the tone map
++		// applies none of its own. This write is no longer what produces the picture - the tone
++		// map's scene-referred branch pins its own window - but the EV triple is still read by the
++		// particle system's ExposureValue domain, so it is kept meaningful and consistent.
++		//
++		// .z = 0 is mandatory (research/s1-exposure-model.md section 7, item 5): the shader's
++		// :807 scene-key tilt is a non-photographic term worth up to +-2 stops of invisible,
++		// per-scene drift, and today Manual mode silently inherits whatever the time of day wrote
++		// there. A camera has no such term.
++		const float ev100 = ComputeSceneReferredEV100();
++		v.x = clamp_tpl(ev100, -6.0f, 24.0f);
++		v.y = v.x;
++		v.z = 0.0f;
++	}
++	else if (m_exposure.exposureMode == EExposureMode::AutoBiased)
+ 	{
+ 		// Game-engine exposure: the engine's night is only a few stops darker than its day
+ 		// (artist-lit, not radiometric), so an absolute EV lock blows out night scenes. Keep
+diff --git a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
+index a69d5ed3..799ea0f8 100644
+--- a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
++++ b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
+@@ -962,6 +962,11 @@ private:
+ 	float GetEffectiveFocalLength() const;
+ 	float ComputeTargetFocalLength() const;
+ 	void  UpdateFocalMotor(float deltaSeconds);
++	//! log2(T^2 / t): the stops of light the aperture and shutter let through, transmission and
++	//! bokeh-mask blocking included. One definition, because the exposure and the film-grain
++	//! light term were computing it separately and were free to drift
++	//! (research/s1-ccam-exposure-today.md section 5, item 12).
++	float ComputeApertureShutterStops() const;
+ 	float ComputeManualEV100() const;
+ 	float ComputeFilmGrain01() const;
+ 	float ComputeFocusRange() const;
+@@ -998,6 +1003,10 @@ private:
+ 	//! The linear scale the renderer must multiply scene light by so that this camera's EV100
+ 	//! renders correctly. 1.0 when the scene-referred path is not requested.
+ 	float ComputeSceneReferredExposureScale() const;
++	//! EV100 the camera is exposing at under the scene-referred path. Manual is the pure
++	//! photographic triangle; the two auto modes fall back to it until the AUTO metering loop
++	//! lands (see decisions/s1-auto-mode.md part 2).
++	float ComputeSceneReferredEV100() const;
+ 	void ApplyStreaks();
+ 	void RestoreStreaks();
+ 	void ApplyHalation();
+@@ -1129,6 +1138,15 @@ private:
+ 	float m_savedSceneExposure  = 1.f;
+ 	bool  m_bSceneExposureSaved = false;
+ 
++	// Log-once flags for the parameters whose meaning changes under the scene-referred switch.
++	// Per component, not function statics: the statics in ApplyExposureGlobalParam() are shared
++	// by every camera in the level (research/s1-ccam-exposure-today.md section 5, item 13).
++	mutable bool m_bLoggedSceneRefResponseIgnored = false;
++	mutable bool m_bLoggedSceneRefAutoAsManual    = false;
++	// Edge-trigger state for the effective-T-stop log line, per component for the same reason.
++	float m_lastLoggedApertureN     = -1.f;
++	float m_lastLoggedTransmission  = -1.f;
++
+ 	// Sprite bokeh saved state (r_DepthOfFieldMode cvar + Dof_User_BokehShapeTex post param).
+ 	// Unknown to an unmodified renderer, where the read returns nothing and the writes are dropped.
+ 	int    m_savedDofModeCVar  = 1;
+-- 
+2.47.1.windows.1
+

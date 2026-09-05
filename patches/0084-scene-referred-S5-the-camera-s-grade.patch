@@ -1,0 +1,238 @@
+From ed71e8e057d53aa478770a9adbd8b9426b7def9c Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Fri, 28 Aug 2026 09:36:37 +0800
+Subject: [PATCH 084/119] scene-referred S5: the camera's grade
+
+The controls that drive the chain the previous commits built. Four property groups, all live -
+the tone map reads plain numbers off the bus and builds the white-balance matrix itself, so there
+is no LUT bake to wait for and a dragged slider moves the picture on the next frame.
+
+- "White Balance" gains Tint beside the existing Kelvin. Tint is the other axis - the
+  green/magenta correction a temperature alone cannot make, for light off the blackbody locus.
+  Positive is magenta. The existing member and its CRC are untouched; every saved level opens
+  with the same 6500 K it had.
+- "Grade": ASC CDL slope, offset and power as RGB triples, saturation, and Bypass Grade. The
+  bypass takes white balance, CDL and look out in one click and leaves the output transform -
+  the A/B, with the exposure and the optics unchanged.
+- "Look" and "Output" already carry the two .cube slots.
+
+Neutral is exact, not approximate. 6500 K + tint 0 is an identity because the tone map derives
+its reference white from the same Planckian locus rather than from a tabulated D65 - source white
+equals destination white, so the Bradford matrix is the identity to the last bit. Slope 1 /
+offset 0 / power 1 / saturation 1 is an identity by arithmetic. With the Look slot empty the chain
+is nothing but ACES 2.0. D10 is therefore a property of the defaults, not a claim about them.
+
+The old channel-gain white balance - which multiplied E3DPARAM_HDR_COLORGRADING_COLOR_BALANCE,
+read by the film curve - now stands down on the scene-referred path and hands the global back.
+It would have been inert there anyway (the scene-referred branch never reads that constant), but
+leaving it writing a global the time of day also owns is noise nobody could trace.
+
+Not done: .cdl (ASC CDL ColorCorrection XML) import/export. It was the stretch goal and it stays
+a follow-up - the numbers on the camera are already the ASC's, in the ASC's order, so the file is
+a serialisation job and nothing about the pipeline waits on it.
+
+Co-Authored-By: Claude Opus <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01A72MFkdSczncE7au9UVnmu
+---
+ .../Module/CinematicCameraComponent.cpp       | 63 +++++++++++++++++++
+ .../Module/CinematicCameraComponent.h         | 57 +++++++++++++++++
+ 2 files changed, 120 insertions(+)
+
+diff --git a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp
+index 4ed508ea..5a5ff747 100644
+--- a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp
++++ b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp
+@@ -167,6 +167,7 @@ void CCinematicCameraComponent::ProcessEvent(const SEntityEvent& event)
+ 		ApplySceneReferred();
+ 		ApplySceneExposure();
+ 		ApplyDisplayLuts();
++		ApplyGrade();
+ 		// DOF is a game-mode effect; don't apply in the editor.
+ 		if (!gEnv->IsEditing() && m_dof.bEnableDOF)
+ 			ApplyDOF();
+@@ -203,6 +204,7 @@ void CCinematicCameraComponent::ProcessEvent(const SEntityEvent& event)
+ 		ApplySceneReferred();
+ 		ApplySceneExposure();
+ 		ApplyDisplayLuts();
++		ApplyGrade();
+ 		break;
+ 
+ 	case ENTITY_EVENT_RESET:
+@@ -337,6 +339,7 @@ void CCinematicCameraComponent::RestoreAllEffects()
+ 	RestoreSceneReferred();
+ 	RestoreSceneExposure();
+ 	RestoreDisplayLuts();
++	RestoreGrade();
+ 	RestoreViewfinder();
+ 	RestoreStreaks();
+ 	RestoreHalation();
+@@ -1041,6 +1044,18 @@ void CCinematicCameraComponent::ApplyWhiteBalance()
+ 	if (!CanDriveRenderState())
+ 		return;
+ 
++	// On the scene-referred path white balance is a Bradford adaptation in the working space,
++	// applied by the display chain from the Kelvin and tint this component publishes
++	// (ApplyGrade). The channel-gain version below writes E3DPARAM_HDR_COLORGRADING_COLOR_BALANCE,
++	// which FilmMapping's scene-referred branch does not read - so it would be inert anyway, and
++	// leaving it writing a global the stock time of day also owns is noise nobody can trace.
++	// Hand the value back and let the real one do the work.
++	if (m_sceneReferred.bSceneReferred)
++	{
++		RestoreWhiteBalance();
++		return;
++	}
++
+ 	if (!m_whiteBalance.bEnableWhiteBalance || (int)m_whiteBalance.colorTemperature == 6500)
+ 	{
+ 		RestoreWhiteBalance();
+@@ -1485,6 +1500,54 @@ void CCinematicCameraComponent::RestoreDisplayLuts()
+ 	s_lutLMT.requested.clear();
+ }
+ 
++// The camera's grade (SceneReferredSpec.md S5). Everything here acts on scene data BEFORE the
++// output transform, which is the whole difference between grading and retouching: the picture
++// has not been squeezed onto a monitor yet, so a saturation push has somewhere to go and a
++// white-balance change is a change of illuminant rather than a tint over a finished frame.
++//
++// All of it is published live, every frame, as plain numbers on the post-effect bus - the tone
++// map builds the white-balance matrix and hands the CDL straight to the shader. There is no
++// per-frame LUT bake to wait for, so dragging a slider moves the picture on the next frame.
++//
++// Neutral by construction: 6500 K + tint 0 is an exact identity (the tone map derives its
++// reference white from the same locus), slope 1 / offset 0 / power 1 / saturation 1 is an exact
++// identity, and with the Look slot empty the chain is nothing but the ACES 2.0 output transform.
++// That is D10 - no hidden house look - and it is a property of the defaults, not a claim.
++void CCinematicCameraComponent::ApplyGrade()
++{
++	if (!CanDriveRenderState())
++		return;
++
++	const bool bBypass = m_grade.bBypassGrade;
++
++	gEnv->p3DEngine->SetPostEffectParam("Global_User_GradeBypass",   bBypass ? 1.0f : 0.0f);
++	gEnv->p3DEngine->SetPostEffectParam("Global_User_GradeWBEnable", m_whiteBalance.bEnableWhiteBalance ? 1.0f : 0.0f);
++	gEnv->p3DEngine->SetPostEffectParam("Global_User_GradeWBKelvin", (float)(int)m_whiteBalance.colorTemperature);
++	gEnv->p3DEngine->SetPostEffectParam("Global_User_GradeWBTint",   (float)m_whiteBalance.tint);
++
++	gEnv->p3DEngine->SetPostEffectParamVec4("Global_User_GradeSlope",  Vec4(m_grade.slope.x, m_grade.slope.y, m_grade.slope.z, 0.0f));
++	gEnv->p3DEngine->SetPostEffectParamVec4("Global_User_GradeOffset", Vec4(m_grade.offset.x, m_grade.offset.y, m_grade.offset.z, 0.0f));
++	gEnv->p3DEngine->SetPostEffectParamVec4("Global_User_GradePower",  Vec4(m_grade.power.x, m_grade.power.y, m_grade.power.z, 0.0f));
++	gEnv->p3DEngine->SetPostEffectParam("Global_User_GradeSaturation", (float)m_grade.saturation);
++}
++
++void CCinematicCameraComponent::RestoreGrade()
++{
++	if (!gEnv || !gEnv->p3DEngine)
++		return;
++
++	// Back to neutral rather than to a saved baseline: nothing but this component ever writes
++	// these params, so their neutral value IS the state the renderer had before the camera.
++	gEnv->p3DEngine->SetPostEffectParam("Global_User_GradeBypass",     0.0f);
++	gEnv->p3DEngine->SetPostEffectParam("Global_User_GradeWBEnable",   0.0f);
++	gEnv->p3DEngine->SetPostEffectParam("Global_User_GradeWBKelvin",   6500.0f);
++	gEnv->p3DEngine->SetPostEffectParam("Global_User_GradeWBTint",     0.0f);
++	gEnv->p3DEngine->SetPostEffectParamVec4("Global_User_GradeSlope",  Vec4(1.0f, 1.0f, 1.0f, 0.0f));
++	gEnv->p3DEngine->SetPostEffectParamVec4("Global_User_GradeOffset", Vec4(0.0f, 0.0f, 0.0f, 0.0f));
++	gEnv->p3DEngine->SetPostEffectParamVec4("Global_User_GradePower",  Vec4(1.0f, 1.0f, 1.0f, 0.0f));
++	gEnv->p3DEngine->SetPostEffectParam("Global_User_GradeSaturation", 1.0f);
++}
++
+ // The scene-referred pipeline switch. Pattern A of the two ccam gating patterns: the component
+ // only ASKS, on the post-effect parameter bus, and r_SceneReferred decides whether the renderer
+ // listens. Nothing global is written, so a crash or a mode change can never strand the engine
+diff --git a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
+index b7fef576..3335b3b0 100644
+--- a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
++++ b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
+@@ -544,10 +544,61 @@ struct SCineWhiteBalanceParams
+ 		desc.AddMember(&SCineWhiteBalanceParams::colorTemperature,
+ 			'kelv', "ColorTemperature", "Color Temperature (K)",
+ 			"White balance in Kelvin. 3200 tungsten, 5600 daylight, 6500 neutral.", 6500);
++		desc.AddMember(&SCineWhiteBalanceParams::tint,
++			'wbtn', "Tint", "Tint",
++			"The other axis of white balance: the green/magenta correction a temperature alone "
++			"cannot make, for light that is off the blackbody locus (fluorescent, LED, foliage "
++			"bounce). Positive is magenta, negative is green; 0 is on the locus. Only reaches "
++			"the picture on the scene-referred path, where white balance is a Bradford "
++			"adaptation before the display transform.", 0.0f);
+ 	}
+ 
+ 	bool bEnableWhiteBalance = true;
+ 	Schematyc::Range<1500, 15000, 2500, 10000, int> colorTemperature = 6500;
++	Schematyc::Range<-1, 1, -1, 1> tint = 0.0f;
++};
++
++// The camera's grade (SceneReferredSpec.md S5). ASC CDL in ACEScct, the interchange every
++// grading tool speaks, applied to scene data before the output transform - not to a picture
++// after it. Neutral by default: with these values the chain is exactly ACES 2.0 (D10).
++struct SCineGradeParams
++{
++	inline bool operator==(const SCineGradeParams& rhs) const { return 0 == memcmp(this, &rhs, sizeof(rhs)); }
++
++	static void ReflectType(Schematyc::CTypeDesc<SCineGradeParams>& desc)
++	{
++		desc.SetGUID("{4C81D3E6-7A29-4F05-B6D4-92E37C0158BA}"_cry_guid);
++		desc.SetLabel("Grade");
++		desc.AddMember(&SCineGradeParams::bBypassGrade,
++			'gbyp', "BypassGrade", "Bypass Grade",
++			"Switch the whole camera grade out of the chain - white balance, CDL and look - and "
++			"leave only the output transform. The A/B: what the shot looks like ungraded, one "
++			"click away, with the exposure and the optics unchanged.", false);
++		desc.AddMember(&SCineGradeParams::slope,
++			'cdls', "Slope", "Slope (RGB)",
++			"ASC CDL slope, per channel. A multiply in log - gain, the highlight end. 1 = "
++			"neutral. Applied first: out = (in * slope + offset) ^ power.", Vec3(1.0f, 1.0f, 1.0f));
++		desc.AddMember(&SCineGradeParams::offset,
++			'cdlo', "Offset", "Offset (RGB)",
++			"ASC CDL offset, per channel. An add in log - lift, the shadow end, and the usual "
++			"place a colour cast is corrected. 0 = neutral.", Vec3(0.0f, 0.0f, 0.0f));
++		desc.AddMember(&SCineGradeParams::power,
++			'cdlp', "Power", "Power (RGB)",
++			"ASC CDL power, per channel. Gamma, the midtones, applied last. 1 = neutral; below 1 "
++			"opens the mids, above 1 closes them.", Vec3(1.0f, 1.0f, 1.0f));
++		desc.AddMember(&SCineGradeParams::saturation,
++			'cdlt', "Saturation", "Saturation",
++			"The ASC's saturation extension, applied after the slope/offset/power triple about "
++			"the luminance of the graded value. 1 = neutral, 0 = monochrome. Because this "
++			"happens in the working space and before the output transform, pushing it does not "
++			"drift the hues the way a saturation slider on a finished picture does.", 1.0f);
++	}
++
++	bool bBypassGrade = false;
++	Vec3 slope = Vec3(1.0f, 1.0f, 1.0f);
++	Vec3 offset = Vec3(0.0f, 0.0f, 0.0f);
++	Vec3 power = Vec3(1.0f, 1.0f, 1.0f);
++	Schematyc::Range<0, 4, 0, 2> saturation = 1.0f;
+ };
+ 
+ struct SCineStreaksParams
+@@ -954,6 +1005,7 @@ public:
+ 		desc.AddMember(&CCinematicCameraComponent::m_streaks, 'gstk', "DiffractionStreaks", "Diffraction Streaks", "", SCineStreaksParams());
+ 		desc.AddMember(&CCinematicCameraComponent::m_filter, 'gflt', "FrontFilter", "Front Filter", "", SCineFilterParams());
+ 		desc.AddMember(&CCinematicCameraComponent::m_viewfinder, 'gvfd', "Viewfinder", "Viewfinder", "", SCineViewfinderParams());
++		desc.AddMember(&CCinematicCameraComponent::m_grade, 'ggrd', "Grade", "Grade", "", SCineGradeParams());
+ 		desc.AddMember(&CCinematicCameraComponent::m_look, 'glok', "Look", "Look", "", SCineLookParams());
+ 		desc.AddMember(&CCinematicCameraComponent::m_output, 'gout', "Output", "Output", "", SCineOutputParams());
+ 	}
+@@ -1081,6 +1133,10 @@ private:
+ 	//! everything else is a member read. See SceneReferredSpec.md D8.
+ 	void ApplyDisplayLuts();
+ 	void RestoreDisplayLuts();
++	//! The camera's grade - white balance, ASC CDL, saturation, bypass - published on the
++	//! post-effect bus every frame. Editor-live, like the switch and the exposure beside it.
++	void ApplyGrade();
++	void RestoreGrade();
+ 	//! The camera's pre-exposure for this frame, published as a linear scale next to the request
+ 	//! above (Global_User_SceneExposure). Editor-live for the same reason.
+ 	void ApplySceneExposure();
+@@ -1123,6 +1179,7 @@ private:
+ 	SCineStreaksParams m_streaks;
+ 	SCineFilterParams m_filter;
+ 	SCineViewfinderParams m_viewfinder;
++	SCineGradeParams m_grade;
+ 	SCineLookParams m_look;
+ 	SCineOutputParams m_output;
+ 
+-- 
+2.47.1.windows.1
+

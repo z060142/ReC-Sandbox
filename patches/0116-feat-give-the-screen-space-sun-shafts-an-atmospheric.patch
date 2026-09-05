@@ -1,0 +1,493 @@
+From 2fed336693e1ffcd1a6da5c0c62ba5d183f2368f Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Sun, 30 Aug 2026 13:57:47 +0800
+Subject: [PATCH 116/119] feat: give the screen-space sun shafts an atmospheric
+ condition (S8, approach A)
+
+A crepuscular ray is single scattering along the view ray,
+L = INTEGRAL sigma_s * p(theta) * E_perp * V dx, and CE's screen-space effect
+implements none of the four factors that decide whether it exists. p(theta) is
+approximated by the radial falloff, E_perp was restored by S2, V is a
+brightness-and-depth heuristic - and sigma_s, the one that spans a factor of
+50-1000 from clear air to fog, is simply absent. So the stock effect paints
+rays on a bone-dry cloudless day at whatever RaysAmount the level authored.
+A 100 m beam in clear air is about 4 % of the sky it is drawn against, which
+is why nobody ever sees one.
+
+On the scene-referred path only, the shaft composite is now scaled by
+
+    cond = 1 - exp(-sigma_s * L_ref)
+
+- sigma_s comes from the fog constants already published on the render thread
+  every frame (SRenderViewShaderConstants): the volumetric fog height-density
+  term when e_VolumetricFog is on, the legacy global fog term otherwise. Both
+  are log2(e) * sigma at the viewer, both from the editor density through the
+  same x 0.01, so no new constant buffer and no new plumbing. The VolFog2
+  inscatter parameter doubles as the scattering albedo (default 1.0, a
+  multiply by one at every stock preset).
+- L_ref = r_ShaftAtmosphereRefLength, default 500 m. THE ONE INVENTED NUMBER,
+  labelled as an assumption in the cvar help, the source and the docs, with
+  the calibration procedure written and not yet run.
+- One multiply on the composite constant, inside the branch ToneMapping.cpp
+  already had for the exposed sun colour. The stock arm is not reached, so
+  byte identity off the switch is structural rather than tested.
+
+SunShafts_RaysAmount keeps its meaning and gains a better one: it is now the
+MAXIMUM, reached in fog, which is where the picture wants it. The condition
+only ever scales down. Nothing is disabled (D13).
+
+r_ShaftAtmosphereCondition (default 1, 0 = off) is the escape hatch: a level
+that authored zero fog and relied on the amount alone loses its shafts, which
+is the intended correction, but "let it break where you can see it" is not
+"break it with no way back".
+
+r_HDRDebug 1 gains one line so the acceptance is read rather than judged by
+eye - sigma_s, the visibility it implies, the condition, and the authored
+amount beside the effective one. The round-3 lesson was that an unmeasured
+shaft term is exactly how this went wrong the first time.
+
+Docs: both cvars in ConsoleReference; the fog-density -> visibility table
+(0.02 = 20 km, 0.1 = 3.9 km, 1.0 = 390 m) and the L_ref calibration procedure
+in SceneReferredCalibration 3.1.
+
+Known limits, on the record: the density is the one at the CAMERA, not along
+the beam; local fog volumes never reach the global parameters; there is still
+no occluder test. The hybrid with volumetric fog's froxel shafts (approach C)
+has none of those problems and is the destination - this scalar is the part of
+it that can be had for one multiply.
+
+Co-Authored-By: Claude Opus <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01A72MFkdSczncE7au9UVnmu
+---
+ .../RenderDll/Common/RendererCVars.cpp        |  33 ++++
+ .../RenderDll/Common/RendererCVars.h          |   2 +
+ .../GraphicsPipeline/ToneMapping.cpp          | 154 +++++++++++++++++-
+ .../GraphicsPipeline/ToneMapping.h            |  15 ++
+ .../CinematicCamera/docs/ConsoleReference.md  |  54 ++++++
+ .../docs/SceneReferredCalibration.md          |  50 ++++++
+ 6 files changed, 307 insertions(+), 1 deletion(-)
+
+diff --git a/Code/CryEngine/RenderDll/Common/RendererCVars.cpp b/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
+index e45e9bbd..1b312344 100644
+--- a/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
++++ b/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
+@@ -427,6 +427,8 @@ int CRendererCVars::CV_r_SceneReferredExportTap;
+ int CRendererCVars::CV_r_SceneReferredExportEncoding;
+ int CRendererCVars::CV_r_SceneReferredExportCompression;
+ float CRendererCVars::CV_r_SceneReferredExportFixedStep;
++int CRendererCVars::CV_r_ShaftAtmosphereCondition;
++float CRendererCVars::CV_r_ShaftAtmosphereRefLength;
+ float CRendererCVars::CV_r_DofLensModelMaxCoC;
+ float CRendererCVars::CV_r_DofLensModelSplatMaxCoC;
+ int CRendererCVars::CV_r_DofLensModelDebug;
+@@ -1897,6 +1899,37 @@ void CRendererCVars::InitCVars()
+ 	               "and N frames is not N/fps seconds. An EXR sequence is a timed artefact or it "
+ 	               "cannot be conformed. 0 = do not touch t_FixedStep (and accept that the result "
+ 	               "has no cadence). Default 0.0333 = 30 fps.");
++	REGISTER_CVAR3("r_ShaftAtmosphereCondition", CV_r_ShaftAtmosphereCondition, 1, VF_NULL,
++	               "The ATMOSPHERIC CONDITION on the screen-space sun shafts, on the scene-referred "
++	               "path only (decisions/s8-sun-shafts-condition.md, approach A). Crepuscular rays "
++	               "are not a property of a bright sun; they are single scattering, "
++	               "L ~= sigma_s * p(theta) * E_perp * s, and CE's screen-space effect carries no "
++	               "sigma_s at all - it paints rays on a bone-dry cloudless day at whatever the "
++	               "level authored. Clear air to fog is a factor of 50-1000 in sigma_s and the "
++	               "effect had no term for any of it. "
++	               "1 = scale the shaft composite by cond = 1 - exp(-sigma_s * L_ref), where "
++	               "sigma_s is the per-metre scattering coefficient of the fog system actually in "
++	               "force at the camera (volumetric fog when e_VolumetricFog is on, the legacy "
++	               "global fog otherwise) and L_ref is r_ShaftAtmosphereRefLength (default). The "
++	               "authored SunShafts_RaysAmount then becomes the MAXIMUM, reached in fog; the "
++	               "condition only ever scales down. At CE's own TOD densities: 0.02 (clear, 20 km) "
++	               "gives 0.07 (3.8 stops down), 0.1 (haze, 3.9 km) 0.36, 0.4 (mist) 0.83, 1.0 "
++	               "(fog, 390 m) 0.99. "
++	               "0 = off, the pure authored amount. A shipped level that authored zero fog and "
++	               "relied on the amount alone loses its shafts entirely under 1 - that is the "
++	               "intended correction, and this is the way back from it. "
++	               "Ignored entirely off the scene-referred path: the stock branch is not touched.");
++	REGISTER_CVAR3("r_ShaftAtmosphereRefLength", CV_r_ShaftAtmosphereRefLength, 500.0f, VF_NULL,
++	               "L_ref for r_ShaftAtmosphereCondition, in METRES: the reference beam length the "
++	               "scattering coefficient is integrated over to turn a density into a 0..1 "
++	               "condition. THIS IS A CALIBRATION CONSTANT, NOT A DERIVED ONE - the one invented "
++	               "number in the feature. It stands in for a path length a screen-space effect "
++	               "cannot know; the shaft mask is depth-weighted (Sunshafts.cfx), so its sources "
++	               "are structurally the far half of the frame, and 500 m is a defensible reference "
++	               "beam for an exterior scene. It is unmeasured and labelled as such - see "
++	               "Code/CryPlugins/CinematicCamera/docs/SceneReferredCalibration.md 3. Longer = "
++	               "shafts appear in thinner air; shorter = they need more fog. 0 suppresses the "
++	               "shafts entirely.");
+ 	REGISTER_CVAR3_CB("r_SceneReferredExrSelfTest", CV_r_SceneReferredExrSelfTest, 0, VF_NULL,
+ 	               "SELF-TEST for the EXR writer behind rec_CaptureEXR (Stage S6). Set it to 1 and "
+ 	               "the renderer writes a 4x4 half EXR into the user folder, reads it back with "
+diff --git a/Code/CryEngine/RenderDll/Common/RendererCVars.h b/Code/CryEngine/RenderDll/Common/RendererCVars.h
+index 8fdbda85..1ffd1897 100644
+--- a/Code/CryEngine/RenderDll/Common/RendererCVars.h
++++ b/Code/CryEngine/RenderDll/Common/RendererCVars.h
+@@ -426,6 +426,8 @@ public:
+ 	static int   CV_r_SceneReferredExportEncoding;
+ 	static int   CV_r_SceneReferredExportCompression;
+ 	static float CV_r_SceneReferredExportFixedStep;
++	static int   CV_r_ShaftAtmosphereCondition;
++	static float CV_r_ShaftAtmosphereRefLength;
+ 	DeclareStaticConstIntCVar(CV_r_nohwgamma, 2);
+ 	DeclareStaticConstIntCVar(CV_r_wireframe, 0);
+ 	DeclareStaticConstIntCVar(CV_r_printmemoryleaks, 0);
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.cpp
+index 6d6f31d6..a00bc902 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.cpp
+@@ -49,6 +49,91 @@ static Vec4 ResolveVignetteParams()
+ // (SceneReferredSpec.md D3/D6, decisions/s1-exposure-constant.md).
+ static const float kSceneReferredUnityEV = 13.0245867f;
+ 
++// ---------------------------------------------------------------------------
++// S8 - the ATMOSPHERIC CONDITION on the screen-space sun shafts
++// (decisions/s8-sun-shafts-condition.md approach A, research/s8-sun-shafts-condition.md).
++//
++// A crepuscular ray is not a property of a bright sun. It is single scattering along the view
++// ray, L = INTEGRAL sigma_s * p(theta) * E_perp * V dx, and every one of those four factors can
++// be zero. CE's screen-space effect implements none of them: p(theta) is approximated by the
++// radial falloff around the sun's screen position, E_perp was restored by S2, V is a
++// brightness-and-depth heuristic - and sigma_s, the one that decides whether the phenomenon
++// EXISTS, is simply absent. So the stock effect paints rays on a bone-dry cloudless day at
++// whatever RaysAmount the level authored, which is the user's round-3 observation.
++//
++// Clear air to fog is a factor of 50-1000 in sigma_s; a 100 m beam in clear air is about 4 % of
++// the sky it is drawn against, which is below the threshold at which anyone sees structure in a
++// soft gradient. That is the whole dynamic range of the effect, and there was no term carrying
++// any of it.
++//
++// The proxy: the fog system's own scattering coefficient at the camera, which is already on the
++// render thread in per-metre units. Both SRenderViewShaderConstants members hold
++// log2(e) * sigma at the viewer's height (D3DHWShader.cpp sGetVolumetricFogParams and
++// sGetVolumetricFogHeightDensityParams, both of which apply the editor's x 0.01), and both are
++// published UNCONDITIONALLY by the TOD - so this needs no new constant, no new plumbing and no
++// dependency on whether volumetric fog is actually rendering. e_VolumetricFog only selects WHICH
++// of the two systems is the one in force.
++//
++// The condition is the optical depth over a reference beam, saturating:
++//     cond = 1 - exp(-sigma_s * L_ref)
++// L_ref is the one invented number here and is labelled as one: no engine anywhere gives a
++// screen-space shaft a physical formulation to borrow a value from. See
++// r_ShaftAtmosphereRefLength and SceneReferredCalibration.md 3.
++//
++// Where this proxy is WRONG, on the record: it is the density AT THE CAMERA, not along the beam
++// (a camera above a ground-fog layer reads as clear), local fog volumes never reach the global
++// parameters, and there is still no occluder test. The hybrid with volumetric fog's real froxel
++// shafts (approach C) has none of those problems and is the destination; this scalar is the part
++// of it that can be had for one multiply.
++// ---------------------------------------------------------------------------
++struct SShaftAtmosphereCondition
++{
++	float sigmaS       = 0.0f;   //!< scattering coefficient at the camera, per metre
++	float visibilityKm = 0.0f;   //!< Koschmieder visual range 3.912 / sigma_e, km
++	float condition    = 1.0f;   //!< the multiplier applied to the shaft composite
++	bool  bActive      = false;  //!< false = the shafts were left at the authored amount
++};
++
++static SShaftAtmosphereCondition ResolveShaftAtmosphereCondition(const CRenderView* pRenderView)
++{
++	SShaftAtmosphereCondition result;
++
++	if (CRenderer::CV_r_ShaftAtmosphereCondition == 0 || pRenderView == nullptr)
++		return result;
++
++	const SRenderViewShaderConstants& PF = pRenderView->GetShaderConstants();
++
++	// Which fog system is the one describing this scene's air. e_VolumetricFog is
++	// VF_REQUIRE_APP_RESTART, so this cannot change under us mid-session.
++	ICVar* pVolFogVar = gEnv->pConsole ? gEnv->pConsole->GetCVar("e_VolumetricFog") : nullptr;
++	const bool bVolFog = (pVolFogVar != nullptr && pVolFogVar->GetIVal() != 0);
++
++	// Both are log2(e) * sigma; divide the log2(e) back out exactly as the shaders do
++	// (VolumeLighting.cfi). The result is extinction, per metre, at the viewer's height.
++	const float kInvLog2e = 1.0f / 1.44269502f;
++	const float sigmaE = max(0.0f, (bVolFog ? PF.pVolumetricFogHeightDensityParams.y
++	                                        : PF.pVolumetricFogParams.y) * kInvLog2e);
++
++	// Scattering is nearly all of extinction for water droplets and most aerosols (single-scatter
++	// albedo 0.85-1.0); soot is the exception and CE has no parameter for it. VOLFOG2_INSCATTER is
++	// the only albedo-shaped knob the engine exposes, default 1.0, so it doubles as the albedo for
++	// both fog systems - which at every stock preset is a multiply by one. Clamped to [0,1]
++	// because an albedo above 1 is not a thing, whatever the slider allows.
++	const float albedo = clamp_tpl(PF.pVolumetricFogScatteringParams.x, 0.0f, 1.0f);
++
++	result.sigmaS = sigmaE * albedo;
++
++	// Koschmieder, for the debug readout only - it is a property of extinction, not of scattering,
++	// so it is computed from sigmaE before the albedo.
++	result.visibilityKm = (sigmaE > 1e-9f) ? (3.912f / sigmaE) * 0.001f : 1e6f;
++
++	const float refLength = max(0.0f, CRenderer::CV_r_ShaftAtmosphereRefLength);
++	result.condition = 1.0f - expf(-result.sigmaS * refLength);
++	result.bActive = true;
++
++	return result;
++}
++
+ // ---------------------------------------------------------------------------
+ // The camera stage's white balance (SceneReferredSpec.md S5).
+ //
+@@ -435,6 +520,14 @@ void CToneMappingStage::Execute()
+ 	m_passToneMapping.SetConstant(colorBalanceName, hdrSetupParams[2], eHWSC_Pixel);
+ 	m_passToneMapping.SetConstant(bloomColorName, hdrSetupParams[1] * Vec4(Vec3(1.0f / 8.0f), 1.0f), eHWSC_Pixel); // Division by 8.0f was done in shader before, remove this at some point
+ 
++	// Reset before the branch so that r_HDRDebug 1 never reports a stale condition from a frame
++	// that had shafts to one that does not.
++	m_shaftCondSigmaS = 0.0f;
++	m_shaftCondVisibilityKm = 0.0f;
++	m_shaftCondition = 1.0f;
++	m_shaftRaysAmount = 0.0f;
++	m_bShaftCondActive = false;
++
+ 	Vec4 shaftsSunCol(0, 0, 0, 0);
+ 	if (bSunShaftsEnabled)
+ 	{
+@@ -467,7 +560,35 @@ void CToneMappingStage::Execute()
+ 			sunColor *= gcpRendD3D->GetSceneReferredExposure();
+ 
+ 		sunColor.SetLerp(Vec3(sunShaftParams[0].x, sunShaftParams[0].y, sunShaftParams[0].z), sunColor, sunShaftParams[1].w);
+-		shaftsSunCol = Vec4(sunColor * sunShaftParams[1].z, 1);
++
++		// S8: the atmospheric condition, and the whole of approach A - one multiply on the
++		// composite constant, inside the branch that already exists. sunShaftParams[1].z is the
++		// authored SunShafts_RaysAmount, which the condition turns into the MAXIMUM the shafts
++		// reach in fog rather than the value they always take (D13: nothing is disabled, and the
++		// slider keeps doing what the author expects, upwards).
++		//
++		// The condition is a property of the AIR, not of the camera, so it must not move with the
++		// aperture: it multiplies the already-exposed colour, and nothing in
++		// ResolveShaftAtmosphereCondition reads an exposure. If the shafts stop following T-stop
++		// and ND, or start following them twice, this is not the line at fault.
++		//
++		// Off the scene-referred switch this line is not reached at all - :465 takes
++		// sunColor.Normalize() and the stock composite - so the stock path is bit-identical by
++		// construction rather than by test.
++		float shaftCondition = 1.0f;
++		if (bSceneReferred)
++		{
++			const SShaftAtmosphereCondition cond = ResolveShaftAtmosphereCondition(RenderView());
++			shaftCondition = cond.condition;
++
++			m_shaftCondSigmaS = cond.sigmaS;
++			m_shaftCondVisibilityKm = cond.visibilityKm;
++			m_shaftCondition = cond.condition;
++			m_shaftRaysAmount = sunShaftParams[1].z;
++			m_bShaftCondActive = cond.bActive;
++		}
++
++		shaftsSunCol = Vec4(sunColor * (sunShaftParams[1].z * shaftCondition), 1);
+ 	}
+ 	m_passToneMapping.SetConstant(shaftsSunColName, shaftsSunCol, eHWSC_Pixel);
+ 
+@@ -750,6 +871,7 @@ void CToneMappingStage::DisplayDebugInfo()
+ 
+ 		DisplaySceneReferredMeterInfo(appliedEV);
+ 		DisplaySceneReferredCoverage();
++		DisplayShaftConditionInfo();
+ 	}
+ 	else
+ 	{
+@@ -900,6 +1022,36 @@ void CToneMappingStage::DisplaySceneReferredCoverage()
+ 	IRenderAuxText::DrawText(Vec3(5, 175, 1), IRenderAuxText::ASize(1.0f), ColorF(1, 0, 1, 1), eDrawText_800x600 | eDrawText_2D, str);
+ }
+ 
++// The sun-shaft atmospheric condition, as it was actually applied (S8,
++// decisions/s8-sun-shafts-condition.md step 3).
++//
++// This exists so the acceptance is READ rather than judged by eye. The round-3 lesson was that an
++// unmeasured shaft term is exactly how the shafts went wrong the first time: the picture cannot
++// tell you whether a faint shaft is a correct clear-air condition or a broken amount, and the two
++// have opposite fixes. Four numbers settle it - what the air is (sigma_s and the visibility it
++// implies, which is the number a level author recognises), what the condition made of it, and the
++// authored amount beside the effective one.
++//
++// The values are the ones Execute() used this frame, not a recomputation.
++void CToneMappingStage::DisplayShaftConditionInfo()
++{
++	char str[256];
++
++	if (!m_bShaftCondActive)
++	{
++		cry_sprintf(str, "  shafts: atmosphere condition OFF (r_ShaftAtmosphereCondition 0, or no shafts this frame) - rays amount %.4f used as authored",
++		            m_shaftRaysAmount);
++	}
++	else
++	{
++		cry_sprintf(str, "  shafts: sigma_s %.4g /m (visibility ~%.2f km), condition %.4f (x), rays amount %.4f -> effective %.4f",
++		            m_shaftCondSigmaS, m_shaftCondVisibilityKm, m_shaftCondition,
++		            m_shaftRaysAmount, m_shaftRaysAmount * m_shaftCondition);
++	}
++
++	IRenderAuxText::DrawText(Vec3(5, 195, 1), IRenderAuxText::ASize(1.0f), ColorF(1, 0, 1, 1), eDrawText_800x600 | eDrawText_2D, str);
++}
++
+ // The skybox unit readout (SceneReferredSpec.md S2, decisions/s2-sky-scale.md).
+ //
+ // The decision note asks for the times-ten at Renderer.cpp:4007 to be PROVEN before it is
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.h b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.h
+index 717d1680..34712897 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.h
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.h
+@@ -30,6 +30,11 @@ public:
+ 	void DisplaySceneReferredMeterInfo(float appliedEV);
+ 	void DisplaySceneReferredCoverage();
+ 
++	//! r_HDRDebug 1: the atmospheric condition the sun shafts were scaled by this frame - the
++	//! scattering coefficient it was read from, the visibility that implies, and the authored
++	//! amount against the effective one (decisions/s8-sun-shafts-condition.md, step 3).
++	void DisplayShaftConditionInfo();
++
+ 	bool IsDebugInfoEnabled() const { return CRendererCVars::CV_r_HDRDebug == 1 && !RenderView()->IsRecursive(); }
+ 	bool IsDebugDrawEnabled() const { return CRendererCVars::CV_r_HDRDebug > 1 && !RenderView()->IsRecursive(); }
+ 
+@@ -41,4 +46,14 @@ private:
+ 	//! S6's negative tap: a straight blit of $HDRTarget into the export ring. The graded tap needs
+ 	//! no pass at all - it is a second render target on the tone map itself.
+ 	CStretchRectPass     m_passExportNegativeCopy;
++
++	//! What the sun-shaft atmospheric condition resolved to on the LAST Execute(), kept so that
++	//! r_HDRDebug 1 reports the numbers the frame was actually drawn with rather than recomputing
++	//! them from state that may have moved. Reset every Execute(); all zero / unity means the
++	//! condition did not run this frame (stock path, shafts off, or the cvar at 0).
++	float                m_shaftCondSigmaS = 0.0f;      //!< scattering coefficient at the camera, 1/m
++	float                m_shaftCondVisibilityKm = 0.0f;//!< Koschmieder visual range from the extinction, km
++	float                m_shaftCondition = 1.0f;       //!< 1 - exp(-sigma_s * L_ref), the multiplier
++	float                m_shaftRaysAmount = 0.0f;      //!< the authored SunShafts_RaysAmount
++	bool                 m_bShaftCondActive = false;    //!< was the condition applied this frame
+ };
+diff --git a/Code/CryPlugins/CinematicCamera/docs/ConsoleReference.md b/Code/CryPlugins/CinematicCamera/docs/ConsoleReference.md
+index d458dab4..137d1997 100644
+--- a/Code/CryPlugins/CinematicCamera/docs/ConsoleReference.md
++++ b/Code/CryPlugins/CinematicCamera/docs/ConsoleReference.md
+@@ -362,6 +362,60 @@ Two existing cvars change what they mean while the switch is on:
+ | Default | 0.0333 (30 fps) |
+ | Purpose | The frame time a capturing **sequence** forces; `t_FixedStep` is saved on start and restored on stop. Outside the editor nothing else locks frame time - `capture_frames` does not, whatever its name suggests - so without this a sequence is one file per rendered frame at whatever rate the machine managed, and N frames is not N/fps seconds. An EXR sequence is a timed artefact or it cannot be conformed. 0 = leave `t_FixedStep` alone and accept that the result has no cadence. |
+ 
++### r_ShaftAtmosphereCondition
++
++| | |
++| --- | --- |
++| Default | 1 |
++| Purpose | Gives the screen-space sun shafts an **atmospheric condition** on the scene-referred path: the composite is scaled by `cond = 1 - exp(-sigma_s * L_ref)`, where `sigma_s` is the per-metre scattering coefficient of the fog system in force at the camera. 0 = off, the authored amount as-is. Ignored off the scene-referred path. |
++
++A crepuscular ray is single scattering, `L = INTEGRAL sigma_s * p(theta) * E_perp * V dx`. CE's
++screen-space effect carries no `sigma_s` at all, so it paints rays on a bone-dry cloudless day at
++whatever the level authored. Clear air to fog is a factor of 50-1000 in `sigma_s`, and nothing in
++the pass carried any of it — a 100 m beam in clear air is about **4 %** of the sky it is drawn
++against, which is why nobody ever sees one.
++
++`sigma_s` is taken from the fog constants already published on the render thread every frame
++(`SRenderViewShaderConstants`): the **volumetric fog** height-density term when `e_VolumetricFog`
++is on, the **legacy global fog** term otherwise. Both are `log2(e) * sigma` at the viewer's
++height, and both come from the editor's density through the same `x 0.01`, so the density slider
++*is* a visibility in metres. See `SceneReferredCalibration.md` §3 for the table.
++
++`SunShafts_RaysAmount` keeps its meaning and gains a better one: it is now the **maximum**, reached
++in fog. The condition only ever scales down.
++
++**The escape hatch, and why there is one.** A shipped level that authored zero fog and relied on
++the amount alone loses its shafts entirely at `1`. That is the intended correction, but "let it
++break where you can see it" is not "break it with no way back", and the lens-preset layer will
++eventually want a deliberate non-physical shaft. `0` is the honest way to say *this scene is not
++obeying the atmosphere*.
++
++Read the result with `r_HDRDebug 1`, which prints the line
++`shafts: sigma_s X /m (visibility ~Y km), condition Z (x), rays amount A -> effective B`.
++
++**Known limits, on the record:** the density is the one at the **camera**, not along the beam (a
++camera above a ground-fog layer reads as clear); local fog volumes never reach the global
++parameters, so they create no shafts; and there is still no occluder test — the mask remains a
++brightness-and-depth heuristic.
++
++### r_ShaftAtmosphereRefLength
++
++| | |
++| --- | --- |
++| Default | 500 (metres) |
++| Purpose | `L_ref` for `r_ShaftAtmosphereCondition`: the reference beam length the scattering coefficient is integrated over to turn a density into a 0..1 condition. Longer = shafts appear in thinner air; shorter = they need more fog. 0 suppresses the shafts entirely. |
++
++**This is a calibration constant, not a derived one — the one invented number in the feature.** It
++stands in for a path length a screen-space effect cannot know. The shaft mask is depth-weighted
++(`Sunshafts.cfx`), so its sources are structurally the far half of the frame, and 500 m is a
++defensible reference beam for an exterior scene. It is unmeasured; `SceneReferredCalibration.md`
++§3 says so and holds the procedure.
++
++Why it has no precedent to follow: screen-space shafts have no physical formulation anywhere to
++borrow a value from — UE, Frostbite and CE all treat the amount as an art parameter. The physics
++being approximated is standard; the mapping from it onto a screen-space radial blur is not, and
++cannot be.
++
+ ### r_DepthOfFieldMode
+ 
+ | | |
+diff --git a/Code/CryPlugins/CinematicCamera/docs/SceneReferredCalibration.md b/Code/CryPlugins/CinematicCamera/docs/SceneReferredCalibration.md
+index 5d166530..092c0d1f 100644
+--- a/Code/CryPlugins/CinematicCamera/docs/SceneReferredCalibration.md
++++ b/Code/CryPlugins/CinematicCamera/docs/SceneReferredCalibration.md
+@@ -238,6 +238,52 @@ the value. Expect the physical setting to be of order **0.01 to 0.05**, not 0.25
+ high-contrast, camera-motion-dependent radial pattern in front of the temporal resolve. Pan the
+ camera across the sun and watch for highlight crawl before signing the value off.
+ 
++### 3.1 The atmosphere the shafts are conditioned on
++
++The amount is only half of it. A shaft is single scattering, so it also needs something in the air
++to scatter off, and on the scene-referred path the composite is scaled by
++
++```
++sigma_s = the fog system's per-metre scattering coefficient at the camera
++cond    = 1 - exp(-sigma_s * L_ref)          (r_ShaftAtmosphereCondition, L_ref = 500 m)
++```
++
++**The fog density slider is already a visibility in metres.** Both fog systems take the editor's
++`Global density` through the same `x 0.01` (`D3DHWShader.cpp`), so `sigma = 0.01 x density` per
++metre, and Koschmieder's `V = 3.912 / sigma` turns that into a meteorological visual range. This
++table is worth knowing independently of the shafts — it is what the slider *means*:
++
++| TOD `Global density` | sigma (1/m) | Visual range | Reads as | `cond` at L_ref = 500 m |
++| --- | --- | --- | --- | --- |
++| 0.001 | 1e-5 | 390 km | (unphysically clean) | 0.005 (-7.6 stops) |
++| **0.02** | 2e-4 | **20 km** | clear | 0.07 (-3.8 stops) |
++| 0.04 | 4e-4 | 10 km | light haze | 0.14 (-2.8 stops) |
++| **0.1** | 1e-3 | **3.9 km** | haze | 0.36 (-1.5 stops) |
++| 0.4 | 4e-3 | 1.0 km | mist | 0.83 (-0.27 stops) |
++| **1.0** | 1e-2 | **390 m** | fog | 0.99 (0 stops) |
++| 4.0 | 4e-2 | 98 m | thick fog | 1.00 (0 stops) |
++
++CE's own defaults put the **legacy** fog at 0.02 (clear) and the **volumetric** fog at 0.1 (haze);
++`e_VolumetricFog` decides which of the two the condition reads.
++
++**L_ref = 500 m is the only invented number in this feature, and it is pending calibration.** It
++stands in for the beam length a screen-space effect cannot know. Every other quantity above is
++either measured meteorology or read straight out of the engine's own constants; this one is
++reasoned and not yet measured.
++
++**Procedure (not yet run).** In the airfield scene, with `r_HDRDebug 1` up, set the TOD fog density
++to 0.02, 0.1 and 0.4 in turn and photograph-match the shafts against a reference for each
++condition. The debug line reports `sigma_s`, the implied visibility, `cond`, and the authored
++amount beside the effective one, so the three steps are read rather than judged. If the shafts are
++consistently too shy in haze, raise `r_ShaftAtmosphereRefLength`; too eager in clear air, lower it.
++Do this in the same session as the `Sun Shaft Amount` calibration above — the two are one
++two-parameter fit (amount sets the ceiling in fog, `L_ref` sets how fast you get there), and
++fitting either alone will chase the other.
++
++**The condition must not move with the aperture.** It is a property of the air, not of the camera.
++Change T-stop or ND: the shafts follow, `cond` in the debug line does not. If it does, an exposure
++has got into `sigma_s`.
++
+ ---
+ 
+ ## 4. Recording results
+@@ -259,6 +305,10 @@ Write measured values into:
+   colour's ALPHA, and alpha becomes the probe's blend weight in the tiled shading attenuation -
+   not its brightness. A probe that needs a trim needs an rgb-only multiplier, which does not
+   exist yet.
++* `r_ShaftAtmosphereRefLength` — into the project's `.cryproject`, and the number and the frames
++  it was fitted against into `scene-notes/research/s8-sun-shafts-condition.md`. Until that
++  happens the shipped 500 m stays labelled as an assumption in the cvar help, here, and in the
++  source. Do **not** quietly promote it to a fact by deleting the label.
+ * Sky and sun lux — into the `.env` preset (`ReC_Physical.env`), never into `default.env` and
+   never into `EnvironmentPreset.cpp`, whose defaults and ranges are shared with the stock path.
+ * The residuals and the date — into `scene-notes/research/s2-*.md`, so the next session does not
+-- 
+2.47.1.windows.1
+

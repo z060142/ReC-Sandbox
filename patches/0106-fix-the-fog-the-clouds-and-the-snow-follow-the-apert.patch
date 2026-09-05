@@ -1,0 +1,359 @@
+From 635e7df0115cbc7f66197dcb78ff39ee7c961894 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Sat, 29 Aug 2026 03:13:35 +0800
+Subject: [PATCH 106/119] fix: the fog, the clouds and the snow follow the
+ aperture too
+
+The rest of the shadow fillers. Four subsystems, one symptom each time:
+something bright in the picture that did not move when the aperture did.
+
+Global fog. Its colour is authored - base, height delta and radial all come off
+the time of day, none of them is derived from the sun - so it is the same class
+of quantity as the skybox emittance and has to follow the aperture like one. It
+did not, and fog at distance is often the brightest thing in shadow: it pinned
+the shadow values and a night scene washed out to a flat grey veil. One multiply
+inside GetVolumetricFogColorInternal, which is where every consumer meets it -
+the fog pass, forward shading, the volumetric blend - rather than at the three
+CPU constants, because the height delta is a DIFFERENCE of two colours and
+scaling it separately is only safe while that recombination stays linear.
+Density and falloff are transmittances and are untouched.
+
+Volumetric fog. Its light list already carried the exposure and its sun did not,
+so turning the aperture changed the fog's colour BALANCE between its sun-lit and
+its lamp-lit halves - a units tear inside one subsystem. The sun now takes the
+multiply, next to the PI gate; so does a fog volume's authored emission, for the
+reason S1 settled for emissive materials. The scattering albedo does not. And
+the ambient-light bug that was fixed in the deferred twin last round was here
+too, unfixed, for the same reason: an ambient light is a multiplicative tint over
+an already-exposed accumulator, so pre-exposing it applies the exposure twice
+inside the shader's lerp and moves its darken/brighten decision boundary.
+
+Clouds. The cloud shading sun colour is a radiance and did not follow, so the sky
+darkened when stopping down and the clouds did not - a hard bright rim at every
+cloud edge. Both consumers take the multiply (the volumetric stage and the legacy
+forward path) rather than the single CPU fill the decision note proposed: that
+fill is ReadPerFrameShaderConstants, which runs on the main thread, and the
+pre-exposure latch is a render-thread value. The atmospheric scattering intensity
+is deliberately left alone - it is a coefficient, not a radiance.
+
+Snow. CSnowStage is the one scene writer that runs after the 709 -> AP1
+conversion, and the flake's own lighting term was being taken from the per-view
+sun and sky colours: Rec.709, and never pre-exposed. It carries the conversion
+itself now, as a delta-from-identity matrix in its own constant buffer, and the
+pre-exposure with it. Separately, the half-res composite's saturate(x10) is gone
+under the switch: on the stock path clamping at 1.0 was a display-referred
+nicety, here 1.0 is 10 000 cd/m2 and that line crushed everything behind the snow
+layer - upstream of bloom, the glare family and the meter - to a flat plateau.
+The x10 stays; only the clamp becomes the writer clamp every other fp16 writer
+already answers to, and the alpha keeps its saturate because it is a blend weight.
+
+r_HDRDebug 1's coverage table now reports all four as reached.
+
+decisions/s8-svogi-fog-clouds.md items 2-5, research/s8-fog-and-clouds.md,
+research/s8-particles-rain-lensoptics.md 2.3(c). Off the switch every multiply is
+an exact 1.0, the matrix delta is an exact 0, and the clamp branch folds away.
+
+Co-Authored-By: Claude Opus <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01A72MFkdSczncE7au9UVnmu
+---
+ .../GraphicsPipeline/SceneForward.cpp         | 10 ++++-
+ .../XRenderD3D9/GraphicsPipeline/Snow.cpp     | 32 ++++++++++++++++
+ .../GraphicsPipeline/ToneMapping.cpp          | 12 +++---
+ .../GraphicsPipeline/VolumetricClouds.cpp     | 18 ++++++++-
+ .../GraphicsPipeline/VolumetricFog.cpp        | 34 +++++++++++++++--
+ .../HWScripts/CryFX/PostEffectsGame.cfx       | 38 ++++++++++++++++++-
+ .../Shaders/HWScripts/CryFX/VolumetricFog.cfi | 15 ++++++++
+ 7 files changed, 145 insertions(+), 14 deletions(-)
+
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/SceneForward.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/SceneForward.cpp
+index 40b39bfc..3967b4d9 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/SceneForward.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/SceneForward.cpp
+@@ -1312,8 +1312,14 @@ void CSceneForwardStage::FillCloudShadingParams(SCloudShadingParams& cloudParams
+ 
+ 	if (enable)
+ 	{
+-		cloudParams.CloudShadingColorSun = Vec4(paramsPF.pCloudShadingColorSun, 0.0f);
+-		cloudParams.CloudShadingColorSky = Vec4(paramsPF.pCloudShadingColorSky, 0.0f);
++		// S8, decisions/s8-svogi-fog-clouds.md item 4: the legacy forward clouds' half of the
++		// same multiply the volumetric clouds stage does. Both are radiances; both have to
++		// follow the aperture or the cloud/sky seam steps. Applied at the consumer, on the
++		// render thread, because the fill these come from runs on the main thread.
++		// Exactly 1.0 off the switch.
++		const float sceneExposure = gcpRendD3D->GetSceneReferredExposure();
++		cloudParams.CloudShadingColorSun = Vec4(paramsPF.pCloudShadingColorSun * sceneExposure, 0.0f);
++		cloudParams.CloudShadingColorSky = Vec4(paramsPF.pCloudShadingColorSky * sceneExposure, 0.0f);
+ 	}
+ 	else
+ 	{
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Snow.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Snow.cpp
+index 5b05a544..ea5f8437 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Snow.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Snow.cpp
+@@ -18,6 +18,15 @@ struct SSnowClusterCB
+ 	Vec4     vSnowClusterPos;
+ 	Vec4     vSnowClusterPosPrev;
+ 	Matrix34 mSnowOccMatr;
++	// S8, decisions/s8-svogi-fog-clouds.md item 5 approach A: the Rec.709 -> working-space
++	// matrix as a DELTA from identity, three rows, .w unused. CSnowStage is the one scene
++	// writer that runs AFTER ExecuteSceneReferredConversion(), so the flake's own lighting term
++	// - which it takes from the per-view CV_SunColor / CV_SkyColor, both Rec.709 - has to carry
++	// the conversion itself. Stored as a delta for the same reason CV_SceneLuminanceWeightsDelta
++	// is: off the switch it is all zeros and the shader adds an exact 0.
++	Vec4     vSnowWorkingDelta0;
++	Vec4     vSnowWorkingDelta1;
++	Vec4     vSnowWorkingDelta2;
+ };
+ }
+ 
+@@ -772,6 +781,26 @@ void CSnowStage::RenderSnowClusters()
+ 		renderState = ReverseDepthHelper::ConvertDepthFunc(renderState);
+ 	}
+ 
++	// The Rec.709 -> working-space matrix, minus identity, built from the one CPU conversion the
++	// tree owns. Identity (and therefore all zeros) whenever the HDR target is not actually AP1,
++	// so the stock path adds an exact zero and stays bit-identical.
++	Vec3 workingDelta[3];
++	{
++		const Vec3 basis[3] = { Vec3(1, 0, 0), Vec3(0, 1, 0), Vec3(0, 0, 1) };
++		for (int i = 0; i < 3; ++i)
++		{
++			const Vec3 converted = CRendererResources::ToWorkingSpace(basis[i]);
++			workingDelta[i] = Vec3(converted.x - basis[i].x, converted.y - basis[i].y, converted.z - basis[i].z);
++		}
++	}
++	// Column-major fill: row r of the matrix is (delta[0][r], delta[1][r], delta[2][r]).
++	{
++		const Vec3 c0 = workingDelta[0], c1 = workingDelta[1], c2 = workingDelta[2];
++		workingDelta[0] = Vec3(c0.x, c1.x, c2.x);
++		workingDelta[1] = Vec3(c0.y, c1.y, c2.y);
++		workingDelta[2] = Vec3(c0.z, c1.z, c2.z);
++	}
++
+ 	static CCryNameTSCRC tech0Name("SceneSnow");
+ 	const Vec4 vSnowFlakeParams = Vec4(snowVolParams.m_fSnowFallBrightness, min(10.0f, snowVolParams.m_fSnowFlakeSize), snowVolParams.m_fSnowFallTurbulence, snowVolParams.m_fSnowFallTurbulenceFreq);
+ 	const Vec4 vWaterLevel = Vec4(PF.vWaterLevel, 0.0f);
+@@ -816,6 +845,9 @@ void CSnowStage::RenderSnowClusters()
+ 
+ 			auto constants = pPrim->GetConstantManager().BeginTypedConstantUpdate<SSnowClusterCB>(eConstantBufferShaderSlot_PerPrimitive, EShaderStage_Vertex | EShaderStage_Pixel);
+ 
++			constants->vSnowWorkingDelta0 = Vec4(workingDelta[0], 0.0f);
++			constants->vSnowWorkingDelta1 = Vec4(workingDelta[1], 0.0f);
++			constants->vSnowWorkingDelta2 = Vec4(workingDelta[2], 0.0f);
+ 			constants->vWaterLevel = vWaterLevel;
+ 			constants->vSnowFlakeParams = vSnowFlakeParams;
+ 			constants->vSnowClusterPos = Vec4(cluster.m_pPos, 1.0f);
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.cpp
+index f4730a17..1e11ecc5 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.cpp
+@@ -858,15 +858,17 @@ void CToneMappingStage::DisplaySceneReferredCoverage()
+ 	const bool bSvo   = cvarOn("e_svoTI_Apply") && cvarOn("e_svoTI_Active");
+ 	const bool bFog   = cvarOn("e_Fog");
+ 	const bool bVFog  = cvarOn("e_VolumetricFog");
++	const bool bSnow  = cvarOn("r_Snow");
+ 
+ 	char str[256];
+-	cry_sprintf(str, "  pre-exposure reaches: sun+lights YES  probes YES (tint; re-bake for PI)  sky YES  forward/emissive YES  SVOGI %s",
+-	            bSvo ? "YES (at ApplyGI + SvoGiFog)" : "YES (off)");
++	cry_sprintf(str, "  pre-exposure reaches: sun+lights YES  probes YES (tint; re-bake for PI)  sky YES  forward/emissive YES");
+ 	IRenderAuxText::DrawText(Vec3(5, 155, 1), IRenderAuxText::ASize(1.0f), ColorF(1, 0, 1, 1), eDrawText_800x600 | eDrawText_2D, str);
+ 
+-	cry_sprintf(str, "  NOT reached (S8): global fog %s  volumetric fog sun/height %s   | ambient lights: n/a, they modulate",
+-	            bFog  ? "ON  <- try e_Fog 0"                        : "off",
+-	            bVFog ? "ON"                                        : "off");
++	cry_sprintf(str, "    ... SVOGI %s  global fog %s  volumetric fog %s  clouds YES  snow %s  | ambient lights: n/a, they modulate",
++	            bSvo  ? "YES (ApplyGI+SvoGiFog)"      : "YES (off)",
++	            bFog  ? "YES"                         : "YES (off)",
++	            bVFog ? "YES (sun+emission)"          : "YES (off)",
++	            bSnow ? "YES (flakes+709->AP1)"       : "YES (off)");
+ 	IRenderAuxText::DrawText(Vec3(5, 175, 1), IRenderAuxText::ASize(1.0f), ColorF(1, 0, 1, 1), eDrawText_800x600 | eDrawText_2D, str);
+ }
+ 
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/VolumetricClouds.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/VolumetricClouds.cpp
+index d685b0ee..3120554d 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/VolumetricClouds.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/VolumetricClouds.cpp
+@@ -1468,7 +1468,23 @@ void CVolumetricCloudsStage::GenerateCloudShaderParam(::VCCloudRenderContext& co
+ 			const auto& viewInfo = viewInfos[i];
+ 			SVolumetricCloudsShaderParam& cb = bufferData[i];
+ 
+-			cb.shadeColorFromSun = PF.pCloudShadingColorSun;
++			// S8, decisions/s8-svogi-fog-clouds.md item 4. The cloud shading sun colour is a
++			// radiance derived from GetSunColor() and it did not carry the pre-exposure, so at a
++			// small aperture the sky darkened (S1 exposed it) and the clouds did not - a hard,
++			// wrong-looking brightness step at every cloud edge.
++			//
++			// The decision note put this multiply at the CPU fill (D3DHWShader.cpp). It is here
++			// instead, at the two CONSUMERS, for the same reason S1 moved the sky multipliers to
++			// CSkyStage: that fill is ReadPerFrameShaderConstants, which runs on the MAIN thread,
++			// and the pre-exposure latch is a render-thread value - reading it there is the
++			// in-frame tearing trap of s1-adapted-scene-scale.md 8.3. The other consumer is
++			// CSceneForwardStage::FillCloudShadingParams for the legacy forward clouds.
++			//
++			// sunIntensityForAtmospheric below is deliberately NOT exposed: it is a scattering
++			// coefficient multiplier, not a radiance, and exposing it would double-count against
++			// this one. Every other cloud knob (scatter, albedo, powder, extinction) is
++			// dimensionless. Exactly 1.0 off the switch.
++			cb.shadeColorFromSun = PF.pCloudShadingColorSun * gcpRendD3D->GetSceneReferredExposure();
+ 			cb.waterLevel = PF.vWaterLevel.x; // static water ocean level
+ 
+ 			cb.cameraPos = viewInfo.cameraOrigin;
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/VolumetricFog.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/VolumetricFog.cpp
+index 689a3172..c266237b 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/VolumetricFog.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/VolumetricFog.cpp
+@@ -1105,9 +1105,19 @@ void CVolumetricFogStage::GenerateLightList()
+ 			lightCullInfo.posRad = Vec4(posVS.x, posVS.y, posVS.z, volumeSize);
+ 			lightShadeInfo.attenuationParams = Vec2(renderLight.m_fAttenuationBulbSize, minBulbSize);
+ 			lightCullInfo.depthBounds = Vec2(posVS.z - volumeSize, posVS.z + volumeSize);
+-			lightShadeInfo.color = Vec4(renderLight.m_Color.r * itensityScale,
+-			                            renderLight.m_Color.g * itensityScale,
+-			                            renderLight.m_Color.b * itensityScale,
++			// S8, research/s8-fog-and-clouds.md 2.5: the same bug the deferred twin had, in the
++			// same shape, found while reading. List index 1 is eDLT_DeferredAmbientLight, and an
++			// ambient light is a multiplicative TINT over an accumulator that already carries the
++			// pre-exposure, not a radiance - pre-exposing it applies the exposure twice inside
++			// the shader's lerp and moves the `lightColor > 1` darken/brighten decision boundary.
++			// TiledLightVolumes.cpp carries the identical guard and the identical reasoning.
++			// Probes (list 0) keep the scale: they are baked at unity and the tint is what
++			// exposes them. Off the switch itensityScale is 1.0 and both branches are identical.
++			const bool bAmbientLightList = (lightListIdx == 1);
++			const float lightIntensityScale = bAmbientLightList ? 1.0f : itensityScale;
++			lightShadeInfo.color = Vec4(renderLight.m_Color.r * lightIntensityScale,
++			                            renderLight.m_Color.g * lightIntensityScale,
++			                            renderLight.m_Color.b * lightIntensityScale,
+ 			                            renderLight.m_fFogRadialLobe);
+ 			lightShadeInfo.resIndex = 0;
+ 			lightShadeInfo.resMipClamp0 = 0;
+@@ -1667,6 +1677,9 @@ void CVolumetricFogStage::GenerateFogVolumeList()
+ 	const Vec3 cameraFront = viewInfo.cameraVZ.GetNormalized();
+ 	const AABB aabbInObj(1.0f);
+ 
++	// The latched pre-exposure for this render view, exactly 1.0 off the switch.
++	const float sceneExposure = gcpRendD3D->GetSceneReferredExposure();
++
+ 	// NOTE: Get aligned stack-space (pointer and size aligned to manager's alignment requirement)
+ 	CryStackAllocWithSizeVector(SFogVolumeCullInfo, CRenderView::MaxFogVolumeNum, cullInfoArray, CDeviceBufferManager::AlignBufferSizeForStreaming);
+ 	CryStackAllocWithSizeVector(SFogVolumeInjectInfo, CRenderView::MaxFogVolumeNum, injectInfoArray, CDeviceBufferManager::AlignBufferSizeForStreaming);
+@@ -1755,7 +1768,12 @@ void CVolumetricFogStage::GenerateFogVolumeList()
+ 
+ 			injectInfo.noiseOffset = fvol.m_noiseOffset;
+ 
+-			injectInfo.emission = fvol.m_emission;
++			// S8, decisions/s8-svogi-fog-clouds.md item 3 A2: a fog volume's authored emission is
++			// the same class of quantity as an emissive material - kcd/m2 of authored radiance -
++			// and S1 settled that those follow the aperture. Without this an emissive fog volume
++			// stays lit at f/22. The albedo (m_pVolFogBufDensityColor) is deliberately NOT
++			// exposed: it is a scattering albedo that multiplies lighting.
++			injectInfo.emission = fvol.m_emission * sceneExposure;
+ 			injectInfo.padding = 0.0f;
+ 
+ 			injectInfo.worldToObjMatrix = fvol.m_matWSInv;
+@@ -2078,6 +2096,14 @@ void CVolumetricFogStage::ExecuteInjectInscatteringLight(const SScopedComputeCom
+ 		// reconstruct vanilla sun color because it's divided by pi in ConvertIlluminanceToLightColor().
+ 		sunColor *= gf_PI;
+ 	}
++
++	// S8, decisions/s8-svogi-fog-clouds.md item 3 A1: the fog's SUN, pre-exposed. Until now the
++	// fog's LIGHT LIST carried the exposure (GenerateLightList) and its sun did not, so the
++	// aperture changed the fog's colour BALANCE between its sun-lit and its lamp-lit halves -
++	// a units tear inside one subsystem. One multiply, next to the PI gate, exactly 1.0 off the
++	// switch. ExponentialHeightFogColor below is a scattering ALBEDO and stays untouched.
++	sunColor *= gcpRendD3D->GetSceneReferredExposure();
++
+ 	static CCryNameR paramSunColor("SunColor");
+ 	const Vec4 vParamSunColor(sunColor.x, sunColor.y, sunColor.z, 0.0f);
+ 	pass.SetConstant(paramSunColor, vParamSunColor);
+diff --git a/Engine/Shaders/HWScripts/CryFX/PostEffectsGame.cfx b/Engine/Shaders/HWScripts/CryFX/PostEffectsGame.cfx
+index aa1cc493..4f9c267e 100644
+--- a/Engine/Shaders/HWScripts/CryFX/PostEffectsGame.cfx
++++ b/Engine/Shaders/HWScripts/CryFX/PostEffectsGame.cfx
+@@ -1545,6 +1545,11 @@ cbuffer CBSnowCluster : register(b0)
+ 	float4   vSnowClusterPos;
+ 	float4   vSnowClusterPosPrev;
+ 	float3x4 mSnowOccMatr;
++	// Rec.709 -> working-space matrix MINUS IDENTITY, one row each, .w unused. All zeros off
++	// the switch (Snow.cpp), so the add below is an exact zero and the stock path is unchanged.
++	float4   vSnowWorkingDelta0;
++	float4   vSnowWorkingDelta1;
++	float4   vSnowWorkingDelta2;
+ };
+ 
+ Texture2D snSceneTargetTex : register(t0) = $SceneTarget;
+@@ -1737,7 +1742,23 @@ pixoutSnow SceneSnowPS(vtxOutSnow IN)
+ 	OUT.Color = snSceneTargetTex.SampleLevel(snPointClampSampler, screenTC.xy + vSnowBump.xy * 0.25h, 0.0f);
+ 
+ 	// Apply snow flake lighting and texture.
+-	OUT.Color.xyz += cSnowFlake * (IN.vVelocity.w * CV_SunColor.xyz + CV_SkyColor.xyz);
++	//
++	// S8, decisions/s8-svogi-fog-clouds.md item 5. This is the flake's OWN light, and it was
++	// wrong on two counts at once. CV_SunColor / CV_SkyColor are the per-view constants taken
++	// straight from the 3D engine: Rec.709, and NOT pre-exposed (the exposed sun lives in
++	// CRenderView::GetSunLightColor(), which this path does not go through). CSnowStage draws
++	// after the 709 -> AP1 conversion, so the term was being added, un-exposed and in the wrong
++	// primaries, onto an exposed AP1 image: snowfall that ignored the aperture completely and
++	// glared white when stopping down, plus a hue error under a warm low sun.
++	//
++	// The base colour above is NOT touched - it is a refracted read of $SceneTarget, which is a
++	// copy of the already-converted, already-exposed scene, and it is correct today.
++	half3 cFlakeLight = IN.vVelocity.w * CV_SunColor.xyz + CV_SkyColor.xyz;
++	cFlakeLight += half3(dot(vSnowWorkingDelta0.xyz, cFlakeLight),
++	                     dot(vSnowWorkingDelta1.xyz, cFlakeLight),
++	                     dot(vSnowWorkingDelta2.xyz, cFlakeLight));
++	cFlakeLight *= PS_HDR_RANGE_ADAPT_MAX;
++	OUT.Color.xyz += cSnowFlake * cFlakeLight;
+ 	OUT.Color.w = fSnowFlake * fSoftIsec * IN.baseTC.z;
+ 
+ #if %_RT_SAMPLE0
+@@ -1782,7 +1803,20 @@ pixoutSnow SnowHalfResCompositePS(vtxOut IN)
+ 	const half4 cB = lerp( c01, c11, vFrac.x );
+ 
+ 	OUT.Color = lerp( cA, cB, vFrac.y );
+-	OUT.Color = saturate(OUT.Color * 10.0); // small brightness boost as half-res introduces some smoothing/darkening
++
++	// S8, research/s8-particles-rain-lensoptics.md 2.3(c). The x10 is an authored brightness
++	// boost and stays; the saturate that followed it does not. On the stock path "1.0" was
++	// bright, so clamping there was a display-referred nicety; on the scene-referred path 1.0 is
++	// 10 000 cd/m2 and a daylight frame lives far above it, so this line crushed EVERYTHING
++	// behind the half-res snow layer - which is written back into the HDR target, upstream of
++	// bloom, the glare family and the meter - to a flat plateau. The scene-referred branch keeps
++	// only the writer clamp every other fp16 writer is held to. SCENE_WRITER_CLAMP is 0 off the
++	// switch, so the stock line is compiled exactly as it was.
++	// Colour only: .a is the layer's blend weight for GS_BLSRC_SRCALPHA and must stay in [0,1].
++	if (SCENE_WRITER_CLAMP > 0)
++		OUT.Color = half4(min(OUT.Color.rgb * 10.0, (half3)SCENE_WRITER_CLAMP), saturate(OUT.Color.a * 10.0));
++	else
++		OUT.Color = saturate(OUT.Color * 10.0); // small brightness boost as half-res introduces some smoothing/darkening
+ 
+ 	// Velocity
+ 	const half4 v00 = shVelocityScaledTex.Sample( shPointClampSampler, IN.baseTC.xy );
+diff --git a/Engine/Shaders/HWScripts/CryFX/VolumetricFog.cfi b/Engine/Shaders/HWScripts/CryFX/VolumetricFog.cfi
+index 8331bc29..e9dde4e3 100644
+--- a/Engine/Shaders/HWScripts/CryFX/VolumetricFog.cfi
++++ b/Engine/Shaders/HWScripts/CryFX/VolumetricFog.cfi
+@@ -138,6 +138,21 @@ float4 GetVolumetricFogColorInternal(
+ 
+ 	fogColor += radialLobe * radialSize * fogParams.radialColor * radialFogShadowInfluence;
+ 
++	// S8, decisions/s8-svogi-fog-clouds.md item 2 approach A. The legacy fog colour is an
++	// AUTHORED radiance in engine units - colGradBase, colGradDelta and radialColor all come
++	// straight off the TOD, none of them is derived from the sun - so it is the same class of
++	// quantity as the skybox emittance and it has to follow the aperture like one. Until now it
++	// did not, and fog is often the brightest thing in shadow at distance: it pinned the shadow
++	// values and a night scene washed out to a flat grey veil.
++	//
++	// One multiply, here rather than at the three CPU constants, because every consumer of
++	// GetVolumetricFogColor* goes through this function - the fog pass, the forward shading path
++	// and the volumetric-fog blend - and because colGradDelta is a DIFFERENCE of two colours,
++	// which is only safe to scale separately while the recombination above stays linear.
++	// Density and falloff are transmittances and are deliberately untouched.
++	// Exactly 1.0 off the switch.
++	fogColor *= PS_HDR_RANGE_ADAPT_MAX;
++
+ 	return float4(fogColor, fog);
+ }
+ 
+-- 
+2.47.1.windows.1
+

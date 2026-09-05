@@ -1,0 +1,210 @@
+From 985f8de4220360649986d28d9643fc41c3c3aa34 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Fri, 28 Aug 2026 08:45:39 +0800
+Subject: [PATCH 074/119] scene-referred S2 review fix: the light paths that
+ bypass the BRDF helpers
+
+Fable's S2 review rejected "area lights are 1.65 stops hot" as known breakage, correctly: the LTC
+path never calling SpecularBRDF is a MISS of the pi unification (D4), not something D13 covers.
+Fixed, together with the seven other bypasses the audit turned up.
+
+Shader-only. No C++ changed, so no DLL was rebuilt or redeployed.
+
+- Area lights, the required fix. AreaLightLTC_GGX now applies SCENE_BRDF_NORM_FACTOR to both
+  outDiffuse and outSpecular, once, after the Fresnel/cosine term - so all six callers (Illum,
+  Glass, HumanSkin, Terrain, MultiLayeredMaterials, and TiledShading's deferred
+  LIGHT_TYPE_REGULAR_AREA branch) are covered by one multiply. The integrators return a bare form
+  factor: LTC_Rectangle ends at `sum = len * scale`, LTC_Disk at `sum = formFactor * scale`, with
+  no 1/PI anywhere, so this path carries exactly the same missing normalisation as DiffuseBRDF and
+  SpecularBRDF.
+
+- Seven more, found by the audit and fixed the same way:
+  * ThinTranslucencyBRDF - the one that would have hurt most. It SUBSTITUTES for DiffuseBRDF in
+    TiledShading's deferred translucent branch and in Vegetation's %GRASS / %LEAVES branch, so
+    leaves would have been PI times brighter than the trunk of the same tree.
+  * Hair (wrapped diffuse + two Kajiya-Kay lobes) and Eye (iris/sclera wrap + BlinnBRDF cornea) -
+    own lobes, never touch the helpers.
+  * Glass's diffuse wrap term only; its specular already goes through SpecularBRDF, and applying
+    the factor to finalIlluminance would have squared it there.
+  * The ocean sun glint (Water.cfx SunSpecular) and the particle sun specular (Particles.cfi) -
+    ad-hoc lobes, but both driven by CV_SunColor, which is PI times larger on this path.
+  * MobileComposition's two Lambert diffuse terms (not the desktop path; done for consistency).
+
+- NOT given the factor, and the reason recorded for each: ambient lights (multiplicative tints),
+  environment probes (a cosine-weighted cubemap is already E/PI and enters no BRDF), emissive,
+  the sky family (emitters), decals (no light path of their own - deferred ones are lit through
+  the G-buffer, forward ones are Illum's %DECAL permutation), SSS (a screen-space pass over the
+  already-shaded buffer), and the bulb x121 round trip (unit-neutral, and folding PI in would
+  desync culling radii from shading).
+
+- The find of the pass: MultiLayeredMaterials' punctual BRDF is ALREADY fully normalised - its
+  GGX NDF has `PI * sqr(denom)` and its diffuse is `diffuse / PI` - so it must not receive the
+  constant. The corollary is that MLM has been PI times DARK relative to Illum on the STOCK path
+  all along, and becomes consistent for the first time on the scene-referred one. Its area branch
+  delegates to AreaLightLTC_GGX, so it was inconsistent with its own punctual branch too; that is
+  now fixed as well.
+
+Full classification of every light path - "gets the factor via X" / "does not need it because Y" /
+"was missing" - appended and dated as scene-notes/research/s2-pi-and-light-units.md section 7.
+
+Two things could not be settled by reading code, and are recorded rather than guessed: whether
+LTCTex_2.w already carries the reference LTC's 1/(2PI) (this fix makes area lights agree with
+point lights in the same engine, which is what D4 asks; the absolute calibration still needs the
+section 6 experiment), and whether the ad-hoc lobes should be exactly 1/PI - they are tuned
+approximations, so the factor is the defensible choice rather than a provable one, and their look
+wants one eyeball pass against Illum.
+
+Every change is one multiply by a constant that is exactly 1.0 off the switch, with no new shader
+permutations.
+
+Co-Authored-By: Claude Opus <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01A72MFkdSczncE7au9UVnmu
+---
+ Engine/Shaders/HWScripts/CryFX/Eye.cfx            |  5 +++--
+ Engine/Shaders/HWScripts/CryFX/Glass.cfx          |  4 +++-
+ Engine/Shaders/HWScripts/CryFX/Hair.cfx           |  7 +++++--
+ .../Shaders/HWScripts/CryFX/MobileComposition.cfx |  5 +++--
+ Engine/Shaders/HWScripts/CryFX/Particles.cfi      |  4 +++-
+ Engine/Shaders/HWScripts/CryFX/Water.cfx          |  5 ++++-
+ Engine/Shaders/HWScripts/CryFX/shadeLib.cfi       | 15 ++++++++++++++-
+ 7 files changed, 35 insertions(+), 10 deletions(-)
+
+diff --git a/Engine/Shaders/HWScripts/CryFX/Eye.cfx b/Engine/Shaders/HWScripts/CryFX/Eye.cfx
+index 527a49e1..2d9320d1 100644
+--- a/Engine/Shaders/HWScripts/CryFX/Eye.cfx
++++ b/Engine/Shaders/HWScripts/CryFX/Eye.cfx
+@@ -317,8 +317,9 @@ void Callback_ShadingDirect(in ForwardShadingAttribs attribs, in ForwardLightPar
+ 	}
+ #endif
+ 
+-	diffuseAcc = cDiffuse.xyz * light.illuminance;
+-	specularAcc = cSpecular.xyz * light.illuminance;
++	// D4: same as hair - the iris/sclera wrap diffuse and BlinnBRDF bypass the shared helpers.
++	diffuseAcc = cDiffuse.xyz * light.illuminance * SCENE_BRDF_NORM_FACTOR;
++	specularAcc = cSpecular.xyz * light.illuminance * SCENE_BRDF_NORM_FACTOR;
+ }
+ 
+ #include "ForwardShading.cfi"
+diff --git a/Engine/Shaders/HWScripts/CryFX/Glass.cfx b/Engine/Shaders/HWScripts/CryFX/Glass.cfx
+index 0cc0e347..ff7d9415 100644
+--- a/Engine/Shaders/HWScripts/CryFX/Glass.cfx
++++ b/Engine/Shaders/HWScripts/CryFX/Glass.cfx
+@@ -256,7 +256,9 @@ void Callback_ShadingDirect(in ForwardShadingAttribs attribs, in ForwardLightPar
+ 	else
+     {
+ 		half3 finalIlluminance = NdotL * light.illuminance * NdotLBackLight;
+-		diffuseAcc = finalIlluminance;
++		// D4: only the DIFFUSE term needs it here - the specular below goes through SpecularBRDF,
++		// which already carries the constant, and applying it to finalIlluminance would square it.
++		diffuseAcc = finalIlluminance * SCENE_BRDF_NORM_FACTOR;
+ 		specularAcc = SpecularBRDF(attribs.normal, -normalize(attribs.worldPos), light.lightVec, attribs.smoothness, attribs.reflectance) * finalIlluminance;
+     }
+ 
+diff --git a/Engine/Shaders/HWScripts/CryFX/Hair.cfx b/Engine/Shaders/HWScripts/CryFX/Hair.cfx
+index f81b0690..c574ac4e 100644
+--- a/Engine/Shaders/HWScripts/CryFX/Hair.cfx
++++ b/Engine/Shaders/HWScripts/CryFX/Hair.cfx
+@@ -265,8 +265,11 @@ void Callback_ShadingDirect(in ForwardShadingAttribs attribs, in ForwardLightPar
+ 		cSpecular.xyz *= fOcclusion;
+ 	}
+ 
+-	diffuseAcc.xyz = cDiffuse.xyz * light.illuminance;
+-	specularAcc.xyz = cSpecular.xyz * light.illuminance;
++	// D4: hair uses its own lobes (wrapped diffuse, Kajiya-Kay anisotropic) and never calls
++	// DiffuseBRDF/SpecularBRDF, so it needs the normalisation constant applied by hand or hair is
++	// 1.65 stops hot against every other surface on the scene-referred path.
++	diffuseAcc.xyz = cDiffuse.xyz * light.illuminance * SCENE_BRDF_NORM_FACTOR;
++	specularAcc.xyz = cSpecular.xyz * light.illuminance * SCENE_BRDF_NORM_FACTOR;
+ }
+ 
+ #include "ForwardShading.cfi"
+diff --git a/Engine/Shaders/HWScripts/CryFX/MobileComposition.cfx b/Engine/Shaders/HWScripts/CryFX/MobileComposition.cfx
+index 24676659..ab498449 100644
+--- a/Engine/Shaders/HWScripts/CryFX/MobileComposition.cfx
++++ b/Engine/Shaders/HWScripts/CryFX/MobileComposition.cfx
+@@ -103,7 +103,8 @@ pixout LightingMobilePS(vtxOutWPOS IN)
+ 	// Sun
+ 	{
+ 		float NdotL = saturate(dot(attribs.NormalWorld, CV_SunLightDir.xyz));
+-		diffuseAcc += NdotL * CV_SunColor.xyz;
++		// D4: bare Lambert, no 1/PI. The specular below is SpecularBRDF and already has it.
++		diffuseAcc += NdotL * CV_SunColor.xyz * SCENE_BRDF_NORM_FACTOR;
+ 		specularAcc += SpecularBRDF(attribs.NormalWorld, viewVec, CV_SunLightDir.xyz, attribs.Smoothness, attribs.Reflectance) * NdotL * CV_SunColor.xyz * CV_SunColor.w;
+ 	}
+ 	
+@@ -146,7 +147,7 @@ pixout LightingMobilePS(vtxOutWPOS IN)
+ 			lightVec = normalize(lightVec);
+ 			float NdotL = saturate(dot(attribs.NormalWorld, lightVec));
+ 			
+-			diffuseAcc += NdotL * illuminance;
++			diffuseAcc += NdotL * illuminance * SCENE_BRDF_NORM_FACTOR;  // D4, as above
+ 			specularAcc += SpecularBRDF(attribs.NormalWorld, viewVec, lightVec.xyz, attribs.Smoothness, attribs.Reflectance) * NdotL * illuminance * light.color.a;
+ 		}
+ 	}
+diff --git a/Engine/Shaders/HWScripts/CryFX/Particles.cfi b/Engine/Shaders/HWScripts/CryFX/Particles.cfi
+index 4b92ceaa..f92456ef 100644
+--- a/Engine/Shaders/HWScripts/CryFX/Particles.cfi
++++ b/Engine/Shaders/HWScripts/CryFX/Particles.cfi
+@@ -975,7 +975,9 @@ pixoutParticle ParticlePS(OutputVS IN)
+ 				sunIntensity *= IN.blendTC.w;
+ 			#endif
+ 
+-			cSpecularAcc.rgb += BlinnBRDF(vNormal, vView, CV_SunLightDir, fGloss) * saturate(dot(vNormal, CV_SunLightDir.xyz)) * sunIntensity;
++			// D4: BlinnBRDF carries no 1/PI and sunIntensity is CV_SunColor, which is PI times
++			// larger on the scene-referred path.
++			cSpecularAcc.rgb += BlinnBRDF(vNormal, vView, CV_SunLightDir, fGloss) * saturate(dot(vNormal, CV_SunLightDir.xyz)) * sunIntensity * SCENE_BRDF_NORM_FACTOR;
+ 			cSpecularAcc *= MatSpecColor.rgb;
+ 
+ 			// combine with diffuse, but make sure we stay energy conservant
+diff --git a/Engine/Shaders/HWScripts/CryFX/Water.cfx b/Engine/Shaders/HWScripts/CryFX/Water.cfx
+index 3ead4247..3d4cf83d 100644
+--- a/Engine/Shaders/HWScripts/CryFX/Water.cfx
++++ b/Engine/Shaders/HWScripts/CryFX/Water.cfx
+@@ -986,7 +986,10 @@ void SunSpecular(in v2f_hs IN, half fNdotL, half3 vNormal, half3 vView, inout ha
+ 	// cSunSpecular *= saturate(dot(cSpecularAcc.xyz, 0.333)*dot(cSpecularAcc.xyz, 0.333)); // squashes sun specular result with low SunColor value
+ 
+ 	// Add sun specular term
+-	cSpecularAcc.xyz += cSunSpecular.xyz;
++	// D4: an ad-hoc two-lobe glint, not a normalised BRDF, but it is driven by CV_SunColor - which
++	// is PI times larger on the scene-referred path - so without the constant the ocean's sun glint
++	// jumps 1.65 stops relative to every other specular in the frame.
++	cSpecularAcc.xyz += cSunSpecular.xyz * SCENE_BRDF_NORM_FACTOR;
+ #endif
+ }
+ 
+diff --git a/Engine/Shaders/HWScripts/CryFX/shadeLib.cfi b/Engine/Shaders/HWScripts/CryFX/shadeLib.cfi
+index 7734879d..2166aadb 100644
+--- a/Engine/Shaders/HWScripts/CryFX/shadeLib.cfi
++++ b/Engine/Shaders/HWScripts/CryFX/shadeLib.cfi
+@@ -822,6 +822,16 @@ void AreaLightLTC_GGX(float3 N, float3 V, float Gloss, float3 SpecCol, float3 po
+ 	// Apply fresnel and shadowing term + cosine factor
+     float cosTheta_i = saturate(dot(center, N));
+     outSpecular *= cosTheta_i * SpecCol * F_G.x + (1.0 - SpecCol) * F_G.y;
++
++    // SceneReferredSpec.md D4. The LTC integrators return a bare form factor - LTC_Rectangle ends
++    // at `sum = len * scale` and LTC_Disk at `sum = formFactor * scale`, with no 1/PI (and no
++    // 1/(2PI)) anywhere - so this path carries the same missing normalisation as DiffuseBRDF and
++    // SpecularBRDF and must receive the same constant, or area lights sit 1.65 stops above point
++    // lights on the scene-referred path. Applied once here, after the Fresnel/cosine term, so all
++    // six callers (Illum, Glass, HumanSkin, Terrain, MultiLayeredMaterials, TiledShading's
++    // deferred branch) are covered by one multiply. Exactly 1.0 off the switch.
++    outDiffuse  *= SCENE_BRDF_NORM_FACTOR;
++    outSpecular *= SCENE_BRDF_NORM_FACTOR;
+ }
+ 
+ // Diffuse BRDFs
+@@ -894,7 +904,10 @@ half3 ThinTranslucencyBRDF(half3 N, half3 L, half3 transmittanceColor)
+ 	half transmittance = saturate((-NdotL + w) * wn);
+ 	half diffuse = saturate((NdotL + w) * wn);
+ 	
+-	return transmittanceColor * transmittance + diffuse;
++	// D4: this SUBSTITUTES for DiffuseBRDF (TiledShading.cfi's deferred translucent branch,
++	// Vegetation's %GRASS / %LEAVES branch), so it has to be in the same convention or leaves are
++	// PI times brighter than the trunk of the same tree.
++	return (transmittanceColor * transmittance + diffuse) * SCENE_BRDF_NORM_FACTOR;
+ }
+ 
+ 
+-- 
+2.47.1.windows.1
+

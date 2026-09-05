@@ -1,0 +1,236 @@
+From 7f88530fed5698e98a4e55aec360d656e126c765 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Fri, 28 Aug 2026 21:54:20 +0800
+Subject: [PATCH 093/119] fix: the ODT field's default lived only in the
+ reflection, so an untouched camera loaded no output transform
+
+Root cause: SCineOutputParams::odtFile had no in-class initialiser. The
+Schematyc::CSharedString("Assets/ODT/odt_srgb_100nit_aces2_65.cube") passed to
+AddMember feeds the REFLECTED default - graph node defaults, "reset to default",
+the serializer's skip-if-equal test - and never assigns the member. So the value
+the runtime read at activation was an empty string, EnsureLutSlot took the
+"empty path is a legitimate answer" branch meant for the LMT slot, cleared the
+ODT slot without a word, and the tone map fell through to D13's clamped encode:
+the flat, washed picture the first runtime test reported. Typing any path in
+worked because that went through the property-changed path with a non-empty
+string; the ICryPak lookup itself was never at fault.
+
+Three changes:
+
+- The member gets the in-class initialiser it was missing, from a new
+  kDefaultODTFile constant that is now the single definition of the shipped
+  default (member initialiser, reflected default, and the fallback below).
+- ApplyDisplayLuts substitutes kDefaultODTFile for an empty field. Levels saved
+  before this commit have an empty string ON DISK, so the initialiser alone
+  would not repair them; and an unset field is not a statement about the
+  display, it is a field nobody has touched.
+- The load is now diagnosable. Success logs the ABSOLUTE path the cube came from
+  (ICryPak::AdjustFileName), because "not found" and "found in the other install
+  tree" are indistinguishable in a relative path and those two trees are exactly
+  the pair that gets confused. Failure is a CryWarning, not a CryLog, and names
+  both absolute paths that were tried - D13's behaviour is kept, but the reason
+  is no longer something the user has to go looking for.
+
+README.md and docs/SceneReferredLook.md updated for the empty-field rule and the
+new log lines.
+
+Co-Authored-By: Claude Opus <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01A72MFkdSczncE7au9UVnmu
+---
+ .../Module/CinematicCameraComponent.cpp       | 54 +++++++++++++++----
+ .../Module/CinematicCameraComponent.h         | 17 ++++--
+ Code/CryPlugins/CinematicCamera/README.md     |  2 +-
+ .../CinematicCamera/docs/SceneReferredLook.md | 22 ++++++--
+ 4 files changed, 76 insertions(+), 19 deletions(-)
+
+diff --git a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp
+index d1a9f408..73d8b819 100644
+--- a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp
++++ b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp
+@@ -1220,28 +1220,44 @@ struct SCubeLut
+ // The plugin's Assets folder can be installed into either tree - a project keeps its looks with
+ // its levels, an engine-wide install makes the shipped ODTs available to every project - and a
+ // path written in the editor has to keep working in the launcher whichever one was used.
+-FILE* OpenLutFile(const char* szPath, string& usedPath)
++string ResolveLutPath(const char* szPath)
++{
++	CryPathString adjusted;
++	// No flags: the default behaviour is exactly what a diagnostic wants - alias expansion
++	// (%ENGINE%), mapping into the asset root, and a relative path made absolute.
++	gEnv->pCryPak->AdjustFileName(szPath, adjusted, 0);
++	return string(adjusted.c_str());
++}
++
++FILE* OpenLutFile(const char* szPath, string& usedPath, string& triedPaths)
+ {
+ 	if (!szPath || !szPath[0] || !gEnv->pCryPak)
+ 		return nullptr;
+ 
+ 	usedPath = szPath;
++	triedPaths = ResolveLutPath(usedPath.c_str());
+ 	if (FILE* pFile = gEnv->pCryPak->FOpen(usedPath.c_str(), "rb"))
+ 		return pFile;
+ 
+ 	usedPath = string("%ENGINE%/") + szPath;
+-	return gEnv->pCryPak->FOpen(usedPath.c_str(), "rb");
++	triedPaths += string(" | ") + ResolveLutPath(usedPath.c_str());
++	if (FILE* pFile = gEnv->pCryPak->FOpen(usedPath.c_str(), "rb"))
++		return pFile;
++
++	usedPath.clear();
++	return nullptr;
+ }
+ 
+-bool ParseCubeFile(const char* szPath, SCubeLut& out, string& error)
++bool ParseCubeFile(const char* szPath, SCubeLut& out, string& error, string& resolvedPath)
+ {
+-	string usedPath;
+-	FILE* pFile = OpenLutFile(szPath, usedPath);
++	string usedPath, triedPaths;
++	FILE* pFile = OpenLutFile(szPath, usedPath, triedPaths);
+ 	if (!pFile)
+ 	{
+-		error = "file not found (tried the project asset directory and %ENGINE%)";
++		error.Format("file not found - tried %s", triedPaths.c_str());
+ 		return false;
+ 	}
++	resolvedPath = ResolveLutPath(usedPath.c_str());
+ 
+ 	gEnv->pCryPak->FSeek(pFile, 0, SEEK_END);
+ 	const size_t nSize = (size_t)gEnv->pCryPak->FTell(pFile);
+@@ -1403,11 +1419,16 @@ void EnsureLutSlot(SLutSlot& slot, const char* szPath, const char* szCacheName,
+ 	}
+ 
+ 	SCubeLut lut;
+-	string error;
+-	if (!ParseCubeFile(szWanted, lut, error))
++	string error, resolvedPath;
++	if (!ParseCubeFile(szWanted, lut, error, resolvedPath))
+ 	{
+ 		// Once per path, not once per frame: the requested string is only re-tested on change.
+-		CryLog("[SceneReferred] %s LUT '%s' NOT loaded: %s", szRole, szWanted, error.c_str());
++		// A WARNING and not a log line: without the output transform the picture is a clamped
++		// encode - flat and washed - and the whole point of D13 is that the user is told why
++		// instead of being left to guess at a look. It has to be findable in a console full of
++		// asset spam, so it goes through CryWarning.
++		CryWarning(VALIDATOR_MODULE_RENDERER, VALIDATOR_WARNING,
++		           "[SceneReferred] %s LUT '%s' NOT loaded: %s", szRole, szWanted, error.c_str());
+ 		ClearLutSlot(slot);
+ 		return;
+ 	}
+@@ -1458,7 +1479,11 @@ void EnsureLutSlot(SLutSlot& slot, const char* szPath, const char* szCacheName,
+ 	slot.size = lut.size;
+ 	slot.loaded = true;
+ 
+-	CryLog("[SceneReferred] %s LUT '%s' loaded: %d^3, texture id %d", szRole, szWanted, lut.size, nNewId);
++	// The ABSOLUTE path, not the requested one: "not found" and "found somewhere else than you
++	// think" look identical in a relative path, and the two install trees (project assets and
++	// %ENGINE%) are exactly the pair that gets confused.
++	CryLog("[SceneReferred] %s LUT '%s' loaded: %d^3, texture id %d, from '%s'",
++	       szRole, szWanted, lut.size, nNewId, resolvedPath.c_str());
+ }
+ 
+ } // namespace
+@@ -1475,7 +1500,14 @@ void CCinematicCameraComponent::ApplyDisplayLuts()
+ 	if (!CanDriveRenderState() || !gEnv->pRenderer)
+ 		return;
+ 
+-	EnsureLutSlot(s_lutODT, m_output.odtFile.c_str(), "$ccamODT", "ODT");
++	// An empty ODT field is not a request for "no output transform" - it is a field nobody has
++	// touched, and the picture it produces (a clamped ACEScct encode) looks like a bug because
++	// it is one. The shipped default stands in, so a freshly ticked switch is already correct.
++	const char* szODT = m_output.odtFile.c_str();
++	if (!szODT[0])
++		szODT = kDefaultODTFile;
++
++	EnsureLutSlot(s_lutODT, szODT, "$ccamODT", "ODT");
+ 	EnsureLutSlot(s_lutLMT, m_look.lmtFile.c_str(), "$ccamLMT", "LMT");
+ 
+ 	gEnv->p3DEngine->SetPostEffectParam("Global_User_LutODT",     (float)s_lutODT.texId);
+diff --git a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
+index 7505afd4..6164a99b 100644
+--- a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
++++ b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
+@@ -966,6 +966,10 @@ struct SCineLookParams
+ 	Schematyc::CSharedString lmtFile;
+ };
+ 
++//! The shipped ACES 2.0 SDR 100 nit sRGB output transform. One definition, used as the member's
++//! initialiser, as the reflected default, and as the fallback when the field is empty.
++constexpr const char* kDefaultODTFile = "Assets/ODT/odt_srgb_100nit_aces2_65.cube";
++
+ struct SCineOutputParams
+ {
+ 	inline bool operator==(const SCineOutputParams& rhs) const { return odtFile == rhs.odtFile; }
+@@ -980,12 +984,19 @@ struct SCineOutputParams
+ 			"ACES 2.0 studio config. THE one place in the chain that knows a display exists. "
+ 			"The default is the ACES 2.0 SDR 100 nit sRGB view; swapping this file changes only "
+ 			"what the monitor shows, never the scene data. Empty or unreadable = the picture goes "
+-			"deliberately, visibly wrong (a clamped encode) rather than silently falling back.",
+-			Schematyc::CSharedString("Assets/ODT/odt_srgb_100nit_aces2_65.cube"));
++			"deliberately, visibly wrong (a clamped encode) rather than silently falling back. "
++			"Left empty, the built-in default below is loaded instead - an unset field is not a "
++			"statement about the display, and a component that has never been touched has to "
++			"come up looking right.",
++			Schematyc::CSharedString(kDefaultODTFile));
+ 	}
+ 
+ 	// Keep last: operator== compares the string by value.
+-	Schematyc::CSharedString odtFile;
++	// The in-class initialiser is what the RUNTIME reads. AddMember's default value feeds
++	// Schematyc's reflected default (graph nodes, "reset to default", the serializer's
++	// skip-if-equal test) and never touches the member itself, so a member without one is an
++	// empty string at activation no matter what the reflection says.
++	Schematyc::CSharedString odtFile = kDefaultODTFile;
+ };
+ 
+ class CCinematicCameraComponent final
+diff --git a/Code/CryPlugins/CinematicCamera/README.md b/Code/CryPlugins/CinematicCamera/README.md
+index 8210c53e..6c5b5ea4 100644
+--- a/Code/CryPlugins/CinematicCamera/README.md
++++ b/Code/CryPlugins/CinematicCamera/README.md
+@@ -324,7 +324,7 @@ term; saturation is the ASC's own extension and comes after.
+ 
+ | Property | Range | Default | Effect |
+ | --- | --- | --- | --- |
+-| ODT File | path | `Assets/ODT/odt_srgb_100nit_aces2_65.cube` | The output transform - THE one place in the chain that knows a display exists. The default is the ACES 2.0 SDR 100 nit sRGB view, baked from the OCIO ACES studio config by `tools/ocio-bake`. Swapping this file changes only what the monitor shows, never the scene data. Empty or unreadable = the picture goes deliberately, visibly wrong (a clamped log image) rather than quietly falling back. |
++| ODT File | path | `Assets/ODT/odt_srgb_100nit_aces2_65.cube` | The output transform - THE one place in the chain that knows a display exists. The default is the ACES 2.0 SDR 100 nit sRGB view, baked from the OCIO ACES studio config by `tools/ocio-bake`. Swapping this file changes only what the monitor shows, never the scene data. Unreadable = the picture goes deliberately, visibly wrong (a clamped log image) rather than quietly falling back, with a warning naming every absolute path tried. Empty = the shipped default above is loaded, so a camera nobody has configured still comes up correct. |
+ 
+ Both paths are resolved through the pak system: first as given, relative to the project's asset
+ directory, then under `%ENGINE%`. Install the plugin's `Assets/ODT` folder into either tree and
+diff --git a/Code/CryPlugins/CinematicCamera/docs/SceneReferredLook.md b/Code/CryPlugins/CinematicCamera/docs/SceneReferredLook.md
+index 4be9cd3e..524f6158 100644
+--- a/Code/CryPlugins/CinematicCamera/docs/SceneReferredLook.md
++++ b/Code/CryPlugins/CinematicCamera/docs/SceneReferredLook.md
+@@ -63,10 +63,24 @@ editor and the launcher.
+ * per project: `<project>/<asset dir>/Assets/ODT/`
+ * engine-wide: `<engine>/engine/Assets/ODT/`
+ 
+-If the file cannot be found or parsed, the reason is logged **once** (`[SceneReferred] ODT LUT
+-'...' NOT loaded: ...`) and the picture goes deliberately, visibly wrong - a flat, milky, clamped
+-log image. That is not a bug to chase; it is the missing-ODT state, made impossible to mistake
+-for a correct picture.
++A **successful** load logs the grid size and the absolute path it came from:
++
++```
++[SceneReferred] ODT LUT 'Assets/ODT/odt_srgb_100nit_aces2_65.cube' loaded: 65^3, texture id 42,
++                from 'S:/.../gamesdk/Assets/ODT/odt_srgb_100nit_aces2_65.cube'
++```
++
++The absolute path is there because "not found" and "found in the other tree" are indistinguishable
++in a relative path, and those two trees are exactly the pair that gets confused.
++
++If the file cannot be found or parsed, the reason is a **warning** (`[SceneReferred] ODT LUT '...'
++NOT loaded: ...`), listing both absolute paths that were tried, and the picture goes deliberately,
++visibly wrong - a flat, milky, clamped log image. That is not a bug to chase; it is the
++missing-ODT state, made impossible to mistake for a correct picture.
++
++An **empty** ODT field is not that state. It is a field nobody has filled in, so the shipped
++default (`Assets/ODT/odt_srgb_100nit_aces2_65.cube`) is loaded instead: ticking Scene Referred on
++a camera that has never been touched gives a correct picture, not a diagnosis.
+ 
+ ### Baking another one
+ 
+-- 
+2.47.1.windows.1
+
