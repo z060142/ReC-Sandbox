@@ -1,0 +1,128 @@
+From 7e99d9ea9c81d7f899991a211f967874e700e431 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Tue, 8 Sep 2026 19:36:27 +0800
+Subject: [PATCH 122/135] feat: ambient lights become real fill lights on the
+ scene-referred path
+
+On the stock path an "ambient" light is not a light at all: the deferred shader runs it after the
+environment probes and before the sun and every local light as
+"indirect *= lerp(1, colour, reach)". The number is dimensionless, the engine switches between a
+brightening and a darkening model at 1.0 per channel, and because it multiplies it can put no
+light into a corner the probes do not reach - anything times zero is zero. It is also excluded
+from volumetric fog and its Cast Shadows checkbox does nothing.
+
+Under Scene Referred the light is now routed to the ordinary deferred light list instead, which is
+the whole change: every consumer downstream keys on the light LIST and not on the flag. The tiled
+stage gives it the regular point/projector/area type with the (1+1/bulb)^2 intensity round trip
+and the pre-exposure exactly once, the BRDF gives it the 1/PI, volumetric fog picks it up, and the
+shadow-gen list finally consumes its shadow frustums. The distance fade also becomes the normal
+fade towards black instead of the ambient fade towards white, which is the clearest statement in
+the stock code that the ambient colour is a ratio rather than a radiance.
+
+No shader change is needed and the stock ambient block is untouched, so with the switch off the
+picture is bit-identical. The switch is read from the 3D engine's mirror of it, on the main
+thread, which is the same value the shadow-frustum decision read a moment earlier, so the two
+halves cannot land on opposite sides of a flip within one frame.
+
+This follows the trodden path rather than inventing one: Frostbite, Unreal and Unity HDRP have no
+ambient light entity - the environment probe is the ambient, and fill is an ordinary lamp. The
+price is that the authored number now means the point light's unit, so a level lit with ambient
+lights has to be re-balanced when the switch goes on. That is documented, in the same family as
+the 1.65 stops on point lights.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01HXzRVK4yBVDUNfdWXEwV5y
+---
+ .../CryEngine/RenderDll/Common/RenderView.cpp | 56 ++++++++++++++++++-
+ 1 file changed, 54 insertions(+), 2 deletions(-)
+
+diff --git a/Code/CryEngine/RenderDll/Common/RenderView.cpp b/Code/CryEngine/RenderDll/Common/RenderView.cpp
+index ceecef7f..ed122c75 100644
+--- a/Code/CryEngine/RenderDll/Common/RenderView.cpp
++++ b/Code/CryEngine/RenderDll/Common/RenderView.cpp
+@@ -369,6 +369,24 @@ void CRenderView::PrepareForWriting()
+ 
+ //////////////////////////////////////////////////////////////////////////
+ 
++namespace
++{
++//! Scene-referred pipeline: the 3DEngine-visible mirror of the renderer's r_SceneReferred switch
++//! (E3DPARAM_SCENE_REFERRED, decisions/s2-engine-side-switch.md approach A). Used here rather than
++//! the renderer cvar because AddDeferredLight runs on the MAIN thread, next to the 3DEngine code
++//! that decided a moment earlier whether to build the same light's shadow frustum, and the two must
++//! read one value. Backed by a plain bool on C3DEngine, so this is a virtual call and a switch.
++static bool IsSceneReferredLightConvention()
++{
++	if (!gEnv->p3DEngine)
++		return false;
++
++	Vec3 v(0.0f, 0.0f, 0.0f);
++	gEnv->p3DEngine->GetGlobalParameter(E3DPARAM_SCENE_REFERRED, v);
++	return v.x > 0.5f;
++}
++}
++
+ RenderLightIndex CRenderView::AddDeferredLight(const SRenderLight& pDL, float fMult, const SRenderingPassInfo& passInfo)
+ {
+ 	CRenderView* pRenderView = passInfo.GetRenderView();
+@@ -377,13 +395,44 @@ RenderLightIndex CRenderView::AddDeferredLight(const SRenderLight& pDL, float fM
+ 	bool bSort = true;
+ 	bool bAppend = true;
+ 
++	// Scene-referred pipeline (SceneReferredSpec.md S8, decisions/s8-ambient-lights.md part 2,
++	// approach 2B): an ambient light entity is re-interpreted as a radiometric FILL LIGHT.
++	//
++	// On the stock path DLF_AMBIENT is a multiplicative tint over the indirect accumulator
++	// (TiledShading.cfi:855-938, `diffuseAcc *= lerp(1, colour, k)`), applied after the probes and
++	// before the sun and every local light. It is unitless, it flips between a brightening and a
++	// darkening model at `colour > 1`, and because it MULTIPLIES it can put no light at all into a
++	// corner the probes do not reach - 0 * anything is 0. That is not a light, and there is no
++	// precedent for it: Frostbite, UE and HDRP all express fill as an ordinary emitter and reserve
++	// "ambient" for the environment probe. Under Scene Referred we follow them.
++	//
++	// The whole re-interpretation is this routing decision, because every consumer downstream keys
++	// on the light LIST, not on the flag (research/s8-ambient-lights.md section 5): the tiled stage
++	// gives it tlTypeRegularPoint/Projector/Area with the (1+1/bulb)^2 intensity round trip and the
++	// pre-exposure exactly once, the BRDF gives it the 1/PI, volumetric fog picks it up, and
++	// D3DShadows' shadow-gen list finally consumes its shadow frustums - so Cast Shadows works
++	// instead of dangling a render view (see CLightEntity::UpdateCastShadowFlag). No shader change
++	// is needed and the stock ambient block is untouched, which is what keeps the switch-off path
++	// bit-identical.
++	//
++	// The unit becomes the point light's (colour x Diffuse Multiplier in 10^4/(1+r)^2 cd). That is
++	// content-visible and path-dependent, in the same documented family as the -1.65 stops on point
++	// lights and the area-light rework - see docs/SceneReferredContent.md "Ambient lights".
++	//
++	// Read from the 3DEngine mirror of the switch and not from a renderer cvar: this runs on the
++	// main thread, and it is the same value CLightEntity::UpdateCastShadowFlag tested a moment
++	// earlier when it decided whether to build the light's shadow frustum. One source, no way for
++	// the two halves to land on opposite sides of a flip within one frame.
++	const bool bAmbientAsFillLight = (pDL.m_Flags & (DLF_AMBIENT | DLF_DEFERRED_CUBEMAPS)) == DLF_AMBIENT
++	                                 && IsSceneReferredLightConvention();
++
+ 	eDeferredLightType LightType = eDLT_DeferredLight;
+ 	if (pDL.m_Flags & DLF_DEFERRED_CUBEMAPS)
+ 	{
+ 		LightType = eDLT_DeferredCubemap;
+ 		bSort = false;
+ 	}
+-	else if (pDL.m_Flags & DLF_AMBIENT)
++	else if ((pDL.m_Flags & DLF_AMBIENT) && !bAmbientAsFillLight)
+ 	{
+ 		LightType = eDLT_DeferredAmbientLight;
+ 		bSort = false;
+@@ -457,7 +506,10 @@ RenderLightIndex CRenderView::AddDeferredLight(const SRenderLight& pDL, float fM
+ 		}
+ 	}
+ 
+-	IF_LIKELY((pDL.m_Flags & (DLF_DEFERRED_CUBEMAPS | DLF_AMBIENT)) == 0)
++	// A fill light fades out like any other emitter (towards black). The ambient branch below fades
++	// towards WHITE, which is the clearest statement in the stock code that its colour is a ratio
++	// and not a radiance.
++	IF_LIKELY((pDL.m_Flags & (DLF_DEFERRED_CUBEMAPS | DLF_AMBIENT)) == 0 || bAmbientAsFillLight)
+ 	{
+ 		pAddedLight->m_Color *= fMult;
+ 		pAddedLight->m_SpecMult *= fMult;
+-- 
+2.47.1.windows.1
+

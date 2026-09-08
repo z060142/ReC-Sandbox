@@ -1,0 +1,198 @@
+From f2d30f9854be1b8f78e6a2be976722bdafcaebba Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Tue, 8 Sep 2026 21:37:07 +0800
+Subject: [PATCH 128/135] fix: the metering histogram was built, armed and
+ never dispatched
+
+Metering Mode - Average / Centre-weighted / Spot - changed nothing in the
+picture and no number in r_HDRDebug 1, even with a uniform wall filling the
+centre circle. Everything downstream of the mask was correct; the pass that
+applies it was never called.
+
+ROOT CAUSE. 353be581 added CAutoExposureStage::ExecuteMeterHistogram() - the
+clear, the constants, the dispatch - and added no call site. Nothing in the
+tree ever invoked it (git log -S confirms one commit, zero callers), so the
+64x1 bin target stayed at zero, m_bMeterHistogramValid stayed false, and
+UpdateSceneReferredMeterReadback() took its documented fallback and downloaded
+the shipped whole-frame log-mean instead. That fallback is a meter with no mask
+and no mode, which is exactly what the user saw: AUTO tracked a lamp perfectly
+(the log-mean works) and the mode dial was inert (the log-mean has no mask).
+The mode did reach the bus, the bus did reach the stage, and the shader did
+scale its weight to integers by 256 before InterlockedAdd - none of the
+suspected losses were real, because the code holding them never ran.
+
+CAutoExposureStage::Execute() now dispatches the histogram first: before the
+readback, which chooses its decoder from m_bMeterHistogramValid, and before
+the bloom stage overwrites m_pTexHDRTargetScaled[1][0] one pass later.
+
+The two masks are resized to what a body actually does now that they are live.
+CenterWeighted was a smoothstep from 1.0 to 0.25 across the whole diagonal,
+which is a very soft slope: it is now a Gaussian of sigma = 1/5 frame height on
+a 0.2 pedestal, so the centre owns the meter while the corners keep a fifth of
+a vote and a bright sky can still move it without owning it. The pedestal is
+what keeps this a centre weight and not a soft spot. Spot keeps its disc a
+fifth of the frame height across (~1.8 % of frame area, inside the camera
+standard of 1.5-3 %) and its edge is tightened to +/- 5 % of the radius, so
+outside the circle the weight is zero, no atomic is issued, and ~98 % of the
+frame does not vote. Both are sized in frame-height units, so a mode means the
+same thing on any aspect.
+
+r_HDRDebug 1 gains the two numbers that make a mode change visible even when
+the picture barely moves: the active mode by index and name, and the WEIGHTED
+SAMPLE COUNT in texel-equivalents with its share of the metered frame. Average
+reads 100 %, Centre-weighted about a third, Spot about 2 %. If that number does
+not move when the dial does, the mask is not reaching the accumulation - the
+failure this commit fixes would have been one screenshot instead of a
+fortnight. The log-mean fallback line now says outright that Metering Mode is
+IGNORED on that path, so the same silence cannot be misread again.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01HXzRVK4yBVDUNfdWXEwV5y
+---
+ .../GraphicsPipeline/AutoExposure.cpp         | 13 +++++++
+ .../GraphicsPipeline/ToneMapping.cpp          | 29 ++++++++++++--
+ .../HWScripts/CryFX/HDRPostProcess.cfx        | 38 ++++++++++++++-----
+ 3 files changed, 66 insertions(+), 14 deletions(-)
+
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/AutoExposure.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/AutoExposure.cpp
+index 31cb78c6..c88388c9 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/AutoExposure.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/AutoExposure.cpp
+@@ -561,6 +561,19 @@ void CAutoExposureStage::Execute()
+ {
+ 	FUNCTION_PROFILER_RENDERER();
+ 
++	// The metering histogram FIRST, and before the readback below, for two reasons: the source it
++	// bins is m_pTexHDRTargetScaled[1][0], which the bloom stage overwrites one pass later, and
++	// UpdateSceneReferredMeterReadback() chooses which of the two meters to download by reading
++	// m_bMeterHistogramValid - the flag this call sets. Dispatching it after the readback would
++	// leave the flag one frame stale on the first frame and, worse, would issue the download of a
++	// target nothing had written this frame.
++	//
++	// This call was MISSING from the day the pass landed (353be581), which is why the Metering
++	// Mode enum had no effect on anything: the compute pass was built, armed and never dispatched,
++	// so the bins stayed at zero, m_bMeterHistogramValid stayed false, and the camera silently
++	// metered off the shipped whole-frame log-mean - a meter with no mask and no mode.
++	ExecuteMeterHistogram();
++
+ 	MeasureLuminance();
+ 	AdjustExposure();
+ 	UpdateSceneReferredMeterReadback();
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.cpp
+index 51814727..e9503eb9 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.cpp
+@@ -939,8 +939,21 @@ void CToneMappingStage::DisplaySceneReferredMeterInfo(float appliedEV)
+ 		static const char* const kModeNames[3] = { "Average", "CentreWeighted", "Spot" };
+ 		const char* szMode = kModeNames[min(hist.meteringMode, 2u)];
+ 
+-		sprintf(str, "  meter histogram [%s] %s   %+.0f..%+.0f stops over grey, %.2f/bin",
+-		        bar, szMode, hist.logMinStops, hist.logMaxStops,
++		// The WEIGHTED SAMPLE COUNT, in texel-equivalents, and what share of the metered frame it
++		// is. This is the number that proves the mask is live even when the picture barely moves:
++		// Average reads 100 %, Centre-weighted about a third (a Gaussian of sigma 1/5 frame height
++		// on a 0.2 pedestal), Spot about 2 %. A mode change that does not move this number means
++		// the mask never reached the accumulation, which is exactly the failure this line was
++		// added for.
++		const CTexture* pMeterSrc = m_graphicsPipelineResources.m_pTexHDRTargetScaled[1][0];
++		const float fFrameTexels = CTexture::IsTextureExist(pMeterSrc)
++		                           ? (float)(pMeterSrc->GetWidth() * pMeterSrc->GetHeight())
++		                           : 0.0f;
++		const float fSamples = hist.totalWeight / 256.0f; // SCENE_METER_HIST_WEIGHT_Q
++		const float fCoverage = (fFrameTexels > 0.0f) ? (100.0f * fSamples / fFrameTexels) : 0.0f;
++
++		sprintf(str, "  meter histogram [%s] mode %u %s   weight %.0f texels (%.1f%% of frame)   %+.0f..%+.0f stops over grey, %.2f/bin",
++		        bar, hist.meteringMode, szMode, fSamples, fCoverage, hist.logMinStops, hist.logMaxStops,
+ 		        (hist.logMaxStops - hist.logMinStops) / (float)SSceneReferredMeterHistogram::kBinCount);
+ 		IRenderAuxText::DrawText(Vec3(5, 115, 1), IRenderAuxText::ASize(1.0f), ColorF(1, 0, 1, 1), eDrawText_800x600 | eDrawText_2D, str);
+ 
+@@ -978,8 +991,16 @@ void CToneMappingStage::DisplaySceneReferredMeterInfo(float appliedEV)
+ 	        gcpRendD3D->m_bSceneReferredMeterRejected ? "  [SAMPLE REFUSED - holding]" : "");
+ 	IRenderAuxText::DrawText(Vec3(5, 115, 1), IRenderAuxText::ASize(1.0f), ColorF(1, 0, 1, 1), eDrawText_800x600 | eDrawText_2D, str);
+ 
+-	sprintf(str, "  LOG-MEAN meter (r_SceneReferredMeterHistogram 0): ceiling %.4g (%.0f stops over grey); stock adaptation bypassed",
+-	        CRendererResources::GetSceneReferredMeterCeiling(), CRendererResources::kSceneReferredMeterCeilingStops);
++	// The mode is printed on the fallback line too, and with a warning, because the mode is a
++	// CAMERA control that has no effect at all on this path: the log-mean meter has no mask. Not
++	// saying so is what let "Metering Mode does nothing" look like a camera bug for a fortnight.
++	float fBusMode = 0.0f;
++	if (CPostEffectsMgr* pPostMgr = PostEffectMgr())
++		fBusMode = pPostMgr->GetByNameF("Global_User_MeterMode");
++
++	sprintf(str, "  LOG-MEAN meter (r_SceneReferredMeterHistogram 0): ceiling %.4g (%.0f stops over grey); stock adaptation bypassed; Metering Mode %d IGNORED (no mask on this path)",
++	        CRendererResources::GetSceneReferredMeterCeiling(), CRendererResources::kSceneReferredMeterCeilingStops,
++	        (int)(fBusMode + 0.5f));
+ 	IRenderAuxText::DrawText(Vec3(5, 135, 1), IRenderAuxText::ASize(1.0f), ColorF(1, 0, 1, 1), eDrawText_800x600 | eDrawText_2D, str);
+ }
+ 
+diff --git a/Engine/Shaders/HWScripts/CryFX/HDRPostProcess.cfx b/Engine/Shaders/HWScripts/CryFX/HDRPostProcess.cfx
+index 657d55b8..7f0ca588 100644
+--- a/Engine/Shaders/HWScripts/CryFX/HDRPostProcess.cfx
++++ b/Engine/Shaders/HWScripts/CryFX/HDRPostProcess.cfx
+@@ -2262,6 +2262,9 @@ float4 MeterHistWeights;
+ #define SCENE_METER_HIST_LOG_MIN  (-14.0)
+ #define SCENE_METER_HIST_LOG_MAX  ( 18.0)
+ #define SCENE_METER_HIST_WEIGHT_Q 256.0
++// The floor of the centre-weighted mask: what a corner texel is still worth. Not zero, or the
++// mode would be a spot with a wide skirt rather than a centre weight.
++#define SCENE_METER_CENTRE_FLOOR  0.2
+ 
+ groupshared uint g_MeterHistBins[SCENE_METER_HIST_BINS];
+ 
+@@ -2269,11 +2272,11 @@ groupshared uint g_MeterHistBins[SCENE_METER_HIST_BINS];
+ // the sizes are the ones the camera industry settled on.
+ //
+ //   Average        - the whole frame, uniformly. The A/B reference against the shipped log-mean.
+-//   CenterWeighted - a smooth radial falloff, full sensitivity at the centre and a quarter of it
+-//                    in the corners. The classic, cheap and predictable answer to "the sky is half
+-//                    the frame and it is not the subject". Default.
++//   CenterWeighted - a Gaussian of sigma = 1/5 frame height on a 0.2 pedestal: full sensitivity at
++//                    the centre, a fifth of it at the corners. The classic, cheap and predictable
++//                    answer to "the sky is half the frame and it is not the subject". Default.
+ //   Spot           - a disc 20 % of frame height across (about 1.8 % of frame area, inside the
+-//                    camera-standard 1.5-3 %), soft-edged. Put it on a grey card and the card is
++//                    camera-standard 1.5-3 %), zero outside. Put it on a grey card and the card is
+ //                    mid grey, whatever else is in the picture.
+ //
+ // The falloff is smooth rather than a hard circle on purpose: a hard edge makes the meter step as
+@@ -2288,16 +2291,31 @@ float MeteringWeight(float2 uv, float2 size, float mode)
+ 	const float aspect = size.x / max(size.y, 1.0);
+ 	const float2 d = (uv - 0.5) * float2(aspect, 1.0);
+ 
++	// r is now in FRAME-HEIGHT units: 0 at the centre, 0.5 at the top and bottom edges, ~1.02 at
++	// the corner of a 16:9 frame. Both modes below are sized in those units, so a mode means the
++	// same thing on any aspect.
++	const float r = length(d);
++
+ 	if (mode < 1.5)
+ 	{
+-		// Normalised so r = 1 at the corner. The normalisation only sets how fast the falloff
+-		// runs; this one gives the classic 100 % centre / 25 % corner split.
+-		const float r = saturate(length(d) / (0.5 * sqrt(aspect * aspect + 1.0)));
+-		return lerp(1.0, 0.25, smoothstep(0.0, 1.0, r));
++		// A Gaussian of sigma = 1/5 frame height on a pedestal. The pedestal is what makes this
++		// CENTRE-WEIGHTED and not a soft spot: a real body puts 60-80 % of its sensitivity in the
++		// middle and still LOOKS at the rest of the frame, so the corners keep a fifth of a vote
++		// and a bright sky can still move the meter - just not own it. Smooth by construction,
++		// which matters because a step in the metering weight is a step in the exposure as
++		// content crosses it.
++		const float sigma = 0.2;
++		return SCENE_METER_CENTRE_FLOOR
++		       + (1.0 - SCENE_METER_CENTRE_FLOOR) * exp(-0.5 * (r * r) / (sigma * sigma));
+ 	}
+ 
+-	const float spotRadius = 0.10;  // 20 % of frame height across
+-	return 1.0 - smoothstep(spotRadius * 0.9, spotRadius * 1.1, length(d));
++	// A disc a fifth of the frame height ACROSS - about 1.8 % of frame area, inside the
++	// camera-standard 1.5-3 % - and exactly zero outside it. Zero weight means no atomic at all,
++	// so ~98 % of the frame does not vote and the weighted sample count in r_HDRDebug 1 collapses
++	// by the same factor: that number is the proof the mask is live. The edge is softened over a
++	// single percent of frame height only so that content crossing the rim does not step.
++	const float spotRadius = 0.10;
++	return 1.0 - smoothstep(spotRadius * 0.95, spotRadius * 1.05, r);
+ }
+ 
+ [numthreads(SCENE_METER_HIST_TILE, SCENE_METER_HIST_TILE, 1)]
+-- 
+2.47.1.windows.1
+

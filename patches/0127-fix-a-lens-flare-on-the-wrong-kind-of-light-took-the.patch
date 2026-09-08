@@ -1,0 +1,267 @@
+From 43cb66f2be30873f8320a8e367aed13e6bd3a26a Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Tue, 8 Sep 2026 21:02:32 +0800
+Subject: [PATCH 127/135] fix: a lens flare on the wrong kind of light took the
+ RenderThread down
+
+The symbolised dump (sys_dump_type 3) put the access violation in
+CryRenderD3D11!CLensOpticsStage::Execute+0x711, LensOptics.cpp:67, on
+`mov rcx,[rdi]` with rdi = bc7d1500`3b9741d0 - the RootOpticsElement* that line 65 read out of the
+SRenderLight line 64 fetched with GetLight(eDLT_DeferredLight, pOD->m_nLightID). The pointer is not
+null and not freed, it is uninitialised noise, which is what you get from a field of an SRenderLight
+that was never constructed.
+
+CRenderView::AddDeferredLight routes a light into ONE OF THREE lists - eDLT_DeferredLight,
+eDLT_DeferredAmbientLight, eDLT_DeferredCubemap - and the index it returns indexes whichever list it
+picked. CRenderer::EF_CheckLightMaterial stores that index on the lens-flare render object, and
+CLensOpticsStage::Execute resolves it against eDLT_DeferredLight and against nothing else. A flare
+on an environment probe, or on an ambient light with the switch off, therefore hands the stage an
+index from a foreign index space. And m_lights is a std::list whose GetLight() walks iterators from
+begin() with nothing but a CRY_ASSERT for bounds: in a Profile build an out-of-range index does not
+read past the end of a buffer, it lands on the list's SENTINEL node and returns its raw memory as an
+SRenderLight. One index too far is enough.
+
+This is a stock CRYENGINE 5.7 bug and it reproduces with r_SceneReferred 0 - the same crash
+signature was already recorded on 2026-09-07, before any ambient work. Routing ambient lights into
+the deferred list (7e99d9ea) does not create it; it changes which lights land in which list, so it
+changes how often the index falls out of range. An interior lit with ambient lights is exactly the
+shape that makes the deferred list shorter than the list the index came from.
+
+The fix keeps the index and the list together:
+
+- CRenderView::ResolveDeferredLightList() is the routing decision extracted into one function.
+  AddDeferredLight now calls it, so the answer has a single source of truth and the consumer side
+  can ask the same question. Pure refactor - the same three branches, the same bSort behaviour.
+- CRenderer::EF_AddDeferredLight passes the resolved list to EF_CheckLightMaterial, which no longer
+  queues an EFSLIST_LENSOPTICS render item unless the light really lives in eDLT_DeferredLight with
+  an index >= 0. Non-flare light materials go to EFSLIST_TRANSP_AW and never read m_nLightID, so
+  they are untouched. nRenderLightID is now a RenderLightIndex rather than a uint16, so a negative
+  index cannot wrap to 65535 on the way in.
+- CRenderView::GetLight() bounds-checks and returns a static default-constructed SRenderLight - null
+  optics element, null occlusion query - instead of the sentinel. The accessor has a dozen callers
+  and should not be a crash primitive in a build with asserts compiled out.
+- CLensOpticsStage::Execute verifies the index against GetLightsCount(eDLT_DeferredLight) before the
+  fetch, so a mismatch shows up as a missing flare rather than as a default light.
+
+Content effect, and it is a restoration rather than a regression because the stock behaviour here
+was undefined: with Scene Referred off, a lens flare attached to an ambient light now draws nothing
+- it never had a meaningful index into the deferred list. With Scene Referred on, an ambient light
+IS a deferred light, so its flare works like any other. Flares on ordinary lights and on the sun are
+unchanged on both paths, and no other pixel moves.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01HXzRVK4yBVDUNfdWXEwV5y
+---
+ .../CryEngine/RenderDll/Common/RenderView.cpp | 47 ++++++++++++++-----
+ Code/CryEngine/RenderDll/Common/RenderView.h  |  6 +++
+ Code/CryEngine/RenderDll/Common/Renderer.cpp  | 38 +++++++++++++--
+ Code/CryEngine/RenderDll/Common/Renderer.h    |  2 +-
+ .../GraphicsPipeline/LensOptics.cpp           | 12 ++++-
+ 5 files changed, 87 insertions(+), 18 deletions(-)
+
+diff --git a/Code/CryEngine/RenderDll/Common/RenderView.cpp b/Code/CryEngine/RenderDll/Common/RenderView.cpp
+index ed122c75..6fb4ee23 100644
+--- a/Code/CryEngine/RenderDll/Common/RenderView.cpp
++++ b/Code/CryEngine/RenderDll/Common/RenderView.cpp
+@@ -387,6 +387,25 @@ static bool IsSceneReferredLightConvention()
+ }
+ }
+ 
++//////////////////////////////////////////////////////////////////////////
++eDeferredLightType CRenderView::ResolveDeferredLightList(const SRenderLight& light)
++{
++	// Keep in lockstep with the routing in AddDeferredLight() below - that function calls this one,
++	// so there is exactly one copy of the decision.
++	if (light.m_Flags & DLF_DEFERRED_CUBEMAPS)
++		return eDLT_DeferredCubemap;
++
++	// Scene-referred: an ambient light is a real fill light and goes into the ordinary deferred
++	// list (see the block in AddDeferredLight). On the stock path it stays a modulator.
++	const bool bAmbientAsFillLight = (light.m_Flags & (DLF_AMBIENT | DLF_DEFERRED_CUBEMAPS)) == DLF_AMBIENT
++	                                 && IsSceneReferredLightConvention();
++
++	if ((light.m_Flags & DLF_AMBIENT) && !bAmbientAsFillLight)
++		return eDLT_DeferredAmbientLight;
++
++	return eDLT_DeferredLight;
++}
++
+ RenderLightIndex CRenderView::AddDeferredLight(const SRenderLight& pDL, float fMult, const SRenderingPassInfo& passInfo)
+ {
+ 	CRenderView* pRenderView = passInfo.GetRenderView();
+@@ -423,20 +442,13 @@ RenderLightIndex CRenderView::AddDeferredLight(const SRenderLight& pDL, float fM
+ 	// main thread, and it is the same value CLightEntity::UpdateCastShadowFlag tested a moment
+ 	// earlier when it decided whether to build the light's shadow frustum. One source, no way for
+ 	// the two halves to land on opposite sides of a flip within one frame.
++	const eDeferredLightType LightType = ResolveDeferredLightList(pDL);
+ 	const bool bAmbientAsFillLight = (pDL.m_Flags & (DLF_AMBIENT | DLF_DEFERRED_CUBEMAPS)) == DLF_AMBIENT
+-	                                 && IsSceneReferredLightConvention();
++	                                 && LightType == eDLT_DeferredLight;
+ 
+-	eDeferredLightType LightType = eDLT_DeferredLight;
+-	if (pDL.m_Flags & DLF_DEFERRED_CUBEMAPS)
+-	{
+-		LightType = eDLT_DeferredCubemap;
+-		bSort = false;
+-	}
+-	else if ((pDL.m_Flags & DLF_AMBIENT) && !bAmbientAsFillLight)
+-	{
+-		LightType = eDLT_DeferredAmbientLight;
++	// Stock: only the ordinary deferred list is size-sorted; cubemaps and ambient modulators are not.
++	if (LightType != eDLT_DeferredLight)
+ 		bSort = false;
+-	}
+ 
+ 	if (pDL.GetLensOpticsElement() && !pDL.m_pSoftOccQuery)
+ 	{
+@@ -605,6 +617,19 @@ SRenderLight& CRenderView::GetLight(eDeferredLightType lightType, RenderLightInd
+ {
+ 	CRY_ASSERT(nLightId >= 0 && nLightId < m_lights[lightType].size());
+ 
++	// Defence in depth. m_lights is a std::list, so an out-of-range index does not merely read past
++	// the end of a buffer: the walk below lands on the list's SENTINEL node, whose SRenderLight is
++	// never constructed, and the caller then dereferences whatever happens to sit in
++	// m_pLensOpticsElement. That is the RenderThread AV of 2026-09-08 (dump: garbage pRootElem in
++	// CLensOpticsStage::Execute, LensOptics.cpp:67). The real fix is that callers must not carry an
++	// index from one light list into another - see CRenderer::EF_CheckLightMaterial - but this
++	// accessor is used from a dozen places and must not be a crash primitive in a Profile build.
++	if (nLightId < 0 || nLightId >= (RenderLightIndex)m_lights[lightType].size())
++	{
++		static SRenderLight s_nullLight; // default-constructed: no optics element, no occlusion query
++		return s_nullLight;
++	}
++
+ 	// find iterator at given index (assuming no [] operator)
+ 	auto itr = m_lights[lightType].begin();
+ 	while (--nLightId >= 0)
+diff --git a/Code/CryEngine/RenderDll/Common/RenderView.h b/Code/CryEngine/RenderDll/Common/RenderView.h
+index c83283c7..3958c9ca 100644
+--- a/Code/CryEngine/RenderDll/Common/RenderView.h
++++ b/Code/CryEngine/RenderDll/Common/RenderView.h
+@@ -293,6 +293,12 @@ public:
+ 	RenderLightsList&     GetLightsArray(eDeferredLightType lightType);
+ 	SRenderLight*         AddLightAtIndex(eDeferredLightType lightType, const SRenderLight& light, RenderLightIndex index = -1);
+ 
++	//! Which of the three deferred light lists AddDeferredLight() will route this light into.
++	//! The index AddDeferredLight() returns is an index into THAT list and into no other, so any
++	//! consumer that stores the index has to store this alongside it (see CLensOpticsStage).
++	//! Single source of truth: AddDeferredLight() itself routes on this.
++	static eDeferredLightType ResolveDeferredLightList(const SRenderLight& light);
++
+ 	bool                  HasSunLight() { return GetSunLight() != nullptr; }
+ 	const SRenderLight*   GetSunLight() const;
+ 	const Vec4            GetSunLightColor();
+diff --git a/Code/CryEngine/RenderDll/Common/Renderer.cpp b/Code/CryEngine/RenderDll/Common/Renderer.cpp
+index 59eee83a..3c38a8fe 100644
+--- a/Code/CryEngine/RenderDll/Common/Renderer.cpp
++++ b/Code/CryEngine/RenderDll/Common/Renderer.cpp
+@@ -1738,7 +1738,7 @@ bool CRenderer::EF_IsFakeDLight(const SRenderLight* Source) const
+ 	return bIgnore;
+ }
+ 
+-void CRenderer::EF_CheckLightMaterial(SRenderLight* pLight, uint16 nRenderLightID, const SRenderingPassInfo& passInfo)
++void CRenderer::EF_CheckLightMaterial(SRenderLight* pLight, RenderLightIndex nRenderLightID, eDeferredLightType lightList, const SRenderingPassInfo& passInfo)
+ {
+ 	ASSERT_IS_MAIN_THREAD(m_pRT);
+ 
+@@ -1748,6 +1748,33 @@ void CRenderer::EF_CheckLightMaterial(SRenderLight* pLight, uint16 nRenderLightI
+ 		TArray<CRenderElement*>* pRendElemBase = pShader ? pLight->m_Shader.m_pShader->GetREs(pLight->m_Shader.m_nTechnique) : 0;
+ 		if (pRendElemBase && !pRendElemBase->empty())
+ 		{
++			CRenderElement* pRE0 = pRendElemBase->Get(0);
++			const bool bLensOptics = pRE0->mfGetType() == eDATA_LensOptics;
++
++			// A lens-flare render item carries nothing but the light's INDEX, and
++			// CLensOpticsStage::Execute resolves that index against eDLT_DeferredLight and against
++			// no other list (LensOptics.cpp:64). CRenderView::AddDeferredLight, however, routes the
++			// light into one of THREE lists and returns an index into whichever one it picked, so a
++			// flare on an environment probe (eDLT_DeferredCubemap) or on an ambient light
++			// (eDLT_DeferredAmbientLight) hands the stage an index from a foreign index space.
++			// Because m_lights is a std::list and CRenderView::GetLight has no bounds check, an
++			// index past the end of the deferred list walks onto the list's sentinel node and
++			// returns an SRenderLight that was never constructed - the RenderThread AV of
++			// 2026-09-08 in CLensOpticsStage::Execute+0x711 (garbage m_pLensOpticsElement).
++			//
++			// This is a STOCK CRYENGINE 5.7 bug: the mismatch exists with the scene-referred switch
++			// off. Our ambient-as-fill-light routing (RenderView.cpp, decisions/s8-ambient-lights.md
++			// part 2) only changes WHICH lights land in which list, so it changes how often the
++			// index lands out of range - which is why the crash became frequent on the flip.
++			//
++			// The fix is to submit the flare only for lights that really live in the deferred list.
++			// A flare on an ambient light therefore does nothing on the stock path (it never had a
++			// meaningful index there) and works on the scene-referred path, where the ambient light
++			// IS a deferred light. Non-flare light materials (EFSLIST_TRANSP_AW) never read
++			// m_nLightID, so they are unaffected.
++			if (bLensOptics && (lightList != eDLT_DeferredLight || nRenderLightID < 0))
++				return;
++
+ 			CRenderObject* pRO = passInfo.GetIRenderView()->AllocateTemporaryRenderObject();
+ 			pRO->m_fAlpha        = 1.0f;
+ 			pRO->SetAmbientColor(Vec3(0, 0, 0));
+@@ -1757,14 +1784,14 @@ void CRenderer::EF_CheckLightMaterial(SRenderLight* pLight, uint16 nRenderLightI
+ 			pOD->m_fTempVars[0] = 0;
+ 			pOD->m_fTempVars[1] = 0;
+ 			pOD->m_fTempVars[3] = pLight->m_fRadius;
+-			pOD->m_nLightID     = nRenderLightID;
++			pOD->m_nLightID     = (uint16)(nRenderLightID < 0 ? 0 : nRenderLightID);
+ 
+ 			pRO->SetAmbientColor(pLight->m_Color);
+ 			pRO->SetMatrix(pLight->m_ObjMatrix);
+ 			pRO->m_ObjFlags     |= FOB_TRANS_MASK;
+ 
+-			CRenderElement* pRE = pRendElemBase->Get(0);
+-			const int32 nList     = (pRE->mfGetType() != eDATA_LensOptics) ? EFSLIST_TRANSP_AW : EFSLIST_LENSOPTICS;
++			CRenderElement* pRE = pRE0;
++			const int32 nList     = !bLensOptics ? EFSLIST_TRANSP_AW : EFSLIST_LENSOPTICS;
+ 
+ 			const float fWaterLevel = gEnv->p3DEngine->GetWaterLevel();
+ 			const float fCamZ       = passInfo.GetCamera().GetPosition().z;
+@@ -1799,7 +1826,8 @@ int CRenderer::EF_AddDeferredLight(const SRenderLight& pLight, float fMult, cons
+ {
+ 	RenderLightIndex nLightID = passInfo.GetRenderView()->AddDeferredLight(pLight, fMult, passInfo);
+ 
+-	EF_CheckLightMaterial(const_cast<SRenderLight*>(&pLight), nLightID, passInfo);
++	// The returned index only means anything inside the list AddDeferredLight routed the light into.
++	EF_CheckLightMaterial(const_cast<SRenderLight*>(&pLight), nLightID, CRenderView::ResolveDeferredLightList(pLight), passInfo);
+ 
+ 	return nLightID;
+ }
+diff --git a/Code/CryEngine/RenderDll/Common/Renderer.h b/Code/CryEngine/RenderDll/Common/Renderer.h
+index 2565a9c3..3b54f5fa 100644
+--- a/Code/CryEngine/RenderDll/Common/Renderer.h
++++ b/Code/CryEngine/RenderDll/Common/Renderer.h
+@@ -1132,7 +1132,7 @@ public:
+ 	virtual SInputShaderResources* EF_CreateInputShaderResource(IRenderShaderResources* pOptionalCopyFrom = nullptr) override;
+ 	virtual void                   ClearPerFrameData(const SRenderingPassInfo& passInfo);
+ 	virtual bool                   EF_UpdateDLight(SRenderLight* pDL) const override;
+-	void                           EF_CheckLightMaterial(SRenderLight* pLight, uint16 nRenderLightID, const SRenderingPassInfo& passInfo);
++	void                           EF_CheckLightMaterial(SRenderLight* pLight, RenderLightIndex nRenderLightID, eDeferredLightType lightList, const SRenderingPassInfo& passInfo);
+ 
+ 	virtual void                   EF_QueryImpl(ERenderQueryTypes eQuery, void* pInOut0, uint32 nInOutSize0, void* pInOut1, uint32 nInOutSize1) override;
+ 
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LensOptics.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LensOptics.cpp
+index 55313191..a293bc66 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LensOptics.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LensOptics.cpp
+@@ -61,7 +61,17 @@ void CLensOpticsStage::Execute()
+ 			CRenderObject* pObj = re.pRenderObject;
+ 			SRenderObjData* pOD = pObj->GetObjData();
+ 
+-			SRenderLight* pLight = pOD ? &pRenderView->GetLight(eDLT_DeferredLight, pOD->m_nLightID) : nullptr;
++			// m_nLightID is an index into eDLT_DeferredLight and into no other list. It is written on
++			// the main thread by CRenderer::EF_CheckLightMaterial, which now refuses to queue a flare
++			// for a light that was routed elsewhere (env probe, stock ambient modulator). Verify it
++			// here as well: m_lights is a std::list, so an out-of-range index silently returns the
++			// sentinel node's never-constructed SRenderLight and the GetLensOpticsElement() read
++			// below faults - that was the RenderThread AV of 2026-09-08.
++			const RenderLightIndex lightID = pOD ? (RenderLightIndex)pOD->m_nLightID : -1;
++			if (lightID < 0 || lightID >= pRenderView->GetLightsCount(eDLT_DeferredLight))
++				continue;
++
++			SRenderLight* pLight = &pRenderView->GetLight(eDLT_DeferredLight, lightID);
+ 			RootOpticsElement* pRootElem = pLight ? (RootOpticsElement*)pLight->GetLensOpticsElement() : nullptr;
+ 
+ 			if (!pRootElem || !pRootElem->IsEnabled() || pRootElem->GetType() != eFT_Root)
+-- 
+2.47.1.windows.1
+
