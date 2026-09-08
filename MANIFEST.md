@@ -1,11 +1,27 @@
 ﻿# Sync manifest
 
 Baseline : main @ a34100a9 (pristine CRYENGINE 5.7.1)
-Dev      : scene @ d8567f37
-Synced   : 2026-09-05 10:28
+Dev      : scene @ 95930889
+Synced   : 2026-09-09 07:33
 
 ## Commits (newest first)
 
+- 95930889 fix: ccam sun-shafts-off did nothing - the stage gate never read SunShafts_Active; add a renderer-side suppress flag
+- 92a2236c feat: ccam pins screen-space sun shafts off; e_VolumetricFog defaults to 1 (ReCS)
+- eaa9d057 feat: retire screen-space sun shafts by default; volumetric fog takes over (ReCS cvar defaults)
+- 5435929a fix: with clouds on the sky stopped darkening - the cloud haze never took the aperture
+- cd063849 fix: the sky did not follow the aperture - the fog painting it was never exposed
+- 5f1d292f feat: the AUTO meter no longer lets the sky own the exposure outdoors (Sky Weight)
+- a66fa37e fix: the metering histogram read its source as black - a D3D11 SRV/RTV hazard
+- f2d30f98 fix: the metering histogram was built, armed and never dispatched
+- 43cb66f2 fix: a lens flare on the wrong kind of light took the RenderThread down
+- e2f2ba8d fix: one scene-referred rebuild per distinct switch answer, not one per frame
+- 1dda9689 fix: the scene-referred flip is a rebuild, not a patch
+- c3bdcffb docs: what an ambient light means under Scene Referred, and how to use one as fill
+- d2c29578 feat: the exposure coverage overlay says which meaning ambient lights have this frame
+- 7e99d9ea feat: ambient lights become real fill lights on the scene-referred path
+- 4906d91f fix: an ambient light that was also asked to cast shadows could take the engine down
+- f5891aab fix: the camera drove render state while the level was still being built
 - d8567f37 fix: the glare source budget's own top end could hang the editor, so it now has a ceiling
 - 38910d91 fix: the preview gate's "log only on a change" logged every frame
 - a88052c5 perf: the wave glare drew one sprite per bright texel, and brightness decides how many there are
@@ -132,9 +148,11 @@ Synced   : 2026-09-05 10:28
 - M	CMakeSettings.json
 - M	Code/CryEngine/Cry3DEngine/3dEngine.cpp
 - M	Code/CryEngine/Cry3DEngine/3dEngine.h
+- M	Code/CryEngine/Cry3DEngine/LightEntity.cpp
 - M	Code/CryEngine/Cry3DEngine/SVO/SceneTree.cpp
 - M	Code/CryEngine/Cry3DEngine/SkyLightManager.cpp
 - M	Code/CryEngine/Cry3DEngine/TimeOfDay.cpp
+- M	Code/CryEngine/Cry3DEngine/cvars.cpp
 - M	Code/CryEngine/CryCommon/Cry3DEngine/I3DEngine.h
 - M	Code/CryEngine/CryCommon/CryRenderer/IRenderer.h
 - M	Code/CryEngine/RenderDll/Common/Include_HLSL_CPP_Shared.h
@@ -142,6 +160,8 @@ Synced   : 2026-09-05 10:28
 - M	Code/CryEngine/RenderDll/Common/PostProcess/PostEffects.h
 - M	Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.cpp
 - M	Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.h
+- M	Code/CryEngine/RenderDll/Common/RenderView.cpp
+- M	Code/CryEngine/RenderDll/Common/RenderView.h
 - M	Code/CryEngine/RenderDll/Common/Renderer.cpp
 - M	Code/CryEngine/RenderDll/Common/Renderer.h
 - M	Code/CryEngine/RenderDll/Common/RendererCVars.cpp
@@ -150,7 +170,6 @@ Synced   : 2026-09-05 10:28
 - M	Code/CryEngine/RenderDll/Common/RendererResources.h
 - A	Code/CryEngine/RenderDll/Common/Textures/Image/ExrImage.cpp
 - A	Code/CryEngine/RenderDll/Common/Textures/Image/ExrImage.h
-- M	Code/CryEngine/RenderDll/Common/Textures/Texture.cpp
 - M	Code/CryEngine/RenderDll/Common/Textures/Texture.h
 - M	Code/CryEngine/RenderDll/XRenderD3D9/CMakeLists.txt
 - M	Code/CryEngine/RenderDll/XRenderD3D9/D3DHWShader.cpp
@@ -171,6 +190,7 @@ Synced   : 2026-09-05 10:28
 - M	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DepthOfField.h
 - A	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DiffractionKernel.cpp
 - A	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DiffractionKernel.h
+- M	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LensOptics.cpp
 - M	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/MotionBlur.cpp
 - M	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/PostAA.cpp
 - M	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/PostEffects.cpp
@@ -179,15 +199,19 @@ Synced   : 2026-09-05 10:28
 - A	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/SceneReferredExport.cpp
 - A	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/SceneReferredExport.h
 - M	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Sky.cpp
+- M	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Sky.h
 - M	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Snow.cpp
 - M	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/StandardGraphicsPipeline.cpp
 - M	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/StandardGraphicsPipeline.h
 - M	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/SunShafts.cpp
+- M	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/SunShafts.h
 - M	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/TiledLightVolumes.cpp
 - M	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.cpp
 - M	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.h
 - M	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/VolumetricClouds.cpp
+- M	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/VolumetricClouds.h
 - M	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/VolumetricFog.cpp
+- M	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Water.cpp
 - M	Code/CryEngine/RenderDll/XRenderD3D9/PostProcessDOF.cpp
 - M	Code/CryEngine/RenderDll/XRenderD3D9/core_renderer.waf_files
 - M	Code/CryPlugins/CMakeLists.txt
