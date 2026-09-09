@@ -1,11 +1,20 @@
-﻿# Sync manifest
+# Sync manifest
 
 Baseline : main @ a34100a9 (pristine CRYENGINE 5.7.1)
-Dev      : scene @ 95930889
-Synced   : 2026-09-09 07:33
+Dev      : scene @ 3f53d2c4
+Synced   : 2026-09-09 23:31
 
 ## Commits (newest first)
 
+- 3f53d2c4 feat: glare thresholds mean "stops above mid grey" on the stock path too; sky sources no longer starve the budget
+- 49d61fd0 fix: the wave-glare source budget was scene-referred only - the stock path drew every source unbudgeted
+- 40873139 tune: cloud edge fade 4 km -> 12 km with smoothstep
+- 28f76ff4 fix: keep Crytek's cloud reach; only the seam fades (edge fade stays, sky-ray unclamp removed)
+- d6f4c52f feat: clouds look the same through every camera - sky-ray unclamp and edge fade are engine behaviour (ReCS)
+- ed573597 fix: the volumetric cloud layer was cut at the far plane - sky rays now march to the cloud shell
+- ed8c3ceb fix: the clouds' atmospheric haze replaced the sky - it followed the sun's convention, not the dome's
+- b7f158c7 feat: Sandbox viewport: a built-in CineCam camera, Create Cinematic Camera, and the preview push
+- 124446cb feat: the Sandbox viewport chooses who drives the picture while editing (cinecam editor preview)
 - 95930889 fix: ccam sun-shafts-off did nothing - the stage gate never read SunShafts_Active; add a renderer-side suppress flag
 - 92a2236c feat: ccam pins screen-space sun shafts off; e_VolumetricFog defaults to 1 (ReCS)
 - eaa9d057 feat: retire screen-space sun shafts by default; volumetric fog takes over (ReCS cvar defaults)
@@ -235,10 +244,15 @@ Synced   : 2026-09-09 07:33
 - A	Code/CryPlugins/CinematicCamera/FilterPSFSpec.md
 - A	Code/CryPlugins/CinematicCamera/HalationSpec.md
 - A	Code/CryPlugins/CinematicCamera/HybridDofSpec.md
+- A	Code/CryPlugins/CinematicCamera/Interface/ICineCamEditorPreview.h
 - A	Code/CryPlugins/CinematicCamera/Interface/ICinematicCameraOptics.h
 - A	Code/CryPlugins/CinematicCamera/LensFlawsSpec.md
 - A	Code/CryPlugins/CinematicCamera/LensGhostSpec.md
 - A	Code/CryPlugins/CinematicCamera/Module/CMakeLists.txt
+- A	Code/CryPlugins/CinematicCamera/Module/CineCamEditorLook.cpp
+- A	Code/CryPlugins/CinematicCamera/Module/CineCamEditorLook.h
+- A	Code/CryPlugins/CinematicCamera/Module/CineCamShared.cpp
+- A	Code/CryPlugins/CinematicCamera/Module/CineCamShared.h
 - A	Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp
 - A	Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
 - A	Code/CryPlugins/CinematicCamera/Module/CinematicCameraPlugin.cpp
@@ -277,7 +291,10 @@ Synced   : 2026-09-09 07:33
 - A	Code/Libs/tinyexr/streamreader.hh
 - A	Code/Libs/tinyexr/tinyexr.h
 - A	Code/Libs/tinyexr/tinyexr_impl.cpp
+- M	Code/Sandbox/EditorQt/LevelEditor/LevelEditorViewport.cpp
+- M	Code/Sandbox/EditorQt/LevelEditor/LevelEditorViewport.h
 - M	Code/Tools/CryCommonTools/FileUtil.cpp
+- M	Engine/Shaders/HWScripts/CryFX/Clouds.cfx
 - M	Engine/Shaders/HWScripts/CryFX/CommonMath.cfi
 - M	Engine/Shaders/HWScripts/CryFX/DepthOfField.cfx
 - M	Engine/Shaders/HWScripts/CryFX/Eye.cfx

@@ -1,0 +1,341 @@
+From b7f158c710556dcb4f5ab067c2041a5acdd56d89 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Wed, 9 Sep 2026 08:50:32 +0800
+Subject: [PATCH 137/144] feat: Sandbox viewport: a built-in CineCam camera,
+ Create Cinematic Camera, and the preview push
+
+Editor side of decisions/s9-editor-cinecam-preview.md (LevelEditorViewport only).
+
+- Camera menu: "CineCam" directly below "Default" - the same fly camera (IsDefaultCamera() stays
+  true, navigation/FOV/cycling untouched) flagged as CineCam mode, which the cinematic camera
+  plugin renders scene-referred with automatic adaptation. The choice persists through the
+  personalization manager (module LevelEditorViewport, key CineCamCamera); the entity choice is
+  not persisted, as stock.
+- Per-frame push: right before SetViewCamera(m_Camera) in OnRender, in edit mode, the perspective
+  viewport calls ICineCamEditorPreview::SetViewportPreview(mode, entityId, camera) - Entity for any
+  camera entity it looks through (TrackView delegate cameras included), CineCam, or Default.
+  The interface is resolved by name from CinematicCamera.dll (same pattern as CryPhoneTracker);
+  without the plugin the viewport is exactly stock. ClearViewportPreview() on destruction and on
+  level close / new level.
+- "Create Cinematic Camera" below "Create Camera from Current View": the stock flow with the
+  cinematic camera component GUID (it creates its own sibling camera component), FOV written
+  through the sibling, the new entity selected, the viewport not switched. Stock item refactored
+  into the shared CreateCameraFromCurrentView(); its behaviour is unchanged.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01HXzRVK4yBVDUNfdWXEwV5y
+---
+ .../LevelEditor/LevelEditorViewport.cpp       | 165 +++++++++++++++++-
+ .../LevelEditor/LevelEditorViewport.h         |  21 +++
+ 2 files changed, 181 insertions(+), 5 deletions(-)
+
+diff --git a/Code/Sandbox/EditorQt/LevelEditor/LevelEditorViewport.cpp b/Code/Sandbox/EditorQt/LevelEditor/LevelEditorViewport.cpp
+index cf712d8b..d6eac3c7 100644
+--- a/Code/Sandbox/EditorQt/LevelEditor/LevelEditorViewport.cpp
++++ b/Code/Sandbox/EditorQt/LevelEditor/LevelEditorViewport.cpp
+@@ -48,6 +48,12 @@
+ #include <CrySystem/ITimer.h>
+ #include <DefaultComponents/Cameras/CameraComponent.h>
+ 
++#include <CryCore/Platform/CryLibrary.h>
++#include <EditorFramework/PersonalizationManager.h>
++
++// Contract shared with the CinematicCamera plugin; resolved at runtime, never linked against.
++#include "../../../CryPlugins/CinematicCamera/Interface/ICineCamEditorPreview.h"
++
+ #include <QResizeEvent>
+ 
+ inline bool SortCameraObjectsByName(CEntityObject* pObject1, CEntityObject* pObject2)
+@@ -55,6 +61,38 @@ inline bool SortCameraObjectsByName(CEntityObject* pObject1, CEntityObject* pObj
+ 	return stricmp(pObject1->GetName(), pObject2->GetName()) < 0;
+ }
+ 
++namespace Private_CineCamPreview
++{
++//! Personalization module / key holding the Default vs CineCam choice of the built-in fly camera.
++const char* const szPersonalizationModule = "LevelEditorViewport";
++const char* const szPersonalizationKey = "CineCamCamera";
++
++//! GUID of CCinematicCameraComponent (Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h).
++//! Hard-coded so that the editor does not depend on the plugin being present.
++const CryGUID cinematicCameraComponentGUID = "{F2A3B4C5-D6E7-4F8A-B9C0-1D2E3F4A5B6C}"_cry_guid;
++
++//! Resolves the editor preview interface of the CinematicCamera plugin the same way CryPhoneTracker
++//! resolves CryGetCinematicCameraOptics. Returns nullptr when the plugin is not part of the project,
++//! in which case the viewport behaves exactly like stock.
++ICineCamEditorPreview* GetPreview()
++{
++	static bool s_resolved = false;
++	static TGetCineCamEditorPreviewFn s_pfn = nullptr;
++
++	if (!s_resolved)
++	{
++		s_resolved = true;
++		if (HMODULE hModule = CryLoadLibraryDefName("CinematicCamera"))
++		{
++			s_pfn = (TGetCineCamEditorPreviewFn)CryGetProcAddress(hModule, CINECAM_EDITOR_PREVIEW_ENTRY);
++		}
++	}
++
++	// The entry point itself may return nullptr until the plugin is up, so it is called every time.
++	return s_pfn != nullptr ? s_pfn() : nullptr;
++}
++}
++
+ //////////////////////////////////////////////////////////////////////////
+ static void ToggleBool(bool* variable, bool* disableVariableIfOn)
+ {
+@@ -143,17 +181,100 @@ static bool FindClassName(const CDragDropData* pDragDropData, string& className)
+ CLevelEditorViewport::CLevelEditorViewport()
+ 	: m_camFOV(gViewportPreferences.defaultFOV)
+ 	, m_headerWidget(nullptr)
++	, m_bCineCamMode(false)
++	, m_bCineCamPreviewPushed(false)
+ {
++	LoadCineCamPersonalization();
+ }
+ 
+ CLevelEditorViewport::~CLevelEditorViewport()
+ {
++	ClearCineCamPreview();
++
+ 	if (this == GetIEditor()->GetViewManager()->GetGameViewport())
+ 	{
+ 		GetIEditor()->GetGameEngine()->SetGameMode(false);
+ 	}
+ }
+ 
++void CLevelEditorViewport::LoadCineCamPersonalization()
++{
++	if (CPersonalizationManager* pPersonalizationManager = GetIEditorImpl()->GetPersonalizationManager())
++	{
++		const QVariant& value = pPersonalizationManager->GetProperty(Private_CineCamPreview::szPersonalizationModule, Private_CineCamPreview::szPersonalizationKey);
++		if (value.isValid())
++		{
++			m_bCineCamMode = value.toBool();
++		}
++	}
++}
++
++void CLevelEditorViewport::SaveCineCamPersonalization() const
++{
++	if (CPersonalizationManager* pPersonalizationManager = GetIEditorImpl()->GetPersonalizationManager())
++	{
++		pPersonalizationManager->SetProperty(Private_CineCamPreview::szPersonalizationModule, Private_CineCamPreview::szPersonalizationKey, m_bCineCamMode);
++	}
++}
++
++void CLevelEditorViewport::SetDefaultFlyCamera()
++{
++	m_bCineCamMode = false;
++	SaveCineCamPersonalization();
++	SetDefaultCamera();
++}
++
++void CLevelEditorViewport::SetCineCamFlyCamera()
++{
++	m_bCineCamMode = true;
++	SaveCineCamPersonalization();
++	SetDefaultCamera();
++}
++
++void CLevelEditorViewport::PushCineCamPreview(EntityId previewEntity)
++{
++	// Only the level editor's main perspective viewport drives the preview.
++	if (GetType() != ET_ViewportCamera || !gEnv->IsEditing())
++	{
++		ClearCineCamPreview();
++		return;
++	}
++
++	ICineCamEditorPreview* pPreview = Private_CineCamPreview::GetPreview();
++	if (pPreview == nullptr)
++	{
++		return;
++	}
++
++	ECineCamEditorPreviewMode mode = ECineCamEditorPreviewMode::Default;
++	if (previewEntity != INVALID_ENTITYID)
++	{
++		mode = ECineCamEditorPreviewMode::Entity;
++	}
++	else if (m_bCineCamMode && IsDefaultCamera())
++	{
++		mode = ECineCamEditorPreviewMode::CineCam;
++	}
++
++	pPreview->SetViewportPreview(mode, previewEntity, m_Camera);
++	m_bCineCamPreviewPushed = true;
++}
++
++void CLevelEditorViewport::ClearCineCamPreview()
++{
++	if (!m_bCineCamPreviewPushed)
++	{
++		return;
++	}
++
++	m_bCineCamPreviewPushed = false;
++
++	if (ICineCamEditorPreview* pPreview = Private_CineCamPreview::GetPreview())
++	{
++		pPreview->ClearViewportPreview();
++	}
++}
++
+ bool CLevelEditorViewport::CreateRenderContext(CRY_HWND hWnd, IRenderer::EViewportType viewportType)
+ {
+ 	return CRenderViewport::CreateRenderContext(hWnd, IRenderer::eViewportType_Default);
+@@ -363,6 +484,7 @@ void CLevelEditorViewport::PopulateMenu(CPopupMenuItem& menu)
+ 	}
+ 
+ 	menu.Add("Create Camera from Current View", functor(*this, &CLevelEditorViewport::OnMenuCreateCameraFromCurrentView));
++	menu.Add("Create Cinematic Camera", functor(*this, &CLevelEditorViewport::OnMenuCreateCinematicCamera));
+ 
+ 	if (GetCameraObject())
+ 		menu.Add("Select Current Camera", functor(*this, &CLevelEditorViewport::OnMenuSelectCurrentCamera));
+@@ -375,6 +497,12 @@ void CLevelEditorViewport::OnEditorNotifyEvent(EEditorNotifyEvent event)
+ {
+ 	CRenderViewport::OnEditorNotifyEvent(event);
+ 
++	// The level (and with it every cinematic camera entity) is going away: let the plugin restore stock state.
++	if (event == eNotify_OnClearLevelContents || event == eNotify_OnBeginNewScene || event == eNotify_OnBeginSceneClose)
++	{
++		ClearCineCamPreview();
++	}
++
+ 	if (event == eNotify_OnEndNewScene)
+ 	{
+ 		CHeightmap* pHmap = GetIEditorImpl()->GetHeightmap();
+@@ -396,7 +524,8 @@ void CLevelEditorViewport::AddCameraMenuItems(CPopupMenuItem& menu)
+ 		menu.AddSeparator();
+ 	}
+ 
+-	menu.Add("Default", functor(*this, &CRenderViewport::SetDefaultCamera)).Check(IsDefaultCamera());
++	menu.Add("Default", functor(*this, &CLevelEditorViewport::SetDefaultFlyCamera)).Check(IsDefaultCamera() && !m_bCineCamMode);
++	menu.Add("CineCam", functor(*this, &CLevelEditorViewport::SetCineCamFlyCamera)).Check(IsDefaultCamera() && m_bCineCamMode);
+ 
+ 	const std::vector<ICameraDelegate*>& cameraDelegates = GetIEditorImpl()->GetViewManager()->GetCameraDelegates();
+ 	const size_t numCameraDelegates = cameraDelegates.size();
+@@ -488,6 +617,10 @@ void CLevelEditorViewport::OnRender(SDisplayContext& context)
+ 	int w = m_currentResolution.width;
+ 	int h = m_currentResolution.height;
+ 
++	// Entity the viewport looks through this frame (also set for a TrackView delegate camera, which
++	// resolves to a camera entity). INVALID_ENTITYID means one of the two built-in fly cameras.
++	EntityId cineCamPreviewEntity = INVALID_ENTITYID;
++
+ 	CBaseObject* cameraObject = GetCameraObject();
+ 	if (cameraObject)
+ 	{
+@@ -508,6 +641,8 @@ void CLevelEditorViewport::OnRender(SDisplayContext& context)
+ 
+ 			if (IEntity* pCameraEntity = ((CEntityObject*)cameraObject)->GetIEntity())
+ 			{
++				cineCamPreviewEntity = pCameraEntity->GetId();
++
+ 				if (Cry::DefaultComponents::CCameraComponent* pCameraComponent = pCameraEntity->GetComponent<Cry::DefaultComponents::CCameraComponent>())
+ 				{
+ 					m_viewTM = pCameraComponent->GetWorldTransformMatrix();
+@@ -605,6 +740,10 @@ void CLevelEditorViewport::OnRender(SDisplayContext& context)
+ 	}
+ 	else
+ 	{
++		// Tell the cinematic camera plugin which camera this viewport is about to render through.
++		// This is the latest possible point (after entity updates and the time-of-day writers).
++		PushCineCamPreview(cineCamPreviewEntity);
++
+ 		GetIEditor()->GetSystem()->SetViewCamera(m_Camera);
+ 
+ 		m_engine->Tick();
+@@ -806,15 +945,26 @@ void CLevelEditorViewport::OnCameraSpeedChanged()
+ }
+ 
+ void CLevelEditorViewport::OnMenuCreateCameraFromCurrentView()
++{
++	CreateCameraFromCurrentView(Schematyc::GetTypeGUID<Cry::DefaultComponents::CCameraComponent>(), "Create Camera from Current View", false);
++}
++
++void CLevelEditorViewport::OnMenuCreateCinematicCamera()
++{
++	// The cinematic camera component creates its own sibling CCameraComponent in Initialize(), so the
++	// new entity ends up with both and the FOV is written through the sibling, as above.
++	// The viewport is deliberately NOT switched to the new camera; it is only selected.
++	CreateCameraFromCurrentView(Private_CineCamPreview::cinematicCameraComponentGUID, "Create Cinematic Camera", true);
++}
++
++void CLevelEditorViewport::CreateCameraFromCurrentView(const CryGUID& componentGUID, const char* szUndoName, bool bSelect)
+ {
+ 	IObjectManager* pObjMgr = GetIEditor()->GetObjectManager();
+ 
+ 	// Create new camera
+ 	GetIEditor()->GetIUndoManager()->Begin();
+ 
+-	CryGUID cameraComponentGUID = Schematyc::GetTypeGUID<Cry::DefaultComponents::CCameraComponent>();
+-
+-	if (CEntityObject* pNewCameraObject = static_cast<CEntityObject*>(pObjMgr->NewObject("EntityWithComponent", nullptr, cameraComponentGUID.ToString())))
++	if (CEntityObject* pNewCameraObject = static_cast<CEntityObject*>(pObjMgr->NewObject("EntityWithComponent", nullptr, componentGUID.ToString())))
+ 	{
+ 		// If new camera was successfully created copy parameters from old camera
+ 		pNewCameraObject->SetWorldTM(m_Camera.GetMatrix());
+@@ -826,7 +976,12 @@ void CLevelEditorViewport::OnMenuCreateCameraFromCurrentView()
+ 			pCameraComponent->SetFieldOfView(CryTransform::CAngle::FromRadians(GetFOV()));
+ 		}
+ 
+-		GetIEditor()->GetIUndoManager()->Accept("Create Camera from Current View");
++		if (bSelect)
++		{
++			pObjMgr->SelectObject(pNewCameraObject);
++		}
++
++		GetIEditor()->GetIUndoManager()->Accept(szUndoName);
+ 	}
+ 	else
+ 	{
+diff --git a/Code/Sandbox/EditorQt/LevelEditor/LevelEditorViewport.h b/Code/Sandbox/EditorQt/LevelEditor/LevelEditorViewport.h
+index 2101baa6..650d53d1 100644
+--- a/Code/Sandbox/EditorQt/LevelEditor/LevelEditorViewport.h
++++ b/Code/Sandbox/EditorQt/LevelEditor/LevelEditorViewport.h
+@@ -33,6 +33,14 @@ public:
+ 	void  SetSelectedCamera();
+ 	bool  IsSelectedCamera() const;
+ 
++	//! CineCam is a second built-in fly camera: it behaves exactly like the default camera
++	//! (same navigation, same FOV handling, no entity) but is flagged as "CineCam mode", which
++	//! the cinematic camera plugin uses to drive its editor preview look.
++	//! IsDefaultCamera() stays true in CineCam mode on purpose (default-camera family).
++	void SetDefaultFlyCamera();
++	void SetCineCamFlyCamera();
++	bool IsCineCamFlyCamera() const { return m_bCineCamMode && IsDefaultCamera(); }
++
+ 	//! This switches the active camera to the next one in the list of (default, all custom cams).
+ 	void CycleCamera();
+ 
+@@ -48,6 +56,15 @@ private:
+ 
+ 	void OnCameraSpeedChanged() override;
+ 	void OnMenuCreateCameraFromCurrentView();
++	void OnMenuCreateCinematicCamera();
++	//! Creates an "EntityWithComponent" object carrying componentGUID at the current view, sets the
++	//! sibling camera component FOV, and optionally selects it. Shared by both "Create ..." menu items.
++	void CreateCameraFromCurrentView(const CryGUID& componentGUID, const char* szUndoName, bool bSelect);
++	//! Per-frame push of (mode, entity, camera) to the cinematic camera plugin, and its counterpart.
++	void PushCineCamPreview(EntityId previewEntity);
++	void ClearCineCamPreview();
++	void LoadCineCamPersonalization();
++	void SaveCineCamPersonalization() const;
+ 	void OnMenuSelectCurrentCamera();
+ 	void OnRender(SDisplayContext& context) override;
+ 	void RenderAll(CObjectRenderHelper& displayInfo);
+@@ -62,4 +79,8 @@ private:
+ 
+ 	float            m_camFOV;
+ 	QViewportHeader* m_headerWidget;
++	//! true when the built-in fly camera is the CineCam one instead of the stock default camera.
++	bool             m_bCineCamMode;
++	//! true while this viewport has an outstanding SetViewportPreview() the plugin must be told to drop.
++	bool             m_bCineCamPreviewPushed;
+ };
+-- 
+2.47.1.windows.1
+

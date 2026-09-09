@@ -1,0 +1,188 @@
+From ed5735974a234f75e3dc5533278faa78e98a515c Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Wed, 9 Sep 2026 15:31:20 +0800
+Subject: [PATCH 139/144] fix: the volumetric cloud layer was cut at the far
+ plane - sky rays now march to the cloud shell
+
+The hard horizontal line across the sky. Proven by experiment, not inference:
+- pristine CRYENGINE 5.7.1 (engine DLLs and shaders from the official archive, stock Sandbox):
+  same level, same camera, 18:00 - the line is there;
+- last night's build (95930889 engine + stock editor + old plugin): the line is there;
+- the same view with e_MaxViewDistance 20000 instead of the level's 8000: the line moves from
+  ~6 deg to ~2.5 deg above the horizon, exactly asin((cloud base - camera) / ZF).
+
+Root cause. Clouds.cfx limits the ray-march by the depth buffer ("limit the length of
+ray-marching by depth buffer"). A sky pixel carries the far plane's depth, so the far plane
+acts as an occluder: every ray whose slab entry lies beyond ZF gets maxStepNum == 0 and the
+cloud layer - clouds, atmospheric haze, everything - stops at that elevation. Stock content
+hides it under fog and a weak haze; the scene-referred path's brighter haze made it stark.
+
+Fix. On the scene-referred path a sky ray (linear depth at the far plane) keeps the geometric
+bounds - the cloud shell and the max viewable distance - and only real geometry clamps the
+march. Both visible march techniques (monolithic and the split RenderCloud); the min-depth
+twin follows. Gate = cloudBaseOffsetParams.w (stock: unused padding), filled 1.0 when the
+scene-referred stage is on; off the switch the stock expressions are evaluated unchanged.
+The overlay's cloud line prints "sky rays past ZF yes/no"; its zenith-haze number uses the
+saturating 1 - exp(-beta OD) form.
+
+Verified with the editor automation: at the level's own 8 km far plane the cloud layer now
+runs continuously to the horizon at 17:30 and 18:00 (scene-notes/build-logs/sky_FINAL*.jpg
+vs sky_OLD*, sky_PRISTINE2*_screen.png, sky_FAR20K*).
+
+Not shipped, kept as an alternative: handing the empty-sky share of the Rayleigh haze to the
+Nishita dome (research/s9-cloud-edge-root.md). It removes the haze's "sky layering", which the
+user wants kept, and the line was never the haze's weight - it was the cut.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01HXzRVK4yBVDUNfdWXEwV5y
+---
+ .../GraphicsPipeline/ToneMapping.cpp          |  3 +-
+ .../GraphicsPipeline/VolumetricClouds.cpp     | 20 ++++++++++--
+ .../GraphicsPipeline/VolumetricClouds.h       |  3 +-
+ Engine/Shaders/HWScripts/CryFX/Clouds.cfx     | 32 ++++++++++++++++---
+ 4 files changed, 49 insertions(+), 9 deletions(-)
+
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.cpp
+index 3ee151d4..423c04c4 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.cpp
+@@ -1184,10 +1184,11 @@ void CToneMappingStage::DisplaySceneReferredCoverage()
+ 		{
+ 			const float sunLum = 0.2126f * cl.sunExposed.x + 0.7152f * cl.sunExposed.y + 0.0722f * cl.sunExposed.z;
+ 			const float skyLum = 0.2126f * cl.skyExposed.x + 0.7152f * cl.skyExposed.y + 0.0722f * cl.skyExposed.z;
+-			cry_sprintf(str, "  clouds [on] x%.4g: sun %.4g  sky %.4g  atmos-sun %.4g  zenith haze %.4g exposed (%+.1f stops vs grey)  | Rayleigh k %.3g/m unexposed by design",
++			cry_sprintf(str, "  clouds [on] x%.4g: sun %.4g  sky %.4g  atmos-sun %.4g  zenith haze %.4g exposed (%+.1f stops vs grey)  sky rays past ZF %s  | Rayleigh k %.3g/m unexposed by design",
+ 			            cl.exposureApplied, sunLum, skyLum, cl.atmosSunExposed,
+ 			            cl.zenithHazeExposed,
+ 			            (cl.zenithHazeExposed > 0.0f) ? log2f(cl.zenithHazeExposed / 0.18f) : -99.0f,
++			            cl.bSkyRayUnclamped ? "yes" : "no",
+ 			            cl.rayleighCoeff.y);
+ 		}
+ 		IRenderAuxText::DrawText(Vec3(5, 235, 1), IRenderAuxText::ASize(1.0f), ColorF(1, 0, 1, 1), eDrawText_800x600 | eDrawText_2D, str);
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/VolumetricClouds.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/VolumetricClouds.cpp
+index 40d558d3..e9272394 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/VolumetricClouds.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/VolumetricClouds.cpp
+@@ -141,7 +141,7 @@ struct SVolumetricCloudsShaderParam
+ 	f32      jitteredSamplingPosition;
+ 
+ 	Vec3     cloudOffset;
+-	f32      padding1;
++	f32      skyRayUnclamped; // cloudBaseOffsetParams.w: 1.0 on the scene-referred path - sky rays are not clamped to the far plane (decisions/s9-cloud-edge.md); 0.0 stock (unused padding)
+ 
+ 	f32      maxGlobalCloudDensity;
+ 	f32      minRescaleCloudTexDensity;
+@@ -1586,7 +1586,13 @@ void CVolumetricCloudsStage::GenerateCloudShaderParam(::VCCloudRenderContext& co
+ 			cb.jitteredSamplingPosition = VCGetVdC(iFrameCount);
+ 
+ 			cb.cloudOffset = Vec3(PF.pVolCloudTilingOffset.x, PF.pVolCloudTilingOffset.y, PF.pVolCloudTilingOffset.z - altitude);
+-			cb.padding1 = 0.0f;
++			// Scene-referred: Clouds.cfx no longer clamps a SKY ray's march to the depth buffer. A sky
++			// pixel carries the far plane's depth and the far plane is not an occluder; clamped to it,
++			// the whole cloud layer was cut at asin((cloud base - camera) / ZF) above the horizon - a
++			// hard line across the sky that stock CRYENGINE 5.7.1 has too (verified against the pristine
++			// engine, research/s9-cloud-edge-root.md, decisions/s9-cloud-edge.md). Exactly 0.0 off the
++			// switch - a lane stock never reads.
++			cb.skyRayUnclamped = CRendererResources::IsSceneReferredStage(2) ? 1.0f : 0.0f;
+ 
+ 			cb.maxGlobalCloudDensity = cloudDensityParams.x;
+ 			cb.minRescaleCloudTexDensity = cloudDensityParams.y;
+@@ -1704,8 +1710,16 @@ void CVolumetricCloudsStage::GenerateCloudShaderParam(::VCCloudRenderContext& co
+ 				const float mu = cb.sunLightDirection.z; // dot(float3(0,0,1), sunLightDir)
+ 				const float phaseRayleigh = cb.sunIntensityForAtmospheric * 3.0f / (16.0f * gf_PI) * (1.0f + mu * mu);
+ 				const float pathIntegral = 8.0e3f * (1.0f - expf(-(cb.altitude + cb.thickness) / 8.0e3f));
+-				const Vec3 haze = cb.atmosphericScattering * (phaseRayleigh * pathIntegral);
++				// The shader's running attenuation exp(-beta * OD) makes the sum phaseRayleigh *
++				// (1 - exp(-beta * OD)) per channel, not beta * OD * phaseRayleigh: identical to 1 %
++				// at the zenith, but the first-order form over-reports by 45 % near the horizon
++				// (research/s9-cloud-haze-ratio.md s7), so carry the saturating form here.
++				const Vec3 beta = cb.atmosphericScattering;
++				const Vec3 haze(phaseRayleigh * (1.0f - expf(-beta.x * pathIntegral)),
++				                phaseRayleigh * (1.0f - expf(-beta.y * pathIntegral)),
++				                phaseRayleigh * (1.0f - expf(-beta.z * pathIntegral)));
+ 				m_srDebug.zenithHazeExposed = 0.2126f * haze.x + 0.7152f * haze.y + 0.0722f * haze.z;
++				m_srDebug.bSkyRayUnclamped = cb.skyRayUnclamped > 0.0f;
+ 			}
+ 		}
+ 
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/VolumetricClouds.h b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/VolumetricClouds.h
+index 330865e0..0f18bb64 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/VolumetricClouds.h
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/VolumetricClouds.h
+@@ -44,7 +44,8 @@ public:
+ 		Vec3  skyExposed        = Vec3(ZERO); // skylightRayleighInScatter, exposed engine units
+ 		float atmosSunExposed   = 0.0f;   // sunIntensityForAtmospheric, exposed engine units
+ 		Vec3  rayleighCoeff     = Vec3(ZERO); // atmosphericScattering, per metre - NOT exposed, it lives inside exp()
+-		float zenithHazeExposed = 0.0f;   // CPU evaluation of the atmospheric inscatter straight up, exposed engine units
++		float zenithHazeExposed = 0.0f;   // CPU evaluation of the atmospheric inscatter straight up, exposed engine units (what a cloud at the zenith gets in front of it)
++		bool  bSkyRayUnclamped  = false;  // skyRayUnclamped lane: sky rays march past the far plane to the cloud layer (decisions/s9-cloud-edge.md)
+ 	};
+ 	const SSceneReferredDebug& GetSceneReferredDebug() const { return m_srDebug; }
+ 
+diff --git a/Engine/Shaders/HWScripts/CryFX/Clouds.cfx b/Engine/Shaders/HWScripts/CryFX/Clouds.cfx
+index 1b2fdb21..2936adcc 100644
+--- a/Engine/Shaders/HWScripts/CryFX/Clouds.cfx
++++ b/Engine/Shaders/HWScripts/CryFX/Clouds.cfx
+@@ -1430,7 +1430,19 @@ void RenderCloudMonolithicCS(uint3 GroupID : SV_GroupID,
+ 	distanceEnd = (distanceEnd - distanceStart) > MaxRaymarchDistance ? (MaxRaymarchDistance + distanceStart) : distanceEnd;
+ 
+ 	// limit the length of ray-marching by depth buffer.
+-	distanceEnd = (distanceTarget < distanceEnd && distanceFar > distanceTarget) ? distanceTarget : distanceEnd;
++	// ReCS scene-referred path (decisions/s9-cloud-edge.md, 2026-09-09): a SKY pixel carries the far
++	// plane's depth, and the far plane is not an occluder. Clamping the march to it cuts the whole cloud
++	// layer - clouds, haze, everything - at the elevation where the layer is entered beyond ZF
++	// (asin((cloud base - camera) / ZF): ~6 degrees for this level's 8 km), a hard line across the sky
++	// that stock CRYENGINE 5.7.1 has too (verified against the pristine engine). Sky rays keep the
++	// geometric bounds (cloud shell, max viewable distance); real geometry still clamps as before.
++	// Off the switch the stock expression is evaluated unchanged.
++#if !%_RT_SAMPLE2
++	const bool bSkyRayUnclamped = (vcCloudBaseOffsetParams.w > 0.0f) && (linearMaxDepth >= 0.999f);
++#else
++	const bool bSkyRayUnclamped = (vc.cloudBaseOffsetParams.w > 0.0f) && (linearMaxDepth >= 0.999f);
++#endif
++	distanceEnd = (!bSkyRayUnclamped && distanceTarget < distanceEnd && distanceFar > distanceTarget) ? distanceTarget : distanceEnd;
+ 
+ 	// intersection with ocean or horizon to stop ray-marching under the horizon.
+ 	float distHorizon = vcGetIntersectionPlane(nearPlanePosWS, camDir, float4(0.0f, 0.0f, 1.0f, horizonHeight));
+@@ -1440,7 +1452,7 @@ void RenderCloudMonolithicCS(uint3 GroupID : SV_GroupID,
+ 	distanceStart = (nearPlanePosWS.z <= horizonHeight && camDir.z <= 0.0f) ? distanceEnd : distanceStart;
+ 
+ 	// if min-depth equals to far depth, it should be beyond far plane.
+-	distanceTargetMin = (distanceTargetMin == distanceFar) ? distanceEnd : distanceTargetMin;
++	distanceTargetMin = (distanceTargetMin == distanceFar || (bSkyRayUnclamped && linearMinDepth >= 0.999f)) ? distanceEnd : distanceTargetMin;
+ 
+ 	// stop ray-marching if it isn't needed.
+ 	float maxStepNum = (distanceStart >= distanceEnd) ? 0.0f : MaxStepRaymarch;
+@@ -2316,7 +2328,19 @@ void RenderCloudCS(uint3 GroupID : SV_GroupID,
+ 	distanceEnd = (distanceEnd - distanceStart) > MaxRaymarchDistance ? (MaxRaymarchDistance + distanceStart) : distanceEnd;
+ 
+ 	// limit the length of ray-marching by depth buffer.
+-	distanceEnd = (distanceTarget < distanceEnd && distanceFar > distanceTarget) ? distanceTarget : distanceEnd;
++	// ReCS scene-referred path (decisions/s9-cloud-edge.md, 2026-09-09): a SKY pixel carries the far
++	// plane's depth, and the far plane is not an occluder. Clamping the march to it cuts the whole cloud
++	// layer - clouds, haze, everything - at the elevation where the layer is entered beyond ZF
++	// (asin((cloud base - camera) / ZF): ~6 degrees for this level's 8 km), a hard line across the sky
++	// that stock CRYENGINE 5.7.1 has too (verified against the pristine engine). Sky rays keep the
++	// geometric bounds (cloud shell, max viewable distance); real geometry still clamps as before.
++	// Off the switch the stock expression is evaluated unchanged.
++#if !%_RT_SAMPLE2
++	const bool bSkyRayUnclamped = (vcCloudBaseOffsetParams.w > 0.0f) && (linearMaxDepth >= 0.999f);
++#else
++	const bool bSkyRayUnclamped = (vc.cloudBaseOffsetParams.w > 0.0f) && (linearMaxDepth >= 0.999f);
++#endif
++	distanceEnd = (!bSkyRayUnclamped && distanceTarget < distanceEnd && distanceFar > distanceTarget) ? distanceTarget : distanceEnd;
+ 
+ 	// intersection with ocean or horizon to stop ray-marching under the horizon.
+ 	float distHorizon = vcGetIntersectionPlane(nearPlanePosWS, camDir, float4(0.0f, 0.0f, 1.0f, horizonHeight));
+@@ -2326,7 +2350,7 @@ void RenderCloudCS(uint3 GroupID : SV_GroupID,
+ 	distanceStart = (nearPlanePosWS.z <= horizonHeight && camDir.z <= 0.0f) ? distanceEnd : distanceStart;
+ 
+ 	// if min-depth equals to far depth, it should be beyond far plane.
+-	distanceTargetMin = (distanceTargetMin == distanceFar) ? distanceEnd : distanceTargetMin;
++	distanceTargetMin = (distanceTargetMin == distanceFar || (bSkyRayUnclamped && linearMinDepth >= 0.999f)) ? distanceEnd : distanceTargetMin;
+ 
+ 	// stop ray-marching if it isn't needed.
+ 	float maxStepNum = (distanceStart >= distanceEnd) ? 0.0f : MaxStepRaymarch;
+-- 
+2.47.1.windows.1
+

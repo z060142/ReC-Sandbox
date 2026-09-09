@@ -1,0 +1,2017 @@
+From 124446cb7d20a421444cdf9cd7ffa9abc2c243b5 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Wed, 9 Sep 2026 08:50:32 +0800
+Subject: [PATCH 136/144] feat: the Sandbox viewport chooses who drives the
+ picture while editing (cinecam editor preview)
+
+Plugin side of decisions/s9-editor-cinecam-preview.md. Until now "active" for the cinematic
+camera meant the CryDefaultEntities camera manager's pointer, which in edit mode is simply the
+last camera component that initialised on level load - so the editor picture followed whichever
+camera happened to be last, not the one the viewport showed, and the game-only effects were
+skipped outright while editing.
+
+- Interface/ICineCamEditorPreview.h + exported CryGetCineCamEditorPreview(): the level-editor
+  viewport tells the plugin once per rendered frame what it is looking through (Default, CineCam,
+  or a camera entity). Frame-counter staleness (two frames), never wall clock, because the editor
+  skips frames when idle.
+- Edit-mode resolver (UpdateEditorPreview): Entity -> that entity's cinematic camera drives the
+  full effect set, including the formerly game-only half (FinalizeGameCamera split into the
+  view write, still game-only, and ApplyGameOnlyEffects) and DOF with the entity's own focus
+  (CanApplyViewEffects replaces the seven !IsEditing() gates); an entity without a cinematic
+  camera (plain camera, TrackView) degrades to Default. CineCam -> a plugin-owned publisher with
+  no entity: scene referred on, default ODT, sun shafts suppressed, exposure from the shared
+  histogram meter only (aperture/shutter/ISO/ND do not participate), one knob cinecam_EditorLookEV.
+  Default -> nobody publishes; the stock picture.
+- Hand-over order: the outgoing owner restores before the incoming one latches, so
+  Entity -> CineCam -> Default leaves stock state. Ctrl+G either way drops the baselines
+  (ResetPostEffects runs on both edges) and the viewport re-establishes the preview next frame.
+- Shared code lifted out of the component into CineCamShared.* (meter reduction, adaptation,
+  scene-referred convention, LUT publication); the component's game-mode behaviour is unchanged.
+- One log line per owner change: "[cinecam] editor preview -> ...".
+
+Naming: the plugin's abbreviation is cinecam from here on; existing ccam_ cvars keep their names.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01HXzRVK4yBVDUNfdWXEwV5y
+---
+ .../Interface/ICineCamEditorPreview.h         |  50 ++
+ .../CinematicCamera/Module/CMakeLists.txt     |   6 +
+ .../Module/CineCamEditorLook.cpp              | 223 ++++++++
+ .../Module/CineCamEditorLook.h                |  73 +++
+ .../CinematicCamera/Module/CineCamShared.cpp  | 366 +++++++++++++
+ .../CinematicCamera/Module/CineCamShared.h    |  96 ++++
+ .../Module/CinematicCameraComponent.cpp       | 495 +++++-------------
+ .../Module/CinematicCameraComponent.h         |  82 ++-
+ .../Module/CinematicCameraPlugin.cpp          | 162 ++++++
+ .../Module/CinematicCameraPlugin.h            |  37 ++
+ 10 files changed, 1180 insertions(+), 410 deletions(-)
+ create mode 100644 Code/CryPlugins/CinematicCamera/Interface/ICineCamEditorPreview.h
+ create mode 100644 Code/CryPlugins/CinematicCamera/Module/CineCamEditorLook.cpp
+ create mode 100644 Code/CryPlugins/CinematicCamera/Module/CineCamEditorLook.h
+ create mode 100644 Code/CryPlugins/CinematicCamera/Module/CineCamShared.cpp
+ create mode 100644 Code/CryPlugins/CinematicCamera/Module/CineCamShared.h
+
+diff --git a/Code/CryPlugins/CinematicCamera/Interface/ICineCamEditorPreview.h b/Code/CryPlugins/CinematicCamera/Interface/ICineCamEditorPreview.h
+new file mode 100644
+index 00000000..7d6ccd1b
+--- /dev/null
++++ b/Code/CryPlugins/CinematicCamera/Interface/ICineCamEditorPreview.h
+@@ -0,0 +1,50 @@
++// Sandbox editor preview surface of the Cinematic Camera plugin ("cinecam").
++//
++// The level-editor viewport tells the plugin, once per rendered frame, what the user is
++// looking through. The plugin resolves that into "who drives the render state this frame":
++//
++//   Default  - nobody. The picture is stock, exactly as an engine without cinecam draws it.
++//   CineCam  - the plugin's own publisher (no entity): scene referred + automatic adaptation.
++//   Entity   - the CCinematicCameraComponent on that entity, with its FULL effect set.
++//
++// The Sandbox side resolves this the same way CryPhoneTracker resolves the optics entry point:
++// CryLoadLibraryDefName("CinematicCamera") + CryGetProcAddress(CINECAM_EDITOR_PREVIEW_ENTRY).
++// A missing module or a null pointer is not an error - the editor then behaves exactly stock.
++#pragma once
++
++#include <CryEntitySystem/IEntityBasicTypes.h>
++
++class CCamera;
++
++//! What the level-editor viewport is looking through this frame.
++enum class ECineCamEditorPreviewMode : int
++{
++	Default = 0,   //!< the stock editor fly camera; the plugin publishes nothing
++	CineCam = 1,   //!< the built-in cinecam fly camera; the plugin's own publisher drives
++	Entity  = 2,   //!< a camera entity; its CCinematicCameraComponent drives (if it has one)
++};
++
++struct ICineCamEditorPreview
++{
++	virtual ~ICineCamEditorPreview() {}
++
++	//! Called by the level-editor viewport once per rendered frame, in edit mode, immediately
++	//! before it hands its camera to the engine. entityId is valid only for Entity mode.
++	//! camera is the viewport's CCamera for this frame (Default/CineCam: the fly camera;
++	//! Entity: the copy taken from the entity).
++	//! A frame without a call falls back to Default after one frame of grace, so a closed
++	//! viewport cannot freeze the look.
++	virtual void SetViewportPreview(ECineCamEditorPreviewMode mode, EntityId entityId, const CCamera& camera) = 0;
++
++	//! The viewport tells the plugin the preview is gone (viewport destroyed, level unload).
++	//! The plugin restores stock state.
++	virtual void ClearViewportPreview() = 0;
++};
++
++//! Name of the C entry point exported by CinematicCamera.dll.
++#define CINECAM_EDITOR_PREVIEW_ENTRY "CryGetCineCamEditorPreview"
++
++//! Signature of that entry point. May return nullptr before the plugin is up.
++typedef ICineCamEditorPreview* (* TGetCineCamEditorPreviewFn)();
++
++extern "C" DLL_EXPORT ICineCamEditorPreview* CryGetCineCamEditorPreview();
+diff --git a/Code/CryPlugins/CinematicCamera/Module/CMakeLists.txt b/Code/CryPlugins/CinematicCamera/Module/CMakeLists.txt
+index 15d5d64f..bb3c20fb 100644
+--- a/Code/CryPlugins/CinematicCamera/Module/CMakeLists.txt
++++ b/Code/CryPlugins/CinematicCamera/Module/CMakeLists.txt
+@@ -11,6 +11,12 @@ add_sources("CinematicCamera_uber_0.cpp"
+ 	SOURCE_GROUP "Components"
+ 		"CinematicCameraComponent.h"
+ 		"CinematicCameraComponent.cpp"
++	SOURCE_GROUP "Editor"
++		"../Interface/ICineCamEditorPreview.h"
++		"CineCamShared.h"
++		"CineCamShared.cpp"
++		"CineCamEditorLook.h"
++		"CineCamEditorLook.cpp"
+ 	SOURCE_GROUP "Tools"
+ 		"HDRIImport.h"
+ 		"HDRIImport.cpp"
+diff --git a/Code/CryPlugins/CinematicCamera/Module/CineCamEditorLook.cpp b/Code/CryPlugins/CinematicCamera/Module/CineCamEditorLook.cpp
+new file mode 100644
+index 00000000..92eb7b24
+--- /dev/null
++++ b/Code/CryPlugins/CinematicCamera/Module/CineCamEditorLook.cpp
+@@ -0,0 +1,223 @@
++#include "StdAfx.h"
++#include "CineCamEditorLook.h"
++#include "CinematicCameraComponent.h"   // EMeteringMode, and the defaults this look mirrors
++
++#include <Cry3DEngine/I3DEngine.h>
++#include <CrySystem/IConsole.h>
++#include <CrySystem/ConsoleRegistration.h>
++#include <CryRenderer/IRenderer.h>
++
++namespace
++{
++// What a fresh Cinematic Camera runs with, and therefore what a fly camera with no lens has to
++// stand in for. Spelled out rather than default-constructing a component: these are the numbers
++// the editor look IS, and a reader should not have to chase reflected in-class initialisers to
++// find out what the viewport is showing them.
++const float kEditorLookSensorClipStops = 8.0f;      // SCineExposureParams::sensorClipStops
++const float kEditorLookMeterSkyWeight  = 0.25f;     // SCineExposureParams::meterSkyWeight
++const float kEditorLookAutoEVMin       = -2.0f;     // SCineExposureParams::autoEVMin
++const float kEditorLookAutoEVMax       = 20.0f;     // SCineExposureParams::autoEVMax
++
++// The triangle the AUTO fallback exposes at before the first measurement lands: f/5.6, 1/50,
++// ISO 400 -> EV100 8.615, the shipped body/lens defaults. Same role as the component's
++// "expose as if Manual rather than at EV 0, which would be a white frame".
++const float kEditorLookFallbackAperture   = 5.6f;
++const float kEditorLookFallbackShutterDen = 50.0f;
++const float kEditorLookFallbackISO        = 400.0f;
++
++// The renderer's twin of this is CRendererResources::kSceneReferredMidGrey's companion, the 1.2 in
++// the saturation-based sensitivity model (spec D6). Same constant as the component uses in
++// ComputeSceneReferredExposureScale(), for the same reason: it is an anchor, not a tunable.
++const float kSensorSaturationFactor = 1.2f;
++}
++
++void CCineCamEditorLook::RegisterCVars()
++{
++	if (m_pEVCVar != nullptr || gEnv->pConsole == nullptr)
++		return;
++
++	// The ONE knob. Stops, positive = brighter, the same sign convention a camera's exposure
++	// compensation dial has and the same one SCineExposureParams::evCompensation has.
++	m_pEVCVar = REGISTER_CVAR2("cinecam_EditorLookEV", &m_evCompensationCVar, 0.0f, VF_NULL,
++		"Exposure compensation, in stops, for the Sandbox viewport's CineCam camera. "
++		"Positive is brighter. Metering-driven exposure only - aperture, shutter, ISO and ND "
++		"belong to a Cinematic Camera entity, not to the editor fly camera.");
++}
++
++void CCineCamEditorLook::UnregisterCVars()
++{
++	if (m_pEVCVar != nullptr && gEnv->pConsole != nullptr)
++		gEnv->pConsole->UnregisterVariable("cinecam_EditorLookEV");
++
++	m_pEVCVar = nullptr;
++}
++
++float CCineCamEditorLook::GetEVCompensation() const
++{
++	return m_pEVCVar ? m_pEVCVar->GetFVal() : m_evCompensationCVar;
++}
++
++float CCineCamEditorLook::ComputeEV100()
++{
++	const float evCompensation = GetEVCompensation();
++
++	// The AUTO meter, with the component's shipped metering settings. AutoCompensation semantics:
++	// the metered EV, minus the compensation - the aperture/shutter/ISO triangle plays no part,
++	// which is the whole difference between this and a camera entity.
++	CineCam::SAutoMeterSettings meter;   // in-class defaults ARE the component's defaults
++
++	float ev = 0.0f;
++	if (!CineCam::UpdateAutoMeteredEV(meter, m_autoMeter, ev))
++	{
++		// Nothing measured yet: the shipped triangle, so the first frames are a plausible daylight
++		// exposure rather than a white or black frame.
++		const float t = 1.0f / kEditorLookFallbackShutterDen;
++		ev = log2f(kEditorLookFallbackAperture * kEditorLookFallbackAperture / t)
++		     - log2f(kEditorLookFallbackISO / 100.0f);
++	}
++
++	ev -= evCompensation;
++
++	return clamp_tpl(clamp_tpl(ev, kEditorLookAutoEVMin, kEditorLookAutoEVMax), -6.0f, 24.0f);
++}
++
++void CCineCamEditorLook::Update()
++{
++	if (gEnv == nullptr || gEnv->p3DEngine == nullptr)
++		return;
++
++	I3DEngine* const p3DEngine = gEnv->p3DEngine;
++
++	// ----- the scene-referred switch ---------------------------------------------------------
++	if (!m_bSceneReferredSaved)
++	{
++		p3DEngine->GetPostEffectParam("Global_User_SceneReferred", m_savedSceneReferred);
++		m_bSceneReferredSaved = true;
++	}
++
++	p3DEngine->SetPostEffectParam("Global_User_SceneReferred", 1.0f);
++	CineCam::PublishSceneReferredConvention(true);
++
++	// ----- the display chain -----------------------------------------------------------------
++	// Default ODT, identity look. Without an output transform the picture is a clamped ACEScct
++	// encode, which is exactly the "looks like a bug because it is one" case the component's
++	// empty-field substitution exists for.
++	CineCam::ApplyDisplayLuts(nullptr, "");
++	m_bLutsPublished = true;
++
++	// ----- the pre-exposure and the meter's inputs -------------------------------------------
++	if (!m_bSceneExposureSaved)
++	{
++		p3DEngine->GetPostEffectParam("Global_User_SceneExposure", m_savedSceneExposure);
++		p3DEngine->GetPostEffectParam("Global_User_SensorClipStops", m_savedSensorClipStops);
++		m_bSceneExposureSaved = true;
++	}
++
++	const float ev100 = ComputeEV100();
++
++	p3DEngine->SetPostEffectParam("Global_User_SceneExposure",
++	                              RENDERER_LIGHT_UNIT_SCALE / (kSensorSaturationFactor * powf(2.0f, ev100)));
++	p3DEngine->SetPostEffectParam("Global_User_SensorClipStops", kEditorLookSensorClipStops);
++
++	p3DEngine->SetPostEffectParam("Global_User_MeterMode", (float)(uint32)EMeteringMode::CenterWeighted);
++	p3DEngine->SetPostEffectParam("Global_User_MeterSkyWeight", kEditorLookMeterSkyWeight);
++
++	// Diagnostics for r_HDRDebug 1, on the same terms as the component: the driver owns the
++	// reduction, so the renderer cannot print the band's edges unless the driver says what they were.
++	p3DEngine->SetPostEffectParam("Global_User_MeterBandLow", m_autoMeter.bandLowLum);
++	p3DEngine->SetPostEffectParam("Global_User_MeterBandHigh", m_autoMeter.bandHighLum);
++	p3DEngine->SetPostEffectParam("Global_User_MeterTargetEV", m_autoMeter.targetEV);
++	p3DEngine->SetPostEffectParam("Global_User_MeterBandMean", m_autoMeter.bandMeanStops);
++	p3DEngine->SetPostEffectParam("Global_User_MeterHold", (float)m_autoMeter.hold);
++
++	// ----- sun shafts ------------------------------------------------------------------------
++	// Screen-space shafts are retired on ReCS; re-asserted per frame so a ResetPostEffects cannot
++	// leave the stage on under the editor look.
++	m_bSunShaftsSaved = true;
++	p3DEngine->SetPostEffectParam("Global_User_SunShaftsSuppressed", 1.0f);
++
++	// ----- the eye-adaptation triple ---------------------------------------------------------
++	// Not what produces the picture on the scene-referred path (the tone map pins its own window),
++	// but the particle system's ExposureValue domain reads it, so it is kept meaningful and
++	// consistent - and .z = 0 because a camera has no scene-key tilt.
++	Vec3 v;
++	p3DEngine->GetGlobalParameter(E3DPARAM_HDR_EYEADAPTATION_PARAMS, v);
++
++	if (!m_bExpParamsSaved)
++	{
++		m_savedEyeAdaptation = v;
++		m_bExpParamsSaved = true;
++	}
++
++	v.x = ev100;
++	v.y = ev100;
++	v.z = 0.0f;
++	p3DEngine->SetGlobalParameter(E3DPARAM_HDR_EYEADAPTATION_PARAMS, v);
++}
++
++void CCineCamEditorLook::Restore()
++{
++	if (gEnv == nullptr || gEnv->p3DEngine == nullptr)
++	{
++		ClearSavedBaselines();
++		return;
++	}
++
++	I3DEngine* const p3DEngine = gEnv->p3DEngine;
++
++	if (m_bSceneReferredSaved)
++	{
++		p3DEngine->SetPostEffectParam("Global_User_SceneReferred", m_savedSceneReferred);
++		m_bSceneReferredSaved = false;
++		// The engine-side mirror goes back by the same flip path, so the 3D engine is left on the
++		// stock light-unit convention with the time of day already re-evaluated for it.
++		CineCam::PublishSceneReferredConvention(m_savedSceneReferred > 0.5f);
++	}
++
++	if (m_bLutsPublished)
++	{
++		CineCam::RestoreDisplayLuts();
++		m_bLutsPublished = false;
++	}
++
++	if (m_bSceneExposureSaved)
++	{
++		p3DEngine->SetPostEffectParam("Global_User_SceneExposure", m_savedSceneExposure);
++		p3DEngine->SetPostEffectParam("Global_User_SensorClipStops", m_savedSensorClipStops);
++
++		// Back to the bus defaults, as RestoreSceneExposure() does: nothing but a cinecam driver
++		// ever writes these, and the readouts describe a measurement no longer being made.
++		p3DEngine->SetPostEffectParam("Global_User_MeterMode", 1.0f);
++		p3DEngine->SetPostEffectParam("Global_User_MeterSkyWeight", 0.25f);
++		p3DEngine->SetPostEffectParam("Global_User_MeterBandLow", 0.0f);
++		p3DEngine->SetPostEffectParam("Global_User_MeterBandHigh", 0.0f);
++		p3DEngine->SetPostEffectParam("Global_User_MeterTargetEV", 0.0f);
++
++		m_bSceneExposureSaved = false;
++	}
++
++	if (m_bSunShaftsSaved)
++	{
++		p3DEngine->SetPostEffectParam("Global_User_SunShaftsSuppressed", 0.0f);
++		m_bSunShaftsSaved = false;
++	}
++
++	if (m_bExpParamsSaved)
++	{
++		p3DEngine->SetGlobalParameter(E3DPARAM_HDR_EYEADAPTATION_PARAMS, m_savedEyeAdaptation);
++		m_bExpParamsSaved = false;
++	}
++
++	// A hand-over is a cut: the next time the editor look drives, the meter snaps.
++	m_autoMeter.bValid = false;
++}
++
++void CCineCamEditorLook::ClearSavedBaselines()
++{
++	m_bSceneReferredSaved = false;
++	m_bSceneExposureSaved = false;
++	m_bExpParamsSaved = false;
++	m_bSunShaftsSaved = false;
++	m_bLutsPublished = false;
++	m_autoMeter.bValid = false;
++}
+diff --git a/Code/CryPlugins/CinematicCamera/Module/CineCamEditorLook.h b/Code/CryPlugins/CinematicCamera/Module/CineCamEditorLook.h
+new file mode 100644
+index 00000000..8636bd87
+--- /dev/null
++++ b/Code/CryPlugins/CinematicCamera/Module/CineCamEditorLook.h
+@@ -0,0 +1,73 @@
++// The "CineCam" viewport camera: the editor look, published without an entity.
++//
++// The Sandbox level-editor viewport camera menu offers CineCam under the stock Default camera
++// (decisions/s9-editor-cinecam-preview.md). CineCam is Default plus the two things that make the
++// editor picture the same picture the pipeline will produce:
++//
++//   - the scene-referred path on (switch, light-unit convention, default ODT, sun shafts off), and
++//   - automatic adaptation: the AUTO meter, and nothing else. There is no aperture, no shutter,
++//     no ISO and no ND here - a fly camera has no lens - so the one knob is an EV compensation,
++//     the cvar cinecam_EditorLookEV, exactly as EExposureMode::AutoCompensation means it on a
++//     component.
++//
++// It is a second driver of the same shared render state as CCinematicCameraComponent, so it uses
++// the same save/restore latches and the same metering code (CineCamShared.h). The plugin's
++// resolver guarantees the two never publish in the same frame.
++#pragma once
++
++#include "CineCamShared.h"
++
++struct ICVar;
++
++class CCineCamEditorLook
++{
++public:
++	//! Registers cinecam_EditorLookEV. Called once from the plugin's Initialize().
++	void RegisterCVars();
++	//! Removes it again. Called from the plugin's destructor.
++	void UnregisterCVars();
++
++	//! Publish the editor look for this frame. Called from the plugin's per-frame resolver while
++	//! the viewport is on the CineCam camera and the level is up.
++	void Update();
++
++	//! Give the render state back: every latch this publisher captured is written back and
++	//! dropped. Called when the viewport moves to Default or to a cinecam entity, and on level
++	//! teardown. Safe to call repeatedly - each restore early-outs when nothing was latched.
++	void Restore();
++
++	//! Drop every latch WITHOUT writing, for the case where the bus was reset behind our back
++	//! (level load, ResetPostEffects on a game/simulation-mode edge). The next Update() re-latches
++	//! from the fresh defaults, exactly as the component's ClearSavedBaselines() does.
++	void ClearSavedBaselines();
++
++private:
++	//! EV100 the editor look exposes at: the shared AUTO meter, minus cinecam_EditorLookEV. Falls
++	//! back to the triangle a fresh Cinematic Camera runs with until the first measurement lands.
++	float ComputeEV100();
++	float GetEVCompensation() const;
++
++	CineCam::SAutoMeterState m_autoMeter;
++
++	ICVar* m_pEVCVar = nullptr;
++	float  m_evCompensationCVar = 0.0f;
++
++	// Scene-referred request (Global_User_SceneReferred).
++	float m_savedSceneReferred = 0.f;
++	bool  m_bSceneReferredSaved = false;
++
++	// Pre-exposure and the sensor's full well (Global_User_SceneExposure / SensorClipStops).
++	float m_savedSceneExposure = 1.f;
++	float m_savedSensorClipStops = 0.f;
++	bool  m_bSceneExposureSaved = false;
++
++	// Eye adaptation triple (E3DPARAM_HDR_EYEADAPTATION_PARAMS).
++	Vec3  m_savedEyeAdaptation = Vec3(4.5f, 17.0f, 1.5f);
++	bool  m_bExpParamsSaved = false;
++
++	// Sun-shaft suppression (Global_User_SunShaftsSuppressed).
++	bool  m_bSunShaftsSaved = false;
++
++	//! Whether we have published LUT ids that still need taking off the bus.
++	bool  m_bLutsPublished = false;
++};
+diff --git a/Code/CryPlugins/CinematicCamera/Module/CineCamShared.cpp b/Code/CryPlugins/CinematicCamera/Module/CineCamShared.cpp
+new file mode 100644
+index 00000000..4328afb2
+--- /dev/null
++++ b/Code/CryPlugins/CinematicCamera/Module/CineCamShared.cpp
+@@ -0,0 +1,366 @@
++#include "StdAfx.h"
++#include "CineCamShared.h"
++
++#include <Cry3DEngine/I3DEngine.h>
++#include <Cry3DEngine/ITimeOfDay.h>
++#include <CryRenderer/IRenderer.h>
++#include <CrySystem/IConsole.h>
++#include <CrySystem/ISystem.h>
++#include <CryMath/Cry_Math.h>
++
++// The cinecam code that is not the entity component's alone: the metering loop, the light-unit
++// convention flip, and (defined next to the LUT slots in CinematicCameraComponent.cpp) the
++// display-LUT publication. Lifted out of CCinematicCameraComponent verbatim when the Sandbox
++// viewport's built-in "CineCam" camera became a second driver of the same render state
++// (decisions/s9-editor-cinecam-preview.md); the entity path is byte-identical to before, it just
++// passes its reflected settings in instead of reading them from members.
++namespace CineCam
++{
++
++// Mid grey, and the ISO 12232 saturation-based sensitivity factor 120/S at S = 100. The renderer's
++// twins are CRendererResources::kSceneReferredMidGrey and the 1.2 in
++// ComputeSceneReferredExposureScale() below; both are spelled out here rather than shared through
++// a header because the plugin cannot see the renderer's internals, and both are anchors of the
++// whole pipeline (spec D6) rather than tunables.
++static const float kSceneMidGrey = 0.18f;
++static const float kSensorSaturationFactor = 1.2f;
++
++// The percentile band, and the EV that puts it on mid grey (decisions/s8-metering.md approach A,
++// steps 3-4).
++//
++// WHY A BAND AND NOT A MEAN. For a geometric mean, a fraction f of the frame at V_hot against a
++// background V_bg shifts the answer by exactly f * log2(V_hot / V_bg) - the sensitivity is LINEAR
++// in area fraction. That single line is why the old meter was nearly blind to the sun (0.025 % of
++// a 50 mm frame, 0.0035 stops) and violently sensitive to the sky (50 % of the frame, 2.65 stops
++// at a fabricated albedo). No amount of clamping fixes a bias caused by half the frame being
++// ordinary-bright and wrongly weighted; a percentile is robust to it by construction, because it
++// asks WHERE the weight sits and not HOW MUCH each texel is worth. This is the shape UE's
++// Histogram mode, Frostbite and the Call-of-Duty family all landed on, and a matrix meter is a
++// coarser, cleverer version of the same instinct.
++//
++// WHY 50-90 AND NOT UE'S 10-90. UE's 10/90 exists to make Histogram agree with Basic, i.e. to be
++// unsurprising to people migrating from a mean. We do not want to agree with the mean - the mean
++// is the bug. Pre-4.25 UE defaulted to 80/98.3, deliberately biased at the bright end, and that
++// instinct is the right one for a scene whose subject is sunlit and whose darkest 40 % is shadow
++// detail nobody meters for. 50-90 sits between the two: it discards the shadow half (which is what
++// dragged the airfield's ground below grey) and the top decile (sky, glints, the sun), and lands
++// on the sunlit subject. Both numbers are on the panel precisely so the operator can walk them.
++//
++// THE STRADDLING BINS ARE SPLIT LINEARLY. 32 stops over 64 bins is half a stop per bin, which as a
++// hard quantisation would be visible as steps in the exposure. Interpolating the CDF inside the
++// two bins the band's edges fall in takes it under a tenth of a stop, and it is not optional.
++//
++// Returns false - and the camera then HOLDS its last EV rather than acting - when the band lands
++// entirely inside a saturating bucket (bin 0 or bin 63 are bounds, not values) or when the result
++// leaves the plausibility window. Holding is always the right answer to a meter that has lost its
++// footing; feeding the loop a number it cannot justify is how a runaway starts.
++bool ReduceMeterHistogram(const SSceneReferredMeterHistogram& hist, const SAutoMeterSettings& settings,
++                          SAutoMeterState& state, float& targetEV)
++{
++	const int nBins = SSceneReferredMeterHistogram::kBinCount;
++	const float step = (hist.logMaxStops - hist.logMinStops) / (float)nBins;
++
++	// Every early return below names its reason on the bus. A meter that holds without saying
++	// why is indistinguishable from Manual, which is how a black histogram passed for a working
++	// camera for a whole evening (scene@f2d30f98 -> the ClearDeviceOutputState fix).
++	state.targetEV = 0.0f;
++
++	if (!(step > 0.0f) || !(hist.totalWeight > 0.0f))
++	{
++		state.hold = eMeterHold_ZeroTotal;
++		return false;
++	}
++
++	float lo = clamp_tpl(settings.bandLowPercent, 0.0f, 100.0f);
++	float hi = clamp_tpl(settings.bandHighPercent, 0.0f, 100.0f);
++	if (hi <= lo)
++	{
++		// An inverted or empty band is an authoring mistake, not a reason to stop metering: fall
++		// back to the whole frame, which is a defensible picture, and say so once.
++		if (!state.bLoggedBandInverted)
++		{
++			state.bLoggedBandInverted = true;
++			CryLog("[CinematicCamera] Metering Band Low (%.0f) is not below Metering Band High (%.0f) - "
++			       "metering the whole frame until they are.", lo, hi);
++		}
++		lo = 0.0f;
++		hi = 100.0f;
++	}
++
++	const float wLo = hist.totalWeight * lo * 0.01f;
++	const float wHi = hist.totalWeight * hi * 0.01f;
++
++	// One walk of the CDF: the weight inside the band, the weighted sum of the sub-interval
++	// centres over it, and the two edges in stops.
++	float acc = 0.0f, bandWeight = 0.0f, bandSum = 0.0f;
++	float loStops = hist.logMinStops, hiStops = hist.logMaxStops;
++	int firstBin = -1, lastBin = -1;
++
++	for (int i = 0; i < nBins; ++i)
++	{
++		const float w = hist.bins[i];
++		if (w <= 0.0f)
++			continue;
++
++		const float a = acc;
++		const float b = acc + w;
++		acc = b;
++
++		const float lower = max(a, wLo);
++		const float upper = min(b, wHi);
++		if (upper <= lower)
++			continue;
++
++		// Where inside this bin the band's slice sits, as a fraction of the bin's width. The bins
++		// are half a stop of log2 luminance each, and the weight is assumed uniform across a bin -
++		// which is the only assumption available and the one that makes the interpolation linear.
++		const float tMid = ((lower + upper) * 0.5f - a) / w;
++		const float centre = hist.logMinStops + ((float)i + tMid) * step;
++
++		const float sliceWeight = upper - lower;
++		bandWeight += sliceWeight;
++		bandSum += sliceWeight * centre;
++
++		if (firstBin < 0)
++		{
++			firstBin = i;
++			loStops = hist.logMinStops + ((float)i + clamp_tpl((wLo - a) / w, 0.0f, 1.0f)) * step;
++		}
++		lastBin = i;
++		hiStops = hist.logMinStops + ((float)i + clamp_tpl((upper - a) / w, 0.0f, 1.0f)) * step;
++	}
++
++	if (bandWeight <= 0.0f || firstBin < 0)
++	{
++		state.hold = eMeterHold_BandEmpty;
++		return false;
++	}
++
++	// The band's log-mean, in stops over mid grey, in the EXPOSED units the bins were built in.
++	// Computed and published BEFORE the refusals below, so the overlay shows where a refused band
++	// sat (-13.75 is bin 0, +17.75 is bin 63) rather than a stale number from the last good frame.
++	const float meanStops = bandSum / bandWeight;
++	state.bandMeanStops = meanStops;
++	state.bandLowLum = (kSceneMidGrey * powf(2.0f, loStops)) / max(hist.exposureAtCapture, 1e-12f);
++	state.bandHighLum = (kSceneMidGrey * powf(2.0f, hiStops)) / max(hist.exposureAtCapture, 1e-12f);
++
++	// A band that resolves entirely inside a saturating bucket has a POSITION and no value: bin 0
++	// means "at or below 14 stops under grey" and bin 63 means "at or above 18 stops over it", and
++	// acting on either would be acting on the edge of the window rather than on the scene.
++	if (firstBin == lastBin && (firstBin == 0 || firstBin == nBins - 1))
++	{
++		state.hold = (firstBin == 0) ? eMeterHold_BandInBottom : eMeterHold_BandInTop;
++		return false;
++	}
++
++	// Undo the pre-exposure that was in force when these bins were measured. The whole histogram
++	// shifts rigidly by that one scalar, which is why this conversion happens once, here, and not
++	// per bin: there is no ordering hazard and no possibility of a half-converted result.
++	const float exposureAtCapture = max(hist.exposureAtCapture, 1e-12f);
++	const float bandAbsolute = (kSceneMidGrey * powf(2.0f, meanStops)) / exposureAtCapture;
++
++	// The plausibility window, in ABSOLUTE engine units of LUMINANCE (1.0 = 10 000 cd/m^2). The
++	// illuminance window the log-mean path uses is the same window scaled by 0.18/pi, since
++	// L = E * rho / pi at rho = 0.18. Outside it the meter has lost its footing and the answer is
++	// to hold, not to drive the camera to a limit.
++	if (!NumberValid(bandAbsolute) || bandAbsolute <= 1e-10f || bandAbsolute >= 1e3f)
++	{
++		state.hold = eMeterHold_OutOfWindow;
++		return false;
++	}
++
++	// The EV that lands the band on mid grey.
++	//
++	//   the pre-exposure is  scale = LIGHT_UNIT_SCALE / (1.2 * 2^EV100)   (spec D6)
++	//   we want              L_absolute * scale = 0.18
++	//   therefore            EV100 = log2( L_absolute * LIGHT_UNIT_SCALE / (1.2 * 0.18) )
++	//
++	// This is the SAME number the incident form gives, not a second calibration: substituting
++	// L = E * 0.18 / pi into it returns log2(E * LIGHT_UNIT_SCALE * 100 / (120*pi)) exactly, which
++	// is decisions/s1-exposure-constant.md's C = 120*pi written the other way round. Metering
++	// luminance instead of an albedo-divided illuminance estimate changes WHAT is measured - the
++	// meter is now reflected rather than incident, and the sky/emissive albedo fallback is simply
++	// gone - but not what "correctly exposed" means.
++	targetEV = log2f(bandAbsolute * RENDERER_LIGHT_UNIT_SCALE / (kSensorSaturationFactor * kSceneMidGrey));
++
++	// For r_HDRDebug 1 only. Published from ApplySceneExposure(), which is called once a frame;
++	// this function can be reached more than once and must not write to the bus itself.
++	state.targetEV = targetEV;
++	state.hold = eMeterHold_Live;
++
++	return true;
++}
++
++// One frame of the AUTO metering loop, lifted whole out of ComputeSceneReferredEV100(): the
++// component keeps the mode dial, the bias and the EV limits, this keeps the meter.
++bool UpdateAutoMeteredEV(const SAutoMeterSettings& settings, SAutoMeterState& state, float& outEV)
++{
++	// ----- AUTO -----------------------------------------------------------------------------
++	// Two meters, and exactly one of them publishes on any frame (r_SceneReferredMeterHistogram).
++	//
++	//   HISTOGRAM (default) - 64 bins of log2 LUMINANCE relative to mid grey, accumulated by a
++	//   compute pass with the camera's metering mask, and reduced HERE to the log-mean of a
++	//   percentile band. This is the one that fixes the outdoor picture: the failure it replaces
++	//   was not a wrong constant but a wrong STATISTIC - a whole-frame mean, in which one large
++	//   region (the sky, at a fabricated 0.2 albedo and full area weight) owned the answer and put
++	//   74 700 lux on mid grey when the subject was lit by 100 000.
++	//
++	//   LOG-MEAN (fallback) - the shipped whole-frame geometric mean of the albedo-divided
++	//   illuminance estimate, kept as the A/B reference.
++	//
++	// Both arrive with the pre-exposure of the sampled frame already accounted for by the stage,
++	// so neither loop has to unwind its own output.
++	SSceneReferredMeterHistogram hist;
++	ZeroStruct(hist);
++	float meteredIlluminance = 0.0f;
++	if (gEnv->pRenderer)
++	{
++		gEnv->pRenderer->EF_Query(EFQ_GetSceneReferredMeterHistogram, hist);
++		gEnv->pRenderer->EF_Query(EFQ_GetSceneReferredMeteredIlluminance, meteredIlluminance);
++	}
++
++	const uint32 frameId = gEnv->nMainFrameID;
++	const bool bNewFrame = (frameId != state.frameId);
++	state.frameId = frameId;
++
++	float targetEV = 0.0f;
++	bool bHaveTarget = false;
++
++	if (hist.sampleId != 0 && hist.totalWeight > 0.0f)
++	{
++		bHaveTarget = ReduceMeterHistogram(hist, settings, state, targetEV);
++	}
++	else if (meteredIlluminance > 0.0f)
++	{
++		// The incident-meter form, ISO 2720: EV = log2(E * S / C) at S = 100 with C = 120*pi -
++		// the constant that puts an 18 % reflector under the metered illuminance on 0.18. The
++		// engine's measure divides the G-buffer albedo out, so this really is an incident reading:
++		// a white wall and a black wall under the same light expose the same, which is what a
++		// light meter on set does and is steadier than reflected metering under a pan.
++		const float kIncidentMeterConstant = 120.0f * gf_PI;
++		targetEV = log2f(meteredIlluminance * RENDERER_LIGHT_UNIT_SCALE * 100.0f / kIncidentMeterConstant);
++		bHaveTarget = true;
++		// Not a hold - but the overlay has to say WHICH meter produced the target, because the
++		// log-mean has no mask and no band, and its band numbers are meaningless.
++		state.hold = eMeterHold_LogMean;
++		state.targetEV = targetEV;
++		state.bandMeanStops = 0.0f;
++	}
++	else
++	{
++		// Neither meter has produced a sample: the readback has not completed yet, the path is
++		// off, or the stage retired the value. The camera holds - and says so.
++		state.hold = eMeterHold_NoSample;
++		state.targetEV = 0.0f;
++	}
++
++	if (bHaveTarget && settings.bLock)
++		state.hold = eMeterHold_Locked;
++
++	if (bHaveTarget && !settings.bLock && bNewFrame)
++	{
++		const float dt = max(gEnv->pTimer->GetFrameTime(), 0.0f);
++
++		// ASYMMETRIC time constants, because the problem is asymmetric and a symmetric tau applied
++		// to it is what made walking out of a hangar a three-second over-exposure
++		// (research/s8-metering.md section 2.5). targetEV ABOVE the current EV means the scene got
++		// brighter and the picture has to DARKEN - a camera stops down at once, and photopic light
++		// adaptation is about a fifth of a second - so that direction gets Auto Darken Time. The
++		// other direction keeps Response Time, because dark adaptation genuinely is slow. 0 on the
++		// darken side means "one time constant for both", the old behaviour.
++		const float darkenTime = settings.darkenTime;
++		const bool bDarkening = (targetEV > state.autoMeteredEV);
++		const float tau = (bDarkening && darkenTime > 0.0f) ? darkenTime : settings.tau;
++
++		if (!state.bValid || tau <= 0.0f || dt <= 0.0f)
++		{
++			// Instant snap: first measurement, or a cut (the component clears the valid flag when
++			// it takes over the view). Same behaviour as AutoExposure.cpp:165 - a cut must not ramp.
++			state.autoMeteredEV = targetEV;
++			state.bValid = true;
++		}
++		else
++		{
++			// Frame-rate independent, and scaled by Exposure Response - which under the switch is
++			// the METERING RESPONSE: the fraction of a measured change the camera follows per tau.
++			// It slows the approach, it does not leave a steady-state error, so the name stays
++			// honest and a level authored with 0.6 still behaves like a camera that does not chase
++			// every flicker (decisions/s1-auto-mode.md part 2, research option (c)).
++			const float response = clamp_tpl(settings.response, 0.0f, 1.0f);
++			const float k = response * (1.0f - expf(-dt / tau));
++			state.autoMeteredEV += (targetEV - state.autoMeteredEV) * k;
++		}
++	}
++	else if (!state.bValid)
++	{
++		// Nothing measured yet (first frames, or the meter is stalled): expose as if Manual rather
++		// than at EV 0, which would be a white frame.
++		return false;
++	}
++
++	outEV = state.autoMeteredEV;
++	return true;
++}
++
++// The 3DEngine-visible half of the switch (SceneReferredSpec.md S2,
++// decisions/s2-engine-side-switch.md approach A).
++//
++// Four unit decisions live inside Cry3DEngine, on the main thread, and cannot read a renderer
++// cvar: the sun's divide by PI in ConvertIlluminanceToLightColor(), the volumetric-cloud
++// replication of that divide, the legacy .tod migration's multiply by PI, and the Nishita sky's
++// sun-intensity scale. E3DPARAM_SCENE_REFERRED carries the answer across the boundary. This is
++// the same mechanism the time of day already uses to reach the renderer (E3DPARAM_*), so nothing
++// new is invented for it.
++//
++// Every one of those values is CACHED until the next time-of-day update, and the Nishita sky
++// updates its LUT at about 12 % per frame, so flipping the parameter without a forced
++// re-evaluation would leave the sun at the old convention until the artist next moved the TOD
++// slider, and the sky mid-crossfade for several frames. ITimeOfDay::Update(true, true) is the
++// engine's own "recompute everything now" call: bForceUpdate reaches
++// C3DEngine::SetSkyLightParameters(..., forceImmediateUpdate) and from there
++// CSkyLightManager::FullUpdate(), which recomputes the whole sky dome in one go.
++//
++// The re-push happens only ON A FLIP. Doing it every frame would mean a full Nishita recompute
++// per frame; doing it never would mean a stale sun. Writing to the plain global unconditionally
++// is harmless (it is a bool store), so the flip test is on the value we last published.
++void PublishSceneReferredConvention(bool bSceneReferred)
++{
++	if (!gEnv->p3DEngine)
++		return;
++
++	// The bisection gate, enforced HERE because the four decision sites inside Cry3DEngine read
++	// E3DPARAM_SCENE_REFERRED directly and cannot see a renderer cvar. Withholding the parameter
++	// below stage 3 leaves the engine on the stock light-unit convention, which is exactly what
++	// "r_SceneReferredStage 2" is supposed to mean. The renderer-side half of the same gate is in
++	// CRendererResources::IsSceneReferredLightUnits().
++	if (bSceneReferred)
++	{
++		if (ICVar* pStage = gEnv->pConsole ? gEnv->pConsole->GetCVar("r_SceneReferredStage") : nullptr)
++		{
++			if (pStage->GetIVal() < 3)
++				bSceneReferred = false;
++		}
++	}
++
++	Vec3 current(0.0f, 0.0f, 0.0f);
++	gEnv->p3DEngine->GetGlobalParameter(E3DPARAM_SCENE_REFERRED, current);
++	const bool bCurrent = (current.x > 0.5f);
++
++	if (bCurrent == bSceneReferred)
++		return;
++
++	gEnv->p3DEngine->SetGlobalParameter(E3DPARAM_SCENE_REFERRED, Vec3(bSceneReferred ? 1.0f : 0.0f, 0.0f, 0.0f));
++
++	if (ITimeOfDay* pTOD = gEnv->p3DEngine->GetTimeOfDay())
++	{
++		// bInterpolate = true keeps the current time of day; bForceUpdate = true is what makes
++		// this a full re-evaluation instead of the usual "only if the time moved" early-out, and
++		// it is also what forces the sky dome's full recompute.
++		pTOD->Update(true, true);
++	}
++
++	CryLog("[SceneReferred] light-unit convention -> %s (time of day re-evaluated, sky dome recomputed)",
++	       bSceneReferred ? "radiometric, 1/PI in the BRDF" : "stock (sun pre-divided by PI)");
++}
++
++} // namespace CineCam
+diff --git a/Code/CryPlugins/CinematicCamera/Module/CineCamShared.h b/Code/CryPlugins/CinematicCamera/Module/CineCamShared.h
+new file mode 100644
+index 00000000..b13e7b80
+--- /dev/null
++++ b/Code/CryPlugins/CinematicCamera/Module/CineCamShared.h
+@@ -0,0 +1,96 @@
++// Shared cinecam render-state code: the pieces the entity component and the plugin-owned
++// editor-preview publisher (Sandbox viewport camera "CineCam") both need.
++//
++// Nothing here knows about entities or reflected properties. The component keeps one copy of
++// SAutoMeterState and passes its own reflected settings in; the publisher keeps a second copy
++// and passes the fixed editor-look settings in. There is exactly one definition of the meter,
++// of the light-unit convention flip and of the display-LUT slots - a second copy of any of them
++// would be a second answer to "what is correctly exposed", which is the one thing the
++// scene-referred pipeline cannot have.
++#pragma once
++
++#include <CryRenderer/IRenderer.h>   // SSceneReferredMeterHistogram, RENDERER_LIGHT_UNIT_SCALE
++
++namespace CineCam
++{
++
++//! WHY the meter is not moving the EV this frame, published as Global_User_MeterHold so that
++//! r_HDRDebug 1 can print it in words. 0 = live and acting. The table is the renderer's
++//! (CToneMappingStage::DisplaySceneReferredMeterInfo); this side only writes the numbers.
++enum EMeterHold : uint32
++{
++	eMeterHold_Live         = 0,  //!< a target was produced and the EV is following it
++	eMeterHold_NoSample     = 1,  //!< no histogram and no log-mean has come back yet
++	eMeterHold_ZeroTotal    = 2,  //!< the histogram arrived with nothing in it
++	eMeterHold_BandEmpty    = 3,  //!< the percentile band collected no weight
++	eMeterHold_BandInBottom = 4,  //!< the band sits entirely in bin 0 (black, or a source read as black)
++	eMeterHold_BandInTop    = 5,  //!< the band sits entirely in bin 63 (clipped / Inf)
++	eMeterHold_OutOfWindow  = 6,  //!< NaN, or outside the plausibility window
++	eMeterHold_Locked       = 7,  //!< Auto Exposure Lock
++	eMeterHold_LogMean      = 8,  //!< the log-mean fallback is driving (r_SceneReferredMeterHistogram 0)
++	eMeterHold_Manual       = 9,  //!< Manual mode: nothing is metered
++};
++
++//! Everything the AUTO metering loop carries between frames, plus the readouts the
++//! r_HDRDebug 1 overlay is fed from. One instance per driver, never shared: two cameras
++//! metering the same scene still have their own adaptation state, and a cut must snap.
++struct SAutoMeterState
++{
++	//! The smoothed metered EV100, before any bias or compensation.
++	float  autoMeteredEV = 0.f;
++	//! False = "snap on the next measurement" - the camera-cut behaviour AutoExposure.cpp:165
++	//! has, which a camera must reproduce or every cut ramps.
++	bool   bValid = false;
++	//! The EV is asked for more than once a frame; the smoothing step must advance exactly once.
++	uint32 frameId = 0;
++
++	// Published on the post-effect bus for the overlay. Nothing is drawn with them.
++	float  bandLowLum    = 0.f;
++	float  bandHighLum   = 0.f;
++	float  targetEV      = 0.f;
++	//! The band's log-mean in EXPOSED stops over mid grey - the loop's error signal, 0 = on target.
++	float  bandMeanStops = 0.f;
++	uint32 hold = eMeterHold_NoSample;
++
++	//! Log-once flag for an inverted percentile band (an authoring mistake, not a meter failure).
++	bool   bLoggedBandInverted = false;
++};
++
++//! The operator's half of the loop. The component fills this from its reflected Exposure group;
++//! the editor-look publisher fills it with the same defaults a fresh component runs with.
++struct SAutoMeterSettings
++{
++	float bandLowPercent  = 50.f;   //!< Metering Band Low
++	float bandHighPercent = 90.f;   //!< Metering Band High
++	float tau             = 1.f;    //!< Auto Exposure Response Time, seconds
++	float darkenTime      = 0.5f;   //!< Auto Darken Time, seconds (0 = one time constant for both)
++	float response        = 0.6f;   //!< Exposure Response: the fraction of a measured change followed per tau
++	bool  bLock           = false;  //!< Auto Exposure Lock
++};
++
++//! Reduce the renderer's 64-bin metering histogram to the EV that lands the log-mean of the
++//! [bandLowPercent, bandHighPercent] percentile band on mid grey. False = the band could not be
++//! trusted (it resolved inside a saturating bucket, or left the plausibility window) and the
++//! caller must hold its last EV. The reason is left in state.hold either way.
++bool ReduceMeterHistogram(const SSceneReferredMeterHistogram& hist, const SAutoMeterSettings& settings,
++                          SAutoMeterState& state, float& targetEV);
++
++//! One frame of the AUTO metering loop: query both meters, reduce, advance the smoother.
++//! Returns false when nothing has been measured yet - the caller then exposes as Manual rather
++//! than at EV 0, which would be a white frame.
++bool UpdateAutoMeteredEV(const SAutoMeterSettings& settings, SAutoMeterState& state, float& outEV);
++
++//! Mirror the scene-referred switch into the 3D engine (E3DPARAM_SCENE_REFERRED) and, ON A FLIP,
++//! force a full time-of-day re-evaluation and sky-dome recompute so nothing stays cached or
++//! mid-crossfade. See SceneReferredSpec.md S2 / decisions/s2-engine-side-switch.md.
++void PublishSceneReferredConvention(bool bSceneReferred);
++
++//! Load (or reload) the two display-chain .cube files into fp16 3D textures and publish their
++//! renderer texture IDs on the post-effect bus. An empty ODT path stands in the shipped default;
++//! an empty LMT path is the identity look. Cheap on every frame but the first after a change.
++void ApplyDisplayLuts(const char* szODTFile, const char* szLMTFile);
++
++//! Take the LUT ids off the bus and release both textures. Safe to call repeatedly.
++void RestoreDisplayLuts();
++
++} // namespace CineCam
+diff --git a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp
+index b73d87af..fca71f75 100644
+--- a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp
++++ b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp
+@@ -23,6 +23,7 @@
+ // Static members
+ // ---------------------------------------------------------------------------
+ CCinematicCameraComponent* CCinematicCameraComponent::s_pActive = nullptr;
++CCinematicCameraComponent* CCinematicCameraComponent::s_pEditorPreviewOwner = nullptr;
+ std::vector<CCinematicCameraComponent*> CCinematicCameraComponent::s_all;
+ 
+ // ---------------------------------------------------------------------------
+@@ -143,8 +144,10 @@ Cry::Entity::EventFlags CCinematicCameraComponent::GetEventMask() const
+ 		ENTITY_EVENT_COMPONENT_PROPERTY_CHANGED |
+ 		ENTITY_EVENT_RESET;
+ 
+-	// Subscribe to per-frame updates while we are the active camera.
+-	if (IsActive())
++	// Subscribe to per-frame updates while we are the active camera - or, in the editor, while we
++	// are the viewport's preview owner: every editor-live effect hangs off this event, so a preview
++	// owner that is not the camera manager's active camera would publish nothing at all.
++	if (IsActive() || IsEditorPreviewOwner())
+ 		flags |= ENTITY_EVENT_UPDATE;
+ 
+ 	return flags;
+@@ -169,8 +172,9 @@ void CCinematicCameraComponent::ProcessEvent(const SEntityEvent& event)
+ 		ApplyExportMetadata();
+ 		ApplyDisplayLuts();
+ 		ApplyGrade();
+-		// DOF is a game-mode effect; don't apply in the editor.
+-		if (!gEnv->IsEditing() && m_dof.bEnableDOF)
++		// DOF belongs to the camera the picture is taken through: game mode, or the editor
++		// viewport's preview owner (whose focus settings are the ones being looked through).
++		if (CanApplyViewEffects() && m_dof.bEnableDOF)
+ 			ApplyDOF();
+ 		break;
+ 
+@@ -191,7 +195,7 @@ void CCinematicCameraComponent::ProcessEvent(const SEntityEvent& event)
+ 	case ENTITY_EVENT_COMPONENT_PROPERTY_CHANGED:
+ 		// Immediately push updated lens params so the editor preview reflects changes.
+ 		UpdateCameraComponentParams();
+-		if (!gEnv->IsEditing())
++		if (CanApplyViewEffects())
+ 		{
+ 			if (m_dof.bEnableDOF)
+ 				ApplyDOF();
+@@ -243,6 +247,9 @@ void CCinematicCameraComponent::OnShutDown()
+ 	if (s_pActive == this)
+ 		s_pActive = nullptr;
+ 
++	if (s_pEditorPreviewOwner == this)
++		s_pEditorPreviewOwner = nullptr;
++
+ 	m_pCameraComponent = nullptr;
+ }
+ 
+@@ -257,7 +264,7 @@ void CCinematicCameraComponent::Activate()
+ 	m_bCinematicSuspended = false;
+ 	// A camera change is a cut: the next measurement snaps instead of ramping from the previous
+ 	// camera's exposure, which is what AutoExposure.cpp:165 does for the engine's own adaptation.
+-	m_bAutoMeteredEVValid = false;
++	m_autoMeter.bValid = false;
+ 
+ 	// Activating the sibling CCameraComponent IS the ownership transfer: it moves the camera
+ 	// manager's active camera, and ResolveActive() picks that up next frame - including the
+@@ -267,9 +274,10 @@ void CCinematicCameraComponent::Activate()
+ 	// Subscribe to ENTITY_EVENT_UPDATE now that we are the active camera.
+ 	m_pEntity->UpdateComponentEventMask(this);
+ 
+-	// DOF is view-dependent, so it is a game-mode effect only: in the editor the viewport
+-	// renders through the fly camera and pushing this camera's focus onto it is meaningless.
+-	if (!gEnv->IsEditing() && m_dof.bEnableDOF)
++	// DOF is view-dependent: it applies where this camera IS the view - game mode, or the editor
++	// viewport looking through this entity. On the editor fly camera, pushing this camera's focus
++	// onto somebody else's view is meaningless, and that is what the gate keeps out.
++	if (CanApplyViewEffects() && m_dof.bEnableDOF)
+ 		ApplyDOF();
+ }
+ 
+@@ -318,6 +326,41 @@ CCinematicCameraComponent* CCinematicCameraComponent::ResolveActive()
+ 	return s_pActive;
+ }
+ 
++// The edit-mode counterpart of ResolveActive(): the Sandbox viewport, not the camera manager,
++// names the owner, and "nobody" is a legitimate answer (the stock Default camera, or the
++// plugin-owned CineCam publisher, which has no entity at all).
++//
++// Identical choreography to a resolver dethroning, and deliberately so: the outgoing owner gets
++// the render state back BEFORE the incoming one latches its baselines, so a switch never captures
++// the previous owner's values as "what the renderer had". Both components' event masks are
++// refreshed, because ENTITY_EVENT_UPDATE - which every editor-live effect hangs off - follows
++// ownership through GetEventMask().
++void CCinematicCameraComponent::SetEditorPreviewOwner(CCinematicCameraComponent* pOwner)
++{
++	if (pOwner == s_pEditorPreviewOwner)
++		return;
++
++	CCinematicCameraComponent* const pPrevious = s_pEditorPreviewOwner;
++	s_pEditorPreviewOwner = pOwner;
++
++	if (pPrevious)
++	{
++		// The flag is already cleared, so CanDriveRenderState() refuses any Apply* the restore
++		// path might otherwise re-trigger.
++		pPrevious->RestoreAllEffects();
++		if (pPrevious->m_pEntity)
++			pPrevious->m_pEntity->UpdateComponentEventMask(pPrevious);
++	}
++
++	if (pOwner && pOwner->m_pEntity)
++	{
++		// A hand-over is a cut: the metered EV snaps to the new camera's first measurement
++		// instead of ramping from the previous one, exactly as Activate() does.
++		pOwner->m_autoMeter.bValid = false;
++		pOwner->m_pEntity->UpdateComponentEventMask(pOwner);
++	}
++}
++
+ CCinematicCameraComponent* CCinematicCameraComponent::FindBySlot(int slot)
+ {
+ 	if (slot <= 0)
+@@ -362,7 +405,7 @@ void CCinematicCameraComponent::ClearSavedBaselines()
+ 	m_bLensCharSaved       = false;
+ 	m_bSceneReferredSaved  = false;
+ 	m_bSceneExposureSaved  = false;
+-	m_bAutoMeteredEVValid  = false;
++	m_autoMeter.bValid  = false;
+ 	m_bSpriteBokehSaved    = false;
+ 	m_bBokehShapeTexPushed = false;
+ 	m_bMBParamsSaved       = false;
+@@ -405,7 +448,15 @@ bool CCinematicCameraComponent::CanDriveRenderState() const
+ 	if (!IsLevelReady())
+ 		return false;
+ 
+-	return s_pActive == this
++	// WHO OWNS THE BUS. Outside the editor this is unchanged: the resolver's cache, i.e. the
++	// camera manager's answer. Inside the editor it is the Sandbox viewport's answer instead - the
++	// camera the user is actually looking through - and "nobody" is a legitimate answer there (the
++	// stock Default camera, and the CineCam publisher, which is not a component). That is also
++	// what retires the old edit-mode leak, where the last-initialised camera published its look
++	// over whatever the viewport happened to show.
++	const bool bOwner = gEnv->IsEditing() ? (s_pEditorPreviewOwner == this) : (s_pActive == this);
++
++	return bOwner
+ 	       && m_pEntity != nullptr
+ 	       && m_pEntity->GetSimulationMode() != EEntitySimulationMode::Preview;
+ }
+@@ -1543,20 +1594,27 @@ void EnsureLutSlot(SLutSlot& slot, const char* szPath, const char* szCacheName,
+ // Nothing here is gated on m_sceneReferred: loading a cube costs one string compare per frame
+ // once it is loaded, and having the texture ready before the switch is flipped means the first
+ // scene-referred frame is already correct.
+-void CCinematicCameraComponent::ApplyDisplayLuts()
++namespace CineCam
++{
++
++// The LUT slots are process-wide (they are the renderer's textures, and only one driver publishes
++// at a time), so this is a free function rather than a component method: the plugin-owned editor
++// look publisher needs exactly the same two uploads for the shipped default ODT, and a second copy
++// of the upload path would mean a second pair of textures fighting over the same two bus slots.
++void ApplyDisplayLuts(const char* szODTFile, const char* szLMTFile)
+ {
+-	if (!CanDriveRenderState() || !gEnv->pRenderer)
++	if (!gEnv->pRenderer || !gEnv->p3DEngine)
+ 		return;
+ 
+ 	// An empty ODT field is not a request for "no output transform" - it is a field nobody has
+ 	// touched, and the picture it produces (a clamped ACEScct encode) looks like a bug because
+ 	// it is one. The shipped default stands in, so a freshly ticked switch is already correct.
+-	const char* szODT = m_output.odtFile.c_str();
++	const char* szODT = szODTFile ? szODTFile : "";
+ 	if (!szODT[0])
+ 		szODT = kDefaultODTFile;
+ 
+ 	EnsureLutSlot(s_lutODT, szODT, "$ccamODT", "ODT");
+-	EnsureLutSlot(s_lutLMT, m_look.lmtFile.c_str(), "$ccamLMT", "LMT");
++	EnsureLutSlot(s_lutLMT, szLMTFile ? szLMTFile : "", "$ccamLMT", "LMT");
+ 
+ 	gEnv->p3DEngine->SetPostEffectParam("Global_User_LutODT",     (float)s_lutODT.texId);
+ 	gEnv->p3DEngine->SetPostEffectParam("Global_User_LutODTSize", (float)s_lutODT.size);
+@@ -1564,11 +1622,11 @@ void CCinematicCameraComponent::ApplyDisplayLuts()
+ 	gEnv->p3DEngine->SetPostEffectParam("Global_User_LutLMTSize", (float)s_lutLMT.size);
+ }
+ 
+-void CCinematicCameraComponent::RestoreDisplayLuts()
++// The bus is cleared first, so the renderer stops referring to the IDs before they die; the
++// textures then go with the driver. There is nothing to save and restore here - off the
++// scene-referred path nothing reads these params, and the stock path never had them.
++void RestoreDisplayLuts()
+ {
+-	// The bus is cleared first, so the renderer stops referring to the IDs before they die; the
+-	// textures then go with the camera. There is nothing to save and restore here - off the
+-	// scene-referred path nothing reads these params, and the stock path never had them.
+ 	if (gEnv && gEnv->p3DEngine)
+ 	{
+ 		gEnv->p3DEngine->SetPostEffectParam("Global_User_LutODT",     0.0f);
+@@ -1583,6 +1641,21 @@ void CCinematicCameraComponent::RestoreDisplayLuts()
+ 	s_lutLMT.requested.clear();
+ }
+ 
++} // namespace CineCam
++
++void CCinematicCameraComponent::ApplyDisplayLuts()
++{
++	if (!CanDriveRenderState())
++		return;
++
++	CineCam::ApplyDisplayLuts(m_output.odtFile.c_str(), m_look.lmtFile.c_str());
++}
++
++void CCinematicCameraComponent::RestoreDisplayLuts()
++{
++	CineCam::RestoreDisplayLuts();
++}
++
+ // A level is going away (ESYSTEM_EVENT_LEVEL_UNLOAD_START / LEVEL_LOAD_PREPARE / LEVEL_LOAD_START
+ // / LEVEL_POST_UNLOAD, whichever the host fires first). This runs BEFORE the renderer frees its
+ // resources, which is the whole point: it is the last moment at which our LUT texture ids are
+@@ -1701,7 +1774,7 @@ void CCinematicCameraComponent::ApplySceneReferred()
+ 	gEnv->p3DEngine->SetPostEffectParam("Global_User_SceneReferred",
+ 	                                    m_sceneReferred.bSceneReferred ? 1.0f : 0.0f);
+ 
+-	PublishSceneReferredConvention(m_sceneReferred.bSceneReferred);
++	CineCam::PublishSceneReferredConvention(m_sceneReferred.bSceneReferred);
+ }
+ 
+ void CCinematicCameraComponent::RestoreSceneReferred()
+@@ -1715,68 +1788,7 @@ void CCinematicCameraComponent::RestoreSceneReferred()
+ 	// The engine-side mirror is restored with it, and by the same flip path, so a deactivating
+ 	// camera leaves the 3D engine on the stock light-unit convention with the time of day
+ 	// already re-evaluated for it.
+-	PublishSceneReferredConvention(m_savedSceneReferred > 0.5f);
+-}
+-
+-// The 3DEngine-visible half of the switch (SceneReferredSpec.md S2,
+-// decisions/s2-engine-side-switch.md approach A).
+-//
+-// Four unit decisions live inside Cry3DEngine, on the main thread, and cannot read a renderer
+-// cvar: the sun's divide by PI in ConvertIlluminanceToLightColor(), the volumetric-cloud
+-// replication of that divide, the legacy .tod migration's multiply by PI, and the Nishita sky's
+-// sun-intensity scale. E3DPARAM_SCENE_REFERRED carries the answer across the boundary. This is
+-// the same mechanism the time of day already uses to reach the renderer (E3DPARAM_*), so nothing
+-// new is invented for it.
+-//
+-// Every one of those values is CACHED until the next time-of-day update, and the Nishita sky
+-// updates its LUT at about 12 % per frame, so flipping the parameter without a forced
+-// re-evaluation would leave the sun at the old convention until the artist next moved the TOD
+-// slider, and the sky mid-crossfade for several frames. ITimeOfDay::Update(true, true) is the
+-// engine's own "recompute everything now" call: bForceUpdate reaches
+-// C3DEngine::SetSkyLightParameters(..., forceImmediateUpdate) and from there
+-// CSkyLightManager::FullUpdate(), which recomputes the whole sky dome in one go.
+-//
+-// The re-push happens only ON A FLIP. Doing it every frame would mean a full Nishita recompute
+-// per frame; doing it never would mean a stale sun. Writing to the plain global unconditionally
+-// is harmless (it is a bool store), so the flip test is on the value we last published.
+-void CCinematicCameraComponent::PublishSceneReferredConvention(bool bSceneReferred)
+-{
+-	if (!gEnv->p3DEngine)
+-		return;
+-
+-	// The bisection gate, enforced HERE because the four decision sites inside Cry3DEngine read
+-	// E3DPARAM_SCENE_REFERRED directly and cannot see a renderer cvar. Withholding the parameter
+-	// below stage 3 leaves the engine on the stock light-unit convention, which is exactly what
+-	// "r_SceneReferredStage 2" is supposed to mean. The renderer-side half of the same gate is in
+-	// CRendererResources::IsSceneReferredLightUnits().
+-	if (bSceneReferred)
+-	{
+-		if (ICVar* pStage = gEnv->pConsole ? gEnv->pConsole->GetCVar("r_SceneReferredStage") : nullptr)
+-		{
+-			if (pStage->GetIVal() < 3)
+-				bSceneReferred = false;
+-		}
+-	}
+-
+-	Vec3 current(0.0f, 0.0f, 0.0f);
+-	gEnv->p3DEngine->GetGlobalParameter(E3DPARAM_SCENE_REFERRED, current);
+-	const bool bCurrent = (current.x > 0.5f);
+-
+-	if (bCurrent == bSceneReferred)
+-		return;
+-
+-	gEnv->p3DEngine->SetGlobalParameter(E3DPARAM_SCENE_REFERRED, Vec3(bSceneReferred ? 1.0f : 0.0f, 0.0f, 0.0f));
+-
+-	if (ITimeOfDay* pTOD = gEnv->p3DEngine->GetTimeOfDay())
+-	{
+-		// bInterpolate = true keeps the current time of day; bForceUpdate = true is what makes
+-		// this a full re-evaluation instead of the usual "only if the time moved" early-out, and
+-		// it is also what forces the sky dome's full recompute.
+-		pTOD->Update(true, true);
+-	}
+-
+-	CryLog("[SceneReferred] light-unit convention -> %s (time of day re-evaluated, sky dome recomputed)",
+-	       bSceneReferred ? "radiometric, 1/PI in the BRDF" : "stock (sun pre-divided by PI)");
++	CineCam::PublishSceneReferredConvention(m_savedSceneReferred > 0.5f);
+ }
+ 
+ // The pre-exposure itself. It travels on the same bus as the request, in the same save/restore
+@@ -1822,11 +1834,11 @@ void CCinematicCameraComponent::ApplySceneExposure()
+ 	// the reduction, so the renderer cannot print the band's edges unless the camera says what
+ 	// they were. Published here, once a frame, rather than from inside ComputeSceneReferredEV100,
+ 	// which is reached more than once per frame.
+-	gEnv->p3DEngine->SetPostEffectParam("Global_User_MeterBandLow", m_meterBandLowLum);
+-	gEnv->p3DEngine->SetPostEffectParam("Global_User_MeterBandHigh", m_meterBandHighLum);
+-	gEnv->p3DEngine->SetPostEffectParam("Global_User_MeterTargetEV", m_meterTargetEV);
+-	gEnv->p3DEngine->SetPostEffectParam("Global_User_MeterBandMean", m_meterBandMeanStops);
+-	gEnv->p3DEngine->SetPostEffectParam("Global_User_MeterHold", (float)m_meterHold);
++	gEnv->p3DEngine->SetPostEffectParam("Global_User_MeterBandLow", m_autoMeter.bandLowLum);
++	gEnv->p3DEngine->SetPostEffectParam("Global_User_MeterBandHigh", m_autoMeter.bandHighLum);
++	gEnv->p3DEngine->SetPostEffectParam("Global_User_MeterTargetEV", m_autoMeter.targetEV);
++	gEnv->p3DEngine->SetPostEffectParam("Global_User_MeterBandMean", m_autoMeter.bandMeanStops);
++	gEnv->p3DEngine->SetPostEffectParam("Global_User_MeterHold", (float)m_autoMeter.hold);
+ }
+ 
+ // The camera's identity and its exposure triangle, onto the same bus everything else travels on.
+@@ -1911,178 +1923,6 @@ void CCinematicCameraComponent::RestoreSceneExposure()
+ //   AutoCompensation = AUTO with exposure compensation only.
+ // Neither can change the aperture's effect on brightness the way Manual does - that is the point
+ // of the distinction, and it is what a camera's mode dial does.
+-// Mid grey, and the ISO 12232 saturation-based sensitivity factor 120/S at S = 100. The renderer's
+-// twins are CRendererResources::kSceneReferredMidGrey and the 1.2 in
+-// ComputeSceneReferredExposureScale() below; both are spelled out here rather than shared through
+-// a header because the plugin cannot see the renderer's internals, and both are anchors of the
+-// whole pipeline (spec D6) rather than tunables.
+-static const float kSceneMidGrey = 0.18f;
+-static const float kSensorSaturationFactor = 1.2f;
+-
+-// The percentile band, and the EV that puts it on mid grey (decisions/s8-metering.md approach A,
+-// steps 3-4).
+-//
+-// WHY A BAND AND NOT A MEAN. For a geometric mean, a fraction f of the frame at V_hot against a
+-// background V_bg shifts the answer by exactly f * log2(V_hot / V_bg) - the sensitivity is LINEAR
+-// in area fraction. That single line is why the old meter was nearly blind to the sun (0.025 % of
+-// a 50 mm frame, 0.0035 stops) and violently sensitive to the sky (50 % of the frame, 2.65 stops
+-// at a fabricated albedo). No amount of clamping fixes a bias caused by half the frame being
+-// ordinary-bright and wrongly weighted; a percentile is robust to it by construction, because it
+-// asks WHERE the weight sits and not HOW MUCH each texel is worth. This is the shape UE's
+-// Histogram mode, Frostbite and the Call-of-Duty family all landed on, and a matrix meter is a
+-// coarser, cleverer version of the same instinct.
+-//
+-// WHY 50-90 AND NOT UE'S 10-90. UE's 10/90 exists to make Histogram agree with Basic, i.e. to be
+-// unsurprising to people migrating from a mean. We do not want to agree with the mean - the mean
+-// is the bug. Pre-4.25 UE defaulted to 80/98.3, deliberately biased at the bright end, and that
+-// instinct is the right one for a scene whose subject is sunlit and whose darkest 40 % is shadow
+-// detail nobody meters for. 50-90 sits between the two: it discards the shadow half (which is what
+-// dragged the airfield's ground below grey) and the top decile (sky, glints, the sun), and lands
+-// on the sunlit subject. Both numbers are on the panel precisely so the operator can walk them.
+-//
+-// THE STRADDLING BINS ARE SPLIT LINEARLY. 32 stops over 64 bins is half a stop per bin, which as a
+-// hard quantisation would be visible as steps in the exposure. Interpolating the CDF inside the
+-// two bins the band's edges fall in takes it under a tenth of a stop, and it is not optional.
+-//
+-// Returns false - and the camera then HOLDS its last EV rather than acting - when the band lands
+-// entirely inside a saturating bucket (bin 0 or bin 63 are bounds, not values) or when the result
+-// leaves the plausibility window. Holding is always the right answer to a meter that has lost its
+-// footing; feeding the loop a number it cannot justify is how a runaway starts.
+-bool CCinematicCameraComponent::ReduceMeterHistogram(const SSceneReferredMeterHistogram& hist, float& targetEV)
+-{
+-	const int nBins = SSceneReferredMeterHistogram::kBinCount;
+-	const float step = (hist.logMaxStops - hist.logMinStops) / (float)nBins;
+-
+-	// Every early return below names its reason on the bus. A meter that holds without saying
+-	// why is indistinguishable from Manual, which is how a black histogram passed for a working
+-	// camera for a whole evening (scene@f2d30f98 -> the ClearDeviceOutputState fix).
+-	m_meterTargetEV = 0.0f;
+-
+-	if (!(step > 0.0f) || !(hist.totalWeight > 0.0f))
+-	{
+-		m_meterHold = eMeterHold_ZeroTotal;
+-		return false;
+-	}
+-
+-	float lo = clamp_tpl((float)m_exposure.meterMinPercent, 0.0f, 100.0f);
+-	float hi = clamp_tpl((float)m_exposure.meterMaxPercent, 0.0f, 100.0f);
+-	if (hi <= lo)
+-	{
+-		// An inverted or empty band is an authoring mistake, not a reason to stop metering: fall
+-		// back to the whole frame, which is a defensible picture, and say so once.
+-		if (!m_bLoggedMeterBandInverted)
+-		{
+-			m_bLoggedMeterBandInverted = true;
+-			CryLog("[CinematicCamera] Metering Band Low (%.0f) is not below Metering Band High (%.0f) - "
+-			       "metering the whole frame until they are.", lo, hi);
+-		}
+-		lo = 0.0f;
+-		hi = 100.0f;
+-	}
+-
+-	const float wLo = hist.totalWeight * lo * 0.01f;
+-	const float wHi = hist.totalWeight * hi * 0.01f;
+-
+-	// One walk of the CDF: the weight inside the band, the weighted sum of the sub-interval
+-	// centres over it, and the two edges in stops.
+-	float acc = 0.0f, bandWeight = 0.0f, bandSum = 0.0f;
+-	float loStops = hist.logMinStops, hiStops = hist.logMaxStops;
+-	int firstBin = -1, lastBin = -1;
+-
+-	for (int i = 0; i < nBins; ++i)
+-	{
+-		const float w = hist.bins[i];
+-		if (w <= 0.0f)
+-			continue;
+-
+-		const float a = acc;
+-		const float b = acc + w;
+-		acc = b;
+-
+-		const float lower = max(a, wLo);
+-		const float upper = min(b, wHi);
+-		if (upper <= lower)
+-			continue;
+-
+-		// Where inside this bin the band's slice sits, as a fraction of the bin's width. The bins
+-		// are half a stop of log2 luminance each, and the weight is assumed uniform across a bin -
+-		// which is the only assumption available and the one that makes the interpolation linear.
+-		const float tMid = ((lower + upper) * 0.5f - a) / w;
+-		const float centre = hist.logMinStops + ((float)i + tMid) * step;
+-
+-		const float sliceWeight = upper - lower;
+-		bandWeight += sliceWeight;
+-		bandSum += sliceWeight * centre;
+-
+-		if (firstBin < 0)
+-		{
+-			firstBin = i;
+-			loStops = hist.logMinStops + ((float)i + clamp_tpl((wLo - a) / w, 0.0f, 1.0f)) * step;
+-		}
+-		lastBin = i;
+-		hiStops = hist.logMinStops + ((float)i + clamp_tpl((upper - a) / w, 0.0f, 1.0f)) * step;
+-	}
+-
+-	if (bandWeight <= 0.0f || firstBin < 0)
+-	{
+-		m_meterHold = eMeterHold_BandEmpty;
+-		return false;
+-	}
+-
+-	// The band's log-mean, in stops over mid grey, in the EXPOSED units the bins were built in.
+-	// Computed and published BEFORE the refusals below, so the overlay shows where a refused band
+-	// sat (-13.75 is bin 0, +17.75 is bin 63) rather than a stale number from the last good frame.
+-	const float meanStops = bandSum / bandWeight;
+-	m_meterBandMeanStops = meanStops;
+-	m_meterBandLowLum = (kSceneMidGrey * powf(2.0f, loStops)) / max(hist.exposureAtCapture, 1e-12f);
+-	m_meterBandHighLum = (kSceneMidGrey * powf(2.0f, hiStops)) / max(hist.exposureAtCapture, 1e-12f);
+-
+-	// A band that resolves entirely inside a saturating bucket has a POSITION and no value: bin 0
+-	// means "at or below 14 stops under grey" and bin 63 means "at or above 18 stops over it", and
+-	// acting on either would be acting on the edge of the window rather than on the scene.
+-	if (firstBin == lastBin && (firstBin == 0 || firstBin == nBins - 1))
+-	{
+-		m_meterHold = (firstBin == 0) ? eMeterHold_BandInBottom : eMeterHold_BandInTop;
+-		return false;
+-	}
+-
+-	// Undo the pre-exposure that was in force when these bins were measured. The whole histogram
+-	// shifts rigidly by that one scalar, which is why this conversion happens once, here, and not
+-	// per bin: there is no ordering hazard and no possibility of a half-converted result.
+-	const float exposureAtCapture = max(hist.exposureAtCapture, 1e-12f);
+-	const float bandAbsolute = (kSceneMidGrey * powf(2.0f, meanStops)) / exposureAtCapture;
+-
+-	// The plausibility window, in ABSOLUTE engine units of LUMINANCE (1.0 = 10 000 cd/m^2). The
+-	// illuminance window the log-mean path uses is the same window scaled by 0.18/pi, since
+-	// L = E * rho / pi at rho = 0.18. Outside it the meter has lost its footing and the answer is
+-	// to hold, not to drive the camera to a limit.
+-	if (!NumberValid(bandAbsolute) || bandAbsolute <= 1e-10f || bandAbsolute >= 1e3f)
+-	{
+-		m_meterHold = eMeterHold_OutOfWindow;
+-		return false;
+-	}
+-
+-	// The EV that lands the band on mid grey.
+-	//
+-	//   the pre-exposure is  scale = LIGHT_UNIT_SCALE / (1.2 * 2^EV100)   (spec D6)
+-	//   we want              L_absolute * scale = 0.18
+-	//   therefore            EV100 = log2( L_absolute * LIGHT_UNIT_SCALE / (1.2 * 0.18) )
+-	//
+-	// This is the SAME number the incident form gives, not a second calibration: substituting
+-	// L = E * 0.18 / pi into it returns log2(E * LIGHT_UNIT_SCALE * 100 / (120*pi)) exactly, which
+-	// is decisions/s1-exposure-constant.md's C = 120*pi written the other way round. Metering
+-	// luminance instead of an albedo-divided illuminance estimate changes WHAT is measured - the
+-	// meter is now reflected rather than incident, and the sky/emissive albedo fallback is simply
+-	// gone - but not what "correctly exposed" means.
+-	targetEV = log2f(bandAbsolute * RENDERER_LIGHT_UNIT_SCALE / (kSensorSaturationFactor * kSceneMidGrey));
+-
+-	// For r_HDRDebug 1 only. Published from ApplySceneExposure(), which is called once a frame;
+-	// this function can be reached more than once and must not write to the bus itself.
+-	m_meterTargetEV = targetEV;
+-	m_meterHold = eMeterHold_Live;
+-
+-	return true;
+-}
+ 
+ float CCinematicCameraComponent::ComputeSceneReferredEV100()
+ {
+@@ -2090,8 +1930,8 @@ float CCinematicCameraComponent::ComputeSceneReferredEV100()
+ 
+ 	if (m_exposure.exposureMode == EExposureMode::Manual)
+ 	{
+-		m_meterHold = eMeterHold_Manual;
+-		m_meterTargetEV = 0.0f;
++		m_autoMeter.hold = CineCam::eMeterHold_Manual;
++		m_autoMeter.targetEV = 0.0f;
+ 		if (fabs_tpl((float)m_exposure.exposureResponse - 1.0f) > 0.001f && !m_bLoggedSceneRefResponseIgnored)
+ 		{
+ 			m_bLoggedSceneRefResponseIgnored = true;
+@@ -2104,110 +1944,26 @@ float CCinematicCameraComponent::ComputeSceneReferredEV100()
+ 	}
+ 
+ 	// ----- AUTO -----------------------------------------------------------------------------
+-	// Two meters, and exactly one of them publishes on any frame (r_SceneReferredMeterHistogram).
+-	//
+-	//   HISTOGRAM (default) - 64 bins of log2 LUMINANCE relative to mid grey, accumulated by a
+-	//   compute pass with the camera's metering mask, and reduced HERE to the log-mean of a
+-	//   percentile band. This is the one that fixes the outdoor picture: the failure it replaces
+-	//   was not a wrong constant but a wrong STATISTIC - a whole-frame mean, in which one large
+-	//   region (the sky, at a fabricated 0.2 albedo and full area weight) owned the answer and put
+-	//   74 700 lux on mid grey when the subject was lit by 100 000.
+-	//
+-	//   LOG-MEAN (fallback) - the shipped whole-frame geometric mean of the albedo-divided
+-	//   illuminance estimate, kept as the A/B reference.
+-	//
+-	// Both arrive with the pre-exposure of the sampled frame already accounted for by the stage,
+-	// so neither loop has to unwind its own output.
+-	SSceneReferredMeterHistogram hist;
+-	ZeroStruct(hist);
+-	float meteredIlluminance = 0.0f;
+-	if (gEnv->pRenderer)
+-	{
+-		gEnv->pRenderer->EF_Query(EFQ_GetSceneReferredMeterHistogram, hist);
+-		gEnv->pRenderer->EF_Query(EFQ_GetSceneReferredMeteredIlluminance, meteredIlluminance);
+-	}
+-
+-	const uint32 frameId = gEnv->nMainFrameID;
+-	const bool bNewFrame = (frameId != m_autoMeteredFrameId);
+-	m_autoMeteredFrameId = frameId;
+-
+-	float targetEV = 0.0f;
+-	bool bHaveTarget = false;
+-
+-	if (hist.sampleId != 0 && hist.totalWeight > 0.0f)
+-	{
+-		bHaveTarget = ReduceMeterHistogram(hist, targetEV);
+-	}
+-	else if (meteredIlluminance > 0.0f)
+-	{
+-		// The incident-meter form, ISO 2720: EV = log2(E * S / C) at S = 100 with C = 120*pi -
+-		// the constant that puts an 18 % reflector under the metered illuminance on 0.18. The
+-		// engine's measure divides the G-buffer albedo out, so this really is an incident reading:
+-		// a white wall and a black wall under the same light expose the same, which is what a
+-		// light meter on set does and is steadier than reflected metering under a pan.
+-		const float kIncidentMeterConstant = 120.0f * gf_PI;
+-		targetEV = log2f(meteredIlluminance * RENDERER_LIGHT_UNIT_SCALE * 100.0f / kIncidentMeterConstant);
+-		bHaveTarget = true;
+-		// Not a hold - but the overlay has to say WHICH meter produced the target, because the
+-		// log-mean has no mask and no band, and its band numbers are meaningless.
+-		m_meterHold = eMeterHold_LogMean;
+-		m_meterTargetEV = targetEV;
+-		m_meterBandMeanStops = 0.0f;
+-	}
+-	else
+-	{
+-		// Neither meter has produced a sample: the readback has not completed yet, the path is
+-		// off, or the stage retired the value. The camera holds - and says so.
+-		m_meterHold = eMeterHold_NoSample;
+-		m_meterTargetEV = 0.0f;
+-	}
+-
+-	if (bHaveTarget && m_exposure.bAutoLock)
+-		m_meterHold = eMeterHold_Locked;
+-
+-	if (bHaveTarget && !m_exposure.bAutoLock && bNewFrame)
+-	{
+-		const float dt = max(gEnv->pTimer->GetFrameTime(), 0.0f);
+-
+-		// ASYMMETRIC time constants, because the problem is asymmetric and a symmetric tau applied
+-		// to it is what made walking out of a hangar a three-second over-exposure
+-		// (research/s8-metering.md section 2.5). targetEV ABOVE the current EV means the scene got
+-		// brighter and the picture has to DARKEN - a camera stops down at once, and photopic light
+-		// adaptation is about a fifth of a second - so that direction gets Auto Darken Time. The
+-		// other direction keeps Response Time, because dark adaptation genuinely is slow. 0 on the
+-		// darken side means "one time constant for both", the old behaviour.
+-		const float darkenTime = (float)m_exposure.autoDarkenTime;
+-		const bool bDarkening = (targetEV > m_autoMeteredEV);
+-		const float tau = (bDarkening && darkenTime > 0.0f) ? darkenTime : (float)m_exposure.autoTau;
+-
+-		if (!m_bAutoMeteredEVValid || tau <= 0.0f || dt <= 0.0f)
+-		{
+-			// Instant snap: first measurement, or a cut (the component clears the valid flag when
+-			// it takes over the view). Same behaviour as AutoExposure.cpp:165 - a cut must not ramp.
+-			m_autoMeteredEV = targetEV;
+-			m_bAutoMeteredEVValid = true;
+-		}
+-		else
+-		{
+-			// Frame-rate independent, and scaled by Exposure Response - which under the switch is
+-			// the METERING RESPONSE: the fraction of a measured change the camera follows per tau.
+-			// It slows the approach, it does not leave a steady-state error, so the name stays
+-			// honest and a level authored with 0.6 still behaves like a camera that does not chase
+-			// every flicker (decisions/s1-auto-mode.md part 2, research option (c)).
+-			const float response = clamp_tpl((float)m_exposure.exposureResponse, 0.0f, 1.0f);
+-			const float k = response * (1.0f - expf(-dt / tau));
+-			m_autoMeteredEV += (targetEV - m_autoMeteredEV) * k;
+-		}
+-	}
+-	else if (!m_bAutoMeteredEVValid)
++	// The meter itself lives in CineCamShared.cpp, because the plugin-owned editor-look publisher
++	// (the Sandbox viewport's built-in "CineCam" camera) meters the same scene the same way. There
++	// is one definition of what the scene measures; the mode dial, the bias and the EV limits
++	// below are what a camera component adds to it.
++	CineCam::SAutoMeterSettings meter;
++	meter.bandLowPercent  = (float)m_exposure.meterMinPercent;
++	meter.bandHighPercent = (float)m_exposure.meterMaxPercent;
++	meter.tau             = (float)m_exposure.autoTau;
++	meter.darkenTime      = (float)m_exposure.autoDarkenTime;
++	meter.response        = (float)m_exposure.exposureResponse;
++	meter.bLock           = m_exposure.bAutoLock;
++
++	float ev = 0.0f;
++	if (!CineCam::UpdateAutoMeteredEV(meter, m_autoMeter, ev))
+ 	{
+ 		// Nothing measured yet (first frames, or the meter is stalled): expose as if Manual rather
+ 		// than at EV 0, which would be a white frame.
+ 		return manualEV;
+ 	}
+ 
+-	float ev = m_autoMeteredEV;
+-
+ 	if (m_exposure.exposureMode == EExposureMode::AutoBiased)
+ 		ev += manualEV - (float)m_exposure.neutralEV;   // EV compensation is already inside manualEV
+ 	else
+@@ -2819,7 +2575,12 @@ float CCinematicCameraComponent::ComputeManualEV100() const
+ // makes "view through the cinematic camera" work in game mode at all.
+ void CCinematicCameraComponent::FinalizeGameCamera()
+ {
+-	// In the editor (editing or simulation mode) the viewport preview path owns the camera.
++	// In the editor (editing or simulation mode) the viewport owns the camera: it writes the
++	// system view camera itself immediately before RenderWorld, so a write from here would be
++	// discarded. Only the VIEW WRITE is game-only, though - the effect list below it is applied in
++	// the editor too, for the viewport's preview owner, from the plugin's resolver
++	// (decisions/s9-editor-cinecam-preview.md). The gate therefore stays exactly where it was and
++	// this function is unchanged for game mode, step for step.
+ 	if (gEnv->IsEditing())
+ 		return;
+ 
+@@ -2831,6 +2592,14 @@ void CCinematicCameraComponent::FinalizeGameCamera()
+ 	camera.SetMatrix(GetWorldTransformMatrix());
+ 	gEnv->pSystem->SetViewCamera(camera);
+ 
++	ApplyGameOnlyEffects();
++}
++
++// The effect list that used to sit inside FinalizeGameCamera(), in the same order. In the editor
++// the focal motor and the sibling FOV are driven by ENTITY_EVENT_UPDATE instead, so what is left
++// here really is only the effects, and the preview owner can be handed exactly this.
++void CCinematicCameraComponent::ApplyGameOnlyEffects()
++{
+ 	// Keep DOF pinned every frame from here as well, so it no longer depends on whether
+ 	// the sibling CCameraComponent won the camera-manager race.
+ 	if (m_dof.bEnableDOF)
+@@ -2970,7 +2739,7 @@ void CCinematicCameraComponent::SetAperture(float fNumber)
+ 		return;
+ 
+ 	m_lens.aperture = clamped;
+-	if (!gEnv->IsEditing() && m_dof.bEnableDOF)
++	if (CanApplyViewEffects() && m_dof.bEnableDOF)
+ 		ApplyDOF();
+ }
+ 
+@@ -2981,7 +2750,7 @@ void CCinematicCameraComponent::SetFocusDistance(float metres)
+ 		return;
+ 
+ 	m_lens.focusDistance = clamped;
+-	if (!gEnv->IsEditing() && m_dof.bEnableDOF)
++	if (CanApplyViewEffects() && m_dof.bEnableDOF)
+ 		ApplyDOF();
+ }
+ 
+@@ -3001,7 +2770,7 @@ void CCinematicCameraComponent::SetDepthOfFieldEnabled(bool enable)
+ 		return;
+ 
+ 	m_dof.bEnableDOF = enable;
+-	if (!gEnv->IsEditing())
++	if (CanApplyViewEffects())
+ 	{
+ 		if (enable)
+ 			ApplyDOF();
+diff --git a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
+index f190dd93..7f2023a0 100644
+--- a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
++++ b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
+@@ -12,6 +12,7 @@
+ #include <vector>
+ 
+ #include "../Interface/ICinematicCameraOptics.h"
++#include "CineCamShared.h"
+ 
+ // CCameraComponent is in CryDefaultEntities/Module — forward-declared here,
+ // included fully in the .cpp (include path set in CMakeLists.txt).
+@@ -1171,6 +1172,14 @@ public:
+ 	// (as CCameraComponent does from ENTITY_EVENT_UPDATE) loses to the GameSDK ViewSystem,
+ 	// which runs in the game framework post update.
+ 	void FinalizeGameCamera();
++	//! The game-only effect list WITHOUT the view-camera write: DOF, film grain, halation, motion
++	//! blur, sprite bokeh, white balance, diffraction streaks, and the two editor-live ones the
++	//! finalize hook has always re-applied. FinalizeGameCamera() calls it in game mode; in the
++	//! editor the plugin's preview resolver calls it on the preview owner, which is the whole of
++	//! "the viewport shows the full effect set of the camera it is looking through"
++	//! (decisions/s9-editor-cinecam-preview.md). Split out of FinalizeGameCamera() so the view
++	//! write stays game-only: in the editor the viewport owns the camera.
++	void ApplyGameOnlyEffects();
+ 	void ApplyExposureGlobalParam();
+ 	//! Screen-space sun shafts are retired on ReCS (volumetric fog is the god-ray source). While the
+ 	//! camera drives the render state it publishes `Global_User_SunShaftsSuppressed = 1` on the
+@@ -1182,6 +1191,18 @@ public:
+ 	void RestoreSunShafts();
+ 
+ 	static CCinematicCameraComponent* GetActiveComponent() { return s_pActive; }
++
++	//! EDITOR PREVIEW (decisions/s9-editor-cinecam-preview.md). While gEnv->IsEditing() the
++	//! Sandbox viewport camera menu decides who drives the render state, not the camera manager:
++	//! the plugin's per-frame resolver names the component the viewport is looking through, or
++	//! nullptr for "nobody" (the stock Default camera, or the plugin-owned CineCam publisher).
++	//! Handles the hand-over itself - the previous owner gets RestoreAllEffects() and both
++	//! components have their event mask refreshed, so ENTITY_EVENT_UPDATE follows ownership.
++	static void SetEditorPreviewOwner(CCinematicCameraComponent* pOwner);
++	static CCinematicCameraComponent* GetEditorPreviewOwner() { return s_pEditorPreviewOwner; }
++	//! True while this component is the edit-mode preview owner. Outside edit mode it is always
++	//! false: there the camera manager and ResolveActive() are authoritative, unchanged.
++	bool IsEditorPreviewOwner() const { return s_pEditorPreviewOwner == this && gEnv->IsEditing(); }
+ 	//! The live component whose Camera Slot equals slot (1-9), or nullptr.
+ 	static CCinematicCameraComponent* FindBySlot(int slot);
+ 	//! Single ownership authority: the camera manager decides which camera is active and
+@@ -1228,6 +1249,11 @@ private:
+ 	//! Ownership gate for every Apply* path: only the resolver-confirmed active component may
+ 	//! write the shared render state, and never from a preview window.
+ 	bool CanDriveRenderState() const;
++	//! Gate for the effects that only make sense on the camera the picture is actually taken
++	//! through - DOF above all, whose focus plane is meaningless on somebody else's view. True in
++	//! game mode (the camera owns the view) and, in the editor, only for the viewport's preview
++	//! owner. This is the old `!gEnv->IsEditing()` test with the preview case added.
++	bool CanApplyViewEffects() const { return !gEnv->IsEditing() || IsEditorPreviewOwner(); }
+ 	//! Removes stray sibling CCameraComponents (accumulated by saves made before the
+ 	//! preview camera carried EEntityComponentFlags::NoSave). User-added cameras are kept.
+ 	void PurgeDuplicateCameraComponents();
+@@ -1269,10 +1295,6 @@ private:
+ 	//! whole picture, so it has to be visible while the properties are being tuned.
+ 	void ApplySceneReferred();
+ 	void RestoreSceneReferred();
+-	//! Mirror the switch into the 3D engine (E3DPARAM_SCENE_REFERRED) and, on a flip, force a
+-	//! full time-of-day re-evaluation and sky-dome recompute so nothing stays cached or
+-	//! mid-crossfade. See SceneReferredSpec.md S2 / decisions/s2-engine-side-switch.md.
+-	void PublishSceneReferredConvention(bool bSceneReferred);
+ 	//! Load (or reload) the two display-chain .cube files into fp16 3D textures and publish their
+ 	//! renderer texture IDs on the post-effect bus, so the tone map's output-transform branch can
+ 	//! resolve them with CTexture::GetByID. Editor-live: a path change reloads on the next frame,
+@@ -1301,11 +1323,6 @@ private:
+ 	//! photographic triangle; the two auto modes fall back to it until the AUTO metering loop
+ 	//! lands (see decisions/s1-auto-mode.md part 2).
+ 	float ComputeSceneReferredEV100();
+-	//! Reduce the renderer's 64-bin metering histogram to the EV that lands the log-mean of the
+-	//! [Metering Band Low, Metering Band High] percentile band on mid grey. False = the band could
+-	//! not be trusted (it resolved inside a saturating bucket, or left the plausibility window) and
+-	//! the camera must hold its last EV.
+-	bool ReduceMeterHistogram(const SSceneReferredMeterHistogram& hist, float& targetEV);
+ 	void ApplyStreaks();
+ 	void RestoreStreaks();
+ 	void ApplyHalation();
+@@ -1448,44 +1465,12 @@ private:
+ 	// by every camera in the level (research/s1-ccam-exposure-today.md section 5, item 13).
+ 	bool m_bLoggedSceneRefResponseIgnored = false;
+ 	bool m_bLoggedSceneRefAutoAsManual    = false;
+-	bool m_bLoggedMeterBandInverted       = false;
+-
+-	// Scene-referred AUTO state: the smoothed metered EV100 and whether it holds a real sample
+-	// yet. Invalid means "snap on the next measurement" - the camera-cut behaviour the engine's
+-	// own adaptation has at AutoExposure.cpp:165, which a camera must reproduce or every cut
+-	// ramps. Cleared on activation and whenever the component stops driving the render state.
+-	float  m_autoMeteredEV       = 0.f;
+-	bool   m_bAutoMeteredEVValid = false;
+-	// The EV is asked for more than once a frame (the bus publication and the eye-adaptation
+-	// write); the smoothing step must advance exactly once, or the response time depends on how
+-	// many callers there happen to be.
+-	uint32 m_autoMeteredFrameId  = 0;
+-	// What the last histogram reduction resolved to: the absolute luminance at each edge of the
+-	// percentile band and the EV it asked for. Nothing is drawn with these - they are published on
+-	// the post-effect bus for the r_HDRDebug 1 overlay, so that "the exposure is wrong" stays one
+-	// screenshot to diagnose rather than a session of guessing which half of the loop moved.
+-	float  m_meterBandLowLum  = 0.f;
+-	float  m_meterBandHighLum = 0.f;
+-	float  m_meterTargetEV    = 0.f;
+-	// The band's log-mean in EXPOSED stops over mid grey - the loop's error signal, 0 = on target.
+-	float  m_meterBandMeanStops = 0.f;
+-	// WHY the meter is not moving the EV this frame, published as Global_User_MeterHold so that
+-	// r_HDRDebug 1 can print it in words. 0 = live and acting. The table is the renderer's
+-	// (CToneMappingStage::DisplaySceneReferredMeterInfo); this side only writes the numbers.
+-	enum EMeterHold : uint32
+-	{
+-		eMeterHold_Live          = 0,  //!< a target was produced and the EV is following it
+-		eMeterHold_NoSample      = 1,  //!< no histogram and no log-mean has come back yet
+-		eMeterHold_ZeroTotal     = 2,  //!< the histogram arrived with nothing in it
+-		eMeterHold_BandEmpty     = 3,  //!< the percentile band collected no weight
+-		eMeterHold_BandInBottom  = 4,  //!< the band sits entirely in bin 0 (black, or a source read as black)
+-		eMeterHold_BandInTop     = 5,  //!< the band sits entirely in bin 63 (clipped / Inf)
+-		eMeterHold_OutOfWindow   = 6,  //!< NaN, or outside the plausibility window
+-		eMeterHold_Locked        = 7,  //!< Auto Exposure Lock
+-		eMeterHold_LogMean       = 8,  //!< the log-mean fallback is driving (r_SceneReferredMeterHistogram 0)
+-		eMeterHold_Manual        = 9,  //!< Manual mode: nothing is metered
+-	};
+-	uint32 m_meterHold = eMeterHold_NoSample;
++
++	// Scene-referred AUTO metering state: the smoothed metered EV100, the cut/snap flag, and the
++	// readouts the r_HDRDebug 1 overlay is fed from. The loop that drives it is shared with the
++	// plugin-owned editor-look publisher (CineCamShared.h), so the state it carries lives there
++	// too; this component owns one instance of it and nothing else touches it.
++	CineCam::SAutoMeterState m_autoMeter;
+ 	// Edge-trigger state for the effective-T-stop log line, per component for the same reason.
+ 	float m_lastLoggedApertureN     = -1.f;
+ 	float m_lastLoggedTransmission  = -1.f;
+@@ -1546,6 +1531,9 @@ private:
+ 
+ 	// Derived cache of the camera manager's answer; written ONLY by ResolveActive().
+ 	static CCinematicCameraComponent* s_pActive;
++	//! The edit-mode preview owner named by the Sandbox viewport; written ONLY by
++	//! SetEditorPreviewOwner(). nullptr = nobody drives (stock picture, or the CineCam publisher).
++	static CCinematicCameraComponent* s_pEditorPreviewOwner;
+ 	//! Every live cinematic camera component. Main-thread only (entity lifecycle), no locking.
+ 	static std::vector<CCinematicCameraComponent*> s_all;
+ };
+diff --git a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraPlugin.cpp b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraPlugin.cpp
+index ba69ea7f..3c034126 100644
+--- a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraPlugin.cpp
++++ b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraPlugin.cpp
+@@ -11,6 +11,7 @@
+ #include <CryCore/Platform/platform_impl.inl>
+ #include <CrySystem/IConsole.h>
+ #include <CrySystem/ConsoleRegistration.h>
++#include <CryEntitySystem/IEntitySystem.h>
+ 
+ // ccam_slot <1-9>: make the cinematic camera carrying that Camera Slot the active one. Bind it
+ // to keys ("bind 1 ccam_slot 1") to cut between cameras; a Phone Tracker set to follow the
+@@ -35,10 +36,18 @@ static void CmdCcamSlot(IConsoleCmdArgs* pArgs)
+ 	}
+ }
+ 
++// The one instance, for the exported editor-preview entry point. Null until the plugin is up and
++// null again once it is gone, which is exactly what the Sandbox side is told to expect.
++static CCinematicCameraPlugin* s_pPluginInstance = nullptr;
++
+ CCinematicCameraPlugin::~CCinematicCameraPlugin()
+ {
++	if (s_pPluginInstance == this)
++		s_pPluginInstance = nullptr;
++
+ 	if (gEnv->pConsole)
+ 		gEnv->pConsole->RemoveCommand("ccam_slot");
++	m_editorLook.UnregisterCVars();
+ 	RemoveHDRIImportCommands();
+ 	gEnv->pSystem->GetISystemEventDispatcher()->RemoveListener(this);
+ 	if (gEnv->pSchematyc)
+@@ -58,6 +67,11 @@ bool CCinematicCameraPlugin::Initialize(SSystemGlobalEnvironment& env, const SSy
+ 	// rec_ImportHDRI - the HDRI to environment-probe importer (HDRIImport.cpp).
+ 	RegisterHDRIImportCommands();
+ 
++	// cinecam_EditorLookEV - the one knob of the Sandbox viewport's CineCam camera.
++	m_editorLook.RegisterCVars();
++
++	s_pPluginInstance = this;
++
+ 	return true;
+ }
+ 
+@@ -73,6 +87,16 @@ void CCinematicCameraPlugin::UpdateBeforeFinalizeCamera()
+ 	if (!CCinematicCameraComponent::IsLevelReady())
+ 		return;
+ 
++	// IN THE EDITOR the Sandbox viewport decides, not the camera manager: the camera the user is
++	// looking through is the one whose look the picture should show, and "the stock Default
++	// camera" is a legitimate answer that publishes nothing. Outside edit mode nothing changes -
++	// ResolveActive() below is authoritative and game mode is untouched.
++	if (gEnv->IsEditing())
++	{
++		UpdateEditorPreview();
++		return;
++	}
++
+ 	if (CCinematicCameraComponent* pActive = CCinematicCameraComponent::ResolveActive())
+ 	{
+ 		pActive->FinalizeGameCamera();
+@@ -83,6 +107,120 @@ void CCinematicCameraPlugin::UpdateBeforeFinalizeCamera()
+ 	}
+ }
+ 
++// ---------------------------------------------------------------------------
++// Sandbox editor preview (decisions/s9-editor-cinecam-preview.md)
++// ---------------------------------------------------------------------------
++void CCinematicCameraPlugin::SetViewportPreview(ECineCamEditorPreviewMode mode, EntityId entityId, const CCamera& camera)
++{
++	// The camera itself is not needed yet: in edit mode the viewport writes the system view camera
++	// itself immediately before RenderWorld, so nothing here may touch it. It is part of the
++	// contract because the alternative - having the plugin guess the viewport's frustum - is the
++	// fragile pose-matching approach this design rejected (research/editor-ccam-activation.md, B2).
++	(void)camera;
++
++	m_previewMode = mode;
++	m_previewEntityId = (mode == ECineCamEditorPreviewMode::Entity) ? entityId : INVALID_ENTITYID;
++	m_previewFrameId = gEnv->nMainFrameID;
++}
++
++void CCinematicCameraPlugin::ClearViewportPreview()
++{
++	m_previewMode = ECineCamEditorPreviewMode::Default;
++	m_previewEntityId = INVALID_ENTITYID;
++	m_previewFrameId = 0;
++
++	// Hand the render state back at once rather than waiting for a frame that may never come: this
++	// is called when the viewport is destroyed or the level is closing.
++	CCinematicCameraComponent::SetEditorPreviewOwner(nullptr);
++	m_editorLook.Restore();
++}
++
++void CCinematicCameraPlugin::LogPreviewOwnerChange(ECineCamEditorPreviewMode mode, const CCinematicCameraComponent* pOwner)
++{
++	const EntityId ownerId = (pOwner && pOwner->GetEntity()) ? pOwner->GetEntity()->GetId() : INVALID_ENTITYID;
++
++	if (m_bLoggedPreviewOnce && mode == m_loggedPreviewMode && ownerId == m_loggedPreviewEntityId)
++		return;
++
++	m_bLoggedPreviewOnce = true;
++	m_loggedPreviewMode = mode;
++	m_loggedPreviewEntityId = ownerId;
++
++	switch (mode)
++	{
++	case ECineCamEditorPreviewMode::CineCam:
++		CryLog("[cinecam] editor preview -> CineCam");
++		break;
++	case ECineCamEditorPreviewMode::Entity:
++		CryLog("[cinecam] editor preview -> Entity %s",
++		       (pOwner && pOwner->GetEntity()) ? pOwner->GetEntity()->GetName() : "<gone>");
++		break;
++	default:
++		CryLog("[cinecam] editor preview -> Default");
++		break;
++	}
++}
++
++void CCinematicCameraPlugin::UpdateEditorPreview()
++{
++	// STALENESS IS COUNTED IN FRAMES, NOT SECONDS. The editor skips frames whenever it is idle,
++	// throttled by sys_MaxFPS or between levels, so a wall-clock timeout would drop the look for a
++	// viewport that is simply not being redrawn. One frame of grace, plus one, because the frame
++	// counter advances on every RenderBegin and a second (secondary) viewport can bump it between
++	// this hook and the level editor viewport's next call.
++	const uint32 kPreviewGraceFrames = 2;
++
++	// The camera manager's answer is still resolved, exactly as before, because other things ask
++	// for it in edit mode: ccam_slot, Schematyc's Activate, and CryGetActiveCinematicCameraEntity
++	// (the phone tracker follows whichever camera is active). It no longer decides the PICTURE
++	// while editing - CanDriveRenderState() asks the preview owner for that - so the old leak,
++	// where the last-initialised camera published its look over whatever the viewport showed,
++	// is gone without taking the rest of the ownership model with it.
++	CCinematicCameraComponent::ResolveActive();
++
++	ECineCamEditorPreviewMode mode = m_previewMode;
++	if (gEnv->nMainFrameID - m_previewFrameId > kPreviewGraceFrames)
++		mode = ECineCamEditorPreviewMode::Default;
++
++	// Entity mode is sent for ANY camera entity the viewport looks through - a plain
++	// CCameraComponent, a legacy camera object, a TrackView sequence camera. Only an entity that
++	// actually carries a Cinematic Camera can drive; everything else is the stock picture.
++	CCinematicCameraComponent* pOwner = nullptr;
++	if (mode == ECineCamEditorPreviewMode::Entity)
++	{
++		IEntity* const pEntity = gEnv->pEntitySystem ? gEnv->pEntitySystem->GetEntity(m_previewEntityId) : nullptr;
++		pOwner = pEntity ? pEntity->GetComponent<CCinematicCameraComponent>() : nullptr;
++		if (pOwner == nullptr)
++			mode = ECineCamEditorPreviewMode::Default;
++	}
++
++	// Ownership first, and only then the publication: the outgoing owner gives the render state
++	// back before the incoming one latches its baselines, so switching Entity -> CineCam ->
++	// Default leaves stock state behind rather than a chain of each other's values.
++	CCinematicCameraComponent::SetEditorPreviewOwner(pOwner);
++
++	if (mode != ECineCamEditorPreviewMode::CineCam)
++		m_editorLook.Restore();
++
++	LogPreviewOwnerChange(mode, pOwner);
++
++	if (pOwner != nullptr)
++	{
++		// The full set. The editor-live half (lens character, viewfinder, scene referred, exposure,
++		// export metadata, LUTs, grade) rides ENTITY_EVENT_UPDATE, which the preview owner is
++		// subscribed to; this is the half that used to be game-only, plus the two writes that have
++		// to happen after the time of day.
++		pOwner->ApplyGameOnlyEffects();
++		pOwner->ApplyExposureGlobalParam();
++		pOwner->ApplySunShaftsOff();
++	}
++	else if (mode == ECineCamEditorPreviewMode::CineCam)
++	{
++		m_editorLook.Update();
++	}
++	// Default: nobody publishes. The picture is stock.
++}
++
+ void CCinematicCameraPlugin::OnSystemEvent(ESystemEvent event, UINT_PTR wparam, UINT_PTR lparam)
+ {
+ 	switch (event)
+@@ -120,11 +258,27 @@ void CCinematicCameraPlugin::OnSystemEvent(ESystemEvent event, UINT_PTR wparam,
+ 	case ESYSTEM_EVENT_LEVEL_LOAD_PREPARE:
+ 	case ESYSTEM_EVENT_LEVEL_LOAD_START:
+ 		CCinematicCameraComponent::OnLevelTeardown();
++		// The editor look latched its baselines from a bus that is about to be reset; writing them
++		// back later would restore values from the previous level. Drop them without writing, the
++		// same answer the components get from OnLevelTeardown().
++		m_editorLook.ClearSavedBaselines();
+ 		break;
+ 
+ 	case ESYSTEM_EVENT_LEVEL_LOAD_END:
+ 	case ESYSTEM_EVENT_LEVEL_GAMEPLAY_START:
+ 		CCinematicCameraComponent::OnLevelLoaded();
++		m_editorLook.ClearSavedBaselines();
++		break;
++
++	// Ctrl+G either way. CGameEngine::SwitchToInGame/SwitchToInEditor call
++	// I3DEngine::ResetPostEffects() on both edges, so every baseline the editor look captured is
++	// stale: drop them WITHOUT writing, exactly as the components do on ENTITY_EVENT_RESET(1).
++	// The preview state goes back to Default and is re-established by the viewport's next call.
++	case ESYSTEM_EVENT_EDITOR_GAME_MODE_CHANGED:
++		m_editorLook.ClearSavedBaselines();
++		m_previewMode = ECineCamEditorPreviewMode::Default;
++		m_previewEntityId = INVALID_ENTITYID;
++		m_previewFrameId = 0;
+ 		break;
+ 
+ 	default:
+@@ -138,6 +292,14 @@ CRYREGISTER_SINGLETON_CLASS(CCinematicCameraPlugin)
+ // C entry point used by other plugins (CryPhoneTracker) to drive the lens without
+ // linking against this module. See Interface/ICinematicCameraOptics.h.
+ // ---------------------------------------------------------------------------
++// The Sandbox level-editor viewport resolves this by name from the already loaded
++// CinematicCamera.dll and tolerates a null answer (it then behaves exactly stock).
++// See Interface/ICineCamEditorPreview.h.
++extern "C" DLL_EXPORT ICineCamEditorPreview* CryGetCineCamEditorPreview()
++{
++	return s_pPluginInstance;
++}
++
+ extern "C" DLL_EXPORT ICinematicCameraOptics* CryGetCinematicCameraOptics(IEntity* pEntity)
+ {
+ 	if (pEntity == nullptr)
+diff --git a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraPlugin.h b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraPlugin.h
+index 0dc5c1db..5a9424b5 100644
+--- a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraPlugin.h
++++ b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraPlugin.h
+@@ -3,9 +3,15 @@
+ #include <CrySystem/ICryPlugin.h>
+ #include <CryEntitySystem/IEntityClass.h>
+ 
++#include "../Interface/ICineCamEditorPreview.h"
++#include "CineCamEditorLook.h"
++
++class CCinematicCameraComponent;
++
+ class CCinematicCameraPlugin
+ 	: public Cry::IEnginePlugin
+ 	, public ISystemEventListener
++	, public ICineCamEditorPreview
+ {
+ public:
+ 	CRYINTERFACE_SIMPLE(Cry::IEnginePlugin)
+@@ -28,4 +34,35 @@ public:
+ 	// ISystemEventListener
+ 	virtual void OnSystemEvent(ESystemEvent event, UINT_PTR wparam, UINT_PTR lparam) override;
+ 	// ~ISystemEventListener
++
++	// ICineCamEditorPreview - what the Sandbox level-editor viewport is looking through this
++	// frame (decisions/s9-editor-cinecam-preview.md). Called once per rendered frame, in edit
++	// mode, from CLevelEditorViewport::OnRender, i.e. AFTER this frame's UpdateBeforeFinalizeCamera
++	// - so the resolver always acts on the previous frame's answer, which is why it tolerates one
++	// frame of staleness before falling back to Default.
++	virtual void SetViewportPreview(ECineCamEditorPreviewMode mode, EntityId entityId, const CCamera& camera) override;
++	virtual void ClearViewportPreview() override;
++	// ~ICineCamEditorPreview
++
++private:
++	//! The edit-mode half of UpdateBeforeFinalizeCamera(): resolve the viewport's answer into
++	//! "who drives the render state this frame" and let that one publish. Three outcomes:
++	//! a cinecam entity, the plugin-owned editor look, or nobody (stock picture).
++	void UpdateEditorPreview();
++	//! One log line per change of preview owner, never per frame.
++	void LogPreviewOwnerChange(ECineCamEditorPreviewMode mode, const CCinematicCameraComponent* pOwner);
++
++	//! The "CineCam" viewport camera: scene referred + automatic adaptation, no entity.
++	CCineCamEditorLook m_editorLook;
++
++	// What the viewport last said. Frame-COUNTER based staleness, never wall clock: the editor
++	// skips frames when it is idle, throttled or has no level, and a timer would flicker.
++	ECineCamEditorPreviewMode m_previewMode = ECineCamEditorPreviewMode::Default;
++	EntityId                  m_previewEntityId = INVALID_ENTITYID;
++	uint32                    m_previewFrameId = 0;
++
++	// Edge-trigger state for the log line.
++	ECineCamEditorPreviewMode m_loggedPreviewMode = ECineCamEditorPreviewMode::Default;
++	EntityId                  m_loggedPreviewEntityId = INVALID_ENTITYID;
++	bool                      m_bLoggedPreviewOnce = false;
+ };
+-- 
+2.47.1.windows.1
+
