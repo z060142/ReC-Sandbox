@@ -27,20 +27,39 @@ through an ACES 2.0 output transform baked by OpenColorIO. The same pre-display 
 written to OpenEXR (ACES2065-1 container) for grading in DaVinci Resolve or Nuke. With the
 switch off the engine renders exactly as stock.
 
-Status: works, under active testing on real scenes; D3D11 only; stock content needs re-lighting
-in physical units (see `docs/SceneReferredContent.md`). Besides the plugin and the renderer it
-touches `Cry3DEngine` (time-of-day light units, procedural sky), `CryEntitySystem` and
-`CryDefaultEntities` (environment-probe bake convention), so build and deploy those too.
-User docs: `docs/SceneReferredContent.md` (light units, physical preset, probes, HDRI import),
-`SceneReferredCalibration.md`, `SceneReferredLook.md` (LUTs, grading), `SceneReferredExport.md`
-(EXR capture and the Resolve round trip). The baked ACES 2.0 LUTs live under
-`engine/Code/CryPlugins/CinematicCamera/Assets/ODT/`; `tools/ocio-bake/` regenerates them.
+What the path covers today:
+
+- **One light-unit convention.** Sun, local lights, area lights (LTC, inverse-square), emissive
+  materials, probes, the procedural (Nishita) sky, volumetric fog and clouds, SVOGI, particles
+  and snow all feed the same exposure, so the aperture darkens the sky and the fog the same way
+  it darkens a wall. Ambient lights become real additive fill lights on this path.
+- **A camera meter.** A 64-bin log-luminance histogram with Average / Centre-weighted / Spot
+  metering, a percentile band instead of a mean, asymmetric adaptation, a sky weight so an
+  outdoor shot is not exposed for the sky, and a per-channel **Sensor Clip** (full-well) above
+  mid-grey.
+- **Display chain.** White balance, Sensor Clip, ACEScct, ASC CDL, a Look LUT (LMT) and the ODT
+  LUT, then dither; the stock LDR stage is inert on this path. Screen-space sun shafts retire by
+  default (`r_SunShafts 0`, and the camera keeps them off even when a spec `.cfg` turns them
+  back on); volumetric fog is on by default (`e_VolumetricFog 1`).
+- **Export.** `rec_CaptureEXR` writes the pre-ODT buffer as OpenEXR; `rec_ImportHDRI` calibrates
+  a measured HDRI into a probe.
+
+Status: verified on a physically lit interior and on the sample airfield in daylight; D3D11
+only; stock content needs re-lighting in physical units (see `docs/SceneReferredContent.md`).
+Two stock crashes found on the way are fixed here too (a lens flare on the wrong kind of light,
+an ambient light asked to cast shadows). Besides the plugin and the renderer the branch touches
+`Cry3DEngine` (time-of-day light units, procedural sky, fog and cloud exposure, cvar defaults),
+`CryEntitySystem` and `CryDefaultEntities` (environment-probe bake convention), so build and
+deploy those too. User docs: `docs/SceneReferredContent.md` (light units, physical preset,
+probes, HDRI import), `SceneReferredCalibration.md`, `SceneReferredLook.md` (LUTs, grading),
+`SceneReferredExport.md` (EXR capture and the Resolve round trip). The baked ACES 2.0 LUTs live
+under `engine/Code/CryPlugins/CinematicCamera/Assets/ODT/`; `tools/ocio-bake/` regenerates them.
 
 ## Layout
 
 | Path | What it is |
 | --- | --- |
-| `engine/` | The modified and added CRYENGINE files, in engine tree layout: the two plugins under `Code/CryPlugins/`, the renderer changes under `Code/CryEngine/RenderDll/`, and the shaders under `Engine/Shaders/`. `DELETED_FILES.txt` lists files removed from the stock tree. |
+| `engine/` | The modified and added CRYENGINE files, in engine tree layout: the two plugins under `Code/CryPlugins/`, the renderer changes under `Code/CryEngine/RenderDll/`, the 3D-engine / entity changes under `Code/CryEngine/Cry3DEngine/` and `CryEntitySystem/`, the EXR writer (`Code/Libs/tinyexr`), and the shaders under `Engine/Shaders/`. `DELETED_FILES.txt` lists files removed from the stock tree. |
 | `patches/` | The same changes as a numbered patch series (one patch per step) and `full.patch`, one cumulative diff against pristine 5.7.1. |
 | `docs/` | User documentation: the two plugin READMEs (parameters, workflow) and the console reference (commands and cvars). |
 | `tools/` | RenderDoc Python scripts used to measure the GPU cost of the added passes; `ocio-bake/` (ACES 2.0 LUT baking), `exr-check/` (EXR vs screenshot comparison), `bitcompare.py` (byte-identity check). |
@@ -57,13 +76,14 @@ git am --keep-cr --3way path/to/ReC-Sandbox/patches/0*.patch
 
 or copy `engine/` over the checkout and delete what `engine/DELETED_FILES.txt` lists. Configure
 with the engine's bundled CMake (`Tools/CMake/Win32/bin/cmake.exe`, Visual Studio 17 2022, x64)
-and build `CryRenderD3D11`, `CinematicCamera` and `CryPhoneTracker` in the Profile
-configuration. The third-party SDK drop (`Code/SDKs`) is not part of this repository.
+and build `CryRenderD3D11`, `Cry3DEngine`, `CryEntitySystem`, `CryDefaultEntities`,
+`CinematicCamera` and `CryPhoneTracker` in the Profile configuration. The third-party SDK drop (`Code/SDKs`) is not part of this repository.
 
-To use it in a project, copy the built `CryRenderD3D11.dll` and the two plugin DLLs into the
-engine's `bin/win_x64/`, the modified `.cfx` / `.cfi` shader files into
-`engine/shaders/HWScripts/CryFX/` (the engine compiles loose shader files at startup), and add
-the plugins to the project's `.cryproject`. See `docs/` for the parameters.
+To use it in a project, copy the built engine DLLs and the two plugin DLLs into the engine's
+`bin/win_x64/`, the modified `.cfx` / `.cfi` shader files into
+`engine/shaders/HWScripts/CryFX/` (the engine compiles loose shader files at startup), the
+`Assets/ODT/*.cube` LUTs next to the project's assets, and add the plugins to the project's
+`.cryproject`. See `docs/` for the parameters.
 
 ## Related
 
