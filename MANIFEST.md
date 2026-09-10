@@ -1,11 +1,27 @@
 # Sync manifest
 
 Baseline : main @ a34100a9 (pristine CRYENGINE 5.7.1)
-Dev      : scene @ 3f53d2c4
-Synced   : 2026-09-09 23:31
+Dev      : scene @ 524e1718
+Synced   : 2026-09-10 18:56
 
 ## Commits (newest first)
 
+- 524e1718 fix: the sprite bokeh report called its cutoff "stops over mid grey", which it is not
+- 3228a164 tune: the CineCam Grade panel now follows the size of its dock
+- 90ca16f2 feat: three real colour wheels for the CineCam Grade, in a dockable panel (S10 item 5)
+- 767c0aa4 fix: a grade file dropped into assets/cinecam registers itself, one file at a time
+- d24cdb96 fix: sprite bokeh had no source budget, so a bright scene drew a sprite for a tenth of the screen
+- 6bca6a97 fix: a grade preset shipped in the engine tree resolves too
+- 1b98d4af feat: asset pickers on both LUT slots, and a grade preset you can export and reuse (S10 item 4b)
+- 419ff469 feat: LUT, ASC CDL and grade preset are CryEngine asset types (S10 item 4b, editor half)
+- df7fbbef feat: the LMT slot knows what space a LUT is in, wraps a Rec.709 one, and hot reloads (S10 item 4)
+- f92d751c feat: three shipped looks, an inverse output transform and a space tag in every cube (S10 item 4)
+- d5dc05ec feat: two 1D curves on the CineCam Grade - a master tone curve and Sat vs Sat (S10 item 3b)
+- d49e019f feat: the grade travels with the capture - an ASC .cdl sidecar and an honest rec/cdl (S10 item 3a)
+- fdd3e998 feat: colour wheels and contrast on the CineCam Grade, folded into one ASC CDL (S10 item 3a)
+- 063ef39b fix: a CineCam Grade that cannot reach the picture now says why (S10 item 2b)
+- 857f1e15 feat: the look moves to its own component - CineCam Grade (S10 item 2)
+- 46f9e8e4 feat: rec_CaptureEXR sequences no longer overwrite the previous take (r_SceneReferredExportSequenceNaming)
 - 3f53d2c4 feat: glare thresholds mean "stops above mid grey" on the stock path too; sky sources no longer starve the budget
 - 49d61fd0 fix: the wave-glare source budget was scene-referred only - the stock path drew every source unbudgeted
 - 40873139 tune: cloud edge fade 4 km -> 12 km with smoothstep
@@ -162,8 +178,10 @@ Synced   : 2026-09-09 23:31
 - M	Code/CryEngine/Cry3DEngine/SkyLightManager.cpp
 - M	Code/CryEngine/Cry3DEngine/TimeOfDay.cpp
 - M	Code/CryEngine/Cry3DEngine/cvars.cpp
+- M	Code/CryEngine/CryCommon/CMakeLists.txt
 - M	Code/CryEngine/CryCommon/Cry3DEngine/I3DEngine.h
 - M	Code/CryEngine/CryCommon/CryRenderer/IRenderer.h
+- A	Code/CryEngine/CryCommon/CryRenderer/SceneReferredCurves.h
 - M	Code/CryEngine/RenderDll/Common/Include_HLSL_CPP_Shared.h
 - M	Code/CryEngine/RenderDll/Common/PostProcess/PostEffects.cpp
 - M	Code/CryEngine/RenderDll/Common/PostProcess/PostEffects.h
@@ -227,14 +245,30 @@ Synced   : 2026-09-09 23:31
 - A	Code/CryPlugins/CinematicCamera/AnamorphicSpec.md
 - A	Code/CryPlugins/CinematicCamera/Assets/Environment/ReC_Physical.env
 - A	Code/CryPlugins/CinematicCamera/Assets/Environment/ReC_Physical.env.cryasset
-- A	Code/CryPlugins/CinematicCamera/Assets/ODT/lmt_identity_33.cube
-- A	Code/CryPlugins/CinematicCamera/Assets/ODT/lmt_identity_33.report.txt
-- A	Code/CryPlugins/CinematicCamera/Assets/ODT/odt_rec1886_100nit_aces2_33.cube
-- A	Code/CryPlugins/CinematicCamera/Assets/ODT/odt_rec1886_100nit_aces2_33.report.txt
-- A	Code/CryPlugins/CinematicCamera/Assets/ODT/odt_srgb_100nit_aces2_33.cube
-- A	Code/CryPlugins/CinematicCamera/Assets/ODT/odt_srgb_100nit_aces2_33.report.txt
-- A	Code/CryPlugins/CinematicCamera/Assets/ODT/odt_srgb_100nit_aces2_65.cube
-- A	Code/CryPlugins/CinematicCamera/Assets/ODT/odt_srgb_100nit_aces2_65.report.txt
+- A	Code/CryPlugins/CinematicCamera/Assets/cinecam/luts/lmt_identity_33.cube
+- A	Code/CryPlugins/CinematicCamera/Assets/cinecam/luts/lmt_identity_33.cube.cryasset
+- A	Code/CryPlugins/CinematicCamera/Assets/cinecam/luts/lmt_identity_33.report.txt
+- A	Code/CryPlugins/CinematicCamera/Assets/cinecam/luts/look_film_contrast_33.cube
+- A	Code/CryPlugins/CinematicCamera/Assets/cinecam/luts/look_film_contrast_33.cube.cryasset
+- A	Code/CryPlugins/CinematicCamera/Assets/cinecam/luts/look_film_contrast_33.report.txt
+- A	Code/CryPlugins/CinematicCamera/Assets/cinecam/luts/look_warm_print_33.cube
+- A	Code/CryPlugins/CinematicCamera/Assets/cinecam/luts/look_warm_print_33.cube.cryasset
+- A	Code/CryPlugins/CinematicCamera/Assets/cinecam/luts/look_warm_print_33.report.txt
+- A	Code/CryPlugins/CinematicCamera/Assets/cinecam/luts/odt_rec1886_100nit_aces2_33.cube
+- A	Code/CryPlugins/CinematicCamera/Assets/cinecam/luts/odt_rec1886_100nit_aces2_33.cube.cryasset
+- A	Code/CryPlugins/CinematicCamera/Assets/cinecam/luts/odt_rec1886_100nit_aces2_33.report.txt
+- A	Code/CryPlugins/CinematicCamera/Assets/cinecam/luts/odt_srgb_100nit_aces2_33.cube
+- A	Code/CryPlugins/CinematicCamera/Assets/cinecam/luts/odt_srgb_100nit_aces2_33.cube.cryasset
+- A	Code/CryPlugins/CinematicCamera/Assets/cinecam/luts/odt_srgb_100nit_aces2_33.report.txt
+- A	Code/CryPlugins/CinematicCamera/Assets/cinecam/luts/odt_srgb_100nit_aces2_65.cube
+- A	Code/CryPlugins/CinematicCamera/Assets/cinecam/luts/odt_srgb_100nit_aces2_65.cube.cryasset
+- A	Code/CryPlugins/CinematicCamera/Assets/cinecam/luts/odt_srgb_100nit_aces2_65.report.txt
+- A	Code/CryPlugins/CinematicCamera/Assets/cinecam/luts/system/odt_srgb_100nit_aces2_inv_65.cube
+- A	Code/CryPlugins/CinematicCamera/Assets/cinecam/luts/system/odt_srgb_100nit_aces2_inv_65.cube.cryasset
+- A	Code/CryPlugins/CinematicCamera/Assets/cinecam/luts/system/odt_srgb_100nit_aces2_inv_65.report.txt
+- A	Code/CryPlugins/CinematicCamera/Assets/cinecam/luts/test_identity_rec709_33.cube
+- A	Code/CryPlugins/CinematicCamera/Assets/cinecam/luts/test_identity_rec709_33.cube.cryasset
+- A	Code/CryPlugins/CinematicCamera/Assets/cinecam/luts/test_identity_rec709_33.report.txt
 - A	Code/CryPlugins/CinematicCamera/AxialChromaticSpec.md
 - A	Code/CryPlugins/CinematicCamera/DiffractionKernelSpec.md
 - A	Code/CryPlugins/CinematicCamera/DiffractionStreaksSpec.md
@@ -251,8 +285,13 @@ Synced   : 2026-09-09 23:31
 - A	Code/CryPlugins/CinematicCamera/Module/CMakeLists.txt
 - A	Code/CryPlugins/CinematicCamera/Module/CineCamEditorLook.cpp
 - A	Code/CryPlugins/CinematicCamera/Module/CineCamEditorLook.h
+- A	Code/CryPlugins/CinematicCamera/Module/CineCamLutTypes.h
 - A	Code/CryPlugins/CinematicCamera/Module/CineCamShared.cpp
 - A	Code/CryPlugins/CinematicCamera/Module/CineCamShared.h
+- A	Code/CryPlugins/CinematicCamera/Module/CineGradeAsset.cpp
+- A	Code/CryPlugins/CinematicCamera/Module/CineGradeAsset.h
+- A	Code/CryPlugins/CinematicCamera/Module/CineGradeComponent.cpp
+- A	Code/CryPlugins/CinematicCamera/Module/CineGradeComponent.h
 - A	Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp
 - A	Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
 - A	Code/CryPlugins/CinematicCamera/Module/CinematicCameraPlugin.cpp
@@ -293,6 +332,21 @@ Synced   : 2026-09-09 23:31
 - A	Code/Libs/tinyexr/tinyexr_impl.cpp
 - M	Code/Sandbox/EditorQt/LevelEditor/LevelEditorViewport.cpp
 - M	Code/Sandbox/EditorQt/LevelEditor/LevelEditorViewport.h
+- A	Code/Sandbox/Plugins/CinematicCameraEditor/CMakeLists.txt
+- A	Code/Sandbox/Plugins/CinematicCameraEditor/CineCamAssetRegistration.cpp
+- A	Code/Sandbox/Plugins/CinematicCameraEditor/CineCamAssetRegistration.h
+- A	Code/Sandbox/Plugins/CinematicCameraEditor/CineCamAssetTypes.cpp
+- A	Code/Sandbox/Plugins/CinematicCameraEditor/CineCamAssetTypes.h
+- A	Code/Sandbox/Plugins/CinematicCameraEditor/CineGradeBinding.cpp
+- A	Code/Sandbox/Plugins/CinematicCameraEditor/CineGradeBinding.h
+- A	Code/Sandbox/Plugins/CinematicCameraEditor/CineGradePanel.cpp
+- A	Code/Sandbox/Plugins/CinematicCameraEditor/CineGradePanel.h
+- A	Code/Sandbox/Plugins/CinematicCameraEditor/CineGradeWidgets.cpp
+- A	Code/Sandbox/Plugins/CinematicCameraEditor/CineGradeWidgets.h
+- A	Code/Sandbox/Plugins/CinematicCameraEditor/CinematicCameraEditorPlugin.cpp
+- A	Code/Sandbox/Plugins/CinematicCameraEditor/CinematicCameraEditorPlugin.h
+- A	Code/Sandbox/Plugins/CinematicCameraEditor/StdAfx.cpp
+- A	Code/Sandbox/Plugins/CinematicCameraEditor/StdAfx.h
 - M	Code/Tools/CryCommonTools/FileUtil.cpp
 - M	Engine/Shaders/HWScripts/CryFX/Clouds.cfx
 - M	Engine/Shaders/HWScripts/CryFX/CommonMath.cfi
@@ -321,4 +375,5 @@ Synced   : 2026-09-09 23:31
 - M	Engine/Shaders/HWScripts/CryFX/WaterVolume.cfx
 - M	Engine/Shaders/HWScripts/CryFX/shadeLib.cfi
 - M	Tools/CMake/BuildEngine.cmake
+- M	Tools/CMake/BuildSandbox.cmake
 - M	Tools/CMake/CRYENGINE-MSVC.cmake

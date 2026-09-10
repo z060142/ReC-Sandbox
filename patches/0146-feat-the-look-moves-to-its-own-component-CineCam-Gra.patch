@@ -1,0 +1,747 @@
+From 857f1e158c9f449ee032f227b7f70ac4991aa40b Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Thu, 10 Sep 2026 01:06:24 +0800
+Subject: [PATCH 146/160] feat: the look moves to its own component - CineCam
+ Grade (S10 item 2)
+
+The ASC CDL and the LMT slot are no longer part of every cinematic camera.
+They move, unchanged, onto a new entity component CCineGradeComponent
+(editor label "CineCam Grade", category Cameras, same plugin) that you add
+to the same entity as a Cinematic Camera. A look is a thing you add, copy
+to another camera and delete - the same story design decision D10 tells
+about the LUT file itself - and a camera that never grades no longer pays
+for two inspector groups it does not use.
+
+What moved
+  - struct SCineGradeParams (Bypass Grade, Slope, Offset, Power, Saturation)
+  - struct SCineLookParams  (LMT File)
+Both keep their type GUIDs and their member ids, so the reflected shape of
+each group is identical; only its owner changed.
+
+What did NOT move
+  - White Balance and Output (ODT) stay on the camera: they are what the
+    camera is and what its monitor is. Note that the four
+    Global_User_GradeWB* bus params are named "Grade" but are fed by the
+    White Balance group - those writes are untouched.
+  - The camera remains the ONLY writer of the Global_User_Grade* params and
+    the only caller of CineCam::ApplyDisplayLuts. The renderer, the shaders,
+    the bus parameter names and the LUT loading code are all unchanged.
+
+The binding (decisions/s10-grade-component.md section 3, alternative P1,
+appended there with the two rejected alternatives)
+  ApplyGrade() and ApplyDisplayLuts() look the sibling up with
+  GetEntity()->GetComponent<CCineGradeComponent>() on the frame they publish
+  and fall back to file-static default-constructed neutrals when there is
+  none. Chosen over a cached pointer / push handshake because it is immune
+  to component creation order, a component removed at runtime falls back to
+  neutral on the next frame with no dangling pointer, and the lookup sits
+  inside the existing CanDriveRenderState() gate rather than adding a second
+  path to the bus (f5891aab). Cost is a linear scan of a three-component
+  entity, no allocation - the same call the plugin already makes each frame.
+  The grade component adds one latency nudge: on its own
+  ENTITY_EVENT_COMPONENT_PROPERTY_CHANGED (which the editor sends to the
+  edited component only) it calls the camera's RefreshGrade(), which is the
+  same two Apply calls behind the same gate. Without a camera sibling the
+  component does nothing and logs one line, once.
+
+Byte identity
+  The neutral values are exact identities, and the bus' own registered
+  defaults are already the neutral grade, so "no grade component" and "an
+  untouched grade component" produce the same bus state RestoreGrade()
+  writes - i.e. pure ACES 2.0, the same picture the camera's own Grade group
+  gave at its defaults. Old saved levels lose the moved values (decided: no
+  migration shim).
+
+Docs: README.md gains a "The CineCam Grade component" section and the Grade
+and Look tables move into it; docs/SceneReferredLook.md sections 1, 3 and 4
+name the new component. Research note:
+scene-notes/research/s10-grade-component-binding.md (outside git).
+
+Build: CinematicCamera, Profile, 0 errors 0 warnings. Deployed to the LTS
+and gamesdk trees.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01ADgAiBYv9AxSd54s1FPREm
+---
+ .../CinematicCamera/Module/CMakeLists.txt     |   2 +
+ .../Module/CineGradeComponent.cpp             |  78 ++++++++++
+ .../Module/CineGradeComponent.h               | 141 ++++++++++++++++++
+ .../Module/CinematicCameraComponent.cpp       |  59 +++++++-
+ .../Module/CinematicCameraComponent.h         |  97 +++---------
+ Code/CryPlugins/CinematicCamera/README.md     |  86 +++++++----
+ .../CinematicCamera/docs/SceneReferredLook.md |  28 +++-
+ 7 files changed, 376 insertions(+), 115 deletions(-)
+ create mode 100644 Code/CryPlugins/CinematicCamera/Module/CineGradeComponent.cpp
+ create mode 100644 Code/CryPlugins/CinematicCamera/Module/CineGradeComponent.h
+
+diff --git a/Code/CryPlugins/CinematicCamera/Module/CMakeLists.txt b/Code/CryPlugins/CinematicCamera/Module/CMakeLists.txt
+index bb3c20fb..b434e147 100644
+--- a/Code/CryPlugins/CinematicCamera/Module/CMakeLists.txt
++++ b/Code/CryPlugins/CinematicCamera/Module/CMakeLists.txt
+@@ -11,6 +11,8 @@ add_sources("CinematicCamera_uber_0.cpp"
+ 	SOURCE_GROUP "Components"
+ 		"CinematicCameraComponent.h"
+ 		"CinematicCameraComponent.cpp"
++		"CineGradeComponent.h"
++		"CineGradeComponent.cpp"
+ 	SOURCE_GROUP "Editor"
+ 		"../Interface/ICineCamEditorPreview.h"
+ 		"CineCamShared.h"
+diff --git a/Code/CryPlugins/CinematicCamera/Module/CineGradeComponent.cpp b/Code/CryPlugins/CinematicCamera/Module/CineGradeComponent.cpp
+new file mode 100644
+index 00000000..154ade45
+--- /dev/null
++++ b/Code/CryPlugins/CinematicCamera/Module/CineGradeComponent.cpp
+@@ -0,0 +1,78 @@
++#include "StdAfx.h"
++#include "CineGradeComponent.h"
++#include "CinematicCameraComponent.h"
++
++#include <CrySchematyc/Env/Elements/EnvComponent.h>
++#include <CrySchematyc/Env/IEnvRegistrar.h>
++#include <CryCore/StaticInstanceList.h>
++
++// ---------------------------------------------------------------------------
++// Schematyc registration - same package as the camera, same auto-registrar. The plugin's
++// ESYSTEM_EVENT_REGISTER_SCHEMATYC_ENV handler invokes every static callback in this module, so a
++// second component costs nothing but this block.
++// ---------------------------------------------------------------------------
++namespace
++{
++	static void RegisterCineGradeComponent(Schematyc::IEnvRegistrar& registrar)
++	{
++		Schematyc::CEnvRegistrationScope scope = registrar.Scope(IEntity::GetEntityScopeGUID());
++		scope.Register(SCHEMATYC_MAKE_ENV_COMPONENT(CCineGradeComponent));
++	}
++
++	CRY_STATIC_AUTO_REGISTER_FUNCTION(&RegisterCineGradeComponent);
++}
++
++// ---------------------------------------------------------------------------
++// IEntityComponent
++// ---------------------------------------------------------------------------
++// No per-frame event. The camera pulls this component's state on the frame it publishes, so
++// there is nothing for an update to do; these three are the moments at which "is there a camera
++// to grade?" can first be answered, and the one at which an edited value should reach the
++// picture without waiting for the camera's next update.
++Cry::Entity::EventFlags CCineGradeComponent::GetEventMask() const
++{
++	return ENTITY_EVENT_COMPONENT_PROPERTY_CHANGED
++	       | ENTITY_EVENT_LEVEL_LOADED
++	       | ENTITY_EVENT_START_GAME;
++}
++
++void CCineGradeComponent::ProcessEvent(const SEntityEvent& event)
++{
++	switch (event.event)
++	{
++	case ENTITY_EVENT_COMPONENT_PROPERTY_CHANGED:
++		// The editor sends this event to the EDITED component only (EntityObject.cpp:831/934), so
++		// the camera does not hear about a grade change by itself. This is the latency nudge from
++		// decisions/s10-grade-component.md section 3 P1 - not the source of truth: the camera
++		// re-reads this component on its own ENTITY_EVENT_UPDATE anyway, so if the nudge never
++		// fired the picture would still be right one frame later.
++		if (m_pEntity != nullptr)
++		{
++			if (CCinematicCameraComponent* pCamera = m_pEntity->GetComponent<CCinematicCameraComponent>())
++				pCamera->RefreshGrade();
++		}
++		WarnIfNoCameraSibling();
++		break;
++
++	case ENTITY_EVENT_LEVEL_LOADED:
++	case ENTITY_EVENT_START_GAME:
++		WarnIfNoCameraSibling();
++		break;
++
++	default:
++		break;
++	}
++}
++
++void CCineGradeComponent::WarnIfNoCameraSibling()
++{
++	if (m_bLoggedNoCamera || m_pEntity == nullptr)
++		return;
++
++	if (m_pEntity->GetComponent<CCinematicCameraComponent>() != nullptr)
++		return;
++
++	m_bLoggedNoCamera = true;
++	CryLog("[cinecam] entity '%s' has a CineCam Grade with no Cinematic Camera on it - the grade "
++	       "does nothing. Add a Cinematic Camera to the same entity.", m_pEntity->GetName());
++}
+diff --git a/Code/CryPlugins/CinematicCamera/Module/CineGradeComponent.h b/Code/CryPlugins/CinematicCamera/Module/CineGradeComponent.h
+new file mode 100644
+index 00000000..57feba00
+--- /dev/null
++++ b/Code/CryPlugins/CinematicCamera/Module/CineGradeComponent.h
+@@ -0,0 +1,141 @@
++// CineCam Grade - the creative half of the display chain, as its own entity component.
++//
++// The division (decisions/s10-grade-component.md section 2 A) mirrors ACES: the camera owns the
++// device-side transforms - exposure, white balance, the output transform that is its monitor -
++// and this component owns the look: the ASC CDL and the LMT slot. A look is then a component you
++// can add, copy between cameras and delete, which is the same story design decision D10 tells
++// about the LUT file itself.
++//
++// It never writes the renderer. The cinematic camera on the same entity remains the single writer
++// of the Global_User_Grade* bus parameters and the only caller of CineCam::ApplyDisplayLuts; it
++// reads this component's two structs when it publishes, and uses the neutral defaults below when
++// there is no grade component on the entity (decisions/s10-grade-component.md section 3, P1).
++// So: no grade component, or a grade component nobody has touched, are the same picture - pure
++// ACES 2.0, exactly as before this component existed.
++#pragma once
++
++#include <CryEntitySystem/IEntityComponent.h>
++#include <CrySchematyc/MathTypes.h>
++#include <CrySchematyc/Reflection/TypeDesc.h>
++#include <CrySchematyc/Env/IEnvRegistrar.h>
++// CSharedString: the reflected string type behind the .cube path property (LMT File).
++#include <CrySchematyc/Utils/SharedString.h>
++
++// The camera's grade (SceneReferredSpec.md S5). ASC CDL in ACEScct, the interchange every
++// grading tool speaks, applied to scene data before the output transform - not to a picture
++// after it. Neutral by default: with these values the chain is exactly ACES 2.0 (D10).
++struct SCineGradeParams
++{
++	inline bool operator==(const SCineGradeParams& rhs) const { return 0 == memcmp(this, &rhs, sizeof(rhs)); }
++
++	static void ReflectType(Schematyc::CTypeDesc<SCineGradeParams>& desc)
++	{
++		desc.SetGUID("{4C81D3E6-7A29-4F05-B6D4-92E37C0158BA}"_cry_guid);
++		desc.SetLabel("Grade");
++		desc.AddMember(&SCineGradeParams::bBypassGrade,
++			'gbyp', "BypassGrade", "Bypass Grade",
++			"Switch the whole camera grade out of the chain - white balance, CDL and look - and "
++			"leave only the output transform. The A/B: what the shot looks like ungraded, one "
++			"click away, with the exposure and the optics unchanged.", false);
++		desc.AddMember(&SCineGradeParams::slope,
++			'cdls', "Slope", "Slope (RGB)",
++			"ASC CDL slope, per channel. A multiply in log - gain, the highlight end. 1 = "
++			"neutral. Applied first: out = (in * slope + offset) ^ power.", Vec3(1.0f, 1.0f, 1.0f));
++		desc.AddMember(&SCineGradeParams::offset,
++			'cdlo', "Offset", "Offset (RGB)",
++			"ASC CDL offset, per channel. An add in log - lift, the shadow end, and the usual "
++			"place a colour cast is corrected. 0 = neutral.", Vec3(0.0f, 0.0f, 0.0f));
++		desc.AddMember(&SCineGradeParams::power,
++			'cdlp', "Power", "Power (RGB)",
++			"ASC CDL power, per channel. Gamma, the midtones, applied last. 1 = neutral; below 1 "
++			"opens the mids, above 1 closes them.", Vec3(1.0f, 1.0f, 1.0f));
++		desc.AddMember(&SCineGradeParams::saturation,
++			'cdlt', "Saturation", "Saturation",
++			"The ASC's saturation extension, applied after the slope/offset/power triple about "
++			"the luminance of the graded value. 1 = neutral, 0 = monochrome. Because this "
++			"happens in the working space and before the output transform, pushing it does not "
++			"drift the hues the way a saturation slider on a finished picture does.", 1.0f);
++	}
++
++	bool bBypassGrade = false;
++	Vec3 slope = Vec3(1.0f, 1.0f, 1.0f);
++	Vec3 offset = Vec3(0.0f, 0.0f, 0.0f);
++	Vec3 power = Vec3(1.0f, 1.0f, 1.0f);
++	Schematyc::Range<0, 4, 0, 2> saturation = 1.0f;
++};
++
++// The look slot (LMT), one of the two .cube files of the display chain (SceneReferredSpec.md
++// S4/S5, D8) - the other, the output transform, stays on the camera because it is the camera's
++// monitor. A plain asset path rather than a resource picker: a .cube is not a texture asset the
++// RC knows about, so there is no selector to reuse, and the files ship with the plugin. The path
++// is resolved through ICryPak - first as given (relative to the project's asset directory), then
++// under %ENGINE% - so the same string works in the editor and in the launcher whichever tree the
++// file was installed into.
++struct SCineLookParams
++{
++	inline bool operator==(const SCineLookParams& rhs) const { return lmtFile == rhs.lmtFile; }
++
++	static void ReflectType(Schematyc::CTypeDesc<SCineLookParams>& desc)
++	{
++		desc.SetGUID("{3A0C6D18-5E47-4B92-9C31-7F6E2D840A15}"_cry_guid);
++		desc.SetLabel("Look");
++		desc.AddMember(&SCineLookParams::lmtFile,
++			'lmtf', "LMTFile", "LMT File",
++			"Creative look, as a Resolve .cube in ACEScct - the Look Modification Transform. It "
++			"is applied AFTER the CDL and BEFORE the output transform, so it grades scene data "
++			"and not a picture. Empty = identity (pure ACES, no house look: SceneReferredSpec.md "
++			"D10). Author it in Resolve on an ACEScct timeline and export a 33-cube; "
++			"Assets/ODT/lmt_identity_33.cube is the pass-through reference.",
++			Schematyc::CSharedString());
++	}
++
++	// Keep last: operator== compares the string by value.
++	Schematyc::CSharedString lmtFile;
++};
++
++//! The look, as an entity component. Holds state and nothing else: see the file header for why
++//! it publishes nothing itself.
++class CCineGradeComponent final : public IEntityComponent
++{
++public:
++	static void ReflectType(Schematyc::CTypeDesc<CCineGradeComponent>& desc)
++	{
++		desc.SetGUID("{1E7C4A93-6B25-4D8F-9A03-52D7F1C86B40}"_cry_guid);
++		desc.SetEditorCategory("Cameras");
++		desc.SetLabel("CineCam Grade");
++		desc.SetDescription(
++			"The look for the Cinematic Camera on the same entity: ASC CDL (slope, offset, "
++			"power, saturation) applied in ACEScct to scene data before the output transform, "
++			"plus the LMT slot. Needs a Cinematic Camera on the same entity and the "
++			"scene-referred path; on its own it does nothing. Neutral values are exact "
++			"identities, so an untouched component is pure ACES 2.0.");
++		desc.SetIcon("icons:General/Camera.ico");
++		desc.SetComponentFlags({
++			IEntityComponent::EFlags::Singleton,
++			IEntityComponent::EFlags::ClientOnly });
++
++		desc.AddMember(&CCineGradeComponent::m_grade, 'ggrd', "Grade", "Grade", "", SCineGradeParams());
++		desc.AddMember(&CCineGradeComponent::m_look,  'glok', "Look",  "Look",  "", SCineLookParams());
++	}
++
++	// IEntityComponent
++	virtual Cry::Entity::EventFlags GetEventMask() const override;
++	virtual void ProcessEvent(const SEntityEvent& event) override;
++	// ~IEntityComponent
++
++	//! Read by the cinematic camera on the same entity when it publishes the grade. Never a copy:
++	//! the camera reads through these on the frame it publishes.
++	const SCineGradeParams& GetGrade() const { return m_grade; }
++	const SCineLookParams&  GetLook()  const { return m_look; }
++
++private:
++	//! One log line for the whole life of the component when there is no camera to grade. Not a
++	//! warning per frame: an entity can legitimately carry the component for a moment while it is
++	//! being built, and the message is only useful the first time.
++	void WarnIfNoCameraSibling();
++
++	SCineGradeParams m_grade;
++	SCineLookParams  m_look;
++
++	bool m_bLoggedNoCamera = false;
++};
+diff --git a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp
+index fca71f75..f9540c32 100644
+--- a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp
++++ b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp
+@@ -1648,7 +1648,7 @@ void CCinematicCameraComponent::ApplyDisplayLuts()
+ 	if (!CanDriveRenderState())
+ 		return;
+ 
+-	CineCam::ApplyDisplayLuts(m_output.odtFile.c_str(), m_look.lmtFile.c_str());
++	CineCam::ApplyDisplayLuts(m_output.odtFile.c_str(), GetLookParams().lmtFile.c_str());
+ }
+ 
+ void CCinematicCameraComponent::RestoreDisplayLuts()
+@@ -1706,6 +1706,52 @@ void CCinematicCameraComponent::OnLevelLoaded()
+ 		p->ClearSavedBaselines();
+ }
+ 
++// WHERE THE GRADE COMES FROM (decisions/s10-grade-component.md section 2 A / section 3 P1).
++// The ASC CDL and the look slot live on a separate CineCam Grade component - a look is a thing
++// you add and delete, not a permanent part of every camera - but the camera stays the single
++// writer of the bus. It looks the sibling up on the frame it publishes rather than caching a
++// pointer: the lookup is a linear scan of a three-component entity with no allocation, and in
++// exchange nothing here depends on which component was created first, a component removed at
++// runtime falls back to neutral on the very next frame with no dangling pointer to clear, and
++// the whole publication stays behind the one CanDriveRenderState() gate.
++//
++// The fallbacks are default-constructed, so their values are the reflected neutrals: bypass off,
++// slope 1, offset 0, power 1, saturation 1, no LMT. That is what makes "no grade component" and
++// "an untouched grade component" the same picture, and both of them exactly ACES 2.0 (D10).
++static const SCineGradeParams s_neutralGrade;
++static const SCineLookParams  s_neutralLook;
++
++const SCineGradeParams& CCinematicCameraComponent::GetGradeParams() const
++{
++	if (m_pEntity != nullptr)
++	{
++		if (const CCineGradeComponent* pGrade = m_pEntity->GetComponent<CCineGradeComponent>())
++			return pGrade->GetGrade();
++	}
++
++	return s_neutralGrade;
++}
++
++const SCineLookParams& CCinematicCameraComponent::GetLookParams() const
++{
++	if (m_pEntity != nullptr)
++	{
++		if (const CCineGradeComponent* pGrade = m_pEntity->GetComponent<CCineGradeComponent>())
++			return pGrade->GetLook();
++	}
++
++	return s_neutralLook;
++}
++
++// The sibling grade component edited one of its properties. Both calls are the ordinary ones,
++// behind the ordinary gate, so this is only about latency: without it the edit would be picked up
++// by the next ENTITY_EVENT_UPDATE instead of immediately.
++void CCinematicCameraComponent::RefreshGrade()
++{
++	ApplyDisplayLuts();
++	ApplyGrade();
++}
++
+ // The camera's grade (SceneReferredSpec.md S5). Everything here acts on scene data BEFORE the
+ // output transform, which is the whole difference between grading and retouching: the picture
+ // has not been squeezed onto a monitor yet, so a saturation push has somewhere to go and a
+@@ -1724,17 +1770,18 @@ void CCinematicCameraComponent::ApplyGrade()
+ 	if (!CanDriveRenderState())
+ 		return;
+ 
+-	const bool bBypass = m_grade.bBypassGrade;
++	const SCineGradeParams& grade = GetGradeParams();
++	const bool bBypass = grade.bBypassGrade;
+ 
+ 	gEnv->p3DEngine->SetPostEffectParam("Global_User_GradeBypass",   bBypass ? 1.0f : 0.0f);
+ 	gEnv->p3DEngine->SetPostEffectParam("Global_User_GradeWBEnable", m_whiteBalance.bEnableWhiteBalance ? 1.0f : 0.0f);
+ 	gEnv->p3DEngine->SetPostEffectParam("Global_User_GradeWBKelvin", (float)(int)m_whiteBalance.colorTemperature);
+ 	gEnv->p3DEngine->SetPostEffectParam("Global_User_GradeWBTint",   (float)m_whiteBalance.tint);
+ 
+-	gEnv->p3DEngine->SetPostEffectParamVec4("Global_User_GradeSlope",  Vec4(m_grade.slope.x, m_grade.slope.y, m_grade.slope.z, 0.0f));
+-	gEnv->p3DEngine->SetPostEffectParamVec4("Global_User_GradeOffset", Vec4(m_grade.offset.x, m_grade.offset.y, m_grade.offset.z, 0.0f));
+-	gEnv->p3DEngine->SetPostEffectParamVec4("Global_User_GradePower",  Vec4(m_grade.power.x, m_grade.power.y, m_grade.power.z, 0.0f));
+-	gEnv->p3DEngine->SetPostEffectParam("Global_User_GradeSaturation", (float)m_grade.saturation);
++	gEnv->p3DEngine->SetPostEffectParamVec4("Global_User_GradeSlope",  Vec4(grade.slope.x, grade.slope.y, grade.slope.z, 0.0f));
++	gEnv->p3DEngine->SetPostEffectParamVec4("Global_User_GradeOffset", Vec4(grade.offset.x, grade.offset.y, grade.offset.z, 0.0f));
++	gEnv->p3DEngine->SetPostEffectParamVec4("Global_User_GradePower",  Vec4(grade.power.x, grade.power.y, grade.power.z, 0.0f));
++	gEnv->p3DEngine->SetPostEffectParam("Global_User_GradeSaturation", (float)grade.saturation);
+ }
+ 
+ void CCinematicCameraComponent::RestoreGrade()
+diff --git a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
+index 7f2023a0..a90c23e2 100644
+--- a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
++++ b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
+@@ -13,6 +13,9 @@
+ 
+ #include "../Interface/ICinematicCameraOptics.h"
+ #include "CineCamShared.h"
++// SCineGradeParams / SCineLookParams and the component that owns them: the camera reads them
++// from its sibling when it publishes the grade (decisions/s10-grade-component.md).
++#include "CineGradeComponent.h"
+ 
+ // CCameraComponent is in CryDefaultEntities/Module — forward-declared here,
+ // included fully in the .cpp (include path set in CMakeLists.txt).
+@@ -649,49 +652,6 @@ struct SCineWhiteBalanceParams
+ 	Schematyc::Range<-1, 1, -1, 1> tint = 0.0f;
+ };
+ 
+-// The camera's grade (SceneReferredSpec.md S5). ASC CDL in ACEScct, the interchange every
+-// grading tool speaks, applied to scene data before the output transform - not to a picture
+-// after it. Neutral by default: with these values the chain is exactly ACES 2.0 (D10).
+-struct SCineGradeParams
+-{
+-	inline bool operator==(const SCineGradeParams& rhs) const { return 0 == memcmp(this, &rhs, sizeof(rhs)); }
+-
+-	static void ReflectType(Schematyc::CTypeDesc<SCineGradeParams>& desc)
+-	{
+-		desc.SetGUID("{4C81D3E6-7A29-4F05-B6D4-92E37C0158BA}"_cry_guid);
+-		desc.SetLabel("Grade");
+-		desc.AddMember(&SCineGradeParams::bBypassGrade,
+-			'gbyp', "BypassGrade", "Bypass Grade",
+-			"Switch the whole camera grade out of the chain - white balance, CDL and look - and "
+-			"leave only the output transform. The A/B: what the shot looks like ungraded, one "
+-			"click away, with the exposure and the optics unchanged.", false);
+-		desc.AddMember(&SCineGradeParams::slope,
+-			'cdls', "Slope", "Slope (RGB)",
+-			"ASC CDL slope, per channel. A multiply in log - gain, the highlight end. 1 = "
+-			"neutral. Applied first: out = (in * slope + offset) ^ power.", Vec3(1.0f, 1.0f, 1.0f));
+-		desc.AddMember(&SCineGradeParams::offset,
+-			'cdlo', "Offset", "Offset (RGB)",
+-			"ASC CDL offset, per channel. An add in log - lift, the shadow end, and the usual "
+-			"place a colour cast is corrected. 0 = neutral.", Vec3(0.0f, 0.0f, 0.0f));
+-		desc.AddMember(&SCineGradeParams::power,
+-			'cdlp', "Power", "Power (RGB)",
+-			"ASC CDL power, per channel. Gamma, the midtones, applied last. 1 = neutral; below 1 "
+-			"opens the mids, above 1 closes them.", Vec3(1.0f, 1.0f, 1.0f));
+-		desc.AddMember(&SCineGradeParams::saturation,
+-			'cdlt', "Saturation", "Saturation",
+-			"The ASC's saturation extension, applied after the slope/offset/power triple about "
+-			"the luminance of the graded value. 1 = neutral, 0 = monochrome. Because this "
+-			"happens in the working space and before the output transform, pushing it does not "
+-			"drift the hues the way a saturation slider on a finished picture does.", 1.0f);
+-	}
+-
+-	bool bBypassGrade = false;
+-	Vec3 slope = Vec3(1.0f, 1.0f, 1.0f);
+-	Vec3 offset = Vec3(0.0f, 0.0f, 0.0f);
+-	Vec3 power = Vec3(1.0f, 1.0f, 1.0f);
+-	Schematyc::Range<0, 4, 0, 2> saturation = 1.0f;
+-};
+-
+ struct SCineStreaksParams
+ {
+ 	inline bool operator==(const SCineStreaksParams& rhs) const { return 0 == memcmp(this, &rhs, sizeof(rhs)); }
+@@ -1030,33 +990,13 @@ struct SCineSceneReferredParams
+ 	bool bSceneReferred = false;
+ };
+ 
+-// The look slot (LMT) and the output transform (ODT), the two .cube files of the display chain
+-// (SceneReferredSpec.md S4/S5, D8). Both are plain asset paths rather than a resource picker:
+-// a .cube is not a texture asset the RC knows about, so there is no selector to reuse, and the
+-// files ship with the plugin. Paths are resolved through ICryPak - first as given (relative to
+-// the project's asset directory), then under %ENGINE% - so the same string works in the editor
+-// and in the launcher whichever tree the file was installed into.
+-struct SCineLookParams
+-{
+-	inline bool operator==(const SCineLookParams& rhs) const { return lmtFile == rhs.lmtFile; }
+-
+-	static void ReflectType(Schematyc::CTypeDesc<SCineLookParams>& desc)
+-	{
+-		desc.SetGUID("{3A0C6D18-5E47-4B92-9C31-7F6E2D840A15}"_cry_guid);
+-		desc.SetLabel("Look");
+-		desc.AddMember(&SCineLookParams::lmtFile,
+-			'lmtf', "LMTFile", "LMT File",
+-			"Creative look, as a Resolve .cube in ACEScct - the Look Modification Transform. It "
+-			"is applied AFTER the CDL and BEFORE the output transform, so it grades scene data "
+-			"and not a picture. Empty = identity (pure ACES, no house look: SceneReferredSpec.md "
+-			"D10). Author it in Resolve on an ACEScct timeline and export a 33-cube; "
+-			"Assets/ODT/lmt_identity_33.cube is the pass-through reference.",
+-			Schematyc::CSharedString());
+-	}
+-
+-	// Keep last: operator== compares the string by value.
+-	Schematyc::CSharedString lmtFile;
+-};
++// The output transform (ODT), one of the two .cube files of the display chain
++// (SceneReferredSpec.md S4/S5, D8) - the other, the look (LMT), lives on the CineCam Grade
++// component (CineGradeComponent.h). A plain asset path rather than a resource picker: a .cube is
++// not a texture asset the RC knows about, so there is no selector to reuse, and the files ship
++// with the plugin. The path is resolved through ICryPak - first as given (relative to the
++// project's asset directory), then under %ENGINE% - so the same string works in the editor and in
++// the launcher whichever tree the file was installed into.
+ 
+ //! The shipped ACES 2.0 SDR 100 nit sRGB output transform. One definition, used as the member's
+ //! initialiser, as the reflected default, and as the fallback when the field is empty.
+@@ -1127,8 +1067,6 @@ public:
+ 		desc.AddMember(&CCinematicCameraComponent::m_streaks, 'gstk', "DiffractionStreaks", "Diffraction Streaks", "", SCineStreaksParams());
+ 		desc.AddMember(&CCinematicCameraComponent::m_filter, 'gflt', "FrontFilter", "Front Filter", "", SCineFilterParams());
+ 		desc.AddMember(&CCinematicCameraComponent::m_viewfinder, 'gvfd', "Viewfinder", "Viewfinder", "", SCineViewfinderParams());
+-		desc.AddMember(&CCinematicCameraComponent::m_grade, 'ggrd', "Grade", "Grade", "", SCineGradeParams());
+-		desc.AddMember(&CCinematicCameraComponent::m_look, 'glok', "Look", "Look", "", SCineLookParams());
+ 		desc.AddMember(&CCinematicCameraComponent::m_output, 'gout', "Output", "Output", "", SCineOutputParams());
+ 	}
+ 
+@@ -1190,6 +1128,13 @@ public:
+ 	void ApplySunShaftsOff();
+ 	void RestoreSunShafts();
+ 
++	//! Re-publish the grade and the display LUTs NOW. Called by the sibling CineCam Grade
++	//! component when one of its properties is edited: the editor sends
++	//! ENTITY_EVENT_COMPONENT_PROPERTY_CHANGED to the edited component only, so without this the
++	//! change would wait for this camera's next update. Both calls are the ordinary ones behind
++	//! the ordinary CanDriveRenderState() gate - this adds no second path to the bus.
++	void RefreshGrade();
++
+ 	static CCinematicCameraComponent* GetActiveComponent() { return s_pActive; }
+ 
+ 	//! EDITOR PREVIEW (decisions/s9-editor-cinecam-preview.md). While gEnv->IsEditing() the
+@@ -1305,6 +1250,12 @@ private:
+ 	//! post-effect bus every frame. Editor-live, like the switch and the exposure beside it.
+ 	void ApplyGrade();
+ 	void RestoreGrade();
++	//! The grade and the look, read from the CineCam Grade component on this entity, or the
++	//! neutral defaults when there is none. Neutral is an EXACT identity in both cases, so an
++	//! entity without a grade component renders pure ACES 2.0 - the same picture the camera's own
++	//! Grade group produced at its defaults before it moved (decisions/s10-grade-component.md).
++	const SCineGradeParams& GetGradeParams() const;
++	const SCineLookParams&  GetLookParams() const;
+ 	//! The camera's pre-exposure for this frame, published as a linear scale next to the request
+ 	//! above (Global_User_SceneExposure). Editor-live for the same reason.
+ 	void ApplySceneExposure();
+@@ -1354,8 +1305,6 @@ private:
+ 	SCineStreaksParams m_streaks;
+ 	SCineFilterParams m_filter;
+ 	SCineViewfinderParams m_viewfinder;
+-	SCineGradeParams m_grade;
+-	SCineLookParams m_look;
+ 	SCineOutputParams m_output;
+ 
+ 	// Zoom motor state: eased focal length chasing the quantised target.
+diff --git a/Code/CryPlugins/CinematicCamera/README.md b/Code/CryPlugins/CinematicCamera/README.md
+index da1cce67..2660e3a2 100644
+--- a/Code/CryPlugins/CinematicCamera/README.md
++++ b/Code/CryPlugins/CinematicCamera/README.md
+@@ -135,8 +135,11 @@ are gone from this path; in their place the frame goes
+       -> dither -> the screen
+ 
+ With nothing set that is pure ACES 2.0 and nothing else: no house look, no hidden correction
+-(design decision D10). The four groups below - White Balance, Grade, Look, Output - are the
+-camera's controls over it. How to make and load a look:
++(design decision D10). Four groups control it, and they are deliberately split over two
++components: **White Balance** and **Output** are on the camera, because they are what the camera
++and its monitor are; **Grade** and **Look** are on a separate *CineCam Grade* component, because
++they are creative decisions - a look is a thing you add, copy to another camera and delete. See
++*The CineCam Grade component* below. How to make and load a look:
+ [docs/SceneReferredLook.md](docs/SceneReferredLook.md).
+ 
+ **The stock LDR post stage goes inert with the switch on, by design** (design decision D9): the
+@@ -315,38 +318,15 @@ What the control actually does depends on the path.
+   the new base so the per-frame multiply never compounds. 6500 K restores the effect and stands
+   down.
+ 
+-### Grade
+-
+-*Scene-referred path only. ASC CDL, the interchange every grading tool speaks, applied in ACEScct
+-to scene data BEFORE the output transform. All of it is live: a dragged slider moves the picture
+-on the next frame.*
+-
+-| Property | Range | Default | Effect |
+-| --- | --- | --- | --- |
+-| Bypass Grade | bool | false | Take white balance, CDL and the look out of the chain in one click and leave only the output transform. The A/B - what the shot looks like ungraded, with the exposure and the optics unchanged. **false = the grade is live.** |
+-| Slope (RGB) | float3 | (1, 1, 1) | ASC CDL slope: a multiply in log - gain, the highlight end. **1 = neutral.** Applied first: `out = (in * slope + offset) ^ power`. |
+-| Offset (RGB) | float3 | (0, 0, 0) | ASC CDL offset: an add in log - lift, the shadow end, and the usual place a colour cast is corrected. **0 = neutral.** |
+-| Power (RGB) | float3 | (1, 1, 1) | ASC CDL power: gamma, the midtones, applied last. **1 = neutral**; below 1 opens the mids, above 1 closes them. |
+-| Saturation | 0-4 (slider 0-2) | 1 | The ASC saturation extension, after the SOP triple, about the luminance of the graded value with AP1 weights. **1 = neutral**, 0 = monochrome. Because it happens in the working space and before the output transform, pushing it does not drift the hues the way a saturation slider on a finished picture does. |
+-
+-The order is the ASC specification's and is not negotiable if the numbers are to round-trip with
+-Resolve: slope, then offset, then power on the clamped result, per channel with no cross-channel
+-term; saturation is the ASC's own extension and comes after.
+-
+-### Look
+-
+-| Property | Range | Default | Effect |
+-| --- | --- | --- | --- |
+-| LMT File | path | *(empty)* | Creative look as a Resolve `.cube` in ACEScct - the Look Modification Transform. Applied after the CDL and before the output transform, so it grades scene data and not a picture. **Empty = identity: pure ACES, no house look.** See [docs/SceneReferredLook.md](docs/SceneReferredLook.md). |
+-
+ ### Output
+ 
+ | Property | Range | Default | Effect |
+ | --- | --- | --- | --- |
+ | ODT File | path | `Assets/ODT/odt_srgb_100nit_aces2_65.cube` | The output transform - THE one place in the chain that knows a display exists. The default is the ACES 2.0 SDR 100 nit sRGB view, baked from the OCIO ACES studio config by `tools/ocio-bake`. Swapping this file changes only what the monitor shows, never the scene data. Unreadable = the picture goes deliberately, visibly wrong (a clamped log image) rather than quietly falling back, with a warning naming every absolute path tried. Empty = the shipped default above is loaded, so a camera nobody has configured still comes up correct. |
+ 
+-Both paths are resolved through the pak system: first as given, relative to the project's asset
+-directory, then under `%ENGINE%`. Install the plugin's `Assets/ODT` folder into either tree and
++Both LUT paths - this one and **LMT File** on the CineCam Grade component - are resolved
++through the pak system: first as given, relative to the project's asset directory, then under
++`%ENGINE%`. Install the plugin's `Assets/ODT` folder into either tree and
+ the same string works in the editor and in the launcher. Parse and load errors are logged once
+ per path, with the reason.
+ 
+@@ -396,6 +376,56 @@ recording.
+ 
+ ---
+ 
++## The CineCam Grade component
++
++Editor label **CineCam Grade**, category *Cameras* - a second component you add to the SAME entity
++as a Cinematic Camera. It carries the look and nothing else: the ASC CDL below and the LMT slot.
++
++It publishes nothing itself. The camera on the same entity stays the single writer of the
++renderer's grade parameters and reads this component when it publishes, so the grade follows
++whichever camera is live for free, and `Bypass Grade` and the camera's restore path keep meaning
++exactly what they meant before. **With no CineCam Grade on the entity the camera renders the
++neutral grade** - no CDL, no look, pure ACES 2.0 - which is bit for bit what an untouched
++component gives you. On an entity with no Cinematic Camera the component does nothing at all and
++says so once in the log.
++
++Two consequences worth knowing:
++
++* it is per camera, so two cameras in one level can carry two different looks and cutting between
++  them cuts the grade with them;
++* levels saved before this component existed lose the values that used to sit in the camera's own
++  Grade and Look groups - they come back at their neutrals, and there is no migration. Re-enter
++  them on a CineCam Grade component.
++
++Scene-referred path only, like everything else in the display chain: with **Scene Referred** off
++nothing here reaches the picture.
++
++### Grade
++
++*Scene-referred path only. ASC CDL, the interchange every grading tool speaks, applied in ACEScct
++to scene data BEFORE the output transform. All of it is live: a dragged slider moves the picture
++on the next frame.*
++
++| Property | Range | Default | Effect |
++| --- | --- | --- | --- |
++| Bypass Grade | bool | false | Take white balance, CDL and the look out of the chain in one click and leave only the output transform. The A/B - what the shot looks like ungraded, with the exposure and the optics unchanged. **false = the grade is live.** |
++| Slope (RGB) | float3 | (1, 1, 1) | ASC CDL slope: a multiply in log - gain, the highlight end. **1 = neutral.** Applied first: `out = (in * slope + offset) ^ power`. |
++| Offset (RGB) | float3 | (0, 0, 0) | ASC CDL offset: an add in log - lift, the shadow end, and the usual place a colour cast is corrected. **0 = neutral.** |
++| Power (RGB) | float3 | (1, 1, 1) | ASC CDL power: gamma, the midtones, applied last. **1 = neutral**; below 1 opens the mids, above 1 closes them. |
++| Saturation | 0-4 (slider 0-2) | 1 | The ASC saturation extension, after the SOP triple, about the luminance of the graded value with AP1 weights. **1 = neutral**, 0 = monochrome. Because it happens in the working space and before the output transform, pushing it does not drift the hues the way a saturation slider on a finished picture does. |
++
++The order is the ASC specification's and is not negotiable if the numbers are to round-trip with
++Resolve: slope, then offset, then power on the clamped result, per channel with no cross-channel
++term; saturation is the ASC's own extension and comes after.
++
++### Look
++
++| Property | Range | Default | Effect |
++| --- | --- | --- | --- |
++| LMT File | path | *(empty)* | Creative look as a Resolve `.cube` in ACEScct - the Look Modification Transform. Applied after the CDL and before the output transform, so it grades scene data and not a picture. **Empty = identity: pure ACES, no house look.** See [docs/SceneReferredLook.md](docs/SceneReferredLook.md). |
++
++---
++
+ ## Viewfinder overlays
+ 
+ **Frame guides** are monitor markings, so they are drawn in viewport space, not in picture
+diff --git a/Code/CryPlugins/CinematicCamera/docs/SceneReferredLook.md b/Code/CryPlugins/CinematicCamera/docs/SceneReferredLook.md
+index bcb31cda..d0bb1880 100644
+--- a/Code/CryPlugins/CinematicCamera/docs/SceneReferredLook.md
++++ b/Code/CryPlugins/CinematicCamera/docs/SceneReferredLook.md
+@@ -3,8 +3,9 @@
+ What the camera does to colour, in what order, and how to put your own look into it.
+ 
+ Design: [../SceneReferredSpec.md](../SceneReferredSpec.md) (stages S4 and S5, decisions D8, D9,
+-D10). Property reference: [../README.md](../README.md), groups **White Balance**, **Grade**,
+-**Look**, **Output**.
++D10). Property reference: [../README.md](../README.md) - groups **White Balance** and **Output**
++on the Cinematic Camera, groups **Grade** and **Look** on the **CineCam Grade** component you add
++to the same entity.
+ 
+ ---
+ 
+@@ -28,6 +29,14 @@ very last step:
+     -> dither -> the screen
+ ```
+ 
++Which control is where: the camera owns **White Balance** and the **Output** transform - what the
++camera is and what its monitor is - while the **ASC CDL** and the **LOOK** slot live on a separate
++**CineCam Grade** component you add to the same entity. A look is then a thing you add, copy to
++another camera and delete. Nothing about the chain above changes with it: the camera is still the
++only thing that talks to the renderer, and it reads the grade component when it publishes. With no
++CineCam Grade on the entity the CDL is neutral and the look slot is empty, which is the same
++picture as an untouched component - pure ACES 2.0.
++
+ Two properties of that picture are worth stating plainly, because they are what the whole
+ pipeline is for.
+ 
+@@ -128,14 +137,15 @@ curve that has already been applied.
+ 2. Grade a still or a clip until you like it. Use nodes freely; the export flattens them.
+ 3. Right-click the clip -> **Generate 3D LUT (Cube)**, 33-point.
+ 4. Save the `.cube` next to the ODTs, e.g. `Assets/ODT/lmt_myshow_33.cube`.
+-5. Put that path in the camera's **Look -> LMT File**.
++5. Put that path in **Look -> LMT File** on the entity's **CineCam Grade** component (add one if
++   the camera has none).
+ 
+ The LUT is loaded and uploaded on the next frame after the path changes. A parse error is logged
+ once, with the reason, and leaves the slot empty (identity) rather than stale.
+ 
+ ### Proving the plumbing first
+ 
+-Load `Assets/ODT/lmt_identity_33.cube` into the Look slot. The picture must not change at all -
++Load `Assets/ODT/lmt_identity_33.cube` into the CineCam Grade component's Look slot. The picture must not change at all -
+ that one test exercises the parser, the fp16 conversion, the 3D texture upload, the sampler
+ addressing and the channel order together. If it *does* change, the look you author next will be
+ wrong in the same way and much harder to see.
+@@ -157,10 +167,14 @@ in the shader, exactly, rather than through a sampled curve.
+ 
+ ---
+ 
+-## 4. Grading on the camera instead
++## 4. Grading in the engine instead
++
++For anything short of a full look, the **CineCam Grade** component is faster than a round trip
++through Resolve, and it is live - the picture moves as you drag. Add it to the same entity as the
++Cinematic Camera; without one the camera renders the neutral grade, which is exactly ACES 2.0.
+ 
+-For anything short of a full look, the **Grade** group is faster than a round trip through
+-Resolve, and it is live - the picture moves as you drag.
++White Balance is the exception in the table below: it stays on the camera, because it says what
++the camera thinks the light is rather than what the colourist wants.
+ 
+ | want | reach for |
+ | --- | --- |
+-- 
+2.47.1.windows.1
+

@@ -1,0 +1,1447 @@
+From df7fbbefc7c41ea66333a4a6d020726b513dee32 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Thu, 10 Sep 2026 11:06:58 +0800
+Subject: [PATCH 152/160] feat: the LMT slot knows what space a LUT is in,
+ wraps a Rec.709 one, and hot reloads (S10 item 4)
+
+Drop any ordinary look LUT into the Look slot and it works. Edit a cube on disk and the
+picture follows. Pick both cube paths with a "..." button instead of typing them.
+
+Research: scene-notes/research/s10-4-lmt-space-wrap.md (read first).
+Decision: scene-notes/decisions/s10-grade-component.md section 4.
+
+--- (a) the space tag -------------------------------------------------------------
+
+A .cube may carry `# ReC-LUT-Space: <ACEScct|ACEScg|Rec709>`, which ParseCubeFile now
+reads instead of skipping. When present it WINS: it was written by whoever made the LUT,
+while the new `LMT Input Space` property is a guess by whoever loaded it. When absent,
+the property decides. When both are present and disagree, the file wins and one log line
+names the file, the tag and the property. An unrecognised tag is a warning and a
+fall-through, not a refusal - a file that loads with a diagnosis beats one that does not.
+
+Aliases, case-insensitive: ACEScct; ACEScg / Linear; Rec709 / Rec.709 / Rec709Display /
+sRGB / sRGBDisplay / Display. Deliberately NOT accepted: ACES2065-1 and the camera log
+spaces (LogC, SLog3, Log3G10) - naming them would promise a conversion we do not have.
+
+The property's default is ACEScct, so an untagged LUT with nobody touching it takes
+exactly the path it took before this commit: parse, convert, upload. Bit-identical, as a
+consequence of the default rather than as a special case in the code.
+
+Nothing is written back into the property - EntityObject.cpp:925 snapshots a component's
+reflected members BEFORE :930 tells it they changed, so a member written from the handler
+renders but does not reliably save (the evidence that killed two-way CDL binding in 3a).
+
+--- (b) wrapping a foreign LUT ----------------------------------------------------
+
+Most look LUTs in the world are made for a finished Rec.709 display picture. This chain
+hands the LMT slot ACEScct. Both are three floats in [0,1] on a unit domain, so the wrong
+one loads silently and the picture is wrong in a way that looks like a grade.
+
+A LUT that is not ACEScct is now WRAPPED at load, on the CPU, onto a 65^3 grid, before
+the fp16 conversion. The recipe is everybody's - the ACES guidance for reusing a legacy
+show LUT, Baselight's and Resolve's inverse-ODT node sandwiches, Nuke's OCIODisplay
+invert: forward output transform, the LUT, inverse output transform. For Rec.709 the two
+halves are two cubes parsed but NEVER uploaded (odt_srgb_100nit_aces2_65 and its new
+inverse), loaded lazily and only when something needs wrapping; for ACEScg it is the
+analytic shaper, now available in C++.
+
+What is ours is that it is applied as a RESIDUAL:
+
+    W(x) = x + [ inv(LUT(fwd(x))) - inv(fwd(x)) ]
+
+because inv(fwd(x)) is not the identity. An SDR output transform folds out-of-gamut
+colour inwards and puts everything above display white on one code value, and neither can
+be undone, so the plain sandwich turns an IDENTITY Rec.709 LUT into a visibly non-identity
+LMT. In the residual form the two inv() calls land on the same coordinate for an identity
+source and cancel, which keeps "a neutral is an exact identity" - the rule every other
+control in this component obeys. No ACES document was found writing it this way, so it is
+recorded as our variant with the argument, and the plain sandwich is kept as the
+documented alternative (one constant).
+
+MEASURED (tools/ocio-bake: uv run wrap.py --verify-identity), wrapping an IDENTITY Rec.709
+LUT and comparing against the identity, over the whole grid, in ACEScct code values where
+1.0 / 17.52 is one stop:
+
+    grid  evaluator                       residual max   sandwich max
+    33^3  plugin (two sampled cubes)      0.000000000    0.954338
+    33^3  wrap.py (exact OCIO)            0.000000000    1.125571
+    33^3  ACEScg (analytic shaper)        0.000000000    0.445205
+    65^3  (all three)                     0.000000000    unchanged
+
+The sandwich's 0.95-1.13 is 16-20 stops of error at the extremes; the residual's zero is
+exact by construction, at any grid size and whatever the two ODT cubes' own error.
+
+On real content - a third-party-style 709 look LUT (S-curve + warm/cool split + saturation
+push), scoring ODT(W(x)) against LUT(ODT(x)) over colour inside the Rec.709 gamut and
+inside the display's range:
+
+    33^3 wrapped, plugin's evaluator   mean 0.96 cv8   p99 7.3   max 23.9
+    65^3 wrapped, plugin's evaluator   mean 0.44 cv8   p99 3.5   max 15.5
+    65^3 wrapped, exact OCIO           mean 0.34 cv8   p99 3.0   max 14.6
+
+Two things follow, and both are in the code. The wrapped grid is ALWAYS 65^3 whatever the
+source's was - a wrapped LUT carries the output transform's curvature as well as the
+look's, and the ODT is much the steeper of the two, so the source's grid is the wrong
+thing to key on. And the plugin's pair of sampled cubes costs only ~0.1 cv8 over OCIO's
+exact processors, which is what justifies doing this at load at all.
+
+The honest cost, documented: above display white the residual does NOT reproduce what the
+LUT does to white. It carries the LUT's white-point shift up as a constant gain and lets
+the ODT re-clip, instead of flattening every super-white value onto LUT(white). That
+keeps a highlight separating on screen and keeps the highlight data in an EXR (the export
+tap is downstream of the LMT). A print look that pulls white down still rolls toward its
+lower white.
+
+The output transform used for the wrap is FIXED at the sRGB SDR one. Which monitor a look
+was authored on is a property of the LOOK, so pointing the camera at a different ODT must
+not change what that look means.
+
+The ODT slot never wraps: an output transform IS the step that leaves the grading space.
+
+--- (c) hot reload ----------------------------------------------------------------
+
+cinecam_LutHotReload <frames>, default 30 in the editor and 0 in the launcher, decided at
+registration from gEnv->IsEditor() and overridable afterwards. Save over the cube the LMT
+(or ODT) slot is using and the picture follows in about half a second.
+
+A poll of (modification time, size) through ICryPak::GetModificationTime, on the SAME
+OpenLutFile two-tree search the load used, so the watcher cannot end up watching a
+different file from the one in the picture; a paked cube returns the archive entry's time
+and never changes, which is correct.
+
+Not IFileChangeMonitor, on evidence: Sandbox is the only provider in the whole tree
+(EditorFileMonitor.cpp:30 is the only SetIFileChangeMonitor; the launcher's is null), and
+even there MonitorDirectories() watches the project game folder, the mod paths, Editor/
+and Engine/Shaders - NOT <engine>/engine/Assets/ODT/, which is one of the two install
+trees this loader documents and logs absolute paths to disambiguate. A reload that works
+in half the installs is worse than none.
+
+Two safeties. A change must be seen TWICE before it is acted on, so a half-written file
+(Resolve writes ~2.7 MB for a 65^3) is never loaded. And a failed RELOAD keeps the
+previous good LUT and warns once with the reason - the user did not ask for a change, so
+the picture must not change under them; a failed FIRST load still clears the slot, because
+that one the user typed and needs to see (D13). One log line per successful reload.
+
+--- (d) the shipped looks ---------------------------------------------------------
+
+Documented in README.md and docs/SceneReferredLook.md; the cubes came in the previous
+commit. No dropdown enum: work item 4b replaces the Look group with CryEngine asset
+pickers and owns where the files live, so an enum built now would be undone.
+
+--- (e) a "..." button on both cube paths -----------------------------------------
+
+ODT File and LMT File become Schematyc::CineCubeFileName - the shipped
+SResourceNameSerializer<&fn returning Serialization::ResourceFilePath> pattern
+(ResourceTypes.h:255, Resources.h:60), the same family MannequinAnimationDatabasePath
+belongs to, with a *.cube filter. The legacy yasli tree the entity inspector uses has the
+row registered (PropertyRowResourceFilePath.cpp:99) and its button runs
+CEngineFileDialog::RunGameOpen, which returns an ENGINE-RELATIVE path - exactly the string
+the loader already resolves, so nothing about storage or existing levels changes (outside
+the editor the type serialises as ar(*value.path, name, label), byte-for-byte what
+CSharedString wrote).
+
+Not the ASSET picker family (Schematyc::TextureFileName's): a .cube is not a registered
+asset type in 5.7.1. That is item 4b.
+
+Two stock quirks documented rather than patched: the row never copies the decorator's
+startFolder (:53 copies filter/flags/handle only), so the start folder is inert; and the
+dialog only offers files under the project, so a cube installed only into the engine tree
+must still be typed - it still resolves and still loads.
+
+--- files -------------------------------------------------------------------------
+
+CryRenderer/SceneReferredCurves.h    the ACEScct shaper in C++, beside the constants that
+                                     were already there. Item 3b's own answer to "two
+                                     copies drift"; the renderer does not call it yet, and
+                                     having it here stops a third copy appearing when it
+                                     does.
+Module/CineCamLutTypes.h (new)       CineCubeFileName and ELutSpace, shared by both
+                                     components.
+Module/CineGradeComponent.h          LMT Input Space; LMT File becomes a picker; the
+                                     tooltip names the three shipped looks.
+Module/CinematicCameraComponent.h    ODT File becomes a picker.
+Module/CinematicCameraComponent.cpp  tag parsing, SampleCubeTrilinear, EnsureWrapTransforms,
+                                     WrapForeignLut, the LoadLutIntoSlot / EnsureLutSlot
+                                     split, the poll, cinecam_LutHotReload.
+Module/CineCamShared.h               ApplyDisplayLuts gains lmtSpace (defaulted, so the
+                                     editor-look publisher is unchanged); RegisterLutCVars.
+Module/CinematicCameraPlugin.cpp     registers / unregisters the cvar.
+README.md, docs/SceneReferredLook.md, docs/ConsoleReference.md.
+
+Renderer: unchanged. No shader edit, no new texture register, no per-pixel cost.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01ADgAiBYv9AxSd54s1FPREm
+---
+ .../CryRenderer/SceneReferredCurves.h         |  47 ++
+ .../CinematicCamera/Module/CMakeLists.txt     |   1 +
+ .../CinematicCamera/Module/CineCamLutTypes.h  |  99 ++++
+ .../CinematicCamera/Module/CineCamShared.h    |  12 +-
+ .../Module/CineGradeComponent.h               |  54 +-
+ .../Module/CinematicCameraComponent.cpp       | 510 ++++++++++++++++--
+ .../Module/CinematicCameraComponent.h         |  18 +-
+ .../Module/CinematicCameraPlugin.cpp          |   5 +
+ Code/CryPlugins/CinematicCamera/README.md     |  33 +-
+ .../CinematicCamera/docs/ConsoleReference.md  |  22 +
+ .../CinematicCamera/docs/SceneReferredLook.md | 143 ++++-
+ 11 files changed, 885 insertions(+), 59 deletions(-)
+ create mode 100644 Code/CryPlugins/CinematicCamera/Module/CineCamLutTypes.h
+
+diff --git a/Code/CryEngine/CryCommon/CryRenderer/SceneReferredCurves.h b/Code/CryEngine/CryCommon/CryRenderer/SceneReferredCurves.h
+index c7da9034..e9f600e0 100644
+--- a/Code/CryEngine/CryCommon/CryRenderer/SceneReferredCurves.h
++++ b/Code/CryEngine/CryCommon/CryRenderer/SceneReferredCurves.h
+@@ -48,6 +48,53 @@ const float kACEScctStopsPerUnit = 17.52f;
+ //! SceneCurveParams.w so that HLSL, C++ and the exported sidecar cannot disagree about it.
+ const float kSatFullScale = 2.0f;
+ 
++// -----------------------------------------------------------------------------------------
++// The ACEScct shaper, on the CPU (S10 item 4).
++//
++// One definition, and this is where it belongs: the constants and the two landmarks above are
++// already here, and the HLSL half at CommonMath.cfi:271-300 was until now the only copy in the
++// tree. The plugin needs it to wrap a foreign LUT into the grading space at load time
++// (decisions/s10-grade-component.md 4.2); the renderer does not call it yet, and having it here
++// is what stops a third copy from appearing when something does.
++//
++// Constants VERBATIM from CommonMath.cfi:271-276, which took them from OCIO's
++// "CURVE - ACEScct-LOG_to_LINEAR" LogCameraTransform. Landmarks: LinearToACEScct(0.18) =
++// 0.41358781 (= kACEScctMidGrey), ACEScctToLinear(1.0) = 222.86 (= +10.3 stops over grey), and
++// -B/A = -0.00691688 is the most negative linear value the encode still represents.
++// -----------------------------------------------------------------------------------------
++const float kACEScctXBrk      = 0.0078125000f;
++const float kACEScctYBrk      = 0.1552511416f;
++const float kACEScctA         = 10.5402377417f;
++const float kACEScctB         = 0.0729055342f;
++const float kACEScctLogOffset = 9.7200000000f;
++const float kACEScctLogScale  = 17.5200000000f;   //!< == kACEScctStopsPerUnit, by construction
++
++inline float LinearToACEScct(float x)
++{
++	// log2 of a non-positive number is not defined; the toe segment covers every value the log
++	// segment cannot, so the branch is the guard as well as the encoding.
++	return (x < kACEScctXBrk)
++	       ? (kACEScctA * x + kACEScctB)
++	       : ((logf(x) / logf(2.0f) + kACEScctLogOffset) / kACEScctLogScale);
++}
++
++inline float ACEScctToLinear(float y)
++{
++	return (y < kACEScctYBrk)
++	       ? ((y - kACEScctB) / kACEScctA)
++	       : powf(2.0f, y * kACEScctLogScale - kACEScctLogOffset);
++}
++
++inline Vec3 LinearToACEScct(const Vec3& c)
++{
++	return Vec3(LinearToACEScct(c.x), LinearToACEScct(c.y), LinearToACEScct(c.z));
++}
++
++inline Vec3 ACEScctToLinear(const Vec3& c)
++{
++	return Vec3(ACEScctToLinear(c.x), ACEScctToLinear(c.y), ACEScctToLinear(c.z));
++}
++
+ //! The master curve's knots, as ACEScct code values: the bottom of the encoding, four stops under
+ //! mid grey, mid grey, four stops over, and the top of the encoding (= +10.3 stops over grey,
+ //! since ACEScctToLinear(1.0) = 222.86).
+diff --git a/Code/CryPlugins/CinematicCamera/Module/CMakeLists.txt b/Code/CryPlugins/CinematicCamera/Module/CMakeLists.txt
+index b434e147..1b4aeeb3 100644
+--- a/Code/CryPlugins/CinematicCamera/Module/CMakeLists.txt
++++ b/Code/CryPlugins/CinematicCamera/Module/CMakeLists.txt
+@@ -9,6 +9,7 @@ add_sources("CinematicCamera_uber_0.cpp"
+ 		"CinematicCameraPlugin.h"
+ 		"CinematicCameraPlugin.cpp"
+ 	SOURCE_GROUP "Components"
++		"CineCamLutTypes.h"
+ 		"CinematicCameraComponent.h"
+ 		"CinematicCameraComponent.cpp"
+ 		"CineGradeComponent.h"
+diff --git a/Code/CryPlugins/CinematicCamera/Module/CineCamLutTypes.h b/Code/CryPlugins/CinematicCamera/Module/CineCamLutTypes.h
+new file mode 100644
+index 00000000..58a56e7e
+--- /dev/null
++++ b/Code/CryPlugins/CinematicCamera/Module/CineCamLutTypes.h
+@@ -0,0 +1,99 @@
++// The two reflected types the display chain's .cube properties need (S10 item 4).
++//
++// Shared by BOTH components: the camera owns the ODT path (its monitor) and the CineCam Grade
++// component owns the LMT path (the look), and neither should invent its own answer to "what is a
++// cube file property" or "what space is a cube in".
++#pragma once
++
++#include <CrySchematyc/ResourceTypes.h>       // SerializationUtils::SResourceNameSerializer
++#include <CrySchematyc/Reflection/TypeDesc.h>
++#include <CrySerialization/Decorators/ResourceFilePath.h>
++
++namespace Schematyc
++{
++
++// ---------------------------------------------------------------------------
++// A .cube file path property with a "..." button (S10 item 4.5)
++// ---------------------------------------------------------------------------
++// Typing an asset path from memory is not a user interface. CRYENGINE 5.7.1 has two reflected
++// path families (CrySchematyc/ResourceTypes.h):
++//
++//   * SResourceNameSelector<&Serialization::XxxPicker<string>> - an ASSET picker, backed by a
++//     registered resource selector and therefore by a registered asset type. That is the family
++//     Schematyc::TextureFileName belongs to (this plugin already uses it for the bokeh shape and
++//     the filter PSF). A .cube is not a registered asset type in 5.7.1, so this family is not
++//     available yet - it is what work item 4b will bring.
++//
++//   * SResourceNameSerializer<&fn> where fn returns Serialization::ResourceFilePath - a plain
++//     FILE picker: a filter string, a "..." button, an engine file dialog. Two shipped instances,
++//     MannequinAnimationDatabasePath and MannequinControllerDefinitionPath
++//     (ResourceTypes.h:255/263, Resources.h:60-61). Nothing else is needed to use it.
++//
++// The second is what a .cube can have today, so that is what it gets. The row is drawn by
++// PropertyRowResourceFilePath (registered at PropertyRowResourceFilePath.cpp:99) in the legacy
++// yasli tree the entity inspector uses; its button runs CEngineFileDialog::RunGameOpen, which
++// returns an ENGINE-RELATIVE path - exactly the string the loader already resolves ("as given"
++// first, then under %ENGINE%). So the stored value, the reflected default and every saved level
++// are unchanged by this: outside the editor the type serialises as `ar(*value.path, name, label)`,
++// which is byte-for-byte what Schematyc::CSharedString wrote before.
++//
++// Two stock quirks, worth knowing rather than patching:
++//   * PropertyRowResourceFilePath::setValueAndContext copies the decorator's filter, flags and
++//     path pointer but NOT its startFolder, so the start folder below is inert in 5.7.1. It is
++//     passed anyway because it states the intent and costs nothing.
++//   * The dialog only accepts files the editor's file-system enumerator knows, i.e. files under
++//     the project. A LUT installed ONLY into <engine>/engine/Assets/ODT/ has to be typed - it
++//     still resolves and still loads.
++inline Serialization::ResourceFilePath CineCubeFilePath(string& value)
++{
++	return Serialization::ResourceFilePath(value, "Cube LUT (cube)|*.cube", "Assets/ODT");
++}
++
++typedef SerializationUtils::SResourceNameSerializer<&CineCubeFilePath> CineCubeFileName;
++
++inline void ReflectType(CTypeDesc<CineCubeFileName>& desc)
++{
++	desc.SetGUID("{9C21A4F7-3E58-4B06-8D19-6A5F0C7E24B3}"_cry_guid);
++	desc.SetLabel("Cube LUT File");
++	desc.SetDescription("Path to a Resolve-dialect .cube LUT");
++}
++
++} // namespace Schematyc
++
++// ---------------------------------------------------------------------------
++// What a .cube expects at its input (S10 item 4.1)
++// ---------------------------------------------------------------------------
++// A Rec.709 display LUT and an ACEScct LMT are both three floats in [0,1] on a unit domain, so
++// the wrong one loads without complaint and produces a wrong picture SILENTLY. Nothing in the
++// .cube format distinguishes them - the Adobe/Resolve dialect has TITLE, the two sizes,
++// DOMAIN_MIN/MAX and comments, and no metadata field at all.
++//
++// So there are two answers, in this order (decisions/s10-grade-component.md 4.1):
++//   1. a `# ReC-LUT-Space: <value>` line in the file's comment block, which our bake tool writes
++//      and the plugin parses. Authoritative when present: it was written by whoever made the LUT.
++//   2. this property, for a foreign LUT that has no tag and never will. Its default is ACEScct,
++//      so an untagged file with an untouched property is exactly the behaviour that existed
++//      before this enum did - parse, convert, upload, bit-identical.
++// Both present and disagreeing: the tag wins, and one warning names the file.
++enum class ELutSpace : uint32
++{
++	//! The grading space this chain works in. No conversion: the file goes straight to the GPU.
++	ACEScct = 0,
++	//! Linear ACEScg. Wrapped with the analytic shaper. NOTE that a unit-domain LINEAR cube covers
++	//! scene linear [0,1] and nothing above, while ACEScctToLinear(1.0) = 222.86 - a linear look
++	//! LUT really wants a shaper, which this chain's parser refuses.
++	ACEScg,
++	//! An ordinary Rec.709 / sRGB DISPLAY look LUT - the overwhelmingly common kind. Wrapped with
++	//! the ACES 2.0 SDR 100 nit sRGB output transform and its inverse.
++	Rec709Display,
++};
++
++inline void ReflectType(Schematyc::CTypeDesc<ELutSpace>& desc)
++{
++	desc.SetGUID("{2F6B8D50-91C3-4A7E-B248-05E7D9A16C3F}"_cry_guid);
++	desc.SetLabel("LUT Input Space");
++	desc.SetDefaultValue(ELutSpace::ACEScct);
++	desc.AddConstant(ELutSpace::ACEScct,       "ACEScct",       "ACEScct (an LMT)");
++	desc.AddConstant(ELutSpace::ACEScg,        "ACEScg",        "ACEScg linear");
++	desc.AddConstant(ELutSpace::Rec709Display, "Rec709Display", "Rec.709 display (a normal LUT)");
++}
+diff --git a/Code/CryPlugins/CinematicCamera/Module/CineCamShared.h b/Code/CryPlugins/CinematicCamera/Module/CineCamShared.h
+index 0f8f7c0e..feb80c10 100644
+--- a/Code/CryPlugins/CinematicCamera/Module/CineCamShared.h
++++ b/Code/CryPlugins/CinematicCamera/Module/CineCamShared.h
+@@ -94,10 +94,20 @@ void PublishSceneReferredConvention(bool bSceneReferred);
+ //! knot offsets in stops and the Sat vs Sat multipliers. **nullptr means neutral**, which is what
+ //! the editor-look publisher passes and what a camera with no CineCam Grade sibling produces: no
+ //! texture is uploaded at all and the tone map issues no fetch.
++//! `lmtSpace` is `(uint32)ELutSpace` and is only the FALLBACK: a cube carrying a
++//! `# ReC-LUT-Space:` line is believed over it. Anything but ACEScct makes the loader wrap the
++//! file into a legal LMT on the CPU before uploading it (S10 item 4). The default keeps every
++//! existing call site - and every untagged file - on exactly the path they were on before.
+ void ApplyDisplayLuts(const char* szODTFile, const char* szLMTFile,
+-                      const float* pMasterCurveStops = nullptr, const float* pSatCurveMultipliers = nullptr);
++                      const float* pMasterCurveStops = nullptr, const float* pSatCurveMultipliers = nullptr,
++                      uint32 lmtSpace = 0);
+ 
+ //! Take the LUT ids off the bus and release the textures. Safe to call repeatedly.
+ void RestoreDisplayLuts();
+ 
++//! cinecam_LutHotReload - the display chain's file watcher. Registered by the plugin at startup
++//! because the LUT slots are process-wide and outlive any one component.
++void RegisterLutCVars();
++void UnregisterLutCVars();
++
+ } // namespace CineCam
+diff --git a/Code/CryPlugins/CinematicCamera/Module/CineGradeComponent.h b/Code/CryPlugins/CinematicCamera/Module/CineGradeComponent.h
+index 2e354f30..0fa8d14c 100644
+--- a/Code/CryPlugins/CinematicCamera/Module/CineGradeComponent.h
++++ b/Code/CryPlugins/CinematicCamera/Module/CineGradeComponent.h
+@@ -20,6 +20,8 @@
+ #include <CrySchematyc/Env/IEnvRegistrar.h>
+ // CSharedString: the reflected string type behind the .cube path property (LMT File).
+ #include <CrySchematyc/Utils/SharedString.h>
++// Schematyc::CineCubeFileName (the "..." file picker) and ELutSpace (the input-space fallback).
++#include "CineCamLutTypes.h"
+ // The shared definition of the two 1D curves: knot positions, the interpolator, the bake and the
+ // neutrality tests. The renderer's EXR exporter includes the SAME header to write the master curve
+ // out as a .cube beside a capture, so there is exactly one answer to "what is the curve between
+@@ -299,31 +301,61 @@ struct SCineCurveParams
+ 
+ // The look slot (LMT), one of the two .cube files of the display chain (SceneReferredSpec.md
+ // S4/S5, D8) - the other, the output transform, stays on the camera because it is the camera's
+-// monitor. A plain asset path rather than a resource picker: a .cube is not a texture asset the
+-// RC knows about, so there is no selector to reuse, and the files ship with the plugin. The path
++// monitor. A FILE picker rather than an asset picker: a .cube is not a registered asset type in
++// 5.7.1, so the property is a Schematyc::CineCubeFileName - the shipped ResourceFilePath row, a
++// "..." button with a *.cube filter, storing the same plain relative string it always did.
++// Registering .cube as a real asset type with an Asset Browser picker is work item 4b. The path
+ // is resolved through ICryPak - first as given (relative to the project's asset directory), then
+ // under %ENGINE% - so the same string works in the editor and in the launcher whichever tree the
+ // file was installed into.
++//
++// The look slot is also the ONE place a foreign LUT enters this chain, so it is where the input
++// space has to be settled (S10 item 4.1): a file tagged '# ReC-LUT-Space:' is believed, otherwise
++// LMT Input Space below decides, and a Rec.709 display LUT is wrapped into a legal LMT at load.
+ struct SCineLookParams
+ {
+-	inline bool operator==(const SCineLookParams& rhs) const { return lmtFile == rhs.lmtFile; }
++	inline bool operator==(const SCineLookParams& rhs) const
++	{
++		return lmtSpace == rhs.lmtSpace && lmtFile.value == rhs.lmtFile.value;
++	}
+ 
+ 	static void ReflectType(Schematyc::CTypeDesc<SCineLookParams>& desc)
+ 	{
+ 		desc.SetGUID("{3A0C6D18-5E47-4B92-9C31-7F6E2D840A15}"_cry_guid);
+ 		desc.SetLabel("Look");
++
++		// WHAT THE FILE EXPECTS AT ITS INPUT. Only consulted when the file itself does not say
++		// (see the CineCamLutTypes.h header comment); leaving it at ACEScct with an untagged file
++		// is the behaviour that existed before this property did, exactly.
++		desc.AddMember(&SCineLookParams::lmtSpace,
++			'lmts', "LMTSpace", "LMT Input Space",
++			"What the LUT below expects at its input - and therefore whether it has to be wrapped "
++			"before it can be a look for this camera. ACEScct = it is already an LMT (the default, "
++			"and what our own bake tool and a Resolve ACEScct export produce). Rec.709 display = "
++			"an ORDINARY look LUT, made for a finished 709 picture; the plugin wraps it "
++			"automatically in the ACES 2.0 output transform and its inverse, so it simply works. "
++			"ACEScg = linear in and out. THE FILE WINS: a cube carrying a '# ReC-LUT-Space:' line "
++			"is believed over this setting, and the console says so if the two disagree.",
++			ELutSpace::ACEScct);
++
+ 		desc.AddMember(&SCineLookParams::lmtFile,
+ 			'lmtf', "LMTFile", "LMT File",
+-			"Creative look, as a Resolve .cube in ACEScct - the Look Modification Transform. It "
+-			"is applied AFTER the CDL and BEFORE the output transform, so it grades scene data "
+-			"and not a picture. Empty = identity (pure ACES, no house look: SceneReferredSpec.md "
+-			"D10). Author it in Resolve on an ACEScct timeline and export a 33-cube; "
+-			"Assets/ODT/lmt_identity_33.cube is the pass-through reference.",
+-			Schematyc::CSharedString());
++			"Creative look, as a Resolve .cube - the Look Modification Transform. It is applied "
++			"AFTER the CDL and the curves and BEFORE the output transform, so it grades scene "
++			"data and not a picture. Empty = identity (pure ACES, no house look: "
++			"SceneReferredSpec.md D10). Author it in Resolve on an ACEScct timeline and export a "
++			"33-cube - or drop in any ordinary Rec.709 look LUT and set LMT Input Space above. "
++			"Shipped: Assets/ODT/lmt_identity_33.cube (neutral, and the plumbing test), "
++			"Assets/ODT/look_film_contrast_33.cube, Assets/ODT/look_warm_print_33.cube. Editing "
++			"the file on disk reloads it live (cinecam_LutHotReload).",
++			Schematyc::CineCubeFileName());
+ 	}
+ 
+-	// Keep last: operator== compares the string by value.
+-	Schematyc::CSharedString lmtFile;
++	ELutSpace lmtSpace = ELutSpace::ACEScct;
++
++	// Keep last: the resource-path types in this plugin all sit at the end of their struct, and
++	// operator== compares the string by value.
++	Schematyc::CineCubeFileName lmtFile;
+ };
+ 
+ //! The look, as an entity component. Holds state and nothing else: see the file header for why
+diff --git a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp
+index dc804a6f..80d60f91 100644
+--- a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp
++++ b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp
+@@ -15,6 +15,8 @@
+ #include <CryRenderer/IRenderer.h>
+ #include <CryRenderer/IRenderAuxGeom.h>
+ #include <CrySystem/File/ICryPak.h>
++#include <CrySystem/IConsole.h>
++#include <CrySystem/ConsoleRegistration.h>   // cinecam_LutHotReload
+ #include <vector>
+ 
+ #include <algorithm>
+@@ -1297,8 +1299,59 @@ struct SCubeLut
+ 	Vec3               domainMin = Vec3(0.0f, 0.0f, 0.0f);
+ 	Vec3               domainMax = Vec3(1.0f, 1.0f, 1.0f);
+ 	std::vector<float> rgb;      // size^3 * 3, red fastest
++
++	//! `# ReC-LUT-Space: <value>` out of the comment block, if the file carried one and it named
++	//! a space we know (S10 item 4.1). The file's own answer beats the property's.
++	bool               bTagged = false;
++	ELutSpace          tagSpace = ELutSpace::ACEScct;
++	//! The tag text exactly as written, so a warning about an unrecognised one can quote it.
++	string             tagText;
+ };
+ 
++//! The tag's accepted spellings, case-insensitive so a hand-edited file is not a trap.
++//!
++//! Deliberately NOT accepted: ACES2065-1 (needs the AP0<->AP1 pair and a shaper decision of its
++//! own, and nobody authors a look LUT in AP0), and the camera log spaces (LogC, SLog3, Log3G10...)
++//! - naming them would promise a conversion this plugin does not have. An unrecognised tag is a
++//! warning and a fall-through to the property, not a refusal: a file that loads with a diagnosis
++//! beats a file that does not load.
++bool ParseLutSpaceName(const char* szValue, ELutSpace& out)
++{
++	struct SAlias { const char* szName; ELutSpace space; };
++	static const SAlias kAliases[] =
++	{
++		{ "acescct",       ELutSpace::ACEScct       },
++		{ "acescg",        ELutSpace::ACEScg        },
++		{ "linear",        ELutSpace::ACEScg        },
++		{ "rec709",        ELutSpace::Rec709Display },
++		{ "rec.709",       ELutSpace::Rec709Display },
++		{ "rec709display", ELutSpace::Rec709Display },
++		{ "srgb",          ELutSpace::Rec709Display },
++		{ "srgbdisplay",   ELutSpace::Rec709Display },
++		{ "display",       ELutSpace::Rec709Display },
++	};
++
++	for (const SAlias& alias : kAliases)
++	{
++		if (stricmp(szValue, alias.szName) == 0)
++		{
++			out = alias.space;
++			return true;
++		}
++	}
++	return false;
++}
++
++const char* LutSpaceName(ELutSpace space)
++{
++	switch (space)
++	{
++	case ELutSpace::ACEScg:        return "ACEScg linear";
++	case ELutSpace::Rec709Display: return "Rec.709 display";
++	default:                       return "ACEScct";
++	}
++}
++
+ // ICryPak, first as given (relative to the project's asset directory), then under %ENGINE%.
+ // The plugin's Assets folder can be installed into either tree - a project keeps its looks with
+ // its levels, an engine-wide install makes the shipped ODTs available to every project - and a
+@@ -1375,9 +1428,30 @@ bool ParseCubeFile(const char* szPath, SCubeLut& out, string& error, string& res
+ 
+ 		while (*pLine == ' ' || *pLine == '\t')
+ 			++pLine;
+-		if (*pLine == '\0' || *pLine == '#')
++		if (*pLine == '\0')
+ 			continue;
+ 
++		// The ONE comment this parser reads. `.cube` has no metadata field at all, so the input
++		// space has to travel as a comment or not at all (decisions/s10-grade-component.md 4.1);
++		// every other tool ignores it, because it is a comment.
++		if (*pLine == '#')
++		{
++			const char* pBody = pLine + 1;
++			while (*pBody == ' ' || *pBody == '\t')
++				++pBody;
++			static const char kTagKey[] = "ReC-LUT-Space:";
++			if (strnicmp(pBody, kTagKey, sizeof(kTagKey) - 1) == 0)
++			{
++				const char* pValue = pBody + sizeof(kTagKey) - 1;
++				while (*pValue == ' ' || *pValue == '\t')
++					++pValue;
++				out.tagText = pValue;
++				out.tagText.Trim();
++				out.bTagged = ParseLutSpaceName(out.tagText.c_str(), out.tagSpace);
++			}
++			continue;
++		}
++
+ 		if (!strnicmp(pLine, "TITLE", 5))
+ 			continue;
+ 
+@@ -1464,16 +1538,56 @@ bool ParseCubeFile(const char* szPath, SCubeLut& out, string& error, string& res
+ // rather than stale: a picture that is visibly wrong beats one that is quietly wrong (D13).
+ struct SLutSlot
+ {
+-	string requested;             //!< the path this slot was last asked for, failures included
+-	string cacheName;             //!< the renderer-side name the texture was uploaded under
+-	int    texId  = 0;
+-	int    size   = 0;
+-	bool   loaded = false;
++	string    requested;          //!< the path this slot was last asked for, failures included
++	ELutSpace requestedSpace = ELutSpace::ACEScct; //!< the fallback space it was last asked with
++	string    cacheName;          //!< the renderer-side name the texture was uploaded under
++	int       texId  = 0;
++	int       size   = 0;
++	bool      loaded = false;
++
++	// --- hot reload (S10 item 4.3) ------------------------------------------------------------
++	// The file's identity as of the last successful load, and the one seen by the last poll. A
++	// reload fires only when a CHANGED pair has been seen TWICE: Resolve writing a 65^3 cube
++	// writes ~2.7 MB and a poll can land in the middle of it, so the second look is what makes
++	// "the file stopped changing" the trigger rather than "the file is being written".
++	uint64    fileTime = 0;
++	uint64    fileSize = 0;
++	uint64    pendingTime = 0;
++	uint64    pendingSize = 0;
++	bool      bPending = false;
+ };
+ 
+ SLutSlot s_lutODT;
+ SLutSlot s_lutLMT;
+ 
++//! The forward and inverse halves of the output transform a Rec.709 look LUT was authored
++//! against, held on the CPU and never uploaded. Fixed files, not the camera's own ODT: which
++//! monitor a foreign look was made on is a property of the LOOK, so pointing the camera at a
++//! different output transform must not change what that look means
++//! (decisions/s10-grade-component.md 4.2).
++constexpr const char* kWrapForwardODTFile = "Assets/ODT/odt_srgb_100nit_aces2_65.cube";
++constexpr const char* kWrapInverseODTFile = "Assets/ODT/odt_srgb_100nit_aces2_inv_65.cube";
++
++//! The grid a wrapped LUT is resampled onto. See the note at the call site: it is the OUTPUT
++//! TRANSFORM's curvature that sets this, not the look's.
++constexpr int kWrapGridSize = 65;
++
++struct SWrapTransforms
++{
++	SCubeLut forward;   //!< ACEScct -> sRGB display code values
++	SCubeLut inverse;   //!< sRGB display code values -> ACEScct
++	bool     bTried = false;
++	bool     bReady = false;
++};
++
++SWrapTransforms s_wrap;
++
++//! cinecam_LutHotReload: poll interval in frames. 0 = off. Default 30 in the editor (author in
++//! Resolve on one monitor, watch the picture move on the other) and 0 in the launcher (a shipped
++//! build's LUTs do not change, and a stat with no user is a cost with no user).
++int s_lutHotReloadFrames = 0;
++ICVar* s_pLutHotReloadCVar = nullptr;
++
+ //! The two 1D curves (S10 item 3b), as ONE N x 1 fp16 texture: R the master (luma) curve, G the
+ //! Sat vs Sat multiplier.
+ //!
+@@ -1526,38 +1640,245 @@ void ClearLutSlot(SLutSlot& slot)
+ 	slot.cacheName.clear();
+ }
+ 
+-//! Load the file at szPath into slot if it is not already there. Cheap on every frame but the
+-//! first after a change: the only work on the common path is one string compare.
+-void EnsureLutSlot(SLutSlot& slot, const char* szPath, const char* szCacheName, const char* szRole)
++//! The file's identity, for the hot-reload poll. Goes through the SAME two-tree search the load
++//! used (OpenLutFile), so the watcher cannot end up watching a different file from the one that
++//! is in the picture. A cube inside a .pak returns the archive entry's time and simply never
++//! changes, which is the right answer for a paked asset.
++bool StatLutFile(const char* szPath, uint64& outTime, uint64& outSize)
+ {
+-	const char* szWanted = szPath ? szPath : "";
++	string usedPath, triedPaths;
++	FILE* const pFile = OpenLutFile(szPath, usedPath, triedPaths);
++	if (!pFile)
++		return false;
+ 
+-	if (slot.requested == szWanted)
+-		return;
++	outTime = (uint64)gEnv->pCryPak->GetModificationTime(pFile);
++	outSize = (uint64)gEnv->pCryPak->FGetSize(pFile);
++	gEnv->pCryPak->FClose(pFile);
++	return true;
++}
+ 
+-	slot.requested = szWanted;
++//! Trilinear fetch of a parsed cube, on the CPU. The same arithmetic the GPU sampler does, and
++//! deliberately the same clamp: the shader saturate()s the LUT input, so the wrap has to as well
++//! or the two would disagree at the edges of the domain.
++Vec3 SampleCubeTrilinear(const SCubeLut& lut, const Vec3& in)
++{
++	const int n = lut.size;
++	const float scale = (float)(n - 1);
++	const float x = clamp_tpl(in.x, 0.0f, 1.0f) * scale;
++	const float y = clamp_tpl(in.y, 0.0f, 1.0f) * scale;
++	const float z = clamp_tpl(in.z, 0.0f, 1.0f) * scale;
++
++	const int ix = min((int)x, n - 2);
++	const int iy = min((int)y, n - 2);
++	const int iz = min((int)z, n - 2);
++	const float fx = x - (float)ix;
++	const float fy = y - (float)iy;
++	const float fz = z - (float)iz;
+ 
+-	if (!szWanted[0])
++	Vec3 acc(0.0f, 0.0f, 0.0f);
++	for (int dz = 0; dz < 2; ++dz)
+ 	{
+-		// An empty path is a legitimate answer for the LMT slot (identity look, D10) and a
+-		// mistake for the ODT slot. The loader does not judge; the tone map does.
+-		ClearLutSlot(slot);
+-		return;
++		const float wz = dz ? fz : (1.0f - fz);
++		for (int dy = 0; dy < 2; ++dy)
++		{
++			const float wy = dy ? fy : (1.0f - fy);
++			for (int dx = 0; dx < 2; ++dx)
++			{
++				const float w = wz * wy * (dx ? fx : (1.0f - fx));
++				// Red fastest, then green, then blue - the .cube order the parser preserved.
++				const size_t idx = ((size_t)(iz + dz) * n * n + (size_t)(iy + dy) * n + (size_t)(ix + dx)) * 3;
++				acc.x += w * lut.rgb[idx + 0];
++				acc.y += w * lut.rgb[idx + 1];
++				acc.z += w * lut.rgb[idx + 2];
++			}
++		}
+ 	}
++	return acc;
++}
+ 
++//! Load the fixed forward/inverse output-transform pair the Rec.709 wrap needs. Once per process;
++//! a failure is remembered so a missing file does not re-read the disk every time a LUT changes.
++bool EnsureWrapTransforms()
++{
++	if (s_wrap.bTried)
++		return s_wrap.bReady;
++
++	s_wrap.bTried = true;
++
++	string error, resolvedPath;
++	if (!ParseCubeFile(kWrapForwardODTFile, s_wrap.forward, error, resolvedPath))
++	{
++		CryWarning(VALIDATOR_MODULE_RENDERER, VALIDATOR_WARNING,
++		           "[SceneReferred] cannot wrap a Rec.709 LUT: '%s' NOT loaded: %s",
++		           kWrapForwardODTFile, error.c_str());
++		return false;
++	}
++	if (!ParseCubeFile(kWrapInverseODTFile, s_wrap.inverse, error, resolvedPath))
++	{
++		CryWarning(VALIDATOR_MODULE_RENDERER, VALIDATOR_WARNING,
++		           "[SceneReferred] cannot wrap a Rec.709 LUT: '%s' NOT loaded: %s. It is baked by "
++		           "tools/ocio-bake (uv run bake.py --preset odt_srgb_100nit_inv) and installs "
++		           "beside the other cubes.",
++		           kWrapInverseODTFile, error.c_str());
++		s_wrap.forward = SCubeLut();
++		return false;
++	}
++
++	s_wrap.bReady = true;
++	CryLog("[SceneReferred] LUT wrap transforms ready: forward %d^3, inverse %d^3",
++	       s_wrap.forward.size, s_wrap.inverse.size);
++	return true;
++}
++
++//! Turn a LUT that is NOT in the grading space into one that is (S10 item 4.2).
++//!
++//! The recipe is everybody's - ACES's own guidance for reusing a legacy show LUT, Baselight's and
++//! Resolve's inverse-ODT node sandwiches, Nuke's OCIODisplay invert: forward output transform,
++//! the foreign LUT, inverse output transform. What is ours is that it is applied as a RESIDUAL:
++//!
++//!     W(x) = x + [ inv(LUT(fwd(x))) - inv(fwd(x)) ]
++//!
++//! because inv(fwd(x)) is NOT the identity. An SDR output transform folds out-of-gamut colour
++//! inwards and puts everything above display white on one code value, and neither can be undone -
++//! so the plain sandwich turns an IDENTITY Rec.709 LUT into a visibly non-identity LMT (measured:
++//! up to 0.95 in ACEScct, ~16 stops, at the extremes). In the residual form the two inv() calls
++//! land on the same coordinate for an identity source and cancel BIT FOR BIT, so "neutral is an
++//! exact identity" survives - the rule every other control in this component keeps. Above display
++//! white the LUT's effect continues as a constant offset in ACEScct = a constant gain in linear,
++//! which is what keeps highlight separation in the EXR (the export tap is downstream of here).
++void WrapForeignLut(SCubeLut& lut, ELutSpace space, int outSize)
++{
++	std::vector<float> wrapped;
++	wrapped.resize((size_t)outSize * outSize * outSize * 3);
++
++	const float scale = 1.0f / (float)(outSize - 1);
++	size_t out = 0;
++	for (int b = 0; b < outSize; ++b)
++	{
++		for (int g = 0; g < outSize; ++g)
++		{
++			for (int r = 0; r < outSize; ++r, out += 3)
++			{
++				const Vec3 x((float)r * scale, (float)g * scale, (float)b * scale);
++
++				Vec3 projected, looked;
++				if (space == ELutSpace::Rec709Display)
++				{
++					const Vec3 display = SampleCubeTrilinear(s_wrap.forward, x);
++					projected = SampleCubeTrilinear(s_wrap.inverse, display);
++					looked = SampleCubeTrilinear(s_wrap.inverse, SampleCubeTrilinear(lut, display));
++				}
++				else
++				{
++					// ACEScg: the shaper is analytic on both sides, so no cube is involved. The
++					// clamp is the honest part - a unit-domain LINEAR cube covers scene linear
++					// [0,1] and ACEScctToLinear(1.0) is 222.86, so everything above 1.0 gets the
++					// LUT's effect AT 1.0, carried up as a constant gain by the residual.
++					Vec3 lin = SceneReferredCurves::ACEScctToLinear(x);
++					lin.x = clamp_tpl(lin.x, 0.0f, 1.0f);
++					lin.y = clamp_tpl(lin.y, 0.0f, 1.0f);
++					lin.z = clamp_tpl(lin.z, 0.0f, 1.0f);
++					projected = SceneReferredCurves::LinearToACEScct(lin);
++					looked = SceneReferredCurves::LinearToACEScct(SampleCubeTrilinear(lut, lin));
++				}
++
++				wrapped[out + 0] = x.x + (looked.x - projected.x);
++				wrapped[out + 1] = x.y + (looked.y - projected.y);
++				wrapped[out + 2] = x.z + (looked.z - projected.z);
++			}
++		}
++	}
++
++	lut.rgb.swap(wrapped);
++	lut.size = outSize;
++}
++
++//! Parse, wrap if the file is not already in the grading space, convert and upload. Called only
++//! when something changed - a path, the declared space, or the file on disk.
++//!
++//! `bIsReload` splits the two failure policies apart, deliberately. A path the user just typed
++//! that does not parse must CLEAR the slot, so the picture goes visibly wrong and the user sees
++//! their mistake (design decision D13). A file that failed to re-read while nobody asked for
++//! anything must keep the previous good LUT: the user did not request a change, so the picture
++//! must not change under them - most often it is a half-written file and the next poll succeeds.
++bool LoadLutIntoSlot(SLutSlot& slot, const char* szWanted, const char* szCacheName,
++                     const char* szRole, ELutSpace fallbackSpace, bool bAllowWrap, bool bIsReload)
++{
+ 	SCubeLut lut;
+ 	string error, resolvedPath;
+ 	if (!ParseCubeFile(szWanted, lut, error, resolvedPath))
+ 	{
+-		// Once per path, not once per frame: the requested string is only re-tested on change.
+-		// A WARNING and not a log line: without the output transform the picture is a clamped
+-		// encode - flat and washed - and the whole point of D13 is that the user is told why
+-		// instead of being left to guess at a look. It has to be findable in a console full of
+-		// asset spam, so it goes through CryWarning.
++		// Once per change, not once per frame. A WARNING and not a log line: without the output
++		// transform the picture is a clamped encode - flat and washed - and the whole point of
++		// D13 is that the user is told why instead of being left to guess at a look. It has to be
++		// findable in a console full of asset spam, so it goes through CryWarning.
++		if (bIsReload && slot.loaded)
++		{
++			CryWarning(VALIDATOR_MODULE_RENDERER, VALIDATOR_WARNING,
++			           "[SceneReferred] %s LUT '%s' changed on disk but was NOT reloaded: %s. "
++			           "KEEPING the last good one - the picture has not changed.",
++			           szRole, szWanted, error.c_str());
++			return false;
++		}
+ 		CryWarning(VALIDATOR_MODULE_RENDERER, VALIDATOR_WARNING,
+ 		           "[SceneReferred] %s LUT '%s' NOT loaded: %s", szRole, szWanted, error.c_str());
+ 		ClearLutSlot(slot);
+-		return;
++		return false;
++	}
++
++	// ----- which space is this file in? (S10 item 4.1) ----------------------------------------
++	// The file's own tag wins when it has one: it was written by whoever made the LUT, while the
++	// property is a guess by whoever loaded it. Both present and disagreeing is not an error - it
++	// is a thing the user has to be TOLD, once, with the file named.
++	ELutSpace space = fallbackSpace;
++	if (lut.bTagged)
++	{
++		space = lut.tagSpace;
++		if (lut.tagSpace != fallbackSpace)
++		{
++			CryLog("[SceneReferred] %s LUT '%s' says it is %s; the %s Input Space property says "
++			       "%s. THE FILE WINS.", szRole, szWanted, LutSpaceName(lut.tagSpace), szRole,
++			       LutSpaceName(fallbackSpace));
++		}
++	}
++	else if (!lut.tagText.empty())
++	{
++		CryWarning(VALIDATOR_MODULE_RENDERER, VALIDATOR_WARNING,
++		           "[SceneReferred] %s LUT '%s' carries an unrecognised ReC-LUT-Space '%s'; "
++		           "using the Input Space property (%s) instead. Known: ACEScct, ACEScg, Rec709.",
++		           szRole, szWanted, lut.tagText.c_str(), LutSpaceName(fallbackSpace));
++	}
++
++	// ----- wrap it into the grading space if it is not there already ---------------------------
++	int nSourceSize = lut.size;
++	bool bWrapped = false;
++	if (space != ELutSpace::ACEScct)
++	{
++		if (!bAllowWrap)
++		{
++			// The ODT slot. An output transform IS the thing that leaves the grading space, so a
++			// space tag on it describes its input and there is nothing to wrap.
++			space = ELutSpace::ACEScct;
++		}
++		else if (space == ELutSpace::Rec709Display && !EnsureWrapTransforms())
++		{
++			CryWarning(VALIDATOR_MODULE_RENDERER, VALIDATOR_WARNING,
++			           "[SceneReferred] %s LUT '%s' is a Rec.709 display LUT but the wrap "
++			           "transforms are missing, so it is being loaded RAW - the picture will be "
++			           "wrong. Install %s.", szRole, szWanted, kWrapInverseODTFile);
++		}
++		else
++		{
++			// ALWAYS 65^3, whatever the source's grid was. The wrapped LUT does not only carry
++			// the look - it carries the output transform's own curvature, which is far steeper
++			// than any look, and that is what sets the grid it needs. Measured against a
++			// third-party-style 709 look LUT, in gamut and in the display's range: 33^3 wrapped
++			// costs ~0.96 8-bit code values of mean error against applying the LUT to the ODT
++			// output directly, 65^3 costs ~0.44. It is the same 2.2 MiB the ODT already spends
++			// and it runs once, on change.
++			WrapForeignLut(lut, space, kWrapGridSize);
++			bWrapped = true;
++		}
+ 	}
+ 
+ 	// fp16 RGBA on the CPU. The upload path does NOT convert formats - source and destination
+@@ -1598,19 +1919,106 @@ void EnsureLutSlot(SLutSlot& slot, const char* szPath, const char* szCacheName,
+ 		slot.texId = 0;
+ 		slot.size = 0;
+ 		slot.loaded = false;
+-		return;
++		return false;
+ 	}
+ 
+ 	slot.texId = nNewId;
+ 	slot.size = lut.size;
+ 	slot.loaded = true;
+ 	slot.cacheName = szCacheName ? szCacheName : "";
++	// What the watcher compares against from now on. Taken AFTER the read, so a file that was
++	// still being written when it was parsed is re-read on the next poll rather than accepted.
++	StatLutFile(szWanted, slot.fileTime, slot.fileSize);
++	slot.bPending = false;
+ 
+ 	// The ABSOLUTE path, not the requested one: "not found" and "found somewhere else than you
+ 	// think" look identical in a relative path, and the two install trees (project assets and
+ 	// %ENGINE%) are exactly the pair that gets confused.
+-	CryLog("[SceneReferred] %s LUT '%s' loaded: %d^3, texture id %d, from '%s'",
+-	       szRole, szWanted, lut.size, nNewId, resolvedPath.c_str());
++	if (bWrapped)
++	{
++		CryLog("[SceneReferred] %s LUT '%s' %s: %d^3 %s source WRAPPED into an ACEScct LMT at "
++		       "%d^3, texture id %d, from '%s'. For a shipping look, wrap it once offline instead: "
++		       "tools/ocio-bake, uv run wrap.py --lut <file> --space %s",
++		       szRole, szWanted, bIsReload ? "reloaded" : "loaded", nSourceSize,
++		       LutSpaceName(space), lut.size, nNewId, resolvedPath.c_str(),
++		       space == ELutSpace::Rec709Display ? "rec709" : "acescg");
++	}
++	else
++	{
++		CryLog("[SceneReferred] %s LUT '%s' %s: %d^3, texture id %d, from '%s'",
++		       szRole, szWanted, bIsReload ? "reloaded" : "loaded", lut.size, nNewId,
++		       resolvedPath.c_str());
++	}
++	return true;
++}
++
++//! Decide whether the slot needs re-reading, and re-read it if so.
++//!
++//! Cheap on every frame but the first after a change: the common path is one string compare and
++//! one enum compare. The hot-reload poll adds an FOpen/FClose every cinecam_LutHotReload frames -
++//! about 30 us, half a second apart, on two files.
++void EnsureLutSlot(SLutSlot& slot, const char* szPath, const char* szCacheName, const char* szRole,
++                   ELutSpace fallbackSpace = ELutSpace::ACEScct, bool bAllowWrap = false)
++{
++	const char* szWanted = szPath ? szPath : "";
++
++	if (slot.requested != szWanted || slot.requestedSpace != fallbackSpace)
++	{
++		slot.requested = szWanted;
++		slot.requestedSpace = fallbackSpace;
++		slot.fileTime = 0;
++		slot.fileSize = 0;
++		slot.bPending = false;
++
++		if (!szWanted[0])
++		{
++			// An empty path is a legitimate answer for the LMT slot (identity look, D10) and a
++			// mistake for the ODT slot. The loader does not judge; the tone map does.
++			ClearLutSlot(slot);
++			return;
++		}
++
++		LoadLutIntoSlot(slot, szWanted, szCacheName, szRole, fallbackSpace, bAllowWrap, false);
++		return;
++	}
++
++	// ----- hot reload (S10 item 4.3) -----------------------------------------------------------
++	if (s_lutHotReloadFrames <= 0 || !szWanted[0] || !slot.loaded)
++		return;
++
++	if ((gEnv->nMainFrameID % (uint32)s_lutHotReloadFrames) != 0)
++		return;
++
++	uint64 fileTime = 0, fileSize = 0;
++	if (!StatLutFile(szWanted, fileTime, fileSize))
++		return;   // gone, or momentarily unopenable. The picture keeps the LUT it has.
++
++	if (fileTime == slot.fileTime && fileSize == slot.fileSize)
++	{
++		slot.bPending = false;
++		return;
++	}
++
++	// Seen changed once: remember it and look again next poll. Resolve writing a 65^3 cube writes
++	// ~2.7 MB, and a poll can land in the middle of that; the second look is what makes the
++	// trigger "the file has stopped changing" rather than "the file is being written".
++	if (!slot.bPending || fileTime != slot.pendingTime || fileSize != slot.pendingSize)
++	{
++		slot.bPending = true;
++		slot.pendingTime = fileTime;
++		slot.pendingSize = fileSize;
++		return;
++	}
++
++	slot.bPending = false;
++	if (!LoadLutIntoSlot(slot, szWanted, szCacheName, szRole, fallbackSpace, bAllowWrap, true))
++	{
++		// A file that is broken and stays broken must be complained about ONCE, not twice a
++		// second: adopt what was seen so the next poll compares equal and says nothing until the
++		// file genuinely changes again.
++		slot.fileTime = fileTime;
++		slot.fileSize = fileSize;
++	}
+ }
+ 
+ void ClearCurveLutSlot()
+@@ -1732,7 +2140,8 @@ namespace CineCam
+ // look publisher needs exactly the same two uploads for the shipped default ODT, and a second copy
+ // of the upload path would mean a second pair of textures fighting over the same two bus slots.
+ void ApplyDisplayLuts(const char* szODTFile, const char* szLMTFile,
+-                      const float* pMasterCurveStops, const float* pSatCurveMultipliers)
++                      const float* pMasterCurveStops, const float* pSatCurveMultipliers,
++                      uint32 lmtSpace)
+ {
+ 	if (!gEnv->pRenderer || !gEnv->p3DEngine)
+ 		return;
+@@ -1744,8 +2153,12 @@ void ApplyDisplayLuts(const char* szODTFile, const char* szLMTFile,
+ 	if (!szODT[0])
+ 		szODT = kDefaultODTFile;
+ 
++	// The ODT slot never wraps: an output transform IS the step that leaves the grading space, so
++	// "what space is this in" has one answer for it and there is nothing to convert. Only the LMT
++	// slot takes files from outside this pipeline, so only it is space-aware (S10 item 4).
+ 	EnsureLutSlot(s_lutODT, szODT, "$ccamODT", "ODT");
+-	EnsureLutSlot(s_lutLMT, szLMTFile ? szLMTFile : "", "$ccamLMT", "LMT");
++	EnsureLutSlot(s_lutLMT, szLMTFile ? szLMTFile : "", "$ccamLMT", "LMT",
++	              (ELutSpace)lmtSpace, /*bAllowWrap*/ true);
+ 
+ 	gEnv->p3DEngine->SetPostEffectParam("Global_User_LutODT",     (float)s_lutODT.texId);
+ 	gEnv->p3DEngine->SetPostEffectParam("Global_User_LutODTSize", (float)s_lutODT.size);
+@@ -1770,6 +2183,40 @@ void ApplyDisplayLuts(const char* szODTFile, const char* szLMTFile,
+ 	gEnv->p3DEngine->SetPostEffectParamVec4("Global_User_CurveSatB",    Vec4(pS[4], s_lutCurve.bSatActive ? 1.0f : 0.0f, 0.0f, 0.0f));
+ }
+ 
++// The display chain's file watcher (S10 item 4.3). Registered by the plugin rather than by a
++// component: the LUT slots are process-wide and outlive any one camera.
++//
++// A POLL and not IFileChangeMonitor, on evidence: that interface is provided by Sandbox and by
++// nothing else (EditorFileMonitor.cpp is the only SetIFileChangeMonitor in the tree), and even
++// there it watches the project's game folder, the mod paths, Editor/ and Engine/Shaders - NOT
++// <engine>/engine/Assets/ODT/, which is one of the two install trees this loader documents. A
++// reload mechanism that works in half the installs is worse than none.
++void RegisterLutCVars()
++{
++	if (s_pLutHotReloadCVar != nullptr || gEnv->pConsole == nullptr)
++		return;
++
++	s_pLutHotReloadCVar = REGISTER_CVAR2("cinecam_LutHotReload", &s_lutHotReloadFrames, 0, VF_NULL,
++		"Re-read the display chain's .cube files (ODT and LMT) when they change on disk, every N "
++		"frames. 0 = off. Author a look in Resolve on one monitor and watch the picture move on "
++		"the other. A change has to be seen twice before it is acted on, so a half-written file is "
++		"not loaded; a file that fails to parse keeps the previous good LUT and says why. Default "
++		"30 in the editor, 0 in the launcher (a shipped build's LUTs do not change).");
++
++	// The default is decided here rather than in the macro because it depends on which host we
++	// are in. Set through the cvar so a user.cfg or a console line still overrides it afterwards.
++	if (s_pLutHotReloadCVar != nullptr && gEnv->IsEditor())
++		s_pLutHotReloadCVar->Set(30);
++}
++
++void UnregisterLutCVars()
++{
++	if (s_pLutHotReloadCVar != nullptr && gEnv->pConsole != nullptr)
++		gEnv->pConsole->UnregisterVariable("cinecam_LutHotReload");
++
++	s_pLutHotReloadCVar = nullptr;
++}
++
+ // The bus is cleared first, so the renderer stops referring to the IDs before they die; the
+ // textures then go with the driver. There is nothing to save and restore here - off the
+ // scene-referred path nothing reads these params, and the stock path never had them.
+@@ -1816,8 +2263,9 @@ void CCinematicCameraComponent::ApplyDisplayLuts()
+ 	curves.GetMasterStops(masterStops);
+ 	curves.GetSatMultipliers(satMult);
+ 
+-	CineCam::ApplyDisplayLuts(m_output.odtFile.c_str(), GetLookParams().lmtFile.c_str(),
+-	                          masterStops, satMult);
++	const SCineLookParams& look = GetLookParams();
++	CineCam::ApplyDisplayLuts(m_output.odtFile.value.c_str(), look.lmtFile.value.c_str(),
++	                          masterStops, satMult, (uint32)look.lmtSpace);
+ }
+ 
+ void CCinematicCameraComponent::RestoreDisplayLuts()
+diff --git a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
+index d093de89..a8806e8b 100644
+--- a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
++++ b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
+@@ -992,9 +992,12 @@ struct SCineSceneReferredParams
+ 
+ // The output transform (ODT), one of the two .cube files of the display chain
+ // (SceneReferredSpec.md S4/S5, D8) - the other, the look (LMT), lives on the CineCam Grade
+-// component (CineGradeComponent.h). A plain asset path rather than a resource picker: a .cube is
+-// not a texture asset the RC knows about, so there is no selector to reuse, and the files ship
+-// with the plugin. The path is resolved through ICryPak - first as given (relative to the
++// component (CineGradeComponent.h). A FILE picker rather than an asset picker: a .cube is not a
++// registered asset type in 5.7.1, so there is no resource selector to reuse - the property is a
++// Schematyc::CineCubeFileName, which is the shipped ResourceFilePath row (a "..." button and a
++// *.cube filter) and serialises as the same plain string it always did. Registering .cube as a
++// real asset type, with an Asset Browser picker, is work item 4b.
++// The path is resolved through ICryPak - first as given (relative to the
+ // project's asset directory), then under %ENGINE% - so the same string works in the editor and in
+ // the launcher whichever tree the file was installed into.
+ 
+@@ -1004,7 +1007,7 @@ constexpr const char* kDefaultODTFile = "Assets/ODT/odt_srgb_100nit_aces2_65.cub
+ 
+ struct SCineOutputParams
+ {
+-	inline bool operator==(const SCineOutputParams& rhs) const { return odtFile == rhs.odtFile; }
++	inline bool operator==(const SCineOutputParams& rhs) const { return odtFile.value == rhs.odtFile.value; }
+ 
+ 	static void ReflectType(Schematyc::CTypeDesc<SCineOutputParams>& desc)
+ 	{
+@@ -1019,8 +1022,9 @@ struct SCineOutputParams
+ 			"deliberately, visibly wrong (a clamped encode) rather than silently falling back. "
+ 			"Left empty, the built-in default below is loaded instead - an unset field is not a "
+ 			"statement about the display, and a component that has never been touched has to "
+-			"come up looking right.",
+-			Schematyc::CSharedString(kDefaultODTFile));
++			"come up looking right. Editing the file on disk reloads it live "
++			"(cinecam_LutHotReload).",
++			Schematyc::CineCubeFileName(kDefaultODTFile));
+ 	}
+ 
+ 	// Keep last: operator== compares the string by value.
+@@ -1028,7 +1032,7 @@ struct SCineOutputParams
+ 	// Schematyc's reflected default (graph nodes, "reset to default", the serializer's
+ 	// skip-if-equal test) and never touches the member itself, so a member without one is an
+ 	// empty string at activation no matter what the reflection says.
+-	Schematyc::CSharedString odtFile = kDefaultODTFile;
++	Schematyc::CineCubeFileName odtFile = kDefaultODTFile;
+ };
+ 
+ class CCinematicCameraComponent final
+diff --git a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraPlugin.cpp b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraPlugin.cpp
+index 3c034126..a7d16ccb 100644
+--- a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraPlugin.cpp
++++ b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraPlugin.cpp
+@@ -48,6 +48,7 @@ CCinematicCameraPlugin::~CCinematicCameraPlugin()
+ 	if (gEnv->pConsole)
+ 		gEnv->pConsole->RemoveCommand("ccam_slot");
+ 	m_editorLook.UnregisterCVars();
++	CineCam::UnregisterLutCVars();
+ 	RemoveHDRIImportCommands();
+ 	gEnv->pSystem->GetISystemEventDispatcher()->RemoveListener(this);
+ 	if (gEnv->pSchematyc)
+@@ -70,6 +71,10 @@ bool CCinematicCameraPlugin::Initialize(SSystemGlobalEnvironment& env, const SSy
+ 	// cinecam_EditorLookEV - the one knob of the Sandbox viewport's CineCam camera.
+ 	m_editorLook.RegisterCVars();
+ 
++	// cinecam_LutHotReload - the display chain's .cube file watcher (S10 item 4). Registered here
++	// and not by a component: the two LUT slots are process-wide and outlive any one camera.
++	CineCam::RegisterLutCVars();
++
+ 	s_pPluginInstance = this;
+ 
+ 	return true;
+diff --git a/Code/CryPlugins/CinematicCamera/README.md b/Code/CryPlugins/CinematicCamera/README.md
+index 285840e4..de3f9b70 100644
+--- a/Code/CryPlugins/CinematicCamera/README.md
++++ b/Code/CryPlugins/CinematicCamera/README.md
+@@ -326,11 +326,17 @@ What the control actually does depends on the path.
+ | --- | --- | --- | --- |
+ | ODT File | path | `Assets/ODT/odt_srgb_100nit_aces2_65.cube` | The output transform - THE one place in the chain that knows a display exists. The default is the ACES 2.0 SDR 100 nit sRGB view, baked from the OCIO ACES studio config by `tools/ocio-bake`. Swapping this file changes only what the monitor shows, never the scene data. Unreadable = the picture goes deliberately, visibly wrong (a clamped log image) rather than quietly falling back, with a warning naming every absolute path tried. Empty = the shipped default above is loaded, so a camera nobody has configured still comes up correct. |
+ 
+-Both LUT paths - this one and **LMT File** on the CineCam Grade component - are resolved
+-through the pak system: first as given, relative to the project's asset directory, then under
+-`%ENGINE%`. Install the plugin's `Assets/ODT` folder into either tree and
+-the same string works in the editor and in the launcher. Parse and load errors are logged once
+-per path, with the reason.
++Both LUT paths - this one and **LMT File** on the CineCam Grade component - have a **"..."
++button** that opens a file dialog filtered to `*.cube`, and both are resolved through the pak
++system: first as given, relative to the project's asset directory, then under `%ENGINE%`. Install
++the plugin's `Assets/ODT` folder into either tree and the same string works in the editor and in
++the launcher. (The dialog can only offer files under the *project*; a cube installed only into
++`<engine>/engine/Assets/ODT/` still has to be typed, and still loads.) Parse and load errors are
++logged once per path, with the reason.
++
++Both also **hot reload**: edit a cube on disk while the editor is running and the picture follows
++within about half a second. See `cinecam_LutHotReload` in
++[docs/ConsoleReference.md](docs/ConsoleReference.md).
+ 
+ ### Diffraction Streaks
+ 
+@@ -548,7 +554,22 @@ is not a LUT at all. See [docs/SceneReferredExport.md](docs/SceneReferredExport.
+ 
+ | Property | Range | Default | Effect |
+ | --- | --- | --- | --- |
+-| LMT File | path | *(empty)* | Creative look as a Resolve `.cube` in ACEScct - the Look Modification Transform. Applied after the CDL and before the output transform, so it grades scene data and not a picture. **Empty = identity: pure ACES, no house look.** See [docs/SceneReferredLook.md](docs/SceneReferredLook.md). |
++| LMT Input Space | ACEScct / ACEScg / Rec.709 display | ACEScct | What the file below expects at its input, and therefore whether it has to be **wrapped** before it can be a look for this camera. `ACEScct` = it is already an LMT (our own bakes, and a Resolve ACEScct export). `Rec.709 display` = an ordinary look LUT made for a finished 709 picture - the plugin wraps it automatically in the ACES 2.0 output transform and its inverse, so it simply works. `ACEScg` = linear in and out. **A cube carrying its own `# ReC-LUT-Space:` line overrides this**, and the console says so when the two disagree. |
++| LMT File | path | *(empty)* | Creative look as a Resolve `.cube` - the Look Modification Transform. Applied after the CDL and the curves and before the output transform, so it grades scene data and not a picture. **Empty = identity: pure ACES, no house look.** "..." opens a `*.cube` file dialog; editing the file on disk reloads it live. See [docs/SceneReferredLook.md](docs/SceneReferredLook.md). |
++
++**Three looks ship with the plugin**, in `Assets/ODT/` beside the output transforms. Each one is a
++recipe, not a mystery: the cube's comment header lists the exact CineCam Grade settings that
++produce it, so it can be rebuilt on the wheels by hand.
++
++| file | what it is |
++| --- | --- |
++| `Assets/ODT/lmt_identity_33.cube` | **neutral** - the identity, and the test that proves the whole LUT path (the picture must not change) |
++| `Assets/ODT/look_film_contrast_33.cube` | soft S-curve about mid grey, a little contrast and colour |
++| `Assets/ODT/look_warm_print_33.cube` | warm shadows, cooler highlights, mild contrast, slightly softer colour |
++
++There is also `Assets/ODT/test_identity_rec709_33.cube`: an identity **tagged as a Rec.709 display
++LUT**, so loading it exercises the whole wrap. The picture must not change - that is what makes the
++wrap testable.
+ 
+ ---
+ 
+diff --git a/Code/CryPlugins/CinematicCamera/docs/ConsoleReference.md b/Code/CryPlugins/CinematicCamera/docs/ConsoleReference.md
+index 8865014e..25e35f24 100644
+--- a/Code/CryPlugins/CinematicCamera/docs/ConsoleReference.md
++++ b/Code/CryPlugins/CinematicCamera/docs/ConsoleReference.md
+@@ -718,6 +718,28 @@ diagnostics outrank the mask. Kernel parameter changes are logged as
+ | Default | 1 |
+ | Purpose | Master switch for film halation — the red-orange halo around sources that overload the emulsion — driven by the `HDR_Halation_*` post effect params and composited into the bloom target right after the streaks. 0 = off (no passes issued), 1 = on (visibility decided by the game-side params), **2 = diagnostic force mode**: amount 1, threshold 0.5, radius 0.7, independent of the game-side params — use it to verify the halation pass itself runs. |
+ 
++## Plugin cvars (`cinecam_*`)
++
++Registered by the CinematicCamera plugin itself, not by the renderer. They are process-wide, so
++they are not tied to any one camera entity.
++
++### cinecam_LutHotReload
++
++| | |
++| --- | --- |
++| Default | **30** in the editor, **0** in the launcher |
++| Purpose | Re-read the display chain's `.cube` files - the camera's **ODT File** and the CineCam Grade's **LMT File** - when they change on disk, every N frames. `0` = off. Author a look in Resolve on one monitor and watch the picture follow on the other. |
++| Mechanism | A poll of `(modification time, size)` through `ICryPak`, on the same two-tree search the loader used, so the watcher cannot end up watching a different file from the one in the picture. It is a poll and not the editor's `IFileChangeMonitor` because that interface exists only inside Sandbox *and* watches only the project tree - a cube installed into `<engine>/engine/Assets/ODT/` would never fire. |
++| Safety | A change has to be seen **twice** before it is acted on, so a half-written file is not loaded. A reload that fails to parse **keeps the previous good LUT** and warns once with the reason - the picture does not change under you when you did not ask for it. (A path you *type* that does not parse still clears the slot, deliberately: you must see that it is wrong.) |
++| Cost | One `FOpen`/`FClose` per watched file per poll, about 30 us, twice a second at the default. |
++
++### cinecam_EditorLookEV
++
++| | |
++| --- | --- |
++| Default | 0 |
++| Purpose | Exposure compensation, in stops, for the Sandbox viewport's built-in **CineCam** camera. Positive is brighter. Metering-driven exposure only - aperture, shutter, ISO and ND belong to a Cinematic Camera entity, not to the editor fly camera. |
++
+ ## Stock engine cvars whose ReCS default differs (2026-09-09)
+ 
+ Four stock CRYENGINE cvars - three registered in `RendererCVars.cpp`, `e_VolumetricFog` in
+diff --git a/Code/CryPlugins/CinematicCamera/docs/SceneReferredLook.md b/Code/CryPlugins/CinematicCamera/docs/SceneReferredLook.md
+index 5406537d..cb812b7f 100644
+--- a/Code/CryPlugins/CinematicCamera/docs/SceneReferredLook.md
++++ b/Code/CryPlugins/CinematicCamera/docs/SceneReferredLook.md
+@@ -68,9 +68,17 @@ Code/CryPlugins/CinematicCamera/Assets/ODT/
+     odt_srgb_100nit_aces2_65.cube      <- the default: ACES 2.0 SDR 100 nit, sRGB display, 65^3
+     odt_srgb_100nit_aces2_33.cube         the same view at 33^3 (8x smaller, ~1/3 code value worse)
+     odt_rec1886_100nit_aces2_33.cube      Rec.1886 - the reference for a Resolve round-trip
++    odt_srgb_100nit_aces2_inv_65.cube     the INVERSE of the default - machinery, see section 3
+     lmt_identity_33.cube                  a pass-through look, for proving the plumbing
++    look_film_contrast_33.cube            shipped look: soft S-curve
++    look_warm_print_33.cube               shipped look: warm shadows, cooler highlights
++    test_identity_rec709_33.cube          test fixture: an identity TAGGED as a 709 display LUT
+ ```
+ 
++The **ODT File** field has a "..." button that opens a file dialog filtered to `*.cube`. It can
++only offer files under the project, so a cube installed only into the engine tree still has to be
++typed - it still loads.
++
+ ### The LUT's domain is the real upper clip
+ 
+ Everything the ODT sees is ACEScct, and `ACEScctToLinear(1.0) = 222.86` - **+10.3 stops over mid
+@@ -138,20 +146,140 @@ A Look Modification Transform is a creative grade that lives *before* the output
+ sees scene data in ACEScct, so it can move exposure and saturation around without fighting a tone
+ curve that has already been applied.
+ 
++### The three looks that ship
++
++Put one of these in **Look -> LMT File** on the entity's **CineCam Grade** component:
++
++| file | what it is |
++| --- | --- |
++| `Assets/ODT/lmt_identity_33.cube` | **neutral** - the identity. Also the plumbing test: the picture must not change at all. |
++| `Assets/ODT/look_film_contrast_33.cube` | a soft S-curve about mid grey, a little contrast and a little more colour |
++| `Assets/ODT/look_warm_print_33.cube` | warm shadows, cooler highlights, mild contrast, slightly softer colour |
++
++**None of them is a mystery.** Open one in a text editor: the comment header at the top lists the
++exact CineCam Grade settings that produce it - Lift, Gamma, Gain, Contrast, Saturation, the five
++master-curve offsets in stops, and the single ASC CDL they all fold into. Type those numbers into
++the component and you get the same picture, live. They are built out of nothing but the controls
++the component already has, deliberately: they exist to be readable and to prove the slot works. A
++look worth shipping on a show is authored in Resolve and comes back as its own cube.
++
++They are baked by `tools/ocio-bake` from a recipe in `presets.toml`, so changing one is editing a
++few numbers and re-running the tool - not editing 35 937 lines of grid.
++
+ ### In Resolve
+ 
+ 1. Set the project colour management so the timeline is **ACEScct**. (Colour Science: ACEScct, or
+    a colour-managed timeline with ACEScct as the working space.) Getting this wrong is the one
+-   mistake that matters - a look authored in Rec.709 will not mean the same thing here.
++   mistake that matters - see the next section, which is about what to do when you get it wrong
++   or when somebody hands you a LUT that was made that way.
+ 2. Grade a still or a clip until you like it. Use nodes freely; the export flattens them.
+ 3. Right-click the clip -> **Generate 3D LUT (Cube)**, 33-point.
+ 4. Save the `.cube` next to the ODTs, e.g. `Assets/ODT/lmt_myshow_33.cube`.
+ 5. Put that path in **Look -> LMT File** on the entity's **CineCam Grade** component (add one if
+-   the camera has none).
++   the camera has none). The "..." button opens a `*.cube` file dialog.
+ 
+ The LUT is loaded and uploaded on the next frame after the path changes. A parse error is logged
+ once, with the reason, and leaves the slot empty (identity) rather than stale.
+ 
++### Dropping in an ordinary Rec.709 look LUT
++
++Most LUTs in the world - everything you can buy, everything that came with a camera, everything
++somebody sends you - are made for a **finished Rec.709 display picture**. They expect display code
++values in and give display code values out. This chain hands the LMT slot **ACEScct** instead.
++
++Both are three numbers in [0,1] on a unit domain, so a 709 LUT loads without complaining and
++produces a wrong picture *silently*. There is nothing in the `.cube` format to tell them apart -
++the format has a title, a grid size, a domain and comments, and no metadata at all.
++
++So there are two ways for a file to say what it is, in this order:
++
++1. **A line in the file**: `# ReC-LUT-Space: Rec709`. Our bake tool writes one into everything it
++   makes, and `wrap.py` writes one into everything it converts. If a file has one, it wins -
++   whoever made the LUT knew better than whoever loaded it. Accepted values, case-insensitive:
++   `ACEScct`, `ACEScg` (or `Linear`), `Rec709` (or `Rec.709`, `sRGB`, `Display`). You can add the
++   line to a third-party LUT by hand; it is just a comment and no other tool will mind.
++2. **The `LMT Input Space` property**, right above the file field. This is for the ordinary case:
++   a LUT with no tag and no prospect of getting one. Set it to **Rec.709 display** and the LUT
++   simply works.
++
++If the file says one thing and the property says another, the file wins and the console says so,
++naming the file. If the file carries a space name we do not know, you get a warning and the
++property is used.
++
++**What "simply works" means.** The plugin wraps the LUT in the output transform and its inverse -
++the standard recipe (it is what ACES's own guidance says to do with a legacy show LUT, and what an
++inverse-ODT node in front of a LUT node does in Resolve or Baselight):
++
++```
++   ACEScct  ->  the ACES 2.0 SDR 100 nit sRGB output transform
++            ->  your Rec.709 LUT
++            ->  the inverse of that same output transform
++            ->  ACEScct
++```
++
++evaluated once on the CPU when the file loads, onto a 65-point grid. Nothing is added to the
++per-pixel cost, and nothing about the rest of the chain changes.
++
++The output transform used for the wrap is **fixed** at the sRGB SDR one, deliberately. Which
++monitor a look LUT was made on is a property of the look, so pointing your camera at a different
++ODT must not change what that look means.
++
++**A LUT tagged `ACEScg`** (linear in and out) is wrapped the same way with the analytic
++`linear <-> ACEScct` shaper instead of the output transform. Note the honest limit: a unit-domain
++*linear* cube covers scene linear 0 to 1 and nothing above, while the top of ACEScct is 222.86 -
++so a linear look LUT really wanted a shaper, which this chain does not accept. Everything above
++linear 1.0 gets the LUT's effect *at* 1.0, carried on as a constant gain.
++
++### How exact is the wrap?
++
++The inverse of an SDR output transform is not a true inverse. Colour outside the display gamut is
++folded inwards on the way out and cannot be unfolded coming back, and everything above display
++white shares one code value. Two consequences worth knowing:
++
++* **An identity 709 LUT gives an exact identity LMT.** That is not luck - the wrap is applied as a
++  *difference* rather than as a straight substitution, so the two inverse lookups cancel exactly
++  when the LUT does nothing. Measured over the whole grid, at 33 and 65 points, with both the
++  engine's own evaluator and OCIO's exact one: **maximum error 0.000000000**. `test_identity_rec709_33.cube`
++  ships so you can see this in the picture: load it with the space set to Rec.709 and nothing may
++  change.
++* **On real content the wrap is worth under half a code value.** Against a third-party-style 709
++  look LUT, comparing what the engine shows with the wrap against applying the LUT to the ODT
++  output directly, over colour inside the Rec.709 gamut and inside the display's range: mean 0.44
++  8-bit code values, 99th percentile 3.5. (Wrapping offline with `wrap.py` and OCIO's exact
++  inverse instead: 0.34 and 3.0 - i.e. almost all of what is left is the grid, not the method.)
++* **Above display white the wrap does not reproduce what the LUT does to white.** Instead of
++  flattening every super-white value onto `LUT(white)`, it carries the LUT's white-point shift up
++  as a constant gain and lets the output transform clip. That keeps a highlight separating on
++  screen instead of going flat, and - because the EXR export tap is taken *after* the LMT - keeps
++  the highlight data in an export. A print look that pulls white down still rolls towards its
++  lower white.
++
++**For a look you are going to ship, wrap it once offline instead**, and load the result as an
++ordinary ACEScct LMT:
++
++```
++cd tools/ocio-bake
++uv run wrap.py --lut theirlook.cube --space rec709 --size 65
++```
++
++The result carries the source file's sha256, the transform chain and the method in its header, and
++a `# ReC-LUT-Space: ACEScct` line, so it never gets wrapped twice. The engine says so in the log
++whenever it wraps something at load time.
++
++### Editing a look while the engine runs
++
++`.cube` files hot reload. Save over the file the LMT (or ODT) slot is using and the picture follows
++within about half a second - no property to touch, no level reload. Author on one monitor, watch on
++the other.
++
++* On by default in the editor, off in the launcher. `cinecam_LutHotReload <frames>` changes the
++  poll interval; `0` turns it off.
++* A change has to be seen twice before it is acted on, so a half-written file is never loaded.
++* If the new file does not parse, **the previous good look stays in the picture** and one warning
++  says why. A path you *type* that does not parse still clears the slot - that one you asked for
++  and need to see.
++* Every reload logs one line.
++
+ ### Proving the plumbing first
+ 
+ Load `Assets/ODT/lmt_identity_33.cube` into the CineCam Grade component's Look slot. The picture must not change at all -
+@@ -159,10 +287,14 @@ that one test exercises the parser, the fp16 conversion, the 3D texture upload,
+ addressing and the channel order together. If it *does* change, the look you author next will be
+ wrong in the same way and much harder to see.
+ 
++Then load `Assets/ODT/test_identity_rec709_33.cube` with **LMT Input Space** set to *Rec.709
++display*. The picture must not change either - and that one test exercises the whole wrap on top.
++
+ ### What the parser accepts
+ 
+ Resolve-dialect `.cube`: comments, `TITLE`, `LUT_3D_SIZE`, optional `DOMAIN_MIN` / `DOMAIN_MAX`,
+-then N^3 triplets with the **red index varying fastest**. Grid sizes 2..129.
++then N^3 triplets with the **red index varying fastest**. Grid sizes 2..129. One comment is read
++rather than skipped: `# ReC-LUT-Space: <value>`.
+ 
+ It refuses, with a message saying why:
+ 
+@@ -254,6 +386,11 @@ effects.
+ | a stock slider does nothing | expected; see section 5 |
+ | **Sensor Clip** changes nothing at high values | expected above ~10 stops - the ODT LUT's domain ends at +10.3 and clips there first. Work in 4-8, where a real sensor lives |
+ | it looks different from before the switch | expected; the level is lit for one path or the other. See [SceneReferredContent.md](SceneReferredContent.md) |
++| a look LUT makes the picture violently wrong - crushed, posterised, wrong colour | it is almost certainly a **Rec.709 display** LUT loaded as if it were ACEScct. Set **LMT Input Space** to *Rec.709 display* |
++| the console says a LUT is being *loaded RAW* | the wrap needs `Assets/ODT/odt_srgb_100nit_aces2_inv_65.cube` and cannot find it. Install the whole `Assets/ODT` folder, or re-bake it with `uv run bake.py --preset odt_srgb_100nit_inv` |
++| the console says *THE FILE WINS* | the cube carries its own `# ReC-LUT-Space:` line and it disagrees with the property. Either fix the property or edit the line out of the file |
++| editing a cube on disk changes nothing | `cinecam_LutHotReload` is 0 (the launcher default). Set it to 30 |
++| a cube edit made the picture go away for a moment and come back | it did not - a reload that fails keeps the previous LUT. Look for the warning; the file was probably half written and the next poll picked it up |
+ 
+ `r_SceneReferredDebug 1` skips the working-space conversion so you can A/B the primaries change on
+ its own; **Bypass Grade** A/Bs the grade without touching the exposure or the optics.
+-- 
+2.47.1.windows.1
+

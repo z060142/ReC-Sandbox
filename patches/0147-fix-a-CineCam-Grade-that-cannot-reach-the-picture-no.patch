@@ -1,0 +1,337 @@
+From 063ef39bae6076db3286dab81ee2c398d32a4409 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Thu, 10 Sep 2026 01:56:09 +0800
+Subject: [PATCH 147/160] fix: a CineCam Grade that cannot reach the picture
+ now says why (S10 item 2b)
+
+The report after 857f1e15 was "Slope 1.2 and Saturation 0.5 on the new
+component do nothing at all". The editor log of that session says why, and it
+is not the component binding: the camera was on the STOCK path.
+
+Root cause of "no effect"
+  The ASC CDL and the LMT are read by the tone map inside `if (bSceneReferred)`
+  (ToneMapping.cpp, the camera grading block) - with Scene Referred off the
+  renderer never looks at Global_User_Grade*, so a grade is inert by
+  construction, exactly as it was before the component existed. The session's
+  camera was created in that session with "Create Cinematic Camera", and
+  SCineSceneReferredParams::bSceneReferred defaults to false. Evidence in
+  editor.log (10 Sep 01:20-01:23): the "[CinematicCamera] WB ... gains ..."
+  lines at 01:22:18-20 are only reachable AFTER ApplyWhiteBalance's
+  `if (m_sceneReferred.bSceneReferred) return;`, "[SceneReferred] stock mid
+  grey armed" is the stock-path arming, and none of the renderer's
+  "request flipped -> " / "starts scene-referred" lines is in the file. The
+  component lookup itself is proven good by the same log: the editor host's
+  component audit lists CCineGradeComponent with classDesc GUID
+  1e7c4a93-6b25-4d8f-9a03-52d7f1c86b40, which is what
+  IEntity::GetComponent<T>() matches on.
+
+  So the defect is not arithmetic, it is that the pothole became invisible.
+  Before the move, Grade sat two groups under the Scene Referred switch on one
+  inspector; now it is a separate component whose inspector shows no trace of
+  the switch it depends on, and a value that cannot reach the picture said
+  nothing at all.
+
+What this adds
+  - CCineGradeComponent::ReportStatus(): on its own PROPERTY_CHANGED it names,
+    in ONE warning, every reason an edited value cannot be in the picture - no
+    Cinematic Camera on the entity, the viewport not looking through it while
+    editing (the S9 preview policy), the camera's Scene Referred switch off -
+    and logs one line when the grade IS live. De-duplicated on the message, so
+    dragging a slider says it once, and re-armed when the answer changes.
+  - CCinematicCameraComponent::ApplyGrade() logs the CDL it publishes whenever
+    the values change, edge-triggered exactly like the white balance line
+    beside it. That splits "the value never left the component" from "the
+    value is on the bus and the chain below is where to look" without a
+    debugger.
+  - CCinematicCameraComponent::IsSceneReferred(), a const accessor for the
+    switch, which is what the grade component asks.
+  - The component's editor description and README name the switch.
+
+Also: the grade component no longer subscribes to ENTITY_EVENT_LEVEL_LOADED or
+ENTITY_EVENT_START_GAME. They existed only to print the "no camera" warning at
+load, which ReportStatus now covers where the user is looking, and a component
+that holds state and answers questions has no business on the game-mode event
+path. This is NOT a proven cause of the second report (the editor froze on
+Ctrl+G): that session was the first game-mode entry into airfield in months and
+the log stops immediately after CryAgentEditorHost auto-started four agentscript
+behaviours, with nothing of this component's between. Narrowing the surface is
+free; the freeze still needs an A/B and a hang dump.
+
+Behaviour of the picture is unchanged: no bus write, no gate, no default moved.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01ADgAiBYv9AxSd54s1FPREm
+---
+ .../Module/CineGradeComponent.cpp             | 95 ++++++++++++-------
+ .../Module/CineGradeComponent.h               | 29 ++++--
+ .../Module/CinematicCameraComponent.cpp       | 22 +++++
+ .../Module/CinematicCameraComponent.h         | 13 +++
+ Code/CryPlugins/CinematicCamera/README.md     | 13 ++-
+ 5 files changed, 127 insertions(+), 45 deletions(-)
+
+diff --git a/Code/CryPlugins/CinematicCamera/Module/CineGradeComponent.cpp b/Code/CryPlugins/CinematicCamera/Module/CineGradeComponent.cpp
+index 154ade45..a5d0665c 100644
+--- a/Code/CryPlugins/CinematicCamera/Module/CineGradeComponent.cpp
++++ b/Code/CryPlugins/CinematicCamera/Module/CineGradeComponent.cpp
+@@ -25,54 +25,79 @@ namespace
+ // ---------------------------------------------------------------------------
+ // IEntityComponent
+ // ---------------------------------------------------------------------------
+-// No per-frame event. The camera pulls this component's state on the frame it publishes, so
+-// there is nothing for an update to do; these three are the moments at which "is there a camera
+-// to grade?" can first be answered, and the one at which an edited value should reach the
+-// picture without waiting for the camera's next update.
++// ONE event, and only in the editor's hands: the moment a property of this component is edited.
++// There is nothing for an update to do (the camera pulls this component's state on the frame it
++// publishes) and nothing to do at level load or at game start either - the camera re-reads this
++// component every frame regardless, so a component that heard nothing would still be in the
++// picture. Staying off the level-load and game-start paths altogether is deliberate: a component
++// that holds state and answers questions has no business being woken by a mode change.
+ Cry::Entity::EventFlags CCineGradeComponent::GetEventMask() const
+ {
+-	return ENTITY_EVENT_COMPONENT_PROPERTY_CHANGED
+-	       | ENTITY_EVENT_LEVEL_LOADED
+-	       | ENTITY_EVENT_START_GAME;
++	return ENTITY_EVENT_COMPONENT_PROPERTY_CHANGED;
+ }
+ 
+ void CCineGradeComponent::ProcessEvent(const SEntityEvent& event)
+ {
+-	switch (event.event)
+-	{
+-	case ENTITY_EVENT_COMPONENT_PROPERTY_CHANGED:
+-		// The editor sends this event to the EDITED component only (EntityObject.cpp:831/934), so
+-		// the camera does not hear about a grade change by itself. This is the latency nudge from
+-		// decisions/s10-grade-component.md section 3 P1 - not the source of truth: the camera
+-		// re-reads this component on its own ENTITY_EVENT_UPDATE anyway, so if the nudge never
+-		// fired the picture would still be right one frame later.
+-		if (m_pEntity != nullptr)
+-		{
+-			if (CCinematicCameraComponent* pCamera = m_pEntity->GetComponent<CCinematicCameraComponent>())
+-				pCamera->RefreshGrade();
+-		}
+-		WarnIfNoCameraSibling();
+-		break;
++	if (event.event != ENTITY_EVENT_COMPONENT_PROPERTY_CHANGED || m_pEntity == nullptr)
++		return;
+ 
+-	case ENTITY_EVENT_LEVEL_LOADED:
+-	case ENTITY_EVENT_START_GAME:
+-		WarnIfNoCameraSibling();
+-		break;
++	// The editor sends this event to the EDITED component only (EntityObject.cpp:831/934), so the
++	// camera does not hear about a grade change by itself. This is the latency nudge from
++	// decisions/s10-grade-component.md section 3 P1 - not the source of truth: the camera re-reads
++	// this component on its own ENTITY_EVENT_UPDATE anyway, so if the nudge never fired the
++	// picture would still be right one frame later.
++	CCinematicCameraComponent* const pCamera = m_pEntity->GetComponent<CCinematicCameraComponent>();
++	if (pCamera != nullptr)
++		pCamera->RefreshGrade();
+ 
+-	default:
+-		break;
+-	}
++	ReportStatus(pCamera);
+ }
+ 
+-void CCineGradeComponent::WarnIfNoCameraSibling()
++// The three preconditions, named in the console the moment the user edits a value that cannot
++// reach the picture. Written as one line listing every reason at once rather than one message per
++// reason: a user whose viewport is on another camera AND whose Scene Referred switch is off
++// should not have to fix one, re-test, and be told about the other.
++void CCineGradeComponent::ReportStatus(const CCinematicCameraComponent* pCamera)
+ {
+-	if (m_bLoggedNoCamera || m_pEntity == nullptr)
++	string reasons;
++
++	if (pCamera == nullptr)
++	{
++		reasons = "there is no Cinematic Camera on this entity";
++	}
++	else
++	{
++		// In the editor the picture belongs to the camera the viewport looks through
++		// (decisions/s9-editor-cinecam-preview.md); outside it, to the active camera.
++		if (gEnv->IsEditing() && !pCamera->IsEditorPreviewOwner())
++			reasons = "the viewport is not looking through this camera (Camera menu -> this entity)";
++
++		if (!pCamera->IsSceneReferred())
++		{
++			if (!reasons.empty())
++				reasons += "; ";
++			reasons += "the camera's Scene Referred switch is off";
++		}
++	}
++
++	if (reasons == m_lastReport)
+ 		return;
+ 
+-	if (m_pEntity->GetComponent<CCinematicCameraComponent>() != nullptr)
++	m_lastReport = reasons;
++
++	if (reasons.empty())
++	{
++		CryLog("[cinecam] entity '%s': the grade is live - the camera is publishing this "
++		       "component's CDL and look.", m_pEntity->GetName());
+ 		return;
++	}
+ 
+-	m_bLoggedNoCamera = true;
+-	CryLog("[cinecam] entity '%s' has a CineCam Grade with no Cinematic Camera on it - the grade "
+-	       "does nothing. Add a Cinematic Camera to the same entity.", m_pEntity->GetName());
++	// A warning and not a log line, for the same reason the missing ODT is one: the user has just
++	// dialled a value and the picture did not move, and the explanation has to be findable in a
++	// console full of asset spam.
++	CryWarning(VALIDATOR_MODULE_SYSTEM, VALIDATOR_WARNING,
++	           "[cinecam] entity '%s': this CineCam Grade is NOT in the picture - %s. The ASC CDL "
++	           "and the LMT are applied in ACEScct by the scene-referred output chain, so they do "
++	           "nothing on the stock path or through another camera.",
++	           m_pEntity->GetName(), reasons.c_str());
+ }
+diff --git a/Code/CryPlugins/CinematicCamera/Module/CineGradeComponent.h b/Code/CryPlugins/CinematicCamera/Module/CineGradeComponent.h
+index 57feba00..0a316ebb 100644
+--- a/Code/CryPlugins/CinematicCamera/Module/CineGradeComponent.h
++++ b/Code/CryPlugins/CinematicCamera/Module/CineGradeComponent.h
+@@ -21,6 +21,11 @@
+ // CSharedString: the reflected string type behind the .cube path property (LMT File).
+ #include <CrySchematyc/Utils/SharedString.h>
+ 
++// The camera this look belongs to. Forward-declared, never included: CinematicCameraComponent.h
++// includes THIS header (the camera reads the two structs below), so the dependency has exactly
++// one direction and the .cpp is where the two meet.
++class CCinematicCameraComponent;
++
+ // The camera's grade (SceneReferredSpec.md S5). ASC CDL in ACEScct, the interchange every
+ // grading tool speaks, applied to scene data before the output transform - not to a picture
+ // after it. Neutral by default: with these values the chain is exactly ACES 2.0 (D10).
+@@ -106,9 +111,10 @@ public:
+ 		desc.SetDescription(
+ 			"The look for the Cinematic Camera on the same entity: ASC CDL (slope, offset, "
+ 			"power, saturation) applied in ACEScct to scene data before the output transform, "
+-			"plus the LMT slot. Needs a Cinematic Camera on the same entity and the "
+-			"scene-referred path; on its own it does nothing. Neutral values are exact "
+-			"identities, so an untouched component is pure ACES 2.0.");
++			"plus the LMT slot. Needs a Cinematic Camera on the same entity WITH ITS SCENE "
++			"REFERRED SWITCH ON - the grade lives in that camera's output chain and does nothing "
++			"without it; the console says so if a value cannot reach the picture. Neutral values "
++			"are exact identities, so an untouched component is pure ACES 2.0.");
+ 		desc.SetIcon("icons:General/Camera.ico");
+ 		desc.SetComponentFlags({
+ 			IEntityComponent::EFlags::Singleton,
+@@ -129,13 +135,20 @@ public:
+ 	const SCineLookParams&  GetLook()  const { return m_look; }
+ 
+ private:
+-	//! One log line for the whole life of the component when there is no camera to grade. Not a
+-	//! warning per frame: an entity can legitimately carry the component for a moment while it is
+-	//! being built, and the message is only useful the first time.
+-	void WarnIfNoCameraSibling();
++	//! Say - once per distinct answer - why an edited look is not in the picture, or that it is.
++	//! A grade is inert unless three things are true at once, and none of them is visible from
++	//! this component's own inspector: there has to be a Cinematic Camera on the same entity, the
++	//! viewport (in the editor) has to be looking through it, and that camera's Scene Referred
++	//! switch has to be on, because the ASC CDL and the LMT are applied by the tone map's
++	//! scene-referred branch only. "Nothing happens and nothing is said" is the one outcome this
++	//! component must never produce; that is the whole reason this exists.
++	void ReportStatus(const CCinematicCameraComponent* pCamera);
+ 
+ 	SCineGradeParams m_grade;
+ 	SCineLookParams  m_look;
+ 
+-	bool m_bLoggedNoCamera = false;
++	//! The last thing ReportStatus() said, so that dragging a slider says it once and not once
++	//! per mouse move. Empty means "published"; unset (see the constructor default) means nothing
++	//! has been said yet.
++	string m_lastReport = "<unreported>";
+ };
+diff --git a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp
+index f9540c32..81799480 100644
+--- a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp
++++ b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp
+@@ -1782,6 +1782,28 @@ void CCinematicCameraComponent::ApplyGrade()
+ 	gEnv->p3DEngine->SetPostEffectParamVec4("Global_User_GradeOffset", Vec4(grade.offset.x, grade.offset.y, grade.offset.z, 0.0f));
+ 	gEnv->p3DEngine->SetPostEffectParamVec4("Global_User_GradePower",  Vec4(grade.power.x, grade.power.y, grade.power.z, 0.0f));
+ 	gEnv->p3DEngine->SetPostEffectParam("Global_User_GradeSaturation", (float)grade.saturation);
++
++	// Diagnostic, edge-triggered exactly like the white balance's below: one line per change of
++	// the CDL this camera publishes. It is the answer to "I moved a grade slider and the picture
++	// did not move" - a line means the value left the component, reached the bus and the reason
++	// lies further down the chain (the Scene Referred switch, which is where the tone map reads
++	// these params at all); no line means it never got here. Two float compares per frame.
++	{
++		const float sat = (float)grade.saturation;
++		if (fabs_tpl(grade.slope.x - m_lastLoggedGradeSlopeX) > 1e-4f ||
++		    fabs_tpl(sat - m_lastLoggedGradeSaturation) > 1e-4f)
++		{
++			m_lastLoggedGradeSlopeX = grade.slope.x;
++			m_lastLoggedGradeSaturation = sat;
++			CryLog("[CinematicCamera] grade published: slope %.3f/%.3f/%.3f offset %.3f/%.3f/%.3f "
++			       "power %.3f/%.3f/%.3f saturation %.3f%s (scene referred %s)",
++			       grade.slope.x, grade.slope.y, grade.slope.z,
++			       grade.offset.x, grade.offset.y, grade.offset.z,
++			       grade.power.x, grade.power.y, grade.power.z, sat,
++			       bBypass ? " BYPASSED" : "",
++			       m_sceneReferred.bSceneReferred ? "on" : "OFF - the tone map does not read these");
++		}
++	}
+ }
+ 
+ void CCinematicCameraComponent::RestoreGrade()
+diff --git a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
+index a90c23e2..3893da42 100644
+--- a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
++++ b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
+@@ -1173,6 +1173,13 @@ public:
+ 	static void OnLevelLoaded();
+ 	bool IsExposureEnabled() const { return m_exposure.bEnableExposure; }
+ 
++	//! The scene-referred switch, read by the sibling CineCam Grade component so it can say why a
++	//! look it holds is not in the picture. The ASC CDL and the LMT are applied by the tone map's
++	//! scene-referred branch ONLY (ToneMapping.cpp: `if (bSceneReferred)` around the camera
++	//! grading block), so with this switch off a grade is inert by construction - which looks
++	//! exactly like a broken component from the outside.
++	bool IsSceneReferred() const { return m_sceneReferred.bSceneReferred; }
++
+ 	//! A shape mask is in use and the iris is opened wider than Mask Aperture (the mask is the
+ 	//! smaller hole). Diagnostic only - every quantity below is continuous across this point.
+ 	bool IsMaskDomain() const;
+@@ -1423,6 +1430,12 @@ private:
+ 	// Edge-trigger state for the effective-T-stop log line, per component for the same reason.
+ 	float m_lastLoggedApertureN     = -1.f;
+ 	float m_lastLoggedTransmission  = -1.f;
++	// Edge-trigger state for the published-grade log line (ApplyGrade). Same shape and the same
++	// reason as the white balance's: "I changed a grade value and nothing happened" has to be
++	// answerable from the log, and the answer is either "the camera never published it" (no line)
++	// or "it is on the bus, look further down the chain" (a line with the values).
++	float m_lastLoggedGradeSlopeX   = -1.f;
++	float m_lastLoggedGradeSaturation = -1.f;
+ 
+ 	// Sprite bokeh saved state (r_DepthOfFieldMode cvar + Dof_User_BokehShapeTex post param).
+ 	// Unknown to an unmodified renderer, where the read returns nothing and the writes are dropped.
+diff --git a/Code/CryPlugins/CinematicCamera/README.md b/Code/CryPlugins/CinematicCamera/README.md
+index 2660e3a2..d4bbf88f 100644
+--- a/Code/CryPlugins/CinematicCamera/README.md
++++ b/Code/CryPlugins/CinematicCamera/README.md
+@@ -386,8 +386,17 @@ renderer's grade parameters and reads this component when it publishes, so the g
+ whichever camera is live for free, and `Bypass Grade` and the camera's restore path keep meaning
+ exactly what they meant before. **With no CineCam Grade on the entity the camera renders the
+ neutral grade** - no CDL, no look, pure ACES 2.0 - which is bit for bit what an untouched
+-component gives you. On an entity with no Cinematic Camera the component does nothing at all and
+-says so once in the log.
++component gives you.
++
++**A grade needs three things to be true at once**, and the console tells you the moment one of
++them is not, so that "I dialled a slope and nothing happened" is never a mystery: a Cinematic
++Camera on the same entity, **that camera's `Scene Referred` switch on** (the CDL and the LMT are
++applied by the scene-referred output chain - on the stock path the tone map does not read them at
++all), and, while editing, the viewport actually looking through that camera. Edit any property
++with one of them missing and a warning names every reason at once; when the grade is live, one log
++line says so. The camera also logs the CDL it publishes whenever the values change
++(`[CinematicCamera] grade published: ...`), so you can tell "the value never left the component"
++from "the value is on the bus".
+ 
+ Two consequences worth knowing:
+ 
+-- 
+2.47.1.windows.1
+

@@ -1,0 +1,532 @@
+From d49e019f92095be2780ef1294589b6c96f07800c Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Thu, 10 Sep 2026 07:59:31 +0800
+Subject: [PATCH 149/160] feat: the grade travels with the capture - an ASC
+ .cdl sidecar and an honest rec/cdl (S10 item 3a)
+
+A captured EXR now arrives in Resolve with the grade that made it, as a file
+Resolve can actually apply rather than a line a human has to retype.
+
+The sidecar is an ASC ColorDecisionList - urn:ASC:CDL:v1.01, one ColorDecision
+holding one ColorCorrection with SOPNode (Slope/Offset/Power) and SatNode
+(Saturation), six fixed decimals, element order as the ASC schema and
+cdl_convert write it. Nothing about the format is invented: the file has to open
+in an application this tree cannot test against. Resolve's ColorTrace lists .cdl
+and .ccc XML (and a CMX EDL carrying SOP in its comments) as the importable
+formats, and an individual file is brought in through Gallery -> Stills ->
+right-click -> Import and applied by hand, which is the right shape for a
+single-camera engine take.
+
+One file per TAKE, not per frame: <prefix>.cdl beside a sequence with the prefix
+as the ColorCorrection id, <prefix>.%06d.cdl beside a single frame (each single
+frame is its own take and already has its own number). It is claimed by the
+first frame of a capture and written when that frame's readback comes home - the
+first moment the numbers are known to belong to a file that exists - on the
+render thread, a few hundred bytes once per capture, because the writer job owns
+pixels and nothing else and the sidecar must sit beside the FIRST file rather
+than beside whichever one a job thread finished first. Naming follows the
+existing r_SceneReferredExportSequenceNaming (46f9e8e4) for free, since it is
+built from the same latched folder and prefix.
+
+A neutral grade is still written: a missing file cannot be told apart from a
+writer that failed, and an identity CDL is a positive statement.
+r_SceneReferredExportCDL 0 opts out.
+
+One CDL cannot describe an animated grade, and every grade property is now
+TrackView-animatable. Rather than silently standing by frame zero's numbers or
+spraying a file per frame, later frames are compared against what was written
+and ONE warning names the first frame at which the sidecar stopped being the
+whole truth. Each frame's own rec/cdl is still correct for that frame.
+
+Two defects in the existing metadata are fixed on the way, both found by reading
+it against ToneMapping.cpp:628-672:
+
+  * GatherMetadata() never read Global_User_GradeBypass, so a frame captured
+    with Bypass Grade ticked recorded a CDL that was demonstrably not in the
+    picture. A bypassed frame now carries the identity, marked "(bypassed)".
+  * it did not apply the renderer's 1e-4 floors on slope and power, so a header
+    could describe a frame that was not rendered.
+
+rec/cdl also moves from %g to the ASC's six fixed decimals, so the EXR header and
+the .cdl beside it can be compared by eye. The metadata struct now carries the
+CDL as numbers as well as text, which is what the sidecar writes from - the
+string is a readout, not a data path.
+
+Nothing about what an EXR CONTAINS has changed: the tap, the encoding, the
+attributes' meaning and the ring are untouched. Which tap you hold decides what
+the sidecar is for - beside a graded tap it is provenance (what was baked in),
+beside the negative it is the starting point (apply it and the day's grade is
+back). docs/SceneReferredExport.md gains section 4.1 for the format and 5.5 for
+the round trip that is this item's acceptance, including which camera operators
+have to be neutral for the comparison to be exact and what each shape of
+difference means.
+
+Decision: scene-notes/decisions/s10-grade-component.md section 3a.5.
+Research: scene-notes/research/s10-3a-wheels-cdl-trackview.md sections 1.3 and 5.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01ADgAiBYv9AxSd54s1FPREm
+---
+ .../RenderDll/Common/RendererCVars.cpp        |  13 ++
+ .../RenderDll/Common/RendererCVars.h          |   1 +
+ .../GraphicsPipeline/SceneReferredExport.cpp  | 183 +++++++++++++++++-
+ .../GraphicsPipeline/SceneReferredExport.h    |  29 +++
+ .../docs/SceneReferredExport.md               |  97 +++++++++-
+ 5 files changed, 312 insertions(+), 11 deletions(-)
+
+diff --git a/Code/CryEngine/RenderDll/Common/RendererCVars.cpp b/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
+index ed7067b4..5cdccdd7 100644
+--- a/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
++++ b/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
+@@ -429,6 +429,7 @@ int CRendererCVars::CV_r_SceneReferredExportTap;
+ int CRendererCVars::CV_r_SceneReferredExportSequenceNaming;
+ int CRendererCVars::CV_r_SceneReferredExportEncoding;
+ int CRendererCVars::CV_r_SceneReferredExportCompression;
++int CRendererCVars::CV_r_SceneReferredExportCDL;
+ float CRendererCVars::CV_r_SceneReferredExportFixedStep;
+ int CRendererCVars::CV_r_ShaftAtmosphereCondition;
+ float CRendererCVars::CV_r_ShaftAtmosphereRefLength;
+@@ -1935,6 +1936,18 @@ void CRendererCVars::InitCVars()
+ 	               "with a hex editor. Lossless compression makes the file size content-dependent, "
+ 	               "so a frame that suddenly compresses badly is a frame the writer takes longer "
+ 	               "over - the capture stops rather than dropping it.");
++	REGISTER_CVAR3("r_SceneReferredExportCDL", CV_r_SceneReferredExportCDL, 1, VF_NULL,
++	               "Write an ASC .cdl sidecar beside a capture. 1 = yes (default), 0 = no. "
++	               "One ColorDecisionList per TAKE - <prefix>.cdl beside a sequence, "
++	               "<prefix>.%06d.cdl beside a single frame - carrying the EFFECTIVE grade of the "
++	               "first captured frame as SOPNode + SatNode, with the take name as the "
++	               "ColorCorrection id. It is the same grade rec/cdl reports in every frame's EXR "
++	               "header, and it is what lets Resolve reproduce the engine picture: import it "
++	               "through Gallery -> Stills -> right-click -> Import and apply it to the clip. "
++	               "A NEUTRAL grade is still written - a missing file cannot be told apart from a "
++	               "writer that failed, and an identity CDL is a statement. A grade that is "
++	               "ANIMATED during a sequence cannot be one CDL: the sidecar keeps the first "
++	               "frame's numbers and the log says at which frame it stopped being the truth.");
+ 	REGISTER_CVAR3("r_SceneReferredExportFixedStep", CV_r_SceneReferredExportFixedStep, 1.0f / 30.0f, VF_NULL,
+ 	               "The frame time rec_CaptureEXR forces while a SEQUENCE is capturing, in seconds; "
+ 	               "t_FixedStep is saved on start and restored on stop. Outside the editor nothing "
+diff --git a/Code/CryEngine/RenderDll/Common/RendererCVars.h b/Code/CryEngine/RenderDll/Common/RendererCVars.h
+index d0c26129..07721b9f 100644
+--- a/Code/CryEngine/RenderDll/Common/RendererCVars.h
++++ b/Code/CryEngine/RenderDll/Common/RendererCVars.h
+@@ -431,6 +431,7 @@ public:
+ 	static int   CV_r_SceneReferredExportSequenceNaming;
+ 	static int   CV_r_SceneReferredExportEncoding;
+ 	static int   CV_r_SceneReferredExportCompression;
++	static int   CV_r_SceneReferredExportCDL;
+ 	static float CV_r_SceneReferredExportFixedStep;
+ 	static int   CV_r_ShaftAtmosphereCondition;
+ 	static float CV_r_ShaftAtmosphereRefLength;
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/SceneReferredExport.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/SceneReferredExport.cpp
+index 6f3a9780..054536bc 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/SceneReferredExport.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/SceneReferredExport.cpp
+@@ -87,6 +87,83 @@ string GetLutName(CEffectParam* pId, CEffectParam* pSize)
+ 	return CTexture::IsTextureExist(pTex) ? string(pTex->GetName()) : string();
+ }
+ 
++//! Whatever the operator typed, made safe to sit inside an XML attribute or element. Not an
++//! escaper - a filter: the two strings this is used on (the capture prefix and a LUT path) have no
++//! business carrying markup, and a `.cdl` a colourist cannot open because our take was called
++//! `a<b` would be a worse outcome than a take called `a_b`.
++string SanitiseForXml(const char* szText)
++{
++	string out;
++	for (const char* p = szText ? szText : ""; *p; ++p)
++	{
++		const char c = *p;
++		const bool bSafe = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')
++		                   || c == '_' || c == '-' || c == '.' || c == '/' || c == ' ';
++		out += bSafe ? c : '_';
++	}
++	return out;
++}
++
++//! The ASC .cdl sidecar (decisions/s10-grade-component.md section 3a.5).
++//!
++//! ColorDecisionList is one of the two XML formats Resolve's ColorTrace lists as importable
++//! (alongside .ccc and a CMX EDL carrying SOP in its comments); individual files are brought in
++//! through Gallery -> Stills -> right-click -> Import and applied to a clip by hand, which is the
++//! right shape for a single-camera engine take. Element order and namespace follow the ASC schema
++//! as cdl_convert writes it - InputDescription / ViewingDescription / Description* / ColorDecision*
++//! at the top level, Description* / SOPNode / SatNode inside a ColorCorrection - and the numbers
++//! are six fixed decimals, which is what every CDL in circulation carries. Nothing here is
++//! invented: a file this writes has to open in an application we cannot test against.
++bool WriteCdlSidecar(const char* szPath, const char* szId, const SSceneReferredExportMetadata& md)
++{
++	string xml;
++	string line;
++
++	xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n";
++	xml += "<ColorDecisionList xmlns=\"urn:ASC:CDL:v1.01\">\n";
++
++	// The one place the file can say where it came from. A colourist opening a stills bin full of
++	// these needs to know the working space the numbers were dialled in, because a CDL carries no
++	// colour space of its own - that is the format's oldest trap.
++	line.Format("  <Description>ReC Sandbox scene-referred capture - ASC CDL applied in ACEScct "
++	            "(AP1 primaries) before the output transform%s</Description>\n",
++	            md.bCdlBypassed ? "; the camera's Bypass Grade was ON, so this is the identity" : "");
++	xml += line;
++	if (!md.odtName.empty())
++	{
++		line.Format("  <ViewingDescription>%s</ViewingDescription>\n", SanitiseForXml(md.odtName.c_str()).c_str());
++		xml += line;
++	}
++
++	xml += "  <ColorDecision>\n";
++	line.Format("    <ColorCorrection id=\"%s\">\n", szId);
++	xml += line;
++	xml += "      <SOPNode>\n";
++	line.Format("        <Slope>%.6f %.6f %.6f</Slope>\n", md.cdlSlope.x, md.cdlSlope.y, md.cdlSlope.z);
++	xml += line;
++	line.Format("        <Offset>%.6f %.6f %.6f</Offset>\n", md.cdlOffset.x, md.cdlOffset.y, md.cdlOffset.z);
++	xml += line;
++	line.Format("        <Power>%.6f %.6f %.6f</Power>\n", md.cdlPower.x, md.cdlPower.y, md.cdlPower.z);
++	xml += line;
++	xml += "      </SOPNode>\n";
++	xml += "      <SatNode>\n";
++	line.Format("        <Saturation>%.6f</Saturation>\n", md.cdlSaturation);
++	xml += line;
++	xml += "      </SatNode>\n";
++	xml += "    </ColorCorrection>\n";
++	xml += "  </ColorDecision>\n";
++	xml += "</ColorDecisionList>\n";
++
++	// ICryPak and not the CRT, exactly as the EXR writer does (ExrImage.cpp:55).
++	FILE* pFile = gEnv->pCryPak->FOpen(szPath, "wb", ICryPak::FOPEN_ONDISK);
++	if (!pFile)
++		return false;
++
++	const size_t written = gEnv->pCryPak->FWrite(xml.c_str(), 1, xml.length(), pFile);
++	gEnv->pCryPak->FClose(pFile);
++	return written == xml.length();
++}
++
+ } // anonymous namespace
+ 
+ CSceneReferredExport& CSceneReferredExport::Get()
+@@ -157,6 +234,7 @@ bool CSceneReferredExport::StartSequence(const char* szFolder, const char* szPre
+ 	m_encoding = clamp_tpl(CRenderer::CV_r_SceneReferredExportEncoding, 0, 1);
+ 	m_state = eState_Sequence;
+ 
++	ArmCdlSidecar();
+ 	SetFixedStep(true);
+ 
+ 	CryLogAlways("[EXR] capture armed: '%s/%s.%%06d.exr' from %06d", m_folder.c_str(), m_prefix.c_str(), m_frameIndex);
+@@ -198,10 +276,21 @@ bool CSceneReferredExport::RequestSingleFrame(const char* szFolder, const char*
+ 	m_encoding = clamp_tpl(CRenderer::CV_r_SceneReferredExportEncoding, 0, 1);
+ 	m_state = eState_SingleFrame;
+ 
++	// A single frame is its own take, so it gets its own sidecar - and, unlike a sequence, its own
++	// number in the name, because the next single frame may carry a different grade entirely.
++	ArmCdlSidecar();
++
+ 	// No cadence to fix for one frame, so t_FixedStep is left alone.
+ 	return true;
+ }
+ 
++void CSceneReferredExport::ArmCdlSidecar()
++{
++	m_bCdlSidecarPending = true;
++	m_bCdlDriftWarned = false;
++	m_cdlSidecarText.clear();
++}
++
+ int CSceneReferredExport::FirstFreeIndex(const string& folder, const string& prefix, int nStartAt)
+ {
+ 	// FLAGS_PATH_REAL: the folder is already an absolute, adjusted path from ResolveCaptureFolder,
+@@ -325,16 +414,41 @@ void CSceneReferredExport::GatherMetadata(SSceneReferredExportMetadata& out) con
+ 		out.odtName = GetLutName(pPostMgr->GetLutODTParam(), pPostMgr->GetLutODTSizeParam());
+ 		out.lmtName = GetLutName(pPostMgr->GetLutLMTParam(), pPostMgr->GetLutLMTSizeParam());
+ 
+-		const Vec4 slope = pPostMgr->GetByNameVec4("Global_User_GradeSlope");
+-		const Vec4 offset = pPostMgr->GetByNameVec4("Global_User_GradeOffset");
+-		const Vec4 power = pPostMgr->GetByNameVec4("Global_User_GradePower");
+-		const float sat = pPostMgr->GetByNameF("Global_User_GradeSaturation");
++		// The EFFECTIVE CDL, i.e. what the tone map really evaluated - the same reasoning
++		// ToneMapping.cpp:628-672 applies, applied here so the file cannot disagree with the
++		// picture (decisions/s10-grade-component.md section 3a.5):
++		//
++		//   * Bypass Grade short-circuits the tone map's reads, so a bypassed frame has the
++		//     IDENTITY grade in it. Recording the camera's dialled numbers on such a frame would
++		//     hand Resolve a grade that was never in the picture - the defect this replaces.
++		//   * the 1e-4 floors on slope and power are the renderer's, and a header that omits them
++		//     describes a frame that was not rendered.
++		//
++		// Everything upstream of the bus - the colour wheels, contrast, the CDL base - has already
++		// been folded into these three triples by the camera (SCineGradeParams::Resolve), so this
++		// is the whole grade and not a part of it.
++		out.bCdlBypassed = pPostMgr->GetByNameF("Global_User_GradeBypass") > 0.5f;
++
++		if (!out.bCdlBypassed)
++		{
++			const Vec4 slope = pPostMgr->GetByNameVec4("Global_User_GradeSlope");
++			const Vec4 offset = pPostMgr->GetByNameVec4("Global_User_GradeOffset");
++			const Vec4 power = pPostMgr->GetByNameVec4("Global_User_GradePower");
++
++			out.cdlSlope = Vec3(max(slope.x, 1e-4f), max(slope.y, 1e-4f), max(slope.z, 1e-4f));
++			out.cdlOffset = Vec3(offset.x, offset.y, offset.z);
++			out.cdlPower = Vec3(max(power.x, 1e-4f), max(power.y, 1e-4f), max(power.z, 1e-4f));
++			out.cdlSaturation = max(pPostMgr->GetByNameF("Global_User_GradeSaturation"), 0.0f);
++		}
+ 
+-		// ASC order, ASC names, one line - the same numbers a .cdl carries, so a human reading the
+-		// header can type them into Resolve.
+-		out.cdl.Format("slope %g %g %g / offset %g %g %g / power %g %g %g / sat %g",
+-		               slope.x, slope.y, slope.z, offset.x, offset.y, offset.z,
+-		               power.x, power.y, power.z, sat);
++		// ASC order, ASC names, ASC number format - the same six decimals the .cdl sidecar beside
++		// this file carries, so the two can be compared by eye and a human reading the header can
++		// type them into Resolve.
++		out.cdl.Format("slope %.6f %.6f %.6f / offset %.6f %.6f %.6f / power %.6f %.6f %.6f / sat %.6f%s",
++		               out.cdlSlope.x, out.cdlSlope.y, out.cdlSlope.z,
++		               out.cdlOffset.x, out.cdlOffset.y, out.cdlOffset.z,
++		               out.cdlPower.x, out.cdlPower.y, out.cdlPower.z,
++		               out.cdlSaturation, out.bCdlBypassed ? " (bypassed)" : "");
+ 	}
+ }
+ 
+@@ -433,6 +547,43 @@ void CSceneReferredExport::EndFrame()
+ 	// every import is manual.
+ 	slot.path.Format("%s/%s.%06d.exr", m_folder.c_str(), m_prefix.c_str(), m_frameIndex);
+ 
++	// The ASC .cdl that travels with the take. Claimed by the FIRST frame of a capture and written
++	// when that frame's readback comes home; every later frame leaves cdlPath empty. See
++	// decisions/s10-grade-component.md section 3a.5 for why one per take rather than one per frame
++	// and why an identity grade is still written.
++	slot.cdlPath.clear();
++	slot.cdlId.clear();
++	if (CRenderer::CV_r_SceneReferredExportCDL != 0)
++	{
++		if (m_bCdlSidecarPending)
++		{
++			m_bCdlSidecarPending = false;
++			m_cdlSidecarText = slot.metadata.cdl;
++
++			if (m_state == eState_SingleFrame)
++			{
++				slot.cdlPath.Format("%s/%s.%06d.cdl", m_folder.c_str(), m_prefix.c_str(), m_frameIndex);
++				slot.cdlId.Format("%s.%06d", SanitiseForXml(m_prefix.c_str()).c_str(), m_frameIndex);
++			}
++			else
++			{
++				slot.cdlPath.Format("%s/%s.cdl", m_folder.c_str(), m_prefix.c_str());
++				slot.cdlId = SanitiseForXml(m_prefix.c_str());
++			}
++		}
++		else if (!m_bCdlDriftWarned && slot.metadata.cdl != m_cdlSidecarText)
++		{
++			// One CDL cannot describe an animated grade. Said once, naming the frame, instead of
++			// either silently standing by frame zero's numbers or spraying a file per frame.
++			m_bCdlDriftWarned = true;
++			CryWarning(VALIDATOR_MODULE_RENDERER, VALIDATOR_WARNING,
++			           "[EXR] the grade changed at frame %06d - the .cdl sidecar carries the grade of "
++			           "the FIRST frame of this capture and no longer describes the whole take. An "
++			           "animated grade has to be re-keyed in Resolve; rec/cdl in each frame's header "
++			           "still carries that frame's own numbers.", m_frameIndex);
++		}
++	}
++
+ 	pDevTex->DownloadToStagingResource(0);
+ 	slot.bIssued = true;
+ 	slot.fIssueTime = gEnv->pTimer->GetAsyncCurTime();
+@@ -501,6 +652,20 @@ bool CSceneReferredExport::ConsumeSlot(SRingSlot& slot)
+ 	pDevTex->AccessCurrStagingResource(0, false, copyOut);
+ 	slot.bIssued = false;
+ 
++	// The take's CDL, written now that this frame is known to have survived the round trip. A few
++	// hundred bytes once per capture, on the render thread, deliberately: the writer job owns
++	// pixels and nothing else, and the sidecar has to be beside the first file rather than beside
++	// whichever one a job thread happened to finish first.
++	if (!slot.cdlPath.empty())
++	{
++		if (WriteCdlSidecar(slot.cdlPath.c_str(), slot.cdlId.c_str(), slot.metadata))
++			CryLogAlways("[EXR] ASC CDL written: '%s' (%s)", slot.cdlPath.c_str(), slot.metadata.cdl.c_str());
++		else
++			CryWarning(VALIDATOR_MODULE_RENDERER, VALIDATOR_WARNING,
++			           "[EXR] could not write the ASC CDL sidecar '%s' - the frames are unaffected",
++			           slot.cdlPath.c_str());
++	}
++
+ 	// Everything the file will say about itself, decided here on the render thread while the
+ 	// camera state that produced these pixels is still the current one.
+ 	const bool bAces2065 = (m_encoding == eSceneReferredExportEncoding_ACES2065);
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/SceneReferredExport.h b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/SceneReferredExport.h
+index 05388d6d..0be18063 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/SceneReferredExport.h
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/SceneReferredExport.h
+@@ -53,6 +53,18 @@ struct SSceneReferredExportMetadata
+ 	string lensName;
+ 	string odtName;
+ 	string lmtName;
++
++	//! The EFFECTIVE ASC CDL - what the tone map really evaluated for this frame, not what the
++	//! camera was asked for: Bypass Grade folded in (a bypassed frame carries the identity,
++	//! because that is what is in the picture) and the renderer's own slope/power floors applied,
++	//! so that the numbers in the header and in the .cdl sidecar are the numbers the shader used.
++	Vec3   cdlSlope = Vec3(1.0f, 1.0f, 1.0f);
++	Vec3   cdlOffset = Vec3(0.0f, 0.0f, 0.0f);
++	Vec3   cdlPower = Vec3(1.0f, 1.0f, 1.0f);
++	float  cdlSaturation = 1.0f;
++	bool   bCdlBypassed = false;
++
++	//! The same numbers as one line, ASC order and ASC names, for the `rec/cdl` attribute.
+ 	string cdl;
+ 
+ 	float  focalLength;
+@@ -137,6 +149,13 @@ private:
+ 		SSceneReferredExportMetadata metadata;
+ 		string                       path;
+ 
++		//! Where this frame's ASC .cdl sidecar goes, and the id it carries - EMPTY on every frame
++		//! but the first of a capture. One CDL describes one grade and a take has one name, so the
++		//! sidecar is written once per capture, from the first frame that actually came back (the
++		//! first moment the numbers are known to belong to a file that exists).
++		string                       cdlPath;
++		string                       cdlId;
++
+ 		//! One writer job per ring slot, so the ring bounds the queue by construction. If a slot's
+ 		//! job is still running when the ring comes round to it, the disk is not keeping up and the
+ 		//! capture STOPS and says so - it never drops a frame, because a hole in a sequence is
+@@ -149,6 +168,8 @@ private:
+ 	bool ConsumeSlot(SRingSlot& slot);
+ 	void GatherMetadata(SSceneReferredExportMetadata& out) const;
+ 	void SetFixedStep(bool bEnable);
++	//! Arm the one-per-capture .cdl sidecar. Called from both arming paths.
++	void ArmCdlSidecar();
+ 
+ 	//! The first index for which <folder>/<prefix>.%06d.exr does not exist on disk, searched from
+ 	//! nStartAt upwards. The session counter is only a HINT into this: files deleted between two
+@@ -175,6 +196,14 @@ private:
+ 	//! to 0 whenever the destination changes, and only ever a starting point for the disk scan.
+ 	string                m_singleFrameKey;
+ 	int                   m_singleFrameNext = 0;
++
++	//! The .cdl sidecar, one per capture: armed on Start/Request, cleared by the first frame that
++	//! claims it. `m_cdlSidecarText` is what that frame wrote, kept only so that a LATER frame
++	//! whose grade has moved (a TrackView-animated grade, which one CDL cannot represent) can be
++	//! named once in a warning instead of silently disagreeing with the file.
++	bool                  m_bCdlSidecarPending = false;
++	bool                  m_bCdlDriftWarned = false;
++	string                m_cdlSidecarText;
+ 	int                   m_width;
+ 	int                   m_height;
+ 	const void*           m_pOwner;
+diff --git a/Code/CryPlugins/CinematicCamera/docs/SceneReferredExport.md b/Code/CryPlugins/CinematicCamera/docs/SceneReferredExport.md
+index f809114b..0e648575 100644
+--- a/Code/CryPlugins/CinematicCamera/docs/SceneReferredExport.md
++++ b/Code/CryPlugins/CinematicCamera/docs/SceneReferredExport.md
+@@ -110,8 +110,75 @@ Every frame carries its own header. The three that are load-bearing rather than
+ The rest: `owner`, `rec/specVersion`, `rec/schemaVersion`, `rec/frameIndex`, `rec/renderFrameId`,
+ `rec/engineTime`, `rec/fps`, `rec/cameraName`, `rec/focalLength_mm`, `rec/tStop`, `rec/iso`,
+ `rec/shutterTime_s` (also as the standard `expTime`), `rec/ndStops`, `rec/ev100`,
+-`rec/whiteBalance_K`, `rec/whiteBalance_tint`, `rec/cdl` (the ASC's numbers in the ASC's order),
+-`rec/odt`, `rec/lmt`.
++`rec/whiteBalance_K`, `rec/whiteBalance_tint`, `rec/cdl` (see below), `rec/odt`, `rec/lmt`.
++
++`rec/cdl` is the **effective** ASC CDL of that frame, in the ASC's own order and number format
++(six fixed decimals): what the tone map really evaluated, not what the camera was asked for. The
++colour wheels, contrast and the CDL base on the *CineCam Grade* component have already been folded
++into one slope/offset/power triple by the time it reaches the bus, `Bypass Grade` folds in as the
++identity — a bypassed frame carries `1 1 1 / 0 0 0 / 1 1 1 / 1 (bypassed)`, because that is what is
++in the picture — and the renderer's own `1e-4` floors on slope and power are applied, so the header
++describes the frame that was rendered rather than the numbers that were typed.
++
++---
++
++## 4.1 The ASC `.cdl` sidecar
++
++The header tells a *reader* what the grade was. The sidecar lets an *application* apply it.
++
++Every capture also writes one ASC ColorDecisionList beside the frames:
++
++| | |
++| --- | --- |
++| a sequence | `<folder>/<prefix>.cdl`, one per take, `id` = the prefix |
++| a single frame | `<folder>/<prefix>.%06d.cdl`, matching the frame's own name, `id` = `<prefix>.<number>` |
++
++It carries the first captured frame's effective CDL as `SOPNode` (Slope/Offset/Power) + `SatNode`
++(Saturation), in `urn:ASC:CDL:v1.01`, with a `Description` naming the working space — a CDL carries
++no colour space of its own, which is the format's oldest trap — and a `ViewingDescription` naming
++the ODT the engine was showing it through.
++
++```xml
++<?xml version="1.0" encoding="UTF-8"?>
++<ColorDecisionList xmlns="urn:ASC:CDL:v1.01">
++  <Description>ReC Sandbox scene-referred capture - ASC CDL applied in ACEScct (AP1 primaries) before the output transform</Description>
++  <ViewingDescription>Assets/ODT/odt_srgb_100nit_aces2_65.cube</ViewingDescription>
++  <ColorDecision>
++    <ColorCorrection id="take01">
++      <SOPNode>
++        <Slope>1.200000 1.000000 0.900000</Slope>
++        <Offset>0.020000 0.020000 0.020000</Offset>
++        <Power>1.000000 1.000000 1.000000</Power>
++      </SOPNode>
++      <SatNode>
++        <Saturation>1.000000</Saturation>
++      </SatNode>
++    </ColorCorrection>
++  </ColorDecision>
++</ColorDecisionList>
++```
++
++**Getting it into Resolve.** `.cdl` and `.ccc` XML are two of the three formats Resolve's ColorTrace
++accepts (the third is a CMX EDL carrying SOP in its comments). Individual files are imported on the
++**Gallery** page — right-click in the *Stills* tab → **Import** — and then applied to a clip by
++hand. Automatic per-shot linking needs an EDL whose metadata matches the timeline, which a
++single-camera engine take does not have and does not need.
++
++**Details worth knowing**
++
++* **A neutral grade is still written.** A missing file cannot be told apart from a writer that
++  failed; an identity CDL is a positive statement. `r_SceneReferredExportCDL 0` turns it off.
++* **One CDL cannot describe an animated grade.** Every grade property is animatable in TrackView;
++  if the grade moves during a sequence the sidecar keeps the **first** frame's numbers and the log
++  says at which frame it stopped being the whole truth. Each frame's own `rec/cdl` is still correct
++  for that frame.
++* **Which tap you are holding decides what the sidecar is FOR.** With `r_SceneReferredExportTap 0`
++  (graded) the CDL is already baked into the pixels and the file is provenance — what was applied,
++  so it can be read, matched or undone. With `r_SceneReferredExportTap 1` (negative) the pixels are
++  ungraded and the sidecar is the **starting point**: apply it in Resolve and the grade the camera
++  operator dialled on the day is back, exactly.
++* Only the numbers travel. The **look LUT** does not: `rec/lmt` names the `.cube` and the file
++  itself has to go with the media.
+ 
+ `rec/tStop` and not `aperture`: the T-stop is what the exposure is actually computed from here, and
+ `aperture` is the classic attribute name to get wrong — a photographic reading (f-number) and a
+@@ -190,6 +257,32 @@ conventions and a third party's idea of what our file means.
+ 6. **Record the Resolve version and its ACES version** next to the numbers. The reference moves
+    when Resolve updates.
+ 
++### 5.5 The grade round trip — the `.cdl` sidecar
++
++5.3 proves the *output transform* travels. This proves the *grade* travels, and it is the acceptance
++for the CineCam Grade component's wheels and contrast.
++
++The engine's scene-referred chain is
++`negative -> vignette x bloom -> white balance -> sensor clip -> ACEScct -> CDL -> LMT -> ODT`.
++Resolve, handed the negative and the sidecar, can do `ACEScct -> CDL -> ODT`. So the two agree
++**exactly** once the operators Resolve was not given are neutral — which is the point of the test,
++not a limitation of it:
++
++1. Neutralise the camera composites: bloom off (`r_HDRBloom 0`), the camera's **Vignette Amount**
++   at 0, `r_sunshafts 0` (the default), **White Balance** unticked, **LMT File** empty.
++2. Dial a grade on the *CineCam Grade* component that uses the wheels — e.g. Gain `1.2 / 1.0 / 0.9`,
++   Lift Master `+0.02`, Contrast `1.3`. Note the `[CinematicCamera] grade published:` line.
++3. `r_SceneReferredExportTap 1` (the negative), then `rec_CaptureEXRFrame` and a matching engine
++   screenshot. You get `frame.000000.exr` and `frame.000000.cdl`; the log line
++   `[EXR] ASC CDL written:` repeats the same numbers as step 2 — that alone catches a fold that has
++   gone wrong before Resolve is even opened.
++4. In Resolve, set up as in 5.3, import the EXR, then **Gallery → Stills → right-click → Import**
++   the `.cdl` and apply it to the clip. One node, nothing else.
++5. Deliver and compare as in 5.3. The budget is the same. A *uniform* difference means an operator
++   that was not neutralised in step 1; a difference only in the saturated areas means the saturation
++   coefficients disagree; a difference only in the deep shadows is the ACEScct toe and is expected
++   to be small.
++
+ ### 5.4 Reading a failure
+ 
+ The *shape* of the difference names the cause more usefully than its size does:
+-- 
+2.47.1.windows.1
+

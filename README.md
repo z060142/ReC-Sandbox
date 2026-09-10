@@ -44,6 +44,42 @@ What the path covers today:
 - **Export.** `rec_CaptureEXR` writes the pre-ODT buffer as OpenEXR; `rec_ImportHDRI` calibrates
   a measured HDRI into a probe.
 
+New in this preview, a grading desk for that path:
+
+- **A CineCam Grade component.** The look leaves the camera and becomes something you add: put
+  **CineCam Grade** on the same entity and it grades what that camera renders. Lift / Gamma / Gain
+  wheels with a master each, Contrast about a pivot, saturation and a raw ASC CDL base all fold on
+  the CPU into the single ASC CDL the shader already applies, so the wheels cost the renderer
+  nothing and a `.cdl` pasted in from Resolve stays exact. A value that cannot reach the picture
+  (no camera on the entity, Scene Referred off, the viewport not looking through it) now says so.
+- **Two curves.** A five-point master tone curve on ACEScct landmarks - each control an offset in
+  stops - and a five-point Sat vs Sat curve, interpolated with monotone cubic Hermite so a steep
+  control cannot ring around a highlight. They sit after the CDL and before the Look LUT, the order
+  a fixed-node grading desk uses. Neutral is an exact identity and issues no texture fetch.
+- **A Look slot that knows what space a LUT is in.** Every baked cube carries a
+  `# ReC-LUT-Space:` line, and a LUT tagged (or declared) as Rec.709 is wrapped at load - forward
+  output transform, LUT, inverse - so an ordinary display look LUT can be dropped straight in and
+  an identity one stays an identity. Cubes hot-reload when they change on disk
+  (`cinecam_LutHotReload`). Three shipped looks and an inverse output transform are baked by
+  `tools/ocio-bake/`.
+- **The grade travels with the take.** A capture writes an ASC `.cdl` sidecar beside the frames
+  (and a 1D `.cube` plus a `.curves.txt` when the curves are not neutral), so an EXR sequence opens
+  in Resolve with the grade that made it; sequences no longer overwrite the previous take
+  (`r_SceneReferredExportSequenceNaming`).
+- **Grade files are assets.** `.cube`, `.cdl` and `.cinegrade` are registered CryEngine asset
+  types under `Assets/cinecam/`, picked through the Asset Browser, and given their `.cryasset`
+  one file at a time as they are dropped into the folder - no Resource Compiler in the loop. A
+  whole grade exports as a `.cinegrade` preset and re-applies to another camera. This half is a
+  new Sandbox plugin, `Code/Sandbox/Plugins/CinematicCameraEditor`, built as a single
+  `EditorPlugins/` DLL.
+- **A dockable grade panel.** `Tools -> Cinematic Camera -> CineCam Grade` puts three real
+  hue/saturation wheels and every grade value in one window, bound to the selected entity,
+  read-only when there is nothing to edit, one undo step per drag.
+- **A source budget for sprite bokeh.** Physical brightness made the population of highlight
+  sprites explode. The pass now ranks candidate cells by their excess over the highlight threshold
+  and keeps the best `r_DepthOfFieldSpriteBokehMaxSources` (256); the rest hand their light back to
+  the gather, so a dropped highlight loses its iris shape, not its light.
+
 Status: verified on a physically lit interior and on the sample airfield in daylight; D3D11
 only; stock content needs re-lighting in physical units (see `docs/SceneReferredContent.md`).
 Two stock crashes found on the way are fixed here too (a lens flare on the wrong kind of light,
@@ -53,13 +89,14 @@ an ambient light asked to cast shadows). Besides the plugin and the renderer the
 deploy those too. User docs: `docs/SceneReferredContent.md` (light units, physical preset,
 probes, HDRI import), `SceneReferredCalibration.md`, `SceneReferredLook.md` (LUTs, grading),
 `SceneReferredExport.md` (EXR capture and the Resolve round trip). The baked ACES 2.0 LUTs live
-under `engine/Code/CryPlugins/CinematicCamera/Assets/ODT/`; `tools/ocio-bake/` regenerates them.
+under `engine/Code/CryPlugins/CinematicCamera/Assets/cinecam/luts/`; `tools/ocio-bake/`
+regenerates them.
 
 ## Layout
 
 | Path | What it is |
 | --- | --- |
-| `engine/` | The modified and added CRYENGINE files, in engine tree layout: the two plugins under `Code/CryPlugins/`, the renderer changes under `Code/CryEngine/RenderDll/`, the 3D-engine / entity changes under `Code/CryEngine/Cry3DEngine/` and `CryEntitySystem/`, the EXR writer (`Code/Libs/tinyexr`), and the shaders under `Engine/Shaders/`. `DELETED_FILES.txt` lists files removed from the stock tree. |
+| `engine/` | The modified and added CRYENGINE files, in engine tree layout: the two plugins under `Code/CryPlugins/`, the editor plugin under `Code/Sandbox/Plugins/`, the renderer changes under `Code/CryEngine/RenderDll/`, the 3D-engine / entity changes under `Code/CryEngine/Cry3DEngine/` and `CryEntitySystem/`, the EXR writer (`Code/Libs/tinyexr`), and the shaders under `Engine/Shaders/`. `DELETED_FILES.txt` lists files removed from the stock tree. |
 | `patches/` | The same changes as a numbered patch series (one patch per step) and `full.patch`, one cumulative diff against pristine 5.7.1. |
 | `docs/` | User documentation: the two plugin READMEs (parameters, workflow) and the console reference (commands and cvars). |
 | `tools/` | RenderDoc Python scripts used to measure the GPU cost of the added passes; `ocio-bake/` (ACES 2.0 LUT baking), `exr-check/` (EXR vs screenshot comparison), `bitcompare.py` (byte-identity check). |
@@ -82,8 +119,10 @@ and build `CryRenderD3D11`, `Cry3DEngine`, `CryEntitySystem`, `CryDefaultEntitie
 To use it in a project, copy the built engine DLLs and the two plugin DLLs into the engine's
 `bin/win_x64/`, the modified `.cfx` / `.cfi` shader files into
 `engine/shaders/HWScripts/CryFX/` (the engine compiles loose shader files at startup), the
-`Assets/ODT/*.cube` LUTs next to the project's assets, and add the plugins to the project's
-`.cryproject`. See `docs/` for the parameters.
+`Assets/cinecam/` tree (LUTs and their `.cryasset` sidecars) next to the project's assets, and
+add the plugins to the project's `.cryproject`. The Sandbox-side grade tools are a separate
+target, `CinematicCameraEditor`; copy that one DLL into the editor's `EditorPlugins/`. See
+`docs/` for the parameters.
 
 ## Related
 

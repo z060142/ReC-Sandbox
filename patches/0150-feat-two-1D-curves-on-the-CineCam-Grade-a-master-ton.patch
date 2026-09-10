@@ -1,0 +1,1836 @@
+From d5dc05ec1a93d827b8249a0d7f80b62ab0c50058 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Thu, 10 Sep 2026 08:56:27 +0800
+Subject: [PATCH 150/160] feat: two 1D curves on the CineCam Grade - a master
+ tone curve and Sat vs Sat (S10 item 3b)
+
+The shape a CDL cannot make, and the last thing the live desk was missing: one master
+(luma) curve applied identically to all three channels, and a Sat vs Sat curve that
+scales saturation as a function of how saturated a pixel already was.
+
+CHAIN POSITION - after the ASC CDL, before the LMT. Not invented: that is the fixed
+processing order every non-Freestyle grading mode in Pomfort Livegrade enforces (input
+transform -> primary adjustments = CDL and saturation -> secondary adjustments = curves
+-> output transform), and its ACES Advanced mode is literally this node set. Livegrade's
+own reason for fixing the order is ours too: it is what makes a CDL + LUT export
+possible. With nothing in front of the CDL, the .cdl sidecar shipped in d49e019f still
+describes the FRONT of the chain and still reproduces in Resolve as node 1, with the
+curves as node 2. Master curve before Sat vs Sat, because a per-channel tone curve
+changes chroma as a side effect and the saturation trim should see the final tonality.
+
+AUTHORING REPRESENTATION - five reflected floats per curve, not a curve widget. The
+widget route was traced all the way and rejected on evidence: a reflected
+ISplineEvaluator really does draw a curve row here (Schematyc hands any type with its
+own Serialize straight to yasli; the entity inspector is the legacy yasli tree; that
+tree registers PropertyRowCurve for ISplineEvaluator) - but the only CCurveEditorPanel
+in the whole 5.7.1 Sandbox is built by the Particle Editor, so in the level editor the
+row's edit broadcast has no receiver and the curve cannot be dragged. A spline is also
+not TrackView-animatable, cannot cross the post-effect bus, and turns "neutral is an
+exact identity" from a property into a measurement. Five floats are typeable, readable,
+animatable, and their neutral is a literal zero.
+
+Master curve knots sit at fixed ACEScct landmarks - the bottom of the encoding, four
+stops under 18% grey, 18% grey itself, four stops over, and ACEScct 1.0 (+10.3 stops) -
+and each control is an OFFSET IN STOPS, so the neutral is 0 and the read-out is the
+language the desk already uses. Sat vs Sat is five multipliers at 0/25/50/75/100% of
+measured saturation, neutral 1, which is Resolve's convention for that control.
+Interpolation is monotone cubic Hermite (Fritsch-Carlson): it cannot overshoot, so a
+steep knot does not ring around a highlight, and on collinear knots it collapses to the
+straight line exactly - the identity curve is bit-exact.
+
+SATURATION MEASURE - sat = saturate(length(c - luma709) * 2.0) in ACEScct, with the ASC
+Rec.709 luma weights the CDL saturation has used since 3a, and the multiplier applied
+about that same luma. It is the length of the very vector the multiplier scales, so
+pushing the curve to zero produces exactly the grey the operator produces; it keeps one
+meaning of "saturation" inside the component; and it is exposure-invariant, because the
+space is log and the weights sum to 1, so a stop shifts c and luma alike. x = 1 is 8.8
+stops of spread between the extreme channels; a strong red reads ~0.54, a near-primary
+~0.96, any neutral exactly 0. The scale rides in the shader constant rather than as an
+HLSL literal so the shader, the bake and the sidecar cannot disagree.
+
+RENDERER - one 1024x1 RGBA16F texture on t5 (R = master curve, G = the multiplier),
+LinearClamp on its own slot s2, uploaded by the plugin through UploadToVideoMemory with
+h = 1 and released by the same name-checked, id-safe path the 3D LUTs use. Two curves in
+two CHANNELS and not two rows: a two-row texture has to be sampled at the row centres
+exactly or a linear sampler bleeds one curve into the other, invisibly. A whole new
+float4 SceneCurveParams (grid N, master active, sat active, axis scale) because all
+three SceneCDL* .w lanes are spent and SceneWBRow1/2's free lanes belong to the
+white-balance step. Neither fetch is issued when its curve is neutral, so an unused
+curve is free and the neutral picture is bit-identical; the stock path never reaches any
+of it. The master curve is extended with slope 1 outside [0,1] rather than clamped,
+because the EXR tap is downstream and a capture must keep highlight separation the
+sensor recorded.
+
+EXPORT - the ASC CDL cannot carry either curve, so they travel as their own files, once
+per take and only when non-neutral (r_SceneReferredExportCurves).
+<prefix>.curve_master.cube is the master curve as a Resolve 1D LUT (LUT_1D_SIZE 1024),
+which applies mechanically on the node after the .cdl node. <prefix>.curves.txt carries
+both curves' control points plus the exact definition of the Sat vs Sat axis, because
+that curve is a multiplier indexed by a per-pixel measure and NOT a per-channel value
+mapping - a .cube of it would load, apply and be silently nonsense. rec/curves joins
+rec/cdl in every EXR header. Bypass Grade folds in as the neutral, exactly as it does
+for the CDL.
+
+To keep one definition of what the curve between two knots is, the knot positions, the
+interpolator, the bake and the neutrality tests live in a new shared header
+CryCommon/CryRenderer/SceneReferredCurves.h, included by the plugin (to bake the
+texture) and by CSceneReferredExport (to write the .cube) - the same kind of shared
+numeric truth RENDERER_LIGHT_UNIT_SCALE already is, rather than two evaluators to keep
+in step.
+
+All ten properties are TrackView-animatable, in a new Curves group; the Grade group's
+member ids and names are untouched.
+
+Research: scene-notes/research/s10-3b-curves.md.
+Decision: scene-notes/decisions/s10-grade-component.md section 3b.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01ADgAiBYv9AxSd54s1FPREm
+---
+ Code/CryEngine/CryCommon/CMakeLists.txt       |   1 +
+ .../CryRenderer/SceneReferredCurves.h         | 193 +++++++++++++++
+ .../Common/PostProcess/PostProcess.cpp        |  20 ++
+ .../Common/PostProcess/PostProcess.h          |  18 ++
+ .../RenderDll/Common/RendererCVars.cpp        |  12 +
+ .../RenderDll/Common/RendererCVars.h          |   1 +
+ .../GraphicsPipeline/SceneReferredExport.cpp  | 232 ++++++++++++++++++
+ .../GraphicsPipeline/SceneReferredExport.h    |  32 ++-
+ .../GraphicsPipeline/ToneMapping.cpp          |  40 ++-
+ .../CinematicCamera/Module/CineCamShared.h    |  17 +-
+ .../Module/CineGradeComponent.cpp             |  32 +++
+ .../Module/CineGradeComponent.h               | 134 +++++++++-
+ .../Module/CinematicCameraComponent.cpp       | 215 ++++++++++++++--
+ .../Module/CinematicCameraComponent.h         |   1 +
+ Code/CryPlugins/CinematicCamera/README.md     |  84 ++++++-
+ .../docs/SceneReferredExport.md               |  67 ++++-
+ .../CinematicCamera/docs/SceneReferredLook.md |  28 ++-
+ .../HWScripts/CryFX/HDRPostProcess.cfx        |  87 +++++++
+ 18 files changed, 1177 insertions(+), 37 deletions(-)
+ create mode 100644 Code/CryEngine/CryCommon/CryRenderer/SceneReferredCurves.h
+
+diff --git a/Code/CryEngine/CryCommon/CMakeLists.txt b/Code/CryEngine/CryCommon/CMakeLists.txt
+index 28fbcdb1..2564d837 100644
+--- a/Code/CryEngine/CryCommon/CMakeLists.txt
++++ b/Code/CryEngine/CryCommon/CMakeLists.txt
+@@ -594,6 +594,7 @@ add_sources("NoUberFile"
+ 		"CryPhysics/IntersectionTestQueue.h"
+ 	SOURCE_GROUP "CryRenderer"
+ 		"CryRenderer/IRenderer.h"
++		"CryRenderer/SceneReferredCurves.h"
+ 		"CryRenderer/IRenderMesh.h"
+ 		"CryRenderer/IRenderAuxGeom.h"
+ 		"CryRenderer/IStereoRenderer.h"
+diff --git a/Code/CryEngine/CryCommon/CryRenderer/SceneReferredCurves.h b/Code/CryEngine/CryCommon/CryRenderer/SceneReferredCurves.h
+new file mode 100644
+index 00000000..c7da9034
+--- /dev/null
++++ b/Code/CryEngine/CryCommon/CryRenderer/SceneReferredCurves.h
+@@ -0,0 +1,193 @@
++// Copyright 2026 ReC Sandbox. The scene-referred display chain's two 1D curves.
++//
++// ONE definition of what a curve IS, shared by the two modules that need it
++// (SceneReferredSpec.md S10 item 3b, decisions/s10-grade-component.md section 3b.5):
++//
++//   * CinematicCamera (the plugin) bakes the control points into the 1D LUT texture the tone map
++//     samples, and publishes the control points on the post-effect bus;
++//   * CryRenderD3D11 (CSceneReferredExport) reads those control points back off the bus and
++//     writes the master curve out as a Resolve 1D .cube beside a capture.
++//
++// Two copies of the interpolator would be exactly the CPU/GPU drift risk item 3a refused to take
++// when it folded contrast on the CPU rather than adding a shader constant. This header is the same
++// kind of shared numeric truth RENDERER_LIGHT_UNIT_SCALE and SSceneReferredMeterHistogram already
++// are, so nothing new is invented for it: header only, no state, no allocation, no dependency
++// beyond CryMath.
++#pragma once
++
++#include <CryMath/Cry_Math.h>
++
++namespace SceneReferredCurves
++{
++
++//! Five control points per curve - the on-set norm (black, shadow, mid, highlight, white) and the
++//! number a colourist's hands already know. Frozen: the bus layout, the reflected member names and
++//! the sidecar format all assume it.
++enum { kKnotCount = 5 };
++
++//! Entries in the baked 1D LUT. 1024 over the ACEScct domain is ~0.1 stop per texel before the
++//! sampler's own linear interpolation, i.e. far finer than the curve it is sampling, and the whole
++//! texture is 8 KiB in RGBA16F. There is no reason to be stingy here and every reason not to be
++//! visible.
++enum { kLutSize = 1024 };
++
++//! ACEScct(0.18) - 18 % grey, the one anchor the pre-exposure guarantees. Same landmark as
++//! CommonMath.cfi:269 and kACEScctMidGrey in CineGradeComponent.h.
++const float kACEScctMidGrey = 0.4135878f;
++
++//! ACESCCT_LOG_SCALE (CommonMath.cfi:280): one photographic stop is 1/17.52 of an ACEScct code
++//! value, above the toe. This is what makes "an offset in stops" an exact, linear thing to do to a
++//! knot's height.
++const float kACEScctStopsPerUnit = 17.52f;
++
++//! The Sat vs Sat curve's x axis: sat = saturate(length(c - luma) * this), in ACEScct, with the
++//! ASC Rec.709 luma weights the CDL saturation uses. x = 1 is therefore a chroma vector of length
++//! 0.5 in the log working space = 8.8 stops of spread between the extreme channels; measured
++//! against content a strong red reads ~0.54 and a near-primary ~0.96
++//! (decisions/s10-grade-component.md section 3b.3). Published to the shader in
++//! SceneCurveParams.w so that HLSL, C++ and the exported sidecar cannot disagree about it.
++const float kSatFullScale = 2.0f;
++
++//! The master curve's knots, as ACEScct code values: the bottom of the encoding, four stops under
++//! mid grey, mid grey, four stops over, and the top of the encoding (= +10.3 stops over grey,
++//! since ACEScctToLinear(1.0) = 222.86).
++inline const float* MasterKnotX()
++{
++	static const float s_x[kKnotCount] =
++	{
++		0.0f,
++		kACEScctMidGrey - 4.0f / kACEScctStopsPerUnit,
++		kACEScctMidGrey,
++		kACEScctMidGrey + 4.0f / kACEScctStopsPerUnit,
++		1.0f
++	};
++	return s_x;
++}
++
++//! The Sat vs Sat curve's knots, on the measured-saturation axis. Evenly spaced because that axis
++//! has no landmarks: it is a normalised distance from the grey axis, not a photographic quantity.
++inline const float* SatKnotX()
++{
++	static const float s_x[kKnotCount] = { 0.0f, 0.25f, 0.5f, 0.75f, 1.0f };
++	return s_x;
++}
++
++//! Monotone cubic Hermite interpolation - Fritsch & Carlson 1980, the PCHIP of every numerical
++//! library, with the Fritsch-Butland weighted harmonic mean for the interior tangents.
++//!
++//! Chosen over Catmull-Rom because Catmull-Rom overshoots between close knots, and an overshoot in
++//! a tone curve is visible ringing around a highlight. This one cannot overshoot: where two
++//! neighbouring secants disagree in sign the tangent is pinned to zero, and where they agree the
++//! harmonic mean is bounded by three times the smaller secant, which is Fritsch & Carlson's
++//! sufficient condition for monotonicity.
++//!
++//! The property that matters most here: on COLLINEAR knots every secant is equal, every tangent
++//! takes that value, and the cubic collapses to the straight line exactly (h00 + h01 = 1 and
++//! h01 + h10 + h11 = s). So an identity curve interpolates to an identity, at any knot spacing.
++//!
++//! x must be strictly increasing. t outside [x[0], x[n-1]] is clamped to the ends.
++inline float Evaluate(const float* x, const float* y, float t)
++{
++	float h[kKnotCount - 1];
++	float d[kKnotCount - 1];
++	for (int i = 0; i < kKnotCount - 1; ++i)
++	{
++		h[i] = max(x[i + 1] - x[i], 1e-6f);
++		d[i] = (y[i + 1] - y[i]) / h[i];
++	}
++
++	float m[kKnotCount];
++	m[0] = d[0];
++	m[kKnotCount - 1] = d[kKnotCount - 2];
++	for (int i = 1; i < kKnotCount - 1; ++i)
++	{
++		if (d[i - 1] * d[i] <= 0.0f)
++		{
++			// A local extremum: a flat tangent is what keeps the curve from running past the knot.
++			m[i] = 0.0f;
++		}
++		else
++		{
++			const float w1 = 2.0f * h[i] + h[i - 1];
++			const float w2 = h[i] + 2.0f * h[i - 1];
++			m[i] = (w1 + w2) / (w1 / d[i - 1] + w2 / d[i]);
++		}
++	}
++
++	if (t <= x[0])
++		return y[0];
++	if (t >= x[kKnotCount - 1])
++		return y[kKnotCount - 1];
++
++	int k = 0;
++	while (k < kKnotCount - 2 && t > x[k + 1])
++		++k;
++
++	const float s = (t - x[k]) / h[k];
++	const float s2 = s * s;
++	const float s3 = s2 * s;
++	const float h00 = 2.0f * s3 - 3.0f * s2 + 1.0f;
++	const float h10 = s3 - 2.0f * s2 + s;
++	const float h01 = -2.0f * s3 + 3.0f * s2;
++	const float h11 = s3 - s2;
++
++	return h00 * y[k] + h10 * h[k] * m[k] + h01 * y[k + 1] + h11 * h[k] * m[k + 1];
++}
++
++//! The master curve's knot HEIGHTS, from the five authored offsets in stops. Neutral (all zero) is
++//! y == x, i.e. the identity, exactly - which is the whole reason the property is an offset in
++//! stops rather than an absolute code value.
++inline void MasterKnotY(const float* pStops, float* pOutY)
++{
++	const float* const px = MasterKnotX();
++	for (int i = 0; i < kKnotCount; ++i)
++		pOutY[i] = px[i] + pStops[i] / kACEScctStopsPerUnit;
++}
++
++//! Exact tests, deliberately: the neutral value of an offset in stops is the literal 0.0f and of a
++//! multiplier the literal 1.0f, so "has the user touched this" needs no epsilon. A neutral curve's
++//! fetch is not issued at all, which is what makes an unused curve free and the neutral picture
++//! bit-identical to the build before this existed.
++inline bool IsMasterNeutral(const float* pStops)
++{
++	for (int i = 0; i < kKnotCount; ++i)
++		if (pStops[i] != 0.0f)
++			return false;
++	return true;
++}
++
++inline bool IsSatNeutral(const float* pMultipliers)
++{
++	for (int i = 0; i < kKnotCount; ++i)
++		if (pMultipliers[i] != 1.0f)
++			return false;
++	return true;
++}
++
++//! Sample the master curve onto a uniform grid over the ACEScct domain [0,1]. Sample i sits at
++//! i/(n-1), which is what a .cube's LUT_1D_SIZE means and what the shader's half-texel inset
++//! reproduces.
++//!
++//! The output is clamped to [-1, 2]: a knot dragged several stops can put the interpolant well
++//! outside anything the ODT can show, and an fp16 texel is not the place to find that out.
++inline void BakeMaster(const float* pStops, float* pOut, int n)
++{
++	float y[kKnotCount];
++	MasterKnotY(pStops, y);
++	const float* const px = MasterKnotX();
++	const float scale = 1.0f / (float)max(n - 1, 1);
++	for (int i = 0; i < n; ++i)
++		pOut[i] = clamp_tpl(Evaluate(px, y, (float)i * scale), -1.0f, 2.0f);
++}
++
++//! Sample the Sat vs Sat curve. Negative multipliers would invert the chroma vector - a colour
++//! rotated 180 degrees about grey - which is never what "less saturation" means, so the floor is 0.
++inline void BakeSat(const float* pMultipliers, float* pOut, int n)
++{
++	const float* const px = SatKnotX();
++	const float scale = 1.0f / (float)max(n - 1, 1);
++	for (int i = 0; i < n; ++i)
++		pOut[i] = clamp_tpl(Evaluate(px, pMultipliers, (float)i * scale), 0.0f, 4.0f);
++}
++
++} // namespace SceneReferredCurves
+diff --git a/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.cpp b/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.cpp
+index f94770ae..bebd3e90 100644
+--- a/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.cpp
++++ b/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.cpp
+@@ -434,6 +434,26 @@ int CPostEffectsMgr::Init()
+ 	AddParamVec4NoTransition("Global_User_GradePower", m_pUserGradePower, Vec4(1.0f, 1.0f, 1.0f, 0.0f));
+ 	AddParamFloatNoTransition("Global_User_GradeSaturation", m_pUserGradeSaturation, 1.0f);
+ 
++	// The two 1D curves (S10 item 3b, decisions/s10-grade-component.md section 3b): the master
++	// (luma) curve and Sat vs Sat, baked by ccam into ONE N x 1 fp16 texture - R the master curve,
++	// G the saturation multiplier - and applied between the ASC CDL and the LMT.
++	//
++	// The ten control points ride here as well, and not only the texture id, because the EXR
++	// exporter has to write the master curve out as a Resolve 1D .cube beside a capture: it
++	// re-evaluates them through the same header the plugin baked with
++	// (CryRenderer/SceneReferredCurves.h), so there is exactly one definition of what the curve
++	// between two knots is. `.w` of the two B params is the per-curve ACTIVE flag - the shader
++	// skips a neutral curve's fetch entirely, which is what makes an unused curve free.
++	//
++	// No transition, like everything else in this block: a curve is a decision, not a value to
++	// cross-fade, and fading a texture id is meaningless.
++	AddParamFloatNoTransition("Global_User_CurveLut", m_pUserCurveLut, 0.0f);
++	AddParamFloatNoTransition("Global_User_CurveLutSize", m_pUserCurveLutSize, 0.0f);
++	AddParamVec4NoTransition("Global_User_CurveMasterA", m_pUserCurveMasterA, Vec4(0.0f, 0.0f, 0.0f, 0.0f));
++	AddParamVec4NoTransition("Global_User_CurveMasterB", m_pUserCurveMasterB, Vec4(0.0f, 0.0f, 0.0f, 0.0f));
++	AddParamVec4NoTransition("Global_User_CurveSatA", m_pUserCurveSatA, Vec4(1.0f, 1.0f, 1.0f, 1.0f));
++	AddParamVec4NoTransition("Global_User_CurveSatB", m_pUserCurveSatB, Vec4(1.0f, 0.0f, 0.0f, 0.0f));
++
+ 	// The camera's identity and its exposure triangle, for the EXR header (SceneReferredSpec.md
+ 	// S6). Nothing in the renderer draws with these: they are metadata, published by ccam and read
+ 	// once per captured frame. They are on the bus rather than behind a new IRenderer method
+diff --git a/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.h b/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.h
+index 35d00de0..7d57e41c 100644
+--- a/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.h
++++ b/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.h
+@@ -525,6 +525,12 @@ public:
+ 		, m_pUserGradeOffset(nullptr)
+ 		, m_pUserGradePower(nullptr)
+ 		, m_pUserGradeSaturation(nullptr)
++		, m_pUserCurveLut(nullptr)
++		, m_pUserCurveLutSize(nullptr)
++		, m_pUserCurveMasterA(nullptr)
++		, m_pUserCurveMasterB(nullptr)
++		, m_pUserCurveSatA(nullptr)
++		, m_pUserCurveSatB(nullptr)
+ 		, m_pUserSunShaftsSuppressed(nullptr)
+ 	{
+ 		ClearCache();
+@@ -611,6 +617,11 @@ public:
+ 	CEffectParam* GetLutLMTParam() const     { return m_pUserLutLMT; }
+ 	CEffectParam* GetLutLMTSizeParam() const { return m_pUserLutLMTSize; }
+ 
++	//! The 1D curve LUT (S10 item 3b), resolved once at Init() for the same reason as the four
++	//! above: the tone map reads both every frame. Size 0 = neither curve is in the picture.
++	CEffectParam* GetCurveLutParam() const     { return m_pUserCurveLut; }
++	CEffectParam* GetCurveLutSizeParam() const { return m_pUserCurveLutSize; }
++
+ 	// Given a string returns containing value if exists, else returns 0
+ 	float       GetByNameF(const char* pszParam);
+ 	const char* GetByNameStr(const char* pszParam);
+@@ -738,6 +749,13 @@ protected:
+ 	// trade worth making.
+ 	CEffectParam*       m_pUserGradeBypass, * m_pUserGradeWBEnable, * m_pUserGradeWBKelvin, * m_pUserGradeWBTint;
+ 	CEffectParam*       m_pUserGradeSlope, * m_pUserGradeOffset, * m_pUserGradePower, * m_pUserGradeSaturation;
++	//! The two 1D curves of S10 item 3b - the master (luma) curve and Sat vs Sat - as ONE
++	//! N x 1 RGBA16F texture (R = master, G = the saturation multiplier) plus the ten control
++	//! points that produced it. Cached like the LUT slots because the tone map reads the id and
++	//! the size every frame; the control points are read only by the EXR exporter, at capture
++	//! time, by name, so that a `.cube` of the master curve can be written beside the frames.
++	CEffectParam*       m_pUserCurveLut, * m_pUserCurveLutSize;
++	CEffectParam*       m_pUserCurveMasterA, * m_pUserCurveMasterB, * m_pUserCurveSatA, * m_pUserCurveSatB;
+ 
+ 	//! The camera identity and settings an exported EXR carries in its header (S6 item 3). They
+ 	//! change nothing about the picture - they exist so that a frame on disk can say what took it.
+diff --git a/Code/CryEngine/RenderDll/Common/RendererCVars.cpp b/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
+index 5cdccdd7..1fa640fc 100644
+--- a/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
++++ b/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
+@@ -430,6 +430,7 @@ int CRendererCVars::CV_r_SceneReferredExportSequenceNaming;
+ int CRendererCVars::CV_r_SceneReferredExportEncoding;
+ int CRendererCVars::CV_r_SceneReferredExportCompression;
+ int CRendererCVars::CV_r_SceneReferredExportCDL;
++int CRendererCVars::CV_r_SceneReferredExportCurves;
+ float CRendererCVars::CV_r_SceneReferredExportFixedStep;
+ int CRendererCVars::CV_r_ShaftAtmosphereCondition;
+ float CRendererCVars::CV_r_ShaftAtmosphereRefLength;
+@@ -1948,6 +1949,17 @@ void CRendererCVars::InitCVars()
+ 	               "writer that failed, and an identity CDL is a statement. A grade that is "
+ 	               "ANIMATED during a sequence cannot be one CDL: the sidecar keeps the first "
+ 	               "frame's numbers and the log says at which frame it stopped being the truth.");
++	REGISTER_CVAR3("r_SceneReferredExportCurves", CV_r_SceneReferredExportCurves, 1, VF_NULL,
++	               "Write the CineCam Grade's two 1D curves beside a capture. 1 = yes (default), 0 = no. "
++	               "The ASC CDL cannot carry them, so they travel as their own files, once per TAKE and "
++	               "ONLY when a curve is doing something (unlike the .cdl, an absent file here is not "
++	               "ambiguous - the .cdl beside it always dates the take). "
++	               "<prefix>.curve_master.cube is the master (luma) curve as a Resolve 1D LUT, which "
++	               "applies mechanically on a node AFTER the .cdl node. <prefix>.curves.txt carries both "
++	               "curves' control points in plain text, because Sat vs Sat is a multiplier indexed by a "
++	               "per-pixel saturation measure and NOT a per-channel value mapping - a .cube of it would "
++	               "load, apply and be silently nonsense. Resolve has that control natively; the file says "
++	               "exactly how the measure is defined so the numbers can be retyped into it.");
+ 	REGISTER_CVAR3("r_SceneReferredExportFixedStep", CV_r_SceneReferredExportFixedStep, 1.0f / 30.0f, VF_NULL,
+ 	               "The frame time rec_CaptureEXR forces while a SEQUENCE is capturing, in seconds; "
+ 	               "t_FixedStep is saved on start and restored on stop. Outside the editor nothing "
+diff --git a/Code/CryEngine/RenderDll/Common/RendererCVars.h b/Code/CryEngine/RenderDll/Common/RendererCVars.h
+index 07721b9f..0fb1564b 100644
+--- a/Code/CryEngine/RenderDll/Common/RendererCVars.h
++++ b/Code/CryEngine/RenderDll/Common/RendererCVars.h
+@@ -432,6 +432,7 @@ public:
+ 	static int   CV_r_SceneReferredExportEncoding;
+ 	static int   CV_r_SceneReferredExportCompression;
+ 	static int   CV_r_SceneReferredExportCDL;
++	static int   CV_r_SceneReferredExportCurves;
+ 	static float CV_r_SceneReferredExportFixedStep;
+ 	static int   CV_r_ShaftAtmosphereCondition;
+ 	static float CV_r_ShaftAtmosphereRefLength;
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/SceneReferredExport.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/SceneReferredExport.cpp
+index 054536bc..66c415ea 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/SceneReferredExport.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/SceneReferredExport.cpp
+@@ -164,6 +164,146 @@ bool WriteCdlSidecar(const char* szPath, const char* szId, const SSceneReferredE
+ 	return written == xml.length();
+ }
+ 
++bool WriteTextFile(const char* szPath, const string& text)
++{
++	FILE* pFile = gEnv->pCryPak->FOpen(szPath, "wb", ICryPak::FOPEN_ONDISK);
++	if (!pFile)
++		return false;
++
++	const size_t written = gEnv->pCryPak->FWrite(text.c_str(), 1, text.length(), pFile);
++	gEnv->pCryPak->FClose(pFile);
++	return written == text.length();
++}
++
++//! The master (luma) curve as a Resolve 1D `.cube` (decisions/s10-grade-component.md section 3b.5).
++//!
++//! A per-channel tone curve IS a 1D LUT, so this is the one part of the curve pair that transfers
++//! mechanically: drop it on a node AFTER the .cdl node and the engine's tone curve is reproduced.
++//! The three columns are identical by construction - the master curve is one curve applied to all
++//! three channels, which is what makes it a tone curve and not a colour operation.
++//!
++//! It is sampled at LUT_1D_SIZE = the same grid the GPU texture holds, through the same
++//! interpolator the plugin baked with, so the file and the picture cannot disagree.
++//!
++//! Known limitation, stated in the file itself: a 1D LUT's domain is [0,1] and the shader extends
++//! the curve with slope 1 above it, so scene values past ACEScct 1.0 (+10.3 stops over grey) are
++//! carried by the engine and not by this file. Nothing reaches the display up there anyway - the
++//! ODT LUT's own domain ends at the same place - so it matters only for the EXR tap.
++bool WriteCurveMasterCube(const char* szPath, const char* szTitle, const SSceneReferredExportMetadata& md)
++{
++	std::vector<float> samples(SceneReferredCurves::kLutSize);
++	SceneReferredCurves::BakeMaster(md.curveMasterStops, samples.data(), SceneReferredCurves::kLutSize);
++
++	string text;
++	string line;
++	text += "# ReC Sandbox - CineCam Grade master (luma) curve\n";
++	text += "# Working space: ACEScct (AP1 primaries). Apply on a node AFTER the ASC CDL beside\n";
++	text += "# this file; see the .curves.txt sidecar for the full chain order.\n";
++	line.Format("# Knot offsets in stops: %.4f %.4f %.4f %.4f %.4f\n",
++	            md.curveMasterStops[0], md.curveMasterStops[1], md.curveMasterStops[2],
++	            md.curveMasterStops[3], md.curveMasterStops[4]);
++	text += line;
++	text += "# Domain [0,1]; the engine extends the curve with slope 1 outside it, which a 1D LUT\n";
++	text += "# cannot carry. Only matters above ACEScct 1.0 = +10.3 stops over 18% grey.\n";
++	line.Format("TITLE \"%s\"\n", szTitle);
++	text += line;
++	line.Format("LUT_1D_SIZE %d\n", (int)SceneReferredCurves::kLutSize);
++	text += line;
++
++	for (int i = 0; i < SceneReferredCurves::kLutSize; ++i)
++	{
++		line.Format("%.6f %.6f %.6f\n", samples[i], samples[i], samples[i]);
++		text += line;
++	}
++
++	return WriteTextFile(szPath, text);
++}
++
++//! Both curves' control points, in plain text, because one of them has nowhere else to go.
++//!
++//! Sat vs Sat is a MULTIPLIER indexed by a per-pixel saturation measure, not a per-channel value
++//! mapping, so it is not a 1D LUT and a `.cube` of it would load, apply and be silently nonsense.
++//! Resolve has the control natively; what a colourist needs from us is the numbers and the exact
++//! definition of the axis they were dialled against. That is what this file is.
++bool WriteCurvesText(const char* szPath, const char* szTitle, const SSceneReferredExportMetadata& md)
++{
++	using namespace SceneReferredCurves;
++
++	string text;
++	string line;
++
++	text += "ReC Sandbox - CineCam Grade curves\n";
++	line.Format("take: %s\n", szTitle);
++	text += line;
++	text += "\n";
++	text += "The engine's display chain, in order:\n";
++	text += "  white balance -> sensor clip -> ACEScct -> ASC CDL (+saturation)\n";
++	text += "  -> MASTER CURVE -> SAT vs SAT -> look LUT (LMT) -> [EXR tap] -> output transform\n";
++	text += "The .cdl beside this file is the ASC CDL step, and it is the FRONT of the chain, so\n";
++	text += "these curves belong on the node AFTER it.\n";
++	text += "\n";
++
++	if (md.bCurveMaster)
++	{
++		const float* const px = MasterKnotX();
++		text += "MASTER (LUMA) CURVE - one curve, applied identically to all three channels in\n";
++		text += "ACEScct. Monotone cubic Hermite (Fritsch-Carlson) through five knots.\n";
++		text += "  knot            x (ACEScct)   offset (stops)   y (ACEScct)\n";
++		static const char* const s_names[kKnotCount] = { "black    ", "shadow   ", "mid grey ", "highlight", "white    " };
++		float y[kKnotCount];
++		MasterKnotY(md.curveMasterStops, y);
++		for (int i = 0; i < kKnotCount; ++i)
++		{
++			line.Format("  %s        %.6f      %+.4f          %.6f\n",
++			            s_names[i], px[i], md.curveMasterStops[i], y[i]);
++			text += line;
++		}
++		text += "  (mid grey is ACEScct(0.18); shadow and highlight are 4 stops either side;\n";
++		text += "   white is ACEScct 1.0 = +10.3 stops over grey.)\n";
++		text += "The same curve is beside this file as a Resolve 1D .cube.\n";
++		text += "\n";
++	}
++	else
++	{
++		text += "MASTER (LUMA) CURVE: neutral (identity).\n\n";
++	}
++
++	if (md.bCurveSat)
++	{
++		const float* const px = SatKnotX();
++		text += "SAT vs SAT - the OUTPUT SATURATION MULTIPLIER as a function of the measured input\n";
++		text += "saturation. Same interpolation. 1.0 means unchanged, which is Resolve's Sat vs Sat\n";
++		text += "convention (a flat line = no change).\n";
++		text += "  input saturation   output multiplier\n";
++		for (int i = 0; i < kKnotCount; ++i)
++		{
++			line.Format("  %.2f               %.4f\n", px[i], md.curveSatMult[i]);
++			text += line;
++		}
++		text += "\n";
++		text += "HOW THE INPUT SATURATION IS MEASURED (this is the part that has to be transferred\n";
++		text += "by eye, because no interchange format carries it):\n";
++		text += "  luma = dot(c, (0.2126, 0.7152, 0.0722))    <- the ASC CDL's own Rec.709 weights\n";
++		line.Format("  sat  = saturate(length(c - luma) * %.4f)\n", kSatFullScale);
++		text += line;
++		text += "  out  = luma + (c - luma) * multiplier\n";
++		text += "with c in ACEScct. So the axis is the LENGTH of the very vector the multiplier\n";
++		text += "scales, and it is exposure-invariant: the space is log and the weights sum to 1,\n";
++		text += "so a stop shifts c and luma by the same amount and leaves c - luma alone.\n";
++		line.Format("sat = 1 is a chroma vector of length %.3f in ACEScct = %.1f stops of spread\n",
++		            1.0f / kSatFullScale, 17.52f / kSatFullScale);
++		text += line;
++		text += "between the extreme channels. For scale: an ordinary strong red reads about 0.54,\n";
++		text += "a near-primary about 0.96, and any neutral reads exactly 0.\n";
++	}
++	else
++	{
++		text += "SAT vs SAT: neutral (multiplier 1 everywhere).\n";
++	}
++
++	return WriteTextFile(szPath, text);
++}
++
+ } // anonymous namespace
+ 
+ CSceneReferredExport& CSceneReferredExport::Get()
+@@ -289,6 +429,7 @@ void CSceneReferredExport::ArmCdlSidecar()
+ 	m_bCdlSidecarPending = true;
+ 	m_bCdlDriftWarned = false;
+ 	m_cdlSidecarText.clear();
++	m_bCurveSidecarPending = true;
+ }
+ 
+ int CSceneReferredExport::FirstFreeIndex(const string& folder, const string& prefix, int nStartAt)
+@@ -441,6 +582,44 @@ void CSceneReferredExport::GatherMetadata(SSceneReferredExportMetadata& out) con
+ 			out.cdlSaturation = max(pPostMgr->GetByNameF("Global_User_GradeSaturation"), 0.0f);
+ 		}
+ 
++		// The two 1D curves (S10 item 3b), on exactly the same terms as the CDL above: what the
++		// tone map really evaluated. Bypass Grade takes the curves out with the CDL and the LMT -
++		// the renderer only reads the active flags inside the !bBypass branch - so a bypassed
++		// frame carries the neutral here too, and no curve sidecar is written for it.
++		if (!out.bCdlBypassed)
++		{
++			const Vec4 masterA = pPostMgr->GetByNameVec4("Global_User_CurveMasterA");
++			const Vec4 masterB = pPostMgr->GetByNameVec4("Global_User_CurveMasterB");
++			const Vec4 satA = pPostMgr->GetByNameVec4("Global_User_CurveSatA");
++			const Vec4 satB = pPostMgr->GetByNameVec4("Global_User_CurveSatB");
++
++			out.curveMasterStops[0] = masterA.x;
++			out.curveMasterStops[1] = masterA.y;
++			out.curveMasterStops[2] = masterA.z;
++			out.curveMasterStops[3] = masterA.w;
++			out.curveMasterStops[4] = masterB.x;
++			out.bCurveMaster = masterB.y > 0.5f;
++
++			out.curveSatMult[0] = satA.x;
++			out.curveSatMult[1] = satA.y;
++			out.curveSatMult[2] = satA.z;
++			out.curveSatMult[3] = satA.w;
++			out.curveSatMult[4] = satB.x;
++			out.bCurveSat = satB.y > 0.5f;
++		}
++
++		if (out.bCurveMaster || out.bCurveSat)
++		{
++			out.curves.Format("master %+.4f %+.4f %+.4f %+.4f %+.4f stops / satvsat %.4f %.4f "
++			                  "%.4f %.4f %.4f%s%s",
++			                  out.curveMasterStops[0], out.curveMasterStops[1], out.curveMasterStops[2],
++			                  out.curveMasterStops[3], out.curveMasterStops[4],
++			                  out.curveSatMult[0], out.curveSatMult[1], out.curveSatMult[2],
++			                  out.curveSatMult[3], out.curveSatMult[4],
++			                  out.bCurveMaster ? "" : " (master neutral)",
++			                  out.bCurveSat ? "" : " (sat neutral)");
++		}
++
+ 		// ASC order, ASC names, ASC number format - the same six decimals the .cdl sidecar beside
+ 		// this file carries, so the two can be compared by eye and a human reading the header can
+ 		// type them into Resolve.
+@@ -584,6 +763,28 @@ void CSceneReferredExport::EndFrame()
+ 		}
+ 	}
+ 
++	// The two curve sidecars, claimed by the same first frame and on the same one-per-take terms -
++	// but only when a curve is actually doing something. An absent curve file is not ambiguous the
++	// way an absent .cdl would be, because the .cdl is always there and dates the take; writing a
++	// pair of "this curve is neutral" files beside every capture would be noise.
++	slot.curveCubePath.clear();
++	slot.curveTextPath.clear();
++	if (CRenderer::CV_r_SceneReferredExportCurves != 0 && m_bCurveSidecarPending
++	    && (slot.metadata.bCurveMaster || slot.metadata.bCurveSat))
++	{
++		m_bCurveSidecarPending = false;
++
++		string base;
++		if (m_state == eState_SingleFrame)
++			base.Format("%s/%s.%06d", m_folder.c_str(), m_prefix.c_str(), m_frameIndex);
++		else
++			base.Format("%s/%s", m_folder.c_str(), m_prefix.c_str());
++
++		slot.curveTextPath = base + ".curves.txt";
++		if (slot.metadata.bCurveMaster)
++			slot.curveCubePath = base + ".curve_master.cube";
++	}
++
+ 	pDevTex->DownloadToStagingResource(0);
+ 	slot.bIssued = true;
+ 	slot.fIssueTime = gEnv->pTimer->GetAsyncCurTime();
+@@ -666,6 +867,31 @@ bool CSceneReferredExport::ConsumeSlot(SRingSlot& slot)
+ 			           slot.cdlPath.c_str());
+ 	}
+ 
++	// The curves, on the same thread and for the same reason. The take's name is the sidecar's
++	// title; it was sanitised for the .cdl's XML id and is reused here so the three files agree.
++	if (!slot.curveTextPath.empty())
++	{
++		const string title = SanitiseForXml(m_prefix.c_str());
++
++		if (WriteCurvesText(slot.curveTextPath.c_str(), title.c_str(), slot.metadata))
++			CryLogAlways("[EXR] grade curves written: '%s' (%s)", slot.curveTextPath.c_str(), slot.metadata.curves.c_str());
++		else
++			CryWarning(VALIDATOR_MODULE_RENDERER, VALIDATOR_WARNING,
++			           "[EXR] could not write the curve sidecar '%s' - the frames are unaffected",
++			           slot.curveTextPath.c_str());
++
++		if (!slot.curveCubePath.empty())
++		{
++			if (WriteCurveMasterCube(slot.curveCubePath.c_str(), title.c_str(), slot.metadata))
++				CryLogAlways("[EXR] master curve written: '%s' (1D cube, %d entries)",
++				             slot.curveCubePath.c_str(), (int)SceneReferredCurves::kLutSize);
++			else
++				CryWarning(VALIDATOR_MODULE_RENDERER, VALIDATOR_WARNING,
++				           "[EXR] could not write the master curve LUT '%s' - the frames are unaffected",
++				           slot.curveCubePath.c_str());
++		}
++	}
++
+ 	// Everything the file will say about itself, decided here on the render thread while the
+ 	// camera state that produced these pixels is still the current one.
+ 	const bool bAces2065 = (m_encoding == eSceneReferredExportEncoding_ACES2065);
+@@ -727,6 +953,12 @@ bool CSceneReferredExport::ConsumeSlot(SRingSlot& slot)
+ 		a.push_back(SExrAttribute::String("rec/lmt", md.lmtName));
+ 	if (!md.cdl.empty())
+ 		a.push_back(SExrAttribute::String("rec/cdl", md.cdl));
++	// The two 1D curves, when either is in the frame. Absent means neutral - which is honest here,
++	// unlike rec/cdl, because a CDL is always evaluated and a curve genuinely is not sampled at all
++	// when it is neutral. Written per FRAME, so an animated curve is still fully described even
++	// though the take's sidecar can only carry the first frame's.
++	if (!md.curves.empty())
++		a.push_back(SExrAttribute::String("rec/curves", md.curves));
+ 
+ 	TSceneReferredExportJob job(pJob);
+ 	job.SetPriorityLevel(JobManager::eLowPriority);
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/SceneReferredExport.h b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/SceneReferredExport.h
+index 0be18063..4786d09f 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/SceneReferredExport.h
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/SceneReferredExport.h
+@@ -7,6 +7,10 @@
+ #include "Common/Textures/Image/ExrImage.h"
+ 
+ #include <CryThreading/IJobManager.h>
++// The shared definition of the display chain's two 1D curves. The plugin bakes them into the LUT
++// texture with this header; the master curve's .cube sidecar below is evaluated with the same one,
++// so there is exactly one answer to what the curve between two knots is.
++#include <CryRenderer/SceneReferredCurves.h>
+ 
+ class CTexture;
+ 
+@@ -67,6 +71,18 @@ struct SSceneReferredExportMetadata
+ 	//! The same numbers as one line, ASC order and ASC names, for the `rec/cdl` attribute.
+ 	string cdl;
+ 
++	//! The two 1D curves of S10 item 3b, exactly as the camera published them: the master curve's
++	//! five knot offsets IN STOPS and the five Sat vs Sat multipliers. Zeroed to the neutral when
++	//! Bypass Grade was on, for the same reason the CDL is - the file has to describe the picture
++	//! that was rendered, not the numbers that were typed.
++	float  curveMasterStops[SceneReferredCurves::kKnotCount] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
++	float  curveSatMult[SceneReferredCurves::kKnotCount] = { 1.0f, 1.0f, 1.0f, 1.0f, 1.0f };
++	bool   bCurveMaster = false;
++	bool   bCurveSat = false;
++
++	//! Both curves as one line, for the `rec/curves` attribute. Empty when neither is in the frame.
++	string curves;
++
+ 	float  focalLength;
+ 	float  tStop;
+ 	float  iso;
+@@ -156,6 +172,13 @@ private:
+ 		string                       cdlPath;
+ 		string                       cdlId;
+ 
++		//! Where this capture's two curve sidecars go - the master curve as a Resolve 1D .cube and
++		//! both curves' control points as text. Empty on every frame but the first of a capture,
++		//! and empty for the whole capture when neither curve is doing anything: unlike the .cdl,
++		//! an absent curve file is not ambiguous, because the .cdl beside it always dates the take.
++		string                       curveCubePath;
++		string                       curveTextPath;
++
+ 		//! One writer job per ring slot, so the ring bounds the queue by construction. If a slot's
+ 		//! job is still running when the ring comes round to it, the disk is not keeping up and the
+ 		//! capture STOPS and says so - it never drops a frame, because a hole in a sequence is
+@@ -168,7 +191,8 @@ private:
+ 	bool ConsumeSlot(SRingSlot& slot);
+ 	void GatherMetadata(SSceneReferredExportMetadata& out) const;
+ 	void SetFixedStep(bool bEnable);
+-	//! Arm the one-per-capture .cdl sidecar. Called from both arming paths.
++	//! Arm the one-per-capture sidecars - the .cdl and the two curve files. Called from both
++	//! arming paths.
+ 	void ArmCdlSidecar();
+ 
+ 	//! The first index for which <folder>/<prefix>.%06d.exr does not exist on disk, searched from
+@@ -204,6 +228,12 @@ private:
+ 	bool                  m_bCdlSidecarPending = false;
+ 	bool                  m_bCdlDriftWarned = false;
+ 	string                m_cdlSidecarText;
++
++	//! The curve sidecars, armed and claimed the same way. Separate from the CDL's flag because the
++	//! two are gated by different cvars AND because the curve files are only written when a curve
++	//! is doing something - a capture whose curves are neutral must not consume the claim and then
++	//! write nothing, or a later frame could not write them either.
++	bool                  m_bCurveSidecarPending = false;
+ 	int                   m_width;
+ 	int                   m_height;
+ 	const void*           m_pOwner;
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.cpp
+index 5ace847f..84c55297 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.cpp
+@@ -12,6 +12,9 @@
+ #include "SceneReferredExport.h"
+ 
+ #include <Common/RenderDisplayContext.h>
++// The shared definition of the display chain's two 1D curves (S10 item 3b). Used here only for
++// the axis constant the shader is fed; the exporter uses the interpolator itself.
++#include <CryRenderer/SceneReferredCurves.h>
+ 
+ // Mechanical light loss of the field-dependent pupil, packed for HDRVignetteParams
+ // (.y = barrel offset per unit field height, .z = barrel radius, .w = diagnostic flag).
+@@ -339,6 +342,12 @@ void CToneMappingStage::Execute()
+ 	CTexture* pOdtTex = CRendererResources::s_ptexWhite3D;
+ 	float fLmtSize = 0.0f;
+ 	float fOdtSize = 0.0f;
++	// The two 1D curves (S10 item 3b) travel as ONE N x 1 fp16 texture - R the master curve, G the
++	// Sat vs Sat multiplier - resolved by exactly the same rule as the two 3D LUTs above: a size
++	// of 0 means neither curve is in the picture and the shader issues no fetch at all. The 2D
++	// stand-in is s_ptexWhite (not White3D) because this one is a Texture2D.
++	CTexture* pCurveTex = CRendererResources::s_ptexWhite;
++	float fCurveSize = 0.0f;
+ 	if (bSceneReferredLook)
+ 	{
+ 		if (CPostEffectsMgr* pPostMgr = PostEffectMgr())
+@@ -362,6 +371,7 @@ void CToneMappingStage::Execute()
+ 
+ 			resolveLut(pPostMgr->GetLutLMTParam(), pPostMgr->GetLutLMTSizeParam(), pLmtTex, fLmtSize);
+ 			resolveLut(pPostMgr->GetLutODTParam(), pPostMgr->GetLutODTSizeParam(), pOdtTex, fOdtSize);
++			resolveLut(pPostMgr->GetCurveLutParam(), pPostMgr->GetCurveLutSizeParam(), pCurveTex, fCurveSize);
+ 		}
+ 	}
+ 
+@@ -388,7 +398,7 @@ void CToneMappingStage::Execute()
+ 	                  ((int)bSceneReferredExp << 15) | ((int)bSceneReferredLook << 16);
+ 
+ 	if (m_passToneMapping.IsDirty(featureMask, pSunShaftsTex->GetTextureID(), pColorChartTex->GetTextureID(), CRendererResources::s_ptexCurLumTexture->GetTextureID(),
+-	                              pLmtTex->GetTextureID(), pOdtTex->GetTextureID(),
++	                              pLmtTex->GetTextureID(), pOdtTex->GetTextureID(), pCurveTex->GetTextureID(),
+ 	                              bExportGraded ? pExportTex->GetTextureID() : 0))
+ 	{
+ 		uint64 rtMask = 0;
+@@ -472,6 +482,14 @@ void CToneMappingStage::Execute()
+ 		m_passToneMapping.SetTexture(4, pOdtTex);
+ 		m_passToneMapping.SetSampler(1, EDefaultSamplerStates::LinearClamp);
+ 
++		// The 1D curve LUT (S10 item 3b), on the same terms: bound unconditionally because the
++		// branch in the shader is a constant compare and not a permutation, with s_ptexWhite as
++		// the harmless 2D stand-in on the frames the size constant says 0. Its own sampler slot
++		// for the same reason s1 is not s0 - the state is identical, but a slot per consumer means
++		// neither can be retuned for the other's sake.
++		m_passToneMapping.SetTexture(5, pCurveTex);
++		m_passToneMapping.SetSampler(2, EDefaultSamplerStates::LinearClamp);
++
+ 		m_passToneMapping.SetRequireWorldPos(true);
+ 		m_passToneMapping.SetRequirePerViewConstantBuffer(true);
+ 	}
+@@ -608,9 +626,16 @@ void CToneMappingStage::Execute()
+ 		static CCryNameR cdlSlopeName("SceneCDLSlope");
+ 		static CCryNameR cdlOffsetName("SceneCDLOffset");
+ 		static CCryNameR cdlPowerName("SceneCDLPower");
++		static CCryNameR curveParamsName("SceneCurveParams");
+ 
+ 		float kelvin = 6500.0f, tint = 0.0f, saturation = 1.0f;
+ 		bool  bWhiteBalance = false, bBypass = false;
++		// The two 1D curves' gates (S10 item 3b). They come off the bus rather than being derived
++		// from the control points here, because the plugin is what decided whether to bake and
++		// upload the texture at all, and two independent answers to "is this curve on" is exactly
++		// the state that drifts. Bypass Grade takes them out with the CDL and the LMT: a curve is
++		// a creative decision, unlike the sensor clip above.
++		bool  bMasterCurve = false, bSatCurve = false;
+ 		Vec4  slope(1.0f, 1.0f, 1.0f, 0.0f), offset(0.0f, 0.0f, 0.0f, 0.0f), power(1.0f, 1.0f, 1.0f, 0.0f);
+ 
+ 		// The sensor's full-well, in stops above mid grey, resolved to the linear level the
+@@ -639,6 +664,8 @@ void CToneMappingStage::Execute()
+ 					offset = pPostMgr->GetByNameVec4("Global_User_GradeOffset");
+ 					power = pPostMgr->GetByNameVec4("Global_User_GradePower");
+ 					saturation = pPostMgr->GetByNameF("Global_User_GradeSaturation");
++					bMasterCurve = pPostMgr->GetByNameVec4("Global_User_CurveMasterB").y > 0.5f;
++					bSatCurve = pPostMgr->GetByNameVec4("Global_User_CurveSatB").y > 0.5f;
+ 				}
+ 			}
+ 		}
+@@ -670,6 +697,17 @@ void CToneMappingStage::Execute()
+ 		m_passToneMapping.SetConstant(cdlSlopeName, Vec4(slope.x, slope.y, slope.z, max(saturation, 0.0f)), eHWSC_Pixel);
+ 		m_passToneMapping.SetConstant(cdlOffsetName, Vec4(offset.x, offset.y, offset.z, bBypass ? 0.0f : fLmtSize), eHWSC_Pixel);
+ 		m_passToneMapping.SetConstant(cdlPowerName, Vec4(power.x, power.y, power.z, fOdtSize), eHWSC_Pixel);
++
++		// The curve block. `.x` = 0 and the whole thing folds away in the shader - which is the
++		// state every frame is in until somebody moves a control point, and the reason a neutral
++		// curve is free rather than cheap. `.w` carries the Sat vs Sat axis scale from the shared
++		// header so that the shader, the plugin that baked the LUT and the sidecar a capture
++		// writes cannot end up with three different ideas of what "fully saturated" is.
++		m_passToneMapping.SetConstant(curveParamsName,
++		                              Vec4(fCurveSize,
++		                                   bMasterCurve ? 1.0f : 0.0f,
++		                                   bSatCurve ? 1.0f : 0.0f,
++		                                   SceneReferredCurves::kSatFullScale), eHWSC_Pixel);
+ 	}
+ 
+ 	m_passToneMapping.Execute();
+diff --git a/Code/CryPlugins/CinematicCamera/Module/CineCamShared.h b/Code/CryPlugins/CinematicCamera/Module/CineCamShared.h
+index b13e7b80..0f8f7c0e 100644
+--- a/Code/CryPlugins/CinematicCamera/Module/CineCamShared.h
++++ b/Code/CryPlugins/CinematicCamera/Module/CineCamShared.h
+@@ -85,12 +85,19 @@ bool UpdateAutoMeteredEV(const SAutoMeterSettings& settings, SAutoMeterState& st
+ //! mid-crossfade. See SceneReferredSpec.md S2 / decisions/s2-engine-side-switch.md.
+ void PublishSceneReferredConvention(bool bSceneReferred);
+ 
+-//! Load (or reload) the two display-chain .cube files into fp16 3D textures and publish their
+-//! renderer texture IDs on the post-effect bus. An empty ODT path stands in the shipped default;
+-//! an empty LMT path is the identity look. Cheap on every frame but the first after a change.
+-void ApplyDisplayLuts(const char* szODTFile, const char* szLMTFile);
++//! Load (or reload) the two display-chain .cube files into fp16 3D textures, bake the two 1D
++//! curves into a third texture, and publish all of it on the post-effect bus. An empty ODT path
++//! stands in the shipped default; an empty LMT path is the identity look. Cheap on every frame but
++//! the first after a change.
++//!
++//! The two curve arrays are `SceneReferredCurves::kKnotCount` floats each - the master curve's
++//! knot offsets in stops and the Sat vs Sat multipliers. **nullptr means neutral**, which is what
++//! the editor-look publisher passes and what a camera with no CineCam Grade sibling produces: no
++//! texture is uploaded at all and the tone map issues no fetch.
++void ApplyDisplayLuts(const char* szODTFile, const char* szLMTFile,
++                      const float* pMasterCurveStops = nullptr, const float* pSatCurveMultipliers = nullptr);
+ 
+-//! Take the LUT ids off the bus and release both textures. Safe to call repeatedly.
++//! Take the LUT ids off the bus and release the textures. Safe to call repeatedly.
+ void RestoreDisplayLuts();
+ 
+ } // namespace CineCam
+diff --git a/Code/CryPlugins/CinematicCamera/Module/CineGradeComponent.cpp b/Code/CryPlugins/CinematicCamera/Module/CineGradeComponent.cpp
+index 947a092a..bd660356 100644
+--- a/Code/CryPlugins/CinematicCamera/Module/CineGradeComponent.cpp
++++ b/Code/CryPlugins/CinematicCamera/Module/CineGradeComponent.cpp
+@@ -93,6 +93,38 @@ SCineEffectiveCdl SCineGradeParams::Resolve() const
+ 	return out;
+ }
+ 
++// ---------------------------------------------------------------------------
++// The two 1D curves -> the ten numbers everything downstream sees
++// (decisions/s10-grade-component.md section 3b, research/s10-3b-curves.md).
++//
++// Both of these are plain gathers, deliberately: the knot POSITIONS, the interpolator, the bake
++// and the neutrality tests all live in CryRenderer/SceneReferredCurves.h, which the renderer's EXR
++// exporter includes as well. A second copy of any of that would be the CPU/GPU drift risk item 3a
++// went out of its way to avoid.
++//
++// The clamps are defensive for the same reason SCineGradeParams::Resolve()'s are: a TrackView key
++// is not clamped to a Range<>'s bounds, so an animated curve can arrive outside the slider.
++// ---------------------------------------------------------------------------
++void SCineCurveParams::GetMasterStops(float(&out)[SceneReferredCurves::kKnotCount]) const
++{
++	out[0] = clamp_tpl((float)masterBlack, -4.0f, 4.0f);
++	out[1] = clamp_tpl((float)masterShadow, -4.0f, 4.0f);
++	out[2] = clamp_tpl((float)masterMid, -4.0f, 4.0f);
++	out[3] = clamp_tpl((float)masterHighlight, -4.0f, 4.0f);
++	out[4] = clamp_tpl((float)masterWhite, -4.0f, 4.0f);
++}
++
++void SCineCurveParams::GetSatMultipliers(float(&out)[SceneReferredCurves::kKnotCount]) const
++{
++	// Floored at 0: a negative multiplier does not desaturate, it rotates the colour 180 degrees
++	// about the grey axis. Nobody has ever wanted that from a saturation control.
++	out[0] = clamp_tpl((float)satAtGrey, 0.0f, 4.0f);
++	out[1] = clamp_tpl((float)satAtLow, 0.0f, 4.0f);
++	out[2] = clamp_tpl((float)satAtMid, 0.0f, 4.0f);
++	out[3] = clamp_tpl((float)satAtHigh, 0.0f, 4.0f);
++	out[4] = clamp_tpl((float)satAtFull, 0.0f, 4.0f);
++}
++
+ // ---------------------------------------------------------------------------
+ // IEntityComponent
+ // ---------------------------------------------------------------------------
+diff --git a/Code/CryPlugins/CinematicCamera/Module/CineGradeComponent.h b/Code/CryPlugins/CinematicCamera/Module/CineGradeComponent.h
+index dee209b0..2e354f30 100644
+--- a/Code/CryPlugins/CinematicCamera/Module/CineGradeComponent.h
++++ b/Code/CryPlugins/CinematicCamera/Module/CineGradeComponent.h
+@@ -20,6 +20,11 @@
+ #include <CrySchematyc/Env/IEnvRegistrar.h>
+ // CSharedString: the reflected string type behind the .cube path property (LMT File).
+ #include <CrySchematyc/Utils/SharedString.h>
++// The shared definition of the two 1D curves: knot positions, the interpolator, the bake and the
++// neutrality tests. The renderer's EXR exporter includes the SAME header to write the master curve
++// out as a .cube beside a capture, so there is exactly one answer to "what is the curve between
++// two knots" (decisions/s10-grade-component.md section 3b.5).
++#include <CryRenderer/SceneReferredCurves.h>
+ 
+ // The camera this look belongs to. Forward-declared, never included: CinematicCameraComponent.h
+ // includes THIS header (the camera reads the two structs below), so the dependency has exactly
+@@ -177,6 +182,121 @@ struct SCineGradeParams
+ 	Vec3 power = Vec3(1.0f, 1.0f, 1.0f);
+ };
+ 
++// The two 1D curves (S10 item 3b, decisions/s10-grade-component.md section 3b) - the shape a CDL
++// cannot make, and the last thing a live desk needs that the wheels do not give.
++//
++// WHERE THEY SIT: between the ASC CDL and the LMT. That is Pomfort Livegrade's fixed order for
++// every one of its grading modes (input transform -> CDL and saturation -> curves -> output
++// transform), and it is what keeps the .cdl a capture writes an exact description of the FRONT of
++// the chain - so it still reproduces in Resolve as node 1, with the curves as node 2.
++//
++// WHY FIVE NUMBERS AND NOT A CURVE WIDGET: 5.7.1 does have a curve property row, and a reflected
++// spline WOULD draw in this inspector - but the only CCurveEditorPanel in the whole Sandbox is
++// created by the Particle Editor, so in the level editor the row's edit broadcast has no receiver
++// and the curve cannot be dragged. Five plain floats, on the other hand, are typeable, readable,
++// TrackView-animatable, they cross the post-effect bus as they are, and their neutral is the
++// literal zero - so "untouched" is an exact identity by construction rather than by measurement.
++// Research: scene-notes/research/s10-3b-curves.md section 3.
++struct SCineCurveParams
++{
++	inline bool operator==(const SCineCurveParams& rhs) const
++	{
++		return (float)masterBlack == (float)rhs.masterBlack
++		       && (float)masterShadow == (float)rhs.masterShadow
++		       && (float)masterMid == (float)rhs.masterMid
++		       && (float)masterHighlight == (float)rhs.masterHighlight
++		       && (float)masterWhite == (float)rhs.masterWhite
++		       && (float)satAtGrey == (float)rhs.satAtGrey
++		       && (float)satAtLow == (float)rhs.satAtLow
++		       && (float)satAtMid == (float)rhs.satAtMid
++		       && (float)satAtHigh == (float)rhs.satAtHigh
++		       && (float)satAtFull == (float)rhs.satAtFull;
++	}
++
++	//! The five master-curve knot heights, as OFFSETS IN STOPS from the identity. Defined in
++	//! CineGradeComponent.cpp.
++	void GetMasterStops(float(&out)[SceneReferredCurves::kKnotCount]) const;
++	//! The five Sat vs Sat multipliers, floored at 0 (a negative multiplier would rotate a colour
++	//! 180 degrees about grey, which is never what "less saturation" means).
++	void GetSatMultipliers(float(&out)[SceneReferredCurves::kKnotCount]) const;
++
++	static void ReflectType(Schematyc::CTypeDesc<SCineCurveParams>& desc)
++	{
++		desc.SetGUID("{7B4E92A1-0C63-4D18-8F52-1A9D6E7C3B04}"_cry_guid);
++		desc.SetLabel("Curves");
++
++		// --- the master (luma) curve ------------------------------------------------------
++		// One curve, applied identically to all three channels, so it is a TONE curve and cannot
++		// introduce a colour cast - that is what the wheels are for. Each control is how far, in
++		// stops, that part of the picture moves; 0 leaves it exactly where it was. The knots sit
++		// at fixed places in ACEScct: the bottom of the encoding, four stops under 18 % grey,
++		// 18 % grey itself, four stops over, and the top (+10.3 stops).
++		desc.AddMember(&SCineCurveParams::masterBlack,
++			'cmbk', "MasterBlack", "Master Black (stops)",
++			"The very bottom of the tone curve, in stops. Negative crushes the deepest blacks, "
++			"positive lifts them. 0 = neutral. Together with Master Shadow this is where a film "
++			"toe is made.", 0.0f);
++		desc.AddMember(&SCineCurveParams::masterShadow,
++			'cmsh', "MasterShadow", "Master Shadow (stops)",
++			"Four stops under 18 % grey, in stops. The shadow half of an S-curve: pull this down "
++			"and lift Master Highlight and the picture gains contrast without the mid tone "
++			"moving at all. 0 = neutral.", 0.0f);
++		desc.AddMember(&SCineCurveParams::masterMid,
++			'cmmd', "MasterMid", "Master Mid (stops)",
++			"18 % grey itself, in stops - the one anchor the exposure guarantees. Moving this is "
++			"moving the exposure of the mid tone WITHOUT moving black or white, which is a thing "
++			"the aperture cannot do. 0 = neutral.", 0.0f);
++		desc.AddMember(&SCineCurveParams::masterHighlight,
++			'cmhl', "MasterHighlight", "Master Highlight (stops)",
++			"Four stops over 18 % grey, in stops. The highlight half of an S-curve; pull it down "
++			"instead for a film shoulder that rolls the brights off softly. 0 = neutral.", 0.0f);
++		desc.AddMember(&SCineCurveParams::masterWhite,
++			'cmwh', "MasterWhite", "Master White (stops)",
++			"The very top of the encoding (+10.3 stops over grey), in stops. Above the output "
++			"transform's own domain very little of this is visible on screen - but it is in the "
++			"EXR, because the export tap is taken after the curve. 0 = neutral.", 0.0f);
++
++		// --- Sat vs Sat -------------------------------------------------------------------
++		// The multiplier, per band of measured saturation. Resolve's control of the same name has
++		// exactly this shape: a flat line at 1 = no change, and the y axis is a multiplier.
++		desc.AddMember(&SCineCurveParams::satAtGrey,
++			'csa0', "SatAtGrey", "Sat @ 0 (neutrals)",
++			"How much saturation survives where there was almost none - the near-neutral parts of "
++			"the picture. Below 1 cleans a faint cast out of greys; above 1 finds colour in them. "
++			"1 = neutral.", 1.0f);
++		desc.AddMember(&SCineCurveParams::satAtLow,
++			'csa1', "SatAtLow", "Sat @ 25 %",
++			"The multiplier for barely-tinted colours - skin, wood, weathered paint. 1 = neutral.",
++			1.0f);
++		desc.AddMember(&SCineCurveParams::satAtMid,
++			'csa2', "SatAtMid", "Sat @ 50 %",
++			"The multiplier for ordinary colours. Raising this and lowering Sat @ 100 % is the "
++			"classic move: everything gains life except what was already screaming. 1 = neutral.",
++			1.0f);
++		desc.AddMember(&SCineCurveParams::satAtHigh,
++			'csa3', "SatAtHigh", "Sat @ 75 %",
++			"The multiplier for strong colours. 1 = neutral.", 1.0f);
++		desc.AddMember(&SCineCurveParams::satAtFull,
++			'csa4', "SatAtFull", "Sat @ 100 %",
++			"The multiplier for the most saturated thing in the frame - a warning light, a red "
++			"coat, a clipped neon. Pulling it down tames exactly those and leaves everything else "
++			"untouched, which no global saturation slider can do. 1 = neutral.", 1.0f);
++	}
++
++	// Hard range +-4 stops (a curve past that is not a grade any more), slider +-2.
++	Schematyc::Range<-4, 4, -2, 2> masterBlack = 0.0f;
++	Schematyc::Range<-4, 4, -2, 2> masterShadow = 0.0f;
++	Schematyc::Range<-4, 4, -2, 2> masterMid = 0.0f;
++	Schematyc::Range<-4, 4, -2, 2> masterHighlight = 0.0f;
++	Schematyc::Range<-4, 4, -2, 2> masterWhite = 0.0f;
++
++	Schematyc::Range<0, 4, 0, 2> satAtGrey = 1.0f;
++	Schematyc::Range<0, 4, 0, 2> satAtLow = 1.0f;
++	Schematyc::Range<0, 4, 0, 2> satAtMid = 1.0f;
++	Schematyc::Range<0, 4, 0, 2> satAtHigh = 1.0f;
++	Schematyc::Range<0, 4, 0, 2> satAtFull = 1.0f;
++};
++
+ // The look slot (LMT), one of the two .cube files of the display chain (SceneReferredSpec.md
+ // S4/S5, D8) - the other, the output transform, stays on the camera because it is the camera's
+ // monitor. A plain asset path rather than a resource picker: a .cube is not a texture asset the
+@@ -228,8 +348,12 @@ public:
+ 			IEntityComponent::EFlags::Singleton,
+ 			IEntityComponent::EFlags::ClientOnly });
+ 
+-		desc.AddMember(&CCineGradeComponent::m_grade, 'ggrd', "Grade", "Grade", "", SCineGradeParams());
+-		desc.AddMember(&CCineGradeComponent::m_look,  'glok', "Look",  "Look",  "", SCineLookParams());
++		desc.AddMember(&CCineGradeComponent::m_grade,  'ggrd', "Grade",  "Grade",  "", SCineGradeParams());
++		// A group of its own and not more members in Grade: everything in Grade folds into one
++		// ASC CDL and travels as one, and the curves are precisely the part that does not. Keeping
++		// them apart is what stops "the Grade group" from quietly meaning two different things.
++		desc.AddMember(&CCineGradeComponent::m_curves, 'gcrv', "Curves", "Curves", "", SCineCurveParams());
++		desc.AddMember(&CCineGradeComponent::m_look,   'glok', "Look",   "Look",   "", SCineLookParams());
+ 	}
+ 
+ 	// IEntityComponent
+@@ -239,8 +363,9 @@ public:
+ 
+ 	//! Read by the cinematic camera on the same entity when it publishes the grade. Never a copy:
+ 	//! the camera reads through these on the frame it publishes.
+-	const SCineGradeParams& GetGrade() const { return m_grade; }
+-	const SCineLookParams&  GetLook()  const { return m_look; }
++	const SCineGradeParams& GetGrade()  const { return m_grade; }
++	const SCineCurveParams& GetCurves() const { return m_curves; }
++	const SCineLookParams&  GetLook()   const { return m_look; }
+ 
+ private:
+ 	//! Say - once per distinct answer - why an edited look is not in the picture, or that it is.
+@@ -253,6 +378,7 @@ private:
+ 	void ReportStatus(const CCinematicCameraComponent* pCamera);
+ 
+ 	SCineGradeParams m_grade;
++	SCineCurveParams m_curves;
+ 	SCineLookParams  m_look;
+ 
+ 	//! The last answer ReportStatus() worked out, as a bitmask, so that dragging a slider - or a
+diff --git a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp
+index 7611cace..dc804a6f 100644
+--- a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp
++++ b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp
+@@ -1474,25 +1474,53 @@ struct SLutSlot
+ SLutSlot s_lutODT;
+ SLutSlot s_lutLMT;
+ 
+-void ClearLutSlot(SLutSlot& slot)
++//! The two 1D curves (S10 item 3b), as ONE N x 1 fp16 texture: R the master (luma) curve, G the
++//! Sat vs Sat multiplier.
++//!
++//! Two curves in two CHANNELS rather than two rows because a two-row texture has to be sampled at
++//! the row centres exactly or a linear sampler bleeds one curve into the other - and it would do
++//! so invisibly. One row, v = 0.5, no hazard. RGBA16F rather than R16G16F because the upload path
++//! does no format conversion and this is the format the two 3D LUTs already prove through this
++//! same call; the difference is 4 KiB.
++struct SCurveLutSlot
++{
++	string cacheName;
++	int    texId = 0;
++	int    size = 0;
++	//! What the current texture was baked from, so that the common path is ten float compares.
++	float  masterStops[SceneReferredCurves::kKnotCount] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
++	float  satMult[SceneReferredCurves::kKnotCount] = { 1.0f, 1.0f, 1.0f, 1.0f, 1.0f };
++	bool   bMasterActive = false;
++	bool   bSatActive = false;
++};
++
++SCurveLutSlot s_lutCurve;
++
++// IRenderer::RemoveTexture(id) is GetByID(id) followed by Release() - it trusts the id. Ours
++// can go stale without us being told: a level change frees the renderer's resources BEFORE
++// the entities are destroyed (editor.log: "*** Start clearing render resources ***" precedes
++// "Ending game context"), so by the time OnShutDown gets here the id may already belong to
++// somebody else's texture, and releasing it would drop a stranger's reference and leave a
++// dangling CTexture for the render thread to trip over later.
++//
++// The name is the check: every upload here passes a fixed cache name ($ccamODT / $ccamLMT /
++// $ccamCurve), so a texture still carrying it at that id is ours and nothing else can be.
++void ReleaseOwnTexture(int& texId, string& cacheName)
+ {
+-	// IRenderer::RemoveTexture(id) is GetByID(id) followed by Release() - it trusts the id. Ours
+-	// can go stale without us being told: a level change frees the renderer's resources BEFORE
+-	// the entities are destroyed (editor.log: "*** Start clearing render resources ***" precedes
+-	// "Ending game context"), so by the time OnShutDown gets here the id may already belong to
+-	// somebody else's texture, and releasing it would drop a stranger's reference and leave a
+-	// dangling CTexture for the render thread to trip over later.
+-	//
+-	// The name is the check: the upload passes a fixed cache name ($ccamODT / $ccamLMT), so a
+-	// texture still carrying it at that id is ours and nothing else can be.
+-	if (slot.texId > 0 && gEnv && gEnv->pRenderer)
++	if (texId > 0 && gEnv && gEnv->pRenderer)
+ 	{
+-		ITexture* const pTex = gEnv->pRenderer->EF_GetTextureByID(slot.texId);
++		ITexture* const pTex = gEnv->pRenderer->EF_GetTextureByID(texId);
+ 		const char* const szName = pTex ? pTex->GetName() : nullptr;
+-		if (szName != nullptr && !slot.cacheName.empty() && slot.cacheName == szName)
+-			gEnv->pRenderer->RemoveTexture((unsigned int)slot.texId);
++		if (szName != nullptr && !cacheName.empty() && cacheName == szName)
++			gEnv->pRenderer->RemoveTexture((unsigned int)texId);
+ 	}
+-	slot.texId = 0;
++	texId = 0;
++	cacheName.clear();
++}
++
++void ClearLutSlot(SLutSlot& slot)
++{
++	ReleaseOwnTexture(slot.texId, slot.cacheName);
+ 	slot.size = 0;
+ 	slot.loaded = false;
+ 	slot.cacheName.clear();
+@@ -1585,6 +1613,108 @@ void EnsureLutSlot(SLutSlot& slot, const char* szPath, const char* szCacheName,
+ 	       szRole, szWanted, lut.size, nNewId, resolvedPath.c_str());
+ }
+ 
++void ClearCurveLutSlot()
++{
++	ReleaseOwnTexture(s_lutCurve.texId, s_lutCurve.cacheName);
++	s_lutCurve.size = 0;
++	s_lutCurve.bMasterActive = false;
++	s_lutCurve.bSatActive = false;
++}
++
++//! Bake the two 1D curves into the shared texture, if either of them is doing anything and if
++//! anything about them has changed (S10 item 3b).
++//!
++//! The neutrality test is EXACT - a master knot's neutral is the literal 0.0f and a saturation
++//! multiplier's is the literal 1.0f - so "nobody has touched this" needs no epsilon and, more to
++//! the point, produces no texture, no bus size and no shader fetch. That is what makes an unused
++//! curve free rather than cheap, and the neutral picture bit-identical to the build before this
++//! existed rather than merely indistinguishable from it.
++//!
++//! Everything about the SHAPE of the curve - where the knots are, what happens between them, how
++//! stops become knot heights - lives in CryRenderer/SceneReferredCurves.h, which the renderer's
++//! EXR exporter includes too. This function only decides when to run it.
++void EnsureCurveLut(const float* pMasterStops, const float* pSatMult)
++{
++	using namespace SceneReferredCurves;
++
++	static const float kNeutralStops[kKnotCount] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
++	static const float kNeutralSat[kKnotCount] = { 1.0f, 1.0f, 1.0f, 1.0f, 1.0f };
++
++	const float* const pMaster = pMasterStops ? pMasterStops : kNeutralStops;
++	const float* const pSat = pSatMult ? pSatMult : kNeutralSat;
++
++	const bool bMasterActive = !IsMasterNeutral(pMaster);
++	const bool bSatActive = !IsSatNeutral(pSat);
++
++	if (!bMasterActive && !bSatActive)
++	{
++		if (s_lutCurve.texId > 0)
++			ClearCurveLutSlot();
++		// Remembered even when nothing is uploaded, so that going neutral and back is one compare.
++		memcpy(s_lutCurve.masterStops, pMaster, sizeof(s_lutCurve.masterStops));
++		memcpy(s_lutCurve.satMult, pSat, sizeof(s_lutCurve.satMult));
++		return;
++	}
++
++	if (s_lutCurve.texId > 0
++	    && memcmp(s_lutCurve.masterStops, pMaster, sizeof(s_lutCurve.masterStops)) == 0
++	    && memcmp(s_lutCurve.satMult, pSat, sizeof(s_lutCurve.satMult)) == 0)
++	{
++		return;
++	}
++
++	memcpy(s_lutCurve.masterStops, pMaster, sizeof(s_lutCurve.masterStops));
++	memcpy(s_lutCurve.satMult, pSat, sizeof(s_lutCurve.satMult));
++	s_lutCurve.bMasterActive = bMasterActive;
++	s_lutCurve.bSatActive = bSatActive;
++
++	std::vector<float> master(kLutSize), sat(kLutSize);
++	BakeMaster(pMaster, master.data(), kLutSize);
++	BakeSat(pSat, sat.data(), kLutSize);
++
++	// R = the master curve, G = the saturation multiplier, B = 0 and A = 1 because there is no
++	// two-channel fp16 upload here and the alpha is the price of admission (the same 8 KiB
++	// argument the 3D LUTs make at 2.2 MiB).
++	std::vector<CryHalf> halfData;
++	halfData.resize((size_t)kLutSize * 4);
++	const CryHalf zero = CryConvertFloatToHalf(0.0f);
++	const CryHalf one = CryConvertFloatToHalf(1.0f);
++	for (int i = 0; i < kLutSize; ++i)
++	{
++		halfData[(size_t)i * 4 + 0] = CryConvertFloatToHalf(master[i]);
++		halfData[(size_t)i * 4 + 1] = CryConvertFloatToHalf(sat[i]);
++		halfData[(size_t)i * 4 + 2] = zero;
++		halfData[(size_t)i * 4 + 3] = one;
++	}
++
++	// h = 1: the public interface has no 1D entry point, and an N x 1 eTT_2D texture is what it
++	// resolves to (DriverD3D.cpp:4782). The width never changes, so this is an in-place refresh of
++	// the same id after the first bake - which is the case that matters, because dragging a knot
++	// runs it once per edit.
++	const int nNewId = (int)gEnv->pRenderer->UploadToVideoMemory(
++		(unsigned char*)halfData.data(), kLutSize, 1,
++		eTF_R16G16B16A16F, eTF_R16G16B16A16F, /*nummipmap*/ 1, /*repeat*/ false,
++		FILTER_LINEAR, s_lutCurve.texId, "$ccamCurve",
++		FT_NOMIPS | FT_DONT_STREAM | FT_STATE_CLAMP);
++
++	if (nNewId <= 0)
++	{
++		// Once per change, not once per frame: this is only reached when something moved.
++		CryWarning(VALIDATOR_MODULE_RENDERER, VALIDATOR_WARNING,
++		           "[SceneReferred] the grade curves were NOT uploaded (the renderer returned no "
++		           "texture) - the picture is ungraded by them until they are edited again");
++		s_lutCurve.texId = 0;
++		s_lutCurve.size = 0;
++		s_lutCurve.bMasterActive = false;
++		s_lutCurve.bSatActive = false;
++		return;
++	}
++
++	s_lutCurve.texId = nNewId;
++	s_lutCurve.size = kLutSize;
++	s_lutCurve.cacheName = "$ccamCurve";
++}
++
+ } // namespace
+ 
+ // The two LUT slots, refreshed and published every frame. "Published" is two numbers per slot on
+@@ -1601,7 +1731,8 @@ namespace CineCam
+ // at a time), so this is a free function rather than a component method: the plugin-owned editor
+ // look publisher needs exactly the same two uploads for the shipped default ODT, and a second copy
+ // of the upload path would mean a second pair of textures fighting over the same two bus slots.
+-void ApplyDisplayLuts(const char* szODTFile, const char* szLMTFile)
++void ApplyDisplayLuts(const char* szODTFile, const char* szLMTFile,
++                      const float* pMasterCurveStops, const float* pSatCurveMultipliers)
+ {
+ 	if (!gEnv->pRenderer || !gEnv->p3DEngine)
+ 		return;
+@@ -1620,6 +1751,23 @@ void ApplyDisplayLuts(const char* szODTFile, const char* szLMTFile)
+ 	gEnv->p3DEngine->SetPostEffectParam("Global_User_LutODTSize", (float)s_lutODT.size);
+ 	gEnv->p3DEngine->SetPostEffectParam("Global_User_LutLMT",     (float)s_lutLMT.texId);
+ 	gEnv->p3DEngine->SetPostEffectParam("Global_User_LutLMTSize", (float)s_lutLMT.size);
++
++	// The two 1D curves. The texture id and size are what the tone map samples; the ten control
++	// points are published as well because the EXR exporter has to write the master curve out as
++	// a Resolve 1D .cube beside a capture, and it re-evaluates them through the same header this
++	// bake used. `.w` of the two B params is deliberately unused - `.y` is the per-curve ACTIVE
++	// flag, which the renderer takes from here rather than deriving a second time from the control
++	// points, because two answers to "is this curve on" is exactly the state that drifts.
++	EnsureCurveLut(pMasterCurveStops, pSatCurveMultipliers);
++
++	const float* const pM = s_lutCurve.masterStops;
++	const float* const pS = s_lutCurve.satMult;
++	gEnv->p3DEngine->SetPostEffectParam("Global_User_CurveLut",     (float)s_lutCurve.texId);
++	gEnv->p3DEngine->SetPostEffectParam("Global_User_CurveLutSize", (float)s_lutCurve.size);
++	gEnv->p3DEngine->SetPostEffectParamVec4("Global_User_CurveMasterA", Vec4(pM[0], pM[1], pM[2], pM[3]));
++	gEnv->p3DEngine->SetPostEffectParamVec4("Global_User_CurveMasterB", Vec4(pM[4], s_lutCurve.bMasterActive ? 1.0f : 0.0f, 0.0f, 0.0f));
++	gEnv->p3DEngine->SetPostEffectParamVec4("Global_User_CurveSatA",    Vec4(pS[0], pS[1], pS[2], pS[3]));
++	gEnv->p3DEngine->SetPostEffectParamVec4("Global_User_CurveSatB",    Vec4(pS[4], s_lutCurve.bSatActive ? 1.0f : 0.0f, 0.0f, 0.0f));
+ }
+ 
+ // The bus is cleared first, so the renderer stops referring to the IDs before they die; the
+@@ -1633,10 +1781,21 @@ void RestoreDisplayLuts()
+ 		gEnv->p3DEngine->SetPostEffectParam("Global_User_LutODTSize", 0.0f);
+ 		gEnv->p3DEngine->SetPostEffectParam("Global_User_LutLMT",     0.0f);
+ 		gEnv->p3DEngine->SetPostEffectParam("Global_User_LutLMTSize", 0.0f);
++
++		// The curve slot goes with them. Only the size and the two active flags matter to the
++		// shader, but the control points are cleared too so that nothing downstream - the EXR
++		// header, the sidecars - can describe a curve that is no longer in the picture.
++		gEnv->p3DEngine->SetPostEffectParam("Global_User_CurveLut",     0.0f);
++		gEnv->p3DEngine->SetPostEffectParam("Global_User_CurveLutSize", 0.0f);
++		gEnv->p3DEngine->SetPostEffectParamVec4("Global_User_CurveMasterA", Vec4(0.0f, 0.0f, 0.0f, 0.0f));
++		gEnv->p3DEngine->SetPostEffectParamVec4("Global_User_CurveMasterB", Vec4(0.0f, 0.0f, 0.0f, 0.0f));
++		gEnv->p3DEngine->SetPostEffectParamVec4("Global_User_CurveSatA",    Vec4(1.0f, 1.0f, 1.0f, 1.0f));
++		gEnv->p3DEngine->SetPostEffectParamVec4("Global_User_CurveSatB",    Vec4(1.0f, 0.0f, 0.0f, 0.0f));
+ 	}
+ 
+ 	ClearLutSlot(s_lutODT);
+ 	ClearLutSlot(s_lutLMT);
++	ClearCurveLutSlot();
+ 	s_lutODT.requested.clear();
+ 	s_lutLMT.requested.clear();
+ }
+@@ -1648,7 +1807,17 @@ void CCinematicCameraComponent::ApplyDisplayLuts()
+ 	if (!CanDriveRenderState())
+ 		return;
+ 
+-	CineCam::ApplyDisplayLuts(m_output.odtFile.c_str(), GetLookParams().lmtFile.c_str());
++	// The curves come from the same sibling as the look, by the same lookup, on the same frame:
++	// nothing is cached, so a CineCam Grade added or removed at runtime is picked up on the very
++	// next publish and its absence is the neutral (no texture, no fetch).
++	const SCineCurveParams& curves = GetCurveParams();
++	float masterStops[SceneReferredCurves::kKnotCount];
++	float satMult[SceneReferredCurves::kKnotCount];
++	curves.GetMasterStops(masterStops);
++	curves.GetSatMultipliers(satMult);
++
++	CineCam::ApplyDisplayLuts(m_output.odtFile.c_str(), GetLookParams().lmtFile.c_str(),
++	                          masterStops, satMult);
+ }
+ 
+ void CCinematicCameraComponent::RestoreDisplayLuts()
+@@ -1719,6 +1888,7 @@ void CCinematicCameraComponent::OnLevelLoaded()
+ // slope 1, offset 0, power 1, saturation 1, no LMT. That is what makes "no grade component" and
+ // "an untouched grade component" the same picture, and both of them exactly ACES 2.0 (D10).
+ static const SCineGradeParams s_neutralGrade;
++static const SCineCurveParams s_neutralCurves;
+ static const SCineLookParams  s_neutralLook;
+ 
+ const SCineGradeParams& CCinematicCameraComponent::GetGradeParams() const
+@@ -1732,6 +1902,17 @@ const SCineGradeParams& CCinematicCameraComponent::GetGradeParams() const
+ 	return s_neutralGrade;
+ }
+ 
++const SCineCurveParams& CCinematicCameraComponent::GetCurveParams() const
++{
++	if (m_pEntity != nullptr)
++	{
++		if (const CCineGradeComponent* pGrade = m_pEntity->GetComponent<CCineGradeComponent>())
++			return pGrade->GetCurves();
++	}
++
++	return s_neutralCurves;
++}
++
+ const SCineLookParams& CCinematicCameraComponent::GetLookParams() const
+ {
+ 	if (m_pEntity != nullptr)
+diff --git a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
+index ff850673..d093de89 100644
+--- a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
++++ b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
+@@ -1262,6 +1262,7 @@ private:
+ 	//! entity without a grade component renders pure ACES 2.0 - the same picture the camera's own
+ 	//! Grade group produced at its defaults before it moved (decisions/s10-grade-component.md).
+ 	const SCineGradeParams& GetGradeParams() const;
++	const SCineCurveParams& GetCurveParams() const;
+ 	const SCineLookParams&  GetLookParams() const;
+ 	//! The camera's pre-exposure for this frame, published as a linear scale next to the request
+ 	//! above (Global_User_SceneExposure). Editor-live for the same reason.
+diff --git a/Code/CryPlugins/CinematicCamera/README.md b/Code/CryPlugins/CinematicCamera/README.md
+index 5f590e4c..285840e4 100644
+--- a/Code/CryPlugins/CinematicCamera/README.md
++++ b/Code/CryPlugins/CinematicCamera/README.md
+@@ -130,14 +130,16 @@ are gone from this path; in their place the frame goes
+       -> white balance (Bradford, from the Kelvin and tint on the camera)
+       -> ACEScct, the grading log space
+       -> ASC CDL: slope, offset, power, then saturation
++      -> the master (luma) curve, then Sat vs Sat
+       -> the Look LUT, if one is loaded
+       -> the Output Transform LUT - ACES 2.0, baked from the OCIO studio config
+       -> dither -> the screen
+ 
+ With nothing set that is pure ACES 2.0 and nothing else: no house look, no hidden correction
+-(design decision D10). Four groups control it, and they are deliberately split over two
++(design decision D10). Five groups control it, and they are deliberately split over two
+ components: **White Balance** and **Output** are on the camera, because they are what the camera
+-and its monitor are; **Grade** and **Look** are on a separate *CineCam Grade* component, because
++and its monitor are; **Grade**, **Curves** and **Look** are on a separate *CineCam Grade*
++component, because
+ they are creative decisions - a look is a thing you add, copy to another camera and delete. See
+ *The CineCam Grade component* below. How to make and load a look:
+ [docs/SceneReferredLook.md](docs/SceneReferredLook.md).
+@@ -379,7 +381,7 @@ recording.
+ ## The CineCam Grade component
+ 
+ Editor label **CineCam Grade**, category *Cameras* - a second component you add to the SAME entity
+-as a Cinematic Camera. It carries the look and nothing else: the ASC CDL below and the LMT slot.
++as a Cinematic Camera. It carries the look and nothing else: the ASC CDL below, the two 1D curves, and the LMT slot.
+ 
+ It publishes nothing itself. The camera on the same entity stays the single writer of the
+ renderer's grade parameters and reads this component when it publishes, so the grade follows
+@@ -406,6 +408,10 @@ Two consequences worth knowing:
+   Grade and Look groups - they come back at their neutrals, and there is no migration. Re-enter
+   them on a CineCam Grade component.
+ 
++The chain inside the component is `ASC CDL -> master curve -> Sat vs Sat -> LMT`, which is the
++fixed order an on-set desk uses and the reason a capture's `.cdl` sidecar still describes the front
++of the chain exactly.
++
+ Scene-referred path only, like everything else in the display chain: with **Scene Referred** off
+ nothing here reaches the picture.
+ 
+@@ -466,6 +472,78 @@ deliberately **not** written back into the properties: the editor snapshots a co
+ properties for saving *before* it tells the component they changed, so a value written from an
+ event handler would render but not reliably save.
+ 
++### Curves
++
++*Scene-referred path only. Two 1D curves, applied in ACEScct **after** the ASC CDL and **before**
++the look LUT - which is the fixed order every on-set desk uses (Pomfort Livegrade: input transform
++-> CDL and saturation -> curves -> output transform). That position is also what keeps a capture's
++`.cdl` sidecar an exact description of the front of the chain. Every property here is animatable in
++TrackView.*
++
++**Neutral is free, not just cheap.** With every control at its default nothing is uploaded, nothing
++is bound and the shader issues no fetch - the picture is the same bits it would have been without
++this group.
++
++**Master (luma) curve.** One curve, applied identically to all three channels, so it shapes
++tonality and cannot introduce a colour cast - that is what the wheels are for. Five control points
++at fixed places in the grading space, each dialled as **an offset in stops**: 0 leaves that part of
++the picture exactly where it was.
++
++| Property | Range | Default | Where it sits | Effect |
++| --- | --- | --- | --- | --- |
++| Master Black (stops) | -4 to 4 (slider ±2) | 0 | ACEScct 0.0, ~7.2 stops under grey | The floor. Negative crushes the deepest blacks, positive lifts them. With Master Shadow this is where a film toe is made. |
++| Master Shadow (stops) | -4 to 4 | 0 | 4 stops under 18 % grey | The shadow half of an S-curve. |
++| Master Mid (stops) | -4 to 4 | 0 | **ACEScct(0.18) = 0.4136** | Moves the mid tone *without moving black or white* - something the aperture cannot do. |
++| Master Highlight (stops) | -4 to 4 | 0 | 4 stops over grey | The highlight half of an S-curve; pull it down instead for a film shoulder. |
++| Master White (stops) | -4 to 4 | 0 | ACEScct 1.0 = +10.3 stops | Above the output transform's own domain, so little of this is visible on screen - but it is in the EXR, because the export tap is taken after the curve. |
++
++Between the knots the curve is a **monotone cubic Hermite** (Fritsch-Carlson) - the interpolant
++that cannot overshoot, so a steep control point does not put ringing around a highlight. On
++collinear knots it collapses to the straight line exactly, which is why all-zero really is the
++identity and not merely close to it.
++
++Outside `[0, 1]` (i.e. above +10.3 stops, reachable with **Sensor Clip** off or high) the curve is
++extended with slope 1 rather than clamped, so a capture keeps the highlight separation the sensor
++recorded.
++
++**Sat vs Sat.** The output saturation **multiplier** as a function of how saturated the pixel
++already was - Resolve's control of the same name, with the same convention that 1 means unchanged.
++It is the tool for "everything gains life except what was already screaming": raise the middle and
++pull the top down.
++
++| Property | Range | Default | Effect |
++| --- | --- | --- | --- |
++| Sat @ 0 (neutrals) | 0 to 4 (slider 0-2) | 1 | The near-neutral parts of the frame. Below 1 cleans a faint cast out of greys. |
++| Sat @ 25 % | 0 to 4 | 1 | Barely-tinted colours - skin, wood, weathered paint. |
++| Sat @ 50 % | 0 to 4 | 1 | Ordinary colours. |
++| Sat @ 75 % | 0 to 4 | 1 | Strong colours. |
++| Sat @ 100 % | 0 to 4 | 1 | The most saturated thing in the frame - a warning light, a red coat, a clipped neon. Pulling this down tames exactly those and leaves everything else alone, which no global saturation slider can do. |
++
++The x axis is measured in the working space as
++
++```
++luma = dot(c, (0.2126, 0.7152, 0.0722))     <- the ASC CDL's own Rec.709 weights
++sat  = saturate(length(c - luma) * 2.0)
++out  = luma + (c - luma) * multiplier
++```
++
++so the axis is the **length of the very vector the multiplier scales**: push the curve to 0 at some
++saturation and you get exactly the grey the operator produces there. It is also
++**exposure-invariant** - the space is log and the weights sum to 1, so a stop shifts `c` and `luma`
++by the same amount and leaves `c - luma` untouched. `sat = 1` corresponds to 8.8 stops of spread
++between the extreme channels; for scale, an ordinary strong red reads about 0.54 and a near-primary
++about 0.96.
++
++**Why five numbers and not a curve you can drag.** CRYENGINE 5.7.1 does have a curve property row,
++and a reflected spline would draw here - but the only curve-editor panel in the whole Sandbox is
++built by the Particle Editor, so in the level editor the row has nothing to open. Five plain floats
++are typeable, readable, TrackView-animatable, and their neutral is a literal zero, which is what
++makes "untouched" an exact identity rather than a measurement.
++
++**They travel with a capture** as their own files - the master curve as a Resolve 1D `.cube` and
++both curves' control points as text, because the ASC CDL cannot carry either and a Sat vs Sat curve
++is not a LUT at all. See [docs/SceneReferredExport.md](docs/SceneReferredExport.md).
++
+ ### Look
+ 
+ | Property | Range | Default | Effect |
+diff --git a/Code/CryPlugins/CinematicCamera/docs/SceneReferredExport.md b/Code/CryPlugins/CinematicCamera/docs/SceneReferredExport.md
+index 0e648575..be84dc2e 100644
+--- a/Code/CryPlugins/CinematicCamera/docs/SceneReferredExport.md
++++ b/Code/CryPlugins/CinematicCamera/docs/SceneReferredExport.md
+@@ -110,7 +110,8 @@ Every frame carries its own header. The three that are load-bearing rather than
+ The rest: `owner`, `rec/specVersion`, `rec/schemaVersion`, `rec/frameIndex`, `rec/renderFrameId`,
+ `rec/engineTime`, `rec/fps`, `rec/cameraName`, `rec/focalLength_mm`, `rec/tStop`, `rec/iso`,
+ `rec/shutterTime_s` (also as the standard `expTime`), `rec/ndStops`, `rec/ev100`,
+-`rec/whiteBalance_K`, `rec/whiteBalance_tint`, `rec/cdl` (see below), `rec/odt`, `rec/lmt`.
++`rec/whiteBalance_K`, `rec/whiteBalance_tint`, `rec/cdl` (see below), `rec/curves` (see 4.2),
++`rec/odt`, `rec/lmt`.
+ 
+ `rec/cdl` is the **effective** ASC CDL of that frame, in the ASC's own order and number format
+ (six fixed decimals): what the tone map really evaluated, not what the camera was asked for. The
+@@ -120,6 +121,12 @@ identity — a bypassed frame carries `1 1 1 / 0 0 0 / 1 1 1 / 1 (bypassed)`, be
+ in the picture — and the renderer's own `1e-4` floors on slope and power are applied, so the header
+ describes the frame that was rendered rather than the numbers that were typed.
+ 
++`rec/curves` is the same idea for the *CineCam Grade*'s two 1D curves — the master curve's five
++knot offsets in stops and the five Sat vs Sat multipliers. It is written **only when a curve is
++doing something**, which is honest here in a way it would not be for the CDL: a CDL is always
++evaluated, while a neutral curve is genuinely not sampled at all. `Bypass Grade` takes the curves
++out with the CDL, so a bypassed frame carries no `rec/curves` either.
++
+ ---
+ 
+ ## 4.1 The ASC `.cdl` sidecar
+@@ -189,6 +196,58 @@ stamped on every frame would be worse than no name.
+ 
+ ---
+ 
++## 4.2 The curve sidecars
++
++The ASC CDL cannot carry a curve, so the two curves travel as their own files — written once per
++take, beside the frames, and **only when a curve is non-neutral** (`r_SceneReferredExportCurves 1`,
++the default; `0` opts out). Unlike the `.cdl`, an absent file here is not ambiguous: the `.cdl` is
++always written and always dates the take.
++
++| file | what it is |
++| --- | --- |
++| `<prefix>.curve_master.cube` | the **master (luma) curve** as a Resolve 1D LUT (`LUT_1D_SIZE 1024`, three identical columns). A per-channel tone curve *is* a 1D LUT, so this one transfers mechanically. |
++| `<prefix>.curves.txt` | both curves' control points in plain text, plus the chain order and the exact definition of the Sat vs Sat axis. |
++
++Naming follows the frames, exactly as the `.cdl` does: `<prefix>.…` beside a sequence,
++`<prefix>.%06d.…` beside a single frame.
++
++**In Resolve**, on the negative:
++
++```
++node 1  ASC CDL          <- imported from <prefix>.cdl
++node 2  1D LUT           <- <prefix>.curve_master.cube
++node 3  Curves -> Sat vs Sat, dialled from <prefix>.curves.txt
++```
++
++**Why the Sat vs Sat curve is text and not a `.cube`.** It is a *multiplier* indexed by a per-pixel
++saturation measure, not a per-channel value mapping. Written as a 1D LUT it would load, apply, and
++be silently nonsense — the worst possible failure for an interchange file. Resolve has the control
++natively, so what is useful is the numbers plus the definition of the axis they were dialled
++against, which is what the `.txt` carries:
++
++```
++luma = dot(c, (0.2126, 0.7152, 0.0722))     the ASC CDL's own Rec.709 weights
++sat  = saturate(length(c - luma) * 2.0)     c in ACEScct
++out  = luma + (c - luma) * multiplier
++```
++
++Transferring that curve is the one part of the round trip that has to be matched **by eye**: no
++interchange format carries a saturation-vs-saturation relationship, and Resolve's own measure is
++not documented well enough to assume it is identical.
++
++**One known limitation of the `.cube`.** A 1D LUT's domain is `[0, 1]`, and the engine extends the
++master curve with slope 1 above ACEScct 1.0 (= +10.3 stops over mid grey) so that a capture keeps
++highlight separation the sensor recorded. The `.cube` cannot carry that extension. It matters only
++above +10.3 stops — nothing reaches the display up there anyway, since the ODT LUT's own domain
++ends at the same place — so it is visible only in the EXR, and only with **Sensor Clip** off or
++above ~10.
++
++**An animated curve** has the same limit the `.cdl` does: one file describes one curve, so the
++sidecars carry the take's first frame. Each frame's own `rec/curves` is still correct for that
++frame.
++
++---
++
+ ## 5. Checking the result
+ 
+ ### 5.1 The writer itself
+@@ -263,7 +322,7 @@ conventions and a third party's idea of what our file means.
+ for the CineCam Grade component's wheels and contrast.
+ 
+ The engine's scene-referred chain is
+-`negative -> vignette x bloom -> white balance -> sensor clip -> ACEScct -> CDL -> LMT -> ODT`.
++`negative -> vignette x bloom -> white balance -> sensor clip -> ACEScct -> CDL -> curves -> LMT -> ODT`.
+ Resolve, handed the negative and the sidecar, can do `ACEScct -> CDL -> ODT`. So the two agree
+ **exactly** once the operators Resolve was not given are neutral — which is the point of the test,
+ not a limitation of it:
+@@ -277,7 +336,9 @@ not a limitation of it:
+    `[EXR] ASC CDL written:` repeats the same numbers as step 2 — that alone catches a fold that has
+    gone wrong before Resolve is even opened.
+ 4. In Resolve, set up as in 5.3, import the EXR, then **Gallery → Stills → right-click → Import**
+-   the `.cdl` and apply it to the clip. One node, nothing else.
++   the `.cdl` and apply it to the clip. One node, nothing else. (Leave the **Curves** group neutral
++   for this test — with a curve dialled the test needs the extra nodes of 4.2 and stops being a
++   test of the fold.)
+ 5. Deliver and compare as in 5.3. The budget is the same. A *uniform* difference means an operator
+    that was not neutralised in step 1; a difference only in the saturated areas means the saturation
+    coefficients disagree; a difference only in the deep shadows is the ACEScct toe and is expected
+diff --git a/Code/CryPlugins/CinematicCamera/docs/SceneReferredLook.md b/Code/CryPlugins/CinematicCamera/docs/SceneReferredLook.md
+index 0d468388..5406537d 100644
+--- a/Code/CryPlugins/CinematicCamera/docs/SceneReferredLook.md
++++ b/Code/CryPlugins/CinematicCamera/docs/SceneReferredLook.md
+@@ -24,14 +24,23 @@ very last step:
+     -> WHITE BALANCE   Bradford adaptation from the camera's Kelvin/tint
+     -> ACEScct         the grading log space
+     -> ASC CDL         (in * slope + offset) ^ power, then saturation
++    -> MASTER CURVE    one tone curve, all three channels       [optional]
++    -> SAT vs SAT      saturation multiplier vs saturation      [optional]
+     -> LOOK (LMT)      your .cube, ACEScct in and out          [optional]
+     -> OUTPUT (ODT)    ACES 2.0, ACEScct in, display code values out
+     -> dither -> the screen
+ ```
+ 
+ Which control is where: the camera owns **White Balance** and the **Output** transform - what the
+-camera is and what its monitor is - while the **ASC CDL** and the **LOOK** slot live on a separate
+-**CineCam Grade** component you add to the same entity. A look is then a thing you add, copy to
++camera is and what its monitor is - while the **ASC CDL**, the two **CURVES** and the **LOOK** slot
++live on a separate **CineCam Grade** component you add to the same entity.
++
++The order of those three is not ours: it is the fixed processing order every on-set grading desk
++enforces (Pomfort Livegrade: input transform, then primary adjustments = CDL and saturation, then
++secondary adjustments = curves, then output transform). Livegrade's reason for fixing it is ours
++too - it is what makes a CDL + LUT export possible at all. With nothing in front of the CDL, the
++`.cdl` a capture writes describes the **front** of the chain exactly, and the curves become the
++node after it. A look is then a thing you add, copy to
+ another camera and delete. Nothing about the chain above changes with it: the camera is still the
+ only thing that talks to the renderer, and it reads the grade component when it publishes. With no
+ CineCam Grade on the entity the CDL is neutral and the look slot is empty, which is the same
+@@ -186,6 +195,12 @@ the camera thinks the light is rather than what the colourist wants.
+ | more contrast in the shadows / the highlights instead | the same, with **Contrast Pivot** lowered or raised |
+ | a colour cast to remove | **Lift** per channel in the shadows, **Gain** per channel in the highlights |
+ | more or less colour | **Saturation** |
++| a film S-curve - crushed toe, rolled shoulder, mid grey untouched | **Curves -> Master Shadow** down and **Master Highlight** up (start at ±0.5 stops). Unlike Contrast this does not have to be symmetric, and it cannot move black or white unless you tell it to |
++| a film shoulder only - highlights roll off, nothing else moves | **Master Highlight** down, everything else 0 |
++| the mid tone brighter without moving black or white | **Master Mid** - a thing the aperture cannot do |
++| tame ONE screaming colour and leave the rest | **Sat @ 100 %** down. A global Saturation cannot do this: it takes the pastels with it |
++| lift the colour out of an ordinary shot without the neons going plastic | **Sat @ 50 %** up and **Sat @ 100 %** down |
++| clean a faint cast out of the near-neutrals | **Sat @ 0** down |
+ | reproduce a `.cdl` somebody sent you | type it into **CDL Slope / Offset / Power (base)** with the wheels and contrast left neutral - those three fields are then exactly what the camera publishes |
+ | see it ungraded | **Bypass Grade** |
+ 
+@@ -198,8 +213,15 @@ which is exactly why lift holds white put and gain holds black put. Contrast abo
+ affine, so it folds into the same slope and offset with nothing left over and needs no extra step in
+ the shader.
+ 
++The curves are a separate group because they are the part that a CDL cannot carry: everything in
++**Grade** folds into one ASC CDL, and everything in **Curves** does not. They are applied after the
++CDL and before the look, they cost nothing at all while neutral (nothing is uploaded and no fetch
++is issued), and their neutral is an exact identity - a master offset of 0 stops and a saturation
++multiplier of 1. A capture writes them beside the `.cdl` as their own files; see
++[SceneReferredExport.md](SceneReferredExport.md).
++
+ Every property here is **animatable in TrackView**: right-click the entity node in a sequence ->
+-*Add Track* -> *Components* -> *CineCam Grade* -> *Grade* -> the property. The RGB triples arrive as
++*Add Track* -> *Components* -> *CineCam Grade* -> *Grade* or *Curves* -> the property. The RGB triples arrive as
+ three-channel vector tracks and the scalars as float tracks. One CDL cannot describe an animated
+ grade, so an EXR capture's `.cdl` sidecar carries the grade of the take's first frame - each frame's
+ own numbers are still in its own EXR header.
+diff --git a/Engine/Shaders/HWScripts/CryFX/HDRPostProcess.cfx b/Engine/Shaders/HWScripts/CryFX/HDRPostProcess.cfx
+index db2937c4..1255b1e2 100644
+--- a/Engine/Shaders/HWScripts/CryFX/HDRPostProcess.cfx
++++ b/Engine/Shaders/HWScripts/CryFX/HDRPostProcess.cfx
+@@ -1141,10 +1141,27 @@ float4 SceneWBRow2;      // Row 2. .w unused.
+ float4 SceneCDLSlope;    // ASC CDL slope.rgb, .w = saturation (1 = neutral)
+ float4 SceneCDLOffset;   // ASC CDL offset.rgb, .w = LMT grid size N (0 = no look loaded)
+ float4 SceneCDLPower;    // ASC CDL power.rgb, .w = ODT grid size N (0 = no output transform loaded)
++float4 SceneCurveParams; // S10 item 3b, the two 1D curves.
++                         // .x = the curve LUT's width N (0 = no curve texture: neither curve is on)
++                         // .y = the master (luma) curve is non-neutral
++                         // .z = the Sat vs Sat curve is non-neutral
++                         // .w = the Sat vs Sat x-axis scale (SceneReferredCurves::kSatFullScale).
++                         //      It rides here rather than as an HLSL literal so that the shader,
++                         //      the plugin that bakes the LUT and the exported sidecar cannot end
++                         //      up disagreeing about what "fully saturated" means.
++                         // A whole new float4 and not a spare .w lane: all three SceneCDL* .w
++                         // slots are taken (saturation, LMT N, ODT N) and SceneWBRow1/2's belong
++                         // to the white-balance step - see the block comment above.
+ 
+ Texture3D lmtTex : register(t3);   // creative look, ACEScct in / ACEScct out
+ Texture3D odtTex : register(t4);   // output transform, ACEScct in / display-encoded out
++Texture2D curveTex : register(t5); // N x 1 fp16: .r the master curve, .g the saturation multiplier
+ SamplerState linearClamp3DSS : register(s1);
++// s2, its own slot, for the same reason s1 is not s0: it is the SAME state (LinearClamp), and
++// giving each consumer its own slot means neither can be changed by accident for the other's sake.
++// It also has to be declared up here - s0's linearClampSS belongs to the pixel shader's own block
++// several hundred lines below and is not in scope for FilmMapping.
++SamplerState linearClampCurveSS : register(s2);
+ 
+ // The standard half-texel inset for an N^3 grid: the first and last samples sit at the CENTRES
+ // of the outer texels, so the usable range is [0.5/N, 1 - 0.5/N] and an input of 0..1 has to be
+@@ -1158,6 +1175,18 @@ float3 SampleLut3D(Texture3D lut, SamplerState ss, float3 c, float fGridSize)
+ 	return lut.SampleLevel(ss, saturate(c) * fScale + fBias, 0).rgb;
+ }
+ 
++// The same inset, one dimension down, for the N x 1 curve texture (S10 item 3b). The row is a
++// single texel high, so v is 0.5 - the texel centre - and no linear filtering happens across it.
++// (Two curves in two CHANNELS rather than two rows precisely so that this coordinate can never be
++// slightly wrong: a two-row texture sampled at 0.25/0.75 bleeds one curve into the other the
++// moment anything about the mapping drifts, and it fails invisibly.)
++float2 SampleCurveLut(float x, float fGridSize)
++{
++	const float fScale = (fGridSize - 1.0) / fGridSize;
++	const float fBias  = 0.5 / fGridSize;
++	return curveTex.SampleLevel(linearClampCurveSS, float2(saturate(x) * fScale + fBias, 0.5), 0).rg;
++}
++
+ half3 FilmMapping( in vert2frag IN, in half3 cScene, in half3 cBloom, in half3 vAdaptedLum, in half fVignetting, out half3 cExportTap )
+ {
+ 	// The EXR export tap (SceneReferredSpec.md section 2, S6). Zero on the stock path and on
+@@ -1245,6 +1274,64 @@ half3 FilmMapping( in vert2frag IN, in half3 cScene, in half3 cBloom, in half3 v
+ 	const float fGradeLuma = dot(cGrade, ASC_CDL_LUMA_WEIGHTS);
+ 	cGrade = fGradeLuma + SceneCDLSlope.w * (cGrade - fGradeLuma);
+ 
++	// 3b. The two 1D curves (S10 item 3b, decisions/s10-grade-component.md section 3b).
++	//
++	//     WHY HERE. Pomfort Livegrade - the on-set desk this whole component copies - fixes the
++	//     order of every one of its grading modes at: input transform -> primary adjustments
++	//     (CDL, saturation) -> secondary adjustments (curves) -> output transform, and says
++	//     outright that the CDL cannot be reordered around the curves and the LUT. Its ACES
++	//     Advanced mode is exactly this node set. The practical half of the same argument: with
++	//     nothing in front of the CDL, the .cdl sidecar a capture writes still describes the FRONT
++	//     of the chain and still reproduces in Resolve as node 1, and the curves become node 2.
++	//
++	//     Neither fetch is issued when its curve is neutral, so an untouched curve costs nothing
++	//     and the picture is bit-identical to the build before this existed. The whole block is
++	//     inside %_RT_SAMPLE0, so the stock path never reaches it.
++	if (SceneCurveParams.x > 1.5)
++	{
++		// 3b-i. The master (luma) curve: ONE curve, applied identically to all three channels, so
++		//       it is a tone curve and not a colour operation - it cannot introduce a cast.
++		//
++		//       The out-of-domain rule. ACEScctToLinear(1.0) = 222.86 = +10.3 stops over grey, so
++		//       values above 1 really do arrive (the sensor clip is optional and goes to 16
++		//       stops). Sampling saturate(x) alone would land every one of them on curve(1) - and
++		//       the EXR export tap is DOWNSTREAM of here, so a capture would lose highlight
++		//       separation the sensor actually recorded. Adding back (x - saturate(x)) extends the
++		//       curve with slope 1 outside [0,1]: continuous at both ends, exactly identity for an
++		//       identity curve, correct for the small negatives a saturation push leaves behind,
++		//       and one instruction.
++		if (SceneCurveParams.y > 0.5)
++		{
++			const float3 vInside = saturate(cGrade);
++			const float3 vOutside = cGrade - vInside;
++			cGrade.r = SampleCurveLut(vInside.r, SceneCurveParams.x).r + vOutside.r;
++			cGrade.g = SampleCurveLut(vInside.g, SceneCurveParams.x).r + vOutside.g;
++			cGrade.b = SampleCurveLut(vInside.b, SceneCurveParams.x).r + vOutside.b;
++		}
++
++		// 3b-ii. Sat vs Sat: the output saturation multiplier as a function of the INPUT
++		//        saturation, which is Resolve's control of the same name (flat line = no change,
++		//        i.e. the y axis is a multiplier whose neutral is 1).
++		//
++		//        The measure is the length of the very vector the multiplier scales - the chroma
++		//        about the ASC Rec.709 luma the CDL saturation above already uses. Three
++		//        consequences: pushing the curve to zero at some x produces exactly the grey the
++		//        operator produces there (one geometry, not two); "saturation" means one thing
++		//        throughout this component; and it is EXPOSURE-INVARIANT, because this is a log
++		//        space and the weights sum to 1, so a stop adds the same constant to c and to
++		//        luma and leaves c - luma alone. An on-set control that slid when the aperture
++		//        moved would be useless.
++		//
++		//        Neutral is an exact identity by construction: luma + (c - luma) * 1 == c.
++		if (SceneCurveParams.z > 0.5)
++		{
++			const float fCurveLuma = dot(cGrade, ASC_CDL_LUMA_WEIGHTS);
++			const float3 vChroma = cGrade - fCurveLuma;
++			const float fSat = length(vChroma) * SceneCurveParams.w;
++			cGrade = fCurveLuma + vChroma * SampleCurveLut(fSat, SceneCurveParams.x).g;
++		}
++	}
++
+ 	// 4. The look (LMT), ACEScct in and out. An empty slot is the identity look - D10's "no
+ 	//    hidden ReC look": with nothing loaded the picture is pure ACES.
+ 	if (SceneCDLOffset.w > 1.5)
+-- 
+2.47.1.windows.1
+

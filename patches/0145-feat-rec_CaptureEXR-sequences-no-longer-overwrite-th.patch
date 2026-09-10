@@ -1,0 +1,151 @@
+From 46f9e8e44b41172abff56d19b94fa0d45258d5bf Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Thu, 10 Sep 2026 00:15:47 +0800
+Subject: [PATCH 145/160] feat: rec_CaptureEXR sequences no longer overwrite
+ the previous take (r_SceneReferredExportSequenceNaming)
+
+User: a second sequence into the same folder and prefix wrote frame.000000.exr over the first.
+Single frames already continued from the first free number on disk; sequences restarted at
+zero on every arm. New cvar r_SceneReferredExportSequenceNaming: 0 = restart at zero (the
+original), 1 = continue from the first free <prefix>.%06d.exr in the folder (default), 2 = the
+prefix gains _YYYYMMDD_HHMMSS and numbering starts at zero. The "capture armed" log line now
+says which number the take starts from. ConsoleReference.md updated.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01HXzRVK4yBVDUNfdWXEwV5y
+---
+ .../RenderDll/Common/RendererCVars.cpp        | 10 +++++++
+ .../RenderDll/Common/RendererCVars.h          |  1 +
+ .../GraphicsPipeline/SceneReferredExport.cpp  | 29 +++++++++++++++++--
+ .../CinematicCamera/docs/ConsoleReference.md  | 13 +++++++--
+ 4 files changed, 49 insertions(+), 4 deletions(-)
+
+diff --git a/Code/CryEngine/RenderDll/Common/RendererCVars.cpp b/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
+index a8da8f38..ed7067b4 100644
+--- a/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
++++ b/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
+@@ -426,6 +426,7 @@ float CRendererCVars::CV_r_SceneReferredWriterClamp;
+ int CRendererCVars::CV_r_SceneReferredMeterHistogram;
+ int CRendererCVars::CV_r_SceneReferredExrSelfTest;
+ int CRendererCVars::CV_r_SceneReferredExportTap;
++int CRendererCVars::CV_r_SceneReferredExportSequenceNaming;
+ int CRendererCVars::CV_r_SceneReferredExportEncoding;
+ int CRendererCVars::CV_r_SceneReferredExportCompression;
+ float CRendererCVars::CV_r_SceneReferredExportFixedStep;
+@@ -1896,6 +1897,15 @@ void CRendererCVars::InitCVars()
+ 	               "estimate, kept as the A/B reference and as the fallback if the compute pass "
+ 	               "ever misbehaves. On 0 the camera's Metering Mode and metering band do nothing "
+ 	               "and the meter's own 14-stop ceiling is back in force.");
++	REGISTER_CVAR3("r_SceneReferredExportSequenceNaming", CV_r_SceneReferredExportSequenceNaming, 1, VF_NULL,
++	               "How a SEQUENCE started by rec_CaptureEXR is numbered and named (single frames from "
++	               "rec_CaptureEXRFrame always continue from the first free number on disk). "
++	               "0 = restart at 000000 on every arm - the original behaviour; a second sequence into the "
++	               "same folder and prefix overwrites the first. "
++	               "1 = CONTINUE (default): start at the first free <prefix>.%06d.exr in that folder, so "
++	               "nothing already on disk is overwritten and repeated takes number on. "
++	               "2 = TIMESTAMP: the prefix becomes <prefix>_YYYYMMDD_HHMMSS and numbering starts at "
++	               "000000 - one folder, one sub-name per take.");
+ 	REGISTER_CVAR3("r_SceneReferredExportTap", CV_r_SceneReferredExportTap, 0, VF_NULL,
+ 	               "WHICH frame rec_CaptureEXR writes. "
+ 	               "0 = GRADED (default): the value HDRFinalPass has right before the output "
+diff --git a/Code/CryEngine/RenderDll/Common/RendererCVars.h b/Code/CryEngine/RenderDll/Common/RendererCVars.h
+index e480a8d8..d0c26129 100644
+--- a/Code/CryEngine/RenderDll/Common/RendererCVars.h
++++ b/Code/CryEngine/RenderDll/Common/RendererCVars.h
+@@ -428,6 +428,7 @@ public:
+ 	static int   CV_r_SceneReferredMeterHistogram;
+ 	static int   CV_r_SceneReferredExrSelfTest;
+ 	static int   CV_r_SceneReferredExportTap;
++	static int   CV_r_SceneReferredExportSequenceNaming;
+ 	static int   CV_r_SceneReferredExportEncoding;
+ 	static int   CV_r_SceneReferredExportCompression;
+ 	static float CV_r_SceneReferredExportFixedStep;
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/SceneReferredExport.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/SceneReferredExport.cpp
+index d3359adb..6f3a9780 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/SceneReferredExport.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/SceneReferredExport.cpp
+@@ -8,6 +8,7 @@
+ #include "Common/RendererResources.h"
+ 
+ #include <CryThreading/IJobManager_JobDelegator.h>
++#include <time.h>
+ 
+ // ---------------------------------------------------------------------------------------------
+ // The writer job. One per captured frame, low priority, and it owns its payload: the render
+@@ -125,8 +126,32 @@ bool CSceneReferredExport::StartSequence(const char* szFolder, const char* szPre
+ 	m_prefix = (szPrefix && *szPrefix) ? szPrefix : "frame";
+ 	// The frame counter belongs to the capture, not to a shared console variable. `capture_frames`
+ 	// is written by ManualFrameStep and by CryMovie as well, so two captures in one session there
+-	// continue the same numbering; here every arm starts at zero.
++	// continue the same numbering; here the arm decides, per r_SceneReferredExportSequenceNaming
++	// (2026-09-10, user: a second take into the same folder must not overwrite the first):
++	//   0 - start at zero (the original behaviour),
++	//   1 - continue from the first free number on disk (default),
++	//   2 - stamp the prefix with the wall-clock time and start at zero.
+ 	m_frameIndex = 0;
++	switch (clamp_tpl(CRenderer::CV_r_SceneReferredExportSequenceNaming, 0, 2))
++	{
++	case 1:
++		m_frameIndex = FirstFreeIndex(m_folder, m_prefix, 0);
++		break;
++	case 2:
++		{
++			time_t now = time(nullptr);
++			tm local;
++			localtime_s(&local, &now);
++			string stamped;
++			stamped.Format("%s_%04d%02d%02d_%02d%02d%02d", m_prefix.c_str(),
++			               local.tm_year + 1900, local.tm_mon + 1, local.tm_mday,
++			               local.tm_hour, local.tm_min, local.tm_sec);
++			m_prefix = stamped;
++		}
++		break;
++	default:
++		break;
++	}
+ 	m_nextSlot = 0;
+ 	m_tap = clamp_tpl(CRenderer::CV_r_SceneReferredExportTap, 0, 1);
+ 	m_encoding = clamp_tpl(CRenderer::CV_r_SceneReferredExportEncoding, 0, 1);
+@@ -134,7 +159,7 @@ bool CSceneReferredExport::StartSequence(const char* szFolder, const char* szPre
+ 
+ 	SetFixedStep(true);
+ 
+-	CryLogAlways("[EXR] capture armed: '%s/%s.%%06d.exr'", m_folder.c_str(), m_prefix.c_str());
++	CryLogAlways("[EXR] capture armed: '%s/%s.%%06d.exr' from %06d", m_folder.c_str(), m_prefix.c_str(), m_frameIndex);
+ 	return true;
+ }
+ 
+diff --git a/Code/CryPlugins/CinematicCamera/docs/ConsoleReference.md b/Code/CryPlugins/CinematicCamera/docs/ConsoleReference.md
+index 98c920b7..8865014e 100644
+--- a/Code/CryPlugins/CinematicCamera/docs/ConsoleReference.md
++++ b/Code/CryPlugins/CinematicCamera/docs/ConsoleReference.md
+@@ -68,8 +68,10 @@ settings in the header. `rec_CaptureEXR` starts a sequence and runs until `rec_C
+ Relative folders land under the user folder, absolute paths are taken as given, and the folder is
+ created if it does not exist (default `CaptureEXR`). Files are `<prefix>.%06d.exr` (default prefix
+ `frame`) - dot-separated, which is what Nuke and Resolve auto-detect as a sequence. The frame
+-counter belongs to the capture and starts at zero on every arm; it is **not** `capture_frames`,
+-which `ManualFrameStep` and CryMovie also write, and none of the stock capture path is touched.
++counter belongs to the capture; it is **not** `capture_frames`, which `ManualFrameStep` and
++CryMovie also write, and none of the stock capture path is touched. Where a sequence starts is
++`r_SceneReferredExportSequenceNaming`: by default it continues from the first free number in the
++folder, so a second take never overwrites the first; `2` stamps the prefix with the time instead.
+ 
+ `rec_CaptureEXRFrame` differs in two ways, both because a single frame is not a sequence. Its
+ arguments are **name first, folder second** - what you want to say about one frame is what it is,
+@@ -336,6 +338,13 @@ Two existing cvars change what they mean while the switch is on:
+   instead. `r_HDREyeAdaptationMode` likewise stops selecting anything - the scene-referred branch
+   is chosen ahead of it, which is the point of S0's D14 work.
+ 
++### r_SceneReferredExportSequenceNaming
++
++| | |
++| --- | --- |
++| Default | 1 |
++| Purpose | How a **sequence** from `rec_CaptureEXR` is numbered (single frames always continue from the first free number on disk). **0** restarts at `000000` on every arm - the original behaviour, and a second take into the same folder and prefix overwrites the first. **1 = continue**: start at the first free `<prefix>.%06d.exr` in the folder; nothing on disk is overwritten and takes number on. **2 = timestamp**: the prefix becomes `<prefix>_YYYYMMDD_HHMMSS` and numbering starts at zero - one folder, one sub-name per take. The armed line in the log says which number the take starts from. |
++
+ ### r_SceneReferredExportTap
+ 
+ | | |
+-- 
+2.47.1.windows.1
+
