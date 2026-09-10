@@ -35,6 +35,9 @@ uv run list_config.py --builtins            # every registered built-in config
 uv run list_config.py "ocio://cg-config-latest" /path/to/config.ocio
 
 uv run verify_matrices.py                   # matrices, luminance weights, ACEScct constants
+
+uv run wrap.py --lut theirlook.cube --space rec709 --size 65   # a 709 LUT -> a legal LMT
+uv run wrap.py --verify-identity                               # the wrap's acceptance instrument
 ```
 
 `out/` is generated and git-ignored. The shipped files are committed in the engine plugin's asset
@@ -191,12 +194,20 @@ display, the view and the grid size(s). The tool refuses to bake if:
 * the red-fastest ordering known-value test fails (a saturated red node that is not red-dominant,
   a saturated blue node that is not blue-dominant, or a neutral input that does not stay neutral).
 
-| file | display | view | size |
-|---|---|---|---|
-| `odt_srgb_100nit_aces2_33.cube` | `sRGB - Display` | `ACES 2.0 - SDR 100 nits (Rec.709)` | 33³ |
-| `odt_srgb_100nit_aces2_65.cube` | `sRGB - Display` | `ACES 2.0 - SDR 100 nits (Rec.709)` | 65³ |
-| `odt_rec1886_100nit_aces2_33.cube` | `Rec.1886 Rec.709 - Display` | `ACES 2.0 - SDR 100 nits (Rec.709)` | 33³ |
-| `lmt_identity_33.cube` | — | — (analytic identity) | 33³ |
+There are four preset **kinds**: `odt` (a display/view baked forward), `inverse_odt` (the same
+display/view baked backwards), `look` (ACEScct arithmetic only, no OCIO — see below) and
+`identity`.
+
+| file | kind | display | view | size |
+|---|---|---|---|---|
+| `odt_srgb_100nit_aces2_33.cube` | odt | `sRGB - Display` | `ACES 2.0 - SDR 100 nits (Rec.709)` | 33³ |
+| `odt_srgb_100nit_aces2_65.cube` | odt | `sRGB - Display` | `ACES 2.0 - SDR 100 nits (Rec.709)` | 65³ |
+| `odt_rec1886_100nit_aces2_33.cube` | odt | `Rec.1886 Rec.709 - Display` | `ACES 2.0 - SDR 100 nits (Rec.709)` | 33³ |
+| `odt_srgb_100nit_aces2_inv_65.cube` | inverse_odt | `sRGB - Display` | `ACES 2.0 - SDR 100 nits (Rec.709)` | 65³ |
+| `lmt_identity_33.cube` | identity | — | — (analytic identity) | 33³ |
+| `look_film_contrast_33.cube` | look | — | — (ACEScct arithmetic) | 33³ |
+| `look_warm_print_33.cube` | look | — | — (ACEScct arithmetic) | 33³ |
+| `test_identity_rec709_33.cube` | identity | — | — (tagged `Rec709`) | 33³ |
 
 The default is the sRGB one: the engine tail writes to a non-sRGB-typed 8-bit swapchain
 (`decisions/s4-display-transform.md` §3A), so the LUT's own encode is what reaches the panel. The
@@ -204,6 +215,86 @@ Rec.1886 bake is the reference for the Resolve round-trip (D12), whose default v
 Rec.1886. `lmt_identity_33.cube` is a pass-through for the LMT slot: with it loaded the image must
 be bit-identical to the LMT slot being off, which proves the parser, the 3D texture upload, the
 sampler addressing and the channel order in one test.
+
+### The `# ReC-LUT-Space:` tag
+
+Every file the tool writes carries one machine-readable line near the top of its comment block:
+
+```
+# ReC-LUT-Space: ACEScct
+```
+
+`.cube` has no metadata field, so the input space has to travel as a comment or not at all — and it
+has to travel, because a Rec.709 display LUT and an ACEScct LMT are both three floats in `[0,1]` on
+a unit domain and the wrong one loads silently. The plugin parses exactly this line and nothing
+else out of the comment block; every other tool ignores it, because it is a comment. Values:
+`ACEScct`, `ACEScg` (alias `Linear`), `Rec709` (aliases `Rec.709`, `sRGB`, `Display`). A file's tag
+overrides the component's `LMT Input Space` property, and the engine logs it when the two disagree.
+
+### `kind = "look"` — a shipped look is a recipe
+
+A look preset is evaluated in ACEScct with no OCIO at all: an ASC CDL, saturation, and the master
+tone curve, in the same order the component itself applies them. The `[preset.grade]` table takes
+the **CineCam Grade component's own controls** — `lift`, `gamma`, `gain` (one number or three),
+`contrast`, `pivot`, `saturation`, plus the raw `slope`/`offset`/`power` base if you want it — and
+folds them into one CDL exactly the way `SCineGradeParams::Resolve()` does. `[preset.curve]` takes
+`master_stops`, the five master-curve offsets in stops.
+
+```toml
+[look_warm_print]
+kind  = "look"
+size  = 33
+out   = "look_warm_print_{size}.cube"
+grade = { lift = [0.010, 0.002, -0.010], gain = [0.985, 0.997, 1.015], contrast = 1.04, saturation = 0.97 }
+curve = { master_stops = [0.0, 0.0, 0.0, 0.0, 0.0] }
+```
+
+The header the tool writes prints those numbers back, plus the single ASC CDL they fold into, so a
+user can read the cube and rebuild the look on the wheels by hand. That is the whole point of the
+shipped looks: no mystery colour science, only the operators the component already has.
+
+`acescct.py` holds the shared arithmetic — the shaper (`CommonMath.cfi:271-300`), the CDL
+(`HDRPostProcess.cfx:1270-1274`) and the monotone cubic Hermite master curve
+(`CryRenderer/SceneReferredCurves.h:89-197`). Each is a **transcription** of the code that runs in
+the engine, not a re-derivation: a shipped look whose recipe cannot be reproduced live on the
+component would be exactly the mystery these files exist not to be.
+
+### `wrap.py` — a Rec.709 LUT into a legal LMT
+
+```
+uv run wrap.py --lut theirlook.cube --space rec709 --size 65
+uv run wrap.py --lut theirlook.cube            # if the file carries its own ReC-LUT-Space tag
+uv run wrap.py --lut linearlook.cube --space acescg
+uv run wrap.py --lut theirlook.cube --method sandwich   # the plain recipe, for comparison
+```
+
+The recipe is the standard one — forward output transform, the LUT, inverse output transform —
+applied as a **residual**, `W(x) = x + [inv(LUT(fwd(x))) - inv(fwd(x))]`, because `inv(fwd(x))` is
+not the identity and the plain form would turn an identity 709 LUT into a visibly non-identity LMT.
+The output carries the source file's sha256, the transform chain, the method, and
+`# ReC-LUT-Space: ACEScct`, so it never gets wrapped twice.
+
+The plugin does the same thing at load time with two sampled cubes (the forward ODT and
+`odt_srgb_100nit_aces2_inv_65.cube`) so that dropping a 709 LUT in just works; wrapping offline is
+for a look you are going to ship.
+
+```
+uv run wrap.py --verify-identity
+```
+
+is the acceptance instrument: wrap an **identity** Rec.709 LUT and measure the result against the
+identity, for both methods, both grid sizes, and both evaluators (the plugin's sampled cubes and
+OCIO's exact processors). Result of the shipped run — the residual rows are **exactly zero** and
+the plain sandwich costs up to 0.95–1.13 in ACEScct (16–20 stops) at the extremes:
+
+| grid | evaluator | residual max | sandwich max |
+|---|---|---|---|
+| 33³ | plugin (sampled cubes) | 0.000000000 | 0.954338 |
+| 33³ | wrap.py (exact OCIO) | 0.000000000 | 1.125571 |
+| 33³ | ACEScg (analytic shaper) | 0.000000000 | 0.445205 |
+| 65³ | plugin (sampled cubes) | 0.000000000 | 0.954338 |
+| 65³ | wrap.py (exact OCIO) | 0.000000000 | 1.125571 |
+| 65³ | ACEScg (analytic shaper) | 0.000000000 | 0.445205 |
 
 ### File format
 
