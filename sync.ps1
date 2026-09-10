@@ -14,6 +14,23 @@ param(
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 
+# Byte-exact copy of a blob out of the dev repo. NOT `git show | Set-Content`: a PowerShell
+# pipeline splits the output into lines and -NoNewline glues them back without terminators,
+# which turned every synced file into one line (every sync before 2026-09-10 did this).
+function Copy-BlobExact([string]$spec, [string]$dst) {
+    $git = (Get-Command git).Source
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $git
+    $psi.Arguments = "-C `"$DevRepo`" cat-file blob `"$spec`""
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardOutput = $true
+    $proc = [System.Diagnostics.Process]::Start($psi)
+    $out = [System.IO.File]::Create($dst)
+    try { $proc.StandardOutput.BaseStream.CopyTo($out) } finally { $out.Dispose() }
+    $proc.WaitForExit()
+    if ($proc.ExitCode -ne 0) { throw "git cat-file failed for $spec" }
+}
+
 function Reset-Dir([string]$path) {
     if (Test-Path $path) { Get-ChildItem $path -Force | Remove-Item -Recurse -Force }
     New-Item -ItemType Directory -Force $path | Out-Null
@@ -42,7 +59,7 @@ foreach ($line in $changes) {
     if ($status -like "D*") { $deleted += $file; continue }
     $dst = Join-Path $srcDir $file
     New-Item -ItemType Directory -Force (Split-Path -Parent $dst) | Out-Null
-    git -C $DevRepo show "${DevRef}:$file" | Set-Content -Path $dst -Encoding utf8 -NoNewline
+    Copy-BlobExact "${DevRef}:$file" $dst
 }
 $deleted | Set-Content (Join-Path $srcDir "DELETED_FILES.txt")
 
@@ -64,7 +81,7 @@ foreach ($doc in ($docSources | Select-Object -Unique)) {
     $name = Split-Path -Leaf $doc
     if ($doc -like "*CryPhoneTracker*" -and $name -eq "README.md") { $name = "CryPhoneTracker-README.md" }
     if ($doc -like "*CinematicCamera*" -and $name -eq "README.md") { $name = "CinematicCamera-README.md" }
-    git -C $DevRepo show "${DevRef}:$doc" | Set-Content -Path (Join-Path $docDir $name) -Encoding utf8 -NoNewline
+    Copy-BlobExact "${DevRef}:$doc" (Join-Path $docDir $name)
 }
 
 # 4. Manifest.

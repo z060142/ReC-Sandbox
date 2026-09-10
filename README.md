@@ -23,8 +23,13 @@ picture from them.
   coma and astigmatism, axial and lateral colour fringing, lens ghosts, front filters such as
   star filters.
 - **Viewfinder aids**: frame guides with readouts, focus peaking.
-- **A phone as a handheld rig**: the `CryPhoneTracker` component and an Android app move the
-  camera from the phone's ARCore pose, with on-screen faders for focus, zoom and iris.
+
+### A simple phone controller
+
+The `CryPhoneTracker` plugin plus an Android app. The phone's ARCore pose moves the camera as a
+handheld 6DoF rig, and on-screen faders drive focus, zoom and aperture. A pose filter and a
+virtual tripod keep a hand-held shot steady, and the phone follows whichever camera is active
+when you cut between camera slots.
 
 ### Real light on the way to the screen
 

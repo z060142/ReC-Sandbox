@@ -1,1 +1,117 @@
-// Copyright 2026 ReC Sandbox. Distributed under the terms in LICENSE.md at the repository root.//// The three asset types the CineCam display chain needs (S10 item 4b).//// Why three plain types and nothing else: everything the user asked for follows from registration// alone (research/s10-4b-asset-system.md).////   * the Asset Browser lists the files with a type name, an icon and a colour, in the project AND//     under %engine% (CAssetManager scans both, AssetManager.cpp:115/307);//   * every component property that names one of these types by string gets an Asset Browser//     picker, because CAssetManager::RegisterAssetResourceSelectors (AssetManager.cpp:728-742)//     creates one selector per type whose IsUsingGenericPropertyTreePicker() is true - which is//     the default.//// Registration does NOT buy metadata generation, and that was item 4b's failure (step 5). Making a// file that appears on disk into an asset is CineCamAssetRegistration.h's job: this plugin writes// the `.cryasset` itself, one file at a time, without the Resource Compiler. See the header comment// there and scene-notes/research/s10-4b-fix-file-registration.md.//// So the whole of item 4b's editor half is three headers' worth of declarations. Anything more// (a thumbnail renderer, an editor window, a "New LUT" command) would be a second, weaker copy of// something that already exists elsewhere - the bake tool, Resolve, or the component's own Export// button.//// THE TYPE NAME STRINGS ARE A CONTRACT with the engine plugin// (Code/CryPlugins/CinematicCamera/Module/CineCamLutTypes.h, CINECAM_ASSET_TYPE_*): the same// string is written into every `.cryasset`'s type= attribute AND is the resource-selector name the// component's property rows look up. They are spelled out here rather than included, because a// Sandbox plugin has no business including an engine plugin's private headers; the two lists are// four strings long and both say so.#pragma once#include <AssetSystem/AssetType.h>//! A colour LUT: a Resolve-dialect `.cube`, 3D or 1D. Output transforms, LMT looks, the shipped//! identity, and any LUT the user drops in.class CCineLutAssetType : public CAssetType{public:	DECLARE_ASSET_TYPE_DESC(CCineLutAssetType);	//! Must match CINECAM_ASSET_TYPE_LUT. Never rename: it is in every sidecar on disk.	virtual const char* GetTypeName() const override      { return "CineLut"; }	virtual const char* GetUiTypeName() const override    { return QT_TR_NOOP("Colour LUT (.cube)"); }	virtual const char* GetFileExtension() const override { return "cube"; }	//! The `.cube` IS the source: there is nothing to convert and therefore no CAssetImporter.	virtual bool        IsImported() const override       { return false; }	//! Not creatable from the browser on purpose: a LUT is baked by tools/ocio-bake or exported	//! from a grading application. An empty one would mean nothing, and the identity we would seed	//! it with is already shipped as lmt_identity_33.cube.	virtual bool        CanBeCreated() const override     { return false; }	virtual bool        CanBeCopied() const override      { return true; }	//! No editor window. Editing a LUT means editing the file, which the plugin hot-reloads	//! (cinecam_LutHotReload).	virtual bool        CanBeEdited() const override      { return false; }	//! We generate our own metadata, per file, in CineCamAssetRegistration.cpp. Returning false here	//! takes "cube" out of CAssetGenerator's file-monitor list and out of its /assettypes= string	//! (AssetGenerator.cpp:159-168), so rc.exe is never launched for a LUT and the two writers cannot	//! race for the same sidecar with two different GUIDs. CScriptType / CXmlType say the same.	virtual bool        CanAutoRepairMetadata() const override { return false; }	virtual QColor      GetThumbnailColor() const override { return QColor(126, 168, 219); }private:	virtual CryIcon     GetIconInternal() const override  { return CryIcon("icons:common/assets_texture.ico"); }};//! An ASC CDL (`urn:ASC:CDL:v1.01`) - slope / offset / power / saturation. Written beside a capture//! by the scene-referred export path, or exported from Resolve.class CCineCdlAssetType : public CAssetType{public:	DECLARE_ASSET_TYPE_DESC(CCineCdlAssetType);	//! Must match CINECAM_ASSET_TYPE_CDL.	virtual const char* GetTypeName() const override      { return "CineCDL"; }	virtual const char* GetUiTypeName() const override    { return QT_TR_NOOP("ASC CDL"); }	virtual const char* GetFileExtension() const override { return "cdl"; }	virtual bool        IsImported() const override       { return false; }	virtual bool        CanBeCreated() const override     { return false; }	virtual bool        CanBeCopied() const override      { return true; }	virtual bool        CanBeEdited() const override      { return false; }	//! \sa CCineLutAssetType::CanAutoRepairMetadata	virtual bool        CanAutoRepairMetadata() const override { return false; }	virtual QColor      GetThumbnailColor() const override { return QColor(214, 166, 96); }private:	virtual CryIcon     GetIconInternal() const override  { return CryIcon("icons:General/File.ico"); }};//! A grade preset: the whole CineCam Grade component - wheels, contrast, curves, the CDL base, the//! LMT reference and its input space, and the bypass - in one XML file. Written by the component's//! Export Preset button, applied by picking it on any other CineCam Grade.class CCineGradeAssetType : public CAssetType{public:	DECLARE_ASSET_TYPE_DESC(CCineGradeAssetType);	//! Must match CINECAM_ASSET_TYPE_GRADE.	virtual const char* GetTypeName() const override      { return "CineGrade"; }	virtual const char* GetUiTypeName() const override    { return QT_TR_NOOP("CineCam Grade Preset"); }	virtual const char* GetFileExtension() const override { return "cinegrade"; }	virtual bool        IsImported() const override       { return false; }	//! The export button on the component is the only sensible way to make one: a preset is a	//! snapshot of a component, and there is no component in the Asset Browser.	virtual bool        CanBeCreated() const override     { return false; }	virtual bool        CanBeCopied() const override      { return true; }	virtual bool        CanBeEdited() const override      { return false; }	//! \sa CCineLutAssetType::CanAutoRepairMetadata	virtual bool        CanAutoRepairMetadata() const override { return false; }	virtual QColor      GetThumbnailColor() const override { return QColor(163, 205, 143); }private:	virtual CryIcon     GetIconInternal() const override  { return CryIcon("icons:General/Camera.ico"); }};
+// Copyright 2026 ReC Sandbox. Distributed under the terms in LICENSE.md at the repository root.
+//
+// The three asset types the CineCam display chain needs (S10 item 4b).
+//
+// Why three plain types and nothing else: everything the user asked for follows from registration
+// alone (research/s10-4b-asset-system.md).
+//
+//   * the Asset Browser lists the files with a type name, an icon and a colour, in the project AND
+//     under %engine% (CAssetManager scans both, AssetManager.cpp:115/307);
+//   * every component property that names one of these types by string gets an Asset Browser
+//     picker, because CAssetManager::RegisterAssetResourceSelectors (AssetManager.cpp:728-742)
+//     creates one selector per type whose IsUsingGenericPropertyTreePicker() is true - which is
+//     the default.
+//
+// Registration does NOT buy metadata generation, and that was item 4b's failure (step 5). Making a
+// file that appears on disk into an asset is CineCamAssetRegistration.h's job: this plugin writes
+// the `.cryasset` itself, one file at a time, without the Resource Compiler. See the header comment
+// there and scene-notes/research/s10-4b-fix-file-registration.md.
+//
+// So the whole of item 4b's editor half is three headers' worth of declarations. Anything more
+// (a thumbnail renderer, an editor window, a "New LUT" command) would be a second, weaker copy of
+// something that already exists elsewhere - the bake tool, Resolve, or the component's own Export
+// button.
+//
+// THE TYPE NAME STRINGS ARE A CONTRACT with the engine plugin
+// (Code/CryPlugins/CinematicCamera/Module/CineCamLutTypes.h, CINECAM_ASSET_TYPE_*): the same
+// string is written into every `.cryasset`'s type= attribute AND is the resource-selector name the
+// component's property rows look up. They are spelled out here rather than included, because a
+// Sandbox plugin has no business including an engine plugin's private headers; the two lists are
+// four strings long and both say so.
+#pragma once
+
+#include <AssetSystem/AssetType.h>
+
+//! A colour LUT: a Resolve-dialect `.cube`, 3D or 1D. Output transforms, LMT looks, the shipped
+//! identity, and any LUT the user drops in.
+class CCineLutAssetType : public CAssetType
+{
+public:
+	DECLARE_ASSET_TYPE_DESC(CCineLutAssetType);
+
+	//! Must match CINECAM_ASSET_TYPE_LUT. Never rename: it is in every sidecar on disk.
+	virtual const char* GetTypeName() const override      { return "CineLut"; }
+	virtual const char* GetUiTypeName() const override    { return QT_TR_NOOP("Colour LUT (.cube)"); }
+	virtual const char* GetFileExtension() const override { return "cube"; }
+
+	//! The `.cube` IS the source: there is nothing to convert and therefore no CAssetImporter.
+	virtual bool        IsImported() const override       { return false; }
+	//! Not creatable from the browser on purpose: a LUT is baked by tools/ocio-bake or exported
+	//! from a grading application. An empty one would mean nothing, and the identity we would seed
+	//! it with is already shipped as lmt_identity_33.cube.
+	virtual bool        CanBeCreated() const override     { return false; }
+	virtual bool        CanBeCopied() const override      { return true; }
+	//! No editor window. Editing a LUT means editing the file, which the plugin hot-reloads
+	//! (cinecam_LutHotReload).
+	virtual bool        CanBeEdited() const override      { return false; }
+	//! We generate our own metadata, per file, in CineCamAssetRegistration.cpp. Returning false here
+	//! takes "cube" out of CAssetGenerator's file-monitor list and out of its /assettypes= string
+	//! (AssetGenerator.cpp:159-168), so rc.exe is never launched for a LUT and the two writers cannot
+	//! race for the same sidecar with two different GUIDs. CScriptType / CXmlType say the same.
+	virtual bool        CanAutoRepairMetadata() const override { return false; }
+	virtual QColor      GetThumbnailColor() const override { return QColor(126, 168, 219); }
+
+private:
+	virtual CryIcon     GetIconInternal() const override  { return CryIcon("icons:common/assets_texture.ico"); }
+};
+
+//! An ASC CDL (`urn:ASC:CDL:v1.01`) - slope / offset / power / saturation. Written beside a capture
+//! by the scene-referred export path, or exported from Resolve.
+class CCineCdlAssetType : public CAssetType
+{
+public:
+	DECLARE_ASSET_TYPE_DESC(CCineCdlAssetType);
+
+	//! Must match CINECAM_ASSET_TYPE_CDL.
+	virtual const char* GetTypeName() const override      { return "CineCDL"; }
+	virtual const char* GetUiTypeName() const override    { return QT_TR_NOOP("ASC CDL"); }
+	virtual const char* GetFileExtension() const override { return "cdl"; }
+
+	virtual bool        IsImported() const override       { return false; }
+	virtual bool        CanBeCreated() const override     { return false; }
+	virtual bool        CanBeCopied() const override      { return true; }
+	virtual bool        CanBeEdited() const override      { return false; }
+	//! \sa CCineLutAssetType::CanAutoRepairMetadata
+	virtual bool        CanAutoRepairMetadata() const override { return false; }
+	virtual QColor      GetThumbnailColor() const override { return QColor(214, 166, 96); }
+
+private:
+	virtual CryIcon     GetIconInternal() const override  { return CryIcon("icons:General/File.ico"); }
+};
+
+//! A grade preset: the whole CineCam Grade component - wheels, contrast, curves, the CDL base, the
+//! LMT reference and its input space, and the bypass - in one XML file. Written by the component's
+//! Export Preset button, applied by picking it on any other CineCam Grade.
+class CCineGradeAssetType : public CAssetType
+{
+public:
+	DECLARE_ASSET_TYPE_DESC(CCineGradeAssetType);
+
+	//! Must match CINECAM_ASSET_TYPE_GRADE.
+	virtual const char* GetTypeName() const override      { return "CineGrade"; }
+	virtual const char* GetUiTypeName() const override    { return QT_TR_NOOP("CineCam Grade Preset"); }
+	virtual const char* GetFileExtension() const override { return "cinegrade"; }
+
+	virtual bool        IsImported() const override       { return false; }
+	//! The export button on the component is the only sensible way to make one: a preset is a
+	//! snapshot of a component, and there is no component in the Asset Browser.
+	virtual bool        CanBeCreated() const override     { return false; }
+	virtual bool        CanBeCopied() const override      { return true; }
+	virtual bool        CanBeEdited() const override      { return false; }
+	//! \sa CCineLutAssetType::CanAutoRepairMetadata
+	virtual bool        CanAutoRepairMetadata() const override { return false; }
+	virtual QColor      GetThumbnailColor() const override { return QColor(163, 205, 143); }
+
+private:
+	virtual CryIcon     GetIconInternal() const override  { return CryIcon("icons:General/Camera.ico"); }
+};

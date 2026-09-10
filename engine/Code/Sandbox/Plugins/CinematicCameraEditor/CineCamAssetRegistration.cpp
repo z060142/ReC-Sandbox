@@ -1,1 +1,430 @@
-// Copyright 2026 ReC Sandbox. Distributed under the terms in LICENSE.md at the repository root.#include "StdAfx.h"#include "CineCamAssetRegistration.h"#include <AssetSystem/Asset.h>#include <AssetSystem/AssetImportContext.h>#include <AssetSystem/AssetImporter.h>#include <AssetSystem/AssetManager.h>#include <AssetSystem/AssetManagerHelpers.h>#include <AssetSystem/AssetType.h>#include <AssetSystem/EditableAsset.h>#include <AssetSystem/Loader/AssetLoaderHelpers.h>#include <FileUtils.h>#include <IEditor.h>#include <PathUtils.h>#include <QtUtil.h>#include <CrySystem/ConsoleRegistration.h>#include <CrySystem/File/ICryPak.h>#include <CrySystem/File/IFileChangeMonitor.h>#include <CryString/CryPath.h>#include <QDir>namespace CineCamAssets{const char* const kWatchedFolder = "assets/cinecam";namespace{//! Extension -> registered type name. THE SAME CONTRACT as CineCamAssetTypes.h (and as the engine//! plugin's CINECAM_ASSET_TYPE_*): the type name goes into every sidecar's type= attribute, and//! CAsset's constructor resolves it through CAssetManager::FindAssetType.struct SKnownType{	const char* szExt;	const char* szTypeName;};const SKnownType kKnownTypes[] ={	{ "cube",      "CineLut"   },	{ "cdl",       "CineCDL"   },	{ "cinegrade", "CineGrade" },};//! True when the path is inside kWatchedFolder. Case-insensitive: the file monitor reports whatever//! case the file system gives it.bool IsInWatchedFolder(const string& gameRelPath){	const size_t len = strlen(kWatchedFolder);	return gameRelPath.length() > len	       && strnicmp(gameRelPath.c_str(), kWatchedFolder, len) == 0	       && gameRelPath[len] == '/';}string ToGameRelative(const char* szPath){	string path = PathUtil::ToUnixPath(string(szPath));	// The file monitor hands out paths that are already relative to the asset root; be tolerant of	// a leading separator so a caller (the console command, say) cannot trip over it.	while (!path.empty() && path[0] == '/')	{		path.erase(0, 1);	}	return path;}//! The one place a sidecar is created. Returns the asset, or nullptr.//! Never rewrites: if the `.cryasset` is already on disk it is loaded as it stands, so the GUID a//! level or a preset may already reference survives.CAsset* MakeAsset(const string& gameRelDataFile, const char* szTypeName){	const string metadataFile = gameRelDataFile + ".cryasset";	if (gEnv->pCryPak->IsFileExist(metadataFile.c_str(), ICryPak::eFileLocation_OnDisk))	{		return AssetLoader::CAssetFactory::LoadAssetFromXmlFile(metadataFile.c_str());	}	if (!CAssetManager::GetInstance()->FindAssetType(szTypeName))	{		CryWarning(VALIDATOR_MODULE_EDITOR, VALIDATOR_WARNING,		           "[cinecam] asset type '%s' is not registered - '%s' cannot be registered",		           szTypeName, gameRelDataFile.c_str());		return nullptr;	}	// The asset's display name is what the browser shows in the Name column. AssetLoader::GetAssetName	// cuts at the FIRST dot, so a vendor LUT called "..._BT.709_33grid_V.1.01.cube" would be listed	// as "..._BT". Passing the full stem keeps the whole name visible; nothing downstream parses it	// (files, picker results and lookups all go through the paths).	const string displayName = PathUtil::RemoveExtension(PathUtil::GetFile(gameRelDataFile));	CAsset* const pAsset = new CAsset(szTypeName, CryGUID::Create(), displayName.c_str());	// CEditableAsset's constructor is private to a list of friends; CAssetImportContext is one of	// them and hands one out (AssetImportContext.cpp:131-134). This is the supported route for code	// outside EditorCommon, and it is what CAssetType::Create does internally.	CAssetImportContext ctx;	CEditableAsset editable = ctx.CreateEditableAsset(*pAsset);	editable.SetMetadataFile(metadataFile.c_str());	editable.SetFiles({ gameRelDataFile });	// CAsset::WriteToFile is the engine's own sidecar writer (Asset.cpp:362-376): it emits exactly	// the XML AssetLoader::ReadMetadata expects and makes the File path relative to the asset's	// folder for us. Writing it by hand would be a second definition of the format.	if (!editable.WriteToFile())	{		CryWarning(VALIDATOR_MODULE_EDITOR, VALIDATOR_WARNING,		           "[cinecam] could not write '%s' - the file is on disk but the Asset Browser will "		           "not see it", metadataFile.c_str());		delete pAsset;		return nullptr;	}	CryLog("[cinecam] registered '%s' as %s", gameRelDataFile.c_str(), szTypeName);	return pAsset;}// ---------------------------------------------------------------------------// The file-change listener// ---------------------------------------------------------------------------//! CAsyncFileListener gives us the FIFO queue and the "the file is still open for writing, try again//! in half a second" retry (AssetManagerHelpers.cpp:140-166, :163-185) - which matters, because a//! 7 MB 65-cube arrives as a create event long before the copy has finished.class CCineCamAssetWatcher : public AssetManagerHelpers::CAsyncFileListener{public:	virtual bool AcceptFile(const char* szFilename, EChangeType eType) override	{		// Unlike CAssetGenerator (AssetGenerator.cpp:77-81) we accept Created as well as Modified:		// a plain Explorer copy usually raises both, but FileChangeMonitor collapses consecutive		// identical events, so relying on the second one is a bet rather than a design.		if (eType != eChangeType_Created		    && eType != eChangeType_Modified		    && eType != eChangeType_RenamedNewName)		{			return false;		}		const string path = ToGameRelative(szFilename);		return IsInWatchedFolder(path) && TypeNameForExtension(PathUtil::GetExt(path.c_str())) != nullptr;	}	virtual bool ProcessFile(const char* szFilename, EChangeType eType) override	{		RegisterFile(ToGameRelative(szFilename));		return true;	}};CCineCamAssetWatcher* g_pWatcher = nullptr;bool g_sweptOnce = false;void OnScanningCompleted(){	if (g_sweptOnce)	{		return;	}	g_sweptOnce = true;	SweepWatchedFolder();}void CmdRegisterAssets(IConsoleCmdArgs*){	const int count = SweepWatchedFolder();	CryLogAlways("[cinecam] cinecam_RegisterAssets: %d new file(s) registered under '%s'",	             count, kWatchedFolder);}} // anonymous namespace// ---------------------------------------------------------------------------// The asset importer - drag and drop, and File -> Import// ---------------------------------------------------------------------------//! Without this, the Asset Browser refuses a dropped `.cube` outright: CAssetDropHandler asks the//! registered importers which extensions they take (AssetDropHandler.cpp:46-49, 67-83) and never//! looks at the asset types. It is also the only route for a LUT that lives outside the project -//! the file is copied into the folder the user dropped it on.//!//! One importer per extension, not one for all three: CAssetDropHandler::ImportExt collects the//! asset types of every importer that claims the extension and offers all of them in the import//! dialog (AssetDropHandler.cpp:232-243). A single three-extension importer would therefore ask//! "is this .cube a Colour LUT, an ASC CDL or a Grade Preset?" for every dropped file.class CCineCamAssetImporterBase : public CAssetImporter{public:	virtual std::vector<string> GetFileExtensions() const override { return { GetExtension() }; }	virtual std::vector<string> GetAssetTypes() const override     { return { TypeNameForExtension(GetExtension()) }; }protected:	virtual const char* GetExtension() const = 0;private:	virtual std::vector<string> GetAssetNames(const std::vector<string>&, CAssetImportContext& ctx) override	{		// NOT ctx.GetOutputFilePath(): that is PathUtil::Make(dir, name, ext), i.e.		// ReplaceExtension(name, ext), which cuts the name at its LAST dot - so a LUT called		// "..._V.1.01.cube" would be given a sidecar called "..._V.1.cube.cryasset", which belongs to		// no file. The sidecar is always <data file>.cryasset, spelled out.		return { ctx.GetOutputSourceFilePath() + ".cryasset" };	}	virtual std::vector<CAsset*> ImportAssets(const std::vector<string>&, CAssetImportContext& ctx) override	{		const string gameRelDataFile = PathUtil::ToUnixPath(ctx.GetOutputSourceFilePath());		const char* const szTypeName = TypeNameForExtension(PathUtil::GetExt(gameRelDataFile.c_str()));		if (!szTypeName)		{			return {};		}		const string absDataFile = PathUtil::Make(PathUtil::GetGameProjectAssetsPath(), gameRelDataFile);		const string absInputFile = PathUtil::ToUnixPath(ctx.GetInputFilePath());		if (stricmp(absInputFile.c_str(), PathUtil::ToUnixPath(absDataFile).c_str()) != 0)		{			QDir().mkpath(QtUtil::ToQString(PathUtil::GetPathWithoutFilename(absDataFile)));			if (!ctx.CanWrite(absDataFile) || !FileUtils::CopyFileAllowOverwrite(absInputFile.c_str(), absDataFile.c_str()))			{				CryWarning(VALIDATOR_MODULE_EDITOR, VALIDATOR_WARNING,				           "[cinecam] could not copy '%s' to '%s'", absInputFile.c_str(), absDataFile.c_str());				return {};			}		}		// MakeAsset leaves an existing sidecar alone, so re-importing the same LUT refreshes the file		// and keeps its GUID. The caller merges what we return, on the main thread		// (AssetDropHandler.cpp:180-187).		CAsset* const pAsset = MakeAsset(gameRelDataFile, szTypeName);		return pAsset ? std::vector<CAsset*>{ pAsset } : std::vector<CAsset*>{};	}};class CCineLutAssetImporter : public CCineCamAssetImporterBase{public:	DECLARE_ASSET_IMPORTER_DESC(CCineLutAssetImporter);protected:	virtual const char* GetExtension() const override { return "cube"; }};class CCineCdlAssetImporter : public CCineCamAssetImporterBase{public:	DECLARE_ASSET_IMPORTER_DESC(CCineCdlAssetImporter);protected:	virtual const char* GetExtension() const override { return "cdl"; }};class CCineGradeAssetImporter : public CCineCamAssetImporterBase{public:	DECLARE_ASSET_IMPORTER_DESC(CCineGradeAssetImporter);protected:	virtual const char* GetExtension() const override { return "cinegrade"; }};REGISTER_ASSET_IMPORTER(CCineLutAssetImporter)REGISTER_ASSET_IMPORTER(CCineCdlAssetImporter)REGISTER_ASSET_IMPORTER(CCineGradeAssetImporter)// ---------------------------------------------------------------------------// Public entry points// ---------------------------------------------------------------------------const char* TypeNameForExtension(const char* szExt){	if (!szExt || !*szExt)	{		return nullptr;	}	for (const auto& known : kKnownTypes)	{		if (stricmp(szExt, known.szExt) == 0)		{			return known.szTypeName;		}	}	return nullptr;}CAsset* CreateAssetForFile(const string& gameRelDataFile){	const char* const szTypeName = TypeNameForExtension(PathUtil::GetExt(gameRelDataFile.c_str()));	if (!szTypeName)	{		return nullptr;	}	if (!gEnv->pCryPak->IsFileExist(gameRelDataFile.c_str(), ICryPak::eFileLocation_OnDisk))	{		return nullptr;	}	return MakeAsset(gameRelDataFile, szTypeName);}bool RegisterFile(const string& gameRelDataFile){	CAssetManager* const pManager = CAssetManager::GetInstance();	if (!pManager)	{		return false;	}	if (pManager->FindAssetForFile(gameRelDataFile.c_str()))	{		return true; // Already known - nothing to write, nothing to say.	}	CAssetPtr pAsset = CreateAssetForFile(gameRelDataFile);	if (!pAsset)	{		return false;	}	// Same two lines CAssetFileMonitor::LoadAsset uses (AssetFileMonitor.cpp:94-104). MergeAssets	// updates an asset with the same metadata path instead of duplicating it, and defers safely	// while the initial scan is still running (AssetManager.cpp:385-392).	pManager->MergeAssets({ pAsset.ReleaseOwnership() });	return true;}int SweepWatchedFolder(){	CAssetManager* const pManager = CAssetManager::GetInstance();	if (!pManager)	{		return 0;	}	const string absFolder = PathUtil::Make(PathUtil::GetGameProjectAssetsPath(), kWatchedFolder);	if (!FileUtils::FolderExists(absFolder))	{		return 0;	}	// Returns paths already relative to the asset root (FileUtils.cpp:19-43).	const std::vector<string> content = FileUtils::GetDirectorysContent(absFolder);	int registered = 0;	for (const string& file : content)	{		const string gameRelPath = PathUtil::ToUnixPath(file);		if (!IsInWatchedFolder(gameRelPath) || !TypeNameForExtension(PathUtil::GetExt(gameRelPath.c_str())))		{			continue;		}		if (pManager->FindAssetForFile(gameRelPath.c_str()))		{			continue;		}		if (RegisterFile(gameRelPath))		{			++registered;		}	}	return registered;}void Install(){	if (g_pWatcher)	{		return;	}	g_pWatcher = new CCineCamAssetWatcher();	// One listener per extension. The folder argument is a prefix the monitor matches itself	// (EditorFileMonitor.cpp:236-247), so events outside assets/cinecam never reach us at all.	IFileChangeMonitor* const pMonitor = GetIEditor() ? GetIEditor()->GetFileMonitor() : nullptr;	if (pMonitor)	{		for (const auto& known : kKnownTypes)		{			pMonitor->RegisterListener(g_pWatcher, kWatchedFolder, known.szExt);		}	}	else	{		CryWarning(VALIDATOR_MODULE_EDITOR, VALIDATOR_WARNING,		           "[cinecam] no file monitor - dropped grade files will not register themselves");	}	// Files copied in while the editor was closed are not events; sweep once, as soon as the asset	// manager knows what it already has.	if (CAssetManager* const pManager = CAssetManager::GetInstance())	{		pManager->signalScanningCompleted.Connect([]() { OnScanningCompleted(); }, (uintptr_t)&kKnownTypes);	}	REGISTER_COMMAND("cinecam_RegisterAssets", CmdRegisterAssets, VF_NULL,	                 "cinecam_RegisterAssets\n"	                 "Registers every LUT / CDL / grade preset under assets/cinecam that the Asset\n"	                 "Browser does not know about yet, one sidecar per file. Existing sidecars are\n"	                 "left alone. Normally unnecessary - the editor does this by itself when a file\n"	                 "appears - but harmless to run.");}void Uninstall(){	if (CAssetManager* const pManager = CAssetManager::GetInstance())	{		pManager->signalScanningCompleted.DisconnectById((uintptr_t)&kKnownTypes);	}	if (g_pWatcher)	{		if (IFileChangeMonitor* const pMonitor = GetIEditor() ? GetIEditor()->GetFileMonitor() : nullptr)		{			pMonitor->UnregisterListener(g_pWatcher);		}		delete g_pWatcher;		g_pWatcher = nullptr;	}	if (gEnv && gEnv->pConsole)	{		gEnv->pConsole->RemoveCommand("cinecam_RegisterAssets");	}}}
+// Copyright 2026 ReC Sandbox. Distributed under the terms in LICENSE.md at the repository root.
+#include "StdAfx.h"
+#include "CineCamAssetRegistration.h"
+
+#include <AssetSystem/Asset.h>
+#include <AssetSystem/AssetImportContext.h>
+#include <AssetSystem/AssetImporter.h>
+#include <AssetSystem/AssetManager.h>
+#include <AssetSystem/AssetManagerHelpers.h>
+#include <AssetSystem/AssetType.h>
+#include <AssetSystem/EditableAsset.h>
+#include <AssetSystem/Loader/AssetLoaderHelpers.h>
+#include <FileUtils.h>
+#include <IEditor.h>
+#include <PathUtils.h>
+#include <QtUtil.h>
+
+#include <CrySystem/ConsoleRegistration.h>
+#include <CrySystem/File/ICryPak.h>
+#include <CrySystem/File/IFileChangeMonitor.h>
+#include <CryString/CryPath.h>
+
+#include <QDir>
+
+namespace CineCamAssets
+{
+
+const char* const kWatchedFolder = "assets/cinecam";
+
+namespace
+{
+
+//! Extension -> registered type name. THE SAME CONTRACT as CineCamAssetTypes.h (and as the engine
+//! plugin's CINECAM_ASSET_TYPE_*): the type name goes into every sidecar's type= attribute, and
+//! CAsset's constructor resolves it through CAssetManager::FindAssetType.
+struct SKnownType
+{
+	const char* szExt;
+	const char* szTypeName;
+};
+
+const SKnownType kKnownTypes[] =
+{
+	{ "cube",      "CineLut"   },
+	{ "cdl",       "CineCDL"   },
+	{ "cinegrade", "CineGrade" },
+};
+
+//! True when the path is inside kWatchedFolder. Case-insensitive: the file monitor reports whatever
+//! case the file system gives it.
+bool IsInWatchedFolder(const string& gameRelPath)
+{
+	const size_t len = strlen(kWatchedFolder);
+	return gameRelPath.length() > len
+	       && strnicmp(gameRelPath.c_str(), kWatchedFolder, len) == 0
+	       && gameRelPath[len] == '/';
+}
+
+string ToGameRelative(const char* szPath)
+{
+	string path = PathUtil::ToUnixPath(string(szPath));
+	// The file monitor hands out paths that are already relative to the asset root; be tolerant of
+	// a leading separator so a caller (the console command, say) cannot trip over it.
+	while (!path.empty() && path[0] == '/')
+	{
+		path.erase(0, 1);
+	}
+	return path;
+}
+
+//! The one place a sidecar is created. Returns the asset, or nullptr.
+//! Never rewrites: if the `.cryasset` is already on disk it is loaded as it stands, so the GUID a
+//! level or a preset may already reference survives.
+CAsset* MakeAsset(const string& gameRelDataFile, const char* szTypeName)
+{
+	const string metadataFile = gameRelDataFile + ".cryasset";
+
+	if (gEnv->pCryPak->IsFileExist(metadataFile.c_str(), ICryPak::eFileLocation_OnDisk))
+	{
+		return AssetLoader::CAssetFactory::LoadAssetFromXmlFile(metadataFile.c_str());
+	}
+
+	if (!CAssetManager::GetInstance()->FindAssetType(szTypeName))
+	{
+		CryWarning(VALIDATOR_MODULE_EDITOR, VALIDATOR_WARNING,
+		           "[cinecam] asset type '%s' is not registered - '%s' cannot be registered",
+		           szTypeName, gameRelDataFile.c_str());
+		return nullptr;
+	}
+
+	// The asset's display name is what the browser shows in the Name column. AssetLoader::GetAssetName
+	// cuts at the FIRST dot, so a vendor LUT called "..._BT.709_33grid_V.1.01.cube" would be listed
+	// as "..._BT". Passing the full stem keeps the whole name visible; nothing downstream parses it
+	// (files, picker results and lookups all go through the paths).
+	const string displayName = PathUtil::RemoveExtension(PathUtil::GetFile(gameRelDataFile));
+
+	CAsset* const pAsset = new CAsset(szTypeName, CryGUID::Create(), displayName.c_str());
+
+	// CEditableAsset's constructor is private to a list of friends; CAssetImportContext is one of
+	// them and hands one out (AssetImportContext.cpp:131-134). This is the supported route for code
+	// outside EditorCommon, and it is what CAssetType::Create does internally.
+	CAssetImportContext ctx;
+	CEditableAsset editable = ctx.CreateEditableAsset(*pAsset);
+	editable.SetMetadataFile(metadataFile.c_str());
+	editable.SetFiles({ gameRelDataFile });
+
+	// CAsset::WriteToFile is the engine's own sidecar writer (Asset.cpp:362-376): it emits exactly
+	// the XML AssetLoader::ReadMetadata expects and makes the File path relative to the asset's
+	// folder for us. Writing it by hand would be a second definition of the format.
+	if (!editable.WriteToFile())
+	{
+		CryWarning(VALIDATOR_MODULE_EDITOR, VALIDATOR_WARNING,
+		           "[cinecam] could not write '%s' - the file is on disk but the Asset Browser will "
+		           "not see it", metadataFile.c_str());
+		delete pAsset;
+		return nullptr;
+	}
+
+	CryLog("[cinecam] registered '%s' as %s", gameRelDataFile.c_str(), szTypeName);
+	return pAsset;
+}
+
+// ---------------------------------------------------------------------------
+// The file-change listener
+// ---------------------------------------------------------------------------
+
+//! CAsyncFileListener gives us the FIFO queue and the "the file is still open for writing, try again
+//! in half a second" retry (AssetManagerHelpers.cpp:140-166, :163-185) - which matters, because a
+//! 7 MB 65-cube arrives as a create event long before the copy has finished.
+class CCineCamAssetWatcher : public AssetManagerHelpers::CAsyncFileListener
+{
+public:
+	virtual bool AcceptFile(const char* szFilename, EChangeType eType) override
+	{
+		// Unlike CAssetGenerator (AssetGenerator.cpp:77-81) we accept Created as well as Modified:
+		// a plain Explorer copy usually raises both, but FileChangeMonitor collapses consecutive
+		// identical events, so relying on the second one is a bet rather than a design.
+		if (eType != eChangeType_Created
+		    && eType != eChangeType_Modified
+		    && eType != eChangeType_RenamedNewName)
+		{
+			return false;
+		}
+
+		const string path = ToGameRelative(szFilename);
+		return IsInWatchedFolder(path) && TypeNameForExtension(PathUtil::GetExt(path.c_str())) != nullptr;
+	}
+
+	virtual bool ProcessFile(const char* szFilename, EChangeType eType) override
+	{
+		RegisterFile(ToGameRelative(szFilename));
+		return true;
+	}
+};
+
+CCineCamAssetWatcher* g_pWatcher = nullptr;
+bool g_sweptOnce = false;
+
+void OnScanningCompleted()
+{
+	if (g_sweptOnce)
+	{
+		return;
+	}
+	g_sweptOnce = true;
+	SweepWatchedFolder();
+}
+
+void CmdRegisterAssets(IConsoleCmdArgs*)
+{
+	const int count = SweepWatchedFolder();
+	CryLogAlways("[cinecam] cinecam_RegisterAssets: %d new file(s) registered under '%s'",
+	             count, kWatchedFolder);
+}
+
+} // anonymous namespace
+
+// ---------------------------------------------------------------------------
+// The asset importer - drag and drop, and File -> Import
+// ---------------------------------------------------------------------------
+
+//! Without this, the Asset Browser refuses a dropped `.cube` outright: CAssetDropHandler asks the
+//! registered importers which extensions they take (AssetDropHandler.cpp:46-49, 67-83) and never
+//! looks at the asset types. It is also the only route for a LUT that lives outside the project -
+//! the file is copied into the folder the user dropped it on.
+//!
+//! One importer per extension, not one for all three: CAssetDropHandler::ImportExt collects the
+//! asset types of every importer that claims the extension and offers all of them in the import
+//! dialog (AssetDropHandler.cpp:232-243). A single three-extension importer would therefore ask
+//! "is this .cube a Colour LUT, an ASC CDL or a Grade Preset?" for every dropped file.
+class CCineCamAssetImporterBase : public CAssetImporter
+{
+public:
+	virtual std::vector<string> GetFileExtensions() const override { return { GetExtension() }; }
+	virtual std::vector<string> GetAssetTypes() const override     { return { TypeNameForExtension(GetExtension()) }; }
+
+protected:
+	virtual const char* GetExtension() const = 0;
+
+private:
+	virtual std::vector<string> GetAssetNames(const std::vector<string>&, CAssetImportContext& ctx) override
+	{
+		// NOT ctx.GetOutputFilePath(): that is PathUtil::Make(dir, name, ext), i.e.
+		// ReplaceExtension(name, ext), which cuts the name at its LAST dot - so a LUT called
+		// "..._V.1.01.cube" would be given a sidecar called "..._V.1.cube.cryasset", which belongs to
+		// no file. The sidecar is always <data file>.cryasset, spelled out.
+		return { ctx.GetOutputSourceFilePath() + ".cryasset" };
+	}
+
+	virtual std::vector<CAsset*> ImportAssets(const std::vector<string>&, CAssetImportContext& ctx) override
+	{
+		const string gameRelDataFile = PathUtil::ToUnixPath(ctx.GetOutputSourceFilePath());
+		const char* const szTypeName = TypeNameForExtension(PathUtil::GetExt(gameRelDataFile.c_str()));
+		if (!szTypeName)
+		{
+			return {};
+		}
+
+		const string absDataFile = PathUtil::Make(PathUtil::GetGameProjectAssetsPath(), gameRelDataFile);
+		const string absInputFile = PathUtil::ToUnixPath(ctx.GetInputFilePath());
+
+		if (stricmp(absInputFile.c_str(), PathUtil::ToUnixPath(absDataFile).c_str()) != 0)
+		{
+			QDir().mkpath(QtUtil::ToQString(PathUtil::GetPathWithoutFilename(absDataFile)));
+
+			if (!ctx.CanWrite(absDataFile) || !FileUtils::CopyFileAllowOverwrite(absInputFile.c_str(), absDataFile.c_str()))
+			{
+				CryWarning(VALIDATOR_MODULE_EDITOR, VALIDATOR_WARNING,
+				           "[cinecam] could not copy '%s' to '%s'", absInputFile.c_str(), absDataFile.c_str());
+				return {};
+			}
+		}
+
+		// MakeAsset leaves an existing sidecar alone, so re-importing the same LUT refreshes the file
+		// and keeps its GUID. The caller merges what we return, on the main thread
+		// (AssetDropHandler.cpp:180-187).
+		CAsset* const pAsset = MakeAsset(gameRelDataFile, szTypeName);
+		return pAsset ? std::vector<CAsset*>{ pAsset } : std::vector<CAsset*>{};
+	}
+};
+
+class CCineLutAssetImporter : public CCineCamAssetImporterBase
+{
+public:
+	DECLARE_ASSET_IMPORTER_DESC(CCineLutAssetImporter);
+protected:
+	virtual const char* GetExtension() const override { return "cube"; }
+};
+
+class CCineCdlAssetImporter : public CCineCamAssetImporterBase
+{
+public:
+	DECLARE_ASSET_IMPORTER_DESC(CCineCdlAssetImporter);
+protected:
+	virtual const char* GetExtension() const override { return "cdl"; }
+};
+
+class CCineGradeAssetImporter : public CCineCamAssetImporterBase
+{
+public:
+	DECLARE_ASSET_IMPORTER_DESC(CCineGradeAssetImporter);
+protected:
+	virtual const char* GetExtension() const override { return "cinegrade"; }
+};
+
+REGISTER_ASSET_IMPORTER(CCineLutAssetImporter)
+REGISTER_ASSET_IMPORTER(CCineCdlAssetImporter)
+REGISTER_ASSET_IMPORTER(CCineGradeAssetImporter)
+
+// ---------------------------------------------------------------------------
+// Public entry points
+// ---------------------------------------------------------------------------
+
+const char* TypeNameForExtension(const char* szExt)
+{
+	if (!szExt || !*szExt)
+	{
+		return nullptr;
+	}
+	for (const auto& known : kKnownTypes)
+	{
+		if (stricmp(szExt, known.szExt) == 0)
+		{
+			return known.szTypeName;
+		}
+	}
+	return nullptr;
+}
+
+CAsset* CreateAssetForFile(const string& gameRelDataFile)
+{
+	const char* const szTypeName = TypeNameForExtension(PathUtil::GetExt(gameRelDataFile.c_str()));
+	if (!szTypeName)
+	{
+		return nullptr;
+	}
+	if (!gEnv->pCryPak->IsFileExist(gameRelDataFile.c_str(), ICryPak::eFileLocation_OnDisk))
+	{
+		return nullptr;
+	}
+	return MakeAsset(gameRelDataFile, szTypeName);
+}
+
+bool RegisterFile(const string& gameRelDataFile)
+{
+	CAssetManager* const pManager = CAssetManager::GetInstance();
+	if (!pManager)
+	{
+		return false;
+	}
+
+	if (pManager->FindAssetForFile(gameRelDataFile.c_str()))
+	{
+		return true; // Already known - nothing to write, nothing to say.
+	}
+
+	CAssetPtr pAsset = CreateAssetForFile(gameRelDataFile);
+	if (!pAsset)
+	{
+		return false;
+	}
+
+	// Same two lines CAssetFileMonitor::LoadAsset uses (AssetFileMonitor.cpp:94-104). MergeAssets
+	// updates an asset with the same metadata path instead of duplicating it, and defers safely
+	// while the initial scan is still running (AssetManager.cpp:385-392).
+	pManager->MergeAssets({ pAsset.ReleaseOwnership() });
+	return true;
+}
+
+int SweepWatchedFolder()
+{
+	CAssetManager* const pManager = CAssetManager::GetInstance();
+	if (!pManager)
+	{
+		return 0;
+	}
+
+	const string absFolder = PathUtil::Make(PathUtil::GetGameProjectAssetsPath(), kWatchedFolder);
+	if (!FileUtils::FolderExists(absFolder))
+	{
+		return 0;
+	}
+
+	// Returns paths already relative to the asset root (FileUtils.cpp:19-43).
+	const std::vector<string> content = FileUtils::GetDirectorysContent(absFolder);
+
+	int registered = 0;
+	for (const string& file : content)
+	{
+		const string gameRelPath = PathUtil::ToUnixPath(file);
+		if (!IsInWatchedFolder(gameRelPath) || !TypeNameForExtension(PathUtil::GetExt(gameRelPath.c_str())))
+		{
+			continue;
+		}
+		if (pManager->FindAssetForFile(gameRelPath.c_str()))
+		{
+			continue;
+		}
+		if (RegisterFile(gameRelPath))
+		{
+			++registered;
+		}
+	}
+	return registered;
+}
+
+void Install()
+{
+	if (g_pWatcher)
+	{
+		return;
+	}
+
+	g_pWatcher = new CCineCamAssetWatcher();
+
+	// One listener per extension. The folder argument is a prefix the monitor matches itself
+	// (EditorFileMonitor.cpp:236-247), so events outside assets/cinecam never reach us at all.
+	IFileChangeMonitor* const pMonitor = GetIEditor() ? GetIEditor()->GetFileMonitor() : nullptr;
+	if (pMonitor)
+	{
+		for (const auto& known : kKnownTypes)
+		{
+			pMonitor->RegisterListener(g_pWatcher, kWatchedFolder, known.szExt);
+		}
+	}
+	else
+	{
+		CryWarning(VALIDATOR_MODULE_EDITOR, VALIDATOR_WARNING,
+		           "[cinecam] no file monitor - dropped grade files will not register themselves");
+	}
+
+	// Files copied in while the editor was closed are not events; sweep once, as soon as the asset
+	// manager knows what it already has.
+	if (CAssetManager* const pManager = CAssetManager::GetInstance())
+	{
+		pManager->signalScanningCompleted.Connect([]() { OnScanningCompleted(); }, (uintptr_t)&kKnownTypes);
+	}
+
+	REGISTER_COMMAND("cinecam_RegisterAssets", CmdRegisterAssets, VF_NULL,
+	                 "cinecam_RegisterAssets\n"
+	                 "Registers every LUT / CDL / grade preset under assets/cinecam that the Asset\n"
+	                 "Browser does not know about yet, one sidecar per file. Existing sidecars are\n"
+	                 "left alone. Normally unnecessary - the editor does this by itself when a file\n"
+	                 "appears - but harmless to run.");
+}
+
+void Uninstall()
+{
+	if (CAssetManager* const pManager = CAssetManager::GetInstance())
+	{
+		pManager->signalScanningCompleted.DisconnectById((uintptr_t)&kKnownTypes);
+	}
+
+	if (g_pWatcher)
+	{
+		if (IFileChangeMonitor* const pMonitor = GetIEditor() ? GetIEditor()->GetFileMonitor() : nullptr)
+		{
+			pMonitor->UnregisterListener(g_pWatcher);
+		}
+		delete g_pWatcher;
+		g_pWatcher = nullptr;
+	}
+
+	if (gEnv && gEnv->pConsole)
+	{
+		gEnv->pConsole->RemoveCommand("cinecam_RegisterAssets");
+	}
+}
+
+}

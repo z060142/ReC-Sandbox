@@ -1,1 +1,988 @@
-// Copyright 2026 ReC Sandbox. Scene-referred pipeline, stage S6 (SceneReferredSpec.md).#include "StdAfx.h"#include "SceneReferredExport.h"#include "DriverD3D.h"#include "Common/PostProcess/PostProcess.h"#include "Common/RendererResources.h"#include <CryThreading/IJobManager_JobDelegator.h>#include <time.h>// ---------------------------------------------------------------------------------------------// The writer job. One per captured frame, low priority, and it owns its payload: the render// thread copied the pixels out of the staging map before launching it, precisely so that nothing// here touches a D3D resource or a ring slot the GPU is about to reuse.// ---------------------------------------------------------------------------------------------void SceneReferredExportWriteJobEntry(SSceneReferredExportJob*);DECLARE_JOB("SceneReferredExport", TSceneReferredExportJob, SceneReferredExportWriteJobEntry);void SceneReferredExportWriteJobEntry(SSceneReferredExportJob* pJob){	if (!pJob)		return;	pJob->desc.pAttributes = pJob->attributes.empty() ? nullptr : pJob->attributes.data();	pJob->desc.numAttributes = (int)pJob->attributes.size();	WriteEXR(pJob->path.c_str(), pJob->width, pJob->height, pJob->pixels.data(), pJob->width, pJob->desc);	delete pJob;}namespace{//! AP1 -> AP0, row-major. The standard ACES matrix pair; these are the AP1ToXYZ / XYZToAP0 product//! and are fixed by the specification, not tuned. Verified against PyOpenColorIO by//! tools/ocio-bake/verify_matrices.py alongside the ones CommonMath.cfi carries.const float kAP1ToAP0[9] ={	 0.6954522414f,  0.1406786965f,  0.1638690622f,	 0.0447945634f,  0.8596711185f,  0.0955343182f,	-0.0055258826f,  0.0040252103f,  1.0015006723f,};//! AP1 (ACEScg) and AP0 (ACES2065-1) primaries with the ACES white, CIE 1931 xy, in the order the//! EXR `chromaticities` attribute wants: rx ry gx gy bx by wx wy.const float kChromaticitiesAP1[8] = { 0.713f,   0.293f,   0.165f, 0.830f,  0.128f,  0.044f,   0.32168f, 0.33767f };const float kChromaticitiesAP0[8] = { 0.7347f,  0.2653f,  0.0f,   1.0f,    0.0001f, -0.0770f, 0.32168f, 0.33767f };//! Turn whatever the operator typed into a real, existing directory. A relative folder lands//! under the user folder, which is where every other tool in this engine writes; an absolute one//! is taken as given.string ResolveCaptureFolder(const char* szFolder){	string folder = (szFolder && *szFolder) ? szFolder : "CaptureEXR";	folder.replace('\\', '/');	const bool bAbsolute = (folder.size() > 1 && folder[1] == ':') || folder[0] == '/';	if (!bAbsolute)		folder = string("%USER%/") + folder;	CryPathString resolved;	gEnv->pCryPak->AdjustFileName(folder.c_str(), resolved, ICryPak::FLAGS_PATH_REAL | ICryPak::FLAGS_FOR_WRITING);	gEnv->pCryPak->MakeDir(resolved.c_str());	return string(resolved.c_str());}float GetBusParam(const char* szName){	CPostEffectsMgr* pPostMgr = PostEffectMgr();	if (!pPostMgr)		return 0.0f;	CEffectParam* pParam = pPostMgr->GetByName(szName);	return pParam ? pParam->GetParam() : 0.0f;}//! The name a LUT slot is currently holding, or "" when the slot is empty. The texture's name is//! the .cube path ccam uploaded it under, so this is where the ODT/LMT provenance comes from//! without the renderer needing a string channel of its own.string GetLutName(CEffectParam* pId, CEffectParam* pSize){	if (!pId || !pSize || pSize->GetParam() < 2.0f)		return string();	CTexture* pTex = CTexture::GetByID((int)pId->GetParam());	return CTexture::IsTextureExist(pTex) ? string(pTex->GetName()) : string();}//! Whatever the operator typed, made safe to sit inside an XML attribute or element. Not an//! escaper - a filter: the two strings this is used on (the capture prefix and a LUT path) have no//! business carrying markup, and a `.cdl` a colourist cannot open because our take was called//! `a<b` would be a worse outcome than a take called `a_b`.string SanitiseForXml(const char* szText){	string out;	for (const char* p = szText ? szText : ""; *p; ++p)	{		const char c = *p;		const bool bSafe = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')		                   || c == '_' || c == '-' || c == '.' || c == '/' || c == ' ';		out += bSafe ? c : '_';	}	return out;}//! The ASC .cdl sidecar (decisions/s10-grade-component.md section 3a.5).//!//! ColorDecisionList is one of the two XML formats Resolve's ColorTrace lists as importable//! (alongside .ccc and a CMX EDL carrying SOP in its comments); individual files are brought in//! through Gallery -> Stills -> right-click -> Import and applied to a clip by hand, which is the//! right shape for a single-camera engine take. Element order and namespace follow the ASC schema//! as cdl_convert writes it - InputDescription / ViewingDescription / Description* / ColorDecision*//! at the top level, Description* / SOPNode / SatNode inside a ColorCorrection - and the numbers//! are six fixed decimals, which is what every CDL in circulation carries. Nothing here is//! invented: a file this writes has to open in an application we cannot test against.bool WriteCdlSidecar(const char* szPath, const char* szId, const SSceneReferredExportMetadata& md){	string xml;	string line;	xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n";	xml += "<ColorDecisionList xmlns=\"urn:ASC:CDL:v1.01\">\n";	// The one place the file can say where it came from. A colourist opening a stills bin full of	// these needs to know the working space the numbers were dialled in, because a CDL carries no	// colour space of its own - that is the format's oldest trap.	line.Format("  <Description>ReC Sandbox scene-referred capture - ASC CDL applied in ACEScct "	            "(AP1 primaries) before the output transform%s</Description>\n",	            md.bCdlBypassed ? "; the camera's Bypass Grade was ON, so this is the identity" : "");	xml += line;	if (!md.odtName.empty())	{		line.Format("  <ViewingDescription>%s</ViewingDescription>\n", SanitiseForXml(md.odtName.c_str()).c_str());		xml += line;	}	xml += "  <ColorDecision>\n";	line.Format("    <ColorCorrection id=\"%s\">\n", szId);	xml += line;	xml += "      <SOPNode>\n";	line.Format("        <Slope>%.6f %.6f %.6f</Slope>\n", md.cdlSlope.x, md.cdlSlope.y, md.cdlSlope.z);	xml += line;	line.Format("        <Offset>%.6f %.6f %.6f</Offset>\n", md.cdlOffset.x, md.cdlOffset.y, md.cdlOffset.z);	xml += line;	line.Format("        <Power>%.6f %.6f %.6f</Power>\n", md.cdlPower.x, md.cdlPower.y, md.cdlPower.z);	xml += line;	xml += "      </SOPNode>\n";	xml += "      <SatNode>\n";	line.Format("        <Saturation>%.6f</Saturation>\n", md.cdlSaturation);	xml += line;	xml += "      </SatNode>\n";	xml += "    </ColorCorrection>\n";	xml += "  </ColorDecision>\n";	xml += "</ColorDecisionList>\n";	// ICryPak and not the CRT, exactly as the EXR writer does (ExrImage.cpp:55).	FILE* pFile = gEnv->pCryPak->FOpen(szPath, "wb", ICryPak::FOPEN_ONDISK);	if (!pFile)		return false;	const size_t written = gEnv->pCryPak->FWrite(xml.c_str(), 1, xml.length(), pFile);	gEnv->pCryPak->FClose(pFile);	return written == xml.length();}bool WriteTextFile(const char* szPath, const string& text){	FILE* pFile = gEnv->pCryPak->FOpen(szPath, "wb", ICryPak::FOPEN_ONDISK);	if (!pFile)		return false;	const size_t written = gEnv->pCryPak->FWrite(text.c_str(), 1, text.length(), pFile);	gEnv->pCryPak->FClose(pFile);	return written == text.length();}//! The master (luma) curve as a Resolve 1D `.cube` (decisions/s10-grade-component.md section 3b.5).//!//! A per-channel tone curve IS a 1D LUT, so this is the one part of the curve pair that transfers//! mechanically: drop it on a node AFTER the .cdl node and the engine's tone curve is reproduced.//! The three columns are identical by construction - the master curve is one curve applied to all//! three channels, which is what makes it a tone curve and not a colour operation.//!//! It is sampled at LUT_1D_SIZE = the same grid the GPU texture holds, through the same//! interpolator the plugin baked with, so the file and the picture cannot disagree.//!//! Known limitation, stated in the file itself: a 1D LUT's domain is [0,1] and the shader extends//! the curve with slope 1 above it, so scene values past ACEScct 1.0 (+10.3 stops over grey) are//! carried by the engine and not by this file. Nothing reaches the display up there anyway - the//! ODT LUT's own domain ends at the same place - so it matters only for the EXR tap.bool WriteCurveMasterCube(const char* szPath, const char* szTitle, const SSceneReferredExportMetadata& md){	std::vector<float> samples(SceneReferredCurves::kLutSize);	SceneReferredCurves::BakeMaster(md.curveMasterStops, samples.data(), SceneReferredCurves::kLutSize);	string text;	string line;	text += "# ReC Sandbox - CineCam Grade master (luma) curve\n";	text += "# Working space: ACEScct (AP1 primaries). Apply on a node AFTER the ASC CDL beside\n";	text += "# this file; see the .curves.txt sidecar for the full chain order.\n";	line.Format("# Knot offsets in stops: %.4f %.4f %.4f %.4f %.4f\n",	            md.curveMasterStops[0], md.curveMasterStops[1], md.curveMasterStops[2],	            md.curveMasterStops[3], md.curveMasterStops[4]);	text += line;	text += "# Domain [0,1]; the engine extends the curve with slope 1 outside it, which a 1D LUT\n";	text += "# cannot carry. Only matters above ACEScct 1.0 = +10.3 stops over 18% grey.\n";	line.Format("TITLE \"%s\"\n", szTitle);	text += line;	line.Format("LUT_1D_SIZE %d\n", (int)SceneReferredCurves::kLutSize);	text += line;	for (int i = 0; i < SceneReferredCurves::kLutSize; ++i)	{		line.Format("%.6f %.6f %.6f\n", samples[i], samples[i], samples[i]);		text += line;	}	return WriteTextFile(szPath, text);}//! Both curves' control points, in plain text, because one of them has nowhere else to go.//!//! Sat vs Sat is a MULTIPLIER indexed by a per-pixel saturation measure, not a per-channel value//! mapping, so it is not a 1D LUT and a `.cube` of it would load, apply and be silently nonsense.//! Resolve has the control natively; what a colourist needs from us is the numbers and the exact//! definition of the axis they were dialled against. That is what this file is.bool WriteCurvesText(const char* szPath, const char* szTitle, const SSceneReferredExportMetadata& md){	using namespace SceneReferredCurves;	string text;	string line;	text += "ReC Sandbox - CineCam Grade curves\n";	line.Format("take: %s\n", szTitle);	text += line;	text += "\n";	text += "The engine's display chain, in order:\n";	text += "  white balance -> sensor clip -> ACEScct -> ASC CDL (+saturation)\n";	text += "  -> MASTER CURVE -> SAT vs SAT -> look LUT (LMT) -> [EXR tap] -> output transform\n";	text += "The .cdl beside this file is the ASC CDL step, and it is the FRONT of the chain, so\n";	text += "these curves belong on the node AFTER it.\n";	text += "\n";	if (md.bCurveMaster)	{		const float* const px = MasterKnotX();		text += "MASTER (LUMA) CURVE - one curve, applied identically to all three channels in\n";		text += "ACEScct. Monotone cubic Hermite (Fritsch-Carlson) through five knots.\n";		text += "  knot            x (ACEScct)   offset (stops)   y (ACEScct)\n";		static const char* const s_names[kKnotCount] = { "black    ", "shadow   ", "mid grey ", "highlight", "white    " };		float y[kKnotCount];		MasterKnotY(md.curveMasterStops, y);		for (int i = 0; i < kKnotCount; ++i)		{			line.Format("  %s        %.6f      %+.4f          %.6f\n",			            s_names[i], px[i], md.curveMasterStops[i], y[i]);			text += line;		}		text += "  (mid grey is ACEScct(0.18); shadow and highlight are 4 stops either side;\n";		text += "   white is ACEScct 1.0 = +10.3 stops over grey.)\n";		text += "The same curve is beside this file as a Resolve 1D .cube.\n";		text += "\n";	}	else	{		text += "MASTER (LUMA) CURVE: neutral (identity).\n\n";	}	if (md.bCurveSat)	{		const float* const px = SatKnotX();		text += "SAT vs SAT - the OUTPUT SATURATION MULTIPLIER as a function of the measured input\n";		text += "saturation. Same interpolation. 1.0 means unchanged, which is Resolve's Sat vs Sat\n";		text += "convention (a flat line = no change).\n";		text += "  input saturation   output multiplier\n";		for (int i = 0; i < kKnotCount; ++i)		{			line.Format("  %.2f               %.4f\n", px[i], md.curveSatMult[i]);			text += line;		}		text += "\n";		text += "HOW THE INPUT SATURATION IS MEASURED (this is the part that has to be transferred\n";		text += "by eye, because no interchange format carries it):\n";		text += "  luma = dot(c, (0.2126, 0.7152, 0.0722))    <- the ASC CDL's own Rec.709 weights\n";		line.Format("  sat  = saturate(length(c - luma) * %.4f)\n", kSatFullScale);		text += line;		text += "  out  = luma + (c - luma) * multiplier\n";		text += "with c in ACEScct. So the axis is the LENGTH of the very vector the multiplier\n";		text += "scales, and it is exposure-invariant: the space is log and the weights sum to 1,\n";		text += "so a stop shifts c and luma by the same amount and leaves c - luma alone.\n";		line.Format("sat = 1 is a chroma vector of length %.3f in ACEScct = %.1f stops of spread\n",		            1.0f / kSatFullScale, 17.52f / kSatFullScale);		text += line;		text += "between the extreme channels. For scale: an ordinary strong red reads about 0.54,\n";		text += "a near-primary about 0.96, and any neutral reads exactly 0.\n";	}	else	{		text += "SAT vs SAT: neutral (multiplier 1 everywhere).\n";	}	return WriteTextFile(szPath, text);}} // anonymous namespaceCSceneReferredExport& CSceneReferredExport::Get(){	static CSceneReferredExport s_instance;	return s_instance;}CSceneReferredExport::CSceneReferredExport()	: m_state(eState_Idle)	, m_tap(eSceneReferredExportTap_Graded)	, m_encoding(eSceneReferredExportEncoding_ACES2065)	, m_frameIndex(0)	, m_nextSlot(0)	, m_width(0)	, m_height(0)	, m_pOwner(nullptr)	, m_bTimeStepOverridden(false)	, m_fSavedFixedStep(0.0f)	, m_nSavedJitter(1){}bool CSceneReferredExport::WantsGradedTap() const{	return IsArmed() && m_tap == eSceneReferredExportTap_Graded;}bool CSceneReferredExport::StartSequence(const char* szFolder, const char* szPrefix){	if (IsArmed())	{		CryLogAlways("[EXR] a capture is already running - stop it first (rec_CaptureEXRStop)");		return false;	}	m_folder = ResolveCaptureFolder(szFolder);	m_prefix = (szPrefix && *szPrefix) ? szPrefix : "frame";	// The frame counter belongs to the capture, not to a shared console variable. `capture_frames`	// is written by ManualFrameStep and by CryMovie as well, so two captures in one session there	// continue the same numbering; here the arm decides, per r_SceneReferredExportSequenceNaming	// (2026-09-10, user: a second take into the same folder must not overwrite the first):	//   0 - start at zero (the original behaviour),	//   1 - continue from the first free number on disk (default),	//   2 - stamp the prefix with the wall-clock time and start at zero.	m_frameIndex = 0;	switch (clamp_tpl(CRenderer::CV_r_SceneReferredExportSequenceNaming, 0, 2))	{	case 1:		m_frameIndex = FirstFreeIndex(m_folder, m_prefix, 0);		break;	case 2:		{			time_t now = time(nullptr);			tm local;			localtime_s(&local, &now);			string stamped;			stamped.Format("%s_%04d%02d%02d_%02d%02d%02d", m_prefix.c_str(),			               local.tm_year + 1900, local.tm_mon + 1, local.tm_mday,			               local.tm_hour, local.tm_min, local.tm_sec);			m_prefix = stamped;		}		break;	default:		break;	}	m_nextSlot = 0;	m_tap = clamp_tpl(CRenderer::CV_r_SceneReferredExportTap, 0, 1);	m_encoding = clamp_tpl(CRenderer::CV_r_SceneReferredExportEncoding, 0, 1);	m_state = eState_Sequence;	ArmCdlSidecar();	SetFixedStep(true);	CryLogAlways("[EXR] capture armed: '%s/%s.%%06d.exr' from %06d", m_folder.c_str(), m_prefix.c_str(), m_frameIndex);	return true;}bool CSceneReferredExport::RequestSingleFrame(const char* szFolder, const char* szPrefix){	if (IsArmed())	{		CryLogAlways("[EXR] a capture is already running - stop it first (rec_CaptureEXRStop)");		return false;	}	m_folder = ResolveCaptureFolder(szFolder);	m_prefix = (szPrefix && *szPrefix) ? szPrefix : "frame";	// A SINGLE frame numbers consecutively for the whole session, which is the one place this	// differs from a sequence. A sequence is one artefact and starts at zero by definition; single	// frames are taken one at a time while something is being looked at, and re-writing	// frame.000000.exr every time makes the command useless for exactly that.	//	// The counter is a hint, not the answer: the disk is asked. That way a file deleted between	// two captures gets its number back, and files left over from a previous session are not	// silently overwritten - neither of which a counter on its own can know. The key is the	// destination, so switching folder or name starts a fresh scan.	const string key = m_folder + "/" + m_prefix;	if (key != m_singleFrameKey)	{		m_singleFrameKey = key;		m_singleFrameNext = 0;	}	m_frameIndex = FirstFreeIndex(m_folder, m_prefix, m_singleFrameNext);	m_singleFrameNext = m_frameIndex + 1;	m_nextSlot = 0;	m_tap = clamp_tpl(CRenderer::CV_r_SceneReferredExportTap, 0, 1);	m_encoding = clamp_tpl(CRenderer::CV_r_SceneReferredExportEncoding, 0, 1);	m_state = eState_SingleFrame;	// A single frame is its own take, so it gets its own sidecar - and, unlike a sequence, its own	// number in the name, because the next single frame may carry a different grade entirely.	ArmCdlSidecar();	// No cadence to fix for one frame, so t_FixedStep is left alone.	return true;}void CSceneReferredExport::ArmCdlSidecar(){	m_bCdlSidecarPending = true;	m_bCdlDriftWarned = false;	m_cdlSidecarText.clear();	m_bCurveSidecarPending = true;}int CSceneReferredExport::FirstFreeIndex(const string& folder, const string& prefix, int nStartAt){	// FLAGS_PATH_REAL: the folder is already an absolute, adjusted path from ResolveCaptureFolder,	// and FLAGS_NEVER_IN_PAK because a capture destination is a disk folder - a name that happens	// to exist inside a .pak must not count as taken.	const int nMax = 1000000;   // the format is %06d; past this the name is not unique anyway	for (int i = max(nStartAt, 0); i < nMax; ++i)	{		string path;		path.Format("%s/%s.%06d.exr", folder.c_str(), prefix.c_str(), i);		if (!gEnv->pCryPak->IsFileExist(path.c_str(), ICryPak::eFileLocation_OnDisk))			return i;	}	return max(nStartAt, 0);}void CSceneReferredExport::Stop(const char* szReason){	if (m_state == eState_Idle)		return;	const int nWritten = m_frameIndex;	m_state = eState_Idle;	SetFixedStep(false);	CryLogAlways("[EXR] capture stopped after %d frame%s%s%s", nWritten, (nWritten == 1) ? "" : "s",	             (szReason && *szReason) ? ": " : "", (szReason && *szReason) ? szReason : "");	// The ring is NOT released here - slots may still have a download in flight, and freeing a	// staging resource that is the target of an unretired GPU copy is the exact bug Bloom.cpp's	// m_bDiffractionReadbackIssued guard exists to avoid. BeginFrame drains and releases.}void CSceneReferredExport::SetFixedStep(bool bEnable){	ICVar* pFixedStep = gEnv->pConsole ? gEnv->pConsole->GetCVar("t_FixedStep") : nullptr;	ICVar* pJitter = gEnv->pConsole ? gEnv->pConsole->GetCVar("r_DepthOfFieldLensModelJitter") : nullptr;	if (bEnable)	{		if (m_bTimeStepOverridden || !pFixedStep)			return;		m_fSavedFixedStep = pFixedStep->GetFVal();		m_nSavedJitter = pJitter ? pJitter->GetIVal() : 1;		const float fStep = max(CRenderer::CV_r_SceneReferredExportFixedStep, 0.0f);		if (fStep > 0.0f)			pFixedStep->Set(fStep);		// Jitter mode 2 freezes the lens model's per-frame tap rotation. A sequence in which every		// frame carries a different sub-pixel dither is not a sequence, it is noise with a picture		// behind it - and it is indistinguishable from TAA ghosting when the result is examined.		if (pJitter)			pJitter->Set(2);		m_bTimeStepOverridden = true;	}	else	{		if (!m_bTimeStepOverridden)			return;		if (pFixedStep)			pFixedStep->Set(m_fSavedFixedStep);		if (pJitter)			pJitter->Set(m_nSavedJitter);		m_bTimeStepOverridden = false;	}}void CSceneReferredExport::ReleaseRing(){	for (int i = 0; i < kRingSize; ++i)	{		if (m_ring[i].bIssued)			return; // a download is still in flight; try again next frame	}	for (int i = 0; i < kRingSize; ++i)	{		if (m_ring[i].jobState.IsRunning())			return; // a writer is still going		m_ring[i].pTex.reset();	}	m_width = m_height = 0;	m_pOwner = nullptr;}void CSceneReferredExport::GatherMetadata(SSceneReferredExportMetadata& out) const{	out.frameIndex = m_frameIndex;	out.renderFrameId = gRenDev ? (int)gRenDev->GetRenderFrameID() : 0;	out.engineTime = gEnv->pTimer ? gEnv->pTimer->GetCurrTime() : 0.0f;	out.fps = (CRenderer::CV_r_SceneReferredExportFixedStep > 0.0f) ? (1.0f / CRenderer::CV_r_SceneReferredExportFixedStep) : 0.0f;	// The number that makes the file's absolute scale recoverable. Everything in this pipeline is	// built on 1.0 = 10 000 cd/m^2, and the pre-exposure destroys that unless the scale it applied	// travels with the frame.	out.exposureScale = gcpRendD3D ? gcpRendD3D->GetSceneReferredExposure() : 1.0f;	out.whiteBalanceK = GetBusParam("Global_User_GradeWBKelvin");	out.whiteBalanceTint = GetBusParam("Global_User_GradeWBTint");	// The camera's own numbers, published by ccam on the same bus. They describe the frame; they	// do not affect it.	out.focalLength = GetBusParam("Global_User_CamFocal");	out.tStop = GetBusParam("Global_User_CamTStop");	out.iso = GetBusParam("Global_User_CamISO");	out.shutterTime = GetBusParam("Global_User_CamShutter");	out.nd = GetBusParam("Global_User_CamND");	out.ev100 = GetBusParam("Global_User_CamEV100");	if (CPostEffectsMgr* pPostMgr = PostEffectMgr())	{		out.cameraName = pPostMgr->GetByNameStr("Global_User_CamName");		out.lensName = pPostMgr->GetByNameStr("Global_User_LensName");		out.odtName = GetLutName(pPostMgr->GetLutODTParam(), pPostMgr->GetLutODTSizeParam());		out.lmtName = GetLutName(pPostMgr->GetLutLMTParam(), pPostMgr->GetLutLMTSizeParam());		// The EFFECTIVE CDL, i.e. what the tone map really evaluated - the same reasoning		// ToneMapping.cpp:628-672 applies, applied here so the file cannot disagree with the		// picture (decisions/s10-grade-component.md section 3a.5):		//		//   * Bypass Grade short-circuits the tone map's reads, so a bypassed frame has the		//     IDENTITY grade in it. Recording the camera's dialled numbers on such a frame would		//     hand Resolve a grade that was never in the picture - the defect this replaces.		//   * the 1e-4 floors on slope and power are the renderer's, and a header that omits them		//     describes a frame that was not rendered.		//		// Everything upstream of the bus - the colour wheels, contrast, the CDL base - has already		// been folded into these three triples by the camera (SCineGradeParams::Resolve), so this		// is the whole grade and not a part of it.		out.bCdlBypassed = pPostMgr->GetByNameF("Global_User_GradeBypass") > 0.5f;		if (!out.bCdlBypassed)		{			const Vec4 slope = pPostMgr->GetByNameVec4("Global_User_GradeSlope");			const Vec4 offset = pPostMgr->GetByNameVec4("Global_User_GradeOffset");			const Vec4 power = pPostMgr->GetByNameVec4("Global_User_GradePower");			out.cdlSlope = Vec3(max(slope.x, 1e-4f), max(slope.y, 1e-4f), max(slope.z, 1e-4f));			out.cdlOffset = Vec3(offset.x, offset.y, offset.z);			out.cdlPower = Vec3(max(power.x, 1e-4f), max(power.y, 1e-4f), max(power.z, 1e-4f));			out.cdlSaturation = max(pPostMgr->GetByNameF("Global_User_GradeSaturation"), 0.0f);		}		// The two 1D curves (S10 item 3b), on exactly the same terms as the CDL above: what the		// tone map really evaluated. Bypass Grade takes the curves out with the CDL and the LMT -		// the renderer only reads the active flags inside the !bBypass branch - so a bypassed		// frame carries the neutral here too, and no curve sidecar is written for it.		if (!out.bCdlBypassed)		{			const Vec4 masterA = pPostMgr->GetByNameVec4("Global_User_CurveMasterA");			const Vec4 masterB = pPostMgr->GetByNameVec4("Global_User_CurveMasterB");			const Vec4 satA = pPostMgr->GetByNameVec4("Global_User_CurveSatA");			const Vec4 satB = pPostMgr->GetByNameVec4("Global_User_CurveSatB");			out.curveMasterStops[0] = masterA.x;			out.curveMasterStops[1] = masterA.y;			out.curveMasterStops[2] = masterA.z;			out.curveMasterStops[3] = masterA.w;			out.curveMasterStops[4] = masterB.x;			out.bCurveMaster = masterB.y > 0.5f;			out.curveSatMult[0] = satA.x;			out.curveSatMult[1] = satA.y;			out.curveSatMult[2] = satA.z;			out.curveSatMult[3] = satA.w;			out.curveSatMult[4] = satB.x;			out.bCurveSat = satB.y > 0.5f;		}		if (out.bCurveMaster || out.bCurveSat)		{			out.curves.Format("master %+.4f %+.4f %+.4f %+.4f %+.4f stops / satvsat %.4f %.4f "			                  "%.4f %.4f %.4f%s%s",			                  out.curveMasterStops[0], out.curveMasterStops[1], out.curveMasterStops[2],			                  out.curveMasterStops[3], out.curveMasterStops[4],			                  out.curveSatMult[0], out.curveSatMult[1], out.curveSatMult[2],			                  out.curveSatMult[3], out.curveSatMult[4],			                  out.bCurveMaster ? "" : " (master neutral)",			                  out.bCurveSat ? "" : " (sat neutral)");		}		// ASC order, ASC names, ASC number format - the same six decimals the .cdl sidecar beside		// this file carries, so the two can be compared by eye and a human reading the header can		// type them into Resolve.		out.cdl.Format("slope %.6f %.6f %.6f / offset %.6f %.6f %.6f / power %.6f %.6f %.6f / sat %.6f%s",		               out.cdlSlope.x, out.cdlSlope.y, out.cdlSlope.z,		               out.cdlOffset.x, out.cdlOffset.y, out.cdlOffset.z,		               out.cdlPower.x, out.cdlPower.y, out.cdlPower.z,		               out.cdlSaturation, out.bCdlBypassed ? " (bypassed)" : "");	}}CTexture* CSceneReferredExport::BeginFrame(CGraphicsPipeline& pipeline, int width, int height){	ConsumeCompleted();	if (m_state == eState_Idle)	{		ReleaseRing();		return nullptr;	}	// Belt and braces for the m_pOwner claim (research/s8-editor-pipelines.md section 4c item 3):	// the exporter is claimed by the first pipeline that runs while armed, and it must never be a	// preview or a probe bake. The tap's own IsSceneReferredStage(6) gate already keeps them out	// now that it carries the preview gate, but the claim is permanent for the duration of a	// capture and the cost of being sure is one virtual call per frame.	if (!pipeline.IsSceneReferredCapable())		return nullptr;	if (m_pOwner == nullptr)		m_pOwner = &pipeline;	if (m_pOwner != &pipeline)		return nullptr;	if (width <= 0 || height <= 0)		return nullptr;	if ((m_width != 0 && m_width != width) || (m_height != 0 && m_height != height))	{		Stop("the resolution changed under the capture");		return nullptr;	}	m_width = width;	m_height = height;	SRingSlot& slot = m_ring[m_nextSlot];	// The ring has come round to a slot whose download has not been consumed, or whose writer is	// still going. Either way the machine cannot keep up, and the honest response is to stop.	if (slot.bIssued)	{		Stop("the readback fell behind - the GPU has not returned an earlier frame");		return nullptr;	}	if (slot.jobState.IsRunning())	{		Stop("the writer fell behind - the disk cannot keep up with the frame rate");		return nullptr;	}	if (!CTexture::IsTextureExist(slot.pTex))	{		// FT_STAGE_READBACK is what gives the texture a PERSISTENT staging resource, and that is		// what makes a two-phase (issue now, map later) download possible at all. The one-shot		// overload allocates a temporary and Maps immediately, which under D3D11 is a full		// pipeline stall - fine for a screenshot, ruinous at one full-res fp16 frame per frame.		const uint32 flags = FT_NOMIPS | FT_DONT_STREAM | FT_USAGE_RENDERTARGET | FT_STAGE_READBACK;		// Named per pipeline AND per slot: the editor runs more than one CGraphicsPipeline, and		// two of them sharing one texture name is the bug S0 had to fix for the satellite formats.		string name;		name.Format("$SceneReferredExport%d%s", m_nextSlot, pipeline.GetUniqueIdentifierName().c_str());		slot.pTex = CTexture::GetOrCreateRenderTarget(name.c_str(), width, height, Clr_Transparent, eTT_2D, flags, eTF_R16G16B16A16F);		if (!CTexture::IsTextureExist(slot.pTex))		{			slot.pTex.reset();			Stop("could not create the readback target");			return nullptr;		}	}	return slot.pTex;}void CSceneReferredExport::EndFrame(){	if (m_state == eState_Idle)		return;	SRingSlot& slot = m_ring[m_nextSlot];	if (!CTexture::IsTextureExist(slot.pTex))		return;	CDeviceTexture* pDevTex = slot.pTex->GetDevTexture();	if (!pDevTex)	{		Stop("the readback target has no device texture");		return;	}	GatherMetadata(slot.metadata);	// The dot before the frame number is the VFX convention Nuke and Resolve auto-detect as a	// sequence, not the engine's own "%s%06d.%s" (DriverD3D.cpp:1258). Getting it wrong means	// every import is manual.	slot.path.Format("%s/%s.%06d.exr", m_folder.c_str(), m_prefix.c_str(), m_frameIndex);	// The ASC .cdl that travels with the take. Claimed by the FIRST frame of a capture and written	// when that frame's readback comes home; every later frame leaves cdlPath empty. See	// decisions/s10-grade-component.md section 3a.5 for why one per take rather than one per frame	// and why an identity grade is still written.	slot.cdlPath.clear();	slot.cdlId.clear();	if (CRenderer::CV_r_SceneReferredExportCDL != 0)	{		if (m_bCdlSidecarPending)		{			m_bCdlSidecarPending = false;			m_cdlSidecarText = slot.metadata.cdl;			if (m_state == eState_SingleFrame)			{				slot.cdlPath.Format("%s/%s.%06d.cdl", m_folder.c_str(), m_prefix.c_str(), m_frameIndex);				slot.cdlId.Format("%s.%06d", SanitiseForXml(m_prefix.c_str()).c_str(), m_frameIndex);			}			else			{				slot.cdlPath.Format("%s/%s.cdl", m_folder.c_str(), m_prefix.c_str());				slot.cdlId = SanitiseForXml(m_prefix.c_str());			}		}		else if (!m_bCdlDriftWarned && slot.metadata.cdl != m_cdlSidecarText)		{			// One CDL cannot describe an animated grade. Said once, naming the frame, instead of			// either silently standing by frame zero's numbers or spraying a file per frame.			m_bCdlDriftWarned = true;			CryWarning(VALIDATOR_MODULE_RENDERER, VALIDATOR_WARNING,			           "[EXR] the grade changed at frame %06d - the .cdl sidecar carries the grade of "			           "the FIRST frame of this capture and no longer describes the whole take. An "			           "animated grade has to be re-keyed in Resolve; rec/cdl in each frame's header "			           "still carries that frame's own numbers.", m_frameIndex);		}	}	// The two curve sidecars, claimed by the same first frame and on the same one-per-take terms -	// but only when a curve is actually doing something. An absent curve file is not ambiguous the	// way an absent .cdl would be, because the .cdl is always there and dates the take; writing a	// pair of "this curve is neutral" files beside every capture would be noise.	slot.curveCubePath.clear();	slot.curveTextPath.clear();	if (CRenderer::CV_r_SceneReferredExportCurves != 0 && m_bCurveSidecarPending	    && (slot.metadata.bCurveMaster || slot.metadata.bCurveSat))	{		m_bCurveSidecarPending = false;		string base;		if (m_state == eState_SingleFrame)			base.Format("%s/%s.%06d", m_folder.c_str(), m_prefix.c_str(), m_frameIndex);		else			base.Format("%s/%s", m_folder.c_str(), m_prefix.c_str());		slot.curveTextPath = base + ".curves.txt";		if (slot.metadata.bCurveMaster)			slot.curveCubePath = base + ".curve_master.cube";	}	pDevTex->DownloadToStagingResource(0);	slot.bIssued = true;	slot.fIssueTime = gEnv->pTimer->GetAsyncCurTime();	++m_frameIndex;	m_nextSlot = (m_nextSlot + 1) % kRingSize;	if (m_state == eState_SingleFrame)	{		m_state = eState_Idle;		CryLogAlways("[EXR] single frame requested: '%s'", slot.path.c_str());	}}void CSceneReferredExport::ConsumeCompleted(){	for (int i = 0; i < kRingSize; ++i)	{		if (m_ring[i].bIssued)			ConsumeSlot(m_ring[i]);	}}bool CSceneReferredExport::ConsumeSlot(SRingSlot& slot){	CDeviceTexture* pDevTex = CTexture::IsTextureExist(slot.pTex) ? slot.pTex->GetDevTexture() : nullptr;	if (!pDevTex)	{		slot.bIssued = false;		return false;	}	// Never block. A slot that is not ready simply comes back next frame; the ring is what makes	// that free rather than a dropped frame.	if (!pDevTex->AccessCurrStagingResource(0, false))	{		if ((gEnv->pTimer->GetAsyncCurTime() - slot.fIssueTime) > 5.0f)		{			slot.bIssued = false;			Stop("a staging download did not signal in 5 s");		}		return false;	}	const int width = m_width;	const int height = m_height;	SSceneReferredExportJob* pJob = new SSceneReferredExportJob();	pJob->width = width;	pJob->height = height;	pJob->path = slot.path;	pJob->pixels.resize((size_t)width * (size_t)height * 4);	// The mapped rows are PITCHED, not packed. Assuming width * 8 bytes here is what produces a	// sheared image and an hour of confusion.	const auto copyOut = [width, height, pJob](void* pData, uint32 rowPitch, uint32 slicePitch) -> bool	{		const uint8* pRow = static_cast<const uint8*>(pData);		CryHalf* pDst = pJob->pixels.data();		const size_t rowBytes = (size_t)width * 4 * sizeof(CryHalf);		for (int y = 0; y < height; ++y, pRow += rowPitch, pDst += (size_t)width * 4)			memcpy(pDst, pRow, rowBytes);		return true;	};	pDevTex->AccessCurrStagingResource(0, false, copyOut);	slot.bIssued = false;	// The take's CDL, written now that this frame is known to have survived the round trip. A few	// hundred bytes once per capture, on the render thread, deliberately: the writer job owns	// pixels and nothing else, and the sidecar has to be beside the first file rather than beside	// whichever one a job thread happened to finish first.	if (!slot.cdlPath.empty())	{		if (WriteCdlSidecar(slot.cdlPath.c_str(), slot.cdlId.c_str(), slot.metadata))			CryLogAlways("[EXR] ASC CDL written: '%s' (%s)", slot.cdlPath.c_str(), slot.metadata.cdl.c_str());		else			CryWarning(VALIDATOR_MODULE_RENDERER, VALIDATOR_WARNING,			           "[EXR] could not write the ASC CDL sidecar '%s' - the frames are unaffected",			           slot.cdlPath.c_str());	}	// The curves, on the same thread and for the same reason. The take's name is the sidecar's	// title; it was sanitised for the .cdl's XML id and is reused here so the three files agree.	if (!slot.curveTextPath.empty())	{		const string title = SanitiseForXml(m_prefix.c_str());		if (WriteCurvesText(slot.curveTextPath.c_str(), title.c_str(), slot.metadata))			CryLogAlways("[EXR] grade curves written: '%s' (%s)", slot.curveTextPath.c_str(), slot.metadata.curves.c_str());		else			CryWarning(VALIDATOR_MODULE_RENDERER, VALIDATOR_WARNING,			           "[EXR] could not write the curve sidecar '%s' - the frames are unaffected",			           slot.curveTextPath.c_str());		if (!slot.curveCubePath.empty())		{			if (WriteCurveMasterCube(slot.curveCubePath.c_str(), title.c_str(), slot.metadata))				CryLogAlways("[EXR] master curve written: '%s' (1D cube, %d entries)",				             slot.curveCubePath.c_str(), (int)SceneReferredCurves::kLutSize);			else				CryWarning(VALIDATOR_MODULE_RENDERER, VALIDATOR_WARNING,				           "[EXR] could not write the master curve LUT '%s' - the frames are unaffected",				           slot.curveCubePath.c_str());		}	}	// Everything the file will say about itself, decided here on the render thread while the	// camera state that produced these pixels is still the current one.	const bool bAces2065 = (m_encoding == eSceneReferredExportEncoding_ACES2065);	pJob->desc.compression = (EExrCompression)clamp_tpl(CRenderer::CV_r_SceneReferredExportCompression, 0, 4);	pJob->desc.bWriteAlpha = false;	pJob->desc.bChromaticities = true;	memcpy(pJob->desc.chromaticities, bAces2065 ? kChromaticitiesAP0 : kChromaticitiesAP1, sizeof(pJob->desc.chromaticities));	// The container flag is a claim of ST 2065-4 conformance, which is a claim about AP0 data. It	// goes on the AP0 file and never on the AP1 one.	pJob->desc.bAcesImageContainerFlag = bAces2065;	pJob->desc.bColorMatrix = bAces2065;	if (bAces2065)		memcpy(pJob->desc.colorMatrix, kAP1ToAP0, sizeof(pJob->desc.colorMatrix));	const SSceneReferredExportMetadata& md = slot.metadata;	const bool bGraded = (m_tap == eSceneReferredExportTap_Graded);	std::vector<SExrAttribute>& a = pJob->attributes;	a.push_back(SExrAttribute::String("owner", "ReC Sandbox"));	// A T1 file and a T2 file look similar and mean completely different things. Anything reading	// these has to be able to tell them apart without asking a human.	a.push_back(SExrAttribute::String("rec/exportTap", bGraded ? "pre-ODT" : "HDRTarget"));	a.push_back(SExrAttribute::String("rec/workingSpace", bAces2065 ? "ACES2065-1" : "ACEScg"));	a.push_back(SExrAttribute::String("rec/specVersion", "SceneReferredSpec S6"));	a.push_back(SExrAttribute::Int("rec/schemaVersion", 1));	a.push_back(SExrAttribute::Int("rec/frameIndex", md.frameIndex));	a.push_back(SExrAttribute::Int("rec/renderFrameId", md.renderFrameId));	a.push_back(SExrAttribute::Float("rec/engineTime", md.engineTime));	if (md.fps > 0.0f)		a.push_back(SExrAttribute::Float("rec/fps", md.fps));	a.push_back(SExrAttribute::Float("rec/exposureScale", md.exposureScale));	a.push_back(SExrAttribute::Float("rec/whiteBalance_K", md.whiteBalanceK));	a.push_back(SExrAttribute::Float("rec/whiteBalance_tint", md.whiteBalanceTint));	// The exposure triangle. T-stop and not f-number: the T-stop is the control the camera model	// actually has, and `aperture` is the classic attribute name to get wrong, since a	// photographic reading and a projection reading both plausibly claim it.	if (md.focalLength > 0.0f)		a.push_back(SExrAttribute::Float("rec/focalLength_mm", md.focalLength));	if (md.tStop > 0.0f)		a.push_back(SExrAttribute::Float("rec/tStop", md.tStop));	if (md.iso > 0.0f)		a.push_back(SExrAttribute::Float("rec/iso", md.iso));	if (md.shutterTime > 0.0f)	{		a.push_back(SExrAttribute::Float("rec/shutterTime_s", md.shutterTime));		// `expTime` is a standard EXR attribute and readers already understand it, so it goes in		// alongside ours rather than instead of it.		a.push_back(SExrAttribute::Float("expTime", md.shutterTime));	}	a.push_back(SExrAttribute::Float("rec/ndStops", md.nd));	a.push_back(SExrAttribute::Float("rec/ev100", md.ev100));	if (!md.cameraName.empty())		a.push_back(SExrAttribute::String("rec/cameraName", md.cameraName));	if (!md.lensName.empty())		a.push_back(SExrAttribute::String("rec/lensName", md.lensName));	if (!md.odtName.empty())		a.push_back(SExrAttribute::String("rec/odt", md.odtName));	if (!md.lmtName.empty())		a.push_back(SExrAttribute::String("rec/lmt", md.lmtName));	if (!md.cdl.empty())		a.push_back(SExrAttribute::String("rec/cdl", md.cdl));	// The two 1D curves, when either is in the frame. Absent means neutral - which is honest here,	// unlike rec/cdl, because a CDL is always evaluated and a curve genuinely is not sampled at all	// when it is neutral. Written per FRAME, so an animated curve is still fully described even	// though the take's sidecar can only carry the first frame's.	if (!md.curves.empty())		a.push_back(SExrAttribute::String("rec/curves", md.curves));	TSceneReferredExportJob job(pJob);	job.SetPriorityLevel(JobManager::eLowPriority);	job.RegisterJobState(&slot.jobState);	job.Run();	return true;}void CSceneReferredExport::Shutdown(){	m_state = eState_Idle;	SetFixedStep(false);	for (int i = 0; i < kRingSize; ++i)	{		// Blocking is correct exactly here and nowhere else: the job manager and the textures are		// about to go away (DiffractionKernel.cpp:761 is the same ordering).		if (m_ring[i].jobState.IsRunning())			gEnv->GetJobManager()->WaitForJob(m_ring[i].jobState);		m_ring[i].bIssued = false;		m_ring[i].pTex.reset();	}	m_width = m_height = 0;	m_pOwner = nullptr;}
+// Copyright 2026 ReC Sandbox. Scene-referred pipeline, stage S6 (SceneReferredSpec.md).
+
+#include "StdAfx.h"
+#include "SceneReferredExport.h"
+
+#include "DriverD3D.h"
+#include "Common/PostProcess/PostProcess.h"
+#include "Common/RendererResources.h"
+
+#include <CryThreading/IJobManager_JobDelegator.h>
+#include <time.h>
+
+// ---------------------------------------------------------------------------------------------
+// The writer job. One per captured frame, low priority, and it owns its payload: the render
+// thread copied the pixels out of the staging map before launching it, precisely so that nothing
+// here touches a D3D resource or a ring slot the GPU is about to reuse.
+// ---------------------------------------------------------------------------------------------
+void SceneReferredExportWriteJobEntry(SSceneReferredExportJob*);
+DECLARE_JOB("SceneReferredExport", TSceneReferredExportJob, SceneReferredExportWriteJobEntry);
+
+void SceneReferredExportWriteJobEntry(SSceneReferredExportJob* pJob)
+{
+	if (!pJob)
+		return;
+
+	pJob->desc.pAttributes = pJob->attributes.empty() ? nullptr : pJob->attributes.data();
+	pJob->desc.numAttributes = (int)pJob->attributes.size();
+
+	WriteEXR(pJob->path.c_str(), pJob->width, pJob->height, pJob->pixels.data(), pJob->width, pJob->desc);
+
+	delete pJob;
+}
+
+namespace
+{
+
+//! AP1 -> AP0, row-major. The standard ACES matrix pair; these are the AP1ToXYZ / XYZToAP0 product
+//! and are fixed by the specification, not tuned. Verified against PyOpenColorIO by
+//! tools/ocio-bake/verify_matrices.py alongside the ones CommonMath.cfi carries.
+const float kAP1ToAP0[9] =
+{
+	 0.6954522414f,  0.1406786965f,  0.1638690622f,
+	 0.0447945634f,  0.8596711185f,  0.0955343182f,
+	-0.0055258826f,  0.0040252103f,  1.0015006723f,
+};
+
+//! AP1 (ACEScg) and AP0 (ACES2065-1) primaries with the ACES white, CIE 1931 xy, in the order the
+//! EXR `chromaticities` attribute wants: rx ry gx gy bx by wx wy.
+const float kChromaticitiesAP1[8] = { 0.713f,   0.293f,   0.165f, 0.830f,  0.128f,  0.044f,   0.32168f, 0.33767f };
+const float kChromaticitiesAP0[8] = { 0.7347f,  0.2653f,  0.0f,   1.0f,    0.0001f, -0.0770f, 0.32168f, 0.33767f };
+
+//! Turn whatever the operator typed into a real, existing directory. A relative folder lands
+//! under the user folder, which is where every other tool in this engine writes; an absolute one
+//! is taken as given.
+string ResolveCaptureFolder(const char* szFolder)
+{
+	string folder = (szFolder && *szFolder) ? szFolder : "CaptureEXR";
+	folder.replace('\\', '/');
+
+	const bool bAbsolute = (folder.size() > 1 && folder[1] == ':') || folder[0] == '/';
+	if (!bAbsolute)
+		folder = string("%USER%/") + folder;
+
+	CryPathString resolved;
+	gEnv->pCryPak->AdjustFileName(folder.c_str(), resolved, ICryPak::FLAGS_PATH_REAL | ICryPak::FLAGS_FOR_WRITING);
+	gEnv->pCryPak->MakeDir(resolved.c_str());
+	return string(resolved.c_str());
+}
+
+float GetBusParam(const char* szName)
+{
+	CPostEffectsMgr* pPostMgr = PostEffectMgr();
+	if (!pPostMgr)
+		return 0.0f;
+	CEffectParam* pParam = pPostMgr->GetByName(szName);
+	return pParam ? pParam->GetParam() : 0.0f;
+}
+
+//! The name a LUT slot is currently holding, or "" when the slot is empty. The texture's name is
+//! the .cube path ccam uploaded it under, so this is where the ODT/LMT provenance comes from
+//! without the renderer needing a string channel of its own.
+string GetLutName(CEffectParam* pId, CEffectParam* pSize)
+{
+	if (!pId || !pSize || pSize->GetParam() < 2.0f)
+		return string();
+	CTexture* pTex = CTexture::GetByID((int)pId->GetParam());
+	return CTexture::IsTextureExist(pTex) ? string(pTex->GetName()) : string();
+}
+
+//! Whatever the operator typed, made safe to sit inside an XML attribute or element. Not an
+//! escaper - a filter: the two strings this is used on (the capture prefix and a LUT path) have no
+//! business carrying markup, and a `.cdl` a colourist cannot open because our take was called
+//! `a<b` would be a worse outcome than a take called `a_b`.
+string SanitiseForXml(const char* szText)
+{
+	string out;
+	for (const char* p = szText ? szText : ""; *p; ++p)
+	{
+		const char c = *p;
+		const bool bSafe = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')
+		                   || c == '_' || c == '-' || c == '.' || c == '/' || c == ' ';
+		out += bSafe ? c : '_';
+	}
+	return out;
+}
+
+//! The ASC .cdl sidecar (decisions/s10-grade-component.md section 3a.5).
+//!
+//! ColorDecisionList is one of the two XML formats Resolve's ColorTrace lists as importable
+//! (alongside .ccc and a CMX EDL carrying SOP in its comments); individual files are brought in
+//! through Gallery -> Stills -> right-click -> Import and applied to a clip by hand, which is the
+//! right shape for a single-camera engine take. Element order and namespace follow the ASC schema
+//! as cdl_convert writes it - InputDescription / ViewingDescription / Description* / ColorDecision*
+//! at the top level, Description* / SOPNode / SatNode inside a ColorCorrection - and the numbers
+//! are six fixed decimals, which is what every CDL in circulation carries. Nothing here is
+//! invented: a file this writes has to open in an application we cannot test against.
+bool WriteCdlSidecar(const char* szPath, const char* szId, const SSceneReferredExportMetadata& md)
+{
+	string xml;
+	string line;
+
+	xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n";
+	xml += "<ColorDecisionList xmlns=\"urn:ASC:CDL:v1.01\">\n";
+
+	// The one place the file can say where it came from. A colourist opening a stills bin full of
+	// these needs to know the working space the numbers were dialled in, because a CDL carries no
+	// colour space of its own - that is the format's oldest trap.
+	line.Format("  <Description>ReC Sandbox scene-referred capture - ASC CDL applied in ACEScct "
+	            "(AP1 primaries) before the output transform%s</Description>\n",
+	            md.bCdlBypassed ? "; the camera's Bypass Grade was ON, so this is the identity" : "");
+	xml += line;
+	if (!md.odtName.empty())
+	{
+		line.Format("  <ViewingDescription>%s</ViewingDescription>\n", SanitiseForXml(md.odtName.c_str()).c_str());
+		xml += line;
+	}
+
+	xml += "  <ColorDecision>\n";
+	line.Format("    <ColorCorrection id=\"%s\">\n", szId);
+	xml += line;
+	xml += "      <SOPNode>\n";
+	line.Format("        <Slope>%.6f %.6f %.6f</Slope>\n", md.cdlSlope.x, md.cdlSlope.y, md.cdlSlope.z);
+	xml += line;
+	line.Format("        <Offset>%.6f %.6f %.6f</Offset>\n", md.cdlOffset.x, md.cdlOffset.y, md.cdlOffset.z);
+	xml += line;
+	line.Format("        <Power>%.6f %.6f %.6f</Power>\n", md.cdlPower.x, md.cdlPower.y, md.cdlPower.z);
+	xml += line;
+	xml += "      </SOPNode>\n";
+	xml += "      <SatNode>\n";
+	line.Format("        <Saturation>%.6f</Saturation>\n", md.cdlSaturation);
+	xml += line;
+	xml += "      </SatNode>\n";
+	xml += "    </ColorCorrection>\n";
+	xml += "  </ColorDecision>\n";
+	xml += "</ColorDecisionList>\n";
+
+	// ICryPak and not the CRT, exactly as the EXR writer does (ExrImage.cpp:55).
+	FILE* pFile = gEnv->pCryPak->FOpen(szPath, "wb", ICryPak::FOPEN_ONDISK);
+	if (!pFile)
+		return false;
+
+	const size_t written = gEnv->pCryPak->FWrite(xml.c_str(), 1, xml.length(), pFile);
+	gEnv->pCryPak->FClose(pFile);
+	return written == xml.length();
+}
+
+bool WriteTextFile(const char* szPath, const string& text)
+{
+	FILE* pFile = gEnv->pCryPak->FOpen(szPath, "wb", ICryPak::FOPEN_ONDISK);
+	if (!pFile)
+		return false;
+
+	const size_t written = gEnv->pCryPak->FWrite(text.c_str(), 1, text.length(), pFile);
+	gEnv->pCryPak->FClose(pFile);
+	return written == text.length();
+}
+
+//! The master (luma) curve as a Resolve 1D `.cube` (decisions/s10-grade-component.md section 3b.5).
+//!
+//! A per-channel tone curve IS a 1D LUT, so this is the one part of the curve pair that transfers
+//! mechanically: drop it on a node AFTER the .cdl node and the engine's tone curve is reproduced.
+//! The three columns are identical by construction - the master curve is one curve applied to all
+//! three channels, which is what makes it a tone curve and not a colour operation.
+//!
+//! It is sampled at LUT_1D_SIZE = the same grid the GPU texture holds, through the same
+//! interpolator the plugin baked with, so the file and the picture cannot disagree.
+//!
+//! Known limitation, stated in the file itself: a 1D LUT's domain is [0,1] and the shader extends
+//! the curve with slope 1 above it, so scene values past ACEScct 1.0 (+10.3 stops over grey) are
+//! carried by the engine and not by this file. Nothing reaches the display up there anyway - the
+//! ODT LUT's own domain ends at the same place - so it matters only for the EXR tap.
+bool WriteCurveMasterCube(const char* szPath, const char* szTitle, const SSceneReferredExportMetadata& md)
+{
+	std::vector<float> samples(SceneReferredCurves::kLutSize);
+	SceneReferredCurves::BakeMaster(md.curveMasterStops, samples.data(), SceneReferredCurves::kLutSize);
+
+	string text;
+	string line;
+	text += "# ReC Sandbox - CineCam Grade master (luma) curve\n";
+	text += "# Working space: ACEScct (AP1 primaries). Apply on a node AFTER the ASC CDL beside\n";
+	text += "# this file; see the .curves.txt sidecar for the full chain order.\n";
+	line.Format("# Knot offsets in stops: %.4f %.4f %.4f %.4f %.4f\n",
+	            md.curveMasterStops[0], md.curveMasterStops[1], md.curveMasterStops[2],
+	            md.curveMasterStops[3], md.curveMasterStops[4]);
+	text += line;
+	text += "# Domain [0,1]; the engine extends the curve with slope 1 outside it, which a 1D LUT\n";
+	text += "# cannot carry. Only matters above ACEScct 1.0 = +10.3 stops over 18% grey.\n";
+	line.Format("TITLE \"%s\"\n", szTitle);
+	text += line;
+	line.Format("LUT_1D_SIZE %d\n", (int)SceneReferredCurves::kLutSize);
+	text += line;
+
+	for (int i = 0; i < SceneReferredCurves::kLutSize; ++i)
+	{
+		line.Format("%.6f %.6f %.6f\n", samples[i], samples[i], samples[i]);
+		text += line;
+	}
+
+	return WriteTextFile(szPath, text);
+}
+
+//! Both curves' control points, in plain text, because one of them has nowhere else to go.
+//!
+//! Sat vs Sat is a MULTIPLIER indexed by a per-pixel saturation measure, not a per-channel value
+//! mapping, so it is not a 1D LUT and a `.cube` of it would load, apply and be silently nonsense.
+//! Resolve has the control natively; what a colourist needs from us is the numbers and the exact
+//! definition of the axis they were dialled against. That is what this file is.
+bool WriteCurvesText(const char* szPath, const char* szTitle, const SSceneReferredExportMetadata& md)
+{
+	using namespace SceneReferredCurves;
+
+	string text;
+	string line;
+
+	text += "ReC Sandbox - CineCam Grade curves\n";
+	line.Format("take: %s\n", szTitle);
+	text += line;
+	text += "\n";
+	text += "The engine's display chain, in order:\n";
+	text += "  white balance -> sensor clip -> ACEScct -> ASC CDL (+saturation)\n";
+	text += "  -> MASTER CURVE -> SAT vs SAT -> look LUT (LMT) -> [EXR tap] -> output transform\n";
+	text += "The .cdl beside this file is the ASC CDL step, and it is the FRONT of the chain, so\n";
+	text += "these curves belong on the node AFTER it.\n";
+	text += "\n";
+
+	if (md.bCurveMaster)
+	{
+		const float* const px = MasterKnotX();
+		text += "MASTER (LUMA) CURVE - one curve, applied identically to all three channels in\n";
+		text += "ACEScct. Monotone cubic Hermite (Fritsch-Carlson) through five knots.\n";
+		text += "  knot            x (ACEScct)   offset (stops)   y (ACEScct)\n";
+		static const char* const s_names[kKnotCount] = { "black    ", "shadow   ", "mid grey ", "highlight", "white    " };
+		float y[kKnotCount];
+		MasterKnotY(md.curveMasterStops, y);
+		for (int i = 0; i < kKnotCount; ++i)
+		{
+			line.Format("  %s        %.6f      %+.4f          %.6f\n",
+			            s_names[i], px[i], md.curveMasterStops[i], y[i]);
+			text += line;
+		}
+		text += "  (mid grey is ACEScct(0.18); shadow and highlight are 4 stops either side;\n";
+		text += "   white is ACEScct 1.0 = +10.3 stops over grey.)\n";
+		text += "The same curve is beside this file as a Resolve 1D .cube.\n";
+		text += "\n";
+	}
+	else
+	{
+		text += "MASTER (LUMA) CURVE: neutral (identity).\n\n";
+	}
+
+	if (md.bCurveSat)
+	{
+		const float* const px = SatKnotX();
+		text += "SAT vs SAT - the OUTPUT SATURATION MULTIPLIER as a function of the measured input\n";
+		text += "saturation. Same interpolation. 1.0 means unchanged, which is Resolve's Sat vs Sat\n";
+		text += "convention (a flat line = no change).\n";
+		text += "  input saturation   output multiplier\n";
+		for (int i = 0; i < kKnotCount; ++i)
+		{
+			line.Format("  %.2f               %.4f\n", px[i], md.curveSatMult[i]);
+			text += line;
+		}
+		text += "\n";
+		text += "HOW THE INPUT SATURATION IS MEASURED (this is the part that has to be transferred\n";
+		text += "by eye, because no interchange format carries it):\n";
+		text += "  luma = dot(c, (0.2126, 0.7152, 0.0722))    <- the ASC CDL's own Rec.709 weights\n";
+		line.Format("  sat  = saturate(length(c - luma) * %.4f)\n", kSatFullScale);
+		text += line;
+		text += "  out  = luma + (c - luma) * multiplier\n";
+		text += "with c in ACEScct. So the axis is the LENGTH of the very vector the multiplier\n";
+		text += "scales, and it is exposure-invariant: the space is log and the weights sum to 1,\n";
+		text += "so a stop shifts c and luma by the same amount and leaves c - luma alone.\n";
+		line.Format("sat = 1 is a chroma vector of length %.3f in ACEScct = %.1f stops of spread\n",
+		            1.0f / kSatFullScale, 17.52f / kSatFullScale);
+		text += line;
+		text += "between the extreme channels. For scale: an ordinary strong red reads about 0.54,\n";
+		text += "a near-primary about 0.96, and any neutral reads exactly 0.\n";
+	}
+	else
+	{
+		text += "SAT vs SAT: neutral (multiplier 1 everywhere).\n";
+	}
+
+	return WriteTextFile(szPath, text);
+}
+
+} // anonymous namespace
+
+CSceneReferredExport& CSceneReferredExport::Get()
+{
+	static CSceneReferredExport s_instance;
+	return s_instance;
+}
+
+CSceneReferredExport::CSceneReferredExport()
+	: m_state(eState_Idle)
+	, m_tap(eSceneReferredExportTap_Graded)
+	, m_encoding(eSceneReferredExportEncoding_ACES2065)
+	, m_frameIndex(0)
+	, m_nextSlot(0)
+	, m_width(0)
+	, m_height(0)
+	, m_pOwner(nullptr)
+	, m_bTimeStepOverridden(false)
+	, m_fSavedFixedStep(0.0f)
+	, m_nSavedJitter(1)
+{}
+
+bool CSceneReferredExport::WantsGradedTap() const
+{
+	return IsArmed() && m_tap == eSceneReferredExportTap_Graded;
+}
+
+bool CSceneReferredExport::StartSequence(const char* szFolder, const char* szPrefix)
+{
+	if (IsArmed())
+	{
+		CryLogAlways("[EXR] a capture is already running - stop it first (rec_CaptureEXRStop)");
+		return false;
+	}
+
+	m_folder = ResolveCaptureFolder(szFolder);
+	m_prefix = (szPrefix && *szPrefix) ? szPrefix : "frame";
+	// The frame counter belongs to the capture, not to a shared console variable. `capture_frames`
+	// is written by ManualFrameStep and by CryMovie as well, so two captures in one session there
+	// continue the same numbering; here the arm decides, per r_SceneReferredExportSequenceNaming
+	// (2026-09-10, user: a second take into the same folder must not overwrite the first):
+	//   0 - start at zero (the original behaviour),
+	//   1 - continue from the first free number on disk (default),
+	//   2 - stamp the prefix with the wall-clock time and start at zero.
+	m_frameIndex = 0;
+	switch (clamp_tpl(CRenderer::CV_r_SceneReferredExportSequenceNaming, 0, 2))
+	{
+	case 1:
+		m_frameIndex = FirstFreeIndex(m_folder, m_prefix, 0);
+		break;
+	case 2:
+		{
+			time_t now = time(nullptr);
+			tm local;
+			localtime_s(&local, &now);
+			string stamped;
+			stamped.Format("%s_%04d%02d%02d_%02d%02d%02d", m_prefix.c_str(),
+			               local.tm_year + 1900, local.tm_mon + 1, local.tm_mday,
+			               local.tm_hour, local.tm_min, local.tm_sec);
+			m_prefix = stamped;
+		}
+		break;
+	default:
+		break;
+	}
+	m_nextSlot = 0;
+	m_tap = clamp_tpl(CRenderer::CV_r_SceneReferredExportTap, 0, 1);
+	m_encoding = clamp_tpl(CRenderer::CV_r_SceneReferredExportEncoding, 0, 1);
+	m_state = eState_Sequence;
+
+	ArmCdlSidecar();
+	SetFixedStep(true);
+
+	CryLogAlways("[EXR] capture armed: '%s/%s.%%06d.exr' from %06d", m_folder.c_str(), m_prefix.c_str(), m_frameIndex);
+	return true;
+}
+
+bool CSceneReferredExport::RequestSingleFrame(const char* szFolder, const char* szPrefix)
+{
+	if (IsArmed())
+	{
+		CryLogAlways("[EXR] a capture is already running - stop it first (rec_CaptureEXRStop)");
+		return false;
+	}
+
+	m_folder = ResolveCaptureFolder(szFolder);
+	m_prefix = (szPrefix && *szPrefix) ? szPrefix : "frame";
+
+	// A SINGLE frame numbers consecutively for the whole session, which is the one place this
+	// differs from a sequence. A sequence is one artefact and starts at zero by definition; single
+	// frames are taken one at a time while something is being looked at, and re-writing
+	// frame.000000.exr every time makes the command useless for exactly that.
+	//
+	// The counter is a hint, not the answer: the disk is asked. That way a file deleted between
+	// two captures gets its number back, and files left over from a previous session are not
+	// silently overwritten - neither of which a counter on its own can know. The key is the
+	// destination, so switching folder or name starts a fresh scan.
+	const string key = m_folder + "/" + m_prefix;
+	if (key != m_singleFrameKey)
+	{
+		m_singleFrameKey = key;
+		m_singleFrameNext = 0;
+	}
+
+	m_frameIndex = FirstFreeIndex(m_folder, m_prefix, m_singleFrameNext);
+	m_singleFrameNext = m_frameIndex + 1;
+
+	m_nextSlot = 0;
+	m_tap = clamp_tpl(CRenderer::CV_r_SceneReferredExportTap, 0, 1);
+	m_encoding = clamp_tpl(CRenderer::CV_r_SceneReferredExportEncoding, 0, 1);
+	m_state = eState_SingleFrame;
+
+	// A single frame is its own take, so it gets its own sidecar - and, unlike a sequence, its own
+	// number in the name, because the next single frame may carry a different grade entirely.
+	ArmCdlSidecar();
+
+	// No cadence to fix for one frame, so t_FixedStep is left alone.
+	return true;
+}
+
+void CSceneReferredExport::ArmCdlSidecar()
+{
+	m_bCdlSidecarPending = true;
+	m_bCdlDriftWarned = false;
+	m_cdlSidecarText.clear();
+	m_bCurveSidecarPending = true;
+}
+
+int CSceneReferredExport::FirstFreeIndex(const string& folder, const string& prefix, int nStartAt)
+{
+	// FLAGS_PATH_REAL: the folder is already an absolute, adjusted path from ResolveCaptureFolder,
+	// and FLAGS_NEVER_IN_PAK because a capture destination is a disk folder - a name that happens
+	// to exist inside a .pak must not count as taken.
+	const int nMax = 1000000;   // the format is %06d; past this the name is not unique anyway
+	for (int i = max(nStartAt, 0); i < nMax; ++i)
+	{
+		string path;
+		path.Format("%s/%s.%06d.exr", folder.c_str(), prefix.c_str(), i);
+		if (!gEnv->pCryPak->IsFileExist(path.c_str(), ICryPak::eFileLocation_OnDisk))
+			return i;
+	}
+	return max(nStartAt, 0);
+}
+
+void CSceneReferredExport::Stop(const char* szReason)
+{
+	if (m_state == eState_Idle)
+		return;
+
+	const int nWritten = m_frameIndex;
+	m_state = eState_Idle;
+	SetFixedStep(false);
+
+	CryLogAlways("[EXR] capture stopped after %d frame%s%s%s", nWritten, (nWritten == 1) ? "" : "s",
+	             (szReason && *szReason) ? ": " : "", (szReason && *szReason) ? szReason : "");
+
+	// The ring is NOT released here - slots may still have a download in flight, and freeing a
+	// staging resource that is the target of an unretired GPU copy is the exact bug Bloom.cpp's
+	// m_bDiffractionReadbackIssued guard exists to avoid. BeginFrame drains and releases.
+}
+
+void CSceneReferredExport::SetFixedStep(bool bEnable)
+{
+	ICVar* pFixedStep = gEnv->pConsole ? gEnv->pConsole->GetCVar("t_FixedStep") : nullptr;
+	ICVar* pJitter = gEnv->pConsole ? gEnv->pConsole->GetCVar("r_DepthOfFieldLensModelJitter") : nullptr;
+
+	if (bEnable)
+	{
+		if (m_bTimeStepOverridden || !pFixedStep)
+			return;
+
+		m_fSavedFixedStep = pFixedStep->GetFVal();
+		m_nSavedJitter = pJitter ? pJitter->GetIVal() : 1;
+
+		const float fStep = max(CRenderer::CV_r_SceneReferredExportFixedStep, 0.0f);
+		if (fStep > 0.0f)
+			pFixedStep->Set(fStep);
+
+		// Jitter mode 2 freezes the lens model's per-frame tap rotation. A sequence in which every
+		// frame carries a different sub-pixel dither is not a sequence, it is noise with a picture
+		// behind it - and it is indistinguishable from TAA ghosting when the result is examined.
+		if (pJitter)
+			pJitter->Set(2);
+
+		m_bTimeStepOverridden = true;
+	}
+	else
+	{
+		if (!m_bTimeStepOverridden)
+			return;
+
+		if (pFixedStep)
+			pFixedStep->Set(m_fSavedFixedStep);
+		if (pJitter)
+			pJitter->Set(m_nSavedJitter);
+
+		m_bTimeStepOverridden = false;
+	}
+}
+
+void CSceneReferredExport::ReleaseRing()
+{
+	for (int i = 0; i < kRingSize; ++i)
+	{
+		if (m_ring[i].bIssued)
+			return; // a download is still in flight; try again next frame
+	}
+
+	for (int i = 0; i < kRingSize; ++i)
+	{
+		if (m_ring[i].jobState.IsRunning())
+			return; // a writer is still going
+		m_ring[i].pTex.reset();
+	}
+
+	m_width = m_height = 0;
+	m_pOwner = nullptr;
+}
+
+void CSceneReferredExport::GatherMetadata(SSceneReferredExportMetadata& out) const
+{
+	out.frameIndex = m_frameIndex;
+	out.renderFrameId = gRenDev ? (int)gRenDev->GetRenderFrameID() : 0;
+	out.engineTime = gEnv->pTimer ? gEnv->pTimer->GetCurrTime() : 0.0f;
+	out.fps = (CRenderer::CV_r_SceneReferredExportFixedStep > 0.0f) ? (1.0f / CRenderer::CV_r_SceneReferredExportFixedStep) : 0.0f;
+
+	// The number that makes the file's absolute scale recoverable. Everything in this pipeline is
+	// built on 1.0 = 10 000 cd/m^2, and the pre-exposure destroys that unless the scale it applied
+	// travels with the frame.
+	out.exposureScale = gcpRendD3D ? gcpRendD3D->GetSceneReferredExposure() : 1.0f;
+
+	out.whiteBalanceK = GetBusParam("Global_User_GradeWBKelvin");
+	out.whiteBalanceTint = GetBusParam("Global_User_GradeWBTint");
+
+	// The camera's own numbers, published by ccam on the same bus. They describe the frame; they
+	// do not affect it.
+	out.focalLength = GetBusParam("Global_User_CamFocal");
+	out.tStop = GetBusParam("Global_User_CamTStop");
+	out.iso = GetBusParam("Global_User_CamISO");
+	out.shutterTime = GetBusParam("Global_User_CamShutter");
+	out.nd = GetBusParam("Global_User_CamND");
+	out.ev100 = GetBusParam("Global_User_CamEV100");
+
+	if (CPostEffectsMgr* pPostMgr = PostEffectMgr())
+	{
+		out.cameraName = pPostMgr->GetByNameStr("Global_User_CamName");
+		out.lensName = pPostMgr->GetByNameStr("Global_User_LensName");
+
+		out.odtName = GetLutName(pPostMgr->GetLutODTParam(), pPostMgr->GetLutODTSizeParam());
+		out.lmtName = GetLutName(pPostMgr->GetLutLMTParam(), pPostMgr->GetLutLMTSizeParam());
+
+		// The EFFECTIVE CDL, i.e. what the tone map really evaluated - the same reasoning
+		// ToneMapping.cpp:628-672 applies, applied here so the file cannot disagree with the
+		// picture (decisions/s10-grade-component.md section 3a.5):
+		//
+		//   * Bypass Grade short-circuits the tone map's reads, so a bypassed frame has the
+		//     IDENTITY grade in it. Recording the camera's dialled numbers on such a frame would
+		//     hand Resolve a grade that was never in the picture - the defect this replaces.
+		//   * the 1e-4 floors on slope and power are the renderer's, and a header that omits them
+		//     describes a frame that was not rendered.
+		//
+		// Everything upstream of the bus - the colour wheels, contrast, the CDL base - has already
+		// been folded into these three triples by the camera (SCineGradeParams::Resolve), so this
+		// is the whole grade and not a part of it.
+		out.bCdlBypassed = pPostMgr->GetByNameF("Global_User_GradeBypass") > 0.5f;
+
+		if (!out.bCdlBypassed)
+		{
+			const Vec4 slope = pPostMgr->GetByNameVec4("Global_User_GradeSlope");
+			const Vec4 offset = pPostMgr->GetByNameVec4("Global_User_GradeOffset");
+			const Vec4 power = pPostMgr->GetByNameVec4("Global_User_GradePower");
+
+			out.cdlSlope = Vec3(max(slope.x, 1e-4f), max(slope.y, 1e-4f), max(slope.z, 1e-4f));
+			out.cdlOffset = Vec3(offset.x, offset.y, offset.z);
+			out.cdlPower = Vec3(max(power.x, 1e-4f), max(power.y, 1e-4f), max(power.z, 1e-4f));
+			out.cdlSaturation = max(pPostMgr->GetByNameF("Global_User_GradeSaturation"), 0.0f);
+		}
+
+		// The two 1D curves (S10 item 3b), on exactly the same terms as the CDL above: what the
+		// tone map really evaluated. Bypass Grade takes the curves out with the CDL and the LMT -
+		// the renderer only reads the active flags inside the !bBypass branch - so a bypassed
+		// frame carries the neutral here too, and no curve sidecar is written for it.
+		if (!out.bCdlBypassed)
+		{
+			const Vec4 masterA = pPostMgr->GetByNameVec4("Global_User_CurveMasterA");
+			const Vec4 masterB = pPostMgr->GetByNameVec4("Global_User_CurveMasterB");
+			const Vec4 satA = pPostMgr->GetByNameVec4("Global_User_CurveSatA");
+			const Vec4 satB = pPostMgr->GetByNameVec4("Global_User_CurveSatB");
+
+			out.curveMasterStops[0] = masterA.x;
+			out.curveMasterStops[1] = masterA.y;
+			out.curveMasterStops[2] = masterA.z;
+			out.curveMasterStops[3] = masterA.w;
+			out.curveMasterStops[4] = masterB.x;
+			out.bCurveMaster = masterB.y > 0.5f;
+
+			out.curveSatMult[0] = satA.x;
+			out.curveSatMult[1] = satA.y;
+			out.curveSatMult[2] = satA.z;
+			out.curveSatMult[3] = satA.w;
+			out.curveSatMult[4] = satB.x;
+			out.bCurveSat = satB.y > 0.5f;
+		}
+
+		if (out.bCurveMaster || out.bCurveSat)
+		{
+			out.curves.Format("master %+.4f %+.4f %+.4f %+.4f %+.4f stops / satvsat %.4f %.4f "
+			                  "%.4f %.4f %.4f%s%s",
+			                  out.curveMasterStops[0], out.curveMasterStops[1], out.curveMasterStops[2],
+			                  out.curveMasterStops[3], out.curveMasterStops[4],
+			                  out.curveSatMult[0], out.curveSatMult[1], out.curveSatMult[2],
+			                  out.curveSatMult[3], out.curveSatMult[4],
+			                  out.bCurveMaster ? "" : " (master neutral)",
+			                  out.bCurveSat ? "" : " (sat neutral)");
+		}
+
+		// ASC order, ASC names, ASC number format - the same six decimals the .cdl sidecar beside
+		// this file carries, so the two can be compared by eye and a human reading the header can
+		// type them into Resolve.
+		out.cdl.Format("slope %.6f %.6f %.6f / offset %.6f %.6f %.6f / power %.6f %.6f %.6f / sat %.6f%s",
+		               out.cdlSlope.x, out.cdlSlope.y, out.cdlSlope.z,
+		               out.cdlOffset.x, out.cdlOffset.y, out.cdlOffset.z,
+		               out.cdlPower.x, out.cdlPower.y, out.cdlPower.z,
+		               out.cdlSaturation, out.bCdlBypassed ? " (bypassed)" : "");
+	}
+}
+
+CTexture* CSceneReferredExport::BeginFrame(CGraphicsPipeline& pipeline, int width, int height)
+{
+	ConsumeCompleted();
+
+	if (m_state == eState_Idle)
+	{
+		ReleaseRing();
+		return nullptr;
+	}
+
+	// Belt and braces for the m_pOwner claim (research/s8-editor-pipelines.md section 4c item 3):
+	// the exporter is claimed by the first pipeline that runs while armed, and it must never be a
+	// preview or a probe bake. The tap's own IsSceneReferredStage(6) gate already keeps them out
+	// now that it carries the preview gate, but the claim is permanent for the duration of a
+	// capture and the cost of being sure is one virtual call per frame.
+	if (!pipeline.IsSceneReferredCapable())
+		return nullptr;
+
+	if (m_pOwner == nullptr)
+		m_pOwner = &pipeline;
+	if (m_pOwner != &pipeline)
+		return nullptr;
+
+	if (width <= 0 || height <= 0)
+		return nullptr;
+
+	if ((m_width != 0 && m_width != width) || (m_height != 0 && m_height != height))
+	{
+		Stop("the resolution changed under the capture");
+		return nullptr;
+	}
+	m_width = width;
+	m_height = height;
+
+	SRingSlot& slot = m_ring[m_nextSlot];
+
+	// The ring has come round to a slot whose download has not been consumed, or whose writer is
+	// still going. Either way the machine cannot keep up, and the honest response is to stop.
+	if (slot.bIssued)
+	{
+		Stop("the readback fell behind - the GPU has not returned an earlier frame");
+		return nullptr;
+	}
+	if (slot.jobState.IsRunning())
+	{
+		Stop("the writer fell behind - the disk cannot keep up with the frame rate");
+		return nullptr;
+	}
+
+	if (!CTexture::IsTextureExist(slot.pTex))
+	{
+		// FT_STAGE_READBACK is what gives the texture a PERSISTENT staging resource, and that is
+		// what makes a two-phase (issue now, map later) download possible at all. The one-shot
+		// overload allocates a temporary and Maps immediately, which under D3D11 is a full
+		// pipeline stall - fine for a screenshot, ruinous at one full-res fp16 frame per frame.
+		const uint32 flags = FT_NOMIPS | FT_DONT_STREAM | FT_USAGE_RENDERTARGET | FT_STAGE_READBACK;
+		// Named per pipeline AND per slot: the editor runs more than one CGraphicsPipeline, and
+		// two of them sharing one texture name is the bug S0 had to fix for the satellite formats.
+		string name;
+		name.Format("$SceneReferredExport%d%s", m_nextSlot, pipeline.GetUniqueIdentifierName().c_str());
+		slot.pTex = CTexture::GetOrCreateRenderTarget(name.c_str(), width, height, Clr_Transparent, eTT_2D, flags, eTF_R16G16B16A16F);
+
+		if (!CTexture::IsTextureExist(slot.pTex))
+		{
+			slot.pTex.reset();
+			Stop("could not create the readback target");
+			return nullptr;
+		}
+	}
+
+	return slot.pTex;
+}
+
+void CSceneReferredExport::EndFrame()
+{
+	if (m_state == eState_Idle)
+		return;
+
+	SRingSlot& slot = m_ring[m_nextSlot];
+	if (!CTexture::IsTextureExist(slot.pTex))
+		return;
+
+	CDeviceTexture* pDevTex = slot.pTex->GetDevTexture();
+	if (!pDevTex)
+	{
+		Stop("the readback target has no device texture");
+		return;
+	}
+
+	GatherMetadata(slot.metadata);
+	// The dot before the frame number is the VFX convention Nuke and Resolve auto-detect as a
+	// sequence, not the engine's own "%s%06d.%s" (DriverD3D.cpp:1258). Getting it wrong means
+	// every import is manual.
+	slot.path.Format("%s/%s.%06d.exr", m_folder.c_str(), m_prefix.c_str(), m_frameIndex);
+
+	// The ASC .cdl that travels with the take. Claimed by the FIRST frame of a capture and written
+	// when that frame's readback comes home; every later frame leaves cdlPath empty. See
+	// decisions/s10-grade-component.md section 3a.5 for why one per take rather than one per frame
+	// and why an identity grade is still written.
+	slot.cdlPath.clear();
+	slot.cdlId.clear();
+	if (CRenderer::CV_r_SceneReferredExportCDL != 0)
+	{
+		if (m_bCdlSidecarPending)
+		{
+			m_bCdlSidecarPending = false;
+			m_cdlSidecarText = slot.metadata.cdl;
+
+			if (m_state == eState_SingleFrame)
+			{
+				slot.cdlPath.Format("%s/%s.%06d.cdl", m_folder.c_str(), m_prefix.c_str(), m_frameIndex);
+				slot.cdlId.Format("%s.%06d", SanitiseForXml(m_prefix.c_str()).c_str(), m_frameIndex);
+			}
+			else
+			{
+				slot.cdlPath.Format("%s/%s.cdl", m_folder.c_str(), m_prefix.c_str());
+				slot.cdlId = SanitiseForXml(m_prefix.c_str());
+			}
+		}
+		else if (!m_bCdlDriftWarned && slot.metadata.cdl != m_cdlSidecarText)
+		{
+			// One CDL cannot describe an animated grade. Said once, naming the frame, instead of
+			// either silently standing by frame zero's numbers or spraying a file per frame.
+			m_bCdlDriftWarned = true;
+			CryWarning(VALIDATOR_MODULE_RENDERER, VALIDATOR_WARNING,
+			           "[EXR] the grade changed at frame %06d - the .cdl sidecar carries the grade of "
+			           "the FIRST frame of this capture and no longer describes the whole take. An "
+			           "animated grade has to be re-keyed in Resolve; rec/cdl in each frame's header "
+			           "still carries that frame's own numbers.", m_frameIndex);
+		}
+	}
+
+	// The two curve sidecars, claimed by the same first frame and on the same one-per-take terms -
+	// but only when a curve is actually doing something. An absent curve file is not ambiguous the
+	// way an absent .cdl would be, because the .cdl is always there and dates the take; writing a
+	// pair of "this curve is neutral" files beside every capture would be noise.
+	slot.curveCubePath.clear();
+	slot.curveTextPath.clear();
+	if (CRenderer::CV_r_SceneReferredExportCurves != 0 && m_bCurveSidecarPending
+	    && (slot.metadata.bCurveMaster || slot.metadata.bCurveSat))
+	{
+		m_bCurveSidecarPending = false;
+
+		string base;
+		if (m_state == eState_SingleFrame)
+			base.Format("%s/%s.%06d", m_folder.c_str(), m_prefix.c_str(), m_frameIndex);
+		else
+			base.Format("%s/%s", m_folder.c_str(), m_prefix.c_str());
+
+		slot.curveTextPath = base + ".curves.txt";
+		if (slot.metadata.bCurveMaster)
+			slot.curveCubePath = base + ".curve_master.cube";
+	}
+
+	pDevTex->DownloadToStagingResource(0);
+	slot.bIssued = true;
+	slot.fIssueTime = gEnv->pTimer->GetAsyncCurTime();
+
+	++m_frameIndex;
+	m_nextSlot = (m_nextSlot + 1) % kRingSize;
+
+	if (m_state == eState_SingleFrame)
+	{
+		m_state = eState_Idle;
+		CryLogAlways("[EXR] single frame requested: '%s'", slot.path.c_str());
+	}
+}
+
+void CSceneReferredExport::ConsumeCompleted()
+{
+	for (int i = 0; i < kRingSize; ++i)
+	{
+		if (m_ring[i].bIssued)
+			ConsumeSlot(m_ring[i]);
+	}
+}
+
+bool CSceneReferredExport::ConsumeSlot(SRingSlot& slot)
+{
+	CDeviceTexture* pDevTex = CTexture::IsTextureExist(slot.pTex) ? slot.pTex->GetDevTexture() : nullptr;
+	if (!pDevTex)
+	{
+		slot.bIssued = false;
+		return false;
+	}
+
+	// Never block. A slot that is not ready simply comes back next frame; the ring is what makes
+	// that free rather than a dropped frame.
+	if (!pDevTex->AccessCurrStagingResource(0, false))
+	{
+		if ((gEnv->pTimer->GetAsyncCurTime() - slot.fIssueTime) > 5.0f)
+		{
+			slot.bIssued = false;
+			Stop("a staging download did not signal in 5 s");
+		}
+		return false;
+	}
+
+	const int width = m_width;
+	const int height = m_height;
+
+	SSceneReferredExportJob* pJob = new SSceneReferredExportJob();
+	pJob->width = width;
+	pJob->height = height;
+	pJob->path = slot.path;
+	pJob->pixels.resize((size_t)width * (size_t)height * 4);
+
+	// The mapped rows are PITCHED, not packed. Assuming width * 8 bytes here is what produces a
+	// sheared image and an hour of confusion.
+	const auto copyOut = [width, height, pJob](void* pData, uint32 rowPitch, uint32 slicePitch) -> bool
+	{
+		const uint8* pRow = static_cast<const uint8*>(pData);
+		CryHalf* pDst = pJob->pixels.data();
+		const size_t rowBytes = (size_t)width * 4 * sizeof(CryHalf);
+		for (int y = 0; y < height; ++y, pRow += rowPitch, pDst += (size_t)width * 4)
+			memcpy(pDst, pRow, rowBytes);
+		return true;
+	};
+
+	pDevTex->AccessCurrStagingResource(0, false, copyOut);
+	slot.bIssued = false;
+
+	// The take's CDL, written now that this frame is known to have survived the round trip. A few
+	// hundred bytes once per capture, on the render thread, deliberately: the writer job owns
+	// pixels and nothing else, and the sidecar has to be beside the first file rather than beside
+	// whichever one a job thread happened to finish first.
+	if (!slot.cdlPath.empty())
+	{
+		if (WriteCdlSidecar(slot.cdlPath.c_str(), slot.cdlId.c_str(), slot.metadata))
+			CryLogAlways("[EXR] ASC CDL written: '%s' (%s)", slot.cdlPath.c_str(), slot.metadata.cdl.c_str());
+		else
+			CryWarning(VALIDATOR_MODULE_RENDERER, VALIDATOR_WARNING,
+			           "[EXR] could not write the ASC CDL sidecar '%s' - the frames are unaffected",
+			           slot.cdlPath.c_str());
+	}
+
+	// The curves, on the same thread and for the same reason. The take's name is the sidecar's
+	// title; it was sanitised for the .cdl's XML id and is reused here so the three files agree.
+	if (!slot.curveTextPath.empty())
+	{
+		const string title = SanitiseForXml(m_prefix.c_str());
+
+		if (WriteCurvesText(slot.curveTextPath.c_str(), title.c_str(), slot.metadata))
+			CryLogAlways("[EXR] grade curves written: '%s' (%s)", slot.curveTextPath.c_str(), slot.metadata.curves.c_str());
+		else
+			CryWarning(VALIDATOR_MODULE_RENDERER, VALIDATOR_WARNING,
+			           "[EXR] could not write the curve sidecar '%s' - the frames are unaffected",
+			           slot.curveTextPath.c_str());
+
+		if (!slot.curveCubePath.empty())
+		{
+			if (WriteCurveMasterCube(slot.curveCubePath.c_str(), title.c_str(), slot.metadata))
+				CryLogAlways("[EXR] master curve written: '%s' (1D cube, %d entries)",
+				             slot.curveCubePath.c_str(), (int)SceneReferredCurves::kLutSize);
+			else
+				CryWarning(VALIDATOR_MODULE_RENDERER, VALIDATOR_WARNING,
+				           "[EXR] could not write the master curve LUT '%s' - the frames are unaffected",
+				           slot.curveCubePath.c_str());
+		}
+	}
+
+	// Everything the file will say about itself, decided here on the render thread while the
+	// camera state that produced these pixels is still the current one.
+	const bool bAces2065 = (m_encoding == eSceneReferredExportEncoding_ACES2065);
+	pJob->desc.compression = (EExrCompression)clamp_tpl(CRenderer::CV_r_SceneReferredExportCompression, 0, 4);
+	pJob->desc.bWriteAlpha = false;
+	pJob->desc.bChromaticities = true;
+	memcpy(pJob->desc.chromaticities, bAces2065 ? kChromaticitiesAP0 : kChromaticitiesAP1, sizeof(pJob->desc.chromaticities));
+	// The container flag is a claim of ST 2065-4 conformance, which is a claim about AP0 data. It
+	// goes on the AP0 file and never on the AP1 one.
+	pJob->desc.bAcesImageContainerFlag = bAces2065;
+	pJob->desc.bColorMatrix = bAces2065;
+	if (bAces2065)
+		memcpy(pJob->desc.colorMatrix, kAP1ToAP0, sizeof(pJob->desc.colorMatrix));
+
+	const SSceneReferredExportMetadata& md = slot.metadata;
+	const bool bGraded = (m_tap == eSceneReferredExportTap_Graded);
+
+	std::vector<SExrAttribute>& a = pJob->attributes;
+	a.push_back(SExrAttribute::String("owner", "ReC Sandbox"));
+	// A T1 file and a T2 file look similar and mean completely different things. Anything reading
+	// these has to be able to tell them apart without asking a human.
+	a.push_back(SExrAttribute::String("rec/exportTap", bGraded ? "pre-ODT" : "HDRTarget"));
+	a.push_back(SExrAttribute::String("rec/workingSpace", bAces2065 ? "ACES2065-1" : "ACEScg"));
+	a.push_back(SExrAttribute::String("rec/specVersion", "SceneReferredSpec S6"));
+	a.push_back(SExrAttribute::Int("rec/schemaVersion", 1));
+	a.push_back(SExrAttribute::Int("rec/frameIndex", md.frameIndex));
+	a.push_back(SExrAttribute::Int("rec/renderFrameId", md.renderFrameId));
+	a.push_back(SExrAttribute::Float("rec/engineTime", md.engineTime));
+	if (md.fps > 0.0f)
+		a.push_back(SExrAttribute::Float("rec/fps", md.fps));
+	a.push_back(SExrAttribute::Float("rec/exposureScale", md.exposureScale));
+	a.push_back(SExrAttribute::Float("rec/whiteBalance_K", md.whiteBalanceK));
+	a.push_back(SExrAttribute::Float("rec/whiteBalance_tint", md.whiteBalanceTint));
+	// The exposure triangle. T-stop and not f-number: the T-stop is the control the camera model
+	// actually has, and `aperture` is the classic attribute name to get wrong, since a
+	// photographic reading and a projection reading both plausibly claim it.
+	if (md.focalLength > 0.0f)
+		a.push_back(SExrAttribute::Float("rec/focalLength_mm", md.focalLength));
+	if (md.tStop > 0.0f)
+		a.push_back(SExrAttribute::Float("rec/tStop", md.tStop));
+	if (md.iso > 0.0f)
+		a.push_back(SExrAttribute::Float("rec/iso", md.iso));
+	if (md.shutterTime > 0.0f)
+	{
+		a.push_back(SExrAttribute::Float("rec/shutterTime_s", md.shutterTime));
+		// `expTime` is a standard EXR attribute and readers already understand it, so it goes in
+		// alongside ours rather than instead of it.
+		a.push_back(SExrAttribute::Float("expTime", md.shutterTime));
+	}
+	a.push_back(SExrAttribute::Float("rec/ndStops", md.nd));
+	a.push_back(SExrAttribute::Float("rec/ev100", md.ev100));
+	if (!md.cameraName.empty())
+		a.push_back(SExrAttribute::String("rec/cameraName", md.cameraName));
+	if (!md.lensName.empty())
+		a.push_back(SExrAttribute::String("rec/lensName", md.lensName));
+	if (!md.odtName.empty())
+		a.push_back(SExrAttribute::String("rec/odt", md.odtName));
+	if (!md.lmtName.empty())
+		a.push_back(SExrAttribute::String("rec/lmt", md.lmtName));
+	if (!md.cdl.empty())
+		a.push_back(SExrAttribute::String("rec/cdl", md.cdl));
+	// The two 1D curves, when either is in the frame. Absent means neutral - which is honest here,
+	// unlike rec/cdl, because a CDL is always evaluated and a curve genuinely is not sampled at all
+	// when it is neutral. Written per FRAME, so an animated curve is still fully described even
+	// though the take's sidecar can only carry the first frame's.
+	if (!md.curves.empty())
+		a.push_back(SExrAttribute::String("rec/curves", md.curves));
+
+	TSceneReferredExportJob job(pJob);
+	job.SetPriorityLevel(JobManager::eLowPriority);
+	job.RegisterJobState(&slot.jobState);
+	job.Run();
+
+	return true;
+}
+
+void CSceneReferredExport::Shutdown()
+{
+	m_state = eState_Idle;
+	SetFixedStep(false);
+
+	for (int i = 0; i < kRingSize; ++i)
+	{
+		// Blocking is correct exactly here and nowhere else: the job manager and the textures are
+		// about to go away (DiffractionKernel.cpp:761 is the same ordering).
+		if (m_ring[i].jobState.IsRunning())
+			gEnv->GetJobManager()->WaitForJob(m_ring[i].jobState);
+		m_ring[i].bIssued = false;
+		m_ring[i].pTex.reset();
+	}
+
+	m_width = m_height = 0;
+	m_pOwner = nullptr;
+}

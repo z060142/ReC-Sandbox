@@ -1,1 +1,28 @@
-start_sources()sources_platform(ALL)add_sources("NoUberFile"	SOURCE_GROUP "Root"		"CineCamAssetTypes.h"		"CineCamAssetTypes.cpp"		"CineCamAssetRegistration.h"		"CineCamAssetRegistration.cpp"		"CineGradeBinding.h"		"CineGradeBinding.cpp"		"CineGradeWidgets.h"		"CineGradeWidgets.cpp"		"CineGradePanel.h"		"CineGradePanel.cpp"		"CinematicCameraEditorPlugin.h"		"CinematicCameraEditorPlugin.cpp"		"StdAfx.h"		"StdAfx.cpp")end_sources()CryEditorPlugin(CinematicCameraEditor PCH "StdAfx.cpp" SOLUTION_FOLDER "Sandbox/Plugins")# EditorCommon is linked by CryEditorPlugin() itself and is all this plugin needs: CAssetType,# REGISTER_ASSET_TYPE and CryIcon all live there. No Sandbox / MFCToolsPlugin dependency, on# purpose - nothing here touches EditorQt, so the DLL is deployable on its own.
+start_sources()
+
+sources_platform(ALL)
+add_sources("NoUberFile"
+	SOURCE_GROUP "Root"
+		"CineCamAssetTypes.h"
+		"CineCamAssetTypes.cpp"
+		"CineCamAssetRegistration.h"
+		"CineCamAssetRegistration.cpp"
+		"CineGradeBinding.h"
+		"CineGradeBinding.cpp"
+		"CineGradeWidgets.h"
+		"CineGradeWidgets.cpp"
+		"CineGradePanel.h"
+		"CineGradePanel.cpp"
+		"CinematicCameraEditorPlugin.h"
+		"CinematicCameraEditorPlugin.cpp"
+		"StdAfx.h"
+		"StdAfx.cpp"
+)
+
+end_sources()
+
+CryEditorPlugin(CinematicCameraEditor PCH "StdAfx.cpp" SOLUTION_FOLDER "Sandbox/Plugins")
+
+# EditorCommon is linked by CryEditorPlugin() itself and is all this plugin needs: CAssetType,
+# REGISTER_ASSET_TYPE and CryIcon all live there. No Sandbox / MFCToolsPlugin dependency, on
+# purpose - nothing here touches EditorQt, so the DLL is deployable on its own.

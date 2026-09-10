@@ -1,1 +1,86 @@
-// Copyright 2017-2021 Crytek GmbH / Crytek Group. All rights reserved.#pragma once#include "RenderViewport.h"#include <CryRenderer/IRenderer.h>#include <DragDrop.h>class CObjectRenderHelper;class QViewportHeader;//! LevelEditorViewport is a specialization of RenderViewport for the Level editor//! In the past RenderViewport was the level editor viewport and also the base class for all other viewports//! Which caused anti-patterns and a ton of issues. This was started as an attempt to sanitize viewport code//! By progressively moving all level editor specific code here. See RenderViewport.h for other refactoring notes.class CLevelEditorViewport : public CRenderViewport{public:	CLevelEditorViewport();	~CLevelEditorViewport();	bool  CreateRenderContext(CRY_HWND hWnd, IRenderer::EViewportType viewportType = IRenderer::eViewportType_Default) override;	void  SetHeaderWidget(QViewportHeader* headerWidget) { m_headerWidget = headerWidget; }	bool  DragEvent(EDragEvent eventId, QEvent* event, int flags) override;	void  PopulateMenu(CPopupMenuItem& menu);	void  SetFOV(float fov);	void  SetFOVDeg(float fov);	float GetFOV() const;	void  SetSelectedCamera();	bool  IsSelectedCamera() const;	//! CineCam is a second built-in fly camera: it behaves exactly like the default camera	//! (same navigation, same FOV handling, no entity) but is flagged as "CineCam mode", which	//! the cinematic camera plugin uses to drive its editor preview look.	//! IsDefaultCamera() stays true in CineCam mode on purpose (default-camera family).	void SetDefaultFlyCamera();	void SetCineCamFlyCamera();	bool IsCineCamFlyCamera() const { return m_bCineCamMode && IsDefaultCamera(); }	//! This switches the active camera to the next one in the list of (default, all custom cams).	void CycleCamera();	void CenterOnSelection() override;	void CenterOnAABB(AABB* const aabb) override;	void OnEditorNotifyEvent(EEditorNotifyEvent event) override;	Vec3 ViewToWorld(POINT vp, bool* collideWithTerrain = 0, bool onlyTerrain = false, bool bSkipVegetation = false, bool bTestRenderMesh = false) const override;	Vec3 ViewToWorldNormal(POINT vp, bool onlyTerrain, bool bTestRenderMesh = false) override;	bool MouseCallback(EMouseEvent event, CPoint& point, int flags) override;private:	void OnCameraSpeedChanged() override;	void OnMenuCreateCameraFromCurrentView();	void OnMenuCreateCinematicCamera();	//! Creates an "EntityWithComponent" object carrying componentGUID at the current view, sets the	//! sibling camera component FOV, and optionally selects it. Shared by both "Create ..." menu items.	void CreateCameraFromCurrentView(const CryGUID& componentGUID, const char* szUndoName, bool bSelect);	//! Per-frame push of (mode, entity, camera) to the cinematic camera plugin, and its counterpart.	void PushCineCamPreview(EntityId previewEntity);	void ClearCineCamPreview();	void LoadCineCamPersonalization();	void SaveCineCamPersonalization() const;	void OnMenuSelectCurrentCamera();	void OnRender(SDisplayContext& context) override;	void RenderAll(CObjectRenderHelper& displayInfo);	void RenderSnappingGrid(SDisplayContext& context);	void AddCameraMenuItems(CPopupMenuItem& menu);	//Get the drag event and use type to either create a new object or apply an asset	bool HandleDragEvent(EDragEvent eventId, QEvent* event, int flags);	//This CDragDropData contains an asset that can be used in the viewport	bool DropHasAsset(const CDragDropData& dragDropData);	//If possible applies the asset in dragDropData to an object	bool ApplyAsset(const CDragDropData& dragDropData, QDropEvent* pDropEvent, EDragEvent eventId);	float            m_camFOV;	QViewportHeader* m_headerWidget;	//! true when the built-in fly camera is the CineCam one instead of the stock default camera.	bool             m_bCineCamMode;	//! true while this viewport has an outstanding SetViewportPreview() the plugin must be told to drop.	bool             m_bCineCamPreviewPushed;};
+// Copyright 2017-2021 Crytek GmbH / Crytek Group. All rights reserved.
+
+#pragma once
+
+#include "RenderViewport.h"
+#include <CryRenderer/IRenderer.h>
+#include <DragDrop.h>
+
+class CObjectRenderHelper;
+class QViewportHeader;
+
+//! LevelEditorViewport is a specialization of RenderViewport for the Level editor
+//! In the past RenderViewport was the level editor viewport and also the base class for all other viewports
+//! Which caused anti-patterns and a ton of issues. This was started as an attempt to sanitize viewport code
+//! By progressively moving all level editor specific code here. See RenderViewport.h for other refactoring notes.
+class CLevelEditorViewport : public CRenderViewport
+{
+public:
+	CLevelEditorViewport();
+	~CLevelEditorViewport();
+
+	bool  CreateRenderContext(CRY_HWND hWnd, IRenderer::EViewportType viewportType = IRenderer::eViewportType_Default) override;
+
+	void  SetHeaderWidget(QViewportHeader* headerWidget) { m_headerWidget = headerWidget; }
+
+	bool  DragEvent(EDragEvent eventId, QEvent* event, int flags) override;
+	void  PopulateMenu(CPopupMenuItem& menu);
+
+	void  SetFOV(float fov);
+	void  SetFOVDeg(float fov);
+	float GetFOV() const;
+
+	void  SetSelectedCamera();
+	bool  IsSelectedCamera() const;
+
+	//! CineCam is a second built-in fly camera: it behaves exactly like the default camera
+	//! (same navigation, same FOV handling, no entity) but is flagged as "CineCam mode", which
+	//! the cinematic camera plugin uses to drive its editor preview look.
+	//! IsDefaultCamera() stays true in CineCam mode on purpose (default-camera family).
+	void SetDefaultFlyCamera();
+	void SetCineCamFlyCamera();
+	bool IsCineCamFlyCamera() const { return m_bCineCamMode && IsDefaultCamera(); }
+
+	//! This switches the active camera to the next one in the list of (default, all custom cams).
+	void CycleCamera();
+
+	void CenterOnSelection() override;
+	void CenterOnAABB(AABB* const aabb) override;
+
+	void OnEditorNotifyEvent(EEditorNotifyEvent event) override;
+
+	Vec3 ViewToWorld(POINT vp, bool* collideWithTerrain = 0, bool onlyTerrain = false, bool bSkipVegetation = false, bool bTestRenderMesh = false) const override;
+	Vec3 ViewToWorldNormal(POINT vp, bool onlyTerrain, bool bTestRenderMesh = false) override;
+	bool MouseCallback(EMouseEvent event, CPoint& point, int flags) override;
+private:
+
+	void OnCameraSpeedChanged() override;
+	void OnMenuCreateCameraFromCurrentView();
+	void OnMenuCreateCinematicCamera();
+	//! Creates an "EntityWithComponent" object carrying componentGUID at the current view, sets the
+	//! sibling camera component FOV, and optionally selects it. Shared by both "Create ..." menu items.
+	void CreateCameraFromCurrentView(const CryGUID& componentGUID, const char* szUndoName, bool bSelect);
+	//! Per-frame push of (mode, entity, camera) to the cinematic camera plugin, and its counterpart.
+	void PushCineCamPreview(EntityId previewEntity);
+	void ClearCineCamPreview();
+	void LoadCineCamPersonalization();
+	void SaveCineCamPersonalization() const;
+	void OnMenuSelectCurrentCamera();
+	void OnRender(SDisplayContext& context) override;
+	void RenderAll(CObjectRenderHelper& displayInfo);
+	void RenderSnappingGrid(SDisplayContext& context);
+	void AddCameraMenuItems(CPopupMenuItem& menu);
+	//Get the drag event and use type to either create a new object or apply an asset
+	bool HandleDragEvent(EDragEvent eventId, QEvent* event, int flags);
+	//This CDragDropData contains an asset that can be used in the viewport
+	bool DropHasAsset(const CDragDropData& dragDropData);
+	//If possible applies the asset in dragDropData to an object
+	bool ApplyAsset(const CDragDropData& dragDropData, QDropEvent* pDropEvent, EDragEvent eventId);
+
+	float            m_camFOV;
+	QViewportHeader* m_headerWidget;
+	//! true when the built-in fly camera is the CineCam one instead of the stock default camera.
+	bool             m_bCineCamMode;
+	//! true while this viewport has an outstanding SetViewportPreview() the plugin must be told to drop.
+	bool             m_bCineCamPreviewPushed;
+};

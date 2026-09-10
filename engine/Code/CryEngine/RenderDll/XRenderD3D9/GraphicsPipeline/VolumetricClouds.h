@@ -1,1 +1,116 @@
-// Copyright 2016-2021 Crytek GmbH / Crytek Group. All rights reserved.#pragma once#include "Common/GraphicsPipelineStage.h"#include "Common/FullscreenPass.h"#include "Common/ComputeRenderPass.h"class CVolumetricCloudsStage : public CGraphicsPipelineStage{public:	static const EGraphicsPipelineStage StageID = eStage_VolumetricClouds;	static bool IsRenderable();	static Vec4 GetVolumetricCloudShadowParams(const CCamera&, const Vec2& windOffset, const Vec2& vTiling);public:	CVolumetricCloudsStage(CGraphicsPipeline& graphicsPipeline);	virtual ~CVolumetricCloudsStage();	bool IsStageActive(EShaderRenderingFlags flags) const final	{		return gcpRendD3D->m_bVolumetricCloudsEnabled;	}	void Init() final;	void Update() final;	void ExecuteShadowGen();	void Execute();	// What the cloud pass actually uploaded on the scene-referred path THIS frame, for	// r_HDRDebug 1 (CToneMappingStage::DisplaySceneReferredCoverage). The coverage line used to	// print a hard-coded "clouds YES", which is a promise and not a measurement: it stayed YES	// while sunIntensityForAtmospheric - the Rayleigh haze between the camera and the cloud deck,	// composited additively over the whole sky - was exposure-invariant, so stopping down darkened	// the sky only until it hit that constant (2026-09-09). Every field below is read back from	// the constants the pass uploaded, not recomputed from cvars.	struct SSceneReferredDebug	{		bool  bActive           = false;  // GenerateCloudShaderParam ran at least once		float exposureApplied   = 1.0f;   // the latched factor every cloud radiance term was multiplied by		Vec3  sunExposed        = Vec3(ZERO); // shadeColorFromSun, exposed engine units		Vec3  skyExposed        = Vec3(ZERO); // skylightRayleighInScatter, exposed engine units		float atmosSunExposed   = 0.0f;   // sunIntensityForAtmospheric, exposed engine units		Vec3  rayleighCoeff     = Vec3(ZERO); // atmosphericScattering, per metre - NOT exposed, it lives inside exp()		float zenithHazeExposed = 0.0f;   // CPU evaluation of the atmospheric inscatter straight up, exposed engine units (what a cloud at the zenith gets in front of it)		bool  bSkyRayUnclamped  = false;  // skyRayUnclamped lane: the sky-ray edge fade is on (decisions/s9-cloud-edge.md)	};	const SSceneReferredDebug& GetSceneReferredDebug() const { return m_srDebug; }private:	void  ExecuteVolumetricCloudShadowGen();	void  GenerateCloudShadowGenShaderParam(const Vec3& texSize);	void  ExecuteComputeDensityAndShadow(const struct VCCloudRenderContext& context);	void  ExecuteRenderClouds(const struct VCCloudRenderContext& context);	void  GenerateCloudShaderParam(struct VCCloudRenderContext& context);	int32 GetBufferIndex(const int32 gpuCount, bool bStereoMultiGPURendering) const;	int32 GetCurrentFrameIndex() const;	int32 GetPreviousFrameIndex(const int32 gpuCount, bool bStereoMultiGPURendering) const;	bool  AreTexturesValid() const;	void  GenerateCloudBlockerList();	void  GenerateCloudBlockerSSList();private:	static const int32   MaxFrameNum = 4;	static const uint32  MaxEyeNum = 2;	_smart_ptr<CTexture> m_pDownscaledMaxTex[MaxEyeNum][2];	_smart_ptr<CTexture> m_pDownscaledMinTex[MaxEyeNum][2];	_smart_ptr<CTexture> m_pScaledPrevDepthTex[MaxEyeNum];	_smart_ptr<CTexture> m_pCloudDepthTex;	_smart_ptr<CTexture> m_pDownscaledMaxTempTex;	_smart_ptr<CTexture> m_pDownscaledMinTempTex;	_smart_ptr<CTexture> m_pDownscaledLeftEyeTex;	_smart_ptr<CTexture> m_pCloudDensityTex;	_smart_ptr<CTexture> m_pCloudShadowTex;	_smart_ptr<CTexture> m_pCloudMiePhaseFuncTex;	_smart_ptr<CTexture> m_pNoiseTex;	_smart_ptr<CTexture> m_pVolCloudTex;	_smart_ptr<CTexture> m_pVolCloudNoiseTex;	_smart_ptr<CTexture> m_pVolCloudEdgeNoiseTex;	CComputeRenderPass   m_passGenerateCloudShadow;	CComputeRenderPass   m_passComputeDensityAndShadow[MaxEyeNum];	CComputeRenderPass   m_passRenderClouds[MaxEyeNum];	CFullscreenPass      m_passTemporalReprojectionDepthMax[MaxEyeNum][2];	CFullscreenPass      m_passTemporalReprojectionDepthMin[MaxEyeNum][2];	CFullscreenPass      m_passUpscale[MaxEyeNum][2];	CConstantBufferPtr   m_pCloudShadowConstantBuffer;	CConstantBufferPtr   m_pRenderCloudConstantBuffer;	CConstantBufferPtr   m_pReprojectionConstantBuffer;	Matrix44             m_viewMatrix[MaxEyeNum][MaxFrameNum];	Matrix44             m_projMatrix[MaxEyeNum][MaxFrameNum];	int64                m_nUpdateFrameID[MaxEyeNum];	int32                m_cleared;	int32                m_tick;	TArray<Vec4>         m_blockerPosArray;	TArray<Vec4>         m_blockerParamArray;	TArray<Vec4>         m_blockerSSPosArray;	TArray<Vec4>         m_blockerSSParamArray;	SSceneReferredDebug  m_srDebug;public:	_smart_ptr<CTexture> m_pTexVolCloudShadow;};
+// Copyright 2016-2021 Crytek GmbH / Crytek Group. All rights reserved.
+
+#pragma once
+
+#include "Common/GraphicsPipelineStage.h"
+#include "Common/FullscreenPass.h"
+#include "Common/ComputeRenderPass.h"
+
+class CVolumetricCloudsStage : public CGraphicsPipelineStage
+{
+public:
+	static const EGraphicsPipelineStage StageID = eStage_VolumetricClouds;
+
+	static bool IsRenderable();
+	static Vec4 GetVolumetricCloudShadowParams(const CCamera&, const Vec2& windOffset, const Vec2& vTiling);
+
+public:
+	CVolumetricCloudsStage(CGraphicsPipeline& graphicsPipeline);
+	virtual ~CVolumetricCloudsStage();
+
+	bool IsStageActive(EShaderRenderingFlags flags) const final
+	{
+		return gcpRendD3D->m_bVolumetricCloudsEnabled;
+	}
+
+	void Init() final;
+	void Update() final;
+
+	void ExecuteShadowGen();
+	void Execute();
+
+	// What the cloud pass actually uploaded on the scene-referred path THIS frame, for
+	// r_HDRDebug 1 (CToneMappingStage::DisplaySceneReferredCoverage). The coverage line used to
+	// print a hard-coded "clouds YES", which is a promise and not a measurement: it stayed YES
+	// while sunIntensityForAtmospheric - the Rayleigh haze between the camera and the cloud deck,
+	// composited additively over the whole sky - was exposure-invariant, so stopping down darkened
+	// the sky only until it hit that constant (2026-09-09). Every field below is read back from
+	// the constants the pass uploaded, not recomputed from cvars.
+	struct SSceneReferredDebug
+	{
+		bool  bActive           = false;  // GenerateCloudShaderParam ran at least once
+		float exposureApplied   = 1.0f;   // the latched factor every cloud radiance term was multiplied by
+		Vec3  sunExposed        = Vec3(ZERO); // shadeColorFromSun, exposed engine units
+		Vec3  skyExposed        = Vec3(ZERO); // skylightRayleighInScatter, exposed engine units
+		float atmosSunExposed   = 0.0f;   // sunIntensityForAtmospheric, exposed engine units
+		Vec3  rayleighCoeff     = Vec3(ZERO); // atmosphericScattering, per metre - NOT exposed, it lives inside exp()
+		float zenithHazeExposed = 0.0f;   // CPU evaluation of the atmospheric inscatter straight up, exposed engine units (what a cloud at the zenith gets in front of it)
+		bool  bSkyRayUnclamped  = false;  // skyRayUnclamped lane: the sky-ray edge fade is on (decisions/s9-cloud-edge.md)
+	};
+	const SSceneReferredDebug& GetSceneReferredDebug() const { return m_srDebug; }
+
+private:
+	void  ExecuteVolumetricCloudShadowGen();
+	void  GenerateCloudShadowGenShaderParam(const Vec3& texSize);
+
+	void  ExecuteComputeDensityAndShadow(const struct VCCloudRenderContext& context);
+	void  ExecuteRenderClouds(const struct VCCloudRenderContext& context);
+	void  GenerateCloudShaderParam(struct VCCloudRenderContext& context);
+
+	int32 GetBufferIndex(const int32 gpuCount, bool bStereoMultiGPURendering) const;
+	int32 GetCurrentFrameIndex() const;
+	int32 GetPreviousFrameIndex(const int32 gpuCount, bool bStereoMultiGPURendering) const;
+
+	bool  AreTexturesValid() const;
+
+	void  GenerateCloudBlockerList();
+	void  GenerateCloudBlockerSSList();
+
+private:
+	static const int32   MaxFrameNum = 4;
+	static const uint32  MaxEyeNum = 2;
+
+	_smart_ptr<CTexture> m_pDownscaledMaxTex[MaxEyeNum][2];
+	_smart_ptr<CTexture> m_pDownscaledMinTex[MaxEyeNum][2];
+	_smart_ptr<CTexture> m_pScaledPrevDepthTex[MaxEyeNum];
+	_smart_ptr<CTexture> m_pCloudDepthTex;
+	_smart_ptr<CTexture> m_pDownscaledMaxTempTex;
+	_smart_ptr<CTexture> m_pDownscaledMinTempTex;
+	_smart_ptr<CTexture> m_pDownscaledLeftEyeTex;
+	_smart_ptr<CTexture> m_pCloudDensityTex;
+	_smart_ptr<CTexture> m_pCloudShadowTex;
+
+	_smart_ptr<CTexture> m_pCloudMiePhaseFuncTex;
+	_smart_ptr<CTexture> m_pNoiseTex;
+
+	_smart_ptr<CTexture> m_pVolCloudTex;
+	_smart_ptr<CTexture> m_pVolCloudNoiseTex;
+	_smart_ptr<CTexture> m_pVolCloudEdgeNoiseTex;
+
+	CComputeRenderPass   m_passGenerateCloudShadow;
+	CComputeRenderPass   m_passComputeDensityAndShadow[MaxEyeNum];
+	CComputeRenderPass   m_passRenderClouds[MaxEyeNum];
+	CFullscreenPass      m_passTemporalReprojectionDepthMax[MaxEyeNum][2];
+	CFullscreenPass      m_passTemporalReprojectionDepthMin[MaxEyeNum][2];
+	CFullscreenPass      m_passUpscale[MaxEyeNum][2];
+
+	CConstantBufferPtr   m_pCloudShadowConstantBuffer;
+	CConstantBufferPtr   m_pRenderCloudConstantBuffer;
+	CConstantBufferPtr   m_pReprojectionConstantBuffer;
+
+	Matrix44             m_viewMatrix[MaxEyeNum][MaxFrameNum];
+	Matrix44             m_projMatrix[MaxEyeNum][MaxFrameNum];
+	int64                m_nUpdateFrameID[MaxEyeNum];
+	int32                m_cleared;
+	int32                m_tick;
+
+	TArray<Vec4>         m_blockerPosArray;
+	TArray<Vec4>         m_blockerParamArray;
+	TArray<Vec4>         m_blockerSSPosArray;
+	TArray<Vec4>         m_blockerSSParamArray;
+
+	SSceneReferredDebug  m_srDebug;
+
+public:
+	_smart_ptr<CTexture> m_pTexVolCloudShadow;
+};

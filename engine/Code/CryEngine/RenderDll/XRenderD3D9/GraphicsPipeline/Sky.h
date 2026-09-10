@@ -1,1 +1,72 @@
-// Copyright 2019-2021 Crytek GmbH / Crytek Group. All rights reserved.#pragma once#include "Common/GraphicsPipelineStage.h"#include <CrySystem/IStreamEngine.h>class CSkyStage : public CGraphicsPipelineStage, IStreamCallback{public:	static const EGraphicsPipelineStage StageID = eStage_Sky;	CSkyStage(CGraphicsPipeline& graphicsPipeline);	bool IsStageActive(EShaderRenderingFlags flags) const final	{		if (!(flags & SHDF_ALLOW_SKY))			return false;		return gcpRendD3D->m_p3DEngineCommon[gRenDev->GetRenderThreadID()].m_SkyInfo.m_bIsVisible;	}	void Init() final;	void Update() final;	void Execute(CTexture* pColorTex, CTexture* pDepthTex);	void ExecuteMinimum(CTexture* pColorTex, CTexture* pDepthTex);	void StreamAsyncOnComplete(IReadStream* pStream, unsigned nError) override final;	// What the sky pass actually did on the scene-referred path THIS frame, for r_HDRDebug 1	// (CToneMappingStage::DisplaySceneReferredCoverage). The coverage line used to print a	// hard-coded "sky YES", which is a promise, not a measurement: it stayed YES while the sky	// region of the frame was being painted by an unexposed writer (the volumetric fog's	// analytical far segment, 2026-09-08). These are the numbers the line prints instead, all	// taken from the constants the pass uploaded, not recomputed from cvars.	struct SSceneReferredDebug	{		bool  bProcedural     = false; // the Nishita dome technique ran (m_bApplySkyDome)		bool  bSkybox         = false; // the textured skybox ran (m_bApplySkyBox)		float exposureApplied = 1.0f;  // the latched factor every dome / skybox constant was multiplied by		float zenithNits      = 0.0f;  // dome radiance straight up, UNEXPOSED, cd/m2 (0 = no dome)		float zenithExposed   = 0.0f;  // the same texel as it lands in the HDR target (exposed engine units)		float sunPeakExposed  = 0.0f;  // dome value at the sun direction after the peak cap (exposed engine units; 0 = sun below horizon)		float peakCapExposed  = 0.0f;  // SkyDome_ScenePeakClamp.x (0 = off the switch / cap disabled)	};	const SSceneReferredDebug& GetSceneReferredDebug() const { return m_srDebug; }private:	void CreateSkyDomeTextures(int32 width, int32 height);	void LoadStarsDataAsync();	void SetSkyParameters();	void SetHDRSkyParameters();private:	int                     m_skyDomeTextureLastTimeStamp;	CTexture*               m_pSkyDomeTextureMie;	CTexture*               m_pSkyDomeTextureRayleigh;	uint32                  m_numStars;	_smart_ptr<IRenderMesh> m_pStarMesh;	CFullscreenPass         m_skyPass;	Vec4                    m_paramMoonTexGenRight;	Vec4                    m_paramMoonTexGenUp;	Vec4                    m_paramMoonDirSize;	CRenderPrimitive        m_starsPrimitive;	CPrimitiveRenderPass    m_starsPass;	bool                    m_isStarsDataLoaded = false;	SSceneReferredDebug     m_srDebug;};
+// Copyright 2019-2021 Crytek GmbH / Crytek Group. All rights reserved.
+
+#pragma once
+
+#include "Common/GraphicsPipelineStage.h"
+#include <CrySystem/IStreamEngine.h>
+
+class CSkyStage : public CGraphicsPipelineStage, IStreamCallback
+{
+public:
+	static const EGraphicsPipelineStage StageID = eStage_Sky;
+
+	CSkyStage(CGraphicsPipeline& graphicsPipeline);
+
+	bool IsStageActive(EShaderRenderingFlags flags) const final
+	{
+		if (!(flags & SHDF_ALLOW_SKY))
+			return false;
+
+		return gcpRendD3D->m_p3DEngineCommon[gRenDev->GetRenderThreadID()].m_SkyInfo.m_bIsVisible;
+	}
+
+	void Init() final;
+	void Update() final;
+
+	void Execute(CTexture* pColorTex, CTexture* pDepthTex);
+	void ExecuteMinimum(CTexture* pColorTex, CTexture* pDepthTex);
+
+	void StreamAsyncOnComplete(IReadStream* pStream, unsigned nError) override final;
+
+	// What the sky pass actually did on the scene-referred path THIS frame, for r_HDRDebug 1
+	// (CToneMappingStage::DisplaySceneReferredCoverage). The coverage line used to print a
+	// hard-coded "sky YES", which is a promise, not a measurement: it stayed YES while the sky
+	// region of the frame was being painted by an unexposed writer (the volumetric fog's
+	// analytical far segment, 2026-09-08). These are the numbers the line prints instead, all
+	// taken from the constants the pass uploaded, not recomputed from cvars.
+	struct SSceneReferredDebug
+	{
+		bool  bProcedural     = false; // the Nishita dome technique ran (m_bApplySkyDome)
+		bool  bSkybox         = false; // the textured skybox ran (m_bApplySkyBox)
+		float exposureApplied = 1.0f;  // the latched factor every dome / skybox constant was multiplied by
+		float zenithNits      = 0.0f;  // dome radiance straight up, UNEXPOSED, cd/m2 (0 = no dome)
+		float zenithExposed   = 0.0f;  // the same texel as it lands in the HDR target (exposed engine units)
+		float sunPeakExposed  = 0.0f;  // dome value at the sun direction after the peak cap (exposed engine units; 0 = sun below horizon)
+		float peakCapExposed  = 0.0f;  // SkyDome_ScenePeakClamp.x (0 = off the switch / cap disabled)
+	};
+	const SSceneReferredDebug& GetSceneReferredDebug() const { return m_srDebug; }
+
+private:
+	void CreateSkyDomeTextures(int32 width, int32 height);
+	void LoadStarsDataAsync();
+	void SetSkyParameters();
+	void SetHDRSkyParameters();
+
+private:
+	int                     m_skyDomeTextureLastTimeStamp;
+	CTexture*               m_pSkyDomeTextureMie;
+	CTexture*               m_pSkyDomeTextureRayleigh;
+	uint32                  m_numStars;
+	_smart_ptr<IRenderMesh> m_pStarMesh;
+
+	CFullscreenPass         m_skyPass;
+	Vec4                    m_paramMoonTexGenRight;
+	Vec4                    m_paramMoonTexGenUp;
+	Vec4                    m_paramMoonDirSize;
+	CRenderPrimitive        m_starsPrimitive;
+	CPrimitiveRenderPass    m_starsPass;
+
+	bool                    m_isStarsDataLoaded = false;
+
+	SSceneReferredDebug     m_srDebug;
+};
