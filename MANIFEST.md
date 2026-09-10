@@ -1,11 +1,116 @@
-﻿# Sync manifest
+# Sync manifest
 
 Baseline : main @ a34100a9 (pristine CRYENGINE 5.7.1)
-Dev      : dev @ 28a492c1
-Synced   : 2026-08-27 19:39
+Dev      : dev @ a4fed24b
+Synced   : 2026-09-10 20:51
 
 ## Commits (newest first)
 
+- a4fed24b tune: the CineCam Grade panel puts the wheels beside the parameters in a wide dock
+- ebb2185e tune: fine control on every draggable control of the CineCam Grade panel
+- 524e1718 fix: the sprite bokeh report called its cutoff "stops over mid grey", which it is not
+- 3228a164 tune: the CineCam Grade panel now follows the size of its dock
+- 90ca16f2 feat: three real colour wheels for the CineCam Grade, in a dockable panel (S10 item 5)
+- 767c0aa4 fix: a grade file dropped into assets/cinecam registers itself, one file at a time
+- d24cdb96 fix: sprite bokeh had no source budget, so a bright scene drew a sprite for a tenth of the screen
+- 6bca6a97 fix: a grade preset shipped in the engine tree resolves too
+- 1b98d4af feat: asset pickers on both LUT slots, and a grade preset you can export and reuse (S10 item 4b)
+- 419ff469 feat: LUT, ASC CDL and grade preset are CryEngine asset types (S10 item 4b, editor half)
+- df7fbbef feat: the LMT slot knows what space a LUT is in, wraps a Rec.709 one, and hot reloads (S10 item 4)
+- f92d751c feat: three shipped looks, an inverse output transform and a space tag in every cube (S10 item 4)
+- d5dc05ec feat: two 1D curves on the CineCam Grade - a master tone curve and Sat vs Sat (S10 item 3b)
+- d49e019f feat: the grade travels with the capture - an ASC .cdl sidecar and an honest rec/cdl (S10 item 3a)
+- fdd3e998 feat: colour wheels and contrast on the CineCam Grade, folded into one ASC CDL (S10 item 3a)
+- 063ef39b fix: a CineCam Grade that cannot reach the picture now says why (S10 item 2b)
+- 857f1e15 feat: the look moves to its own component - CineCam Grade (S10 item 2)
+- 46f9e8e4 feat: rec_CaptureEXR sequences no longer overwrite the previous take (r_SceneReferredExportSequenceNaming)
+- 3f53d2c4 feat: glare thresholds mean "stops above mid grey" on the stock path too; sky sources no longer starve the budget
+- 49d61fd0 fix: the wave-glare source budget was scene-referred only - the stock path drew every source unbudgeted
+- 40873139 tune: cloud edge fade 4 km -> 12 km with smoothstep
+- 28f76ff4 fix: keep Crytek's cloud reach; only the seam fades (edge fade stays, sky-ray unclamp removed)
+- d6f4c52f feat: clouds look the same through every camera - sky-ray unclamp and edge fade are engine behaviour (ReCS)
+- ed573597 fix: the volumetric cloud layer was cut at the far plane - sky rays now march to the cloud shell
+- ed8c3ceb fix: the clouds' atmospheric haze replaced the sky - it followed the sun's convention, not the dome's
+- b7f158c7 feat: Sandbox viewport: a built-in CineCam camera, Create Cinematic Camera, and the preview push
+- 124446cb feat: the Sandbox viewport chooses who drives the picture while editing (cinecam editor preview)
+- 95930889 fix: ccam sun-shafts-off did nothing - the stage gate never read SunShafts_Active; add a renderer-side suppress flag
+- 92a2236c feat: ccam pins screen-space sun shafts off; e_VolumetricFog defaults to 1 (ReCS)
+- eaa9d057 feat: retire screen-space sun shafts by default; volumetric fog takes over (ReCS cvar defaults)
+- 5435929a fix: with clouds on the sky stopped darkening - the cloud haze never took the aperture
+- cd063849 fix: the sky did not follow the aperture - the fog painting it was never exposed
+- 5f1d292f feat: the AUTO meter no longer lets the sky own the exposure outdoors (Sky Weight)
+- a66fa37e fix: the metering histogram read its source as black - a D3D11 SRV/RTV hazard
+- f2d30f98 fix: the metering histogram was built, armed and never dispatched
+- 43cb66f2 fix: a lens flare on the wrong kind of light took the RenderThread down
+- e2f2ba8d fix: one scene-referred rebuild per distinct switch answer, not one per frame
+- 1dda9689 fix: the scene-referred flip is a rebuild, not a patch
+- c3bdcffb docs: what an ambient light means under Scene Referred, and how to use one as fill
+- d2c29578 feat: the exposure coverage overlay says which meaning ambient lights have this frame
+- 7e99d9ea feat: ambient lights become real fill lights on the scene-referred path
+- 4906d91f fix: an ambient light that was also asked to cast shadows could take the engine down
+- f5891aab fix: the camera drove render state while the level was still being built
+- d8567f37 fix: the glare source budget's own top end could hang the editor, so it now has a ceiling
+- 38910d91 fix: the preview gate's "log only on a change" logged every frame
+- a88052c5 perf: the wave glare drew one sprite per bright texel, and brightness decides how many there are
+- 2fed3366 feat: give the screen-space sun shafts an atmospheric condition (S8, approach A)
+- 1acdef48 fix: Sensor Clip lands inside the range the display can actually show
+- 1a8c4306 fix: the wave glare's log line said "half-res" about the deposit layer and was read as the source, and the report now says what a ray is actually worth
+- deb2f816 feat: rec_ImportHDRI - a measured HDRI becomes a probe with a known absolute luminance
+- 57023243 docs: the EXR tap becomes measurable, and an EXR sequence out of TrackView
+- 4fc0a60e fix: area lights fell off as the fourth power of distance, and the rectangle was 2pi over its own disc
+- aa8e3090 fix: the previews were being lit in absolute units and shown as if they were not
+- c64d3aea docs: the shadow fillers, the sky's real unit, and a fifth round of tests
+- d79cd7b7 scene-referred S8: the Nishita sky is physical after all, and 0.37 is derived
+- 3e9dfa5c fix: lit particles were missing the diffuse 1/PI, and had been since S2
+- 635e7df0 fix: the fog, the clouds and the snow follow the aperture too
+- 67f6d69a fix: SVOGI - the sun goes in at stock units and the exposure comes out at the boundary
+- 1ff9e370 docs: the histogram meter, the band, and what it will not fix
+- 0c67f8ea S8 metering: the camera takes the middle of the frame, not the average of it
+- 353be581 S8 metering: the meter reads a histogram, because a mean cannot survive a sky
+- 8501adfe docs: Sensor Clip, the writer clamp, and a third round of tests
+- b372dde2 fix: the wave glare's source was a DENOISED copy of the frame, and denoising is what a glare source cannot survive
+- 21dd71c7 fix: the sky's Mie peak wrote Inf into an fp16 target, and the bloom's firefly knee turned the sun into a flat bun
+- 552318c6 fix: the sensor has a full well - highlights clip per channel after the white balance, so a blown neutral stays neutral
+- 60e20283 fix: ambient light entities were pre-exposed, and r_HDRDebug 1 now says which contributors the exposure reaches
+- f07f3c20 fix: the wave glare's amount spans stops, not a 4x window - S7 read the pre-exposure as making sources brighter
+- d31f28b5 fix: a single EXR frame numbers on from the last one instead of re-writing frame.000000.exr
+- e45ddaf1 fix: the exposure meter read an fp16 Inf as black, and AUTO ratcheted itself into the sun
+- 7f88530f fix: the ODT field's default lived only in the reflection, so an untouched camera loaded no output transform
+- 037b3641 fix: the scene-referred conversion pass never allocated its shader reflection - the RenderThread crash on the first tick of the checkbox
+- d5db1ec1 scene-referred S7: thresholds in stops above mid grey, and Streak Amount back to physical
+- 5bda6b43 docs: the export, the two round trips, and what a difference means
+- 012b0605 scene-referred S6: the capture commands, and a frame that says what took it
+- 8752ce36 scene-referred S6: the tap, and the pixels leaving the GPU without stopping it
+- 499478c7 scene-referred S6: a float file writer, next to the eight-bit ones
+- 3885832b fix: the LUT textures follow the tree's own Texture3D declaration style
+- 789b6a2b docs: the display chain, the camera grade, and how to make a look
+- ed71e8e0 scene-referred S5: the camera's grade
+- b908b041 scene-referred S4: our own Rec.709-authored colours, in the working primaries
+- 9c3cf4d7 scene-referred S4: the stock LDR stage goes inert (D9)
+- 1f937c32 scene-referred S4: the output transform, and FilmMapping's other half
+- 1724ec22 scene-referred S4: the .cube loader, and two LUTs the camera owns
+- 989e3440 docs: the S3 debug cvar, the spec status line, and what will look wrong until S4
+- 020ca844 scene-referred S3: the boundary audit - who reads what, on which side of the conversion
+- 36b9ed9b scene-referred S3: the luminance weights follow the buffer, and the clamp audit comes back empty
+- bdfb8dbf scene-referred S3: the conversion node, and the Prev copy that must precede it
+- 4a06a353 scene-referred S3: the ACES matrices, and the fp16 floor reaches the working space itself
+- 985f8de4 scene-referred S2 review fix: the light paths that bypass the BRDF helpers
+- 559845f3 scene-referred S2: the physical preset, the probe convention, and the content documentation
+- f8a798da scene-referred S2: sun shafts that carry the sun
+- 2b57127a scene-referred S2: the skybox times-ten, an instrument to prove it, and the Nishita slot
+- 37de8254 scene-referred S2: one light-unit convention - radiometric lights, 1/PI in the BRDF
+- 08fef577 scene-referred S2: the engine-side switch and the convention latch
+- 55f7abc0 docs: spec amendments from the S3/S4 research; baked ACES 2.0 ODT cubes
+- a0a4d3e7 scene-referred S1: documentation, and the spec amendments S1 earned
+- b7d2ef36 scene-referred S1: the camera's AUTO exposure mode
+- edc8330d scene-referred S1: writer coverage - sky, emissive and the forward/transparent lever
+- 2bf9c918 scene-referred S1: the exposure constant, unit exposure in the tone map, Manual as a pure triangle
+- c553113d scene-referred S1: publish the camera's pre-exposure and latch it once per render view
+- f8713f74 scene-referred S0: review fixes - cached request pointer, in-place target reformat
+- b477fc0e scene-referred S0: exposure-path branch in the tone map (D14)
+- cfbd5d94 scene-referred S0: force fp16 on the HDR satellite targets
+- f1fc0400 scene-referred S0: r_SceneReferred master switch
+- 12135acb docs: scene-referred pipeline audit and specification
 - 28a492c1 fix: the barrel clips the iris polygon, so a lens wide open diffracts rings and not rays
 - 5587483d fix: the wave glare moves to half resolution, its own layer and a pre-blurred source
 - 0223903b fix: the wave glare is no longer gated by the analytic f-number ramp
@@ -68,26 +173,104 @@ Synced   : 2026-08-27 19:39
 
 - M	.gitignore
 - M	CMakeSettings.json
+- M	Code/CryEngine/Cry3DEngine/3dEngine.cpp
+- M	Code/CryEngine/Cry3DEngine/3dEngine.h
+- M	Code/CryEngine/Cry3DEngine/LightEntity.cpp
+- M	Code/CryEngine/Cry3DEngine/SVO/SceneTree.cpp
+- M	Code/CryEngine/Cry3DEngine/SkyLightManager.cpp
+- M	Code/CryEngine/Cry3DEngine/TimeOfDay.cpp
+- M	Code/CryEngine/Cry3DEngine/cvars.cpp
+- M	Code/CryEngine/CryCommon/CMakeLists.txt
+- M	Code/CryEngine/CryCommon/Cry3DEngine/I3DEngine.h
+- M	Code/CryEngine/CryCommon/CryRenderer/IRenderer.h
+- A	Code/CryEngine/CryCommon/CryRenderer/SceneReferredCurves.h
+- M	Code/CryEngine/RenderDll/Common/Include_HLSL_CPP_Shared.h
 - M	Code/CryEngine/RenderDll/Common/PostProcess/PostEffects.cpp
 - M	Code/CryEngine/RenderDll/Common/PostProcess/PostEffects.h
 - M	Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.cpp
 - M	Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.h
+- M	Code/CryEngine/RenderDll/Common/RenderView.cpp
+- M	Code/CryEngine/RenderDll/Common/RenderView.h
+- M	Code/CryEngine/RenderDll/Common/Renderer.cpp
+- M	Code/CryEngine/RenderDll/Common/Renderer.h
 - M	Code/CryEngine/RenderDll/Common/RendererCVars.cpp
 - M	Code/CryEngine/RenderDll/Common/RendererCVars.h
+- M	Code/CryEngine/RenderDll/Common/RendererResources.cpp
+- M	Code/CryEngine/RenderDll/Common/RendererResources.h
+- A	Code/CryEngine/RenderDll/Common/Textures/Image/ExrImage.cpp
+- A	Code/CryEngine/RenderDll/Common/Textures/Image/ExrImage.h
+- M	Code/CryEngine/RenderDll/Common/Textures/Texture.h
 - M	Code/CryEngine/RenderDll/XRenderD3D9/CMakeLists.txt
+- M	Code/CryEngine/RenderDll/XRenderD3D9/D3DHWShader.cpp
+- M	Code/CryEngine/RenderDll/XRenderD3D9/D3DRendPipeline.cpp
+- M	Code/CryEngine/RenderDll/XRenderD3D9/D3DSystem.cpp
+- M	Code/CryEngine/RenderDll/XRenderD3D9/D3D_SVO.cpp
+- M	Code/CryEngine/RenderDll/XRenderD3D9/DeviceManager/DeviceObjectHelpers.cpp
+- M	Code/CryEngine/RenderDll/XRenderD3D9/DriverD3D.cpp
+- M	Code/CryEngine/RenderDll/XRenderD3D9/DriverD3D.h
+- M	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/AutoExposure.cpp
+- M	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/AutoExposure.h
 - M	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Bloom.cpp
 - M	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Bloom.h
+- M	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Common/GraphicsPipeline.cpp
+- M	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Common/GraphicsPipeline.h
+- M	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Common/UtilityPasses.cpp
 - M	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DepthOfField.cpp
 - M	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DepthOfField.h
 - A	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DiffractionKernel.cpp
 - A	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DiffractionKernel.h
+- M	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LensOptics.cpp
 - M	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/MotionBlur.cpp
 - M	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/PostAA.cpp
+- M	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/PostEffects.cpp
+- M	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/PostEffects.h
+- M	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/SceneForward.cpp
+- A	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/SceneReferredExport.cpp
+- A	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/SceneReferredExport.h
+- M	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Sky.cpp
+- M	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Sky.h
+- M	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Snow.cpp
 - M	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/StandardGraphicsPipeline.cpp
+- M	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/StandardGraphicsPipeline.h
+- M	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/SunShafts.cpp
+- M	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/SunShafts.h
+- M	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/TiledLightVolumes.cpp
 - M	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.cpp
+- M	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.h
+- M	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/VolumetricClouds.cpp
+- M	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/VolumetricClouds.h
+- M	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/VolumetricFog.cpp
+- M	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Water.cpp
 - M	Code/CryEngine/RenderDll/XRenderD3D9/PostProcessDOF.cpp
+- M	Code/CryEngine/RenderDll/XRenderD3D9/core_renderer.waf_files
 - M	Code/CryPlugins/CMakeLists.txt
 - A	Code/CryPlugins/CinematicCamera/AnamorphicSpec.md
+- A	Code/CryPlugins/CinematicCamera/Assets/Environment/ReC_Physical.env
+- A	Code/CryPlugins/CinematicCamera/Assets/Environment/ReC_Physical.env.cryasset
+- A	Code/CryPlugins/CinematicCamera/Assets/cinecam/luts/lmt_identity_33.cube
+- A	Code/CryPlugins/CinematicCamera/Assets/cinecam/luts/lmt_identity_33.cube.cryasset
+- A	Code/CryPlugins/CinematicCamera/Assets/cinecam/luts/lmt_identity_33.report.txt
+- A	Code/CryPlugins/CinematicCamera/Assets/cinecam/luts/look_film_contrast_33.cube
+- A	Code/CryPlugins/CinematicCamera/Assets/cinecam/luts/look_film_contrast_33.cube.cryasset
+- A	Code/CryPlugins/CinematicCamera/Assets/cinecam/luts/look_film_contrast_33.report.txt
+- A	Code/CryPlugins/CinematicCamera/Assets/cinecam/luts/look_warm_print_33.cube
+- A	Code/CryPlugins/CinematicCamera/Assets/cinecam/luts/look_warm_print_33.cube.cryasset
+- A	Code/CryPlugins/CinematicCamera/Assets/cinecam/luts/look_warm_print_33.report.txt
+- A	Code/CryPlugins/CinematicCamera/Assets/cinecam/luts/odt_rec1886_100nit_aces2_33.cube
+- A	Code/CryPlugins/CinematicCamera/Assets/cinecam/luts/odt_rec1886_100nit_aces2_33.cube.cryasset
+- A	Code/CryPlugins/CinematicCamera/Assets/cinecam/luts/odt_rec1886_100nit_aces2_33.report.txt
+- A	Code/CryPlugins/CinematicCamera/Assets/cinecam/luts/odt_srgb_100nit_aces2_33.cube
+- A	Code/CryPlugins/CinematicCamera/Assets/cinecam/luts/odt_srgb_100nit_aces2_33.cube.cryasset
+- A	Code/CryPlugins/CinematicCamera/Assets/cinecam/luts/odt_srgb_100nit_aces2_33.report.txt
+- A	Code/CryPlugins/CinematicCamera/Assets/cinecam/luts/odt_srgb_100nit_aces2_65.cube
+- A	Code/CryPlugins/CinematicCamera/Assets/cinecam/luts/odt_srgb_100nit_aces2_65.cube.cryasset
+- A	Code/CryPlugins/CinematicCamera/Assets/cinecam/luts/odt_srgb_100nit_aces2_65.report.txt
+- A	Code/CryPlugins/CinematicCamera/Assets/cinecam/luts/system/odt_srgb_100nit_aces2_inv_65.cube
+- A	Code/CryPlugins/CinematicCamera/Assets/cinecam/luts/system/odt_srgb_100nit_aces2_inv_65.cube.cryasset
+- A	Code/CryPlugins/CinematicCamera/Assets/cinecam/luts/system/odt_srgb_100nit_aces2_inv_65.report.txt
+- A	Code/CryPlugins/CinematicCamera/Assets/cinecam/luts/test_identity_rec709_33.cube
+- A	Code/CryPlugins/CinematicCamera/Assets/cinecam/luts/test_identity_rec709_33.cube.cryasset
+- A	Code/CryPlugins/CinematicCamera/Assets/cinecam/luts/test_identity_rec709_33.report.txt
 - A	Code/CryPlugins/CinematicCamera/AxialChromaticSpec.md
 - A	Code/CryPlugins/CinematicCamera/DiffractionKernelSpec.md
 - A	Code/CryPlugins/CinematicCamera/DiffractionStreaksSpec.md
@@ -97,21 +280,40 @@ Synced   : 2026-08-27 19:39
 - A	Code/CryPlugins/CinematicCamera/FilterPSFSpec.md
 - A	Code/CryPlugins/CinematicCamera/HalationSpec.md
 - A	Code/CryPlugins/CinematicCamera/HybridDofSpec.md
+- A	Code/CryPlugins/CinematicCamera/Interface/ICineCamEditorPreview.h
 - A	Code/CryPlugins/CinematicCamera/Interface/ICinematicCameraOptics.h
 - A	Code/CryPlugins/CinematicCamera/LensFlawsSpec.md
 - A	Code/CryPlugins/CinematicCamera/LensGhostSpec.md
 - A	Code/CryPlugins/CinematicCamera/Module/CMakeLists.txt
+- A	Code/CryPlugins/CinematicCamera/Module/CineCamEditorLook.cpp
+- A	Code/CryPlugins/CinematicCamera/Module/CineCamEditorLook.h
+- A	Code/CryPlugins/CinematicCamera/Module/CineCamLutTypes.h
+- A	Code/CryPlugins/CinematicCamera/Module/CineCamShared.cpp
+- A	Code/CryPlugins/CinematicCamera/Module/CineCamShared.h
+- A	Code/CryPlugins/CinematicCamera/Module/CineGradeAsset.cpp
+- A	Code/CryPlugins/CinematicCamera/Module/CineGradeAsset.h
+- A	Code/CryPlugins/CinematicCamera/Module/CineGradeComponent.cpp
+- A	Code/CryPlugins/CinematicCamera/Module/CineGradeComponent.h
 - A	Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp
 - A	Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
 - A	Code/CryPlugins/CinematicCamera/Module/CinematicCameraPlugin.cpp
 - A	Code/CryPlugins/CinematicCamera/Module/CinematicCameraPlugin.h
+- A	Code/CryPlugins/CinematicCamera/Module/HDRIImport.cpp
+- A	Code/CryPlugins/CinematicCamera/Module/HDRIImport.h
 - A	Code/CryPlugins/CinematicCamera/Module/StdAfx.cpp
 - A	Code/CryPlugins/CinematicCamera/Module/StdAfx.h
 - A	Code/CryPlugins/CinematicCamera/Module/resource.h
 - A	Code/CryPlugins/CinematicCamera/README.md
+- A	Code/CryPlugins/CinematicCamera/SceneReferredResearch.md
+- A	Code/CryPlugins/CinematicCamera/SceneReferredSpec.md
 - A	Code/CryPlugins/CinematicCamera/SpriteBokehSpec.md
 - A	Code/CryPlugins/CinematicCamera/ViewfinderSpec.md
 - A	Code/CryPlugins/CinematicCamera/docs/ConsoleReference.md
+- A	Code/CryPlugins/CinematicCamera/docs/SceneReferredCalibration.md
+- A	Code/CryPlugins/CinematicCamera/docs/SceneReferredContent.md
+- A	Code/CryPlugins/CinematicCamera/docs/SceneReferredExport.md
+- A	Code/CryPlugins/CinematicCamera/docs/SceneReferredLook.md
+- M	Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Lights/EnvironmentProbeComponent.h
 - A	Code/CryPlugins/CryPhoneTracker/Module/CMakeLists.txt
 - A	Code/CryPlugins/CryPhoneTracker/Module/PhoneTrackerComponent.cpp
 - A	Code/CryPlugins/CryPhoneTracker/Module/PhoneTrackerComponent.h
@@ -124,9 +326,56 @@ Synced   : 2026-08-27 19:39
 - A	Code/CryPlugins/CryPhoneTracker/Module/resource.h
 - A	Code/CryPlugins/CryPhoneTracker/PoseFilterSpec.md
 - A	Code/CryPlugins/CryPhoneTracker/README.md
+- A	Code/Libs/tinyexr/CMakeLists.txt
+- A	Code/Libs/tinyexr/LICENSE
+- A	Code/Libs/tinyexr/exr_reader.hh
+- A	Code/Libs/tinyexr/streamreader.hh
+- A	Code/Libs/tinyexr/tinyexr.h
+- A	Code/Libs/tinyexr/tinyexr_impl.cpp
+- M	Code/Sandbox/EditorQt/LevelEditor/LevelEditorViewport.cpp
+- M	Code/Sandbox/EditorQt/LevelEditor/LevelEditorViewport.h
+- A	Code/Sandbox/Plugins/CinematicCameraEditor/CMakeLists.txt
+- A	Code/Sandbox/Plugins/CinematicCameraEditor/CineCamAssetRegistration.cpp
+- A	Code/Sandbox/Plugins/CinematicCameraEditor/CineCamAssetRegistration.h
+- A	Code/Sandbox/Plugins/CinematicCameraEditor/CineCamAssetTypes.cpp
+- A	Code/Sandbox/Plugins/CinematicCameraEditor/CineCamAssetTypes.h
+- A	Code/Sandbox/Plugins/CinematicCameraEditor/CineGradeBinding.cpp
+- A	Code/Sandbox/Plugins/CinematicCameraEditor/CineGradeBinding.h
+- A	Code/Sandbox/Plugins/CinematicCameraEditor/CineGradePanel.cpp
+- A	Code/Sandbox/Plugins/CinematicCameraEditor/CineGradePanel.h
+- A	Code/Sandbox/Plugins/CinematicCameraEditor/CineGradeWidgets.cpp
+- A	Code/Sandbox/Plugins/CinematicCameraEditor/CineGradeWidgets.h
+- A	Code/Sandbox/Plugins/CinematicCameraEditor/CinematicCameraEditorPlugin.cpp
+- A	Code/Sandbox/Plugins/CinematicCameraEditor/CinematicCameraEditorPlugin.h
+- A	Code/Sandbox/Plugins/CinematicCameraEditor/StdAfx.cpp
+- A	Code/Sandbox/Plugins/CinematicCameraEditor/StdAfx.h
 - M	Code/Tools/CryCommonTools/FileUtil.cpp
+- M	Engine/Shaders/HWScripts/CryFX/Clouds.cfx
+- M	Engine/Shaders/HWScripts/CryFX/CommonMath.cfi
 - M	Engine/Shaders/HWScripts/CryFX/DepthOfField.cfx
+- M	Engine/Shaders/HWScripts/CryFX/Eye.cfx
+- M	Engine/Shaders/HWScripts/CryFX/FXConstantDefs.cfi
+- M	Engine/Shaders/HWScripts/CryFX/Glass.cfx
 - M	Engine/Shaders/HWScripts/CryFX/HDRPostProcess.cfx
+- M	Engine/Shaders/HWScripts/CryFX/Hair.cfx
+- M	Engine/Shaders/HWScripts/CryFX/Illum.cfx
+- M	Engine/Shaders/HWScripts/CryFX/LightVolumes.cfi
+- M	Engine/Shaders/HWScripts/CryFX/MobileComposition.cfx
+- M	Engine/Shaders/HWScripts/CryFX/MultiLayeredMaterials.cfx
+- M	Engine/Shaders/HWScripts/CryFX/Particles.cfi
 - M	Engine/Shaders/HWScripts/CryFX/PostAA.cfx
+- M	Engine/Shaders/HWScripts/CryFX/PostEffects.cfx
+- M	Engine/Shaders/HWScripts/CryFX/PostEffectsGame.cfx
 - M	Engine/Shaders/HWScripts/CryFX/PostEffectsLib.cfi
+- M	Engine/Shaders/HWScripts/CryFX/SkyCommon.cfi
+- M	Engine/Shaders/HWScripts/CryFX/Stars.cfx
+- M	Engine/Shaders/HWScripts/CryFX/Sunshafts.cfx
+- M	Engine/Shaders/HWScripts/CryFX/TiledShading.cfi
+- M	Engine/Shaders/HWScripts/CryFX/VolumetricFog.cfi
+- M	Engine/Shaders/HWScripts/CryFX/Water.cfx
+- M	Engine/Shaders/HWScripts/CryFX/WaterReflectionsPass.cfi
+- M	Engine/Shaders/HWScripts/CryFX/WaterVolume.cfx
+- M	Engine/Shaders/HWScripts/CryFX/shadeLib.cfi
+- M	Tools/CMake/BuildEngine.cmake
+- M	Tools/CMake/BuildSandbox.cmake
 - M	Tools/CMake/CRYENGINE-MSVC.cmake

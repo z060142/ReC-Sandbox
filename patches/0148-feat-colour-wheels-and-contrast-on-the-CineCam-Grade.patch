@@ -1,0 +1,674 @@
+From fdd3e998b137ae47e84b78921ce5a331c2d08c0c Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Thu, 10 Sep 2026 07:59:02 +0800
+Subject: [PATCH 148/162] feat: colour wheels and contrast on the CineCam
+ Grade, folded into one ASC CDL (S10 item 3a)
+
+The Grade component grows the controls a colourist expects on a Primaries page -
+Lift / Gamma / Gain with a master each, and Contrast about a Pivot - without the
+renderer learning a single new thing. Every one of them folds into the ASC CDL
+that already reaches the shader, exactly, on the CPU.
+
+The mapping is the one Resolve, Nuke and every other lift/gamma/gain control
+implements, and it is a mapping and not an approximation:
+
+    slope = gain - lift        gain  = slope + offset
+    offset = lift              lift  = offset
+    power = 1 / gamma          gamma = 1 / power
+
+so lift holds white put (x = 1 maps to 1 - lift + lift = 1) and gain holds black
+put, which is what those controls do everywhere. The masters are the wheels' Y
+rings: lift adds (neutral 0), gain and gamma multiply (neutral 1).
+
+Contrast about a pivot is affine - c*(x - p) + p = c*x + p*(1 - c) - and the ASC
+order is ONE affine step followed by ONE power. So contrast, the wheels and the
+raw CDL all compose into a single (slope, offset) pair with one exponent:
+
+    slope  = contrast * (gain - lift) * CDL_slope
+    offset = contrast * ((gain - lift) * CDL_offset + lift) + pivot * (1 - contrast)
+    power  = CDL_power / gamma
+
+This is exact for EVERY value of power, not only power == 1, so the alternative
+of adding two bus parameters and a few ALU inside the %_RT_SAMPLE0 block was not
+needed - which is just as well, because all three .w slots of SceneCDLSlope /
+Offset / Power are already spoken for (saturation, LMT grid, ODT grid). No new
+bus parameter, no new shader constant, no renderer node. Pivot defaults to
+0.4135878 = ACEScct(0.18), so contrast leaves a grey card exactly where it is.
+
+Source of truth: the wheels and contrast compose ON TOP OF an ASC CDL base, and
+the three base fields keep their old member ids. With the wheels neutral those
+fields ARE what the camera publishes, number for number, which is what makes
+pasting in a .cdl from Resolve exact. The derived numbers are never written back
+into properties - the editor snapshots a component's properties for saving at
+EntityObject.cpp:925, BEFORE it tells the component they changed at :930, so a
+member written from an event handler renders but does not reliably save. They
+are shown instead in the `grade published:` log line, which now prints the
+folded numbers at four decimals and re-triggers on offset and power as well as
+slope.
+
+The one shader change is the CDL saturation's luma weights: the ASC CDL fixes
+them at Rec.709 (0.2126, 0.7152, 0.0722) regardless of the encoding the CDL is
+applied in, and OCIO, Flame, Natron and Pomfort's on-set ACES CDL grading mode
+in ACEScct all use exactly those. A number published as "ASC CDL saturation",
+written into an EXR header and exported as a .cdl has to mean the same thing
+here as in the application that reads the file. The AP1 argument at
+CommonMath.cfi:245 is right for every other luminance in this pipeline and is
+overruled only for this one, because this one is an interchange parameter. sat =
+1 remains an exact identity, so nothing moves for an ungraded picture, and the
+stock path never reaches the line.
+
+TrackView was verified in 5.7.1's source rather than assumed:
+CAnimEntityNode::UpdateDynamicParams_Editor walks the entity's components and
+serialises every reflected member (CryMovie/EntityNode.cpp:446-491), reached by
+right-clicking the entity node -> Add Track -> Components -> CineCam Grade ->
+Grade -> the property. bool, float, Vec3 and Schematyc::Range<> all produce
+tracks; ColorF also does but keys in 0-255 with alpha clobbered
+(EntityNode.cpp:326/334), which is why the wheels are Vec3 and not colour
+pickers - a gain above 1 or a negative lift could not survive that. The
+persisted track key is the member NAME, so the new names are frozen from here.
+The component is notified through the ENTITY_EVENT_COMPONENT_PROPERTY_CHANGED it
+already handles, on the frames a value really moves (EntityNode.cpp:2843-2848),
+so an animated grade needs no plumbing - but ReportStatus() is now on a
+per-frame path and gained a cheap integer early-out before any string work.
+
+SCineGradeParams::operator== is field-wise instead of memcmp: the struct has
+padding after the bool and padding bytes are not guaranteed equal between two
+structs holding the same values.
+
+Neutral is still an exact identity end to end: no grade component, an untouched
+grade component, and every neutral typed by hand are the same picture - pure
+ACES 2.0. Stock path bit-identical.
+
+Decision: scene-notes/decisions/s10-grade-component.md section 3a.
+Research (written first): scene-notes/research/s10-3a-wheels-cdl-trackview.md.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01ADgAiBYv9AxSd54s1FPREm
+---
+ .../Module/CineGradeComponent.cpp             | 118 ++++++++++++--
+ .../Module/CineGradeComponent.h               | 152 +++++++++++++++---
+ .../Module/CinematicCameraComponent.cpp       |  41 +++--
+ .../Module/CinematicCameraComponent.h         |   2 +
+ Code/CryPlugins/CinematicCamera/README.md     |  61 +++++--
+ .../CinematicCamera/docs/SceneReferredLook.md |  26 ++-
+ .../HWScripts/CryFX/HDRPostProcess.cfx        |  21 ++-
+ 7 files changed, 358 insertions(+), 63 deletions(-)
+
+diff --git a/Code/CryPlugins/CinematicCamera/Module/CineGradeComponent.cpp b/Code/CryPlugins/CinematicCamera/Module/CineGradeComponent.cpp
+index a5d0665c..947a092a 100644
+--- a/Code/CryPlugins/CinematicCamera/Module/CineGradeComponent.cpp
++++ b/Code/CryPlugins/CinematicCamera/Module/CineGradeComponent.cpp
+@@ -22,10 +22,86 @@ namespace
+ 	CRY_STATIC_AUTO_REGISTER_FUNCTION(&RegisterCineGradeComponent);
+ }
+ 
++// ---------------------------------------------------------------------------
++// The fold: every control this component offers -> one ASC CDL
++// (decisions/s10-grade-component.md section 3a.1 / 3a.2, research/s10-3a-wheels-cdl-trackview.md).
++//
++// The ASC evaluation order is ONE affine step then ONE power - out = (in * slope + offset) ^ power
++// - and lift/gain, the CDL base's own slope/offset, and contrast about a pivot are ALL affine. So
++// they compose into a single (slope, offset) pair with no approximation, for any value of power,
++// and the gamma wheel and the base power compose into the single exponent. The consequence is the
++// point of the whole design: there is no picture this component can produce that an exported .cdl
++// cannot reproduce, in Resolve or anywhere else.
++//
++// The order below is "the base first, the wheels on top": a .cdl pasted into the CDL group is the
++// starting grade and the wheels trim it, which is how a CDL is used on a real timeline. With the
++// wheels and contrast neutral the fold collapses to exactly (slope, offset, power) as typed - the
++// base is then a bit-exact ASC evaluation, which is what makes "type what you were sent" true.
++//
++// The one deviation from strict per-node ASC order is that the base's power is applied after the
++// wheels rather than immediately after the base's own slope/offset. It has to be: two powers with
++// an affine step between them is not a CDL, and a control that cannot be exported is a control
++// that lies about what the file will look like.
++//
++// The 1e-4 floors are the renderer's, copied deliberately (ToneMapping.cpp:648-649) so that the
++// numbers written into the EXR header and the .cdl sidecar are the numbers the shader used, not
++// the numbers it was asked for.
++// ---------------------------------------------------------------------------
++SCineEffectiveCdl SCineGradeParams::Resolve() const
++{
++	SCineEffectiveCdl out;
++
++	const float fContrast = max((float)contrast, 0.0f);
++	const float fPivot = clamp_tpl((float)pivot, 0.0f, 1.0f);
++	const float fLiftMaster = (float)liftMaster;
++	const float fGammaMaster = (float)gammaMaster;
++	const float fGainMaster = (float)gainMaster;
++
++	for (int c = 0; c < 3; ++c)
++	{
++		// The masters are the wheels' Y rings: lift adds (its neutral is 0), gain and gamma
++		// multiply (theirs is 1). Every neutral is an exact identity, not a near one.
++		const float fLift = lift[c] + fLiftMaster;
++		const float fGain = gain[c] * fGainMaster;
++		// A gamma of zero is a division; the floor keeps it a picture instead of a NaN. It is
++		// needed even though the property is a Range<>, because a TrackView key is not clamped to
++		// a Range<>'s bounds (research section 6).
++		const float fGamma = max(gamma[c] * fGammaMaster, 1e-3f);
++
++		// 1. the ASC CDL base, affine part
++		float a = slope[c];
++		float b = offset[c];
++
++		// 2. the wheels. slope = gain - lift, offset = lift: lift holds WHITE put (x = 1 maps to
++		//    1 - lift + lift = 1) and gain holds BLACK put (x = 0 maps to 0), which is what every
++		//    LGG control in every application does.
++		const float fWheelSlope = fGain - fLift;
++		a = fWheelSlope * a;
++		b = fWheelSlope * b + fLift;
++
++		// 3. contrast about the pivot: c * (x - p) + p = c * x + p * (1 - c).
++		a = fContrast * a;
++		b = fContrast * b + fPivot * (1.0f - fContrast);
++
++		out.slope[c] = max(a, 1e-4f);
++		out.offset[c] = b;
++		// 4. the one power. The gamma wheel is the CDL power read the colourist's way round.
++		out.power[c] = max(power[c] / fGamma, 1e-4f);
++	}
++
++	out.saturation = max((float)saturation, 0.0f);
++	return out;
++}
++
+ // ---------------------------------------------------------------------------
+ // IEntityComponent
+ // ---------------------------------------------------------------------------
+-// ONE event, and only in the editor's hands: the moment a property of this component is edited.
++// ONE event: the moment a property of this component changes. That is the editor's inspector, and
++// - since every one of these properties is animatable - it is also TrackView, which walks the
++// component's reflected members, writes the animated one in place and sends exactly this event, on
++// the frames the value really moved and not on the others (CryMovie/EntityNode.cpp:2837-2852). So
++// an animated grade needs no plumbing of its own: it arrives here and nudges the camera like any
++// other edit.
+ // There is nothing for an update to do (the camera pulls this component's state on the frame it
+ // publishes) and nothing to do at level load or at game start either - the camera re-reads this
+ // component every frame regardless, so a component that heard nothing would still be in the
+@@ -59,20 +135,49 @@ void CCineGradeComponent::ProcessEvent(const SEntityEvent& event)
+ // should not have to fix one, re-test, and be told about the other.
+ void CCineGradeComponent::ReportStatus(const CCinematicCameraComponent* pCamera)
+ {
+-	string reasons;
++	enum : int
++	{
++		eStatus_NoCamera      = 1 << 0,
++		eStatus_NotPreviewing = 1 << 1,
++		eStatus_NotSceneRef   = 1 << 2,
++	};
+ 
++	// The cheap half first, and the whole function turns on it. Since S10 item 3a this is a
++	// PER-FRAME path during a TrackView playback - CryMovie sends this component
++	// ENTITY_EVENT_COMPONENT_PROPERTY_CHANGED on every frame an animated grade property actually
++	// moves (EntityNode.cpp:2843-2848) - so building a string on every call would be an
++	// allocation per animated key per frame for a message that is almost always the same one.
++	int status = 0;
+ 	if (pCamera == nullptr)
+ 	{
+-		reasons = "there is no Cinematic Camera on this entity";
++		status = eStatus_NoCamera;
+ 	}
+ 	else
+ 	{
+ 		// In the editor the picture belongs to the camera the viewport looks through
+ 		// (decisions/s9-editor-cinecam-preview.md); outside it, to the active camera.
+ 		if (gEnv->IsEditing() && !pCamera->IsEditorPreviewOwner())
++			status |= eStatus_NotPreviewing;
++		if (!pCamera->IsSceneReferred())
++			status |= eStatus_NotSceneRef;
++	}
++
++	if (status == m_lastStatus)
++		return;
++
++	m_lastStatus = status;
++
++	string reasons;
++	if (status & eStatus_NoCamera)
++	{
++		reasons = "there is no Cinematic Camera on this entity";
++	}
++	else
++	{
++		if (status & eStatus_NotPreviewing)
+ 			reasons = "the viewport is not looking through this camera (Camera menu -> this entity)";
+ 
+-		if (!pCamera->IsSceneReferred())
++		if (status & eStatus_NotSceneRef)
+ 		{
+ 			if (!reasons.empty())
+ 				reasons += "; ";
+@@ -80,11 +185,6 @@ void CCineGradeComponent::ReportStatus(const CCinematicCameraComponent* pCamera)
+ 		}
+ 	}
+ 
+-	if (reasons == m_lastReport)
+-		return;
+-
+-	m_lastReport = reasons;
+-
+ 	if (reasons.empty())
+ 	{
+ 		CryLog("[cinecam] entity '%s': the grade is live - the camera is publishing this "
+diff --git a/Code/CryPlugins/CinematicCamera/Module/CineGradeComponent.h b/Code/CryPlugins/CinematicCamera/Module/CineGradeComponent.h
+index 0a316ebb..dee209b0 100644
+--- a/Code/CryPlugins/CinematicCamera/Module/CineGradeComponent.h
++++ b/Code/CryPlugins/CinematicCamera/Module/CineGradeComponent.h
+@@ -26,12 +26,56 @@
+ // one direction and the .cpp is where the two meet.
+ class CCinematicCameraComponent;
+ 
++//! The ACEScct code value of 18 % grey - LinearToACEScct(0.18), the one anchor the pre-exposure
++//! guarantees (SceneReferredSpec.md D6). The default contrast pivot, so that "more contrast"
++//! leaves mid grey where it was. Same constant as CommonMath.cfi's documented landmark.
++constexpr float kACEScctMidGrey = 0.4135878f;
++
++//! What the camera actually publishes and what an exported .cdl carries: ONE ASC CDL, per
++//! channel, in the ASC's own order. Everything the user turns - the wheels, contrast, the CDL
++//! base - folds into these numbers exactly (see SCineGradeParams::Resolve).
++struct SCineEffectiveCdl
++{
++	Vec3  slope = Vec3(1.0f, 1.0f, 1.0f);
++	Vec3  offset = Vec3(0.0f, 0.0f, 0.0f);
++	Vec3  power = Vec3(1.0f, 1.0f, 1.0f);
++	float saturation = 1.0f;
++};
++
+ // The camera's grade (SceneReferredSpec.md S5). ASC CDL in ACEScct, the interchange every
+ // grading tool speaks, applied to scene data before the output transform - not to a picture
+ // after it. Neutral by default: with these values the chain is exactly ACES 2.0 (D10).
++//
++// THE UI IS A PARAMETERISATION OF THE CDL, NOT A SECOND OPERATOR (decisions/s10-grade-component.md
++// section 3a). Three colour wheels in the convention Resolve, Nuke and every other LGG control
++// share - lift holds white put, gain holds black put, gamma is the mids - plus contrast about a
++// pivot, all of which fold EXACTLY into a single slope/offset/power triple because the ASC order
++// is "one affine step, then one power" and every one of these operators is affine. So there is
++// never a picture the engine can show and a .cdl cannot reproduce.
++//
++// Nothing here is ever written back by the component: the editor snapshots a component's
++// properties for saving BEFORE it tells the component they changed
++// (EntityObject.cpp:925 vs :930), so a member written from an event handler renders but does not
++// reliably save. The published CDL is therefore derived at publish time and shown in the log line
++// (`grade published:`), in the EXR header (`rec/cdl`) and in the .cdl sidecar - never stored.
+ struct SCineGradeParams
+ {
+-	inline bool operator==(const SCineGradeParams& rhs) const { return 0 == memcmp(this, &rhs, sizeof(rhs)); }
++	//! Field-wise and not memcmp: the struct has padding after the bool, and padding bytes are not
++	//! guaranteed to be equal between two structs that hold the same values.
++	inline bool operator==(const SCineGradeParams& rhs) const
++	{
++		return bBypassGrade == rhs.bBypassGrade
++		       && lift == rhs.lift && (float)liftMaster == (float)rhs.liftMaster
++		       && gamma == rhs.gamma && (float)gammaMaster == (float)rhs.gammaMaster
++		       && gain == rhs.gain && (float)gainMaster == (float)rhs.gainMaster
++		       && (float)contrast == (float)rhs.contrast && (float)pivot == (float)rhs.pivot
++		       && (float)saturation == (float)rhs.saturation
++		       && slope == rhs.slope && offset == rhs.offset && power == rhs.power;
++	}
++
++	//! Fold everything the user turned into the one ASC CDL the renderer and every exported file
++	//! see. Exact - no approximation anywhere in it. Defined in CineGradeComponent.cpp.
++	SCineEffectiveCdl Resolve() const;
+ 
+ 	static void ReflectType(Schematyc::CTypeDesc<SCineGradeParams>& desc)
+ 	{
+@@ -42,31 +86,95 @@ struct SCineGradeParams
+ 			"Switch the whole camera grade out of the chain - white balance, CDL and look - and "
+ 			"leave only the output transform. The A/B: what the shot looks like ungraded, one "
+ 			"click away, with the exposure and the optics unchanged.", false);
+-		desc.AddMember(&SCineGradeParams::slope,
+-			'cdls', "Slope", "Slope (RGB)",
+-			"ASC CDL slope, per channel. A multiply in log - gain, the highlight end. 1 = "
+-			"neutral. Applied first: out = (in * slope + offset) ^ power.", Vec3(1.0f, 1.0f, 1.0f));
+-		desc.AddMember(&SCineGradeParams::offset,
+-			'cdlo', "Offset", "Offset (RGB)",
+-			"ASC CDL offset, per channel. An add in log - lift, the shadow end, and the usual "
+-			"place a colour cast is corrected. 0 = neutral.", Vec3(0.0f, 0.0f, 0.0f));
+-		desc.AddMember(&SCineGradeParams::power,
+-			'cdlp', "Power", "Power (RGB)",
+-			"ASC CDL power, per channel. Gamma, the midtones, applied last. 1 = neutral; below 1 "
+-			"opens the mids, above 1 closes them.", Vec3(1.0f, 1.0f, 1.0f));
++
++		// --- the wheels -------------------------------------------------------------------
++		desc.AddMember(&SCineGradeParams::lift,
++			'wlft', "Lift", "Lift (RGB)",
++			"The shadow end, per channel, in the convention every colour wheel shares: lifting "
++			"the blacks leaves WHITE exactly where it was (slope = gain - lift, offset = lift). "
++			"0 = neutral. Negative numbers crush. This is the place a colour cast in the shadows "
++			"is corrected.", Vec3(0.0f, 0.0f, 0.0f));
++		desc.AddMember(&SCineGradeParams::liftMaster,
++			'wlfm', "LiftMaster", "Lift Master",
++			"The wheel's Y ring: added to all three Lift channels at once. 0 = neutral.", 0.0f);
++		desc.AddMember(&SCineGradeParams::gamma,
++			'wgam', "Gamma", "Gamma (RGB)",
++			"The midtones, per channel - the CDL power written the way a colourist reads it "
++			"(power = 1 / gamma), so ABOVE 1 opens the mids and below 1 closes them, the "
++			"opposite sense to the raw power below. 1 = neutral. Neither black nor white moves.",
++			Vec3(1.0f, 1.0f, 1.0f));
++		desc.AddMember(&SCineGradeParams::gammaMaster,
++			'wgmm', "GammaMaster", "Gamma Master",
++			"The wheel's Y ring: multiplies all three Gamma channels at once. 1 = neutral.", 1.0f);
++		desc.AddMember(&SCineGradeParams::gain,
++			'wgan', "Gain", "Gain (RGB)",
++			"The highlight end, per channel - a multiply in log. Raising the gain leaves BLACK "
++			"exactly where it was. 1 = neutral. With Lift at 0 this is the ASC slope itself.",
++			Vec3(1.0f, 1.0f, 1.0f));
++		desc.AddMember(&SCineGradeParams::gainMaster,
++			'wgnm', "GainMaster", "Gain Master",
++			"The wheel's Y ring: multiplies all three Gain channels at once. 1 = neutral.", 1.0f);
++
++		// --- contrast about a pivot -------------------------------------------------------
++		desc.AddMember(&SCineGradeParams::contrast,
++			'wcon', "Contrast", "Contrast",
++			"Steepen or flatten the whole curve about the pivot below. 1 = neutral, 0 = a flat "
++			"grey field. It is an affine operator in the grading space, so it folds into the "
++			"published slope and offset EXACTLY - there is no extra step in the shader and "
++			"nothing here that a .cdl cannot carry.", 1.0f);
++		desc.AddMember(&SCineGradeParams::pivot,
++			'wpiv', "ContrastPivot", "Contrast Pivot",
++			"The code value Contrast turns about, in ACEScct. The default 0.4136 is ACEScct(0.18) "
++			"- 18 % grey - so contrast leaves a grey card exactly where it is and opens or closes "
++			"everything around it. Lower it to pivot on the shadows, raise it to pivot on the "
++			"highlights.", kACEScctMidGrey);
++
+ 		desc.AddMember(&SCineGradeParams::saturation,
+ 			'cdlt', "Saturation", "Saturation",
+ 			"The ASC's saturation extension, applied after the slope/offset/power triple about "
+-			"the luminance of the graded value. 1 = neutral, 0 = monochrome. Because this "
+-			"happens in the working space and before the output transform, pushing it does not "
+-			"drift the hues the way a saturation slider on a finished picture does.", 1.0f);
++			"the luminance of the graded value, with the ASC's own Rec.709 luma weights so that "
++			"the number means here exactly what it means in Resolve, OCIO or Flame. 1 = neutral, "
++			"0 = monochrome. Because this happens in the working space and before the output "
++			"transform, pushing it does not drift the hues the way a saturation slider on a "
++			"finished picture does.", 1.0f);
++
++		// --- the ASC CDL the wheels sit on top of -----------------------------------------
++		desc.AddMember(&SCineGradeParams::slope,
++			'cdls', "Slope", "CDL Slope (base)",
++			"ASC CDL slope, per channel - the raw interchange numbers, for pasting a .cdl that "
++			"came from Resolve. WITH THE WHEELS NEUTRAL THESE THREE GROUPS ARE EXACTLY WHAT THE "
++			"CAMERA PUBLISHES; the wheels and contrast compose on top of them and the result is "
++			"still one legal CDL. 1 = neutral. ASC order: out = (in * slope + offset) ^ power.",
++			Vec3(1.0f, 1.0f, 1.0f));
++		desc.AddMember(&SCineGradeParams::offset,
++			'cdlo', "Offset", "CDL Offset (base)",
++			"ASC CDL offset, per channel. An add in log. 0 = neutral. Note this is the raw ASC "
++			"offset, which moves white as well as black - the Lift wheel above is the one that "
++			"holds white put.", Vec3(0.0f, 0.0f, 0.0f));
++		desc.AddMember(&SCineGradeParams::power,
++			'cdlp', "Power", "CDL Power (base)",
++			"ASC CDL power, per channel. 1 = neutral; BELOW 1 opens the mids, above 1 closes "
++			"them - the opposite sense to the Gamma wheel above, which is 1 / this.",
++			Vec3(1.0f, 1.0f, 1.0f));
+ 	}
+ 
+ 	bool bBypassGrade = false;
++
++	Vec3 lift = Vec3(0.0f, 0.0f, 0.0f);
++	Schematyc::Range<-1, 1, -1, 1> liftMaster = 0.0f;
++	Vec3 gamma = Vec3(1.0f, 1.0f, 1.0f);
++	Schematyc::Range<0, 4, 0, 2> gammaMaster = 1.0f;
++	Vec3 gain = Vec3(1.0f, 1.0f, 1.0f);
++	Schematyc::Range<0, 4, 0, 2> gainMaster = 1.0f;
++
++	Schematyc::Range<0, 4, 0, 2> contrast = 1.0f;
++	Schematyc::Range<0, 1, 0, 1> pivot = kACEScctMidGrey;
++
++	Schematyc::Range<0, 4, 0, 2> saturation = 1.0f;
++
+ 	Vec3 slope = Vec3(1.0f, 1.0f, 1.0f);
+ 	Vec3 offset = Vec3(0.0f, 0.0f, 0.0f);
+ 	Vec3 power = Vec3(1.0f, 1.0f, 1.0f);
+-	Schematyc::Range<0, 4, 0, 2> saturation = 1.0f;
+ };
+ 
+ // The look slot (LMT), one of the two .cube files of the display chain (SceneReferredSpec.md
+@@ -147,8 +255,10 @@ private:
+ 	SCineGradeParams m_grade;
+ 	SCineLookParams  m_look;
+ 
+-	//! The last thing ReportStatus() said, so that dragging a slider says it once and not once
+-	//! per mouse move. Empty means "published"; unset (see the constructor default) means nothing
+-	//! has been said yet.
+-	string m_lastReport = "<unreported>";
++	//! The last answer ReportStatus() worked out, as a bitmask, so that dragging a slider - or a
++	//! TrackView playback, which sends this component one property-changed event per animated key
++	//! per frame - says it once and not once per event. 0 means "published"; -1 means nothing has
++	//! been said yet. An int and not the message text: the comparison has to be the cheap thing,
++	//! because on the animated path it is the only thing that runs.
++	int m_lastStatus = -1;
+ };
+diff --git a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp
+index 81799480..7611cace 100644
+--- a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp
++++ b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp
+@@ -1773,33 +1773,48 @@ void CCinematicCameraComponent::ApplyGrade()
+ 	const SCineGradeParams& grade = GetGradeParams();
+ 	const bool bBypass = grade.bBypassGrade;
+ 
++	// The wheels, contrast and the ASC CDL base fold into ONE CDL on the way out
++	// (SCineGradeParams::Resolve, decisions/s10-grade-component.md section 3a). The bus, the
++	// shader, the EXR header and the .cdl sidecar all therefore see the same three triples, and
++	// nothing downstream has to know that a colour wheel exists.
++	const SCineEffectiveCdl cdl = grade.Resolve();
++
+ 	gEnv->p3DEngine->SetPostEffectParam("Global_User_GradeBypass",   bBypass ? 1.0f : 0.0f);
+ 	gEnv->p3DEngine->SetPostEffectParam("Global_User_GradeWBEnable", m_whiteBalance.bEnableWhiteBalance ? 1.0f : 0.0f);
+ 	gEnv->p3DEngine->SetPostEffectParam("Global_User_GradeWBKelvin", (float)(int)m_whiteBalance.colorTemperature);
+ 	gEnv->p3DEngine->SetPostEffectParam("Global_User_GradeWBTint",   (float)m_whiteBalance.tint);
+ 
+-	gEnv->p3DEngine->SetPostEffectParamVec4("Global_User_GradeSlope",  Vec4(grade.slope.x, grade.slope.y, grade.slope.z, 0.0f));
+-	gEnv->p3DEngine->SetPostEffectParamVec4("Global_User_GradeOffset", Vec4(grade.offset.x, grade.offset.y, grade.offset.z, 0.0f));
+-	gEnv->p3DEngine->SetPostEffectParamVec4("Global_User_GradePower",  Vec4(grade.power.x, grade.power.y, grade.power.z, 0.0f));
+-	gEnv->p3DEngine->SetPostEffectParam("Global_User_GradeSaturation", (float)grade.saturation);
++	gEnv->p3DEngine->SetPostEffectParamVec4("Global_User_GradeSlope",  Vec4(cdl.slope.x, cdl.slope.y, cdl.slope.z, 0.0f));
++	gEnv->p3DEngine->SetPostEffectParamVec4("Global_User_GradeOffset", Vec4(cdl.offset.x, cdl.offset.y, cdl.offset.z, 0.0f));
++	gEnv->p3DEngine->SetPostEffectParamVec4("Global_User_GradePower",  Vec4(cdl.power.x, cdl.power.y, cdl.power.z, 0.0f));
++	gEnv->p3DEngine->SetPostEffectParam("Global_User_GradeSaturation", cdl.saturation);
+ 
+ 	// Diagnostic, edge-triggered exactly like the white balance's below: one line per change of
+ 	// the CDL this camera publishes. It is the answer to "I moved a grade slider and the picture
+ 	// did not move" - a line means the value left the component, reached the bus and the reason
+ 	// lies further down the chain (the Scene Referred switch, which is where the tone map reads
+ 	// these params at all); no line means it never got here. Two float compares per frame.
+-	{
+-		const float sat = (float)grade.saturation;
+-		if (fabs_tpl(grade.slope.x - m_lastLoggedGradeSlopeX) > 1e-4f ||
++	//
++	// These are the FOLDED numbers, which is the point: with wheels in front of the CDL the raw
++	// properties no longer say what is on the bus, and this line is where "what is actually being
++	// sent" is readable without a debugger. It is also, verbatim, what the .cdl sidecar of a
++	// capture taken now would contain.
++	{
++		const float sat = cdl.saturation;
++		if (fabs_tpl(cdl.slope.x - m_lastLoggedGradeSlopeX) > 1e-4f ||
++		    fabs_tpl(cdl.offset.x - m_lastLoggedGradeOffsetX) > 1e-4f ||
++		    fabs_tpl(cdl.power.x - m_lastLoggedGradePowerX) > 1e-4f ||
+ 		    fabs_tpl(sat - m_lastLoggedGradeSaturation) > 1e-4f)
+ 		{
+-			m_lastLoggedGradeSlopeX = grade.slope.x;
++			m_lastLoggedGradeSlopeX = cdl.slope.x;
++			m_lastLoggedGradeOffsetX = cdl.offset.x;
++			m_lastLoggedGradePowerX = cdl.power.x;
+ 			m_lastLoggedGradeSaturation = sat;
+-			CryLog("[CinematicCamera] grade published: slope %.3f/%.3f/%.3f offset %.3f/%.3f/%.3f "
+-			       "power %.3f/%.3f/%.3f saturation %.3f%s (scene referred %s)",
+-			       grade.slope.x, grade.slope.y, grade.slope.z,
+-			       grade.offset.x, grade.offset.y, grade.offset.z,
+-			       grade.power.x, grade.power.y, grade.power.z, sat,
++			CryLog("[CinematicCamera] grade published: slope %.4f/%.4f/%.4f offset %.4f/%.4f/%.4f "
++			       "power %.4f/%.4f/%.4f saturation %.4f%s (scene referred %s)",
++			       cdl.slope.x, cdl.slope.y, cdl.slope.z,
++			       cdl.offset.x, cdl.offset.y, cdl.offset.z,
++			       cdl.power.x, cdl.power.y, cdl.power.z, sat,
+ 			       bBypass ? " BYPASSED" : "",
+ 			       m_sceneReferred.bSceneReferred ? "on" : "OFF - the tone map does not read these");
+ 		}
+diff --git a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
+index 3893da42..ff850673 100644
+--- a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
++++ b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
+@@ -1435,6 +1435,8 @@ private:
+ 	// answerable from the log, and the answer is either "the camera never published it" (no line)
+ 	// or "it is on the bus, look further down the chain" (a line with the values).
+ 	float m_lastLoggedGradeSlopeX   = -1.f;
++	float m_lastLoggedGradeOffsetX  = -1.f;
++	float m_lastLoggedGradePowerX   = -1.f;
+ 	float m_lastLoggedGradeSaturation = -1.f;
+ 
+ 	// Sprite bokeh saved state (r_DepthOfFieldMode cvar + Dof_User_BokehShapeTex post param).
+diff --git a/Code/CryPlugins/CinematicCamera/README.md b/Code/CryPlugins/CinematicCamera/README.md
+index d4bbf88f..5f590e4c 100644
+--- a/Code/CryPlugins/CinematicCamera/README.md
++++ b/Code/CryPlugins/CinematicCamera/README.md
+@@ -411,21 +411,60 @@ nothing here reaches the picture.
+ 
+ ### Grade
+ 
+-*Scene-referred path only. ASC CDL, the interchange every grading tool speaks, applied in ACEScct
+-to scene data BEFORE the output transform. All of it is live: a dragged slider moves the picture
+-on the next frame.*
++*Scene-referred path only. Everything in this group is a way of writing ONE ASC CDL - the
++interchange every grading tool speaks - applied in ACEScct to scene data BEFORE the output
++transform. All of it is live: a dragged slider moves the picture on the next frame, and every
++property is animatable in TrackView.*
++
++Three colour wheels in the convention Resolve, Nuke and every other lift/gamma/gain control share,
++plus contrast about a pivot:
+ 
+ | Property | Range | Default | Effect |
+ | --- | --- | --- | --- |
+ | Bypass Grade | bool | false | Take white balance, CDL and the look out of the chain in one click and leave only the output transform. The A/B - what the shot looks like ungraded, with the exposure and the optics unchanged. **false = the grade is live.** |
+-| Slope (RGB) | float3 | (1, 1, 1) | ASC CDL slope: a multiply in log - gain, the highlight end. **1 = neutral.** Applied first: `out = (in * slope + offset) ^ power`. |
+-| Offset (RGB) | float3 | (0, 0, 0) | ASC CDL offset: an add in log - lift, the shadow end, and the usual place a colour cast is corrected. **0 = neutral.** |
+-| Power (RGB) | float3 | (1, 1, 1) | ASC CDL power: gamma, the midtones, applied last. **1 = neutral**; below 1 opens the mids, above 1 closes them. |
+-| Saturation | 0-4 (slider 0-2) | 1 | The ASC saturation extension, after the SOP triple, about the luminance of the graded value with AP1 weights. **1 = neutral**, 0 = monochrome. Because it happens in the working space and before the output transform, pushing it does not drift the hues the way a saturation slider on a finished picture does. |
+-
+-The order is the ASC specification's and is not negotiable if the numbers are to round-trip with
+-Resolve: slope, then offset, then power on the clamped result, per channel with no cross-channel
+-term; saturation is the ASC's own extension and comes after.
++| Lift (RGB) | float3 | (0, 0, 0) | The shadow end. Lifting the blacks leaves **white exactly where it was**; negative crushes. The place a colour cast in the shadows is corrected. **0 = neutral.** |
++| Lift Master | -1 to 1 | 0 | The wheel's Y ring: added to all three Lift channels at once. **0 = neutral.** |
++| Gamma (RGB) | float3 | (1, 1, 1) | The midtones - the CDL power read the colourist's way round, so **above 1 opens** the mids and below 1 closes them. Neither black nor white moves. **1 = neutral.** |
++| Gamma Master | 0-4 (slider 0-2) | 1 | Multiplies all three Gamma channels at once. **1 = neutral.** |
++| Gain (RGB) | float3 | (1, 1, 1) | The highlight end, a multiply in log. Raising it leaves **black exactly where it was**. With Lift at 0 this is the ASC slope itself. **1 = neutral.** |
++| Gain Master | 0-4 (slider 0-2) | 1 | Multiplies all three Gain channels at once. **1 = neutral.** |
++| Contrast | 0-4 (slider 0-2) | 1 | Steepen or flatten the whole curve about the pivot. **1 = neutral**, 0 = a flat grey field. |
++| Contrast Pivot | 0-1 | 0.4136 | The code value Contrast turns about, in ACEScct. The default is ACEScct(0.18), i.e. **18 % grey stays put** while everything around it opens or closes. Lower it to pivot on the shadows, raise it for the highlights. |
++| Saturation | 0-4 (slider 0-2) | 1 | The ASC saturation extension, after the SOP triple, about the luminance of the graded value **with the ASC's Rec.709 weights** - so the number means here exactly what it means in Resolve, OCIO or Flame. **1 = neutral**, 0 = monochrome. Because it happens in the working space and before the output transform, pushing it does not drift the hues the way a saturation slider on a finished picture does. |
++
++And the raw ASC CDL the wheels sit on top of - the place to paste a `.cdl` that came from Resolve:
++
++| Property | Range | Default | Effect |
++| --- | --- | --- | --- |
++| CDL Slope (base) | float3 | (1, 1, 1) | ASC CDL slope. **1 = neutral.** ASC order: `out = (in * slope + offset) ^ power`. |
++| CDL Offset (base) | float3 | (0, 0, 0) | ASC CDL offset - the raw one, which moves white as well as black. (The Lift wheel is the one that holds white put.) **0 = neutral.** |
++| CDL Power (base) | float3 | (1, 1, 1) | ASC CDL power. **1 = neutral**; below 1 opens the mids, above 1 closes them - the opposite sense to the Gamma wheel, which is `1 / this`. |
++
++**How the two halves combine, and why it matters.** The wheels, contrast and the CDL base all fold
++into a **single** ASC CDL before anything is published:
++
++```
++slope  = contrast * (gain - lift) * CDL_slope
++offset = contrast * ((gain - lift) * CDL_offset + lift) + pivot * (1 - contrast)
++power  = CDL_power / gamma
++```
++
++per channel, with the masters folded into `lift`, `gain` and `gamma` first (lift adds, gain and
++gamma multiply). The fold is **exact** - it works out that way because the ASC order is one affine
++step followed by one power, and lift, gain, contrast and the CDL base are all affine. Two
++consequences worth having:
++
++* **with the wheels and contrast at their neutrals, the three CDL fields ARE what the camera
++  publishes**, number for number, so pasting in a `.cdl` from Resolve reproduces it exactly;
++* **there is no picture this group can make that a `.cdl` cannot carry**, which is what makes the
++  Resolve round trip (`docs/SceneReferredExport.md`) a real test rather than an approximation.
++
++The folded numbers - the ones actually on the bus - are printed by the camera whenever they change
++(`[CinematicCamera] grade published: slope ... offset ... power ... saturation ...`), written into
++every exported EXR as `rec/cdl`, and written beside a capture as an ASC `.cdl` sidecar. They are
++deliberately **not** written back into the properties: the editor snapshots a component's
++properties for saving *before* it tells the component they changed, so a value written from an
++event handler would render but not reliably save.
+ 
+ ### Look
+ 
+diff --git a/Code/CryPlugins/CinematicCamera/docs/SceneReferredLook.md b/Code/CryPlugins/CinematicCamera/docs/SceneReferredLook.md
+index d0bb1880..0d468388 100644
+--- a/Code/CryPlugins/CinematicCamera/docs/SceneReferredLook.md
++++ b/Code/CryPlugins/CinematicCamera/docs/SceneReferredLook.md
+@@ -179,14 +179,30 @@ the camera thinks the light is rather than what the colourist wants.
+ | want | reach for |
+ | --- | --- |
+ | the shot is too warm / too cool | **White Balance -> Color Temperature** (and **Tint** for green/magenta). Camera semantics: the number is what the camera is told the illuminant IS, so a shot reads *cooler* as you dial the Kelvin DOWN and warmer as you dial it up - the opposite of a "colour temperature" slider on a finished image. What the transform guarantees is that clipped highlights stay neutral either way. |
+-| lift the shadows | **Offset**, a small positive number |
+-| more contrast in the mids | **Power** above 1 (or **Slope** above 1 for the highlight end) |
+-| a colour cast to remove | **Offset**, per channel |
++| lift the shadows without touching the highlights | **Lift** up (or **Lift Master** for all three channels at once) |
++| brighter / darker highlights without touching black | **Gain** (or **Gain Master**) |
++| brighter or darker mids only | **Gamma** (or **Gamma Master**) - above 1 opens the mids |
++| more contrast with mid grey left where it is | **Contrast** above 1. It turns about **Contrast Pivot**, whose default 0.4136 is ACEScct(0.18), so a grey card does not move |
++| more contrast in the shadows / the highlights instead | the same, with **Contrast Pivot** lowered or raised |
++| a colour cast to remove | **Lift** per channel in the shadows, **Gain** per channel in the highlights |
+ | more or less colour | **Saturation** |
++| reproduce a `.cdl` somebody sent you | type it into **CDL Slope / Offset / Power (base)** with the wheels and contrast left neutral - those three fields are then exactly what the camera publishes |
+ | see it ungraded | **Bypass Grade** |
+ 
+-These are ASC CDL numbers in the ASC's own order - `(in * slope + offset) ^ power`, then
+-saturation - so they mean the same thing here as they do in Resolve, Baselight or Nuke.
++All of it folds into a **single** ASC CDL in the ASC's own order - `(in * slope + offset) ^ power`,
++then saturation with the ASC's Rec.709 weights - so it means the same thing here as it does in
++Resolve, Baselight or Nuke, and so a capture's `.cdl` sidecar reproduces the engine picture exactly
++(see [SceneReferredExport.md](SceneReferredExport.md)). The wheels are those same ASC numbers
++written the way a colourist reads them: `slope = gain - lift`, `offset = lift`, `power = 1 / gamma`,
++which is exactly why lift holds white put and gain holds black put. Contrast about a pivot is
++affine, so it folds into the same slope and offset with nothing left over and needs no extra step in
++the shader.
++
++Every property here is **animatable in TrackView**: right-click the entity node in a sequence ->
++*Add Track* -> *Components* -> *CineCam Grade* -> *Grade* -> the property. The RGB triples arrive as
++three-channel vector tracks and the scalars as float tracks. One CDL cannot describe an animated
++grade, so an EXR capture's `.cdl` sidecar carries the grade of the take's first frame - each frame's
++own numbers are still in its own EXR header.
+ 
+ Every neutral value is an **exact** identity, not a near one. That matters: it means you can
+ always get back to "pure ACES" by typing the defaults, and that the switch itself can be proved to
+diff --git a/Engine/Shaders/HWScripts/CryFX/HDRPostProcess.cfx b/Engine/Shaders/HWScripts/CryFX/HDRPostProcess.cfx
+index 3fbbfced..db2937c4 100644
+--- a/Engine/Shaders/HWScripts/CryFX/HDRPostProcess.cfx
++++ b/Engine/Shaders/HWScripts/CryFX/HDRPostProcess.cfx
+@@ -1224,12 +1224,25 @@ half3 FilmMapping( in vert2frag IN, in half3 cScene, in half3 cBloom, in half3 v
+ 	//    with the power applied to the clamped result (the spec's "negative values are clamped
+ 	//    to zero before the power function"), per channel and with no cross-channel term.
+ 	//    Saturation is the ASC's own extension and comes AFTER the SOP, about the luminance of
+-	//    the already-graded value - and the luminance weights are AP1's, because that is the
+-	//    space this is happening in. Using Rec.709 weights on AP1 data is the classic silent
+-	//    failure: the picture is wrong and nothing reports it.
++	//    the already-graded value.
++	//
++	//    THE WEIGHTS ARE THE ASC'S REC.709 ONES AND NOT AP1'S, DELIBERATELY (S10 item 3a,
++	//    decisions/s10-grade-component.md section 3a.4). Everywhere else in this pipeline AP1
++	//    weights are the right answer and CommonMath.cfi says why. Here they are the wrong one,
++	//    because this number is not a luminance measurement - it is an INTERCHANGE PARAMETER. The
++	//    ASC CDL specification fixes the saturation coefficients at (0.2126, 0.7152, 0.0722)
++	//    regardless of the encoding the CDL is applied in, and OCIO, Flame, Natron and Pomfort's
++	//    on-set ACES CDL grading mode - which is the workflow this component copies - all use
++	//    exactly those in ACEScct. A number we publish as "ASC CDL saturation", write into an EXR
++	//    header and export as a .cdl has to mean the same thing here as it does in the application
++	//    that reads the file, or the round trip that is this feature's whole point cannot match.
++	//
++	//    A saturation of 1 is still an EXACT identity either way (luma + 1 * (c - luma) == c), so
++	//    nothing moves for an ungraded picture, and the stock path below never sees this at all.
++	const float3 ASC_CDL_LUMA_WEIGHTS = float3(0.2126, 0.7152, 0.0722);
+ 	cGrade = cGrade * SceneCDLSlope.rgb + SceneCDLOffset.rgb;
+ 	cGrade = pow(max(cGrade, 0.0), SceneCDLPower.rgb);
+-	const float fGradeLuma = dot(cGrade, ACESCG_LUMINANCE_WEIGHTS);
++	const float fGradeLuma = dot(cGrade, ASC_CDL_LUMA_WEIGHTS);
+ 	cGrade = fGradeLuma + SceneCDLSlope.w * (cGrade - fGradeLuma);
+ 
+ 	// 4. The look (LMT), ACEScct in and out. An empty slot is the identity look - D10's "no
+-- 
+2.47.1.windows.1
+

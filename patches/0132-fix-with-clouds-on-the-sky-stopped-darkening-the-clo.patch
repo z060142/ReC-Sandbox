@@ -1,0 +1,271 @@
+From 5435929a58e81eed22fe32990b7c717fcf3e910c Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Wed, 9 Sep 2026 00:34:14 +0800
+Subject: [PATCH 132/162] fix: with clouds on the sky stopped darkening - the
+ cloud haze never took the aperture
+
+User, outdoor, Scene Referred on, after cd063849: stopping down in Manual now darkens
+the sky, but only to a certain level and then it stops; switching effects one at a time
+identified volumetric clouds - with clouds off the sky keeps darkening.
+
+Root cause. The volumetric cloud pass has FOUR radiance terms, not three. S8 exposed the
+cloud shading sun colour (635e7df0) and cd063849 added the sky light; the fourth is the
+atmospheric Rayleigh haze between the camera and the cloud deck, and it was deliberately
+left alone on a written claim that turns out to be false. The S8 note said
+sunIntensityForAtmospheric is "a scattering coefficient multiplier, not a radiance, and
+exposing it would double-count against" the cloud sun. It is a radiance. In Clouds.cfx it
+appears only in GetAtmosphericParam's phaseRayleigh / phaseMie, and those appear only in
+GetAtmosphericInscattering's odRayleigh x phase x RayleighScatteringCoeff -
+shadeColorFromSun never enters that expression, so there was nothing to double-count
+against. TimeOfDay builds it as sunIntensityLux / RENDERER_LIGHT_UNIT_SCALE (already PI
+gated there) times an authored dimensionless multiplier: the sun in engine units, exactly
+the class of quantity the cloud sun colour is.
+
+Why that floors the SKY and not just the clouds. The term is accumulated on every ray
+that reaches the cloud layer - outdoors, the whole sky - in the four-step pre-march and
+again inside the ray-march loop, and it accumulates independently of cloud density, so it
+is there even where transmittance stays 1 and the composite alpha is 1. CloudsBlend
+composites additively, GS_BLSRC_ONE | GS_BLDST_SRCALPHA. So an unexposed constant was
+being ADDED on top of an exposed sky: below some aperture the sky underneath kept
+darkening and the sum stopped moving. With clouds off the term is never produced, which
+is precisely the A/B the user found.
+
+Fix. One multiply at the CB fill in GenerateCloudShaderParam, on the render thread -
+RenderCloud is a compute pass that binds no per-view constant buffer, so a shader-side
+PS_HDR_RANGE_ADAPT_MAX would silently read 1.0 there, the unbound-CB trap cd063849 already
+paid for. Exactly 1.0 off the switch. No shader change. The genuine coefficient,
+E3DPARAM_VOLCLOUD_ATMOSPHERIC_SCATTERING (atmospheric albedo x 2.06e-5 per metre), is fed
+to exp() for the extinction as well as to the inscattering product and stays exactly as
+authored: a coefficient inside an exponential must never take the exposure.
+
+Audited and already correct, so that the next reader does not re-walk them: the sun single
+and low-order multi-scatter, the high-order approximation, the sky term, the ground
+bounce, the clouds' own fog through GetVolumetricFogAnalyticalColor, and the alto/cirrus
+layer. No clamp from below and no emissive floor exists on any cloud radiance path - the
+only saturate is a wrapped N.L geometry factor, and ENABLE_REDUCED_COLOR_RANGE, the one
+scale-dependent range compression, is undefined. The pass does not paint its own sky
+background: the alpha it writes is the transmittance, so the scene shows through
+untouched where there is no cloud. The reprojection history is clamped to the current
+frame's 2x2 neighbourhood, so an exposure change lags a few frames and cannot floor. The
+only R11G11B10F targets are the shadow and transmittance volumes.
+
+Overlay, so this cannot hide again. A measured cloud line at y=235 from
+CVolumetricCloudsStage::SSceneReferredDebug, filled from the constants the pass uploaded:
+the exposure factor, the sun, sky and atmospheric-sun terms in exposed units, and the
+zenith haze - a CPU evaluation of the shader's own arithmetic straight up, which is the
+number that used to sit still while the aperture moved. The coverage line's hard-coded
+"clouds YES" becomes "YES (see cloud line)" or "YES (off)", for the same reason the sky
+line replaced its hard-coded promise a day earlier: three terms out of four exposed still
+prints YES.
+
+The S8 acceptance for the clouds asked for exactly this check ("capture-verify that
+sunIntensityForAtmospheric is not a second copy of the same radiance") and it was never
+executed - it shipped instead as a code comment asserting the opposite. Recorded as such
+in decisions/s8-svogi-fog-clouds.md, with research/s8-fog-and-clouds.md 3.4 rewritten and
+its open question 1 closed, and two STRUCTURE.md rows.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01HXzRVK4yBVDUNfdWXEwV5y
+---
+ .../GraphicsPipeline/ToneMapping.cpp          | 39 +++++++++++-
+ .../GraphicsPipeline/VolumetricClouds.cpp     | 59 +++++++++++++++++--
+ .../GraphicsPipeline/VolumetricClouds.h       | 21 +++++++
+ 3 files changed, 113 insertions(+), 6 deletions(-)
+
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.cpp
+index 0297f733..3ee151d4 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.cpp
+@@ -6,6 +6,7 @@
+ #include "Bloom.h"
+ #include "SunShafts.h"
+ #include "Sky.h"
++#include "VolumetricClouds.h"
+ #include "DepthOfField.h"
+ #include "D3DPostProcess.h"
+ #include "SceneReferredExport.h"
+@@ -1101,6 +1102,9 @@ void CToneMappingStage::DisplaySceneReferredCoverage()
+ 	const bool bFog   = cvarOn("e_Fog");
+ 	const bool bVFog  = cvarOn("e_VolumetricFog");
+ 	const bool bSnow  = cvarOn("r_Snow");
++	// The same predicate CVolumetricCloudsStage::IsStageActive uses, so the line cannot claim the
++	// pass ran on a frame where it did not.
++	const bool bClouds = gcpRendD3D->m_bVolumetricCloudsEnabled;
+ 
+ 	char str[384];
+ 	cry_sprintf(str, "  pre-exposure reaches: sun+lights YES  probes YES (tint; re-bake for PI)  sky YES (see sky line)  forward/emissive YES");
+@@ -1148,13 +1152,46 @@ void CToneMappingStage::DisplaySceneReferredCoverage()
+ 		bAmbientAsFill = v.x > 0.5f;
+ 	}
+ 
+-	cry_sprintf(str, "    ... SVOGI %s  global fog %s  volumetric fog %s  clouds YES  snow %s  | ambient lights: %s",
++	cry_sprintf(str, "    ... SVOGI %s  global fog %s  volumetric fog %s  clouds %s  snow %s  | ambient lights: %s",
+ 	            bSvo  ? "YES (ApplyGI+SvoGiFog)"      : "YES (off)",
+ 	            bFog  ? "YES"                         : "YES (off)",
+ 	            bVFog ? "YES (sun+emission+analytical far)" : "YES (off)",
++	            bClouds ? "YES (see cloud line)"      : "YES (off)",
+ 	            bSnow ? "YES (flakes+709->AP1)"       : "YES (off)",
+ 	            bAmbientAsFill ? "YES (routed as fill lights, shadows on)" : "n/a, they modulate");
+ 	IRenderAuxText::DrawText(Vec3(5, 175, 1), IRenderAuxText::ASize(1.0f), ColorF(1, 0, 1, 1), eDrawText_800x600 | eDrawText_2D, str);
++
++	// The clouds, MEASURED rather than promised (2026-09-09). "clouds YES" was true of three of the
++	// pass's four radiance terms; the fourth - the atmospheric Rayleigh haze the cloud pass
++	// accumulates on every ray that reaches the cloud deck and composites ADDITIVELY over the whole
++	// sky - was exposure-invariant, so stopping down darkened the sky until it hit that constant and
++	// then stopped. All four are printed in exposed engine units beside the factor that was applied
++	// to them, so a term that stops moving with the aperture is visible in one glance. The zenith
++	// haze is the CPU evaluation of the shader's own arithmetic straight up; it is the number that
++	// used to sit still.
++	if (const CVolumetricCloudsStage* pClouds = m_graphicsPipeline.GetStage<CVolumetricCloudsStage>())
++	{
++		const CVolumetricCloudsStage::SSceneReferredDebug& cl = pClouds->GetSceneReferredDebug();
++		if (!bClouds)
++		{
++			cry_sprintf(str, "  clouds [off]");
++		}
++		else if (!cl.bActive)
++		{
++			cry_sprintf(str, "  clouds [on, no upload yet this session]");
++		}
++		else
++		{
++			const float sunLum = 0.2126f * cl.sunExposed.x + 0.7152f * cl.sunExposed.y + 0.0722f * cl.sunExposed.z;
++			const float skyLum = 0.2126f * cl.skyExposed.x + 0.7152f * cl.skyExposed.y + 0.0722f * cl.skyExposed.z;
++			cry_sprintf(str, "  clouds [on] x%.4g: sun %.4g  sky %.4g  atmos-sun %.4g  zenith haze %.4g exposed (%+.1f stops vs grey)  | Rayleigh k %.3g/m unexposed by design",
++			            cl.exposureApplied, sunLum, skyLum, cl.atmosSunExposed,
++			            cl.zenithHazeExposed,
++			            (cl.zenithHazeExposed > 0.0f) ? log2f(cl.zenithHazeExposed / 0.18f) : -99.0f,
++			            cl.rayleighCoeff.y);
++		}
++		IRenderAuxText::DrawText(Vec3(5, 235, 1), IRenderAuxText::ASize(1.0f), ColorF(1, 0, 1, 1), eDrawText_800x600 | eDrawText_2D, str);
++	}
+ }
+ 
+ // The sun-shaft atmospheric condition, as it was actually applied (S8,
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/VolumetricClouds.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/VolumetricClouds.cpp
+index f87d28c8..40d558d3 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/VolumetricClouds.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/VolumetricClouds.cpp
+@@ -1480,10 +1480,9 @@ void CVolumetricCloudsStage::GenerateCloudShaderParam(::VCCloudRenderContext& co
+ 			// in-frame tearing trap of s1-adapted-scene-scale.md 8.3. The other consumer is
+ 			// CSceneForwardStage::FillCloudShadingParams for the legacy forward clouds.
+ 			//
+-			// sunIntensityForAtmospheric below is deliberately NOT exposed: it is a scattering
+-			// coefficient multiplier, not a radiance, and exposing it would double-count against
+-			// this one. Every other cloud knob (scatter, albedo, powder, extinction) is
+-			// dimensionless. Exactly 1.0 off the switch.
++			// (2026-09-09: the paragraph that used to stand here said sunIntensityForAtmospheric is
++			// "a scattering coefficient multiplier, not a radiance". That was wrong and it cost the
++			// sky its floor - see the correction at the sunIntensityForAtmospheric fill below.)
+ 			cb.shadeColorFromSun = PF.pCloudShadingColorSun * gcpRendD3D->GetSceneReferredExposure();
+ 			cb.waterLevel = PF.vWaterLevel.x; // static water ocean level
+ 
+@@ -1518,8 +1517,31 @@ void CVolumetricCloudsStage::GenerateCloudShaderParam(::VCCloudRenderContext& co
+ 			// Exactly 1.0 off the switch.
+ 			cb.skylightRayleighInScatter *= gcpRendD3D->GetSceneReferredExposure();
+ 
++			// atmosphericScattering is the Rayleigh scattering COEFFICIENT, per metre
++			// (TimeOfDay.cpp: atmospheric albedo x 2.06e-5), and Clouds.cfx feeds it to exp() for
++			// the extinction as well as to the inscattering product. A coefficient inside an
++			// exponential must never take the exposure - this one stays exactly as authored.
+ 			gEnv->p3DEngine->GetGlobalParameter(E3DPARAM_VOLCLOUD_ATMOSPHERIC_SCATTERING, cb.atmosphericScattering);
+-			cb.sunIntensityForAtmospheric = cloudWindAndAtmosphericParams.z;
++
++			// CORRECTION, 2026-09-09. sunIntensityForAtmospheric IS a radiance scale and it needs
++			// the exposure. The S8 note called it "a coefficient" and left it alone; the user then
++			// found that with volumetric clouds on, stopping down darkens the sky only so far and
++			// then it floors, and that turning the clouds off removes the floor.
++			//
++			// Why it floors: Clouds.cfx's GetAtmosphericParam puts this value straight into
++			// phaseRayleigh / phaseMie, and GetAtmosphericInscattering returns
++			//   inscatter = transmittance x atmosTrns x odRayleigh x phaseRayleigh x RayleighCoeff
++			// which is the ONLY appearance of either. shadeColorFromSun does not enter that term at
++			// all, so there is nothing to double-count against - it is a second, independent sun
++			// radiance, the Rayleigh haze between the camera and the cloud deck. The cloud pass
++			// accumulates it on every ray that reaches the cloud layer, which outdoors is the whole
++			// sky, and composites additively (GS_BLSRC_ONE | GS_BLDST_SRCALPHA). Unexposed, that
++			// added haze is a constant in the target: the exposed sky underneath it kept darkening
++			// while the sum stopped. TimeOfDay.cpp builds it as sunIntensityLux /
++			// RENDERER_LIGHT_UNIT_SCALE (already PI-gated there) times an authored dimensionless
++			// atmospheric multiplier - i.e. the sun in engine units, exactly the class of quantity
++			// shadeColorFromSun is. Exactly 1.0 off the switch.
++			cb.sunIntensityForAtmospheric = cloudWindAndAtmosphericParams.z * gcpRendD3D->GetSceneReferredExposure();
+ 
+ 			cb.sunSingleScatter = cloudScatteringLowParams.x;
+ 			cb.sunLowOrderScatter = cloudScatteringLowParams.y;
+@@ -1658,6 +1680,33 @@ void CVolumetricCloudsStage::GenerateCloudShaderParam(::VCCloudRenderContext& co
+ 			cb.fullScreenSize = Vec4(fullScreenWidth, fullScreenHeight, 0.0f, 0.0f);
+ 			std::copy_n(m_blockerSSPosArray.begin(), m_blockerSSPosArray.size(), &(cb.cloudBlockerSSPos));
+ 			std::copy_n(m_blockerSSParamArray.begin(), m_blockerSSParamArray.size(), &(cb.cloudBlockerSSParam));
++
++			// r_HDRDebug 1's measured cloud line. Filled from the constants this pass just
++			// uploaded - the same discipline as CSkyStage::SSceneReferredDebug, and for the same
++			// reason: the coverage line's hard-coded "clouds YES" stayed YES while one of the four
++			// cloud radiance terms was exposure-invariant and floored the sky (2026-09-09). Left
++			// eye only; the right eye's constants differ only in view geometry.
++			if (i == 0)
++			{
++				m_srDebug.bActive = true;
++				m_srDebug.exposureApplied = gcpRendD3D->GetSceneReferredExposure();
++				m_srDebug.sunExposed = cb.shadeColorFromSun;
++				m_srDebug.skyExposed = cb.skylightRayleighInScatter;
++				m_srDebug.atmosSunExposed = cb.sunIntensityForAtmospheric;
++				m_srDebug.rayleighCoeff = cb.atmosphericScattering;
++
++				// Zenith haze, the term that used to floor: Clouds.cfx accumulates
++				//   inscatter += odRayleigh * phaseRayleigh * RayleighCoeff
++				// with odRayleigh = exp(-h / 8000) * stepSize and atmosTrns = 1 (the transmittance
++				// and Mie variants are #undef in the shader). Evaluated here in closed form for a
++				// straight-up ray from the camera to the top of the cloud deck, which is what the
++				// shader's discrete steps converge to: the integral of exp(-h/8000) dh.
++				const float mu = cb.sunLightDirection.z; // dot(float3(0,0,1), sunLightDir)
++				const float phaseRayleigh = cb.sunIntensityForAtmospheric * 3.0f / (16.0f * gf_PI) * (1.0f + mu * mu);
++				const float pathIntegral = 8.0e3f * (1.0f - expf(-(cb.altitude + cb.thickness) / 8.0e3f));
++				const Vec3 haze = cb.atmosphericScattering * (phaseRayleigh * pathIntegral);
++				m_srDebug.zenithHazeExposed = 0.2126f * haze.x + 0.7152f * haze.y + 0.0722f * haze.z;
++			}
+ 		}
+ 
+ 		// upload data to constant buffer on GPU.
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/VolumetricClouds.h b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/VolumetricClouds.h
+index 87a48017..330865e0 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/VolumetricClouds.h
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/VolumetricClouds.h
+@@ -29,6 +29,25 @@ public:
+ 	void ExecuteShadowGen();
+ 	void Execute();
+ 
++	// What the cloud pass actually uploaded on the scene-referred path THIS frame, for
++	// r_HDRDebug 1 (CToneMappingStage::DisplaySceneReferredCoverage). The coverage line used to
++	// print a hard-coded "clouds YES", which is a promise and not a measurement: it stayed YES
++	// while sunIntensityForAtmospheric - the Rayleigh haze between the camera and the cloud deck,
++	// composited additively over the whole sky - was exposure-invariant, so stopping down darkened
++	// the sky only until it hit that constant (2026-09-09). Every field below is read back from
++	// the constants the pass uploaded, not recomputed from cvars.
++	struct SSceneReferredDebug
++	{
++		bool  bActive           = false;  // GenerateCloudShaderParam ran at least once
++		float exposureApplied   = 1.0f;   // the latched factor every cloud radiance term was multiplied by
++		Vec3  sunExposed        = Vec3(ZERO); // shadeColorFromSun, exposed engine units
++		Vec3  skyExposed        = Vec3(ZERO); // skylightRayleighInScatter, exposed engine units
++		float atmosSunExposed   = 0.0f;   // sunIntensityForAtmospheric, exposed engine units
++		Vec3  rayleighCoeff     = Vec3(ZERO); // atmosphericScattering, per metre - NOT exposed, it lives inside exp()
++		float zenithHazeExposed = 0.0f;   // CPU evaluation of the atmospheric inscatter straight up, exposed engine units
++	};
++	const SSceneReferredDebug& GetSceneReferredDebug() const { return m_srDebug; }
++
+ private:
+ 	void  ExecuteVolumetricCloudShadowGen();
+ 	void  GenerateCloudShadowGenShaderParam(const Vec3& texSize);
+@@ -89,6 +108,8 @@ private:
+ 	TArray<Vec4>         m_blockerSSPosArray;
+ 	TArray<Vec4>         m_blockerSSParamArray;
+ 
++	SSceneReferredDebug  m_srDebug;
++
+ public:
+ 	_smart_ptr<CTexture> m_pTexVolCloudShadow;
+ };
+-- 
+2.47.1.windows.1
+

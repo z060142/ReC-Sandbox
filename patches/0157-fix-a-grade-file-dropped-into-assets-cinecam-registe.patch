@@ -1,0 +1,809 @@
+From 767c0aa455587478a6682048b3ed6a4c1e9880c7 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Thu, 10 Sep 2026 16:19:10 +0800
+Subject: [PATCH 157/162] fix: a grade file dropped into assets/cinecam
+ registers itself, one file at a time
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Item 4b's step 5 failed: copying a third-party .cube into
+assets/cinecam/luts/ produced no .cryasset, no Asset Browser entry and no
+log line at all.
+
+Root cause. The stock per-file watcher, CAssetGenerator, does reach our
+extensions - the plugin loads before CAssetManager::Init, so cube/cdl/
+cinegrade are in its listener list. It then throws the file away at
+AssetGenerator.cpp:96-100, because CAssetType::IsValidAssetPath forbids a
+dot in the asset base name (AssetType.cpp:382-388), and it discards the
+reason it was given. The file was called
+XT3_FLog_FGamut_to_ETERNA_BT.709_33grid_V.1.01.cube. Vendor LUT names
+carry colour-space names, version numbers and spaces as a matter of
+course, and CryStringUtils::IsValidFileName rejects the last of those
+too.
+
+Two more layers behind it. "Generate/Repair Metadata" could never have
+helped: it runs one fixed job file, Tools/cryassets/rcjob_cryassets.xml,
+whose sixteen-extension list contains none of ours - so the documented
+fallback would have regenerated the whole asset directory and still not
+registered the LUT. And the whole stock path is an rc.exe round trip per
+file, which is a dependency we must not add.
+
+Mechanism of the fix, entirely inside CinematicCameraEditor.dll and with
+no Resource Compiler anywhere in it:
+
+* all three asset types now return CanAutoRepairMetadata() == false. That
+  takes their extensions out of CAssetGenerator's file-monitor list and
+  out of its /assettypes= string (AssetGenerator.cpp:159-168), so the
+  stock watcher never fires on them and two writers cannot race for the
+  same sidecar with two different GUIDs. CScriptType and CXmlType already
+  say the same thing;
+* CineCamAssetRegistration.cpp registers an AssetManagerHelpers::
+  CAsyncFileListener on assets/cinecam/ for the three extensions - which
+  brings the FIFO queue and the "the file is still being written, retry
+  in half a second" logic with it, and which accepts Created as well as
+  Modified, unlike the stock watcher;
+* the same file sweeps assets/cinecam/ once on
+  CAssetManager::signalScanningCompleted, for files copied in while the
+  editor was closed;
+* three CAssetImporters, one per extension, make drag-and-drop onto the
+  Asset Browser and File -> Import work at all: the drop handler gates on
+  importers and never looks at asset types (AssetDropHandler.cpp:67-83).
+  One importer per extension so the import dialog offers one type rather
+  than asking whether a .cube might be a CDL;
+* cinecam_RegisterAssets on the console re-runs the sweep by hand.
+
+All four entry points share one writer: new CAsset + CEditableAsset::
+WriteToFile - the engine's own sidecar writer, reached through the
+exported CAssetImportContext::CreateEditableAsset - then MergeAssets, the
+same two calls CAssetFileMonitor::LoadAsset makes.
+
+Two invariants it never breaks: an existing .cryasset is never rewritten
+(it carries the asset's GUID, and re-issuing that would break every
+reference to it), and nothing outside assets/cinecam/ is touched on our
+own initiative - the importer being the exception, because the user
+pointed at the destination folder.
+
+Names IsValidAssetPath rejects are deliberately accepted. That rule is a
+creation-time rule for types RC compiles; nothing on the loading side
+enforces it, so the sidecar loads, lists and picks correctly. The only
+consequence is that the browser's Name column cuts the label at the first
+dot, which is documented.
+
+Nothing outside the editor plugin changed: no renderer, no engine plugin,
+no EditorQt, no EditorCommon, no RC config. Docs: README's picker
+paragraph, SceneReferredLook §2 and its troubleshooting table,
+ConsoleReference gains cinecam_RegisterAssets.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01ADgAiBYv9AxSd54s1FPREm
+---
+ Code/CryPlugins/CinematicCamera/README.md     |   8 +-
+ .../CinematicCamera/docs/ConsoleReference.md  |  10 +
+ .../CinematicCamera/docs/SceneReferredLook.md |  20 +-
+ .../CinematicCameraEditor/CMakeLists.txt      |   2 +
+ .../CineCamAssetRegistration.cpp              | 430 ++++++++++++++++++
+ .../CineCamAssetRegistration.h                |  65 +++
+ .../CinematicCameraEditor/CineCamAssetTypes.h |  19 +-
+ .../CinematicCameraEditorPlugin.cpp           |  17 +
+ .../CinematicCameraEditorPlugin.h             |  13 +-
+ 9 files changed, 571 insertions(+), 13 deletions(-)
+ create mode 100644 Code/Sandbox/Plugins/CinematicCameraEditor/CineCamAssetRegistration.cpp
+ create mode 100644 Code/Sandbox/Plugins/CinematicCameraEditor/CineCamAssetRegistration.h
+
+diff --git a/Code/CryPlugins/CinematicCamera/README.md b/Code/CryPlugins/CinematicCamera/README.md
+index f01aff6c..412efd4c 100644
+--- a/Code/CryPlugins/CinematicCamera/README.md
++++ b/Code/CryPlugins/CinematicCamera/README.md
+@@ -330,8 +330,12 @@ Both LUT paths - this one and **LMT File** on the CineCam Grade component - are
+ the button opens the Asset Browser filtered to **Colour LUT (.cube)**, which lists the project's
+ LUTs and the engine's. Both are resolved through the pak system: first as given, relative to the
+ project's asset directory, then under `%ENGINE%`. Install the plugin's `Assets/cinecam` folder into
+-either tree and the same string works in the editor and in the launcher. A `.cube` copied into
+-`Assets/cinecam/luts/` becomes a pickable asset by itself (the editor writes its `.cryasset`).
++either tree and the same string works in the editor and in the launcher. **A `.cube` copied into
++`Assets/cinecam/luts/` registers itself**: the editor writes that one file's `.cryasset` within a
++second or two and the LUT is in the browser and the picker - no Resource Compiler, no
++"Generate/Repair Metadata", and existing sidecars are never rewritten. Dragging a cube from
++Explorer onto the Asset Browser, or File → Import, copies it in and registers it the same way;
++`cinecam_RegisterAssets` on the console does it by hand if a file is ever missed.
+ Levels saved before the folder move keep working: an old `Assets/ODT/...` path that no longer
+ resolves is retried under the new folder, with a line in the console. Parse and load errors are
+ logged once per path, with the reason.
+diff --git a/Code/CryPlugins/CinematicCamera/docs/ConsoleReference.md b/Code/CryPlugins/CinematicCamera/docs/ConsoleReference.md
+index 5ca8c99f..4a9fd859 100644
+--- a/Code/CryPlugins/CinematicCamera/docs/ConsoleReference.md
++++ b/Code/CryPlugins/CinematicCamera/docs/ConsoleReference.md
+@@ -767,6 +767,16 @@ they are not tied to any one camera entity.
+ | Why it is a command and not automatic | A take belongs beside its frames, under `%USER%`, and an EXR sequence is not an asset. This is the explicit step that says "this grade is worth keeping". |
+ | Notes | Frames are never copied. Existing files of the same name are overwritten, sidecar included, which re-identifies the asset - copy a take you want to keep to a new name first. |
+ 
++### cinecam_RegisterAssets
++
++| | |
++| --- | --- |
++| Syntax | `cinecam_RegisterAssets` |
++| Where | The **editor only** - it lives in `CinematicCameraEditor.dll`, not in the engine plugin. |
++| Purpose | Registers every `.cube`, `.cdl` and `.cinegrade` under `Assets/cinecam/` that the Asset Browser does not know about yet, by writing that one file's `.cryasset`. Prints how many it registered. |
++| Why you should not need it | The editor watches `Assets/cinecam/` and does this per file as soon as one appears, and sweeps the folder once at start-up for anything copied in while it was closed. The command is the manual fallback for a file-system event that never arrived (a network share, an unpacked archive). |
++| Notes | Never rewrites an existing `.cryasset` - that file carries the asset's GUID, and re-issuing it would break every reference. Never touches anything outside `Assets/cinecam/`. Never invokes the Resource Compiler, so it is not the stock "Generate/Repair Metadata", which regenerates the whole asset directory and does not know these three extensions in the first place. |
++
+ ### cinecam_EditorLookEV
+ 
+ | | |
+diff --git a/Code/CryPlugins/CinematicCamera/docs/SceneReferredLook.md b/Code/CryPlugins/CinematicCamera/docs/SceneReferredLook.md
+index 49874fcb..a3a43df4 100644
+--- a/Code/CryPlugins/CinematicCamera/docs/SceneReferredLook.md
++++ b/Code/CryPlugins/CinematicCamera/docs/SceneReferredLook.md
+@@ -82,8 +82,23 @@ Code/CryPlugins/CinematicCamera/Assets/cinecam/
+ Every one of those files is a **CryEngine asset**: it has a `.cryasset` beside it, it appears in
+ the Asset Browser under **Colour LUT (.cube)**, and it can be picked. The **ODT File** field opens
+ the Asset Browser filtered to LUTs, in both the project and the engine root - so a cube installed
+-only into the engine tree can be picked as well as loaded. Copy any `.cube` into
+-`Assets/cinecam/luts/` and the editor writes its metadata for you; it is then in the picker too.
++only into the engine tree can be picked as well as loaded.
++
++**Drop a file in and it registers itself.** Copy a `.cube`, a `.cdl` or a `.cinegrade` into
++`Assets/cinecam/` (any depth) while the editor is running and, within a second or two, its
++`.cryasset` appears beside it and the file is in the Asset Browser and in the pickers. Dragging a
++file from Explorer onto the Asset Browser does the same and copies it in for you, as does
++**File → Import**. Files copied in while the editor was closed are picked up the next time it
++starts. Three things this never does: it never rewrites a `.cryasset` that already exists (that
++file carries the asset's identity), it never touches anything outside `Assets/cinecam/`, and it
++never runs the Resource Compiler - so **you never need "Generate/Repair Metadata"** for a grade
++file. If a file ever does not show up, `cinecam_RegisterAssets` on the console registers everything
++under `Assets/cinecam/` that is not registered yet, one sidecar per file, and leaves the rest alone.
++
++Vendor LUT names are taken as they are, dots and all. The Asset Browser's *Name* column cuts a name
++at its first dot (`XT3_FLog_FGamut_to_ETERNA_BT.709_33grid_V.1.01.cube` is listed as
++`XT3_FLog_FGamut_to_ETERNA_BT`), but the file name on disk, the picker and the loader all use the
++whole thing - the label is the only thing that is short.
+ 
+ `luts/system/` holds files that are machinery, not choices: the inverse output transform exists so
+ that a Rec.709 look LUT can be wrapped (section 3) and nobody should ever select it. It is a
+@@ -437,6 +452,7 @@ effects.
+ | a look LUT makes the picture violently wrong - crushed, posterised, wrong colour | it is almost certainly a **Rec.709 display** LUT loaded as if it were ACEScct. Set **LMT Input Space** to *Rec.709 display* |
+ | the console says a LUT is being *loaded RAW* | the wrap needs `Assets/cinecam/luts/system/odt_srgb_100nit_aces2_inv_65.cube` and cannot find it. Install the whole `Assets/cinecam` folder, or re-bake it with `uv run bake.py --preset odt_srgb_100nit_inv` |
+ | the console says *THE FILE WINS* | the cube carries its own `# ReC-LUT-Space:` line and it disagrees with the property. Either fix the property or edit the line out of the file |
++| a cube copied into `Assets/cinecam/luts/` does not appear in the browser or the picker | run `cinecam_RegisterAssets` on the console; it says how many files it registered. If it says 0, the file is not under `Assets/cinecam/` in the **project's** asset tree (the engine tree is deliberately not watched - see section 2) |
+ | editing a cube on disk changes nothing | `cinecam_LutHotReload` is 0 (the launcher default). Set it to 30 |
+ | a cube edit made the picture go away for a moment and come back | it did not - a reload that fails keeps the previous LUT. Look for the warning; the file was probably half written and the next poll picked it up |
+ 
+diff --git a/Code/Sandbox/Plugins/CinematicCameraEditor/CMakeLists.txt b/Code/Sandbox/Plugins/CinematicCameraEditor/CMakeLists.txt
+index 697dbc07..f7447949 100644
+--- a/Code/Sandbox/Plugins/CinematicCameraEditor/CMakeLists.txt
++++ b/Code/Sandbox/Plugins/CinematicCameraEditor/CMakeLists.txt
+@@ -5,6 +5,8 @@ add_sources("NoUberFile"
+ 	SOURCE_GROUP "Root"
+ 		"CineCamAssetTypes.h"
+ 		"CineCamAssetTypes.cpp"
++		"CineCamAssetRegistration.h"
++		"CineCamAssetRegistration.cpp"
+ 		"CinematicCameraEditorPlugin.h"
+ 		"CinematicCameraEditorPlugin.cpp"
+ 		"StdAfx.h"
+diff --git a/Code/Sandbox/Plugins/CinematicCameraEditor/CineCamAssetRegistration.cpp b/Code/Sandbox/Plugins/CinematicCameraEditor/CineCamAssetRegistration.cpp
+new file mode 100644
+index 00000000..da8ceda0
+--- /dev/null
++++ b/Code/Sandbox/Plugins/CinematicCameraEditor/CineCamAssetRegistration.cpp
+@@ -0,0 +1,430 @@
++// Copyright 2026 ReC Sandbox. Distributed under the terms in LICENSE.md at the repository root.
++#include "StdAfx.h"
++#include "CineCamAssetRegistration.h"
++
++#include <AssetSystem/Asset.h>
++#include <AssetSystem/AssetImportContext.h>
++#include <AssetSystem/AssetImporter.h>
++#include <AssetSystem/AssetManager.h>
++#include <AssetSystem/AssetManagerHelpers.h>
++#include <AssetSystem/AssetType.h>
++#include <AssetSystem/EditableAsset.h>
++#include <AssetSystem/Loader/AssetLoaderHelpers.h>
++#include <FileUtils.h>
++#include <IEditor.h>
++#include <PathUtils.h>
++#include <QtUtil.h>
++
++#include <CrySystem/ConsoleRegistration.h>
++#include <CrySystem/File/ICryPak.h>
++#include <CrySystem/File/IFileChangeMonitor.h>
++#include <CryString/CryPath.h>
++
++#include <QDir>
++
++namespace CineCamAssets
++{
++
++const char* const kWatchedFolder = "assets/cinecam";
++
++namespace
++{
++
++//! Extension -> registered type name. THE SAME CONTRACT as CineCamAssetTypes.h (and as the engine
++//! plugin's CINECAM_ASSET_TYPE_*): the type name goes into every sidecar's type= attribute, and
++//! CAsset's constructor resolves it through CAssetManager::FindAssetType.
++struct SKnownType
++{
++	const char* szExt;
++	const char* szTypeName;
++};
++
++const SKnownType kKnownTypes[] =
++{
++	{ "cube",      "CineLut"   },
++	{ "cdl",       "CineCDL"   },
++	{ "cinegrade", "CineGrade" },
++};
++
++//! True when the path is inside kWatchedFolder. Case-insensitive: the file monitor reports whatever
++//! case the file system gives it.
++bool IsInWatchedFolder(const string& gameRelPath)
++{
++	const size_t len = strlen(kWatchedFolder);
++	return gameRelPath.length() > len
++	       && strnicmp(gameRelPath.c_str(), kWatchedFolder, len) == 0
++	       && gameRelPath[len] == '/';
++}
++
++string ToGameRelative(const char* szPath)
++{
++	string path = PathUtil::ToUnixPath(string(szPath));
++	// The file monitor hands out paths that are already relative to the asset root; be tolerant of
++	// a leading separator so a caller (the console command, say) cannot trip over it.
++	while (!path.empty() && path[0] == '/')
++	{
++		path.erase(0, 1);
++	}
++	return path;
++}
++
++//! The one place a sidecar is created. Returns the asset, or nullptr.
++//! Never rewrites: if the `.cryasset` is already on disk it is loaded as it stands, so the GUID a
++//! level or a preset may already reference survives.
++CAsset* MakeAsset(const string& gameRelDataFile, const char* szTypeName)
++{
++	const string metadataFile = gameRelDataFile + ".cryasset";
++
++	if (gEnv->pCryPak->IsFileExist(metadataFile.c_str(), ICryPak::eFileLocation_OnDisk))
++	{
++		return AssetLoader::CAssetFactory::LoadAssetFromXmlFile(metadataFile.c_str());
++	}
++
++	if (!CAssetManager::GetInstance()->FindAssetType(szTypeName))
++	{
++		CryWarning(VALIDATOR_MODULE_EDITOR, VALIDATOR_WARNING,
++		           "[cinecam] asset type '%s' is not registered - '%s' cannot be registered",
++		           szTypeName, gameRelDataFile.c_str());
++		return nullptr;
++	}
++
++	// The asset's display name is what the browser shows in the Name column. AssetLoader::GetAssetName
++	// cuts at the FIRST dot, so a vendor LUT called "..._BT.709_33grid_V.1.01.cube" would be listed
++	// as "..._BT". Passing the full stem keeps the whole name visible; nothing downstream parses it
++	// (files, picker results and lookups all go through the paths).
++	const string displayName = PathUtil::RemoveExtension(PathUtil::GetFile(gameRelDataFile));
++
++	CAsset* const pAsset = new CAsset(szTypeName, CryGUID::Create(), displayName.c_str());
++
++	// CEditableAsset's constructor is private to a list of friends; CAssetImportContext is one of
++	// them and hands one out (AssetImportContext.cpp:131-134). This is the supported route for code
++	// outside EditorCommon, and it is what CAssetType::Create does internally.
++	CAssetImportContext ctx;
++	CEditableAsset editable = ctx.CreateEditableAsset(*pAsset);
++	editable.SetMetadataFile(metadataFile.c_str());
++	editable.SetFiles({ gameRelDataFile });
++
++	// CAsset::WriteToFile is the engine's own sidecar writer (Asset.cpp:362-376): it emits exactly
++	// the XML AssetLoader::ReadMetadata expects and makes the File path relative to the asset's
++	// folder for us. Writing it by hand would be a second definition of the format.
++	if (!editable.WriteToFile())
++	{
++		CryWarning(VALIDATOR_MODULE_EDITOR, VALIDATOR_WARNING,
++		           "[cinecam] could not write '%s' - the file is on disk but the Asset Browser will "
++		           "not see it", metadataFile.c_str());
++		delete pAsset;
++		return nullptr;
++	}
++
++	CryLog("[cinecam] registered '%s' as %s", gameRelDataFile.c_str(), szTypeName);
++	return pAsset;
++}
++
++// ---------------------------------------------------------------------------
++// The file-change listener
++// ---------------------------------------------------------------------------
++
++//! CAsyncFileListener gives us the FIFO queue and the "the file is still open for writing, try again
++//! in half a second" retry (AssetManagerHelpers.cpp:140-166, :163-185) - which matters, because a
++//! 7 MB 65-cube arrives as a create event long before the copy has finished.
++class CCineCamAssetWatcher : public AssetManagerHelpers::CAsyncFileListener
++{
++public:
++	virtual bool AcceptFile(const char* szFilename, EChangeType eType) override
++	{
++		// Unlike CAssetGenerator (AssetGenerator.cpp:77-81) we accept Created as well as Modified:
++		// a plain Explorer copy usually raises both, but FileChangeMonitor collapses consecutive
++		// identical events, so relying on the second one is a bet rather than a design.
++		if (eType != eChangeType_Created
++		    && eType != eChangeType_Modified
++		    && eType != eChangeType_RenamedNewName)
++		{
++			return false;
++		}
++
++		const string path = ToGameRelative(szFilename);
++		return IsInWatchedFolder(path) && TypeNameForExtension(PathUtil::GetExt(path.c_str())) != nullptr;
++	}
++
++	virtual bool ProcessFile(const char* szFilename, EChangeType eType) override
++	{
++		RegisterFile(ToGameRelative(szFilename));
++		return true;
++	}
++};
++
++CCineCamAssetWatcher* g_pWatcher = nullptr;
++bool g_sweptOnce = false;
++
++void OnScanningCompleted()
++{
++	if (g_sweptOnce)
++	{
++		return;
++	}
++	g_sweptOnce = true;
++	SweepWatchedFolder();
++}
++
++void CmdRegisterAssets(IConsoleCmdArgs*)
++{
++	const int count = SweepWatchedFolder();
++	CryLogAlways("[cinecam] cinecam_RegisterAssets: %d new file(s) registered under '%s'",
++	             count, kWatchedFolder);
++}
++
++} // anonymous namespace
++
++// ---------------------------------------------------------------------------
++// The asset importer - drag and drop, and File -> Import
++// ---------------------------------------------------------------------------
++
++//! Without this, the Asset Browser refuses a dropped `.cube` outright: CAssetDropHandler asks the
++//! registered importers which extensions they take (AssetDropHandler.cpp:46-49, 67-83) and never
++//! looks at the asset types. It is also the only route for a LUT that lives outside the project -
++//! the file is copied into the folder the user dropped it on.
++//!
++//! One importer per extension, not one for all three: CAssetDropHandler::ImportExt collects the
++//! asset types of every importer that claims the extension and offers all of them in the import
++//! dialog (AssetDropHandler.cpp:232-243). A single three-extension importer would therefore ask
++//! "is this .cube a Colour LUT, an ASC CDL or a Grade Preset?" for every dropped file.
++class CCineCamAssetImporterBase : public CAssetImporter
++{
++public:
++	virtual std::vector<string> GetFileExtensions() const override { return { GetExtension() }; }
++	virtual std::vector<string> GetAssetTypes() const override     { return { TypeNameForExtension(GetExtension()) }; }
++
++protected:
++	virtual const char* GetExtension() const = 0;
++
++private:
++	virtual std::vector<string> GetAssetNames(const std::vector<string>&, CAssetImportContext& ctx) override
++	{
++		// NOT ctx.GetOutputFilePath(): that is PathUtil::Make(dir, name, ext), i.e.
++		// ReplaceExtension(name, ext), which cuts the name at its LAST dot - so a LUT called
++		// "..._V.1.01.cube" would be given a sidecar called "..._V.1.cube.cryasset", which belongs to
++		// no file. The sidecar is always <data file>.cryasset, spelled out.
++		return { ctx.GetOutputSourceFilePath() + ".cryasset" };
++	}
++
++	virtual std::vector<CAsset*> ImportAssets(const std::vector<string>&, CAssetImportContext& ctx) override
++	{
++		const string gameRelDataFile = PathUtil::ToUnixPath(ctx.GetOutputSourceFilePath());
++		const char* const szTypeName = TypeNameForExtension(PathUtil::GetExt(gameRelDataFile.c_str()));
++		if (!szTypeName)
++		{
++			return {};
++		}
++
++		const string absDataFile = PathUtil::Make(PathUtil::GetGameProjectAssetsPath(), gameRelDataFile);
++		const string absInputFile = PathUtil::ToUnixPath(ctx.GetInputFilePath());
++
++		if (stricmp(absInputFile.c_str(), PathUtil::ToUnixPath(absDataFile).c_str()) != 0)
++		{
++			QDir().mkpath(QtUtil::ToQString(PathUtil::GetPathWithoutFilename(absDataFile)));
++
++			if (!ctx.CanWrite(absDataFile) || !FileUtils::CopyFileAllowOverwrite(absInputFile.c_str(), absDataFile.c_str()))
++			{
++				CryWarning(VALIDATOR_MODULE_EDITOR, VALIDATOR_WARNING,
++				           "[cinecam] could not copy '%s' to '%s'", absInputFile.c_str(), absDataFile.c_str());
++				return {};
++			}
++		}
++
++		// MakeAsset leaves an existing sidecar alone, so re-importing the same LUT refreshes the file
++		// and keeps its GUID. The caller merges what we return, on the main thread
++		// (AssetDropHandler.cpp:180-187).
++		CAsset* const pAsset = MakeAsset(gameRelDataFile, szTypeName);
++		return pAsset ? std::vector<CAsset*>{ pAsset } : std::vector<CAsset*>{};
++	}
++};
++
++class CCineLutAssetImporter : public CCineCamAssetImporterBase
++{
++public:
++	DECLARE_ASSET_IMPORTER_DESC(CCineLutAssetImporter);
++protected:
++	virtual const char* GetExtension() const override { return "cube"; }
++};
++
++class CCineCdlAssetImporter : public CCineCamAssetImporterBase
++{
++public:
++	DECLARE_ASSET_IMPORTER_DESC(CCineCdlAssetImporter);
++protected:
++	virtual const char* GetExtension() const override { return "cdl"; }
++};
++
++class CCineGradeAssetImporter : public CCineCamAssetImporterBase
++{
++public:
++	DECLARE_ASSET_IMPORTER_DESC(CCineGradeAssetImporter);
++protected:
++	virtual const char* GetExtension() const override { return "cinegrade"; }
++};
++
++REGISTER_ASSET_IMPORTER(CCineLutAssetImporter)
++REGISTER_ASSET_IMPORTER(CCineCdlAssetImporter)
++REGISTER_ASSET_IMPORTER(CCineGradeAssetImporter)
++
++// ---------------------------------------------------------------------------
++// Public entry points
++// ---------------------------------------------------------------------------
++
++const char* TypeNameForExtension(const char* szExt)
++{
++	if (!szExt || !*szExt)
++	{
++		return nullptr;
++	}
++	for (const auto& known : kKnownTypes)
++	{
++		if (stricmp(szExt, known.szExt) == 0)
++		{
++			return known.szTypeName;
++		}
++	}
++	return nullptr;
++}
++
++CAsset* CreateAssetForFile(const string& gameRelDataFile)
++{
++	const char* const szTypeName = TypeNameForExtension(PathUtil::GetExt(gameRelDataFile.c_str()));
++	if (!szTypeName)
++	{
++		return nullptr;
++	}
++	if (!gEnv->pCryPak->IsFileExist(gameRelDataFile.c_str(), ICryPak::eFileLocation_OnDisk))
++	{
++		return nullptr;
++	}
++	return MakeAsset(gameRelDataFile, szTypeName);
++}
++
++bool RegisterFile(const string& gameRelDataFile)
++{
++	CAssetManager* const pManager = CAssetManager::GetInstance();
++	if (!pManager)
++	{
++		return false;
++	}
++
++	if (pManager->FindAssetForFile(gameRelDataFile.c_str()))
++	{
++		return true; // Already known - nothing to write, nothing to say.
++	}
++
++	CAssetPtr pAsset = CreateAssetForFile(gameRelDataFile);
++	if (!pAsset)
++	{
++		return false;
++	}
++
++	// Same two lines CAssetFileMonitor::LoadAsset uses (AssetFileMonitor.cpp:94-104). MergeAssets
++	// updates an asset with the same metadata path instead of duplicating it, and defers safely
++	// while the initial scan is still running (AssetManager.cpp:385-392).
++	pManager->MergeAssets({ pAsset.ReleaseOwnership() });
++	return true;
++}
++
++int SweepWatchedFolder()
++{
++	CAssetManager* const pManager = CAssetManager::GetInstance();
++	if (!pManager)
++	{
++		return 0;
++	}
++
++	const string absFolder = PathUtil::Make(PathUtil::GetGameProjectAssetsPath(), kWatchedFolder);
++	if (!FileUtils::FolderExists(absFolder))
++	{
++		return 0;
++	}
++
++	// Returns paths already relative to the asset root (FileUtils.cpp:19-43).
++	const std::vector<string> content = FileUtils::GetDirectorysContent(absFolder);
++
++	int registered = 0;
++	for (const string& file : content)
++	{
++		const string gameRelPath = PathUtil::ToUnixPath(file);
++		if (!IsInWatchedFolder(gameRelPath) || !TypeNameForExtension(PathUtil::GetExt(gameRelPath.c_str())))
++		{
++			continue;
++		}
++		if (pManager->FindAssetForFile(gameRelPath.c_str()))
++		{
++			continue;
++		}
++		if (RegisterFile(gameRelPath))
++		{
++			++registered;
++		}
++	}
++	return registered;
++}
++
++void Install()
++{
++	if (g_pWatcher)
++	{
++		return;
++	}
++
++	g_pWatcher = new CCineCamAssetWatcher();
++
++	// One listener per extension. The folder argument is a prefix the monitor matches itself
++	// (EditorFileMonitor.cpp:236-247), so events outside assets/cinecam never reach us at all.
++	IFileChangeMonitor* const pMonitor = GetIEditor() ? GetIEditor()->GetFileMonitor() : nullptr;
++	if (pMonitor)
++	{
++		for (const auto& known : kKnownTypes)
++		{
++			pMonitor->RegisterListener(g_pWatcher, kWatchedFolder, known.szExt);
++		}
++	}
++	else
++	{
++		CryWarning(VALIDATOR_MODULE_EDITOR, VALIDATOR_WARNING,
++		           "[cinecam] no file monitor - dropped grade files will not register themselves");
++	}
++
++	// Files copied in while the editor was closed are not events; sweep once, as soon as the asset
++	// manager knows what it already has.
++	if (CAssetManager* const pManager = CAssetManager::GetInstance())
++	{
++		pManager->signalScanningCompleted.Connect([]() { OnScanningCompleted(); }, (uintptr_t)&kKnownTypes);
++	}
++
++	REGISTER_COMMAND("cinecam_RegisterAssets", CmdRegisterAssets, VF_NULL,
++	                 "cinecam_RegisterAssets\n"
++	                 "Registers every LUT / CDL / grade preset under assets/cinecam that the Asset\n"
++	                 "Browser does not know about yet, one sidecar per file. Existing sidecars are\n"
++	                 "left alone. Normally unnecessary - the editor does this by itself when a file\n"
++	                 "appears - but harmless to run.");
++}
++
++void Uninstall()
++{
++	if (CAssetManager* const pManager = CAssetManager::GetInstance())
++	{
++		pManager->signalScanningCompleted.DisconnectById((uintptr_t)&kKnownTypes);
++	}
++
++	if (g_pWatcher)
++	{
++		if (IFileChangeMonitor* const pMonitor = GetIEditor() ? GetIEditor()->GetFileMonitor() : nullptr)
++		{
++			pMonitor->UnregisterListener(g_pWatcher);
++		}
++		delete g_pWatcher;
++		g_pWatcher = nullptr;
++	}
++
++	if (gEnv && gEnv->pConsole)
++	{
++		gEnv->pConsole->RemoveCommand("cinecam_RegisterAssets");
++	}
++}
++
++}
+diff --git a/Code/Sandbox/Plugins/CinematicCameraEditor/CineCamAssetRegistration.h b/Code/Sandbox/Plugins/CinematicCameraEditor/CineCamAssetRegistration.h
+new file mode 100644
+index 00000000..c4338915
+--- /dev/null
++++ b/Code/Sandbox/Plugins/CinematicCameraEditor/CineCamAssetRegistration.h
+@@ -0,0 +1,65 @@
++// Copyright 2026 ReC Sandbox. Distributed under the terms in LICENSE.md at the repository root.
++//
++// Per-file asset registration for the CineCam grade files (S10 item 4b-fix).
++//
++// The problem this solves: dropping a `.cube` into `assets/cinecam/luts/` did nothing at all. The
++// stock watcher (CAssetGenerator) rejects the file before it does any work, silently, because
++// CAssetType::IsValidAssetPath forbids a dot in the asset name (AssetType.cpp:382-388) - and every
++// second vendor LUT is called something like "XT3_FLog_FGamut_to_ETERNA_BT.709_33grid_V.1.01.cube".
++// The whole-project "Generate/Repair Metadata" would not have helped either: it runs one fixed job
++// file, Tools/cryassets/rcjob_cryassets.xml, whose sixteen-extension list contains none of ours.
++// Full analysis: scene-notes/research/s10-4b-fix-file-registration.md.
++//
++// What we do instead, entirely inside this DLL and without ever invoking the Resource Compiler:
++//
++//   * a file-change listener on `assets/cinecam/`: a new .cube / .cdl / .cinegrade gets its own
++//     `.cryasset` written and is handed to the asset manager - one file, one sidecar;
++//   * a one-shot sweep of the same folder once the asset manager's initial scan is done, for files
++//     that were copied in while the editor was closed;
++//   * an asset importer for the three extensions, so dragging a file from Explorer onto the Asset
++//     Browser (and File -> Import) works at all - the browser gates drops on importers, never on
++//     types (AssetDropHandler.cpp:67-83);
++//   * `cinecam_RegisterAssets` on the console, to re-run the sweep by hand.
++//
++// Two rules the implementation never breaks:
++//   1. an existing `.cryasset` is never rewritten. It carries the asset's GUID; re-issuing that
++//      would break every reference to it.
++//   2. nothing outside `assets/cinecam/` is touched on our own initiative. The importer is the one
++//      exception, and only because the user pointed at the destination folder themselves.
++#pragma once
++
++#include <CryString/CryString.h>
++
++class CAsset;
++
++namespace CineCamAssets
++{
++
++//! The one folder this plugin watches, relative to the project's asset root. Lower case, unix
++//! separators, no trailing slash - it is compared with strnicmp against the file monitor's paths.
++extern const char* const kWatchedFolder;
++
++//! The registered CAssetType name for a data-file extension we own ("cube" -> "CineLut"), or
++//! nullptr for anything else. The strings are the same contract as CineCamAssetTypes.h.
++const char* TypeNameForExtension(const char* szExt);
++
++//! Builds the asset for one data file and writes its `.cryasset`, unless one already exists - in
++//! which case the existing sidecar is loaded as it stands and nothing is written.
++//! \param gameRelDataFile Path to the data file, relative to the assets root, unix separators.
++//! \return A new CAsset the caller must hand to CAssetManager::MergeAssets, or nullptr.
++CAsset* CreateAssetForFile(const string& gameRelDataFile);
++
++//! CreateAssetForFile + MergeAssets. Returns true if the file is registered afterwards.
++bool RegisterFile(const string& gameRelDataFile);
++
++//! Registers every file under kWatchedFolder that the asset manager does not know yet.
++//! \return The number of files newly registered.
++int SweepWatchedFolder();
++
++//! Called once from the plugin's constructor: file listener, scan-completed hook, console command.
++void Install();
++
++//! Called once from the plugin's destructor.
++void Uninstall();
++
++}
+diff --git a/Code/Sandbox/Plugins/CinematicCameraEditor/CineCamAssetTypes.h b/Code/Sandbox/Plugins/CinematicCameraEditor/CineCamAssetTypes.h
+index dbadc977..01beaa7f 100644
+--- a/Code/Sandbox/Plugins/CinematicCameraEditor/CineCamAssetTypes.h
++++ b/Code/Sandbox/Plugins/CinematicCameraEditor/CineCamAssetTypes.h
+@@ -7,16 +7,16 @@
+ //
+ //   * the Asset Browser lists the files with a type name, an icon and a colour, in the project AND
+ //     under %engine% (CAssetManager scans both, AssetManager.cpp:115/307);
+-//   * a `.cube` (or `.cdl`, or `.cinegrade`) copied into the project gets its `.cryasset` written
+-//     for it, because CAssetGenerator registers a file-monitor listener per registered extension
+-//     whose CanAutoRepairMetadata() is true (AssetGenerator.cpp:151-179) and RC's metadata
+-//     compiler has a generic fallback for any extension it does not special-case
+-//     (MetadataCompiler.cpp:403-405);
+ //   * every component property that names one of these types by string gets an Asset Browser
+ //     picker, because CAssetManager::RegisterAssetResourceSelectors (AssetManager.cpp:728-742)
+ //     creates one selector per type whose IsUsingGenericPropertyTreePicker() is true - which is
+ //     the default.
+ //
++// Registration does NOT buy metadata generation, and that was item 4b's failure (step 5). Making a
++// file that appears on disk into an asset is CineCamAssetRegistration.h's job: this plugin writes
++// the `.cryasset` itself, one file at a time, without the Resource Compiler. See the header comment
++// there and scene-notes/research/s10-4b-fix-file-registration.md.
++//
+ // So the whole of item 4b's editor half is three headers' worth of declarations. Anything more
+ // (a thumbnail renderer, an editor window, a "New LUT" command) would be a second, weaker copy of
+ // something that already exists elsewhere - the bake tool, Resolve, or the component's own Export
+@@ -54,6 +54,11 @@ public:
+ 	//! No editor window. Editing a LUT means editing the file, which the plugin hot-reloads
+ 	//! (cinecam_LutHotReload).
+ 	virtual bool        CanBeEdited() const override      { return false; }
++	//! We generate our own metadata, per file, in CineCamAssetRegistration.cpp. Returning false here
++	//! takes "cube" out of CAssetGenerator's file-monitor list and out of its /assettypes= string
++	//! (AssetGenerator.cpp:159-168), so rc.exe is never launched for a LUT and the two writers cannot
++	//! race for the same sidecar with two different GUIDs. CScriptType / CXmlType say the same.
++	virtual bool        CanAutoRepairMetadata() const override { return false; }
+ 	virtual QColor      GetThumbnailColor() const override { return QColor(126, 168, 219); }
+ 
+ private:
+@@ -76,6 +81,8 @@ public:
+ 	virtual bool        CanBeCreated() const override     { return false; }
+ 	virtual bool        CanBeCopied() const override      { return true; }
+ 	virtual bool        CanBeEdited() const override      { return false; }
++	//! \sa CCineLutAssetType::CanAutoRepairMetadata
++	virtual bool        CanAutoRepairMetadata() const override { return false; }
+ 	virtual QColor      GetThumbnailColor() const override { return QColor(214, 166, 96); }
+ 
+ private:
+@@ -101,6 +108,8 @@ public:
+ 	virtual bool        CanBeCreated() const override     { return false; }
+ 	virtual bool        CanBeCopied() const override      { return true; }
+ 	virtual bool        CanBeEdited() const override      { return false; }
++	//! \sa CCineLutAssetType::CanAutoRepairMetadata
++	virtual bool        CanAutoRepairMetadata() const override { return false; }
+ 	virtual QColor      GetThumbnailColor() const override { return QColor(163, 205, 143); }
+ 
+ private:
+diff --git a/Code/Sandbox/Plugins/CinematicCameraEditor/CinematicCameraEditorPlugin.cpp b/Code/Sandbox/Plugins/CinematicCameraEditor/CinematicCameraEditorPlugin.cpp
+index f0c8e6b2..2fd47092 100644
+--- a/Code/Sandbox/Plugins/CinematicCameraEditor/CinematicCameraEditorPlugin.cpp
++++ b/Code/Sandbox/Plugins/CinematicCameraEditor/CinematicCameraEditorPlugin.cpp
+@@ -2,6 +2,23 @@
+ #include "StdAfx.h"
+ #include "CinematicCameraEditorPlugin.h"
+ 
++#include "CineCamAssetRegistration.h"
++
+ #include <CryCore/Platform/platform_impl.inl>
+ 
++// The constructor runs after REGISTER_PLUGIN has installed GetIEditor() and ISystem, and before
++// RegisterPlugin() drains the auto-register lists - which is fine: the file listener is keyed on our
++// own extension table, not on the asset types. Both CAssetManager and CEditorFileMonitor already
++// exist by then (IEditorImpl.cpp:141/143), and CAssetManager::Init - which starts the scan the sweep
++// waits for - runs afterwards (CryEdit.cpp:557 loads plugins, :721 initialises the asset manager).
++CCinematicCameraEditorPlugin::CCinematicCameraEditorPlugin()
++{
++	CineCamAssets::Install();
++}
++
++CCinematicCameraEditorPlugin::~CCinematicCameraEditorPlugin()
++{
++	CineCamAssets::Uninstall();
++}
++
+ REGISTER_PLUGIN(CCinematicCameraEditorPlugin);
+diff --git a/Code/Sandbox/Plugins/CinematicCameraEditor/CinematicCameraEditorPlugin.h b/Code/Sandbox/Plugins/CinematicCameraEditor/CinematicCameraEditorPlugin.h
+index f5fe97fe..8ce50075 100644
+--- a/Code/Sandbox/Plugins/CinematicCameraEditor/CinematicCameraEditorPlugin.h
++++ b/Code/Sandbox/Plugins/CinematicCameraEditor/CinematicCameraEditorPlugin.h
+@@ -4,17 +4,22 @@
+ #include "IPlugin.h"
+ 
+ //! The editor half of the cinematic camera (S10 item 4b): it registers the three asset types the
+-//! display chain's files need, and nothing else. Deliberately separate from the S9 editor work,
+-//! which lives in Sandbox itself (the viewport's CineCam camera) - this DLL has no UI, no viewport
+-//! and no state, so it can be deployed on its own and removed on its own.
++//! display chain's files need, and the per-file registration that turns a file someone dropped into
++//! `assets/cinecam/` into one of them. Deliberately separate from the S9 editor work, which lives in
++//! Sandbox itself (the viewport's CineCam camera) - this DLL has no UI, no viewport and no state, so
++//! it can be deployed on its own and removed on its own.
+ class CCinematicCameraEditorPlugin : public IPlugin
+ {
+ public:
++	CCinematicCameraEditorPlugin();
++	~CCinematicCameraEditorPlugin();
++
+ 	int32       GetPluginVersion() override     { return 1; }
+ 	const char* GetPluginName() override        { return "Cinematic Camera Editor"; }
+ 	const char* GetPluginDescription() override
+ 	{
+ 		return "Asset types for the cinematic camera's display chain: colour LUTs (.cube), "
+-		       "ASC CDLs (.cdl) and CineCam Grade presets (.cinegrade).";
++		       "ASC CDLs (.cdl) and CineCam Grade presets (.cinegrade). Files dropped into "
++		       "assets/cinecam register themselves.";
+ 	}
+ };
+-- 
+2.47.1.windows.1
+

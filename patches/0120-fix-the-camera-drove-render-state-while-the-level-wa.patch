@@ -1,0 +1,481 @@
+From f5891aab3642d95b0e57ab103bdc154f7f36e3b6 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Mon, 7 Sep 2026 14:06:33 +0800
+Subject: [PATCH 120/162] fix: the camera drove render state while the level
+ was still being built
+
+CRASH
+
+Opening a level whose Cinematic Camera has Scene Referred saved ON froze the
+editor (unrelated: 25 redeployed shaders had invalidated the whole shader cache,
+so every shader recompiled) and then killed the RenderThread with
+EXCEPTION_ACCESS_VIOLATION reading 0xFFFFFFFFFFFFFFFF, twice in a row, one second
+after the last level-load line.
+
+WHAT THE LOG ACTUALLY SAYS - and the log line that lied
+
+  <13:53:09> r_SceneReferred=0 [  ]
+  <13:53:12> general.open
+  <13:53:17> Precaching textures done in 0.16 seconds
+  <13:53:17> [SceneReferred] request flipped -> off, pipeline 'Standard_0' ...
+  <13:53:18> [crash]
+
+That "request flipped -> off" was read as "the request was ON during the load and
+the engine reset it at load end". It was not. m_nSceneReferredLogged starts at -1
+and a level load builds a NEW CGraphicsPipelineResources, so the first Update() of
+the level always printed a flip that never happened - here with r_SceneReferred
+already 0, i.e. with the request never having been on at all. The seeding pass is
+now silent when the answer is "off" and says "pipeline '...' starts scene-referred"
+when it is not, so the next crash log means what it says.
+
+ROOT CAUSE
+
+The Cinematic Camera drives shared render state from ENTITY_EVENT_UPDATE and
+ENTITY_EVENT_COMPONENT_PROPERTY_CHANGED, and the only gate on it was ownership
+(CanDriveRenderState: am I the active camera, am I not a preview). Neither event
+knows whether a level is being torn down or built, and every Apply* behind that
+gate reaches into something the load owns:
+
+  * the post-effect bus - which CRenderer::EF_ResetPostEffects clears on the
+    render thread at the end of the load, so anything published during the load is
+    thrown away and the switch is flipped twice before the first frame is drawn;
+  * the renderer's texture set - ApplyDisplayLuts uploads two 3D LUT textures
+    whose ids the tone map then holds, while the level load is freeing and
+    re-creating render resources ("*** Start clearing render resources ***"
+    precedes "Ending game context" in the same load);
+  * the time of day - PublishSceneReferredConvention forces
+    ITimeOfDay::Update(true, true), which recomputes the whole Nishita sky dome.
+
+That is the class of bug: our work runs on a pipeline whose resources are still
+being created, and against a texture set that is being replaced underneath it.
+
+THE FIX - the trodden path
+
+CanDriveRenderState() now also requires ESYSTEM_GLOBAL_STATE == RUNNING, which is
+the engine's own "the level is up" answer: CCryEditDoc::LoadLevel() sets it right
+after firing ESYSTEM_EVENT_LEVEL_LOAD_END, CCryAction after
+LEVEL_GAMEPLAY_START. A poll, not a listener, so there is no bookkeeping to get
+out of step and a host that fires a begin without an end cannot leave the camera
+stuck. The plugin's UpdateBeforeFinalizeCamera() takes the same gate one level up,
+so the resolver does not hand the render state around mid-load either. Nothing is
+applied during a load; the first frame after it applies everything, so the switch
+comes on by itself one frame late with the level fully built.
+
+The plugin's existing system-event listener brackets that:
+
+  LEVEL_UNLOAD_START / LEVEL_UNLOAD / LEVEL_POST_UNLOAD / LEVEL_LOAD_PREPARE /
+  LEVEL_LOAD_START -> OnLevelTeardown()
+      takes the request and the four LUT params off the bus, writes
+      E3DPARAM_SCENE_REFERRED to 0 as a PLAIN store (no forced TOD update - the
+      level is going away and reloads its own time of day), releases both LUT
+      slots while their texture ids are still ours, and drops every captured
+      baseline, which was taken from a bus that is about to be reset.
+
+  LEVEL_LOAD_END / LEVEL_GAMEPLAY_START -> OnLevelLoaded()
+      forgets the LUT path cache and the baselines, so the new level re-applies
+      from scratch instead of from a cache that predates the load.
+
+TWO REAL HAZARDS FOUND IN THE AUDIT, BOTH FIXED
+
+ClearLutSlot released a bare texture id. IRenderer::RemoveTexture(id) is
+GetByID(id) followed by Release() - it trusts the id - and a level change frees
+render resources BEFORE the entities are destroyed, so by the time OnShutDown gets
+there the id can already belong to somebody else's texture; releasing it drops a
+stranger's reference and leaves a dangling CTexture for the render thread. The
+slot now records the cache name it uploaded under ($ccamODT / $ccamLMT) and only
+releases an id whose texture still carries it. The in-place resize path went
+through the same unguarded RemoveTexture and now goes through ClearLutSlot.
+
+CAutoExposureStage cached m_meterHistogramUAV across the life of the CTexture, and
+EnsureMeterHistogramTexture() returned early - without re-deriving it - whenever
+the texture object existed. A ResourceViewHandle is an INDEX into the owning
+CDeviceTexture's view container, not a pointer, and the CTexture object outlives
+its device texture (a level change frees render resources and the pool re-creates
+them under the same object). Used against the new device texture the handle
+indexes past the end of a container holding only the predefined views, and
+CComposedDeviceObjectStorage::Lookup()'s bounds assert is compiled out in Profile,
+so ClearUAV was handed whatever lay past the vector. The handle is now re-derived
+whenever the device texture underneath moves (one pointer compare on the common
+path) and a null view skips the clear instead of being dereferenced.
+
+ALSO
+
+A flip of the switch to off now stops any running EXR capture, so the S6 ring
+cannot be left with a download in flight against a path that has been turned off.
+
+Byte identity off the switch is unchanged: every line above is either inside
+scene-referred-only code, inside the ccam plugin, or a log string.
+
+CryRenderD3D11 and CinematicCamera build 0 errors / 0 warnings outside Code/SDKs.
+No shader changed.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01HXzRVK4yBVDUNfdWXEwV5y
+---
+ .../GraphicsPipeline/AutoExposure.cpp         |  29 ++++-
+ .../GraphicsPipeline/AutoExposure.h           |   8 ++
+ .../Common/GraphicsPipeline.cpp               |  28 ++++-
+ .../Module/CinematicCameraComponent.cpp       | 102 +++++++++++++++++-
+ .../Module/CinematicCameraComponent.h         |  17 +++
+ .../Module/CinematicCameraPlugin.cpp          |  30 ++++++
+ 6 files changed, 208 insertions(+), 6 deletions(-)
+
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/AutoExposure.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/AutoExposure.cpp
+index 11d1f33c..ee9f0303 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/AutoExposure.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/AutoExposure.cpp
+@@ -394,7 +394,26 @@ void CAutoExposureStage::RetireSceneReferredMeter()
+ bool CAutoExposureStage::EnsureMeterHistogramTexture()
+ {
+ 	if (CTexture::IsTextureExist(m_pTexMeterHistogram))
++	{
++		// The texture object is alive, but the DEVICE texture under it may not be the one the
++		// cached UAV handle was created from: a level change frees render resources and the pool
++		// re-creates the device texture under the same CTexture. The handle is an index into the
++		// device texture's own view container, so carrying it across that swap indexes past the
++		// end of a freshly created (predefined-views-only) container, and LookupUAV then hands
++		// ClearUAV whatever lies past the vector. Re-derive it whenever the owner moves; on the
++		// common path this is one pointer compare.
++		CDeviceTexture* pDevTex = m_pTexMeterHistogram->GetDevTexture();
++		if (pDevTex != m_pMeterHistogramUAVOwner)
++		{
++			const SResourceView typedUAV = SResourceView::UnorderedAccessView(DXGI_FORMAT_R32_UINT, 0, -1, 0,
++			                                                                  SResourceView::eUAV_ReadWrite);
++			m_meterHistogramUAV = pDevTex->GetOrCreateResourceViewHandle(typedUAV);
++			m_pMeterHistogramUAVOwner = pDevTex;
++		}
+ 		return true;
++	}
++
++	m_pMeterHistogramUAVOwner = nullptr;
+ 
+ 	const uint32 flags = FT_NOMIPS | FT_DONT_STREAM | FT_USAGE_RENDERTARGET
+ 	                     | FT_USAGE_UNORDERED_ACCESS | FT_USAGE_UAV_RWTEXTURE | FT_STAGE_READBACK;
+@@ -420,6 +439,7 @@ bool CAutoExposureStage::EnsureMeterHistogramTexture()
+ 	const SResourceView typedUAV = SResourceView::UnorderedAccessView(DXGI_FORMAT_R32_UINT, 0, -1, 0,
+ 	                                                                  SResourceView::eUAV_ReadWrite);
+ 	m_meterHistogramUAV = m_pTexMeterHistogram->GetDevTexture()->GetOrCreateResourceViewHandle(typedUAV);
++	m_pMeterHistogramUAVOwner = m_pTexMeterHistogram->GetDevTexture();
+ 
+ 	CryLog("[SceneReferred] metering histogram armed: %d bins, %.1f to %.1f stops over mid grey, %.3f stops per bin",
+ 	       (int)SSceneReferredMeterHistogram::kBinCount, kMeterHistogramLogMin, kMeterHistogramLogMax,
+@@ -475,8 +495,13 @@ void CAutoExposureStage::ExecuteMeterHistogram()
+ 		// by contract.
+ 		CDeviceCommandListRef commandList = GetDeviceObjectFactory().GetCoreCommandList();
+ 		const ColorI cClear(0, 0, 0, 0);
+-		commandList.GetComputeInterface()->ClearUAV(
+-			m_pTexMeterHistogram->GetDevTexture()->LookupUAV(m_meterHistogramUAV), cClear);
++		// The lookup is bounds-asserted only in Debug, so the null test is the real guard: a view
++		// that could not be created leaves the bins uncleared, which is a wrong measurement for
++		// one frame and not a dereference of whatever the index landed on.
++		D3DUAV* const pUAV = m_pTexMeterHistogram->GetDevTexture()->LookupUAV(m_meterHistogramUAV);
++		if (pUAV == nullptr)
++			return;
++		commandList.GetComputeInterface()->ClearUAV(pUAV, cClear);
+ 	}
+ 
+ 	CComputeRenderPass& pass = m_passMeterHistogram;
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/AutoExposure.h b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/AutoExposure.h
+index 2ec25396..4c44c587 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/AutoExposure.h
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/AutoExposure.h
+@@ -63,6 +63,14 @@ private:
+ 	// is built by hand - the precedent is m_pTexLinearDepthFixupUAV in GraphicsPipeline.cpp.
+ 	_smart_ptr<CTexture> m_pTexMeterHistogram;
+ 	ResourceViewHandle   m_meterHistogramUAV = EDefaultResourceViews::UnorderedAccess;
++	// WHICH device texture the handle above indexes into. A ResourceViewHandle is an INDEX into
++	// the owning CDeviceTexture's view container, not a pointer, so it is only meaningful for the
++	// device texture it was created from; used against a different one it indexes out of range
++	// and CComposedDeviceObjectStorage::Lookup()'s bounds assert is compiled out in Profile. The
++	// CTexture object outlives its device texture (a level change frees render resources and the
++	// pool re-creates them under the same CTexture), so the handle has to be re-derived whenever
++	// the device texture underneath moves. Compared by value only - never dereferenced.
++	const void*          m_pMeterHistogramUAVOwner = nullptr;
+ 	bool                 m_bMeterHistogramValid = false;
+ 	// The creation failure below is retried every frame the meter runs, so the line that reports it
+ 	// has to be latched or it becomes a per-frame log. Cleared when a target is created, so a
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Common/GraphicsPipeline.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Common/GraphicsPipeline.cpp
+index 0128c180..88095c58 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Common/GraphicsPipeline.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Common/GraphicsPipeline.cpp
+@@ -5,6 +5,7 @@
+ #include "Common/RendererResources.h"
+ #include "Common/Textures/TextureHelpers.h"
+ #include "XRenderD3D9/D3DPostProcess.h"
++#include "../SceneReferredExport.h"
+ #include "../PostAA.h"
+ #include "../ShadowMap.h"
+ #include "../SceneGBuffer.h"
+@@ -693,13 +694,38 @@ void CGraphicsPipelineResources::Update(EShaderRenderingFlags renderingFlags)
+ 	// separate one-line-per-decision log in CRendererResources::SetSceneReferredPipelineGate().
+ 	{
+ 		const int nState = CRendererResources::IsSceneReferred() ? 1 : 0;
+-		if (nState != m_nSceneReferredLogged)
++		if (m_nSceneReferredLogged < 0)
++		{
++			// FIRST Update() of this pipeline's resources - a level load creates a new
++			// CGraphicsPipelineResources, so this runs once per level, not once per flip. It is
++			// NOT a flip and must not say so: the 2026-09-07 crash log was read as "the request
++			// was on during load and got reset to off" purely because the seeding pass printed
++			// "request flipped -> off" on the first frame of the level, with the switch never
++			// having been on. Seed silently when the answer is "off" (the overwhelmingly common
++			// case, and the one that says nothing); say so when a pipeline is born scene-referred,
++			// because that IS news.
++			m_nSceneReferredLogged = nState;
++			if (nState)
++			{
++				CryLogAlways("[SceneReferred] pipeline '%s' starts scene-referred (stage gate r_SceneReferredStage %d, %dx%d)",
++				             m_graphicsPipeline.GetUniqueIdentifierName().c_str(),
++				             CRenderer::CV_r_SceneReferredStage, m_resourceWidth, m_resourceHeight);
++			}
++		}
++		else if (nState != m_nSceneReferredLogged)
+ 		{
+ 			m_nSceneReferredLogged = nState;
+ 			CryLogAlways("[SceneReferred] request flipped -> %s, pipeline '%s' (stage gate r_SceneReferredStage %d, %dx%d)",
+ 			             nState ? "on" : "off",
+ 			             m_graphicsPipeline.GetUniqueIdentifierName().c_str(),
+ 			             CRenderer::CV_r_SceneReferredStage, m_resourceWidth, m_resourceHeight);
++
++			// The switch going off retires everything that could still be holding a GPU resource
++			// or a readback in flight on the scene-referred path. The passes themselves all
++			// early-out on the gate, so nothing new is issued; this is about what was already
++			// issued before the gate closed. A capture is the only one that owns its own textures.
++			if (!nState)
++				CSceneReferredExport::Get().Stop("the scene-referred switch was turned off");
+ 		}
+ 	}
+ 
+diff --git a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp
+index b674448a..29d0423f 100644
+--- a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp
++++ b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp
+@@ -371,8 +371,38 @@ void CCinematicCameraComponent::ClearSavedBaselines()
+ 	m_bViewfinderSaved     = false;
+ }
+ 
++// The engine's own answer to "is the level up yet", and the reason it is asked here rather than
++// tracked with a listener: ESYSTEM_GLOBAL_STATE goes back to RUNNING at exactly one place per
++// host - CCryEditDoc::LoadLevel() right after it fires ESYSTEM_EVENT_LEVEL_LOAD_END, and
++// CCryAction after ESYSTEM_EVENT_LEVEL_GAMEPLAY_START - so a poll is the same answer as the
++// event with no bookkeeping to get out of step and nothing to leave the camera stuck if a host
++// fires a begin without an end.
++bool CCinematicCameraComponent::IsLevelReady()
++{
++	ISystem* const pSystem = gEnv ? gEnv->pSystem : nullptr;
++	return pSystem != nullptr && pSystem->GetSystemGlobalState() == ESYSTEM_GLOBAL_STATE_RUNNING;
++}
++
+ bool CCinematicCameraComponent::CanDriveRenderState() const
+ {
++	// NOT WHILE A LEVEL IS LOADING (2026-09-07). Everything below this gate reaches into render
++	// state that the load is in the middle of tearing down and rebuilding: the post-effect bus
++	// (which EF_ResetPostEffects clears on the render thread at the end of the load, so anything
++	// published during it is thrown away anyway), the renderer's texture set (ApplyDisplayLuts
++	// uploads two 3D textures whose ids the tone map then holds), and - through
++	// PublishSceneReferredConvention - a forced ITimeOfDay::Update(true, true), which recomputes
++	// the whole Nishita sky dome. Pushing the request from a component that initialises DURING
++	// the load means the scene-referred path is asked to run on a pipeline whose targets are
++	// still being created, and it is then reset back off at load end by the engine, so the switch
++	// is flipped twice for nothing before the first frame is drawn.
++	//
++	// The trodden path is the one every other level-sensitive engine system takes: do nothing
++	// until the level is loaded, then apply. ENTITY_EVENT_UPDATE and the plugin's per-frame
++	// resolve both run again on the first frame after the load, so the camera applies itself
++	// there - the switch comes on by itself, one frame late, with the level fully built.
++	if (!IsLevelReady())
++		return false;
++
+ 	return s_pActive == this
+ 	       && m_pEntity != nullptr
+ 	       && m_pEntity->GetSimulationMode() != EEntitySimulationMode::Preview;
+@@ -1382,6 +1412,7 @@ bool ParseCubeFile(const char* szPath, SCubeLut& out, string& error, string& res
+ struct SLutSlot
+ {
+ 	string requested;             //!< the path this slot was last asked for, failures included
++	string cacheName;             //!< the renderer-side name the texture was uploaded under
+ 	int    texId  = 0;
+ 	int    size   = 0;
+ 	bool   loaded = false;
+@@ -1392,11 +1423,26 @@ SLutSlot s_lutLMT;
+ 
+ void ClearLutSlot(SLutSlot& slot)
+ {
++	// IRenderer::RemoveTexture(id) is GetByID(id) followed by Release() - it trusts the id. Ours
++	// can go stale without us being told: a level change frees the renderer's resources BEFORE
++	// the entities are destroyed (editor.log: "*** Start clearing render resources ***" precedes
++	// "Ending game context"), so by the time OnShutDown gets here the id may already belong to
++	// somebody else's texture, and releasing it would drop a stranger's reference and leave a
++	// dangling CTexture for the render thread to trip over later.
++	//
++	// The name is the check: the upload passes a fixed cache name ($ccamODT / $ccamLMT), so a
++	// texture still carrying it at that id is ours and nothing else can be.
+ 	if (slot.texId > 0 && gEnv && gEnv->pRenderer)
+-		gEnv->pRenderer->RemoveTexture((unsigned int)slot.texId);
++	{
++		ITexture* const pTex = gEnv->pRenderer->EF_GetTextureByID(slot.texId);
++		const char* const szName = pTex ? pTex->GetName() : nullptr;
++		if (szName != nullptr && !slot.cacheName.empty() && slot.cacheName == szName)
++			gEnv->pRenderer->RemoveTexture((unsigned int)slot.texId);
++	}
+ 	slot.texId = 0;
+ 	slot.size = 0;
+ 	slot.loaded = false;
++	slot.cacheName.clear();
+ }
+ 
+ //! Load the file at szPath into slot if it is not already there. Cheap on every frame but the
+@@ -1452,8 +1498,7 @@ void EnsureLutSlot(SLutSlot& slot, const char* szPath, const char* szCacheName,
+ 	// refreshes the contents in place and does not re-describe the resource.
+ 	if (slot.texId > 0 && slot.size != lut.size)
+ 	{
+-		gEnv->pRenderer->RemoveTexture((unsigned int)slot.texId);
+-		slot.texId = 0;
++		ClearLutSlot(slot);   // id-safe release; see the comment there
+ 	}
+ 
+ 	// repeat = false -> FT_STATE_CLAMP, which is what a LUT wants on all three axes.
+@@ -1478,6 +1523,7 @@ void EnsureLutSlot(SLutSlot& slot, const char* szPath, const char* szCacheName,
+ 	slot.texId = nNewId;
+ 	slot.size = lut.size;
+ 	slot.loaded = true;
++	slot.cacheName = szCacheName ? szCacheName : "";
+ 
+ 	// The ABSOLUTE path, not the requested one: "not found" and "found somewhere else than you
+ 	// think" look identical in a relative path, and the two install trees (project assets and
+@@ -1535,6 +1581,56 @@ void CCinematicCameraComponent::RestoreDisplayLuts()
+ 	s_lutLMT.requested.clear();
+ }
+ 
++// A level is going away (ESYSTEM_EVENT_LEVEL_UNLOAD_START / LEVEL_LOAD_PREPARE / LEVEL_LOAD_START
++// / LEVEL_POST_UNLOAD, whichever the host fires first). This runs BEFORE the renderer frees its
++// resources, which is the whole point: it is the last moment at which our LUT texture ids are
++// still ours to release.
++//
++// It also takes the scene-referred request off the bus by hand. Leaving it standing means the
++// pipeline is asked to run scene-referred across a load - on targets that are being destroyed and
++// re-created, with the shader cache possibly invalidated behind it - and the engine then clears
++// the bus itself at the end of the load (CRenderer::EF_ResetPostEffects, render thread), so the
++// switch gets flipped twice before the first frame of the new level is drawn for no gain at all.
++// The engine-side mirror goes with it as a PLAIN STORE: PublishSceneReferredConvention()'s forced
++// ITimeOfDay::Update(true, true) recomputes the whole Nishita sky dome, and asking for that in
++// the middle of a level teardown is exactly the kind of work this function exists to prevent. The
++// time of day is reloaded by the level anyway.
++void CCinematicCameraComponent::OnLevelTeardown()
++{
++	if (gEnv && gEnv->p3DEngine)
++	{
++		gEnv->p3DEngine->SetPostEffectParam("Global_User_SceneReferred", 0.0f);
++		gEnv->p3DEngine->SetPostEffectParam("Global_User_LutODT", 0.0f);
++		gEnv->p3DEngine->SetPostEffectParam("Global_User_LutODTSize", 0.0f);
++		gEnv->p3DEngine->SetPostEffectParam("Global_User_LutLMT", 0.0f);
++		gEnv->p3DEngine->SetPostEffectParam("Global_User_LutLMTSize", 0.0f);
++		gEnv->p3DEngine->SetGlobalParameter(E3DPARAM_SCENE_REFERRED, Vec3(0.0f, 0.0f, 0.0f));
++	}
++
++	ClearLutSlot(s_lutODT);
++	ClearLutSlot(s_lutLMT);
++	s_lutODT.requested.clear();
++	s_lutLMT.requested.clear();
++
++	// The baselines were captured from a bus that is about to be reset; writing them back later
++	// would restore values from the previous level.
++	for (CCinematicCameraComponent* p : s_all)
++		p->ClearSavedBaselines();
++}
++
++// The level is up (ESYSTEM_EVENT_LEVEL_LOAD_END / LEVEL_GAMEPLAY_START). Nothing is applied here:
++// CanDriveRenderState() has been refusing for the whole load and starts saying yes on the next
++// frame, so the resolver and ENTITY_EVENT_UPDATE re-apply the camera by themselves. All this does
++// is make sure they re-apply from scratch rather than from a cache that predates the load.
++void CCinematicCameraComponent::OnLevelLoaded()
++{
++	s_lutODT.requested.clear();
++	s_lutLMT.requested.clear();
++
++	for (CCinematicCameraComponent* p : s_all)
++		p->ClearSavedBaselines();
++}
++
+ // The camera's grade (SceneReferredSpec.md S5). Everything here acts on scene data BEFORE the
+ // output transform, which is the whole difference between grading and retouching: the picture
+ // has not been squeezed onto a monitor yet, so a saturation push has somewhere to go and a
+diff --git a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
+index d2715830..567da7d5 100644
+--- a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
++++ b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
+@@ -1169,6 +1169,23 @@ public:
+ 	//! s_pActive merely caches its answer. Called once per frame from the plugin hook, before
+ 	//! anything else. Hands the render state back when a component is dethroned.
+ 	static CCinematicCameraComponent* ResolveActive();
++
++	//! True only while the engine reports ESYSTEM_GLOBAL_STATE_RUNNING - i.e. no level load,
++	//! unload or reload is in progress. Every Apply* path is gated on it (see
++	//! CanDriveRenderState): render state must not be driven while the level that owns the
++	//! render targets, the post-effect bus and the time of day is being rebuilt.
++	static bool IsLevelReady();
++
++	//! A level is going away. Called from the plugin's system-event listener BEFORE the renderer
++	//! frees its resources, so the display LUTs can be released while their texture ids are still
++	//! ours, and the scene-referred request is taken off the bus rather than left standing into a
++	//! load. Safe to call repeatedly and with no level open.
++	static void OnLevelTeardown();
++
++	//! A level finished loading. Drops every captured baseline (EF_ResetPostEffects wiped the bus
++	//! at the end of the load, so what we saved before it is stale) and forgets which LUT files
++	//! are uploaded, so the first frame of the new level re-applies everything from scratch.
++	static void OnLevelLoaded();
+ 	bool IsExposureEnabled() const { return m_exposure.bEnableExposure; }
+ 
+ 	//! A shape mask is in use and the iris is opened wider than Mask Aperture (the mask is the
+diff --git a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraPlugin.cpp b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraPlugin.cpp
+index dc6f61a4..82179bf1 100644
+--- a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraPlugin.cpp
++++ b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraPlugin.cpp
+@@ -66,6 +66,13 @@ void CCinematicCameraPlugin::UpdateBeforeFinalizeCamera()
+ 	// Resolve ownership from the camera manager FIRST: it is the single authority, and this
+ 	// is also where a dethroned cinematic camera hands the render state back. Returns nullptr
+ 	// when a non-cinematic camera is active, in which case we finalize nothing.
++	// Nothing is finalized while a level is loading: FinalizeGameCamera() writes the view camera
++	// and ApplyExposureGlobalParam() writes E3DPARAM_HDR_EYEADAPTATION_PARAMS, and both belong to
++	// a level that exists. Same gate as CanDriveRenderState(), asked one level up so the resolver
++	// does not hand the render state around mid-load either.
++	if (!CCinematicCameraComponent::IsLevelReady())
++		return;
++
+ 	if (CCinematicCameraComponent* pActive = CCinematicCameraComponent::ResolveActive())
+ 	{
+ 		pActive->FinalizeGameCamera();
+@@ -96,6 +103,29 @@ void CCinematicCameraPlugin::OnSystemEvent(ESystemEvent event, UINT_PTR wparam,
+ 		}
+ 		break;
+ 	}
++
++	// Level lifetime (2026-09-07). The cinematic camera drives shared render state - the
++	// post-effect bus, two uploaded 3D LUT textures, the engine-side light-unit convention and,
++	// through it, a forced time-of-day and sky-dome recompute. None of that may happen while a
++	// level is being torn down or built: the targets, the bus and the time of day all belong to
++	// the level. CCinematicCameraComponent::CanDriveRenderState() already refuses for the
++	// duration (it asks ESYSTEM_GLOBAL_STATE), so these two hooks only have to bracket it -
++	// release what we own while it is still ours, and forget what we cached once the level is up.
++	case ESYSTEM_EVENT_LEVEL_UNLOAD_START:
++	case ESYSTEM_EVENT_LEVEL_UNLOAD:
++	case ESYSTEM_EVENT_LEVEL_POST_UNLOAD:
++	case ESYSTEM_EVENT_LEVEL_LOAD_PREPARE:
++	case ESYSTEM_EVENT_LEVEL_LOAD_START:
++		CCinematicCameraComponent::OnLevelTeardown();
++		break;
++
++	case ESYSTEM_EVENT_LEVEL_LOAD_END:
++	case ESYSTEM_EVENT_LEVEL_GAMEPLAY_START:
++		CCinematicCameraComponent::OnLevelLoaded();
++		break;
++
++	default:
++		break;
+ 	}
+ }
+ 
+-- 
+2.47.1.windows.1
+

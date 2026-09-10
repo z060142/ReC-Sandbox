@@ -1,0 +1,1313 @@
+From d24cdb962770699e76f61efbc2d0ca96a19e3c05 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Thu, 10 Sep 2026 12:55:40 +0800
+Subject: [PATCH 156/162] fix: sprite bokeh had no source budget, so a bright
+ scene drew a sprite for a tenth of the screen
+
+User: with Scene Referred on and Use Sprite Bokeh on, the number of CoC sources explodes and the
+frame rate collapses. Right about the cause, wrong about which parameter: the threshold DID reach
+this pass (PostProcessDOF.cpp:117 has run it through ResolveThreshold since S7, and since 3f53d2c4
+that means stops over mid grey on the stock path too). What never reached it was the BUDGET.
+
+Root cause. DofBokehRefVS draws one sprite per grid cell whose highlight excess clears the
+threshold - 960 x 540 candidate cells at 1080p, culled in the vertex shader and counted nowhere.
+A threshold is not a population: "+2 stops over mid grey" is a 90% white in sunlight, the sky, and
+every specular, i.e. tens of percent of a physically lit frame, where the old absolute reading
+(2.0 engine units = 20 000 cd/m2) picked out light sources only. Each survivor rasterizes a disc
+of up to r_DepthOfFieldLensModelSplatMaxCoC (256) native pixels into TWO blended RGBA16F targets:
+measured on an 85 mm f/1.4 at 1080p, 10% of the cells is 1 870 Mpx of blending per frame.
+decisions/s8-glare-budget.md said the DOF splat was "governed by its own energy split" - true of
+where the light goes, silent about how many sprites are drawn. STRUCTURE.md line 432 had already
+named this as the outstanding case.
+
+Mechanism (the wave glare's, with the one addition the DOF needs). Four passes in the DOF stage,
+before the layer downscale, no CPU round trip:
+  DofSpriteWeight       half-res map of (priority, weight, excess) per cell. Priority = the cell's
+                        mean excess above the knee x the splat's own fade x the sky weight.
+  DofSpriteSourceStats  -> 8x8 tiles (raw, drawn, summed excess, excess handed back)
+  DofSpriteStatsReduce  -> a fixed 16x16
+  DofSpriteBudget       -> one texel: the cutoff, corrected from last frame's count towards N.
+The controller is HDRDiffractionBudgetPS's line for line (multiplicative, asymmetric, dead band,
+decay to zero) because it has been measured on this project and its failure modes are written down.
+
+The addition: ONE WEIGHT, TWO CONSUMERS. The excess is read by two passes with different tap
+patterns - DownscaleDofPS subtracts it from the gather layers, DofBokehRefVS deposits it - so a
+weight computed twice would disagree exactly for the sources on the cutoff and would double count
+or drop them. The weight pass writes it once and both scale by the same texel, so the excess a
+culled source does not splat is exactly the excess the gather kept. A source that loses its slot
+loses its iris SHAPE and keeps its light, spread by the gather - which is what unshaped defocused
+light looks like. The glare deposits its losers as a flat one-texel residual instead, because its
+layer is additive on top of a complete frame; here the gather layer is what the excess came out of.
+
+A losing cell's quad is collapsed in the vertex shader, so it costs no fill at all. A scene whose
+population fits drives the cutoff to 0 and both consumers are then bit-identical to the un-budgeted
+pass. Unconditional on both exposure paths (49d61fd0's lesson: the stock path had the same bug);
+stock CRYENGINE is untouched because r_DepthOfFieldMode ships as 1 and only a cinecam sets 0.
+
+cvars:
+  r_DepthOfFieldSpriteBokehMaxSources  256, hard cap 4096, 0 = the cap (not "unlimited")
+  r_DepthOfFieldSpriteBokehSkyWeight   0.25 - a far-plane cell competes at this fraction of its
+                                       excess. Priority only; the frame's light does not move.
+  r_DepthOfFieldSpriteBokehDebug       1 = the existing silhouette diagnostic (unchanged),
+                                       2 = one report a second (population, drawn, cutoff in stops
+                                       over the mid grey in force, share handed back to the gather,
+                                       sky weight, and the splat's GPU ms), 3 = both.
+
+research/s10-sprite-bokeh-budget.md; decisions/s10-sprite-bokeh-budget.md (5 alternatives, one
+chosen); STRUCTURE.md; SpriteBokehSpec.md 7; SceneReferredSpec.md S7; docs/ConsoleReference.md.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01ADgAiBYv9AxSd54s1FPREm
+---
+ .../RenderDll/Common/RendererCVars.cpp        |  30 +-
+ .../RenderDll/Common/RendererCVars.h          |   4 +
+ .../GraphicsPipeline/DepthOfField.cpp         | 486 +++++++++++++++++-
+ .../GraphicsPipeline/DepthOfField.h           |  52 +-
+ .../CinematicCamera/SceneReferredSpec.md      |   8 +
+ .../CinematicCamera/SpriteBokehSpec.md        |  30 ++
+ .../CinematicCamera/docs/ConsoleReference.md  |  24 +
+ .../Shaders/HWScripts/CryFX/DepthOfField.cfx  | 381 +++++++++++++-
+ 8 files changed, 1004 insertions(+), 11 deletions(-)
+
+diff --git a/Code/CryEngine/RenderDll/Common/RendererCVars.cpp b/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
+index 1fa640fc..af1d5ff6 100644
+--- a/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
++++ b/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
+@@ -411,6 +411,8 @@ int CRendererCVars::CV_r_dof;
+ int CRendererCVars::CV_r_DofMode;
+ int CRendererCVars::CV_r_DofBokehQuality;
+ int CRendererCVars::CV_r_DofSpriteBokehDebug;
++int CRendererCVars::CV_r_DofSpriteBokehMaxSources;
++float CRendererCVars::CV_r_DofSpriteBokehSkyWeight;
+ int CRendererCVars::CV_r_DofResolutionScale;
+ float CRendererCVars::CV_r_DofSpriteBokehFadeCoC;
+ float CRendererCVars::CV_r_DofCatEyeBarrel;
+@@ -1708,7 +1710,33 @@ void CRendererCVars::InitCVars()
+ 	               "DIAGNOSTIC for the hybrid sprite bokeh splats (r_DepthOfFieldMode 0). "
+ 	               "1 = every surviving splat is drawn as its raw shape mask at full strength, "
+ 	               "skipping the energy normalization - the silhouette (texture x iris polygon) "
+-	               "becomes unmissable. 0 = off (default).");
++	               "becomes unmissable. "
++	               "2 = the SOURCE BUDGET's report, once a second, in the log: how many cells "
++	               "cleared the highlight threshold, how many of them the budget could afford a "
++	               "shaped disc for, the energy cutoff in stops over mid grey, how much of the "
++	               "excess went back to the gather instead, and the splat's GPU milliseconds. "
++	               "Does not change the picture. 3 = both. 0 = off (default).");
++	REGISTER_CVAR3("r_DepthOfFieldSpriteBokehMaxSources", CV_r_DofSpriteBokehMaxSources, 256, VF_NULL,
++	               "SOURCE BUDGET for the hybrid sprite bokeh (r_DepthOfFieldMode 0): the largest "
++	               "number of grid cells that may draw a shaped bokeh disc in one frame. "
++	               "The splat draws one sprite per cell over the highlight threshold and a "
++	               "threshold does not bound a population - in a physically lit frame it is tens "
++	               "of percent of the screen, each rasterizing a disc of up to "
++	               "r_DepthOfFieldLensModelSplatMaxCoC pixels into two blended fp16 targets. "
++	               "The brightest N cells keep their shape; every other one hands its excess back "
++	               "to the GATHER, which blurs it - so a scene never gets darker, a source that "
++	               "crosses the budget loses its shape over a stop rather than popping, and a "
++	               "scene whose population fits is bit-identical to no budget at all. "
++	               "Watch it with r_DepthOfFieldSpriteBokehDebug 2. "
++	               "Clamped to 4096; 0 means the clamp, not 'unlimited'. Default 256.");
++	REGISTER_CVAR3("r_DepthOfFieldSpriteBokehSkyWeight", CV_r_DofSpriteBokehSkyWeight, 0.25f, VF_NULL,
++	               "How much a SKY cell's excess is worth when cells compete for the sprite bokeh "
++	               "budget above. A sky is enormous, sits at infinity so its discs are the largest "
++	               "in the frame, and is routinely two to five stops over mid grey; on equal terms "
++	               "(1.0) it takes every slot and the practicals in the scene lose their bokeh. "
++	               "This is a PRIORITY and never light: a sky cell that wins a slot draws its full "
++	               "disc, one that loses keeps all of its light in the gather, so the frame's total "
++	               "brightness is identical at every value. Default 0.25.");
+ 	REGISTER_CVAR3("r_DepthOfFieldResolutionScale", CV_r_DofResolutionScale, 0, VF_NULL,
+ 	               "Internal resolution of the hybrid depth-of-field splat pass "
+ 	               "(r_DepthOfFieldMode 0). 0 = half-resolution quad grid (default; cheapest, "
+diff --git a/Code/CryEngine/RenderDll/Common/RendererCVars.h b/Code/CryEngine/RenderDll/Common/RendererCVars.h
+index 0fb1564b..46ab9f47 100644
+--- a/Code/CryEngine/RenderDll/Common/RendererCVars.h
++++ b/Code/CryEngine/RenderDll/Common/RendererCVars.h
+@@ -409,6 +409,10 @@ public:
+ 	static int CV_r_DofMode;
+ 	static int CV_r_DofBokehQuality;
+ 	static int CV_r_DofSpriteBokehDebug;
++	//! Sprite bokeh SOURCE BUDGET (S10, decisions/s10-sprite-bokeh-budget.md): how many grid
++	//! cells may draw a shaped disc, and how a sky cell's excess is weighted when they compete.
++	static int CV_r_DofSpriteBokehMaxSources;
++	static float CV_r_DofSpriteBokehSkyWeight;
+ 	static int CV_r_DofResolutionScale;
+ 	static float CV_r_DofSpriteBokehFadeCoC;
+ 	static float CV_r_DofCatEyeBarrel;
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DepthOfField.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DepthOfField.cpp
+index b0c7f959..491aef81 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DepthOfField.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DepthOfField.cpp
+@@ -686,8 +686,21 @@ void CDepthOfFieldStage::Execute()
+ 	// triggering a resolve would see a stale frame, and that read was already stale in stock CE.
+ 	m_passCopySceneTarget.Execute(m_graphicsPipelineResources.m_pTexHDRTarget, m_graphicsPipelineResources.m_pTexSceneTarget);
+ 
++	// The sprite bokeh SOURCE BUDGET (S10, decisions/s10-sprite-bokeh-budget.md), resolved HERE -
++	// before the downscale - because the downscale is the pass that hands the highlight excess to
++	// the splat, and it may only hand over as much as the splat is actually going to deposit. The
++	// weight map it produces is the single point of truth for both.
++	CTexture* pSpriteBudgetWeight = ExecuteSpriteBudget(dofParams, vDofParams0, vDofParams1, vFieldPupil2,
++	                                                    vDofLensModel, vDofLensModel2, vDownscaleHighlight,
++	                                                    nLensRTMask, bSplat);
++	// x = the flag both shaders branch on. At 0 neither reads the map and both are byte-identical
++	// to the un-budgeted pass; the white texture is bound only so the slot is never empty.
++	const Vec4 vSpriteBudgetFlag(pSpriteBudgetWeight ? 1.0f : 0.0f, 0.0f, 0.0f, 0.0f);
++	CTexture* pSpriteBudgetBind = pSpriteBudgetWeight ? pSpriteBudgetWeight : CRendererResources::s_ptexWhite;
++
+ 	static CCryNameR dofFocusParam0Name("vDofParamsFocus0");
+ 	static CCryNameR dofFocusParam1Name("vDofParamsFocus1");
++	static CCryNameR dofSpriteBudgetName("vDofSpriteBudget");
+ 	static CCryNameR dofTapsName("g_Taps");
+ 	static CCryNameR dofFieldPupilName("vDofFieldPupil");
+ 	static CCryNameR dofFieldPupil2Name("vDofFieldPupil2");
+@@ -706,7 +719,7 @@ void CDepthOfFieldStage::Execute()
+ 			// by itself - the variadic IsDirty is how a pass tracks an input of its own, so
+ 			// toggling Lens Model DOF at runtime re-selects the permutation instead of leaving
+ 			// the previously compiled one bound.
+-			if (m_passLayerDownscale.IsDirty(nLensRTMask))
++			if (m_passLayerDownscale.IsDirty(nLensRTMask, pSpriteBudgetBind->GetTextureID()))
+ 			{
+ 				static CCryNameTSCRC techNameDownscale("DownscaleDof");
+ 				m_passLayerDownscale.SetPrimitiveFlags(CRenderPrimitive::eFlags_ReflectShaderConstants_PS);
+@@ -717,6 +730,10 @@ void CDepthOfFieldStage::Execute()
+ 				m_passLayerDownscale.SetState(GS_NODEPTHTEST);
+ 				m_passLayerDownscale.SetTextureSamplerPair(0, m_graphicsPipelineResources.m_pTexLinearDepth, EDefaultSamplerStates::PointClamp);
+ 				m_passLayerDownscale.SetTextureSamplerPair(1, m_graphicsPipelineResources.m_pTexHDRTarget, EDefaultSamplerStates::LinearClamp);
++				// The sprite budget's weight map (S10). Point sampled and 1:1 with this pass's own
++				// output, so the excess this pass hands over and the excess the splat deposits are
++				// scaled by the SAME texel.
++				m_passLayerDownscale.SetTextureSamplerPair(2, pSpriteBudgetBind, EDefaultSamplerStates::PointClamp);
+ 				m_passLayerDownscale.SetRequirePerViewConstantBuffer(true);
+ 			}
+ 
+@@ -743,6 +760,7 @@ void CDepthOfFieldStage::Execute()
+ 			// only when the splat is actually running. This pass repacks zw of the constant for
+ 			// that (see DownscaleDofPS); the splat's own copy is unaffected.
+ 			m_passLayerDownscale.SetConstant(dofBokehHighlightName, vDownscaleHighlight, eHWSC_Pixel);
++			m_passLayerDownscale.SetConstant(dofSpriteBudgetName, vSpriteBudgetFlag, eHWSC_Pixel);
+ 			m_passLayerDownscale.Execute();
+ 		}
+ 
+@@ -988,7 +1006,8 @@ void CDepthOfFieldStage::Execute()
+ 	if (bSplat || bGhost)
+ 	{
+ 		ExecuteSplatLayers(dofParams, vDofParams0, vDofParams1, fNumApertureSides, fIrisExponent, fIrisEdgeSoft,
+-		                   bSplat, bGhost, bLensModel, vDofLensModel, vDofLensModel2, fLensSplatCap, vFieldPupil2);
++		                   bSplat, bGhost, bLensModel, vDofLensModel, vDofLensModel2, fLensSplatCap, vFieldPupil2,
++		                   pSpriteBudgetBind, vSpriteBudgetFlag);
+ 	}
+ 
+ 	m_bWroteHDRTarget = true;
+@@ -1076,6 +1095,456 @@ void CDepthOfFieldStage::Resize(int renderWidth, int renderHeight)
+ 	// Drop them; the next hybrid frame reallocates at the new size.
+ 	ReleaseSplatLayers();
+ 	ReleaseGhostLayer();
++	ReleaseSpriteBudgetTargets();
++}
++
++//////////////////////////////////////////////////////////////////////////////////////////////////
++// THE SPRITE BOKEH SOURCE BUDGET (S10, decisions/s10-sprite-bokeh-budget.md)
++//
++// The splat pass draws one sprite per grid cell over the highlight threshold, and a threshold does
++// not bound a population: under a physically lit frame "+2 stops over mid grey" is most of a
++// sunlit image, and each of those cells rasterizes a disc of up to
++// r_DepthOfFieldLensModelSplatMaxCoC native pixels into two blended RGBA16F targets. That is the
++// reported "sprite bokeh on, frame rate gone", and it is the same failure the wave glare had
++// before decisions/s8-glare-budget.md - measured there, fixed there, and never carried across to
++// this pass because the DOF's energy split was assumed to govern it. It governs where the light
++// GOES; it says nothing about how many sprites are drawn.
++//
++// Four passes, no CPU round trip in the hot path:
++//
++//   0. DofSpriteWeight       the grid -> (priority, weight, excess). THE weight, for both consumers.
++//   1. DofSpriteSourceStats  that -> 8x8 tiles: (raw, drawn, summed excess, excess handed back)
++//   2. DofSpriteStatsReduce  tiles -> a fixed 16x16
++//   3. DofSpriteBudget       16x16 -> one texel, and the cutoff for the NEXT frame
++//
++// The cutoff step 0 reads is the PREVIOUS frame's, which is the controller's one frame of lag (the
++// glare's, unchanged): a hard cut into a bright scene overshoots for two or three frames and then
++// settles. r_DepthOfFieldSpriteBokehDebug 2 prints the count, so it is observable rather than
++// theoretical.
++//////////////////////////////////////////////////////////////////////////////////////////////////
++
++// The first reduction block, in weight-map texels per axis.
++static const int kSpriteStatsTileSize = 8;
++// HARD CAP on the budget, enforced at the CONSUMER so no console value or config line can get past
++// it - the glare's own lesson (decisions/s8-glare-budget.md, addendum 2026-09-05: an unbounded
++// budget is what let Windows kill Sandbox as AppHangB1). A bokeh sprite is larger than a glare
++// sprite and lands in two blended targets, so this is deliberately the same 4096 and not more.
++static const int kSpriteMaxSourceBudget = 4096;
++
++CTexture* CDepthOfFieldStage::ExecuteSpriteBudget(const SDepthOfFieldParams& dofParams, const Vec4& vDofParams0, const Vec4& vDofParams1,
++                                                  const Vec4& vFieldPupil2, const Vec4& vLensModel, const Vec4& vLensModel2,
++                                                  const Vec4& vDownscaleHighlight, uint64 nLensRTMask, bool bSplat)
++{
++	const int nRequestedBudget = CRenderer::CV_r_DofSpriteBokehMaxSources;
++	const int nDebugMode       = CRenderer::CV_r_DofSpriteBokehDebug;
++
++	// No splat this frame: nothing to budget, and the targets are dropped so pure gather DOF
++	// (r_DepthOfFieldMode 1, the engine default) costs exactly what it always did.
++	if (!bSplat)
++	{
++		ReleaseSpriteBudgetTargets();
++		UpdateSpriteBudgetReport(0, 0, 0, 0, 0, false);
++		return nullptr;
++	}
++
++	CTexture* pSceneTarget = m_graphicsPipelineResources.m_pTexSceneTarget;
++	CTexture* pDepth       = m_graphicsPipelineResources.m_pTexLinearDepth;
++	CTexture* pHalfRes     = m_graphicsPipelineResources.m_pTexHDRTargetMaskedScaled[0][0];
++
++	if (!CTexture::IsTextureExist(pSceneTarget) || !CTexture::IsTextureExist(pDepth) || !CTexture::IsTextureExist(pHalfRes))
++		return nullptr;
++
++	// Sized to the DOWNSCALE's own target, not to the splat grid: the downscale is the other
++	// consumer and the energy split has to be exact against it. On the native splat grid
++	// (r_DepthOfFieldResolutionScale 1) four sprite cells therefore share one weight - see the
++	// decision file, "Native grid".
++	if (!AcquireSpriteBudgetTargets(pHalfRes->GetWidth(), pHalfRes->GetHeight()))
++		return nullptr;
++
++	PROFILE_LABEL_SCOPE("SPRITE BOKEH BUDGET");
++
++	const int nBudget = (nRequestedBudget <= 0) ? kSpriteMaxSourceBudget
++	                                            : min(nRequestedBudget, kSpriteMaxSourceBudget);
++
++	static CCryNameTSCRC techSpriteWeight("DofSpriteWeight");
++	static CCryNameTSCRC techSourceStats("DofSpriteSourceStats");
++	static CCryNameTSCRC techStatsReduce("DofSpriteStatsReduce");
++	static CCryNameTSCRC techBudget("DofSpriteBudget");
++	static CCryNameR dofFocusParam0Name("vDofParamsFocus0");
++	static CCryNameR dofFocusParam1Name("vDofParamsFocus1");
++	static CCryNameR dofFieldPupil2Name("vDofFieldPupil2");
++	static CCryNameR dofLensModelName("vDofLensModel");
++	static CCryNameR dofLensModel2Name("vDofLensModel2");
++	static CCryNameR dofBokehHighlightName("vDofBokehHighlight");
++	static CCryNameR spriteBudgetName("vDofSpriteBudget");
++	static CCryNameR spriteBudget2Name("vDofSpriteBudget2");
++	static CCryNameR spriteStats0Name("vDofSpriteStats0");
++	static CCryNameR spriteStats1Name("vDofSpriteStats1");
++	static CCryNameR spriteBudgetNName("vDofSpriteBudgetN");
++
++	CShader* pShader = CShaderMan::s_shPostDepthOfField;
++
++	const int nGridW = m_pTexSpriteWeight->GetWidth();
++	const int nGridH = m_pTexSpriteWeight->GetHeight();
++
++	// The texel THIS frame's weights are measured against: the one the controller wrote last
++	// frame. The chain below then writes the other half of the ping-pong.
++	CTexture* pPrev = m_pTexSpriteStats[m_nSpriteStatsIndex];
++
++	// -------- step 0: the weight map, the one number both consumers read --------
++	{
++		if (m_passSpriteWeight.IsDirty(nLensRTMask, pSceneTarget->GetTextureID(), pPrev->GetTextureID()))
++		{
++			m_passSpriteWeight.SetPrimitiveFlags(CRenderPrimitive::eFlags_ReflectShaderConstants_PS);
++			m_passSpriteWeight.SetPrimitiveType(CRenderPrimitive::ePrim_ProceduralTriangle);
++			m_passSpriteWeight.SetTechnique(pShader, techSpriteWeight, nLensRTMask);
++			m_passSpriteWeight.SetRenderTarget(0, m_pTexSpriteWeight);
++			m_passSpriteWeight.SetState(GS_NODEPTHTEST);
++			m_passSpriteWeight.SetTextureSamplerPair(0, pSceneTarget, EDefaultSamplerStates::PointClamp);
++			m_passSpriteWeight.SetTextureSamplerPair(1, pDepth, EDefaultSamplerStates::PointClamp);
++			m_passSpriteWeight.SetTextureSamplerPair(2, pPrev, EDefaultSamplerStates::PointClamp);
++			// The circle of confusion is derived here from the same helper the downscale uses,
++			// which reads the field curvature out of the per-view constants.
++			m_passSpriteWeight.SetRequirePerViewConstantBuffer(true);
++		}
++
++		// One quarter of a grid texel in this pass's UV: the four taps then land on exactly the
++		// four native texels of the cell, which is the set DofBokehRefVS thresholds.
++		const float fTapU = 0.25f / (float)max(nGridW, 1);
++		const float fTapV = 0.25f / (float)max(nGridH, 1);
++		const float fSkyWeight = clamp_tpl(CRenderer::CV_r_DofSpriteBokehSkyWeight, 0.0f, 1.0f);
++
++		// Native pixels of disc DIAMETER per unit of circle of confusion - the sprite's own scale
++		// (LensCoCUnitPixels x 2), so the sub-pixel cull in the weight pass is the sprite's cull
++		// and not a second, different one.
++		const float fFrameW = (float)m_graphicsPipelineResources.m_pTexHDRTarget->GetWidth();
++		const float fFrameH = (float)m_graphicsPipelineResources.m_pTexHDRTarget->GetHeight();
++		const float fDiameterPerUnit = 8.0f * max(fFrameW / 1920.0f, fFrameH / 1080.0f);
++
++		m_passSpriteWeight.BeginConstantUpdate();
++		m_passSpriteWeight.SetConstant(dofFocusParam0Name, vDofParams0, eHWSC_Pixel);
++		m_passSpriteWeight.SetConstant(dofFocusParam1Name, vDofParams1, eHWSC_Pixel);
++		m_passSpriteWeight.SetConstant(dofFieldPupil2Name, vFieldPupil2, eHWSC_Pixel);
++		m_passSpriteWeight.SetConstant(dofLensModelName, vLensModel, eHWSC_Pixel);
++		m_passSpriteWeight.SetConstant(dofLensModel2Name, vLensModel2, eHWSC_Pixel);
++		// The DOWNSCALE's packing of the highlight constant (threshold, knee, fade CoC, splat on),
++		// deliberately: this pass has to select the same cells the split hands energy over for.
++		m_passSpriteWeight.SetConstant(dofBokehHighlightName, vDownscaleHighlight, eHWSC_Pixel);
++		m_passSpriteWeight.SetConstant(spriteBudgetName, Vec4(1.0f, fSkyWeight, fTapU, fTapV), eHWSC_Pixel);
++		m_passSpriteWeight.SetConstant(spriteBudget2Name, Vec4(fDiameterPerUnit, 0.0f, 0.0f, 0.0f), eHWSC_Pixel);
++		m_passSpriteWeight.Execute();
++	}
++
++	// -------- steps 1-3: the cutoff controller, for the NEXT frame --------
++	m_nSpriteStatsIndex ^= 1;
++	CTexture* pCur = m_pTexSpriteStats[m_nSpriteStatsIndex];
++
++	const int nTileW = m_pTexSpriteTileStats->GetWidth();
++	const int nTileH = m_pTexSpriteTileStats->GetHeight();
++	const int nMidW  = m_pTexSpriteStatsMid->GetWidth();
++	const int nMidH  = m_pTexSpriteStatsMid->GetHeight();
++
++	if (m_passSpriteSourceStats.IsDirty(m_pTexSpriteWeight->GetTextureID()))
++	{
++		m_passSpriteSourceStats.SetPrimitiveFlags(CRenderPrimitive::eFlags_ReflectShaderConstants_PS);
++		m_passSpriteSourceStats.SetPrimitiveType(CRenderPrimitive::ePrim_ProceduralTriangle);
++		m_passSpriteSourceStats.SetTechnique(pShader, techSourceStats, 0);
++		m_passSpriteSourceStats.SetRenderTarget(0, m_pTexSpriteTileStats);
++		m_passSpriteSourceStats.SetState(GS_NODEPTHTEST);
++		m_passSpriteSourceStats.SetTextureSamplerPair(0, m_pTexSpriteWeight, EDefaultSamplerStates::PointClamp);
++	}
++
++	m_passSpriteSourceStats.BeginConstantUpdate();
++	m_passSpriteSourceStats.SetConstant(spriteStats0Name,
++	                                    Vec4(1.0f / (float)max(nGridW, 1), 1.0f / (float)max(nGridH, 1),
++	                                         (float)kSpriteStatsTileSize, (float)kSpriteStatsTileSize), eHWSC_Pixel);
++	m_passSpriteSourceStats.SetConstant(spriteStats1Name,
++	                                    Vec4((float)nGridW, (float)nGridH, (float)nTileW, (float)nTileH), eHWSC_Pixel);
++	m_passSpriteSourceStats.Execute();
++
++	const int nReduceX = (nTileW + nMidW - 1) / nMidW;
++	const int nReduceY = (nTileH + nMidH - 1) / nMidH;
++
++	if (m_passSpriteStatsReduce.IsDirty(m_pTexSpriteTileStats->GetTextureID()))
++	{
++		m_passSpriteStatsReduce.SetPrimitiveFlags(CRenderPrimitive::eFlags_ReflectShaderConstants_PS);
++		m_passSpriteStatsReduce.SetPrimitiveType(CRenderPrimitive::ePrim_ProceduralTriangle);
++		m_passSpriteStatsReduce.SetTechnique(pShader, techStatsReduce, 0);
++		m_passSpriteStatsReduce.SetRenderTarget(0, m_pTexSpriteStatsMid);
++		m_passSpriteStatsReduce.SetState(GS_NODEPTHTEST);
++		m_passSpriteStatsReduce.SetTextureSamplerPair(0, m_pTexSpriteTileStats, EDefaultSamplerStates::PointClamp);
++	}
++
++	m_passSpriteStatsReduce.BeginConstantUpdate();
++	m_passSpriteStatsReduce.SetConstant(spriteStats0Name,
++	                                    Vec4(1.0f / (float)max(nTileW, 1), 1.0f / (float)max(nTileH, 1),
++	                                         (float)nReduceX, (float)nReduceY), eHWSC_Pixel);
++	m_passSpriteStatsReduce.SetConstant(spriteStats1Name,
++	                                    Vec4((float)nTileW, (float)nTileH, (float)nMidW, (float)nMidH), eHWSC_Pixel);
++	m_passSpriteStatsReduce.Execute();
++
++	if (m_passSpriteBudget.IsDirty(m_pTexSpriteStatsMid->GetTextureID(), pPrev->GetTextureID(), pCur->GetTextureID()))
++	{
++		m_passSpriteBudget.SetPrimitiveFlags(CRenderPrimitive::eFlags_ReflectShaderConstants_PS);
++		m_passSpriteBudget.SetPrimitiveType(CRenderPrimitive::ePrim_ProceduralTriangle);
++		m_passSpriteBudget.SetTechnique(pShader, techBudget, 0);
++		m_passSpriteBudget.SetRenderTarget(0, pCur);
++		m_passSpriteBudget.SetState(GS_NODEPTHTEST);
++		m_passSpriteBudget.SetTextureSamplerPair(0, m_pTexSpriteStatsMid, EDefaultSamplerStates::PointClamp);
++		m_passSpriteBudget.SetTextureSamplerPair(1, pPrev, EDefaultSamplerStates::PointClamp);
++	}
++
++	m_passSpriteBudget.BeginConstantUpdate();
++	m_passSpriteBudget.SetConstant(spriteStats0Name,
++	                               Vec4(1.0f / (float)max(nMidW, 1), 1.0f / (float)max(nMidH, 1),
++	                                    (float)nMidW, (float)nMidH), eHWSC_Pixel);
++	m_passSpriteBudget.SetConstant(spriteStats1Name,
++	                               Vec4((float)nMidW, (float)nMidH, 1.0f, 1.0f), eHWSC_Pixel);
++	m_passSpriteBudget.SetConstant(spriteBudgetNName, Vec4((float)nBudget, 0.0f, 0.0f, 0.0f), eHWSC_Pixel);
++	m_passSpriteBudget.Execute();
++
++	UpdateSpriteBudgetReport(nDebugMode, nRequestedBudget, nBudget, nGridW, nGridH, true);
++
++	return m_pTexSpriteWeight;
++}
++
++bool CDepthOfFieldStage::AcquireSpriteBudgetTargets(int halfWidth, int halfHeight)
++{
++	const int w = max(halfWidth, 1);
++	const int h = max(halfHeight, 1);
++
++	if (m_pTexSpriteWeight && m_pTexSpriteTileStats && m_pTexSpriteStatsMid &&
++	    m_pTexSpriteStats[0] && m_pTexSpriteStats[1] &&
++	    m_spriteBudgetWidth == w && m_spriteBudgetHeight == h)
++		return true;
++
++	ReleaseSpriteBudgetTargets();
++
++	const uint32 flags = FT_NOMIPS | FT_DONT_STREAM | FT_USAGE_RENDERTARGET;
++	const std::string id = m_graphicsPipeline.GetUniqueIdentifierName();
++
++	// The weight map is fp16: it carries a priority and an excess, both HDR, and a weight in
++	// [0,1]. Precision there is irrelevant - the weight is a crossfade the eye reads over frames.
++	m_pTexSpriteWeight = CTexture::GetOrCreateRenderTarget(("$DofSpriteWeight" + id).c_str(),
++	                                                       w, h, Clr_Transparent, eTT_2D, flags, eTF_R16G16B16A16F);
++
++	// The stats chain is RGBA32F and has to be: the middle targets carry a COUNT of up to half a
++	// million next to a summed HDR excess, and fp16 runs out of mantissa at 2048 - it would report
++	// a population of "65504" for anything large and be believed.
++	const int nTileW = (w + kSpriteStatsTileSize - 1) / kSpriteStatsTileSize;
++	const int nTileH = (h + kSpriteStatsTileSize - 1) / kSpriteStatsTileSize;
++	m_pTexSpriteTileStats = CTexture::GetOrCreateRenderTarget(("$DofSpriteTileStats" + id).c_str(),
++	                                                          nTileW, nTileH, Clr_Transparent, eTT_2D, flags, eTF_R32G32B32A32F);
++	m_pTexSpriteStatsMid  = CTexture::GetOrCreateRenderTarget(("$DofSpriteStatsMid" + id).c_str(),
++	                                                          16, 16, Clr_Transparent, eTT_2D, flags, eTF_R32G32B32A32F);
++	// FT_STAGE_READBACK on the 1x1 pair: a persistent staging resource is what makes the report's
++	// download two-phase instead of a pipeline stall.
++	const uint32 statsFlags = flags | FT_STAGE_READBACK;
++	m_pTexSpriteStats[0] = CTexture::GetOrCreateRenderTarget(("$DofSpriteStats0" + id).c_str(),
++	                                                         1, 1, Clr_Transparent, eTT_2D, statsFlags, eTF_R32G32B32A32F);
++	m_pTexSpriteStats[1] = CTexture::GetOrCreateRenderTarget(("$DofSpriteStats1" + id).c_str(),
++	                                                         1, 1, Clr_Transparent, eTT_2D, statsFlags, eTF_R32G32B32A32F);
++
++	if (!CTexture::IsTextureExist(m_pTexSpriteWeight) || !CTexture::IsTextureExist(m_pTexSpriteTileStats) ||
++	    !CTexture::IsTextureExist(m_pTexSpriteStatsMid) ||
++	    !CTexture::IsTextureExist(m_pTexSpriteStats[0]) || !CTexture::IsTextureExist(m_pTexSpriteStats[1]))
++	{
++		ReleaseSpriteBudgetTargets();
++		return false;
++	}
++
++	// A cutoff of zero is "no budget", which is the only safe thing for the first frame to read.
++	CClearSurfacePass::Execute(m_pTexSpriteStats[0], Clr_Transparent);
++	CClearSurfacePass::Execute(m_pTexSpriteStats[1], Clr_Transparent);
++	m_nSpriteStatsIndex = 0;
++
++	m_spriteBudgetWidth = w;
++	m_spriteBudgetHeight = h;
++	CryLog("[DOF] sprite bokeh budget targets acquired: %d x %d weight map, %d x %d tiles", w, h, nTileW, nTileH);
++	return true;
++}
++
++void CDepthOfFieldStage::ReleaseSpriteBudgetTargets()
++{
++	m_pTexSpriteWeight.reset();
++	// Not while a download is in flight: the staging resource is the target of a GPU copy that has
++	// not necessarily retired.
++	if (!m_pTexSpriteStatsInFlight)
++	{
++		m_pTexSpriteTileStats.reset();
++		m_pTexSpriteStatsMid.reset();
++		m_pTexSpriteStats[0].reset();
++		m_pTexSpriteStats[1].reset();
++		m_spriteBudgetWidth = 0;
++		m_spriteBudgetHeight = 0;
++	}
++}
++
++//////////////////////////////////////////////////////////////////////////////////////////////////
++// r_DepthOfFieldSpriteBokehDebug 2 - the population, said out loud once a second.
++//
++// The count is the one number that decides what this pass COSTS, and until now nothing on this
++// path counted anything: the user's only instrument was the frame rate. Sixteen bytes come back
++// from the GPU a second, two-phase, so nothing ever blocks; the GPU milliseconds come from the
++// pass's own PROFILE_LABEL_SCOPE via the render pipeline profiler, which this mode cannot switch
++// on and says so rather than printing a zero that would read as "free".
++//////////////////////////////////////////////////////////////////////////////////////////////////
++void CDepthOfFieldStage::UpdateSpriteBudgetReport(int nDebugMode, int nRequestedBudget, int nBudget,
++                                                  int nGridW, int nGridH, bool bInForce)
++{
++	const bool bWantReport = (nDebugMode == 2 || nDebugMode == 3) && bInForce;
++
++	if (!bWantReport)
++	{
++		if (!m_bSpriteReadbackIssued)
++		{
++			m_pTexSpriteStatsInFlight.reset();
++			m_bSpriteReadbackStalled = false;
++			m_fSpriteReadbackTime = 0.0f;
++		}
++		return;
++	}
++
++	if (gEnv->pTimer == nullptr)
++		return;
++
++	const float fNow = gEnv->pTimer->GetAsyncCurTime();
++
++	if (m_bSpriteReadbackIssued)
++	{
++		CTexture* pInFlight = m_pTexSpriteStatsInFlight;
++		CDeviceTexture* pDevTex = CTexture::IsTextureExist(pInFlight) ? pInFlight->GetDevTexture() : nullptr;
++		if (pDevTex == nullptr)
++		{
++			m_bSpriteReadbackIssued = false;
++			m_pTexSpriteStatsInFlight.reset();
++			return;
++		}
++
++		// Not signalled yet: come back next frame. The whole point of the two-phase download is
++		// that this never blocks.
++		if (!pDevTex->AccessCurrStagingResource(0, false))
++		{
++			if ((fNow - m_fSpriteReadbackTime) > 5.0f && !m_bSpriteReadbackStalled)
++			{
++				m_bSpriteReadbackStalled = true;
++				CryLogAlways("[DOF] sprite bokeh budget: the stats download has not signalled in 5 s - no reports");
++			}
++			return;
++		}
++		m_bSpriteReadbackStalled = false;
++
++		float fCutoff = 0.0f, fRaw = 0.0f, fDrawn = 0.0f, fResidualFrac = 0.0f;
++		const auto statsData = [&fCutoff, &fRaw, &fDrawn, &fResidualFrac](void* pData, uint32 rowPitch, uint32 slicePitch) -> bool
++		{
++			const float* pTexel = static_cast<const float*>(pData);
++			fCutoff = pTexel[0];
++			fRaw = pTexel[1];
++			fDrawn = pTexel[2];
++			fResidualFrac = pTexel[3];
++			return true;
++		};
++		pDevTex->AccessCurrStagingResource(0, false, statsData);
++
++		m_bSpriteReadbackIssued = false;
++		m_pTexSpriteStatsInFlight.reset();
++		// Time the cadence from the REPORT, not from the request, so a slow fence cannot turn this
++		// into a per-frame download.
++		m_fSpriteReadbackTime = fNow;
++
++		// The unit every "stops" figure is in: 0.18 on the scene-referred path because the frame is
++		// pre-exposed, and 0.18 / the tone map's own exposure off it (S9). Zero means the stock
++		// measurement was not available this frame, in which case the threshold itself fell back to
++		// its absolute reading and the report says so instead of printing stops over a mid grey
++		// that is not the one in force.
++		const float fMidGrey = CRendererResources::IsSceneReferredStage(5)
++		                       ? CRendererResources::kSceneReferredMidGrey
++		                       : CRendererResources::GetStockMidGrey();
++		const float fReportGrey = (fMidGrey > 0.0f) ? fMidGrey : CRendererResources::kSceneReferredMidGrey;
++		const float fInvLn2 = 1.0f / logf(2.0f);
++
++		float fSplatMs = -1.0f, fBudgetMs = -1.0f;
++		if (gcpRendD3D != nullptr)
++		{
++			const DynArray<RPProfilerDetailedStats>* pStats = gcpRendD3D->GetRPPDetailedStatsArray(false);
++			if (pStats != nullptr)
++			{
++				for (const RPProfilerDetailedStats& stat : *pStats)
++				{
++					if (strcmp(stat.name, "HIGHLIGHT SPLATS") == 0)
++						fSplatMs = stat.gpuTimeSmoothed;
++					else if (strcmp(stat.name, "SPRITE BOKEH BUDGET") == 0)
++						fBudgetMs = stat.gpuTimeSmoothed;
++				}
++			}
++		}
++
++		const float fSpriteCapPx = max(CRenderer::CV_r_DofLensModelSplatMaxCoC, 1.0f);
++
++		CryLog("[DOF] ---- sprite bokeh sources, once a second (r_DepthOfFieldSpriteBokehDebug 2) ----");
++		CryLog("[DOF]   SOURCES: raw above the highlight threshold = %.0f of the %d x %d grid"
++		       " -- one sprite each, up to %.0f x %.0f native px per sprite (r_DepthOfFieldLensModelSplatMaxCoC)",
++		       fRaw, nGridW, nGridH, fSpriteCapPx, fSpriteCapPx);
++		CryLog("[DOF]            budget %d (r_DepthOfFieldSpriteBokehMaxSources): %.0f drew a shaped disc,"
++		       " cutoff %.4g = %+.1f stops over mid grey -- the other %.0f kept their LIGHT (%.1f%% of the"
++		       " source excess, handed back to the GATHER and blurred there) and lost their shape",
++		       nBudget, fDrawn, fCutoff,
++		       (fCutoff > 1e-12f) ? (logf(fCutoff / fReportGrey) * fInvLn2) : -99.0f,
++		       max(fRaw - fDrawn, 0.0f), fResidualFrac * 100.0f);
++		if (fCutoff <= 0.0f)
++		{
++			CryLog("[DOF]            cutoff 0 = the budget is NOT binding: the whole population fits, and both"
++			       " the downscale's energy split and the splat are bit-identical to the un-budgeted pass");
++		}
++		if (nRequestedBudget != nBudget)
++		{
++			CryLog("[DOF]            r_DepthOfFieldSpriteBokehMaxSources %d was CLAMPED to %d: %s",
++			       nRequestedBudget, nBudget,
++			       (nRequestedBudget <= 0)
++			       ? "0 does not mean unlimited here - unlimited is the bug this budget exists for"
++			       : "beyond a few thousand shaped discs the picture stops changing and only the frame time grows");
++		}
++		const float fSkyWeight = clamp_tpl(CRenderer::CV_r_DofSpriteBokehSkyWeight, 0.0f, 1.0f);
++		CryLog("[DOF]            sky weight %.2f (r_DepthOfFieldSpriteBokehSkyWeight): a cell at the far plane"
++		       " enters that cutoff at %.2f of its excess, so a practical in the scene wins a slot over a sky"
++		       " texel of the same brightness. Priority only -- a losing cell keeps every bit of its light in"
++		       " the gather, so the frame's total does not move with this number",
++		       fSkyWeight, fSkyWeight);
++		if (fSplatMs >= 0.0f)
++		{
++			CryLog("[DOF]            GPU %.2f ms in the splat draw + %.2f ms in the budget's own passes,"
++			       " for %.0f sprites (%.1f us each)",
++			       fSplatMs, max(fBudgetMs, 0.0f), fDrawn,
++			       (fDrawn > 0.5f) ? (1000.0f * fSplatMs / fDrawn) : 0.0f);
++		}
++		else
++		{
++			CryLog("[DOF]            GPU time not measured: the render pipeline profiler is not recording."
++			       " Set r_profiler 1 (or r_DisplayInfo 3) to put the splat's milliseconds on this line.");
++		}
++		if (fMidGrey <= 0.0f)
++		{
++			CryLog("[DOF]            NOTE: the stock path's mid grey is not measured this frame, so the"
++			       " highlight threshold is being read as an ABSOLUTE value and the stops above are nominal");
++		}
++		return;
++	}
++
++	if (m_fSpriteReadbackTime > 0.0f && (fNow - m_fSpriteReadbackTime) < 1.0f)
++		return;
++
++	// Our own target, downloadable where it stands - no blit.
++	CTexture* pStatsTex = m_pTexSpriteStats[m_nSpriteStatsIndex];
++	if (!CTexture::IsTextureExist(pStatsTex) || pStatsTex->GetDevTexture() == nullptr)
++		return;
++
++	if (m_fSpriteReadbackTime <= 0.0f)
++		CryLog("[DOF] sprite bokeh budget report armed (one line group a second)");
++
++	pStatsTex->GetDevTexture()->DownloadToStagingResource(0);
++	m_pTexSpriteStatsInFlight = pStatsTex;
++	m_bSpriteReadbackIssued = true;
++	m_fSpriteReadbackTime = fNow;
+ }
+ 
+ //////////////////////////////////////////////////////////////////////////////////////////////////
+@@ -1175,7 +1644,7 @@ void CDepthOfFieldStage::ExecuteSplatLayers(const SDepthOfFieldParams& dofParams
+                                             float fNumApertureSides, float fIrisExponent, float fIrisEdgeSoft,
+                                             bool bSplat, bool bGhost,
+                                             bool bLensModel, const Vec4& vLensModel, const Vec4& vLensModel2, float fSplatCapPx,
+-                                            const Vec4& vGatherFieldPupil2)
++                                            const Vec4& vGatherFieldPupil2, CTexture* pSpriteBudget, const Vec4& vSpriteBudgetFlag)
+ {
+ 	// Two views of one constant. The splat and the ghost draws never form a circle of confusion
+ 	// (they read the gather's), so their .z lane carries the SPRITE's own size cap; the overlay
+@@ -1341,7 +1810,9 @@ void CDepthOfFieldStage::ExecuteSplatLayers(const SDepthOfFieldParams& dofParams
+ 	// old grid-to-layer divide double-counted the dilution and dimmed every splat 4x.
+ 	// .w is the diagnostic flag: the pixel shader draws the raw silhouette at full
+ 	// strength instead of the energy-normalized deposit, so the shape is unmissable.
+-	const float fSpriteDebug = (CRenderer::CV_r_DofSpriteBokehDebug > 0) ? 1.0f : 0.0f;
++	// 1 and 3 draw the silhouette; 2 is the source budget's once-a-second report and must NOT
++	// change the picture, or the population it is reporting on is not the one being drawn.
++	const float fSpriteDebug = (CRenderer::CV_r_DofSpriteBokehDebug == 1 || CRenderer::CV_r_DofSpriteBokehDebug == 3) ? 1.0f : 0.0f;
+ 	const Vec4 vBokehHighlight(fHighlightThreshold, fHighlightKnee, fSplatEnergyGain, fSpriteDebug);
+ 
+ 	static CCryNameR dofFocusParam0Name("vDofParamsFocus0");
+@@ -1356,6 +1827,7 @@ void CDepthOfFieldStage::ExecuteSplatLayers(const SDepthOfFieldParams& dofParams
+ 	static CCryNameR dofAxialChromaticName("vDofAxialChromatic");
+ 	static CCryNameR dofLensModelName("vDofLensModel");
+ 	static CCryNameR dofLensModel2Name("vDofLensModel2");
++	static CCryNameR dofSpriteBudgetName("vDofSpriteBudget");
+ 
+ 	// Ground truth log, once per change: what the splat grid and the iris actually resolve to.
+ 	{
+@@ -1456,6 +1928,10 @@ void CDepthOfFieldStage::ExecuteSplatLayers(const SDepthOfFieldParams& dofParams
+ 		// pass runs). The splat sizes itself from the SAME numbers the gather blurred with, so
+ 		// the two never disagree on how far out of focus a highlight is.
+ 		prim.SetTexture(4, m_graphicsPipelineResources.m_pTexSceneCoC[1], EDefaultResourceViews::Default, EShaderStage_Vertex);
++		// The source budget's weight map (S10): the same texel the downscale scaled its energy
++		// hand-over by, read with the same point sampler as the source (slot 0).
++		prim.SetTexture(5, pSpriteBudget ? pSpriteBudget : CRendererResources::s_ptexWhite,
++		                EDefaultResourceViews::Default, EShaderStage_Vertex);
+ 		prim.SetSampler(0, EDefaultSamplerStates::PointClamp, EShaderStage_Vertex | EShaderStage_Pixel);
+ 		prim.SetSampler(1, EDefaultSamplerStates::PointClamp, EShaderStage_Vertex | EShaderStage_Pixel);
+ 		prim.SetSampler(2, EDefaultSamplerStates::PointWrap);
+@@ -1488,6 +1964,8 @@ void CDepthOfFieldStage::ExecuteSplatLayers(const SDepthOfFieldParams& dofParams
+ 			// which EvalPupilShape applies in both permutations (at 0 it is exactly 1).
+ 			constantManager.SetNamedConstant(dofLensModelName, vSpriteLensModel, eHWSC_Vertex);
+ 			constantManager.SetNamedConstant(dofLensModelName, vSpriteLensModel, eHWSC_Pixel);
++			// The source budget's flag. Vertex only: the pixel shader draws whatever reaches it.
++			constantManager.SetNamedConstant(dofSpriteBudgetName, vSpriteBudgetFlag, eHWSC_Vertex);
+ 			constantManager.EndNamedConstantUpdate(&viewport, m_graphicsPipeline.GetCurrentRenderView());
+ 
+ 			m_passSpriteSplat.AddPrimitive(&prim);
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DepthOfField.h b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DepthOfField.h
+index c35381fc..17520b58 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DepthOfField.h
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DepthOfField.h
+@@ -27,6 +27,10 @@ public:
+ 		, m_passComposition(&graphicsPipeline)
+ 		, m_passSpriteComposition(&graphicsPipeline)
+ 		, m_passGhostComposition(&graphicsPipeline)
++		, m_passSpriteWeight(&graphicsPipeline)
++		, m_passSpriteSourceStats(&graphicsPipeline)
++		, m_passSpriteStatsReduce(&graphicsPipeline)
++		, m_passSpriteBudget(&graphicsPipeline)
+ 	{
+ 		for (auto& pass : m_passTileMinCoC)
+ 			pass.SetGraphicsPipeline(&graphicsPipeline);
+@@ -97,10 +101,32 @@ private:
+ 	// it has to mask the far splats with exactly the sharpness the composite used.
+ 	// shapeExponent / edgeSoftness: the iris polygon's shape (0 = circle, 1 = the true polygon)
+ 	// and how crisp its edge is cut, both resolved once in Execute() from blade curvature.
++	// pSpriteBudget / vSpriteBudgetFlag: the source budget's weight map and the flag that says
++	// whether it is in force (S10). The splat's vertex shader reads the very texel the downscale
++	// scaled its energy hand-over by, so the light one gives away is the light the other takes.
+ 	void ExecuteSplatLayers(const SDepthOfFieldParams& dofParams, const Vec4& vDofParams0, const Vec4& vDofParams1,
+ 	                        float blades, float shapeExponent, float edgeSoftness, bool bSplat, bool bGhost,
+ 	                        bool bLensModel, const Vec4& vLensModel, const Vec4& vLensModel2, float fSplatCapPx,
+-	                        const Vec4& vGatherFieldPupil2);
++	                        const Vec4& vGatherFieldPupil2, CTexture* pSpriteBudget, const Vec4& vSpriteBudgetFlag);
++
++	//! The sprite bokeh SOURCE BUDGET (S10, decisions/s10-sprite-bokeh-budget.md). Resolves this
++	//! frame's weight map and advances the cutoff controller; returns the weight map, or null when
++	//! the budget is not in force (no splat this frame, or its targets could not be created), in
++	//! which case both consumers take their un-budgeted branch and the pass is byte-identical.
++	//!
++	//! Called from Execute() right after the $HDRTarget -> $SceneTarget copy, i.e. BEFORE the
++	//! downscale, because the downscale is the pass that hands the highlight excess away and it
++	//! has to know how much of it the splat will actually deposit.
++	CTexture* ExecuteSpriteBudget(const SDepthOfFieldParams& dofParams, const Vec4& vDofParams0, const Vec4& vDofParams1,
++	                              const Vec4& vFieldPupil2, const Vec4& vLensModel, const Vec4& vLensModel2,
++	                              const Vec4& vDownscaleHighlight, uint64 nLensRTMask, bool bSplat);
++
++	bool AcquireSpriteBudgetTargets(int halfWidth, int halfHeight);
++	void ReleaseSpriteBudgetTargets();
++
++	//! r_DepthOfFieldSpriteBokehDebug 2: one plain-language report a second, from a two-phase
++	//! (never blocking) download of the budget's 1x1 stats texel. Nothing else reads it back.
++	void UpdateSpriteBudgetReport(int nDebugMode, int nRequestedBudget, int nBudget, int nGridW, int nGridH, bool bInForce);
+ 
+ 	// Mask gather kernel: CDFs importance-sampling the PUPIL (mask x iris disc of radius
+ 	// fIrisRadius in mask units, 1 = the mask's bounding circle, >= 1.5 = no clipping), built on
+@@ -164,6 +190,30 @@ private:
+ 	bool AcquireGhostLayer(int width, int height);
+ 	void ReleaseGhostLayer();
+ 
++	// The sprite bokeh source budget (S10). The weight map is the single point of truth both the
++	// downscale's energy split and the splat's deposit read, so that the light one of them gives
++	// away is exactly the light the other takes; the three stats targets are the glare's cutoff
++	// controller reproduced on this path (decisions/s10-sprite-bokeh-budget.md).
++	CFullscreenPass      m_passSpriteWeight;
++	CFullscreenPass      m_passSpriteSourceStats;
++	CFullscreenPass      m_passSpriteStatsReduce;
++	CFullscreenPass      m_passSpriteBudget;
++
++	_smart_ptr<CTexture> m_pTexSpriteWeight;      //!< half res, (priority, weight, excess, 0)
++	_smart_ptr<CTexture> m_pTexSpriteTileStats;   //!< 8x8 blocks of the above
++	_smart_ptr<CTexture> m_pTexSpriteStatsMid;    //!< fixed 16x16
++	_smart_ptr<CTexture> m_pTexSpriteStats[2];    //!< 1x1 ping-pong: (cutoff, raw, drawn, residual share)
++	int                  m_nSpriteStatsIndex = 0;
++	int                  m_spriteBudgetWidth = 0;
++	int                  m_spriteBudgetHeight = 0;
++
++	// The report's two-phase readback (r_DepthOfFieldSpriteBokehDebug 2). Sixteen bytes a second,
++	// issued and collected on later frames, never mapped inline.
++	_smart_ptr<CTexture> m_pTexSpriteStatsInFlight;
++	bool                 m_bSpriteReadbackIssued = false;
++	bool                 m_bSpriteReadbackStalled = false;
++	float                m_fSpriteReadbackTime = 0.0f;
++
+ 	// Mask-domain gather kernel state. Built once per texture name from the DDS file itself
+ 	// (the GPU resource has no CPU-side copy); steady state costs one string compare.
+ 	std::vector<float> m_maskRowCDF;    // marginal CDF over rows
+diff --git a/Code/CryPlugins/CinematicCamera/SceneReferredSpec.md b/Code/CryPlugins/CinematicCamera/SceneReferredSpec.md
+index 7ce3c8b4..4d678b84 100644
+--- a/Code/CryPlugins/CinematicCamera/SceneReferredSpec.md
++++ b/Code/CryPlugins/CinematicCamera/SceneReferredSpec.md
+@@ -267,6 +267,14 @@ the Hable curve and the sRGB encode are being fed AP1 values as if they were Rec
+   high pass, so bloom's exposure response comes entirely from S1's pre-exposure. The firefly filter
+   is likewise untouched. The stops (not the linear result) are what gets clamped, because the ghost
+   and front-filter sliders have a 1..64 travel chosen for absolute values.
++  **A threshold is not a population (S10, 2026-09-10).** Making every threshold exposure-relative
++  keeps a SETTING meaningful across apertures; it does not bound how many texels clear it, and
++  under real scene ratios "+2 stops over mid grey" is most of a sunlit frame. Every sparse
++  sprite-scatter pass therefore needs a source BUDGET as well: the wave glare got one in S8/S9
++  (`r_HDRDiffractionMaxSources`), the **sprite bokeh** in S10
++  (`r_DepthOfFieldSpriteBokehMaxSources` / `...SkyWeight` / `...Debug 2`, weight map shared by the
++  downscale's energy split and the splat so a culled source's light returns to the gather), and the
++  front filter PSF still has none. `decisions/s10-sprite-bokeh-budget.md`.
+ 
+ ### Stage S8 — breakage sweep (D13)
+ - Run with volumetric fog, SVOGI, clouds, particles, water, sun shafts **on**. Log each breakage
+diff --git a/Code/CryPlugins/CinematicCamera/SpriteBokehSpec.md b/Code/CryPlugins/CinematicCamera/SpriteBokehSpec.md
+index 8cd8bfe9..0bc38f77 100644
+--- a/Code/CryPlugins/CinematicCamera/SpriteBokehSpec.md
++++ b/Code/CryPlugins/CinematicCamera/SpriteBokehSpec.md
+@@ -87,3 +87,33 @@ star/flare 形狀)當冒煙測試素材,把路徑寫在報告裡;自訂愛心等
+ 4. 收光圈 f/1.2→f/2.8→f/5.6:多邊形逐漸啃進貼圖形狀(交集),繼續收則趨近純多邊形。
+ 5. `Use Sprite Bokeh` 屬性開關等效於 cvar,還原鏈正確。
+ 6. 效能:1080p sprite 模式 < 3ms(舊實作的正常水位)。
++
++## 7. Source budget (S10, 2026-09-10)
++
++The pass draws one sprite per grid cell whose highlight excess clears the threshold, and a
++threshold does not bound a population. Under the scene-referred pre-exposure (and, since S9, on
++the stock path too) the shipped `Highlight Threshold 2.0` means "+2 stops over mid grey", which in
++a physically lit frame is most of a sunlit image: tens of thousands of cells, each rasterizing a
++disc of up to `r_DepthOfFieldLensModelSplatMaxCoC` native pixels into two blended fp16 targets.
++That is the reported "Use Sprite Bokeh on, frame rate gone".
++
++A budget now bounds it, modelled on the wave glare's (`decisions/s8-glare-budget.md`):
++
++* A half-resolution **weight pass** runs before the layer downscale and writes, per cell,
++  `(priority, weight, excess)`. Priority is the cell's mean excess above the knee, times the
++  splat's own fade, times `r_DepthOfFieldSpriteBokehSkyWeight` for a cell at the far plane.
++* Three small passes reduce that to one texel holding `(cutoff, raw count, drawn count, share of
++  the excess handed back)`, correcting the cutoff from the previous frame's count towards
++  `r_DepthOfFieldSpriteBokehMaxSources`.
++* **One weight, two consumers.** `DownscaleDofPS` scales its energy hand-over by the weight and
++  `DofBokehRefVS` scales its deposit by the same texel, so the excess the sprite does not deposit
++  is exactly the excess the gather kept. A source that loses its slot loses its iris SHAPE and
++  keeps its light, spread by the gather - which is what unshaped defocused light looks like.
++* The quad of a losing cell is collapsed in the vertex shader, so it costs no fill at all.
++* A scene whose population fits the budget drives the cutoff to zero, and both consumers are then
++  bit-identical to the un-budgeted pass. The budget binds on both exposure paths; what keeps stock
++  CRYENGINE untouched is that `r_DepthOfFieldMode` ships as 1 and only the camera sets 0.
++
++`r_DepthOfFieldSpriteBokehDebug 2` prints the population, the cutoff in stops, the residual share
++and the splat's GPU milliseconds once a second. Acceptance item 6 above ("< 3 ms at 1080p") is now
++something the renderer measures rather than something the user infers from the frame rate.
+diff --git a/Code/CryPlugins/CinematicCamera/docs/ConsoleReference.md b/Code/CryPlugins/CinematicCamera/docs/ConsoleReference.md
+index 15553548..5ca8c99f 100644
+--- a/Code/CryPlugins/CinematicCamera/docs/ConsoleReference.md
++++ b/Code/CryPlugins/CinematicCamera/docs/ConsoleReference.md
+@@ -585,6 +585,30 @@ diagnostics outrank the mask. Kernel parameter changes are logged as
+ | --- | --- |
+ | Default | 0 |
+ | Purpose | Diagnostic for the hybrid sprite bokeh splats (`r_DepthOfFieldMode 0`). 1 = every surviving splat is drawn as its raw shape mask at full strength, skipping the energy normalization, so the silhouette (texture x iris polygon) becomes unmissable. 0 = off. |
++| 2 — sources | The **source budget's** report, once a second, in the log. Does not touch the picture. Five lines: how many grid cells cleared the highlight threshold (`SOURCES: raw above the highlight threshold = N of the W x H grid`), how many of them the budget could afford a shaped disc for and at what energy cutoff (printed in stops over the mid grey in force), how much of the source excess was handed back to the gather instead, the sky weight and what head start it gives a scene source, and the splat's **GPU milliseconds** — so the population and its cost are on adjacent lines. The milliseconds come from the render pipeline profiler and therefore need `r_profiler 1` (or `r_DisplayInfo 3`); without it the line says the profiler is not recording. |
++| 3 | Both of the above. |
++
++### r_DepthOfFieldSpriteBokehMaxSources
++
++| | |
++| --- | --- |
++| Default | 256 |
++| Purpose | **Source budget** for the hybrid sprite bokeh (`r_DepthOfFieldMode 0` = the camera's **Use Sprite Bokeh**). The splat draws one sprite per grid cell above the highlight threshold, and a threshold does not bound a population: in a physically lit frame "+2 stops over mid grey" is most of a sunlit image, and each of those cells rasterizes a disc of up to `r_DepthOfFieldLensModelSplatMaxCoC` native pixels into two blended fp16 targets. This is the largest number of cells that may draw a shaped disc in one frame. |
++| Who wins a slot | The N brightest, by their excess above the threshold, with SKY de-prioritised — see `r_DepthOfFieldSpriteBokehSkyWeight`. |
++| Where the rest of the light goes | Back into the **gather**. A cell that cannot afford a disc keeps its excess in the layers the gather is about to blur, so it loses its iris SHAPE and keeps its light, spread the way a lens spreads unshaped defocused light. Nothing darkens when the budget binds, and a one-stop crossfade at the cutoff means nothing pops while panning. |
++| When it does nothing | Whenever the population already fits: the cutoff decays to 0 and both the downscale's energy split and the splat are bit-identical to the un-budgeted pass. In force on both exposure paths (Scene Referred on or off) — the same shader and the same grid run on both. |
++| Hard cap | **4096**, clamped at the consumer, and **0 does not mean unlimited** (0 or less means the cap). A budget whose top end can hang the editor is not a budget — the lesson `r_HDRDiffractionMaxSources` learned on 2026-09-05. A clamped value is said out loud in the debug report rather than swallowed. |
++| Measuring | `r_DepthOfFieldSpriteBokehDebug 2`. |
++
++### r_DepthOfFieldSpriteBokehSkyWeight
++
++| | |
++| --- | --- |
++| Default | 0.25 |
++| Purpose | How hard a **sky** cell competes for `r_DepthOfFieldSpriteBokehMaxSources`. A sky is enormous, sits at infinity so its discs are the largest and most expensive in the frame, and is routinely two to five stops over mid grey; on equal terms it takes every slot and the practicals in the scene lose their bokeh. A cell at the **far plane** enters the energy cutoff with its excess multiplied by this weight. |
++| It is a PRIORITY, not a brightness | Nothing here scales light. A sky cell that **wins** draws its full shaped disc; one that **loses** keeps every bit of its excess in the gather. The frame's total light is identical at every value — only who gets a *shape* changes. |
++| Range | 0 … 1. **1 = sky and scene competing on equal terms.** |
++| Sky test | Linear depth at the far plane (`>= 0.9999`), on all four of the cell's native texels. The same test the wave glare's budget and the camera's metering histogram use. |
+ 
+ ### r_DepthOfFieldSpriteBokehFadeCoC
+ 
+diff --git a/Engine/Shaders/HWScripts/CryFX/DepthOfField.cfx b/Engine/Shaders/HWScripts/CryFX/DepthOfField.cfx
+index 812b4d6c..990c4f87 100644
+--- a/Engine/Shaders/HWScripts/CryFX/DepthOfField.cfx
++++ b/Engine/Shaders/HWScripts/CryFX/DepthOfField.cfx
+@@ -63,6 +63,22 @@ float4 vDofFieldPupil;
+ // ComputeCircleOfConfusion and reach the downscale and the composite, not the splat.
+ float4 vDofFieldPupil2;
+ 
++// Sprite bokeh SOURCE BUDGET (S10, decisions/s10-sprite-bokeh-budget.md). The splat pass draws
++// one sprite per grid cell whose highlight excess clears the threshold, and nothing about a
++// threshold bounds how many cells that is: in a physically lit frame it is tens of percent of the
++// screen, each drawing a disc of up to r_DepthOfFieldLensModelSplatMaxCoC pixels into two blended
++// fp16 targets. The budget picks the N brightest and hands the rest back to the gather.
++//
++// x = 1 when the weight texture is bound and the budget is in force. At 0 not one line of the
++//     mechanism runs, in either consumer, so the un-budgeted pass is byte-identical.
++// y = sky priority weight (r_DepthOfFieldSpriteBokehSkyWeight), WEIGHT PASS ONLY.
++// zw = half a native texel in the weight pass's own UV, so it can read the cell's four native
++//     texels exactly as the sprite vertex shader does. WEIGHT PASS ONLY.
++float4 vDofSpriteBudget;
++// x = native pixels of disc DIAMETER per unit of circle of confusion (2 * LensCoCUnitPixels),
++// so the weight pass can apply the sprite's own sub-pixel cull. WEIGHT PASS ONLY. yzw unused.
++float4 vDofSpriteBudget2;
++
+ // Axial (longitudinal) chromatic aberration, AxialChromaticSpec.md. x = s, the radius of the
+ // shrunk channels' out-of-focus disc in units of the full one (1 = off). Not a field effect:
+ // each wavelength simply focuses at its own distance, so the centre of the frame fringes as
+@@ -284,6 +300,11 @@ Texture2D texDofBkRef_SceneDepth  : register(t1);
+ Texture2D texDofBkRef_Dither      : register(t2);
+ Texture2D texDofBkRef_BokehShape  : register(t3);
+ Texture2D texDofBkRef_CoC         : register(t4);  // gather's CoC: r = near (tile max), g = far (tile min)
++// The source budget's weight map (S10): r = this cell's priority, g = the weight in [0,1] the
++// budget gives it. Half resolution, one texel per HALF-res cell, written by DofSpriteWeightPS
++// BEFORE the downscale so that this pass and the downscale's energy split read the same number -
++// see decisions/s10-sprite-bokeh-budget.md, "One weight, computed once".
++Texture2D texDofBkRef_Budget      : register(t5);
+ 
+ SamplerState ssDofBkRef_SceneTarget : register(s0);
+ SamplerState ssDofBkRef_SceneDepth  : register(s1);
+@@ -318,9 +339,33 @@ v2fBokehQuad DofBokehRefVS(uint nVertexID : SV_VertexID)
+ 	vOutPos = INPos;
+ 	vOutPos.xy =  vOutPos.xy *2 -1;
+ 
+-	OUT.Position = float4(vOutPos.xy, 0, 1);//vWorldPos.z, fDepth); //mul(vpMatrix, vPos);  
++	OUT.Position = float4(vOutPos.xy, 0, 1);//vWorldPos.z, fDepth); //mul(vpMatrix, vPos);
+ 	float4 screenProj = HPosToScreenTC(OUT.Position);
+-		
++
++	// The SOURCE BUDGET (S10, decisions/s10-sprite-bokeh-budget.md), first because it is the
++	// cheapest cull in the shader: one point read, and a losing cell skips the depth taps, the
++	// four colour taps and - above all - a disc of up to 256 x 256 pixels in two blended fp16
++	// targets. vDofSpriteBudget.x is 0 unless the budget is configured and its weight map exists,
++	// and at 0 not one line of this runs, which is what keeps the un-budgeted pass byte-identical.
++	//
++	// The weight is NOT recomputed here. DofSpriteWeightPS wrote it before the downscale, and the
++	// downscale's energy split scaled its hand-over by the same texel: the excess this sprite does
++	// not deposit is exactly the excess the gather kept, so the frame's light is unchanged at any
++	// budget. Point sampled at the cell centre - the map is half resolution, so on the native grid
++	// (r_DepthOfFieldResolutionScale 1) four cells share one weight, which is deliberate: the
++	// downscale is half resolution and the split has to be exact against IT.
++	float fBudgetWeight = 1.0;
++	if (vDofSpriteBudget.x > 0.5)
++	{
++		fBudgetWeight = GetTexture2DLod(texDofBkRef_Budget, ssDofBkRef_SceneTarget, float4(screenProj.xy, 0, 0)).g;
++		if (fBudgetWeight <= 0.0)
++		{
++			OUT.Position.xy = 0;
++			return OUT;
++		}
++	}
++
++
+ 	// fetch scene color - output vertex/quad color
+ 	float fDepth = GetTexture2DLod(texDofBkRef_SceneDepth, ssDofBkRef_SceneDepth, float4(screenProj.xy, 0, 0)).x;
+ 	
+@@ -451,7 +496,11 @@ v2fBokehQuad DofBokehRefVS(uint nVertexID : SV_VertexID)
+ 		OUT.Position.xy=0;
+ 		return OUT;
+ 	}
+-	OUT.Color.rgb = cExcess * 0.25 * fSplatFade;
++	// x the budget's weight: 1 for every source while the population fits (and always when the
++	// budget is off), and a one-STOP crossfade for the sources on the cutoff so that a highlight
++	// drifting past the budget while the camera pans loses its shape over several frames instead
++	// of switching off. The complement stayed in the gather layers - see the weight sample above.
++	OUT.Color.rgb = cExcess * 0.25 * fSplatFade * fBudgetWeight;
+ 
+ 	// Field-dependent pupil, evaluated at the SPRITE's own place in the frame (a splat is one
+ 	// point of the field, unlike a gather pixel which is the field position itself).
+@@ -1014,6 +1063,13 @@ Texture2D<float4> DnScDoF_Depth            : register(t0);
+ SamplerState DnScDoF_DepthSamp             : register(s0);  //PointClamp
+ Texture2D<float4> DnScDoF_HDRTarg          : register(t1);
+ SamplerState DnScDoF_HDRTargSamp           : register(s1);  //LinearClamp
++// The sprite bokeh source budget's weight map (S10). This pass and the splat pass are the two
++// consumers of one weight, and they must read the SAME texel: this one is what decides how much
++// of a highlight's excess is taken OUT of the gather layers, the splat is what puts that much
++// back as a shaped disc. Both are half resolution and this pass writes one texel per cell, so the
++// mapping is 1:1. Only read in the lens permutation, where the energy split exists at all.
++Texture2D<float4> DnScDoF_SpriteBudget     : register(t2);
++SamplerState DnScDoF_SpriteBudgetSamp      : register(s2);  //PointClamp
+ 
+ 
+ struct vtxOutDownscaleDof
+@@ -1099,7 +1155,18 @@ OutDownscaleDof DownscaleDofPS(vtxOutDownscaleDof IN)
+ 		const float fFadeFull  = max(vDofBokehHighlight.z, 1e-3);
+ 		const float fCocHere   = max(max(max(vCocNear.x, vCocNear.y), max(vCocNear.z, vCocNear.w)),
+ 		                             min(min(vCocFar.x, vCocFar.y), min(vCocFar.z, vCocFar.w)));
+-		const float fHandOver  = vDofBokehHighlight.w * smoothstep(fFadeFull * 0.333, fFadeFull, fCocHere);
++		// x the SOURCE BUDGET's weight (S10). A cell the budget cannot afford a sprite for keeps
++		// its excess HERE, in the layer the gather is about to blur - so it loses its iris shape
++		// and keeps its light, spread the way a lens spreads unshaped defocused light. This is
++		// the one place the DOF has to differ from the wave glare, whose losers deposit their
++		// energy as a flat one-texel residual because its layer is additive on top of a complete
++		// frame; here the gather layer is what the sprite's excess was taken OUT of.
++		// decisions/s10-sprite-bokeh-budget.md, approach A.2.
++		float fBudgetWeight = 1.0;
++		if (vDofSpriteBudget.x > 0.5)
++			fBudgetWeight = GetTexture2D(DnScDoF_SpriteBudget, DnScDoF_SpriteBudgetSamp, IN.tc2.xy).g;
++
++		const float fHandOver  = vDofBokehHighlight.w * fBudgetWeight * smoothstep(fFadeFull * 0.333, fFadeFull, fCocHere);
+ 
+ 		// Per sample, before the average: see LensHighlightExcess.
+ 		const float fL  = GetWorkingLuminance(c.rgb);
+@@ -1159,7 +1226,311 @@ technique DownscaleDof
+   {
+     VertexShader = DownscaleDofVS();
+     PixelShader = DownscaleDofPS();
+-    CullMode = None;        
++    CullMode = None;
++  }
++}
++
++//////////////////////////////////////////////////////////////////////////////////////////////////
++// THE SPRITE BOKEH SOURCE BUDGET (S10, decisions/s10-sprite-bokeh-budget.md)
++//
++// DofBokehRefVS draws one sprite per grid cell whose highlight excess clears the threshold. A
++// threshold does not bound a population: under a physically lit frame "+2 stops over mid grey" is
++// most of a sunlit image, and each of those cells rasterizes a disc of up to
++// r_DepthOfFieldLensModelSplatMaxCoC native pixels into two blended RGBA16F targets. Measured on
++// an 85 mm f/1.4 at 1080p that is 1 870 Mpx of blending for a tenth of the frame. That is the
++// reported "sprite bokeh on, frame rate gone".
++//
++// Four passes answer, on the GPU with no CPU round trip, the one question the splat needs: what is
++// a source worth this frame, and can it afford a shape?
++//
++//   0. DofSpriteWeight      grid -> (priority, weight, excess): the ONE weight both consumers read
++//   1. DofSpriteSourceStats weights -> 8x8 tiles: (raw, drawn, summed excess, excess handed back)
++//   2. DofSpriteStatsReduce tiles -> a fixed 16x16, the same four sums
++//   3. DofSpriteBudget      16x16 -> ONE texel, and the cutoff for the NEXT frame
++//
++// Steps 1-3 are the wave glare's controller (HDRPostProcess.cfx, decisions/s8-glare-budget.md)
++// reproduced on this path: a multiplicative correction of last frame's cutoff, asymmetric (react
++// fast to too many, relax slowly to too few), a dead band so it does not hunt, and a decay to zero
++// whenever the whole population fits - which is what makes an unbudgeted scene byte-identical.
++// They are duplicated rather than shared because the two budgets are independent, the DOF's stats
++// live on a different shader, and a cross-shader technique call would couple two effects that have
++// no reason to move together. The one thing that MUST not drift is the cutoff's meaning, and that
++// is decided in step 0 here, once, for both consumers.
++//
++// Step 0 is what the glare did not need. Its sources live in a texture that is itself the single
++// point of truth; here the excess is read by TWO passes with different tap patterns (the downscale
++// subtracts it from the gather layers, the splat deposits it), so a weight computed twice would
++// disagree exactly for the sources on the cutoff and would either double count them or drop them.
++// One pass writes it, both read it, and the split is exact by construction.
++//////////////////////////////////////////////////////////////////////////////////////////////////
++
++// The far plane, the same test the wave glare's source threshold and the metering histogram use.
++#define kDofSpriteSkyDepth  0.9999
++
++Texture2D<float4> DofSpriteW_Scene   : register(t0);  // $SceneTarget, the sharp pre-DOF copy
++SamplerState      DofSpriteW_SceneS  : register(s0);  // PointClamp
++Texture2D<float4> DofSpriteW_Depth   : register(t1);  // full-res linear depth
++SamplerState      DofSpriteW_DepthS  : register(s1);  // PointClamp
++Texture2D<float4> DofSpriteW_Stats   : register(t2);  // the PREVIOUS frame's 1x1 stats
++SamplerState      DofSpriteW_StatsS  : register(s2);  // PointClamp
++
++// Step 0. One texel per HALF-resolution cell: what this cell is worth, and what the budget lets
++// it draw. Half resolution in every mode, including the native splat grid, because the OTHER
++// consumer - the downscale - is half resolution and the energy split has to be exact against it.
++float4 DofSpriteWeightPS(vtxOut IN) : SV_Target
++{
++	// Half a native texel in this pass's own UV: the four samples below then land on exactly the
++	// four native texels of the cell, which is the set DofBokehRefVS thresholds.
++	const float2 vTap = vDofSpriteBudget.zw;
++
++	const float3 c0 = GetTexture2DLod(DofSpriteW_Scene, DofSpriteW_SceneS, float4(IN.baseTC.xy + vTap * float2(-1, -1), 0, 0)).rgb;
++	const float3 c1 = GetTexture2DLod(DofSpriteW_Scene, DofSpriteW_SceneS, float4(IN.baseTC.xy + vTap * float2( 1,  1), 0, 0)).rgb;
++	const float3 c2 = GetTexture2DLod(DofSpriteW_Scene, DofSpriteW_SceneS, float4(IN.baseTC.xy + vTap * float2( 1, -1), 0, 0)).rgb;
++	const float3 c3 = GetTexture2DLod(DofSpriteW_Scene, DofSpriteW_SceneS, float4(IN.baseTC.xy + vTap * float2(-1,  1), 0, 0)).rgb;
++
++	float4 rawDepths = float4(
++		GetTexture2DLod(DofSpriteW_Depth, DofSpriteW_DepthS, float4(IN.baseTC.xy + vTap * float2(-1, -1), 0, 0)).x,
++		GetTexture2DLod(DofSpriteW_Depth, DofSpriteW_DepthS, float4(IN.baseTC.xy + vTap * float2( 1,  1), 0, 0)).x,
++		GetTexture2DLod(DofSpriteW_Depth, DofSpriteW_DepthS, float4(IN.baseTC.xy + vTap * float2( 1, -1), 0, 0)).x,
++		GetTexture2DLod(DofSpriteW_Depth, DofSpriteW_DepthS, float4(IN.baseTC.xy + vTap * float2(-1,  1), 0, 0)).x);
++
++	const float4 depths = rawDepths * PS_NearFarClipDist.y;
++
++	// The circle of confusion from DEPTH, with the same helper the downscale uses. It cannot read
++	// the gather's dilated CoC texture - that does not exist yet this frame, the min chain runs
++	// after this pass - so a cell at a blur boundary can be worth slightly less here than the
++	// sprite will actually draw. That only shifts WHO gets a shape, never how much light is in the
++	// frame: both consumers keep their own fade, and the weight is the same number in both.
++	float4 vCocNear, vCocFar;
++#if %_RT_SAMPLE2
++	LensModelCoC(depths, LensFieldRadius2(IN.baseTC.xy), vCocNear, vCocFar);
++	float fCocNear = max(max(vCocNear.x, vCocNear.y), max(vCocNear.z, vCocNear.w));
++	float fCocFar  = min(min(vCocFar.x,  vCocFar.y),  min(vCocFar.z,  vCocFar.w));
++#else
++	ComputeCircleOfConfusion(depths, LensFieldRadius2(IN.baseTC.xy), vCocNear, vCocFar);
++	// The stock permutation's sprite clamps the CoC it reads to four units; match it, so the
++	// sub-pixel cull below is the sprite's own and not a second, different one.
++	float fCocNear = clamp(max(max(vCocNear.x, vCocNear.y), max(vCocNear.z, vCocNear.w)), 0, 4);
++	float fCocFar  = clamp(min(min(vCocFar.x,  vCocFar.y),  min(vCocFar.z,  vCocFar.w)),  0, 4);
++#endif
++	const float fCocHere = max(fCocNear, fCocFar);
++
++	// The sprite's own two culls, in the sprite's own units: a disc under one pixel across, and
++	// the fade-in that keeps the splat's amplitude in step with the gather's.
++	const float fDiameterPx = fCocHere * vDofSpriteBudget2.x;
++	const float fFadeFull   = max(vDofBokehHighlight.z, 1e-3);
++	const float fFade       = smoothstep(fFadeFull * 0.333, fFadeFull, fCocHere);
++
++	// Per NATIVE texel, before the average: max(0, x - t) is convex, so the excess of a mean
++	// understates the mean of the excesses. Same order of operations as DofBokehRefVS.
++	const float fThreshold = vDofBokehHighlight.x;
++	const float fKnee      = max(vDofBokehHighlight.y, 1e-4);
++	const float fExcess = 0.25 * (LensHighlightExcess(GetWorkingLuminance(c0), fThreshold, fKnee) +
++	                              LensHighlightExcess(GetWorkingLuminance(c1), fThreshold, fKnee) +
++	                              LensHighlightExcess(GetWorkingLuminance(c2), fThreshold, fKnee) +
++	                              LensHighlightExcess(GetWorkingLuminance(c3), fThreshold, fKnee));
++
++	// SKY DE-PRIORITISATION (r_DepthOfFieldSpriteBokehSkyWeight), the S9 finding applied here: a
++	// sky is enormous, sits at infinity so its discs are the largest and most expensive in the
++	// frame, and is routinely two to five stops over mid grey. On equal terms it takes every slot
++	// and the practicals in the scene lose their bokeh. This is a PRIORITY and never light: a sky
++	// cell that wins draws its full sprite, and one that loses keeps all of its excess in the
++	// gather, so the frame's total is identical at every value of the weight.
++	const float fSky = (min(min(rawDepths.x, rawDepths.y), min(rawDepths.z, rawDepths.w)) >= kDofSpriteSkyDepth) ? 1.0 : 0.0;
++
++	float fPriority = fExcess * fFade * lerp(1.0, vDofSpriteBudget.y, fSky);
++	if (fDiameterPx < 1.0 || fFade <= 0.001 || fExcess < 1e-4)
++		fPriority = 0.0;
++
++	const float fCut = DofSpriteW_Stats.SampleLevel(DofSpriteW_StatsS, float2(0.5, 0.5), 0).x;
++
++	// One STOP of crossfade, not a hard cut, so a source drifting past the budget while the camera
++	// pans loses its shape over several frames. A cell this pass cannot measure as a source
++	// (fPriority 0) is left at 1 and the sprite's own culls decide it, which is the safe direction:
++	// this pass may DEMOTE a source, it may never invent a cull the splat did not have.
++	float fWeight = 1.0;
++	if (fCut > 0.0 && fPriority > 0.0)
++		fWeight = smoothstep(fCut, fCut * 2.0, fPriority);
++
++	return float4(fPriority, fWeight, fExcess, 0.0);
++}
++
++Texture2D<float4> DofSpriteStats_Src  : register(t0);  // the weight map, or the previous stage
++SamplerState      DofSpriteStats_SrcS : register(s0);  // PointClamp
++
++float4 vDofSpriteStats0;   // (1 / source width, 1 / source height, block width, block height)
++float4 vDofSpriteStats1;   // (source width, source height, target width, target height)
++float4 vDofSpriteBudgetN;  // (budget N, unused x3)
++
++// Step 1. One output texel per 8x8 block of weight-map texels. The raw count uses exactly the
++// weight pass's own test, so "raw sources" in the report is the number of sprites this frame would
++// rasterize with no budget at all - not an estimate of it.
++float4 DofSpriteSourceStatsPS(vtxOut IN) : SV_Target
++{
++	const float2 vSrcSize    = vDofSpriteStats1.xy;
++	const float2 vTargetSize = vDofSpriteStats1.zw;
++	const float2 vInvSrc     = vDofSpriteStats0.xy;
++	const int2   vBlock      = (int2)vDofSpriteStats0.zw;
++
++	const int2 vBase = ((int2)floor(IN.baseTC.xy * vTargetSize)) * vBlock;
++
++	float4 acc = 0;
++
++	[loop] for (int j = 0; j < vBlock.y; ++j)
++	{
++		[loop] for (int i = 0; i < vBlock.x; ++i)
++		{
++			const int2 p = vBase + int2(i, j);
++			if (p.x >= (int)vSrcSize.x || p.y >= (int)vSrcSize.y)
++				continue;
++
++			const float4 c = DofSpriteStats_Src.SampleLevel(DofSpriteStats_SrcS, ((float2)p + 0.5) * vInvSrc, 0);
++			if (c.x <= 0.0)
++				continue;   // not a source at all: the splat would collapse this quad anyway
++
++			acc.x += 1.0;
++			// z and w are TRUE excess, not priority: they are what the report calls the source
++			// excess and what the bootstrap sizes the first cutoff from. Only SELECTION is weighted.
++			acc.z += c.z;
++			if (c.y > 0.0)
++				acc.y += 1.0;
++			else
++				acc.w += c.z;
++		}
++	}
++
++	return acc;
++}
++
++// Step 2. Plain block sum into the fixed 16x16, so step 3 is always 256 taps at any resolution.
++float4 DofSpriteStatsReducePS(vtxOut IN) : SV_Target
++{
++	const float2 vSrcSize    = vDofSpriteStats1.xy;
++	const float2 vTargetSize = vDofSpriteStats1.zw;
++	const float2 vInvSrc     = vDofSpriteStats0.xy;
++	const int2   vBlock      = (int2)vDofSpriteStats0.zw;
++
++	const int2 vBase = ((int2)floor(IN.baseTC.xy * vTargetSize)) * vBlock;
++
++	float4 acc = 0;
++
++	[loop] for (int j = 0; j < vBlock.y; ++j)
++	{
++		[loop] for (int i = 0; i < vBlock.x; ++i)
++		{
++			const int2 p = vBase + int2(i, j);
++			if (p.x >= (int)vSrcSize.x || p.y >= (int)vSrcSize.y)
++				continue;
++
++			acc += DofSpriteStats_Src.SampleLevel(DofSpriteStats_SrcS, ((float2)p + 0.5) * vInvSrc, 0);
++		}
++	}
++
++	return acc;
++}
++
++Texture2D<float4> DofSpriteBudget_Prev  : register(t1);  // the PREVIOUS frame's 1x1 stats
++SamplerState      DofSpriteBudget_PrevS : register(s1);  // PointClamp
++
++// Step 3. One texel: sum what is left, then correct the cutoff for the next frame.
++// The controller is HDRDiffractionBudgetPS's, line for line, and deliberately so: it has been
++// measured on this project and its failure modes are written down.
++float4 DofSpriteBudgetPS(vtxOut IN) : SV_Target
++{
++	const int2   vSrcSize = (int2)vDofSpriteStats1.xy;
++	const float2 vInvSrc  = vDofSpriteStats0.xy;
++
++	float4 acc = 0;
++	[loop] for (int j = 0; j < vSrcSize.y; ++j)
++	{
++		[loop] for (int i = 0; i < vSrcSize.x; ++i)
++		{
++			acc += DofSpriteStats_Src.SampleLevel(DofSpriteStats_SrcS, ((float2)int2(i, j) + 0.5) * vInvSrc, 0);
++		}
++	}
++
++	const float fRaw   = acc.x;
++	const float fAbove = acc.y;
++	const float fSum   = acc.z;
++	const float fBelow = acc.w;
++
++	const float fPrevCut = DofSpriteBudget_Prev.SampleLevel(DofSpriteBudget_PrevS, float2(0.5, 0.5), 0).x;
++	const float fBudget  = vDofSpriteBudgetN.x;
++
++	const float kMinCut = 1e-6;
++
++	float fCut;
++
++	if (fBudget < 0.5 || fRaw <= fBudget)
++	{
++		// The budget is off, or the whole population fits: DECAY rather than snap to zero, so a
++		// frame that drops back under the budget fades its shapes in over a few frames. A scene
++		// that has always fitted sits at 0, and both consumers are then bit-identical to today.
++		fCut = fPrevCut * 0.5;
++		if (fCut < kMinCut)
++			fCut = 0.0;
++	}
++	else if (fPrevCut <= 0.0)
++	{
++		// Bootstrap two decades below the mean excess and climb: starting at the answer would cull
++		// half the frame in one frame, which is the pop this exists to avoid.
++		fCut = max(0.01 * fSum / max(fRaw, 1.0), kMinCut);
++	}
++	else if (fAbove <= fBudget && fAbove >= 0.8 * fBudget)
++	{
++		// Dead band, or the controller hunts around N every frame - over exactly the sources that
++		// are on the crossfade, i.e. it would flicker them.
++		fCut = fPrevCut;
++	}
++	else
++	{
++		// Asymmetric on purpose: react fast when there are too many (that is the frame-rate cliff
++		// arriving) and relax slowly when there are too few (that is only a missing bokeh shape).
++		const float fRatio = clamp(fAbove / max(fBudget, 1.0), 0.02, 100.0);
++		const float fStep  = (fRatio > 1.0) ? 0.5 : 0.15;
++		fCut = max(fPrevCut * pow(fRatio, fStep), kMinCut);
++	}
++
++	return float4(fCut, fRaw, fAbove, (fSum > 0.0) ? (fBelow / fSum) : 0.0);
++}
++
++technique DofSpriteWeight
++{
++  pass p0
++  {
++    VertexShader = FullscreenTriVS() PostMotionBlurVS;
++    PixelShader = DofSpriteWeightPS() PostMotionBlurPS;
++    CullMode = None;
++  }
++}
++
++technique DofSpriteSourceStats
++{
++  pass p0
++  {
++    VertexShader = FullscreenTriVS() PostMotionBlurVS;
++    PixelShader = DofSpriteSourceStatsPS() PostMotionBlurPS;
++    CullMode = None;
++  }
++}
++
++technique DofSpriteStatsReduce
++{
++  pass p0
++  {
++    VertexShader = FullscreenTriVS() PostMotionBlurVS;
++    PixelShader = DofSpriteStatsReducePS() PostMotionBlurPS;
++    CullMode = None;
++  }
++}
++
++technique DofSpriteBudget
++{
++  pass p0
++  {
++    VertexShader = FullscreenTriVS() PostMotionBlurVS;
++    PixelShader = DofSpriteBudgetPS() PostMotionBlurPS;
++    CullMode = None;
+   }
+ }
+ 
+-- 
+2.47.1.windows.1
+

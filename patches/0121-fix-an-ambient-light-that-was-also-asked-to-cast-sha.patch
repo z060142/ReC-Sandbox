@@ -1,0 +1,78 @@
+From 4906d91fd8b286df948cfafd54aa8841c03552a5 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Tue, 8 Sep 2026 19:36:03 +0800
+Subject: [PATCH 121/162] fix: an ambient light that was also asked to cast
+ shadows could take the engine down
+
+Ticking both "ambient" and "cast shadows" on one light crashed the engine. This is a stock
+CRYENGINE 5.7 bug, not something the scene-referred work introduced, so the guard is not gated on
+the switch.
+
+The engine builds a shadow frustum and a one-pass shadow render view for any light carrying
+DLF_CASTSHADOW_MAPS, ambient lights included, and parks the view in eUsageModeWriting on
+pFr->pOnePassShadowView. The renderer's shadow-gen list walks only eDLT_DynamicLight and
+eDLT_DeferredLight, never eDLT_DeferredAmbientLight, so that view is never consumed and never
+switched to eUsageModeWritingDone. The next frame overwrites the pointer, the view is released
+while still in Writing mode, and CRenderView::Clear() skips its three job-state waits (they sit
+inside the WritingDone branch) before freeing the render items - assert in a Profile editor,
+use-after-free on the render thread otherwise. It also leaked one shadow render view per frame and
+made the shadow-pool packer free and re-allocate the light's block every frame.
+
+Nothing ever read an ambient light's shadow map: the tiled stage guards the whole shadow block
+with "not an ambient light", and the light never enters the shadow-mask frustum list. So no longer
+asking for one cannot change a pixel on any path; it only removes the dangling view, the leak and
+the wasted shadow geometry passes.
+
+Under Scene Referred the same light is routed as a real fill light in the following commit, so it
+is no longer a modulator and its Cast Shadows checkbox becomes meaningful - hence the test on the
+3D engine's mirror of the switch rather than a blanket clear.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01HXzRVK4yBVDUNfdWXEwV5y
+---
+ Code/CryEngine/Cry3DEngine/LightEntity.cpp | 29 ++++++++++++++++++++++
+ 1 file changed, 29 insertions(+)
+
+diff --git a/Code/CryEngine/Cry3DEngine/LightEntity.cpp b/Code/CryEngine/Cry3DEngine/LightEntity.cpp
+index 712f4368..0f7c175f 100644
+--- a/Code/CryEngine/Cry3DEngine/LightEntity.cpp
++++ b/Code/CryEngine/Cry3DEngine/LightEntity.cpp
+@@ -1758,6 +1758,35 @@ void CLightEntity::UpdateCastShadowFlag(float fDistance, const SRenderingPassInf
+ 			m_light.m_Flags |= DLF_CASTSHADOW_MAPS;
+ 	}
+ 
++	// Ambient lights must never request a shadow map. This is a STOCK CRYENGINE 5.7 bug and the
++	// guard is deliberately NOT gated on the scene-referred switch, because the crash is stock.
++	//
++	// An ambient light is routed into eDLT_DeferredAmbientLight (RenderView.cpp:386), but the
++	// renderer's shadow-gen list walks only eDLT_DynamicLight and eDLT_DeferredLight
++	// (D3DShadows.cpp:60-87). So with DLF_CASTSHADOW_MAPS set we build the frustum here, and
++	// C3DEngine::PrepareShadowPasses takes a render view out of the pool, switches it to
++	// eUsageModeWriting and parks it on pFr->pOnePassShadowView (3DEngineRender.cpp:3800-3803) -
++	// and nothing ever consumes it or switches it to eUsageModeWritingDone. Next frame the same
++	// frustum overwrites the pointer, the view is released while still in eUsageModeWriting, and
++	// CRenderView::Clear() skips its three m_jobstate_*.Wait() calls (they sit inside
++	// `if (m_usageMode == eUsageModeWritingDone)`) before freeing the render items: assert in a
++	// Profile editor, use-after-free on the RenderThread otherwise. It also leaked one shadow
++	// render view per frame and thrashed the shadow pool packer, whose orphan test
++	// (D3DShadows.cpp:225-245) scans the deferred list only.
++	//
++	// Behaviour-preserving: an ambient light's shadow map has NO consumer. TiledLightVolumes.cpp
++	// guards the whole shadow block with `if (!ambientLight && ...)`, and the light never enters
++	// m_shadows.m_renderFrustums, so it gets no shadow-mask slice either. Not building it cannot
++	// change a pixel - it only stops the dangling view, the leak and the wasted geometry passes.
++	//
++	// On the scene-referred path an ambient light is re-routed to eDLT_DeferredLight as a real
++	// fill light (decisions/s8-ambient-lights.md part 2), so it is no longer a modulator and its
++	// Cast Shadows checkbox becomes meaningful - hence the switch test here rather than a blanket
++	// clear. Read through the 3DEngine-visible mirror of the renderer switch, which is the same
++	// value the routing in AddDeferredLight reads, so the two cannot disagree within a frame.
++	if ((m_light.m_Flags & DLF_AMBIENT) && !Get3DEngine()->IsSceneReferredConvention())
++		m_light.m_Flags &= ~DLF_CASTSHADOW_MAPS;
++
+ #if defined(FEATURE_SVO_GI)
+ 	IRenderNode::EGIMode eVoxMode = GetGIMode();
+ 	if (eVoxMode == IRenderNode::eGM_DynamicVoxelization || (eVoxMode == IRenderNode::eGM_StaticVoxelization && !GetCVars()->e_svoTI_IntegrationMode && !(m_light.m_Flags & DLF_SUN)))
+-- 
+2.47.1.windows.1
+

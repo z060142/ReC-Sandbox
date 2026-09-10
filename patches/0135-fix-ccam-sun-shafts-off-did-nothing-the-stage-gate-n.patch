@@ -1,0 +1,290 @@
+From 9593088974a8b8f720ccd679ccb1cda2b1f061cc Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Wed, 9 Sep 2026 01:43:27 +0800
+Subject: [PATCH 135/162] fix: ccam sun-shafts-off did nothing - the stage gate
+ never read SunShafts_Active; add a renderer-side suppress flag
+
+Root cause: 92a2236c pinned the Time of Day's `SunShafts_Active` to 0 on the
+post-effect bus. Nothing in the 5.7 pipeline reads that parameter.
+`CSunShaftsStage::IsStageActive` is `r_sunshafts && r_PostProcess` only, and
+every consumer (the half-res downsample decision, Execute, the tone map's
+featureMask / texture bind) goes through it. The old `CSunShafts::Preprocess`
+that ANDed the param with the cvar is not even defined in this tree; the TOD's
+visibility sliders act through SunShafts_Amount / RaysAmount. The apply did run
+(editor.log has the `sun shafts off` line twice) - it just wrote a value with no
+reader. Ordering vs SyncMainWithRender, bForceValue and the editor path are
+all irrelevant.
+
+Fix (the trodden path - a bus request the renderer ANDs, like every other
+Global_User_ camera param):
+- CPostEffectsMgr: new `Global_User_SunShaftsSuppressed` (no-transition
+  float, default 0).
+- CSunShaftsStage::IsStageActive: cvars AND NOT flag. Flag 0 = byte-identical.
+- ccam ApplySunShaftsOff/RestoreSunShafts publish 1 / 0 on that flag instead of
+  touching the TOD's param; m_savedSunShaftsActive removed; per-frame
+  re-assert and the once-per-activation log kept.
+- Docs (README, SceneReferredContent, ConsoleReference) corrected.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01HXzRVK4yBVDUNfdWXEwV5y
+---
+ .../Common/PostProcess/PostProcess.cpp        |  7 +++++
+ .../Common/PostProcess/PostProcess.h          |  6 +++++
+ .../XRenderD3D9/GraphicsPipeline/SunShafts.h  | 12 ++++++++-
+ .../Module/CinematicCameraComponent.cpp       | 26 ++++++++++---------
+ .../Module/CinematicCameraComponent.h         | 13 +++++-----
+ .../Module/CinematicCameraPlugin.cpp          |  4 +--
+ Code/CryPlugins/CinematicCamera/README.md     |  3 ++-
+ .../CinematicCamera/docs/ConsoleReference.md  |  9 ++++---
+ .../docs/SceneReferredContent.md              | 11 ++++----
+ 9 files changed, 60 insertions(+), 31 deletions(-)
+
+diff --git a/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.cpp b/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.cpp
+index cd407e14..f94770ae 100644
+--- a/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.cpp
++++ b/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.cpp
+@@ -472,6 +472,13 @@ int CPostEffectsMgr::Init()
+ 	AddParamFloatNoTransition("Global_User_MeterBandMean", m_pUserMeterBandMean, 0.0f);
+ 	AddParamFloatNoTransition("Global_User_MeterHold", m_pUserMeterHold, 0.0f);
+ 
++	// The Cinematic Camera's "keep the screen-space sun shafts off" request (2026-09-09). The
++	// stage's gate never read the TOD's SunShafts_Active - CSunShaftsStage::IsStageActive is the
++	// two cvars only - so the request needs its own input into that gate. Read by IsStageActive on
++	// the render thread (ToneMapping + StandardGraphicsPipeline), written by the camera on the main
++	// thread; the bus double-buffers it like every other Global_User_ param. Default 0 = stock.
++	AddParamFloatNoTransition("Global_User_SunShaftsSuppressed", m_pUserSunShaftsSuppressed, 0.0f);
++
+ 	// Register all post processes
+ 	AddEffect(CSunShafts);
+ 	AddEffect(CDepthOfField);
+diff --git a/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.h b/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.h
+index 36c5dd78..35d00de0 100644
+--- a/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.h
++++ b/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.h
+@@ -525,6 +525,7 @@ public:
+ 		, m_pUserGradeOffset(nullptr)
+ 		, m_pUserGradePower(nullptr)
+ 		, m_pUserGradeSaturation(nullptr)
++		, m_pUserSunShaftsSuppressed(nullptr)
+ 	{
+ 		ClearCache();
+ #ifndef _RELEASE
+@@ -750,6 +751,11 @@ protected:
+ 	//! overlay so that a metering complaint stays one screenshot to diagnose.
+ 	CEffectParam*       m_pUserMeterMode, * m_pUserMeterBandLow, * m_pUserMeterBandHigh, * m_pUserMeterTargetEV;
+ 	CEffectParam*       m_pUserMeterBandMean, * m_pUserMeterHold;
++	//! The camera's request to keep the screen-space sun shafts off (ReCS 2026-09-09: retired in
++	//! favour of volumetric fog). ANDed into CSunShaftsStage::IsStageActive - a renderer-side gate
++	//! like the scene-referred switch, not a fight with the Time of Day over its own parameters.
++	//! 0 = byte-identical to stock.
++	CEffectParam*       m_pUserSunShaftsSuppressed;
+ 	//! The sky's vote in the metering histogram, 0..1 (decisions/s8-metering-sky.md). An INPUT
+ 	//! like MeterMode.
+ 	CEffectParam*       m_pUserMeterSkyWeight;
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/SunShafts.h b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/SunShafts.h
+index 59fa7e75..849880dc 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/SunShafts.h
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/SunShafts.h
+@@ -17,9 +17,19 @@ public:
+ 		, m_passShaftsGen0(&graphicsPipeline)
+ 		, m_passShaftsGen1(&graphicsPipeline) {}
+ 
++	// The two cvars, ANDed with the Cinematic Camera's suppression request on the post-effect bus
++	// (ReCS 2026-09-09: the screen-space shafts are retired under the camera; volumetric fog is the
++	// god-ray source). Note this gate never read the Time of Day's SunShafts_Active - that param
++	// only reaches the composite through SunShafts_Amount / RaysAmount - which is why pinning it
++	// from the camera did nothing. Every caller of the stage (the half-res downsample decision,
++	// Execute, and the tone map's featureMask / texture bind) goes through here, so one AND covers
++	// the whole chain. Flag 0 = byte-identical to stock.
+ 	bool IsStageActive(EShaderRenderingFlags flags) const final
+ 	{
+-		return CRenderer::CV_r_sunshafts && CRenderer::CV_r_PostProcess;
++		if (!(CRenderer::CV_r_sunshafts && CRenderer::CV_r_PostProcess))
++			return false;
++		CPostEffectsMgr* pPostMgr = PostEffectMgr();
++		return !(pPostMgr && pPostMgr->GetByNameF("Global_User_SunShaftsSuppressed") > 0.5f);
+ 	}
+ 
+ 	void      Init() final;
+diff --git a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp
+index 4138d147..b73d87af 100644
+--- a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp
++++ b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp
+@@ -2745,14 +2745,18 @@ void CCinematicCameraComponent::RestoreHalation()
+ // (Engine/Config/CVarGroups/sys_spec_PostProcessing.cfg, `r_SunShafts=2` in the [default]
+ // block) re-apply the stock value at startup, so the code default alone is not seen. The cvar is
+ // VF_DUMPTODISK and global (decisions/s0-master-switch.md), so the camera does not write it.
+-// Instead it holds the OTHER input of the stage's gate: CSunShafts::Preprocess() runs only when
+-// `SunShafts_Active` (published by CTimeOfDay::UpdateEnvLighting from the TOD's visibility
+-// sliders) is > 0 AND the cvar is on. Pinning the parameter at 0 from here switches the stage off
+-// through the bus every other camera effect already uses, whatever the cfg did to the cvar.
+ //
+-// The TOD rewrites the parameter on every UpdateEnvLighting() (time change, preset edit, our own
+-// forced update in PublishSceneReferredConvention), so this is re-asserted per frame from the
+-// plugin's BeforeFinalizeCamera hook - which runs AFTER the TOD update - not written once.
++// First attempt (92a2236c) pinned the TOD's `SunShafts_Active` to 0 on the bus. That did nothing:
++// `CSunShaftsStage::IsStageActive` is `r_sunshafts && r_PostProcess` and never reads the param
++// (the `CSunShafts::Preprocess` that once ANDed it with the cvar is not on the pipeline's path in
++// 5.7 - only Init/Release/Reset survive), and the TOD's visibility sliders reach the picture
++// through `SunShafts_Amount` / `SunShafts_RaysAmount`, which the TOD republishes on every
++// environment update. So the camera now publishes its OWN request, `Global_User_SunShaftsSuppressed`,
++// which the renderer ANDs into `IsStageActive` - the same shape as every other Global_User_
++// request the lens model makes. Nothing of the TOD's is touched or fought over.
++//
++// Re-asserted per frame from the plugin's BeforeFinalizeCamera hook so a ResetPostEffects (level
++// load, RESET into game) cannot leave the stage on under an active camera; cleared on deactivate.
+ // ---------------------------------------------------------------------------
+ void CCinematicCameraComponent::ApplySunShaftsOff()
+ {
+@@ -2761,12 +2765,11 @@ void CCinematicCameraComponent::ApplySunShaftsOff()
+ 
+ 	if (!m_bSunShaftsSaved)
+ 	{
+-		gEnv->p3DEngine->GetPostEffectParam("SunShafts_Active", m_savedSunShaftsActive);
+ 		m_bSunShaftsSaved = true;
+ 		CryLog("[CinematicCamera] sun shafts off (retired in favour of volumetric fog)");
+ 	}
+ 
+-	gEnv->p3DEngine->SetPostEffectParam("SunShafts_Active", 0.0f);
++	gEnv->p3DEngine->SetPostEffectParam("Global_User_SunShaftsSuppressed", 1.0f);
+ }
+ 
+ void CCinematicCameraComponent::RestoreSunShafts()
+@@ -2774,9 +2777,8 @@ void CCinematicCameraComponent::RestoreSunShafts()
+ 	if (!m_bSunShaftsSaved)
+ 		return;
+ 
+-	// The saved value is the TOD's last publish before we took over; the TOD's next update
+-	// overwrites it with the current sliders anyway.
+-	gEnv->p3DEngine->SetPostEffectParam("SunShafts_Active", m_savedSunShaftsActive);
++	// 0 = stock gate (cvars only); the TOD's own params were never written, nothing to give back.
++	gEnv->p3DEngine->SetPostEffectParam("Global_User_SunShaftsSuppressed", 0.0f);
+ 	m_bSunShaftsSaved = false;
+ }
+ 
+diff --git a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
+index 3ae51be9..f190dd93 100644
+--- a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
++++ b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
+@@ -1173,10 +1173,11 @@ public:
+ 	void FinalizeGameCamera();
+ 	void ApplyExposureGlobalParam();
+ 	//! Screen-space sun shafts are retired on ReCS (volumetric fog is the god-ray source). While the
+-	//! camera drives the render state it holds `SunShafts_Active` at 0 through the post-effect bus -
+-	//! the same parameter the Time of Day publishes and the shafts stage ANDs with `r_sunshafts` -
+-	//! so the shafts stay off whatever a sys_spec cfg sets the cvar to. Re-asserted every frame
+-	//! after the TOD update; restored on deactivate.
++	//! camera drives the render state it publishes `Global_User_SunShaftsSuppressed = 1` on the
++	//! post-effect bus; `CSunShaftsStage::IsStageActive` ANDs it with `r_sunshafts`, so the shafts
++	//! stay off whatever a sys_spec cfg sets the cvar to. (The TOD's `SunShafts_Active` is NOT read
++	//! by that gate - pinning it, as 92a2236c did, changed nothing.) Re-asserted every frame;
++	//! cleared on deactivate.
+ 	void ApplySunShaftsOff();
+ 	void RestoreSunShafts();
+ 
+@@ -1539,8 +1540,8 @@ private:
+ 	Vec4  m_savedHalationTint      = Vec4(1.0f, 0.35f, 0.15f, 0.0f);
+ 	bool  m_bHalationSaved         = false;
+ 
+-	// Sun shafts saved param (SunShafts_Active). Latched once per activation; logged once with it.
+-	float m_savedSunShaftsActive   = 0.f;
++	// Sun shafts suppression published (Global_User_SunShaftsSuppressed). Latched once per
++	// activation; logged once with it; RestoreSunShafts() clears the flag and the latch.
+ 	bool  m_bSunShaftsSaved        = false;
+ 
+ 	// Derived cache of the camera manager's answer; written ONLY by ResolveActive().
+diff --git a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraPlugin.cpp b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraPlugin.cpp
+index c4a421c8..ba69ea7f 100644
+--- a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraPlugin.cpp
++++ b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraPlugin.cpp
+@@ -77,8 +77,8 @@ void CCinematicCameraPlugin::UpdateBeforeFinalizeCamera()
+ 	{
+ 		pActive->FinalizeGameCamera();
+ 		pActive->ApplyExposureGlobalParam();
+-		// After the TOD update, in editor and game alike: the TOD republishes SunShafts_Active
+-		// on every environment update and this write has to be the last one before render.
++		// Per frame, in editor and game alike, so a ResetPostEffects (level load / RESET) cannot
++		// leave the shafts stage on under an active camera.
+ 		pActive->ApplySunShaftsOff();
+ 	}
+ }
+diff --git a/Code/CryPlugins/CinematicCamera/README.md b/Code/CryPlugins/CinematicCamera/README.md
+index 0c21fe9a..da1cce67 100644
+--- a/Code/CryPlugins/CinematicCamera/README.md
++++ b/Code/CryPlugins/CinematicCamera/README.md
+@@ -147,7 +147,8 @@ this pipeline exists to get away from. What still runs: PostAA, the HUD, the fin
+ and all of the camera's own optics.
+ 
+ **Screen-space sun shafts are switched off by the camera** (2026-09-09): while a cinematic camera
+-is active it holds the Time of Day's `SunShafts_Active` at 0, so the radial-blur god rays never
++is active it publishes `Global_User_SunShaftsSuppressed = 1`, which the shafts stage ANDs with the
++cvar, so the radial-blur god rays never
+ run under it whatever `r_sunshafts` says (the engine's spec cfg keeps that cvar at 2). Real light
+ shafts come from volumetric fog, on by default on ReCS (`e_VolumetricFog` 1, restart required):
+ give the Time of Day's volumetric fog some `Global density` and they appear behind trees and
+diff --git a/Code/CryPlugins/CinematicCamera/docs/ConsoleReference.md b/Code/CryPlugins/CinematicCamera/docs/ConsoleReference.md
+index e382470c..5e05b315 100644
+--- a/Code/CryPlugins/CinematicCamera/docs/ConsoleReference.md
++++ b/Code/CryPlugins/CinematicCamera/docs/ConsoleReference.md
+@@ -715,7 +715,7 @@ in the build for that case.
+ | ReCS default | **0** (off) |
+ | Stock 5.7.1 default | 2 (on, with occlusion query) |
+ | DLL | CryRenderD3D11 |
+-| Purpose | Master switch for the **screen-space** sun shafts (`CSunShaftsStage` and its composite in `HDRFinalPass`). The Time of Day's `Sun shafts visibility` / `Sun rays visibility` only publish `SunShafts_Active`, which the renderer ANDs with this cvar, so a level cannot force the shafts on past it. 1 = on, 2 = on with the sun-disc occlusion query. |
++| Purpose | Master switch for the **screen-space** sun shafts (`CSunShaftsStage` and its composite in `HDRFinalPass`). The Time of Day's `Sun shafts visibility` / `Sun rays visibility` publish `SunShafts_Amount` / `SunShafts_RaysAmount` (and `SunShafts_Active`, which nothing in the 5.7 pipeline reads); the stage's gate is this cvar AND `r_PostProcess` AND NOT the Cinematic Camera's `Global_User_SunShaftsSuppressed`, so a level cannot force the shafts on past it. 1 = on, 2 = on with the sun-disc occlusion query. |
+ 
+ **The code default is overridden by the engine's spec cfgs.** `sys_spec_PostProcessing`
+ (`Engine/Config/CVarGroups/sys_spec_PostProcessing.cfg` line 21, `r_SunShafts=2` in its
+@@ -725,9 +725,10 @@ that system at work. (`mobile.cfg:78` and `recording.cfg:62` set it too, for the
+ Two consequences:
+ 
+ * **The Cinematic Camera turns the shafts off itself** (2026-09-09, second pass). While the
+-  component drives the render state it publishes `SunShafts_Active = 0` on the post-effect bus
+-  every frame after the Time of Day update - the other input of the stage's gate - and gives the
+-  TOD's value back on deactivate. The log prints `[CinematicCamera] sun shafts off (retired in
++  component drives the render state it publishes `Global_User_SunShaftsSuppressed = 1` on the
++  post-effect bus every frame, and `CSunShaftsStage::IsStageActive` ANDs it with this cvar;
++  cleared on deactivate. (92a2236c pinned the TOD's `SunShafts_Active` instead - a parameter that
++  gate never read, so the shafts stayed; fixed the same day.) The log prints `[CinematicCamera] sun shafts off (retired in
+   favour of volumetric fog)` once per activation. It does not write `r_sunshafts` (VF_DUMPTODISK,
+   global; `decisions/s0-master-switch.md`), so `r_sunshafts` may still read 2 in the console while
+   the stage is off - expected. With no cinematic camera active, the cfg's value rules.
+diff --git a/Code/CryPlugins/CinematicCamera/docs/SceneReferredContent.md b/Code/CryPlugins/CinematicCamera/docs/SceneReferredContent.md
+index db5f8c92..e3127580 100644
+--- a/Code/CryPlugins/CinematicCamera/docs/SceneReferredContent.md
++++ b/Code/CryPlugins/CinematicCamera/docs/SceneReferredContent.md
+@@ -31,7 +31,7 @@ What that means for content already in your level:
+ | Environment probe | unchanged by the convention, but its *contents* are now stale — see section 4 |
+ | Emissive material | unchanged |
+ | Skybox with an HDR texture | **3.32 stops darker**, and now delivers exactly its authored lux |
+-| Sun shafts | **screen-space shafts are off whenever the Cinematic Camera is active** (it pins `SunShafts_Active` 0; `r_sunshafts` also defaults to 0 but the engine's spec cfg puts it back to 2 - ReCS policy 2026-09-09); god rays come from volumetric fog (`e_VolumetricFog` ReCS default 1). With no cinematic camera and `r_sunshafts` on they follow the sun, the aperture and ND instead of sitting at a fixed display fraction |
++| Sun shafts | **screen-space shafts are off whenever the Cinematic Camera is active** (it publishes `Global_User_SunShaftsSuppressed` 1, ANDed into the stage's gate; `r_sunshafts` also defaults to 0 but the engine's spec cfg puts it back to 2 - ReCS policy 2026-09-09); god rays come from volumetric fog (`e_VolumetricFog` ReCS default 1). With no cinematic camera and `r_sunshafts` on they follow the sun, the aperture and ND instead of sitting at a fixed display fraction |
+ 
+ So a sun-lit exterior gets more contrast between sun and shade, and a point-lit interior drops
+ 1.65 stops against its sky-derived ambient. **ReC scenes are lit for the ReC path.** Re-lighting
+@@ -162,9 +162,10 @@ real single-scattering integral, shadow map included, and since S8 it runs on sc
+ is the god-ray source now. In practice the cvar default is not what switches the old shafts off:
+ the engine's `sys_spec_PostProcessing` cfg (`Engine/Config/CVarGroups/sys_spec_PostProcessing.cfg`
+ line 21, inside `engine.pak`) sets `r_SunShafts=2` again at startup. So **the Cinematic Camera
+-turns them off itself**: while it is active it publishes `SunShafts_Active = 0` after every Time
+-of Day update (the parameter the stage ANDs with the cvar) and gives the TOD's value back on
+-deactivate; the log prints `[CinematicCamera] sun shafts off (retired in favour of volumetric
++turns them off itself**: while it is active it publishes `Global_User_SunShaftsSuppressed = 1` on
++the post-effect bus every frame, and `CSunShaftsStage::IsStageActive` ANDs that with the cvar
++(the TOD's `SunShafts_Active` is not read by that gate - the first attempt pinned it and nothing
++changed); cleared on deactivate. The log prints `[CinematicCamera] sun shafts off (retired in favour of volumetric
+ fog)` once per activation. To get shafts: `e_VolumetricFog` is now **1 by default** (ReCS; stock
+ 0 - it needs a restart, so a build deployed over a running editor shows the fog only after the
+ editor is restarted; if a project `system.cfg` / `game.cfg` or a spec cfg sets it to 0, edit that
+@@ -262,7 +263,7 @@ Notes that matter:
+ | Warning about a probe's light-unit convention | probe baked under the other convention | re-bake with the switch in the state you ship |
+ | Sky far too bright / far too dark relative to the sun | procedural dome uncalibrated | `r_SceneReferredNishitaScale`, `SceneReferredCalibration.md` section 2 |
+ | No sun shafts at all | the active cinematic camera pins the screen-space shafts off; the fog has no density | restart once after deploying (`e_VolumetricFog` default 1 needs it), TOD volumetric fog density 0.1–0.4 (section 3) |
+-| Screen-space shafts still visible with the camera active | the CinematicCamera.dll in the bin predates 2026-09-09 (no `sun shafts off` line in the log) | redeploy the DLL |
++| Screen-space shafts still visible with the camera active | the CinematicCamera.dll or CryRenderD3D11.dll in the bin predates the 2026-09-09 fix (`sun shafts off` in the log but `r_sunshafts 0` still changes the picture = old renderer DLL) | redeploy both DLLs |
+ | Sun shafts washing the frame out (no cinematic camera, `r_sunshafts 1`) | amount is now a scattering coefficient | drop it to 0.01–0.05 |
+ | A legacy `.tod` reads 1.65 stops bright | migration is path-dependent | re-save the preset with the camera active, or author a `.env` |
+ 
+-- 
+2.47.1.windows.1
+

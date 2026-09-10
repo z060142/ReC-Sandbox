@@ -1,0 +1,473 @@
+From 5f1d292fed41b3758e0b1a1a479ac13945380e6d Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Tue, 8 Sep 2026 22:47:25 +0800
+Subject: [PATCH 130/162] feat: the AUTO meter no longer lets the sky own the
+ exposure outdoors (Sky Weight)
+
+Outdoors the sky is about half the frame at 0..+2 stops over the sunlit ground.
+Centre-weighting is symmetric about a centred horizon, so it does not reduce the
+sky's share at all, and the 50-90 % metering band was therefore entirely sky: the
+camera exposed the SKY to mid grey and the ground landed 0.5-1.8 stops under it,
+the shade 4-5 stops under - black. Indoors the sky through a door is under 20 %
+and already outside the band, which is why indoors was fine.
+
+The fix is a matrix meter's sky detection with the engine's classifier
+(decisions/s8-metering-sky.md, approach A):
+
+- SceneReferredMeterHistogramCS binds the quarter-res linear depth
+  (m_pTexLinearDepthScaled[1], same grid as the source) as t1. Its .y is the 4x4
+  minimum linear depth and the linearise pass preserves an exact 1.0 for the
+  sky, so .y >= 1 means every pixel under the texel is sky; the mask weight of
+  such a texel is multiplied by MeterHistParams.w before binning.
+- New Cinematic Camera member 'mtsk' MeterSkyWeight / "Sky Weight", 0..1,
+  default 0.25 (1 = previous behaviour, 0 = the sky is invisible to the meter
+  and an all-sky frame holds). Published as Global_User_MeterSkyWeight beside
+  MeterMode; the value the dispatch used comes back with the bins.
+- The histogram target grows from 64x1 to 66x1: columns 64/65 accumulate the
+  sky texel count and the sky weight that actually entered the bins. The
+  readback latches the sky weight and source texel count at download time and
+  publishes skyFraction / skyMeterShare / skyWeight on SSceneReferredMeterHistogram.
+- r_HDRDebug 1 histogram line gains "sky NN% of frame x W = MM% of meter".
+- README / ConsoleReference describe the parameter.
+
+Off the switch nothing changes: the pass is not dispatched. The
+r_SceneReferredMeterHistogram 0 log-mean fallback is untouched.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01HXzRVK4yBVDUNfdWXEwV5y
+---
+ .../CryCommon/CryRenderer/IRenderer.h         | 13 +++-
+ .../Common/PostProcess/PostProcess.cpp        |  4 ++
+ .../Common/PostProcess/PostProcess.h          |  3 +
+ .../GraphicsPipeline/AutoExposure.cpp         | 59 +++++++++++++++++--
+ .../GraphicsPipeline/AutoExposure.h           |  7 +++
+ .../GraphicsPipeline/ToneMapping.cpp          |  9 ++-
+ .../Module/CinematicCameraComponent.cpp       |  5 ++
+ .../Module/CinematicCameraComponent.h         | 11 ++++
+ Code/CryPlugins/CinematicCamera/README.md     |  1 +
+ .../CinematicCamera/docs/ConsoleReference.md  |  6 +-
+ .../HWScripts/CryFX/HDRPostProcess.cfx        | 50 +++++++++++++++-
+ 11 files changed, 155 insertions(+), 13 deletions(-)
+
+diff --git a/Code/CryEngine/CryCommon/CryRenderer/IRenderer.h b/Code/CryEngine/CryCommon/CryRenderer/IRenderer.h
+index 158a5458..660f9029 100644
+--- a/Code/CryEngine/CryCommon/CryRenderer/IRenderer.h
++++ b/Code/CryEngine/CryCommon/CryRenderer/IRenderer.h
+@@ -248,7 +248,12 @@ enum ERenderQueryTypes
+ //! log-means may all be computed in exposed units and converted once, at the end.
+ struct SSceneReferredMeterHistogram
+ {
+-	enum { kBinCount = 64 };
++	enum
++	{
++		kBinCount    = 64,
++		kExtraCount  = 2,                       //!< sky accumulators after the bins (decisions/s8-metering-sky.md)
++		kColumnCount = kBinCount + kExtraCount, //!< width of the readback row, in uints
++	};
+ 
+ 	float  bins[kBinCount];      //!< accumulated metering weight per bin
+ 	float  totalWeight;          //!< sum of the bins; 0 means "no measurement, hold the last EV"
+@@ -257,6 +262,12 @@ struct SSceneReferredMeterHistogram
+ 	float  logMaxStops;          //!< upper edge of the top bin, same units
+ 	uint32 sampleId;             //!< increments once per completed readback; 0 = never measured
+ 	uint32 meteringMode;         //!< the mask the accumulation actually used (0 Avg, 1 Centre, 2 Spot)
++	//! Sky bookkeeping (decisions/s8-metering-sky.md). The pass classifies a quarter-res texel as
++	//! sky when the 4x4 MINIMUM linear depth under it is the far plane, and multiplies its mask
++	//! weight by skyWeight before binning - the engine's form of a matrix meter's sky detection.
++	float  skyFraction;          //!< sky texels / frame texels, 0..1
++	float  skyMeterShare;        //!< the sky's share of totalWeight AFTER the down-weight, 0..1
++	float  skyWeight;            //!< the multiplier the accumulation actually used
+ };
+ 
+ enum class EGraphicsPipelineType
+diff --git a/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.cpp b/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.cpp
+index 4c09cfff..cd407e14 100644
+--- a/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.cpp
++++ b/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.cpp
+@@ -458,6 +458,10 @@ int CPostEffectsMgr::Init()
+ 	// draws with them. No transition on any of them: a metering mask is a switch, and fading a
+ 	// diagnostic readout would make it lie.
+ 	AddParamFloatNoTransition("Global_User_MeterMode", m_pUserMeterMode, 1.0f);
++	// The sky's vote in the histogram (decisions/s8-metering-sky.md): a second INPUT, read by the
++	// same pass. Defaults to the camera's default so a frame before the camera publishes meters
++	// the same way.
++	AddParamFloatNoTransition("Global_User_MeterSkyWeight", m_pUserMeterSkyWeight, 0.25f);
+ 	AddParamFloatNoTransition("Global_User_MeterBandLow", m_pUserMeterBandLow, 0.0f);
+ 	AddParamFloatNoTransition("Global_User_MeterBandHigh", m_pUserMeterBandHigh, 0.0f);
+ 	AddParamFloatNoTransition("Global_User_MeterTargetEV", m_pUserMeterTargetEV, 0.0f);
+diff --git a/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.h b/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.h
+index 54561dc8..36c5dd78 100644
+--- a/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.h
++++ b/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.h
+@@ -750,6 +750,9 @@ protected:
+ 	//! overlay so that a metering complaint stays one screenshot to diagnose.
+ 	CEffectParam*       m_pUserMeterMode, * m_pUserMeterBandLow, * m_pUserMeterBandHigh, * m_pUserMeterTargetEV;
+ 	CEffectParam*       m_pUserMeterBandMean, * m_pUserMeterHold;
++	//! The sky's vote in the metering histogram, 0..1 (decisions/s8-metering-sky.md). An INPUT
++	//! like MeterMode.
++	CEffectParam*       m_pUserMeterSkyWeight;
+ 	CEffectParam*       m_pUserColorC, * m_pUserColorY, * m_pUserColorM, * m_pUserColorK, * m_pUserColorHue;
+ 
+ 	CPostEffectVec      m_pEffects;
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/AutoExposure.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/AutoExposure.cpp
+index 9f726847..aa9fc49f 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/AutoExposure.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/AutoExposure.cpp
+@@ -279,11 +279,17 @@ void CAutoExposureStage::UpdateSceneReferredMeterReadback()
+ 			SSceneReferredMeterHistogram hist;
+ 			ZeroStruct(hist);
+ 
+-			const auto readbackBins = [&hist](void* pData, uint32 rowPitch, uint32 slicePitch) -> bool
++			// The two sky accumulators sit after the bins in the same row (decisions/
++			// s8-metering-sky.md): the sky texel count (x256, unmasked) and the sky weight that
++			// actually went into the bins (masked and down-weighted).
++			float fSkyCount = 0.0f, fSkyWeight = 0.0f;
++			const auto readbackBins = [&hist, &fSkyCount, &fSkyWeight](void* pData, uint32 rowPitch, uint32 slicePitch) -> bool
+ 			{
+ 				const uint32* pBins = static_cast<const uint32*>(pData);
+ 				for (int i = 0; i < SSceneReferredMeterHistogram::kBinCount; ++i)
+ 					hist.bins[i] = (float)pBins[i];
++				fSkyCount  = (float)pBins[SSceneReferredMeterHistogram::kBinCount + 0];
++				fSkyWeight = (float)pBins[SSceneReferredMeterHistogram::kBinCount + 1];
+ 				return true;
+ 			};
+ 			pDevTex->AccessCurrStagingResource(0, false, readbackBins);
+@@ -293,6 +299,13 @@ void CAutoExposureStage::UpdateSceneReferredMeterReadback()
+ 			for (int i = 0; i < SSceneReferredMeterHistogram::kBinCount; ++i)
+ 				fTotal += hist.bins[i];
+ 
++			// 256.0f is SCENE_METER_HIST_WEIGHT_Q. skyFraction is of the FRAME (what the camera
++			// sees), skyMeterShare is of the METER (what the camera acts on); the gap between the
++			// two is the down-weight doing its job, and the overlay prints both.
++			hist.skyFraction   = (m_fMeterIssuedTexels > 0.0f) ? clamp_tpl(fSkyCount / (256.0f * m_fMeterIssuedTexels), 0.0f, 1.0f) : 0.0f;
++			hist.skyMeterShare = (fTotal > 0.0f) ? clamp_tpl(fSkyWeight / fTotal, 0.0f, 1.0f) : 0.0f;
++			hist.skyWeight     = m_fMeterIssuedSkyWeight;
++
+ 			// The window has to travel with the bins: it is a compile-time constant in the shader,
+ 			// but the camera must not have to keep a second copy of it in step by hand.
+ 			hist.totalWeight = fTotal;
+@@ -362,6 +375,13 @@ void CAutoExposureStage::UpdateSceneReferredMeterReadback()
+ 		m_bMeterIssuedHistogram = bHistogram;
+ 		m_fMeterIssuedExposure = pRenderer->GetSceneReferredExposure();
+ 		m_fMeterIssuedTime = fNow;
++		m_fMeterIssuedSkyWeight = m_fMeterSkyWeightUsed;
++		{
++			const CTexture* pSource = m_graphicsPipelineResources.m_pTexHDRTargetScaled[1][0];
++			m_fMeterIssuedTexels = CTexture::IsTextureExist(pSource)
++			                       ? (float)(pSource->GetWidth() * pSource->GetHeight())
++			                       : 0.0f;
++		}
+ 	}
+ }
+ 
+@@ -419,8 +439,9 @@ bool CAutoExposureStage::EnsureMeterHistogramTexture()
+ 	                     | FT_USAGE_UNORDERED_ACCESS | FT_USAGE_UAV_RWTEXTURE | FT_STAGE_READBACK;
+ 	const std::string id = m_graphicsPipeline.GetUniqueIdentifierName();
+ 
++	// 64 bins plus the two sky accumulators, one row (decisions/s8-metering-sky.md).
+ 	m_pTexMeterHistogram = CTexture::GetOrCreateRenderTarget(("$SceneReferredMeterHistogram" + id).c_str(),
+-	                                                         SSceneReferredMeterHistogram::kBinCount, 1,
++	                                                         SSceneReferredMeterHistogram::kColumnCount, 1,
+ 	                                                         Clr_Transparent, eTT_2D, flags, eTF_R32F);
+ 
+ 	if (!CTexture::IsTextureExist(m_pTexMeterHistogram) || m_pTexMeterHistogram->GetDevTexture() == nullptr)
+@@ -472,6 +493,11 @@ void CAutoExposureStage::ExecuteMeterHistogram()
+ 	CTexture* pSource = m_graphicsPipelineResources.m_pTexHDRTargetScaled[1][0];
+ 	if (!CTexture::IsTextureExist(pSource))
+ 		return;
++	// The sky classifier: the quarter-res linear depth, same grid as the source, already produced
++	// this frame by CSceneDepthStage for AO / fog / DOF (decisions/s8-metering-sky.md approach A).
++	CTexture* pDepth = m_graphicsPipelineResources.m_pTexLinearDepthScaled[1];
++	if (!CTexture::IsTextureExist(pDepth))
++		return;
+ 	if (!EnsureMeterHistogramTexture())
+ 		return;
+ 
+@@ -481,13 +507,33 @@ void CAutoExposureStage::ExecuteMeterHistogram()
+ 	// here rather than passed down from ccam so that the mask the accumulation used travels back
+ 	// to the camera with the bins - one authority, one frame.
+ 	float fMode = 0.0f;
++	float fSkyWeight = 1.0f;
+ 	if (CPostEffectsMgr* pPostMgr = PostEffectMgr())
++	{
+ 		fMode = pPostMgr->GetByNameF("Global_User_MeterMode");
++		fSkyWeight = pPostMgr->GetByNameF("Global_User_MeterSkyWeight");
++	}
+ 	const uint32 nMode = (uint32)clamp_tpl((int)(fMode + 0.5f), 0, 2);
++	fSkyWeight = clamp_tpl(fSkyWeight, 0.0f, 1.0f);
+ 
+ 	const int width = pSource->GetWidth();
+ 	const int height = pSource->GetHeight();
+ 
++	// Both are width_r4 x height_r4 by construction (GraphicsPipeline.cpp), so the depth texel and
++	// the source texel are the same texel. If that ever stops being true the classification would
++	// be misaligned along the horizon; say so once and meter with the sky at full weight rather
++	// than with a wrong mask.
++	if (pDepth->GetWidth() != width || pDepth->GetHeight() != height)
++	{
++		if (!m_bMeterSkyDepthMismatchLogged)
++		{
++			m_bMeterSkyDepthMismatchLogged = true;
++			CryLogAlways("[SceneReferred] metering: quarter-res depth is %dx%d but the meter source is %dx%d - Sky Weight is ignored",
++			             pDepth->GetWidth(), pDepth->GetHeight(), width, height);
++		}
++		fSkyWeight = 1.0f;
++	}
++
+ 	{
+ 		// The bins are accumulated with InterlockedAdd, so they have to start at zero every frame.
+ 		// ClearUAV on the typed view, not a render-target clear: the RTV would be R32_FLOAT and
+@@ -518,14 +564,16 @@ void CAutoExposureStage::ExecuteMeterHistogram()
+ 	// B). The pointers go in as uintptr_t because CRenderPassBase::IsDirty() serialises its tuple
+ 	// and static_asserts on non-pointer trivial types.
+ 	const uintptr_t hSourceDevTex    = reinterpret_cast<uintptr_t>(pSource->GetDevTexture());
++	const uintptr_t hDepthDevTex     = reinterpret_cast<uintptr_t>(pDepth->GetDevTexture());
+ 	const uintptr_t hHistogramDevTex = reinterpret_cast<uintptr_t>(m_pTexMeterHistogram->GetDevTexture());
+ 
+-	if (pass.IsDirty(pSource->GetTextureID(), m_pTexMeterHistogram->GetTextureID(),
+-	                 hSourceDevTex, hHistogramDevTex))
++	if (pass.IsDirty(pSource->GetTextureID(), pDepth->GetTextureID(), m_pTexMeterHistogram->GetTextureID(),
++	                 hSourceDevTex, hDepthDevTex, hHistogramDevTex))
+ 	{
+ 		static CCryNameTSCRC techHistogram("SceneReferredMeterHistogram");
+ 		pass.SetTechnique(CShaderMan::s_shHDRPostProcess, techHistogram, 0);
+ 		pass.SetTexture(0, pSource);
++		pass.SetTexture(1, pDepth);
+ 		pass.SetOutputUAV(0, m_pTexMeterHistogram.get(), m_meterHistogramUAV);
+ 	}
+ 
+@@ -534,7 +582,7 @@ void CAutoExposureStage::ExecuteMeterHistogram()
+ 		static CCryNameR paramsName("MeterHistParams");
+ 		static CCryNameR weightsName("MeterHistWeights");
+ 
+-		pass.SetConstant(paramsName, Vec4((float)width, (float)height, (float)nMode, 0.0f));
++		pass.SetConstant(paramsName, Vec4((float)width, (float)height, (float)nMode, fSkyWeight));
+ 
+ 		// The luminance weights of the space the source is actually in this frame. A compute pass
+ 		// has no per-view constant buffer binding in this renderer, so GetWorkingLuminance() is
+@@ -576,6 +624,7 @@ void CAutoExposureStage::ExecuteMeterHistogram()
+ 	}
+ 
+ 	m_nMeterIssuedMode = nMode;
++	m_fMeterSkyWeightUsed = fSkyWeight;
+ 	m_bMeterHistogramValid = true;
+ }
+ 
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/AutoExposure.h b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/AutoExposure.h
+index 4c44c587..034eaf16 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/AutoExposure.h
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/AutoExposure.h
+@@ -91,4 +91,11 @@ private:
+ 	uint32 m_nMeterHistogramMode   = 0;
+ 	uint32 m_nMeterIssuedMode      = 0;
+ 	uint32 m_nMeterSampleId        = 0;
++	// The sky down-weight the dispatch used (decisions/s8-metering-sky.md), and the source's texel
++	// count, both latched at DOWNLOAD time so that the sample decoded two or three frames later is
++	// described by the values that produced it and not by this frame's.
++	float  m_fMeterSkyWeightUsed   = 1.0f;
++	float  m_fMeterIssuedSkyWeight = 1.0f;
++	float  m_fMeterIssuedTexels    = 0.0f;
++	bool   m_bMeterSkyDepthMismatchLogged = false;
+ };
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.cpp
+index 99c9a250..315a6277 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.cpp
+@@ -973,8 +973,13 @@ void CToneMappingStage::DisplaySceneReferredMeterInfo(float appliedEV)
+ 		const float fSamples = hist.totalWeight / 256.0f; // SCENE_METER_HIST_WEIGHT_Q
+ 		const float fCoverage = (fFrameTexels > 0.0f) ? (100.0f * fSamples / fFrameTexels) : 0.0f;
+ 
+-		sprintf(str, "  meter histogram [%s] mode %u %s   weight %.0f texels (%.1f%% of frame)   %+.0f..%+.0f stops over grey, %.2f/bin",
+-		        bar, hist.meteringMode, szMode, fSamples, fCoverage, hist.logMinStops, hist.logMaxStops,
++		// The sky, twice: its share of the FRAME and its share of the METER after Sky Weight
++		// (decisions/s8-metering-sky.md). Ground dark with "sky 55% of frame -> 14% of meter" on
++		// this line means the sky is not what is pulling the exposure, and the search moves on.
++		sprintf(str, "  meter histogram [%s] mode %u %s   weight %.0f texels (%.1f%% of frame)   sky %.0f%% of frame x %.2f = %.0f%% of meter   %+.0f..%+.0f stops over grey, %.2f/bin",
++		        bar, hist.meteringMode, szMode, fSamples, fCoverage,
++		        100.0f * hist.skyFraction, hist.skyWeight, 100.0f * hist.skyMeterShare,
++		        hist.logMinStops, hist.logMaxStops,
+ 		        (hist.logMaxStops - hist.logMinStops) / (float)SSceneReferredMeterHistogram::kBinCount);
+ 		IRenderAuxText::DrawText(Vec3(5, 115, 1), IRenderAuxText::ASize(1.0f), ColorF(1, 0, 1, 1), eDrawText_800x600 | eDrawText_2D, str);
+ 
+diff --git a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp
+index 71115b9d..c4efec2b 100644
+--- a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp
++++ b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp
+@@ -1811,6 +1811,10 @@ void CCinematicCameraComponent::ApplySceneExposure()
+ 	// the render thread and stamps the mode it used onto the bins it hands back, so a mode change
+ 	// costs one frame of latency and can never be attributed to the wrong histogram.
+ 	gEnv->p3DEngine->SetPostEffectParam("Global_User_MeterMode", (float)(uint32)m_exposure.meteringMode);
++	// The sky's vote in the same histogram (decisions/s8-metering-sky.md): a second input to the
++	// same pass, with the same one-frame latency and the same "the value used comes back with the
++	// bins" rule.
++	gEnv->p3DEngine->SetPostEffectParam("Global_User_MeterSkyWeight", (float)m_exposure.meterSkyWeight);
+ 
+ 	// Diagnostics for r_HDRDebug 1 (decisions/s8-metering.md, "Diagnosability"). The camera owns
+ 	// the reduction, so the renderer cannot print the band's edges unless the camera says what
+@@ -1881,6 +1885,7 @@ void CCinematicCameraComponent::RestoreSceneExposure()
+ 	// Back to the bus defaults rather than to a saved value: nothing but a Cinematic Camera ever
+ 	// writes these, and the metering readouts describe a measurement that is no longer being made.
+ 	gEnv->p3DEngine->SetPostEffectParam("Global_User_MeterMode", 1.0f);
++	gEnv->p3DEngine->SetPostEffectParam("Global_User_MeterSkyWeight", 0.25f);
+ 	gEnv->p3DEngine->SetPostEffectParam("Global_User_MeterBandLow", 0.0f);
+ 	gEnv->p3DEngine->SetPostEffectParam("Global_User_MeterBandHigh", 0.0f);
+ 	gEnv->p3DEngine->SetPostEffectParam("Global_User_MeterTargetEV", 0.0f);
+diff --git a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
+index ee059a9e..a68d8494 100644
+--- a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
++++ b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
+@@ -480,6 +480,16 @@ struct SCineExposureParams
+ 			"the top decile - sky, glints, the sun itself - so panning past the sun is a "
+ 			"non-event instead of a stop-down. 100 keeps the whole frame. The camera exposes so "
+ 			"that the log-mean of what is LEFT between the two lands on mid grey.", 90.0f);
++		desc.AddMember(&SCineExposureParams::meterSkyWeight,
++			'mtsk', "MeterSkyWeight", "Sky Weight",
++			"Scene-referred AUTO only: how much of a vote the SKY gets in the meter. Outdoors the "
++			"sky is half the frame and a stop or two brighter than the ground; left at full weight "
++			"it owns the metering band and the camera exposes the sky to mid grey, which puts the "
++			"ground and everything in shade near black. A real camera's evaluative meter "
++			"recognises the sky and counts it less - this does the same, using the engine's depth "
++			"to tell sky from ground. 0.25 keeps the ground readable and still lets a bright sky "
++			"move the meter a little; 1 counts the sky like anything else; 0 makes it invisible "
++			"(an all-sky frame then holds the last exposure).", 0.25f);
+ 		desc.AddMember(&SCineExposureParams::autoEVMin,
+ 			'aevn', "AutoExposureEVMin", "Auto Exposure EV Min",
+ 			"Scene-referred AUTO only: the brightest the camera will open up to (low EV = open).", -2.0f);
+@@ -510,6 +520,7 @@ struct SCineExposureParams
+ 	EMeteringMode meteringMode = EMeteringMode::CenterWeighted;
+ 	Schematyc::Range<0, 100, 0, 100> meterMinPercent = 50.0f;
+ 	Schematyc::Range<0, 100, 0, 100> meterMaxPercent = 90.0f;
++	Schematyc::Range<0, 1, 0, 1> meterSkyWeight = 0.25f;
+ 	Schematyc::Range<-6, 24, -6, 24> autoEVMin = -2.0f;
+ 	Schematyc::Range<-6, 24, -6, 24> autoEVMax = 20.0f;
+ 	Schematyc::Range<4, 12, 4, 12> sensorClipStops = 8.0f;
+diff --git a/Code/CryPlugins/CinematicCamera/README.md b/Code/CryPlugins/CinematicCamera/README.md
+index 19298ba6..ae88ba0f 100644
+--- a/Code/CryPlugins/CinematicCamera/README.md
++++ b/Code/CryPlugins/CinematicCamera/README.md
+@@ -231,6 +231,7 @@ is deliberately inert (above).
+ | Metering Mode | enum | Centre-weighted | **Scene Referred only.** Where in the frame the camera meters. **Average** reads the whole frame uniformly - the A/B reference, and outdoors the pattern that most often gets it wrong. **Centre-weighted** keeps full sensitivity in the middle and a quarter of it in the corners, which is what stops a bright sky from stopping the subject down. **Spot** reads a soft-edged disc a fifth of the frame height across (about 1.8 % of frame area), so you can put it on a face or a grey card and let everything else fall where it falls. |
+ | Metering Band Low | 0-100 % | 50 | **Scene Referred only.** Discard everything below this percentile of metering weight before averaging. The camera meters a 64-bin histogram, not an average, and this is the bottom of the band it keeps. 50 throws away the darker half of the frame - shadow detail nobody meters for, and exactly what dragged an outdoor scene below mid grey. 0 keeps everything. |
+ | Metering Band High | 0-100 % | 90 | **Scene Referred only.** Discard everything above this percentile. 90 throws away the top decile - sky, glints, the sun itself - so panning past the sun is a non-event instead of a stop-down. 100 keeps everything. The camera exposes so that the log-mean of what is **left** between the two lands on mid grey. Deliberately not Unreal's 10/90, which exists to make its histogram agree with its mean; the mean is the thing this replaces. |
++| Sky Weight | 0-1 | 0.25 | **Scene Referred only.** How much of a vote the **sky** gets in the meter. Outdoors the sky is half the frame and a stop or two brighter than the ground; at full weight it owns the metering band and the camera exposes the *sky* to mid grey, which puts the ground and everything in shade near black. A real camera's evaluative meter recognises the sky and counts it less; this does the same using the engine's depth to tell sky from ground (a texel is sky when nothing was drawn under it). 0.25 keeps the ground readable and still lets a bright sky move the meter a little as you tilt up; 1 counts the sky like anything else; 0 makes it invisible, and an all-sky frame then holds the last exposure. `r_HDRDebug 1` prints the sky's share of the frame and of the meter. |
+ | Auto Exposure EV Min | -6 to 24 | -2.0 | **Scene Referred only.** The brightest the camera will open up to (low EV = open). |
+ | Auto Exposure EV Max | -6 to 24 | 20.0 | **Scene Referred only.** The darkest the camera will stop down to (high EV = closed). |
+ | Sensor Clip (stops over grey) | 4-12 | 8.0 | **Scene Referred only.** The stops over mid grey at which the sensor saturates. Highlights are clipped per channel at this level, **after** the white balance, so a clipped highlight stays white at every colour temperature instead of taking the balance's tint - which is what every RAW converter does and why a blown sky in a real camera is white and not blue. Real cinema sensors hold **6-8 stops over grey** (ARRI ALEV III about 7.4, Sony Venice about 7.5; the advertised "14+ stops" is the sensor's TOTAL range, most of it *below* grey). Above about **10** the display transform has already turned everything white on its own - the ODT LUT's ACEScct domain ends at +10.3 stops - so higher values change only the EXR negative, never the picture. Lower = a smaller, earlier-clipping sensor (more flat white sky); higher = highlight colour and structure further up, until the display transform runs out. The lens effects upstream - bloom, glare, diffraction, depth of field - are deliberately **not** clipped: the lens sees the real light, so a sun a hundred thousand times over the clip still throws a flare that says so. |
+diff --git a/Code/CryPlugins/CinematicCamera/docs/ConsoleReference.md b/Code/CryPlugins/CinematicCamera/docs/ConsoleReference.md
+index fa66c8e3..423efade 100644
+--- a/Code/CryPlugins/CinematicCamera/docs/ConsoleReference.md
++++ b/Code/CryPlugins/CinematicCamera/docs/ConsoleReference.md
+@@ -280,8 +280,10 @@ arrive broken rather than texels this pass already repaired.
+ 
+ `1` - the **64-bin log2 luminance histogram**. A compute pass over the quarter-res exposed frame
+ bins every texel by how many stops it sits above or below mid grey (-14 to +18, half a stop per
+-bin), weighted by the camera's **Metering Mode**, and the camera takes the log-mean of the
+-percentile band between **Metering Band Low** and **Metering Band High**.
++bin), weighted by the camera's **Metering Mode** and with sky texels (quarter-res linear depth at
++the far plane) multiplied by the camera's **Sky Weight**, and the camera takes the log-mean of the
++percentile band between **Metering Band Low** and **Metering Band High**. The `r_HDRDebug 1`
++histogram line prints the sky's share of the frame and, after the weight, of the meter.
+ 
+ `0` - the shipped **whole-frame log-mean** of the albedo-divided illuminance estimate. Kept as the
+ A/B reference and as the fallback if the compute pass ever misbehaves. On `0` the camera's
+diff --git a/Engine/Shaders/HWScripts/CryFX/HDRPostProcess.cfx b/Engine/Shaders/HWScripts/CryFX/HDRPostProcess.cfx
+index 7f0ca588..f9d1066d 100644
+--- a/Engine/Shaders/HWScripts/CryFX/HDRPostProcess.cfx
++++ b/Engine/Shaders/HWScripts/CryFX/HDRPostProcess.cfx
+@@ -2245,11 +2245,18 @@ technique SceneReferredConvert
+ // bin per group: 2 025 groups x 64 = 129 600 global atomics at 1080p, 0.02-0.05 ms. An order of
+ // magnitude under the bloom that runs on the same texture one pass later.
+ Texture2D<float4>  MeterHistSource : register(t0);
++// The quarter-res linear depth (m_pTexLinearDepthScaled[1]) - the same texel grid as the source,
++// produced every frame for AO / fog / DOF. Its .y is the MINIMUM linear depth of the 4x4 full-res
++// texels underneath, and the linearise pass preserves an exact 1.0 for the sky, so .y >= 1 means
++// "every pixel under this texel is sky". The minimum rather than the maximum so that a horizon
++// texel with any ground in it votes as ground: the meter's job is to protect the ground, and the
++// tie goes to it.
++Texture2D<float4>  MeterHistDepth  : register(t1);
+ RWTexture2D<uint>  MeterHistogram  : register(u0);
+ 
+ // .x/.y = source size in texels (the dispatch is padded up to the group size)
+ // .z    = metering mode: 0 Average, 1 CenterWeighted, 2 Spot
+-// .w    = unused
++// .w    = sky weight 0..1: what a sky texel's vote is multiplied by (1 = counts like anything else)
+ float4 MeterHistParams;
+ // .xyz = the luminance weights of the space the HDR target is in this frame (Rec.709 before the
+ //        working-space conversion, AP1 after it). Passed explicitly rather than read through
+@@ -2265,8 +2272,17 @@ float4 MeterHistWeights;
+ // The floor of the centre-weighted mask: what a corner texel is still worth. Not zero, or the
+ // mode would be a spot with a wide skirt rather than a centre weight.
+ #define SCENE_METER_CENTRE_FLOOR  0.2
++// Linear depth at or above which a texel is sky. The linearise pass writes an exact 1.0 for the
++// sky and fp16 holds 1.0 exactly; the margin is for the lens-matched projection path only.
++#define SCENE_METER_SKY_DEPTH     0.9999
++// Two accumulators after the 64 bins, in the same target: the sky texel COUNT (x256, unmasked,
++// so the CPU can form "sky fraction of the frame") and the sky WEIGHT that actually went into
++// the bins (masked and down-weighted, so the CPU can form "the sky's share of the meter").
++#define SCENE_METER_COL_SKY_COUNT  (SCENE_METER_HIST_BINS + 0)
++#define SCENE_METER_COL_SKY_WEIGHT (SCENE_METER_HIST_BINS + 1)
+ 
+ groupshared uint g_MeterHistBins[SCENE_METER_HIST_BINS];
++groupshared uint g_MeterHistSky[2];
+ 
+ // The metering mask. A real body offers exactly this family of choices and has since the 1980s;
+ // the sizes are the ones the camera industry settled on.
+@@ -2323,6 +2339,8 @@ void SceneReferredMeterHistogramCS(uint3 DispatchThreadID : SV_DispatchThreadID,
+ {
+ 	if (GroupIndex < SCENE_METER_HIST_BINS)
+ 		g_MeterHistBins[GroupIndex] = 0;
++	if (GroupIndex < 2)
++		g_MeterHistSky[GroupIndex] = 0;
+ 
+ 	GroupMemoryBarrierWithGroupSync();
+ 
+@@ -2351,11 +2369,31 @@ void SceneReferredMeterHistogramCS(uint3 DispatchThreadID : SV_DispatchThreadID,
+ 			                              0.0, SCENE_METER_HIST_BINS - 1.0);
+ 
+ 			const float2 uv = (float2(vPixCoord) + 0.5) / float2(vSize);
+-			const uint nWeight = (uint)(saturate(MeteringWeight(uv, float2(vSize), MeterHistParams.z))
+-			                            * SCENE_METER_HIST_WEIGHT_Q + 0.5);
++			float fWeight = saturate(MeteringWeight(uv, float2(vSize), MeterHistParams.z));
++
++			// THE SKY IS NOT THE SUBJECT (decisions/s8-metering-sky.md). Outdoors it is half the
++			// frame at 0..+2 stops over the sunlit ground - not a highlight the band can discard,
++			// but a large, ordinary-bright region that owns any percentile pair - and the centre
++			// weight is symmetric about a centred horizon, so it does not reduce the sky's share
++			// at all. A matrix meter solves this by RECOGNISING the sky and down-weighting it;
++			// the engine knows which texel is sky for the cost of one load, so the mask weight is
++			// simply multiplied by the camera's Sky Weight here. At 1 the sky counts like
++			// anything else; at 0 it is invisible to the meter.
++			const bool bSky = (MeterHistDepth[vPixCoord].y >= SCENE_METER_SKY_DEPTH);
++			if (bSky)
++				fWeight *= saturate(MeterHistParams.w);
++
++			const uint nWeight = (uint)(fWeight * SCENE_METER_HIST_WEIGHT_Q + 0.5);
+ 
+ 			if (nWeight > 0)
+ 				InterlockedAdd(g_MeterHistBins[nBin], nWeight);
++
++			if (bSky)
++			{
++				InterlockedAdd(g_MeterHistSky[0], (uint)SCENE_METER_HIST_WEIGHT_Q);
++				if (nWeight > 0)
++					InterlockedAdd(g_MeterHistSky[1], nWeight);
++			}
+ 		}
+ 	}
+ 
+@@ -2369,6 +2407,12 @@ void SceneReferredMeterHistogramCS(uint3 DispatchThreadID : SV_DispatchThreadID,
+ 		if (nLocal > 0)
+ 			InterlockedAdd(MeterHistogram[int2(GroupIndex, 0)], nLocal);
+ 	}
++	if (GroupIndex < 2)
++	{
++		const uint nSky = g_MeterHistSky[GroupIndex];
++		if (nSky > 0)
++			InterlockedAdd(MeterHistogram[int2(SCENE_METER_COL_SKY_COUNT + GroupIndex, 0)], nSky);
++	}
+ }
+ 
+ technique SceneReferredMeterHistogram
+-- 
+2.47.1.windows.1
+

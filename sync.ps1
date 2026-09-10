@@ -52,10 +52,15 @@ Reset-Dir $docDir
 $docSources = @(
     "Code/CryPlugins/CinematicCamera/README.md",
     "Code/CryPlugins/CinematicCamera/docs/ConsoleReference.md",
-    "Code/CryPlugins/CryPhoneTracker/README.md"
+    "Code/CryPlugins/CryPhoneTracker/README.md",
+    "Code/CryPlugins/CinematicCamera/docs/SceneReferredContent.md",
+    "Code/CryPlugins/CinematicCamera/docs/SceneReferredCalibration.md",
+    "Code/CryPlugins/CinematicCamera/docs/SceneReferredLook.md",
+    "Code/CryPlugins/CinematicCamera/docs/SceneReferredExport.md"
 )
 # Design specs are internal work orders and stay out of the public snapshot.
 foreach ($doc in ($docSources | Select-Object -Unique)) {
+    git -C $DevRepo cat-file -e "${DevRef}:$doc" 2>$null; if ($LASTEXITCODE -ne 0) { continue }
     $name = Split-Path -Leaf $doc
     if ($doc -like "*CryPhoneTracker*" -and $name -eq "README.md") { $name = "CryPhoneTracker-README.md" }
     if ($doc -like "*CinematicCamera*" -and $name -eq "README.md") { $name = "CinematicCamera-README.md" }

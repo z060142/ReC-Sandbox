@@ -1,0 +1,445 @@
+From a66fa37e5bd3c22548fb8f1a0491cb359e2a5f3f Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Tue, 8 Sep 2026 22:09:32 +0800
+Subject: [PATCH 129/162] fix: the metering histogram read its source as black
+ - a D3D11 SRV/RTV hazard
+
+After f2d30f98 finally dispatched the histogram pass, AUTO stopped adapting
+altogether: Auto, Auto+Bias and Manual were the same picture and so were the
+three metering modes. The pass ran; it binned a frame of zeros.
+
+ROOT CAUSE. The compute pass reads m_pTexHDRTargetScaled[1][0], and the pass
+immediately before CAutoExposureStage::Execute() is the quarter-res downsample
+that RENDERS INTO that texture. The D3D11 backend never unbinds a render target
+when a pass ends (CDeviceGraphicsCommandInterfaceImpl has no EndRenderPassImpl;
+only the next BeginRenderPass replaces the OM state), so the texture was still
+bound as an RTV when the compute pass issued CSSetShaderResources() for it. The
+D3D11 runtime resolves that hazard by silently filling the SRV slot with NULL.
+The shader read (0,0,0,0) for every texel, log2(1e-8/0.18) = -24 stops clamps
+into bin 0, so the histogram came back "valid" with 100 % of its weight in the
+bottom saturating bucket. CCinematicCameraComponent::ReduceMeterHistogram
+refused a band that resolves inside a saturating bucket - correctly, a bound is
+not a value - no target was ever produced, m_bAutoMeteredEVValid never became
+true, and ComputeSceneReferredEV100() returned manualEV every frame. The stock
+measure pass reads the same texture without trouble because its own
+BeginRenderPass moves the OM to s_ptexHDRToneMaps[n] before its SRVs go in,
+which is why the log-mean meter worked and the histogram could not.
+
+FIX. ExecuteMeterHistogram() calls ClearDeviceOutputState() before the dispatch
+- the same call CTiledLightVolumesStage, CVolumetricFogStage and
+CRenderPassScheduler ("TODO: Workaround") make before their compute passes for
+exactly this reason. One OMSetRenderTargets(nulls) on D3D11, a no-op on
+D3D12/Vulkan. Alternatives kept in decisions/s8-metering.md: reorder the pass
+after MeasureLuminance (free, but makes correctness a property of the
+neighbour), or bin a CopyResource'd scratch (robust, ~1 MB/frame, only needed
+on an async compute queue). Meter saturation is untouched: the log-mean's
+ceiling and the histogram's Inf-to-bin-63 immunity are as before; only the
+pass's input is restored.
+
+DIAGNOSABILITY, so this can never be silent again. r_HDRDebug 1's band line is
+now one line that always prints: histogram total in texels, the band edges in
+exposed stops and cd/m2, the band log-mean in stops (the loop's error signal,
+0 = on target), target and applied EV, and in words WHY the camera is holding.
+The camera publishes Global_User_MeterHold (EMeterHold: no sample / zero total /
+band empty / band in bin 0 / band in bin 63 / NaN or out of window / lock /
+log-mean fallback / Manual) and Global_User_MeterBandMean beside the existing
+band edges; ReduceMeterHistogram() names its reason at every early return and
+publishes the band mean before refusing, so a refused band shows where it sat
+(-13.75 is bin 0) instead of a stale number. The renderer adds its own verdict
+independent of the camera: "ALL WEIGHT IN BIN 0 - source read as BLACK" when
+bin 0 owns >= 99.9 % of the weight, and the bin-63 twin for Inf. The log-mean
+line carries the hold reason too.
+
+DIFFRACTION. "[BLOOM] diffraction primitive failed to compile - pass skipped"
+in the same log was not a compile failure. CRenderPrimitive::Compile() returns
+"dirty" both for a broken PSO and for shaders still in the async compile queue;
+the line fired on the first frame after the redeployed HDRPostProcess.cfx
+invalidated the cache, the DiffractionPSFVS/PS compile lines printed right after
+it, and the user shader cache holds real bytecode for both. The check now waits
+while SShaderAsyncInfo::s_nPendingAsyncShaders > 0, reports a genuine failure
+only once the queue has drained and the PSO is still invalid after 2 s, and
+logs when the pass comes back.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01HXzRVK4yBVDUNfdWXEwV5y
+---
+ .../Common/PostProcess/PostProcess.cpp        |  6 ++
+ .../Common/PostProcess/PostProcess.h          |  1 +
+ .../GraphicsPipeline/AutoExposure.cpp         | 22 +++++++
+ .../XRenderD3D9/GraphicsPipeline/Bloom.cpp    | 32 ++++++++--
+ .../XRenderD3D9/GraphicsPipeline/Bloom.h      |  6 ++
+ .../GraphicsPipeline/ToneMapping.cpp          | 58 ++++++++++++++++---
+ .../Module/CinematicCameraComponent.cpp       | 51 ++++++++++++++--
+ .../Module/CinematicCameraComponent.h         | 19 ++++++
+ 8 files changed, 179 insertions(+), 16 deletions(-)
+
+diff --git a/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.cpp b/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.cpp
+index 39f96cb0..4c09cfff 100644
+--- a/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.cpp
++++ b/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.cpp
+@@ -461,6 +461,12 @@ int CPostEffectsMgr::Init()
+ 	AddParamFloatNoTransition("Global_User_MeterBandLow", m_pUserMeterBandLow, 0.0f);
+ 	AddParamFloatNoTransition("Global_User_MeterBandHigh", m_pUserMeterBandHigh, 0.0f);
+ 	AddParamFloatNoTransition("Global_User_MeterTargetEV", m_pUserMeterTargetEV, 0.0f);
++	// The band's log-mean in EXPOSED stops over mid grey (the error signal the loop acts on: 0
++	// means the picture is already on target) and WHY the camera is holding, as a small integer
++	// the overlay turns into words (0 = live; see CToneMappingStage::DisplaySceneReferredMeterInfo
++	// for the table). Both exist so that a meter that stops moving can never again be silent.
++	AddParamFloatNoTransition("Global_User_MeterBandMean", m_pUserMeterBandMean, 0.0f);
++	AddParamFloatNoTransition("Global_User_MeterHold", m_pUserMeterHold, 0.0f);
+ 
+ 	// Register all post processes
+ 	AddEffect(CSunShafts);
+diff --git a/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.h b/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.h
+index fc3f8b9a..54561dc8 100644
+--- a/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.h
++++ b/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.h
+@@ -749,6 +749,7 @@ protected:
+ 	//! reads; the other three are what the camera MADE of the bins it got back, printed by the
+ 	//! overlay so that a metering complaint stays one screenshot to diagnose.
+ 	CEffectParam*       m_pUserMeterMode, * m_pUserMeterBandLow, * m_pUserMeterBandHigh, * m_pUserMeterTargetEV;
++	CEffectParam*       m_pUserMeterBandMean, * m_pUserMeterHold;
+ 	CEffectParam*       m_pUserColorC, * m_pUserColorY, * m_pUserColorM, * m_pUserColorK, * m_pUserColorHue;
+ 
+ 	CPostEffectVec      m_pEffects;
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/AutoExposure.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/AutoExposure.cpp
+index c88388c9..9f726847 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/AutoExposure.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/AutoExposure.cpp
+@@ -546,6 +546,28 @@ void CAutoExposureStage::ExecuteMeterHistogram()
+ 	const int tile = 8; // must match SCENE_METER_HIST_TILE in HDRPostProcess.cfx
+ 	pass.SetDispatchSize((width + tile - 1) / tile, (height + tile - 1) / tile, 1);
+ 
++	// UNBIND THE RENDER TARGETS BEFORE THE DISPATCH. This is the line the whole meter hung on.
++	//
++	// The pass that ran immediately before this stage is the quarter-res downsample, and its
++	// render target is pSource - the very texture this dispatch reads. The D3D11 backend never
++	// unbinds a render target when a pass ends (CDeviceGraphicsCommandInterfaceImpl has no
++	// EndRenderPassImpl; only the next BeginRenderPass replaces the OM state), so at this point
++	// pSource is still bound on the output merger. A graphics pass never notices, because its own
++	// BeginRenderPass re-targets the OM before its SRVs go in. A compute pass has no render target
++	// and re-targets nothing, so CSSetShaderResources() is issued with an SRV of a resource that is
++	// still bound as an RTV - and the D3D11 runtime resolves that hazard by silently filling the
++	// slot with NULL. The shader then read zeros for every texel: log2(1e-8 / 0.18) is -24 stops,
++	// which clamps into bin 0, so the histogram came back with its FULL weight in the bottom
++	// saturating bucket, the camera's band reduction correctly refused to act on a bound instead
++	// of a value, and AUTO held its last EV forever - which, with no EV ever having been measured,
++	// is Manual. Every metering mode looked identical because every mode was binning black.
++	//
++	// The stock pipeline has exactly this problem and exactly this answer: CTiledLightVolumesStage
++	// and CVolumetricFogStage both call ClearDeviceOutputState() before their compute dispatches,
++	// and CRenderPassScheduler does the same before every scheduled compute pass ("TODO:
++	// Workaround"). On D3D12 and Vulkan the call is a no-op and the hazard does not exist.
++	ClearDeviceOutputState();
++
+ 	pass.PrepareResourcesForUse(GetDeviceObjectFactory().GetCoreCommandList());
+ 
+ 	{
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Bloom.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Bloom.cpp
+index 05a85191..560e4b24 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Bloom.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Bloom.cpp
+@@ -957,14 +957,38 @@ void CBloomStage::ExecuteDiffraction(const SHDRStreaksParams& streakParams, floa
+ 
+ 	if (prim.Compile(m_passDiffraction) != CRenderPrimitive::eDirty_None)
+ 	{
+-		static bool s_bWarned = false;
+-		if (!s_bWarned)
++		// Compile() returns "dirty" for two very different reasons and cannot tell them apart:
++		// the PSO could not be built (a real shader error), or the PSO's shaders are still in the
++		// async compile queue - which is the normal state for a few frames after HDRPostProcess.cfx
++		// is redeployed and its cache CRC no longer matches. The old line called both a failure,
++		// once, and never said when the pass came back; the 2026-09-08 log showed it firing at
++		// 21:43:00 with the DiffractionPSFVS/PS compile lines printed right after it, and the
++		// shader cache holding real bytecode for both a moment later. So: wait while the async
++		// queue is non-empty, log the real thing only after it has drained and the PSO is still
++		// invalid, and say so when the pass recovers.
++		const float fNow = gEnv->pTimer->GetAsyncCurTime();
++		if (m_fDiffractionPrimWaitStart < 0.0f)
+ 		{
+-			s_bWarned = true;
+-			CryLogAlways("[BLOOM] diffraction primitive failed to compile - pass skipped");
++			m_fDiffractionPrimWaitStart = fNow;
++			CryLog("[BLOOM] diffraction primitive not ready (%d shaders compiling) - pass skipped until it is",
++			       (int)SShaderAsyncInfo::s_nPendingAsyncShaders);
++		}
++		else if (!m_bDiffractionPrimFailureLogged
++		         && SShaderAsyncInfo::s_nPendingAsyncShaders == 0
++		         && (fNow - m_fDiffractionPrimWaitStart) > 2.0f)
++		{
++			m_bDiffractionPrimFailureLogged = true;
++			CryLogAlways("[BLOOM] diffraction primitive failed to compile (nothing left in the async queue after %.1f s) - pass skipped; check the shader log for DiffractionPSFVS / DiffractionPSFPS",
++			             fNow - m_fDiffractionPrimWaitStart);
+ 		}
+ 		return;
+ 	}
++	if (m_fDiffractionPrimWaitStart >= 0.0f)
++	{
++		CryLog("[BLOOM] diffraction primitive ready after %.2f s", gEnv->pTimer->GetAsyncCurTime() - m_fDiffractionPrimWaitStart);
++		m_fDiffractionPrimWaitStart = -1.0f;
++		m_bDiffractionPrimFailureLogged = false;
++	}
+ 
+ 	const Vec4 vDiffParams0(fRadiusHalfPx, fPitchHalfPx, fRingRadius, fNorm);
+ 	// w carries the debug mode into both the sprite shader (mode 2 replaces the deposit) and
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Bloom.h b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Bloom.h
+index 9fed649b..70dc92e3 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Bloom.h
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Bloom.h
+@@ -178,6 +178,12 @@ private:
+ 	CPrimitiveRenderPass m_passDiffraction;
+ 	CRenderPrimitive     m_diffractionPrimitive;
+ 	CConstantBufferPtr   m_pDiffractionPerViewCB;
++	// When the sprite primitive first failed to compile and has not succeeded since. A PSO that
++	// is not valid yet is, on the frame a shader cache was just invalidated, almost always an
++	// ASYNC COMPILE IN FLIGHT and not a broken shader; the two are told apart by time and by the
++	// async queue, not by the return value of Compile().
++	float                m_fDiffractionPrimWaitStart = -1.0f;
++	bool                 m_bDiffractionPrimFailureLogged = false;
+ 	CFullscreenPass      m_passDiffractionDebug;
+ 	CFullscreenPass      m_passDiffractionComposite;
+ 
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.cpp
+index e9503eb9..99c9a250 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.cpp
+@@ -906,6 +906,27 @@ void CToneMappingStage::DisplayDebugInfo()
+ //   applied EV   what the camera settled on: the smoothed EV plus the mode's bias, after the
+ //                Auto EV Min/Max clamp. target and applied converging is the loop working;
+ //                applied pinned at a limit while target sits far away is the loop having lost.
++// Why the camera's AUTO loop is not moving the EV, in words. The codes are the Cinematic
++// Camera's EMeterHold, published as Global_User_MeterHold; anything the camera has not published
++// yet reads 0 on the bus, which is why 0 is worded as an observation and not as a promise.
++static const char* MeterHoldReason(int nHold)
++{
++	switch (nHold)
++	{
++	case 0:  return "LIVE";
++	case 1:  return "HOLDING: no sample yet (readback not back / meter retired)";
++	case 2:  return "HOLDING: histogram total is zero";
++	case 3:  return "HOLDING: band collected no weight";
++	case 4:  return "HOLDING: band entirely in bin 0 (black source?)";
++	case 5:  return "HOLDING: band entirely in bin 63 (Inf / clipped)";
++	case 6:  return "HOLDING: result NaN or outside 1e-10..1e3";
++	case 7:  return "HOLDING: Auto Exposure Lock";
++	case 8:  return "LIVE (log-mean fallback drives, band n/a)";
++	case 9:  return "MANUAL (not metering)";
++	default: return "HOLDING: unknown reason";
++	}
++}
++
+ void CToneMappingStage::DisplaySceneReferredMeterInfo(float appliedEV)
+ {
+ 	const SSceneReferredMeterHistogram& hist = gcpRendD3D->m_sceneReferredMeterHistogram;
+@@ -961,19 +982,38 @@ void CToneMappingStage::DisplaySceneReferredMeterInfo(float appliedEV)
+ 		// post-effect bus because the reduction lives in the camera, where the percentiles are;
+ 		// printing them beside the applied EV is what separates "the meter read the wrong thing"
+ 		// from "the loop has not caught up yet" from "the clamp is holding it".
+-		float fBandLow = 0.0f, fBandHigh = 0.0f, fTargetEV = 0.0f;
++		float fBandLow = 0.0f, fBandHigh = 0.0f, fBandMean = 0.0f, fTargetEV = 0.0f;
++		int nHold = 0;
+ 		if (CPostEffectsMgr* pPostMgr = PostEffectMgr())
+ 		{
+ 			fBandLow = pPostMgr->GetByNameF("Global_User_MeterBandLow");
+ 			fBandHigh = pPostMgr->GetByNameF("Global_User_MeterBandHigh");
++			fBandMean = pPostMgr->GetByNameF("Global_User_MeterBandMean");
+ 			fTargetEV = pPostMgr->GetByNameF("Global_User_MeterTargetEV");
++			nHold = (int)(pPostMgr->GetByNameF("Global_User_MeterHold") + 0.5f);
+ 		}
+ 
+-		sprintf(str, "  band %.4g..%.4g (%.0f..%.0f cd/m2) at exposure %.4g -> target EV %.2f, applied EV %.2f%s",
+-		        fBandLow, fBandHigh,
++		// The band edges in the SAME units as the bar above - exposed stops over mid grey - so
++		// that the eye can place them on the bins, with the absolute luminance beside them.
++		const float fExp = max(hist.exposureAtCapture, 1e-12f);
++		const float fLoStops = (fBandLow > 0.0f) ? log2f(fBandLow * fExp / 0.18f) : 0.0f;
++		const float fHiStops = (fBandHigh > 0.0f) ? log2f(fBandHigh * fExp / 0.18f) : 0.0f;
++
++		// The renderer's own verdict on the bins, independent of the camera: if the whole weight
++		// sits in a saturating bucket the MEASUREMENT is degenerate, whatever the camera does with
++		// it. Bin 0 owning everything is the signature of the source being read as black - an SRV
++		// the runtime nulled because the texture was still a render target (the f2d30f98 bug) -
++		// and bin 63 owning everything is a source of Inf.
++		const char* szBins = "";
++		if (hist.bins[0] >= hist.totalWeight * 0.999f)
++			szBins = "  !! ALL WEIGHT IN BIN 0 - source read as BLACK (SRV nulled / unbound?)";
++		else if (hist.bins[SSceneReferredMeterHistogram::kBinCount - 1] >= hist.totalWeight * 0.999f)
++			szBins = "  !! ALL WEIGHT IN BIN 63 - source is Inf / clipped";
++
++		sprintf(str, "  meter: total %.0f texels | band %+.2f..%+.2f stops (%.0f..%.0f cd/m2) mean %+.2f stops | target EV %.2f applied %.2f | %s%s",
++		        fSamples, fLoStops, fHiStops,
+ 		        fBandLow * RENDERER_LIGHT_UNIT_SCALE, fBandHigh * RENDERER_LIGHT_UNIT_SCALE,
+-		        hist.exposureAtCapture, fTargetEV, appliedEV,
+-		        (fTargetEV == 0.0f) ? "  [BAND REFUSED - holding]" : "");
++		        fBandMean, fTargetEV, appliedEV, MeterHoldReason(nHold), szBins);
+ 		IRenderAuxText::DrawText(Vec3(5, 135, 1), IRenderAuxText::ASize(1.0f), ColorF(1, 0, 1, 1), eDrawText_800x600 | eDrawText_2D, str);
+ 		return;
+ 	}
+@@ -995,12 +1035,16 @@ void CToneMappingStage::DisplaySceneReferredMeterInfo(float appliedEV)
+ 	// CAMERA control that has no effect at all on this path: the log-mean meter has no mask. Not
+ 	// saying so is what let "Metering Mode does nothing" look like a camera bug for a fortnight.
+ 	float fBusMode = 0.0f;
++	int nHold = 0;
+ 	if (CPostEffectsMgr* pPostMgr = PostEffectMgr())
++	{
+ 		fBusMode = pPostMgr->GetByNameF("Global_User_MeterMode");
++		nHold = (int)(pPostMgr->GetByNameF("Global_User_MeterHold") + 0.5f);
++	}
+ 
+-	sprintf(str, "  LOG-MEAN meter (r_SceneReferredMeterHistogram 0): ceiling %.4g (%.0f stops over grey); stock adaptation bypassed; Metering Mode %d IGNORED (no mask on this path)",
++	sprintf(str, "  LOG-MEAN meter (r_SceneReferredMeterHistogram 0): ceiling %.4g (%.0f stops over grey); stock adaptation bypassed; Metering Mode %d IGNORED (no mask on this path) | %s",
+ 	        CRendererResources::GetSceneReferredMeterCeiling(), CRendererResources::kSceneReferredMeterCeilingStops,
+-	        (int)(fBusMode + 0.5f));
++	        (int)(fBusMode + 0.5f), MeterHoldReason(nHold));
+ 	IRenderAuxText::DrawText(Vec3(5, 135, 1), IRenderAuxText::ASize(1.0f), ColorF(1, 0, 1, 1), eDrawText_800x600 | eDrawText_2D, str);
+ }
+ 
+diff --git a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp
+index 29d0423f..71115b9d 100644
+--- a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp
++++ b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp
+@@ -1819,6 +1819,8 @@ void CCinematicCameraComponent::ApplySceneExposure()
+ 	gEnv->p3DEngine->SetPostEffectParam("Global_User_MeterBandLow", m_meterBandLowLum);
+ 	gEnv->p3DEngine->SetPostEffectParam("Global_User_MeterBandHigh", m_meterBandHighLum);
+ 	gEnv->p3DEngine->SetPostEffectParam("Global_User_MeterTargetEV", m_meterTargetEV);
++	gEnv->p3DEngine->SetPostEffectParam("Global_User_MeterBandMean", m_meterBandMeanStops);
++	gEnv->p3DEngine->SetPostEffectParam("Global_User_MeterHold", (float)m_meterHold);
+ }
+ 
+ // The camera's identity and its exposure triangle, onto the same bus everything else travels on.
+@@ -1943,8 +1945,17 @@ bool CCinematicCameraComponent::ReduceMeterHistogram(const SSceneReferredMeterHi
+ {
+ 	const int nBins = SSceneReferredMeterHistogram::kBinCount;
+ 	const float step = (hist.logMaxStops - hist.logMinStops) / (float)nBins;
++
++	// Every early return below names its reason on the bus. A meter that holds without saying
++	// why is indistinguishable from Manual, which is how a black histogram passed for a working
++	// camera for a whole evening (scene@f2d30f98 -> the ClearDeviceOutputState fix).
++	m_meterTargetEV = 0.0f;
++
+ 	if (!(step > 0.0f) || !(hist.totalWeight > 0.0f))
++	{
++		m_meterHold = eMeterHold_ZeroTotal;
+ 		return false;
++	}
+ 
+ 	float lo = clamp_tpl((float)m_exposure.meterMinPercent, 0.0f, 100.0f);
+ 	float hi = clamp_tpl((float)m_exposure.meterMaxPercent, 0.0f, 100.0f);
+@@ -2006,16 +2017,27 @@ bool CCinematicCameraComponent::ReduceMeterHistogram(const SSceneReferredMeterHi
+ 	}
+ 
+ 	if (bandWeight <= 0.0f || firstBin < 0)
++	{
++		m_meterHold = eMeterHold_BandEmpty;
+ 		return false;
++	}
++
++	// The band's log-mean, in stops over mid grey, in the EXPOSED units the bins were built in.
++	// Computed and published BEFORE the refusals below, so the overlay shows where a refused band
++	// sat (-13.75 is bin 0, +17.75 is bin 63) rather than a stale number from the last good frame.
++	const float meanStops = bandSum / bandWeight;
++	m_meterBandMeanStops = meanStops;
++	m_meterBandLowLum = (kSceneMidGrey * powf(2.0f, loStops)) / max(hist.exposureAtCapture, 1e-12f);
++	m_meterBandHighLum = (kSceneMidGrey * powf(2.0f, hiStops)) / max(hist.exposureAtCapture, 1e-12f);
+ 
+ 	// A band that resolves entirely inside a saturating bucket has a POSITION and no value: bin 0
+ 	// means "at or below 14 stops under grey" and bin 63 means "at or above 18 stops over it", and
+ 	// acting on either would be acting on the edge of the window rather than on the scene.
+ 	if (firstBin == lastBin && (firstBin == 0 || firstBin == nBins - 1))
++	{
++		m_meterHold = (firstBin == 0) ? eMeterHold_BandInBottom : eMeterHold_BandInTop;
+ 		return false;
+-
+-	// The band's log-mean, in stops over mid grey, in the EXPOSED units the bins were built in.
+-	const float meanStops = bandSum / bandWeight;
++	}
+ 
+ 	// Undo the pre-exposure that was in force when these bins were measured. The whole histogram
+ 	// shifts rigidly by that one scalar, which is why this conversion happens once, here, and not
+@@ -2028,7 +2050,10 @@ bool CCinematicCameraComponent::ReduceMeterHistogram(const SSceneReferredMeterHi
+ 	// L = E * rho / pi at rho = 0.18. Outside it the meter has lost its footing and the answer is
+ 	// to hold, not to drive the camera to a limit.
+ 	if (!NumberValid(bandAbsolute) || bandAbsolute <= 1e-10f || bandAbsolute >= 1e3f)
++	{
++		m_meterHold = eMeterHold_OutOfWindow;
+ 		return false;
++	}
+ 
+ 	// The EV that lands the band on mid grey.
+ 	//
+@@ -2046,9 +2071,8 @@ bool CCinematicCameraComponent::ReduceMeterHistogram(const SSceneReferredMeterHi
+ 
+ 	// For r_HDRDebug 1 only. Published from ApplySceneExposure(), which is called once a frame;
+ 	// this function can be reached more than once and must not write to the bus itself.
+-	m_meterBandLowLum = (kSceneMidGrey * powf(2.0f, loStops)) / exposureAtCapture;
+-	m_meterBandHighLum = (kSceneMidGrey * powf(2.0f, hiStops)) / exposureAtCapture;
+ 	m_meterTargetEV = targetEV;
++	m_meterHold = eMeterHold_Live;
+ 
+ 	return true;
+ }
+@@ -2059,6 +2083,8 @@ float CCinematicCameraComponent::ComputeSceneReferredEV100()
+ 
+ 	if (m_exposure.exposureMode == EExposureMode::Manual)
+ 	{
++		m_meterHold = eMeterHold_Manual;
++		m_meterTargetEV = 0.0f;
+ 		if (fabs_tpl((float)m_exposure.exposureResponse - 1.0f) > 0.001f && !m_bLoggedSceneRefResponseIgnored)
+ 		{
+ 			m_bLoggedSceneRefResponseIgnored = true;
+@@ -2115,7 +2141,22 @@ float CCinematicCameraComponent::ComputeSceneReferredEV100()
+ 		const float kIncidentMeterConstant = 120.0f * gf_PI;
+ 		targetEV = log2f(meteredIlluminance * RENDERER_LIGHT_UNIT_SCALE * 100.0f / kIncidentMeterConstant);
+ 		bHaveTarget = true;
++		// Not a hold - but the overlay has to say WHICH meter produced the target, because the
++		// log-mean has no mask and no band, and its band numbers are meaningless.
++		m_meterHold = eMeterHold_LogMean;
++		m_meterTargetEV = targetEV;
++		m_meterBandMeanStops = 0.0f;
+ 	}
++	else
++	{
++		// Neither meter has produced a sample: the readback has not completed yet, the path is
++		// off, or the stage retired the value. The camera holds - and says so.
++		m_meterHold = eMeterHold_NoSample;
++		m_meterTargetEV = 0.0f;
++	}
++
++	if (bHaveTarget && m_exposure.bAutoLock)
++		m_meterHold = eMeterHold_Locked;
+ 
+ 	if (bHaveTarget && !m_exposure.bAutoLock && bNewFrame)
+ 	{
+diff --git a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
+index 567da7d5..ee059a9e 100644
+--- a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
++++ b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
+@@ -1448,6 +1448,25 @@ private:
+ 	float  m_meterBandLowLum  = 0.f;
+ 	float  m_meterBandHighLum = 0.f;
+ 	float  m_meterTargetEV    = 0.f;
++	// The band's log-mean in EXPOSED stops over mid grey - the loop's error signal, 0 = on target.
++	float  m_meterBandMeanStops = 0.f;
++	// WHY the meter is not moving the EV this frame, published as Global_User_MeterHold so that
++	// r_HDRDebug 1 can print it in words. 0 = live and acting. The table is the renderer's
++	// (CToneMappingStage::DisplaySceneReferredMeterInfo); this side only writes the numbers.
++	enum EMeterHold : uint32
++	{
++		eMeterHold_Live          = 0,  //!< a target was produced and the EV is following it
++		eMeterHold_NoSample      = 1,  //!< no histogram and no log-mean has come back yet
++		eMeterHold_ZeroTotal     = 2,  //!< the histogram arrived with nothing in it
++		eMeterHold_BandEmpty     = 3,  //!< the percentile band collected no weight
++		eMeterHold_BandInBottom  = 4,  //!< the band sits entirely in bin 0 (black, or a source read as black)
++		eMeterHold_BandInTop     = 5,  //!< the band sits entirely in bin 63 (clipped / Inf)
++		eMeterHold_OutOfWindow   = 6,  //!< NaN, or outside the plausibility window
++		eMeterHold_Locked        = 7,  //!< Auto Exposure Lock
++		eMeterHold_LogMean       = 8,  //!< the log-mean fallback is driving (r_SceneReferredMeterHistogram 0)
++		eMeterHold_Manual        = 9,  //!< Manual mode: nothing is metered
++	};
++	uint32 m_meterHold = eMeterHold_NoSample;
+ 	// Edge-trigger state for the effective-T-stop log line, per component for the same reason.
+ 	float m_lastLoggedApertureN     = -1.f;
+ 	float m_lastLoggedTransmission  = -1.f;
+-- 
+2.47.1.windows.1
+

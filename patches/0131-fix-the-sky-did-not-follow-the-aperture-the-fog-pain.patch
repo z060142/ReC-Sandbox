@@ -1,0 +1,423 @@
+From cd063849fde13ee92461cfdd6ab9554ff75a86de Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Tue, 8 Sep 2026 23:19:20 +0800
+Subject: [PATCH 131/162] fix: the sky did not follow the aperture - the fog
+ painting it was never exposed
+
+User: in Manual, f/64 ISO 50 1/5000 ND10 blackens the ground and leaves the sky
+bright; r_HDRDebug 1 with Spot on the sky reads a band of 1.08e6..1.24e6 cd/m2
+"absolute" at EV 20. AUTO with sky in frame ran to its EV ceiling and the ground
+went black; Sky Weight (5f1d292f) only masked that.
+
+Root cause. The Nishita dome at CSkyStage HAS carried the pre-exposure since S1,
+and r_SceneReferredNishitaScale 0.37 is applied on every dome recompute. But with
+e_VolumetricFog 1 (the gamesdk project default) the sky texels at the far plane
+are painted by the volumetric fog's ANALYTICAL segment,
+GetVolumetricFogAnalyticalColor - from the ray-march volume's far edge to the
+target, which for the sky is the whole optical path - and its sun colour,
+PB_VolumetricFogScatteringColor / SecondaryColor (= GetSunColor() x fog albedo,
+filled on the main thread in sGetVolumetricFogScatteringColor), never took the
+exposure. S8 exposed the ray-marched half (SunColor, VolumetricFog.cpp) and the
+research note claimed the legacy-fog multiply at VolumetricFog.cfi:154 covered
+the analytical half; it is a different function. So the sky region of the frame
+sat at a constant ~0.9 exposed units at every aperture: the meter divided that
+by the exposure and reported 1.1e6 cd/m2, and no EV could move it.
+
+Fix. The latched exposure is applied to the xyz of both constants at their four
+RENDER-THREAD consumers, not at the main-thread fill (s1-adapted-scene-scale 8.3):
+  - CHWShader_D3D::mfSetParameters, the ECGP_PB cases (fog pass, forward PB path)
+  - CVolumetricFogStage::FillForwardParams (forward cbFog)
+  - CVolumetricCloudsStage::GenerateCloudShaderParam (clouds fog themselves from
+    this buffer; RenderCloud is a compute pass with no per-view CB, so a
+    shader-side PS_HDR_RANGE_ADAPT_MAX would silently read 1.0 there)
+  - CWaterStage::UpdatePerPassResources (cbVoxVolFog)
+.w is an anisotropy term and is untouched. Exactly 1.0 off the switch.
+
+Also found and fixed on the way: the volumetric clouds' SKY light
+cb.skylightRayleighInScatter (the dome's horizon Rayleigh radiance, engine units)
+was unexposed while shadeColorFromSun was - a cloud's sky-lit half did not follow
+the aperture.
+
+Overlay, so this cannot hide again. The coverage line's hard-coded "sky YES" is
+replaced by a measured line (y=215) from CSkyStage::SSceneReferredDebug, filled
+from the constants the pass actually uploads: the technique that ran
+(Nishita/skybox), the factor the dome constants were multiplied by, the dome
+straight up in UNEXPOSED cd/m2 (CPU evaluation of texel 0 with SkyPassPS's own
+arithmetic), its value in the target and stops vs grey, the sun texel after the
+peak cap, the cap, and "far plane = vol-fog inscatter" when volumetric fog is on.
+"metered EV: -28.49" was log2(1e-12): the histogram path publishes the scalar
+meter as 0 by design; the line now prints the camera's MeterTargetEV ("histogram
+band") or "n/a" with the reason.
+
+Not changed, deliberately: the Manual EV clamp at 24 (saturation 2e7 cd/m2, nine
+stops over sunlit snow - nothing in a scene needs more once the sky follows), and
+the sky peak cap, which is already computed in unexposed units and pre-exposed
+with the writer clamp as the fp16 guard only.
+
+Notes: research/s8-fog-and-clouds.md 2.1/2.6 corrected, research/s8-nishita-sky.md
+section 7, decisions/s8-metering-sky.md and research/s8-metering-sky.md (Sky
+Weight treated a symptom), decisions/s1-writer-coverage.md post-mortem,
+STRUCTURE.md two rows, log.md.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01HXzRVK4yBVDUNfdWXEwV5y
+---
+ .../RenderDll/XRenderD3D9/D3DHWShader.cpp     | 33 +++++++---
+ .../XRenderD3D9/GraphicsPipeline/Sky.cpp      | 56 +++++++++++++++++
+ .../XRenderD3D9/GraphicsPipeline/Sky.h        | 20 ++++++
+ .../GraphicsPipeline/ToneMapping.cpp          | 61 +++++++++++++++++--
+ .../GraphicsPipeline/VolumetricClouds.cpp     | 19 +++++-
+ .../GraphicsPipeline/VolumetricFog.cpp        | 16 ++++-
+ .../XRenderD3D9/GraphicsPipeline/Water.cpp    | 10 ++-
+ 7 files changed, 196 insertions(+), 19 deletions(-)
+
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/D3DHWShader.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/D3DHWShader.cpp
+index 147260f6..d59111c6 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/D3DHWShader.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/D3DHWShader.cpp
+@@ -1892,18 +1892,35 @@ void CHWShader_D3D::mfSetParameters(SCGParam* pParams, const int nINParams, EHWS
+ 				sData[0].f[3] = PF.pVolumetricFogScatteringBlendParams.w;
+ 				break;
+ 
++			// Scene-referred pre-exposure (2026-09-08, research/s8-fog-and-clouds.md 2.6 item 4,
++			// corrected). These two are the volumetric fog's ANALYTICAL sun in-scatter colour
++			// (GetSunColor() x fog albedo, filled on the main thread in sGetVolumetricFogScatteringColor)
++			// and they feed GetVolumetricFogAnalyticalColor - the segment from the ray-march volume's
++			// far edge to the target, which for the sky and for distant terrain is the whole optical
++			// path. The ray-marched half took the exposure in S8 (VolumetricFog.cpp SunColor); this
++			// half did not, so under dense fog the sky region of the frame was exposure-INVARIANT:
++			// Manual could not darken it and AUTO ran to its EV ceiling chasing it. Applied at the
++			// four render-thread consumers of the constant (here, FillForwardParams, the clouds CB and
++			// the water CB) rather than at the main-thread fill, for the s1-adapted-scene-scale 8.3
++			// tearing reason. .w is an anisotropy term and is not a radiance. Exactly 1.0 off the switch.
+ 			case ECGP_PB_VolumetricFogScatteringColor:
+-				sData[0].f[0] = PF.pVolumetricFogScatteringColor.x;
+-				sData[0].f[1] = PF.pVolumetricFogScatteringColor.y;
+-				sData[0].f[2] = PF.pVolumetricFogScatteringColor.z;
+-				sData[0].f[3] = PF.pVolumetricFogScatteringColor.w;
++				{
++					const float sceneExposure = r->GetSceneReferredExposure();
++					sData[0].f[0] = PF.pVolumetricFogScatteringColor.x * sceneExposure;
++					sData[0].f[1] = PF.pVolumetricFogScatteringColor.y * sceneExposure;
++					sData[0].f[2] = PF.pVolumetricFogScatteringColor.z * sceneExposure;
++					sData[0].f[3] = PF.pVolumetricFogScatteringColor.w;
++				}
+ 				break;
+ 
+ 			case ECGP_PB_VolumetricFogScatteringSecondaryColor:
+-				sData[0].f[0] = PF.pVolumetricFogScatteringSecondaryColor.x;
+-				sData[0].f[1] = PF.pVolumetricFogScatteringSecondaryColor.y;
+-				sData[0].f[2] = PF.pVolumetricFogScatteringSecondaryColor.z;
+-				sData[0].f[3] = PF.pVolumetricFogScatteringSecondaryColor.w;
++				{
++					const float sceneExposure = r->GetSceneReferredExposure();
++					sData[0].f[0] = PF.pVolumetricFogScatteringSecondaryColor.x * sceneExposure;
++					sData[0].f[1] = PF.pVolumetricFogScatteringSecondaryColor.y * sceneExposure;
++					sData[0].f[2] = PF.pVolumetricFogScatteringSecondaryColor.z * sceneExposure;
++					sData[0].f[3] = PF.pVolumetricFogScatteringSecondaryColor.w;
++				}
+ 				break;
+ 
+ 			case ECGP_PB_VolumetricFogHeightDensityParams:
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Sky.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Sky.cpp
+index 405ba768..005609de 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Sky.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Sky.cpp
+@@ -167,6 +167,14 @@ void CSkyStage::SetSkyParameters()
+ 		static CCryNameR skyPeakClampName("SkyDome_ScenePeakClamp");
+ 		const float skyPeakClamp = CRendererResources::GetSceneReferredSkyPeakClamp(sceneExposure);
+ 		m_skyPass.SetConstant(skyPeakClampName, Vec4(skyPeakClamp, 0.0f, 0.0f, 0.0f), eHWSC_Pixel);
++
++		// For r_HDRDebug 1: what this pass is about to do, recorded from the values it uploads.
++		// The dome numbers are filled in by SetHDRSkyParameters() below when the dome runs.
++		m_srDebug = SSceneReferredDebug();
++		m_srDebug.bProcedural     = rd->m_p3DEngineCommon[threadID].m_SkyInfo.m_bApplySkyDome;
++		m_srDebug.bSkybox         = rd->m_p3DEngineCommon[threadID].m_SkyInfo.m_bApplySkyBox;
++		m_srDebug.exposureApplied = sceneExposure;
++		m_srDebug.peakCapExposed  = skyPeakClamp;
+ 	}
+ 
+ 	// Skybox
+@@ -214,6 +222,54 @@ void CSkyStage::SetHDRSkyParameters()
+ 		m_skyPass.SetConstant(rayleighName, renderParams->m_partialRayleighInScatteringConst * sceneExposure, eHWSC_Pixel);
+ 		m_skyPass.SetConstant(sunDirectionName, renderParams->m_sunDirection, eHWSC_Pixel);
+ 		m_skyPass.SetConstant(phaseName, renderParams->m_phaseFunctionConsts, eHWSC_Pixel);
++
++		// r_HDRDebug 1: the dome evaluated on the CPU at two directions, with the same arithmetic
++		// SkyPassPS uses (Stars.cfx, "Day sky gradient"), so the overlay can print what the dome
++		// is worth in UNEXPOSED cd/m2 and what it lands at in the target. The texel layout is the
++		// one CSkyLightManager::UpdateInternal writes: row = angle from the zenith in steps of
++		// 90/height degrees, column = azimuth in steps of 360/width degrees, so straight up is
++		// texel 0 and the sun is at skyDir = -m_sunDirection (the phase peaks at cosine = +1).
++		// Reading the dome data here is safe: Execute() already reads the same pointers for the
++		// texture upload, on this thread, this frame.
++		if (CRendererResources::IsSceneReferredStage(2) && renderParams->m_pSkyDomeTextureDataMie && renderParams->m_pSkyDomeTextureDataRayleigh)
++		{
++			const CryHalf4* const pMie = static_cast<const CryHalf4*>(renderParams->m_pSkyDomeTextureDataMie);
++			const CryHalf4* const pRay = static_cast<const CryHalf4*>(renderParams->m_pSkyDomeTextureDataRayleigh);
++			const Vec3 sunDir(renderParams->m_sunDirection.x, renderParams->m_sunDirection.y, renderParams->m_sunDirection.z);
++			const Vec3 mieConst(renderParams->m_partialMieInScatteringConst.x, renderParams->m_partialMieInScatteringConst.y, renderParams->m_partialMieInScatteringConst.z);
++			const Vec3 rayConst(renderParams->m_partialRayleighInScatteringConst.x, renderParams->m_partialRayleighInScatteringConst.y, renderParams->m_partialRayleighInScatteringConst.z);
++			const float miePart_g_2 = renderParams->m_phaseFunctionConsts.x;
++			const float miePart_g2_1 = renderParams->m_phaseFunctionConsts.y;
++
++			const auto evalDome = [&](int texel, const Vec3& skyDir) -> float
++			{
++				const Vec3 mie(CryConvertHalfToFloat(pMie[texel].x), CryConvertHalfToFloat(pMie[texel].y), CryConvertHalfToFloat(pMie[texel].z));
++				const Vec3 ray(CryConvertHalfToFloat(pRay[texel].x), CryConvertHalfToFloat(pRay[texel].y), CryConvertHalfToFloat(pRay[texel].z));
++				const float cosine = -sunDir.Dot(skyDir);
++				const float cosine2 = cosine * cosine;
++				const float miePhaseTmp = miePart_g2_1 + miePart_g_2 * cosine;
++				const float miePhase = (miePhaseTmp > 0.0f) ? (1.0f + cosine2) * powf(miePhaseTmp, -1.5f) : 0.0f;
++				const float rayleighPhase = 0.75f * (1.0f + cosine2);
++				const Vec3 c = mie.CompMul(mieConst) * miePhase + ray.CompMul(rayConst) * rayleighPhase;
++				return 0.2126f * c.x + 0.7152f * c.y + 0.0722f * c.z; // Rec.709 luminance, unexposed engine units
++			};
++
++			const float zenith = evalDome(0, Vec3(0.0f, 0.0f, 1.0f));
++			m_srDebug.zenithNits = zenith * RENDERER_LIGHT_UNIT_SCALE;
++			m_srDebug.zenithExposed = zenith * sceneExposure;
++
++			const Vec3 toSun = -sunDir.GetNormalizedSafe(Vec3(0.0f, 0.0f, -1.0f));
++			if (toSun.z > 0.0f)
++			{
++				const float fromZenithDeg = RAD2DEG(acosf(clamp_tpl(toSun.z, -1.0f, 1.0f)));
++				float azimuthDeg = RAD2DEG(atan2f(toSun.y, toSun.x));
++				if (azimuthDeg < 0.0f) azimuthDeg += 360.0f;
++				const int row = clamp_tpl((int)(fromZenithDeg * SSkyLightRenderParams::skyDomeTextureHeight / 90.0f + 0.5f), 0, SSkyLightRenderParams::skyDomeTextureHeight - 1);
++				const int col = ((int)(azimuthDeg * SSkyLightRenderParams::skyDomeTextureWidth / 360.0f + 0.5f)) % SSkyLightRenderParams::skyDomeTextureWidth;
++				const float sunPeak = evalDome(row * SSkyLightRenderParams::skyDomeTextureWidth + col, toSun) * sceneExposure;
++				m_srDebug.sunPeakExposed = (m_srDebug.peakCapExposed > 0.0f) ? min(sunPeak, m_srDebug.peakCapExposed) : sunPeak;
++			}
++		}
+ 	}
+ 
+ 	// Night sky
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Sky.h b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Sky.h
+index 783df95d..73a77968 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Sky.h
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Sky.h
+@@ -28,6 +28,24 @@ public:
+ 
+ 	void StreamAsyncOnComplete(IReadStream* pStream, unsigned nError) override final;
+ 
++	// What the sky pass actually did on the scene-referred path THIS frame, for r_HDRDebug 1
++	// (CToneMappingStage::DisplaySceneReferredCoverage). The coverage line used to print a
++	// hard-coded "sky YES", which is a promise, not a measurement: it stayed YES while the sky
++	// region of the frame was being painted by an unexposed writer (the volumetric fog's
++	// analytical far segment, 2026-09-08). These are the numbers the line prints instead, all
++	// taken from the constants the pass uploaded, not recomputed from cvars.
++	struct SSceneReferredDebug
++	{
++		bool  bProcedural     = false; // the Nishita dome technique ran (m_bApplySkyDome)
++		bool  bSkybox         = false; // the textured skybox ran (m_bApplySkyBox)
++		float exposureApplied = 1.0f;  // the latched factor every dome / skybox constant was multiplied by
++		float zenithNits      = 0.0f;  // dome radiance straight up, UNEXPOSED, cd/m2 (0 = no dome)
++		float zenithExposed   = 0.0f;  // the same texel as it lands in the HDR target (exposed engine units)
++		float sunPeakExposed  = 0.0f;  // dome value at the sun direction after the peak cap (exposed engine units; 0 = sun below horizon)
++		float peakCapExposed  = 0.0f;  // SkyDome_ScenePeakClamp.x (0 = off the switch / cap disabled)
++	};
++	const SSceneReferredDebug& GetSceneReferredDebug() const { return m_srDebug; }
++
+ private:
+ 	void CreateSkyDomeTextures(int32 width, int32 height);
+ 	void LoadStarsDataAsync();
+@@ -49,4 +67,6 @@ private:
+ 	CPrimitiveRenderPass    m_starsPass;
+ 
+ 	bool                    m_isStarsDataLoaded = false;
++
++	SSceneReferredDebug     m_srDebug;
+ };
+\ No newline at end of file
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.cpp
+index 315a6277..0297f733 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.cpp
+@@ -5,6 +5,7 @@
+ #include "ColorGrading.h"
+ #include "Bloom.h"
+ #include "SunShafts.h"
++#include "Sky.h"
+ #include "DepthOfField.h"
+ #include "D3DPostProcess.h"
+ #include "SceneReferredExport.h"
+@@ -863,10 +864,31 @@ void CToneMappingStage::DisplayDebugInfo()
+ 		// holds and is therefore still exposed. Printing the exposed one made the gap between
+ 		// "metered" and "applied" read as an exposure error of exactly the applied exposure,
+ 		// which is the one thing this overlay exists to rule out.
++		// On the HISTOGRAM path (r_SceneReferredMeterHistogram 1, the default) the scalar meter is
++		// deliberately published as 0, so this formula printed log2(1e-12 ...) = "-28.49" - a
++		// number that looks like a broken meter and is only the absence of one. There the metered
++		// EV is the camera's band reduction, which comes back over the bus as MeterTargetEV.
+ 		const float absoluteIllum = gcpRendD3D->m_fSceneReferredMeteredIlluminance;
+-		const float meteredEV = logf(max(absoluteIllum, 1e-12f) * RENDERER_LIGHT_UNIT_SCALE * 100.0f / (120.0f * gf_PI)) / logf(2.0f);
++		const SSceneReferredMeterHistogram& hist = gcpRendD3D->m_sceneReferredMeterHistogram;
++		const bool bHistogramLive = (hist.sampleId != 0 && hist.totalWeight > 0.0f);
++		float meteredEV = 0.0f;
++		bool bMetered = false;
++		if (bHistogramLive)
++		{
++			if (CPostEffectsMgr* pPostMgr = PostEffectMgr())
++				meteredEV = pPostMgr->GetByNameF("Global_User_MeterTargetEV");
++			bMetered = (meteredEV != 0.0f);
++		}
++		else if (absoluteIllum > 0.0f)
++		{
++			meteredEV = logf(absoluteIllum * RENDERER_LIGHT_UNIT_SCALE * 100.0f / (120.0f * gf_PI)) / logf(2.0f);
++			bMetered = true;
++		}
+ 
+-		sprintf(str, "Scene-referred EV: %.2f  (metered EV: %.2f)  pre-exposure x%.4g", appliedEV, meteredEV, scale);
++		if (bMetered)
++			sprintf(str, "Scene-referred EV: %.2f  (metered EV: %.2f%s)  pre-exposure x%.4g", appliedEV, meteredEV, bHistogramLive ? ", histogram band" : ", log-mean", scale);
++		else
++			sprintf(str, "Scene-referred EV: %.2f  (metered EV: n/a - %s)  pre-exposure x%.4g", appliedEV, bHistogramLive ? "camera has not published a target yet" : "no meter sample / Manual", scale);
+ 		IRenderAuxText::DrawText(Vec3(5, 75, 1), IRenderAuxText::ASize(1.0f), ColorF(1, 0, 1, 1), eDrawText_800x600 | eDrawText_2D, str);
+ 
+ 		DisplaySceneReferredMeterInfo(appliedEV);
+@@ -1080,10 +1102,39 @@ void CToneMappingStage::DisplaySceneReferredCoverage()
+ 	const bool bVFog  = cvarOn("e_VolumetricFog");
+ 	const bool bSnow  = cvarOn("r_Snow");
+ 
+-	char str[256];
+-	cry_sprintf(str, "  pre-exposure reaches: sun+lights YES  probes YES (tint; re-bake for PI)  sky YES  forward/emissive YES");
++	char str[384];
++	cry_sprintf(str, "  pre-exposure reaches: sun+lights YES  probes YES (tint; re-bake for PI)  sky YES (see sky line)  forward/emissive YES");
+ 	IRenderAuxText::DrawText(Vec3(5, 155, 1), IRenderAuxText::ASize(1.0f), ColorF(1, 0, 1, 1), eDrawText_800x600 | eDrawText_2D, str);
+ 
++	// The sky, MEASURED rather than promised (2026-09-08). "sky YES" stayed YES for a fortnight
++	// while the sky region of an outdoor frame was exposure-invariant, because the dome was
++	// exposed and the thing actually painting the far plane - the volumetric fog's analytical
++	// segment - was not. So this line prints what the sky pass uploaded this frame: which
++	// technique ran, the factor its constants were multiplied by, the dome straight up in
++	// unexposed cd/m2 and in the target, the sun peak after the cap, and the cap - and then says
++	// who owns the far plane when volumetric fog is on, so the next reader looks in the right
++	// place first. Every number is from CSkyStage's own upload, not recomputed from cvars.
++	if (const CSkyStage* pSky = m_graphicsPipeline.GetStage<CSkyStage>())
++	{
++		const CSkyStage::SSceneReferredDebug& sky = pSky->GetSceneReferredDebug();
++		const char* szPath = (sky.bProcedural && sky.bSkybox) ? "Nishita+skybox" : sky.bProcedural ? "Nishita" : sky.bSkybox ? "skybox" : "NONE (black)";
++		if (sky.bProcedural)
++		{
++			cry_sprintf(str, "  sky [%s] x%.4g: zenith %.0f cd/m2 unexposed -> %.4g in target (%+.1f stops vs grey), sun peak %.4g (cap %.4g)%s",
++			            szPath, sky.exposureApplied,
++			            sky.zenithNits, sky.zenithExposed,
++			            (sky.zenithExposed > 0.0f) ? log2f(sky.zenithExposed / 0.18f) : -99.0f,
++			            sky.sunPeakExposed, sky.peakCapExposed,
++			            bVFog ? "  | far plane = vol-fog inscatter (sun x albedo, exposed)" : "");
++		}
++		else
++		{
++			cry_sprintf(str, "  sky [%s] x%.4g (cap %.4g)%s", szPath, sky.exposureApplied, sky.peakCapExposed,
++			            bVFog ? "  | far plane = vol-fog inscatter (sun x albedo, exposed)" : "");
++		}
++		IRenderAuxText::DrawText(Vec3(5, 215, 1), IRenderAuxText::ASize(1.0f), ColorF(1, 0, 1, 1), eDrawText_800x600 | eDrawText_2D, str);
++	}
++
+ 	// Ambient light entities have two possible meanings and the overlay must say which one is in
+ 	// force, or the reader cannot tell a fill light that is not following the aperture from a
+ 	// modulator that is behaving correctly by doing nothing. Read from the SAME 3DEngine mirror
+@@ -1100,7 +1151,7 @@ void CToneMappingStage::DisplaySceneReferredCoverage()
+ 	cry_sprintf(str, "    ... SVOGI %s  global fog %s  volumetric fog %s  clouds YES  snow %s  | ambient lights: %s",
+ 	            bSvo  ? "YES (ApplyGI+SvoGiFog)"      : "YES (off)",
+ 	            bFog  ? "YES"                         : "YES (off)",
+-	            bVFog ? "YES (sun+emission)"          : "YES (off)",
++	            bVFog ? "YES (sun+emission+analytical far)" : "YES (off)",
+ 	            bSnow ? "YES (flakes+709->AP1)"       : "YES (off)",
+ 	            bAmbientAsFill ? "YES (routed as fill lights, shadows on)" : "n/a, they modulate");
+ 	IRenderAuxText::DrawText(Vec3(5, 175, 1), IRenderAuxText::ASize(1.0f), ColorF(1, 0, 1, 1), eDrawText_800x600 | eDrawText_2D, str);
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/VolumetricClouds.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/VolumetricClouds.cpp
+index 3120554d..f87d28c8 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/VolumetricClouds.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/VolumetricClouds.cpp
+@@ -1510,6 +1510,13 @@ void CVolumetricCloudsStage::GenerateCloudShaderParam(::VCCloudRenderContext& co
+ 			cb.frustumBL = Vec4(vLB.x, vLB.y, vLB.z, 0.0f);
+ 
+ 			gEnv->p3DEngine->GetGlobalParameter(E3DPARAM_SKYLIGHT_RAYLEIGH_INSCATTER, cb.skylightRayleighInScatter);
++			// The cloud's SKY light is the Nishita dome's horizon Rayleigh radiance
++			// (3DEngineRender.cpp: hazeColorRayleighNoPremul x partialRayleighInScatteringConst), in
++			// engine units - the same class of quantity as shadeColorFromSun below, and it was
++			// missed when that one took the exposure. Without it a cloud's sky-lit half sits at the
++			// old brightness while its sun-lit half and the dome behind it follow the aperture.
++			// Exactly 1.0 off the switch.
++			cb.skylightRayleighInScatter *= gcpRendD3D->GetSceneReferredExposure();
+ 
+ 			gEnv->p3DEngine->GetGlobalParameter(E3DPARAM_VOLCLOUD_ATMOSPHERIC_SCATTERING, cb.atmosphericScattering);
+ 			cb.sunIntensityForAtmospheric = cloudWindAndAtmosphericParams.z;
+@@ -1628,8 +1635,16 @@ void CVolumetricCloudsStage::GenerateCloudShaderParam(::VCCloudRenderContext& co
+ 			cb.vfDistributionParams = PF.pVolumetricFogDistributionParams;              // PB_VolumetricFogDistributionParams
+ 			cb.vfScatteringParams = PF.pVolumetricFogScatteringParams;                  // PB_VolumetricFogScatteringParams
+ 			cb.vfScatteringBlendParams = PF.pVolumetricFogScatteringBlendParams;        // PB_VolumetricFogScatteringBlendParams
+-			cb.vfScatteringColor = PF.pVolumetricFogScatteringColor;                    // PB_VolumetricFogScatteringColor
+-			cb.vfScatteringSecondaryColor = PF.pVolumetricFogScatteringSecondaryColor;  // PB_VolumetricFogScatteringSecondaryColor
++			// Analytical fog sun colour, pre-exposed on xyz (see CHWShader_D3D::mfSetParameters).
++			// The clouds fog themselves with GetVolumetricFogAnalyticalColor from THIS buffer, and
++			// the RenderCloud compute pass binds no per-view CB, so the multiply has to be here.
++			{
++				const float sceneExposure = gcpRendD3D->GetSceneReferredExposure();
++				const Vec4& c1 = PF.pVolumetricFogScatteringColor;
++				const Vec4& c2 = PF.pVolumetricFogScatteringSecondaryColor;
++				cb.vfScatteringColor = Vec4(c1.x * sceneExposure, c1.y * sceneExposure, c1.z * sceneExposure, c1.w);           // PB_VolumetricFogScatteringColor
++				cb.vfScatteringSecondaryColor = Vec4(c2.x * sceneExposure, c2.y * sceneExposure, c2.z * sceneExposure, c2.w);  // PB_VolumetricFogScatteringSecondaryColor
++			}
+ 			cb.vfHeightDensityParams = PF.pVolumetricFogHeightDensityParams;            // PB_VolumetricFogHeightDensityParams
+ 			cb.vfHeightDensityRampParams = PF.pVolumetricFogHeightDensityRampParams;    // PB_VolumetricFogHeightDensityRampParams
+ 			cb.vfDistanceParams = PF.pVolumetricFogDistanceParams;                      // PB_VolumetricFogDistanceParams
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/VolumetricFog.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/VolumetricFog.cpp
+index c266237b..f5a91beb 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/VolumetricFog.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/VolumetricFog.cpp
+@@ -2509,14 +2509,26 @@ void CVolumetricFogStage::FillForwardParams(SForwardParams& forwardParams, bool
+ {
+ 	SRenderViewShaderConstants& paramsPF = RenderView()->GetShaderConstants();
+ 
++	// The analytical fog's sun colour, pre-exposed (xyz only - .w is anisotropy). Same fix, same
++	// reason as the PB upload in CHWShader_D3D::mfSetParameters; see the comment there.
++	const float sceneExposure = gcpRendD3D->GetSceneReferredExposure();
++	const Vec4 exposedScatteringColor(paramsPF.pVolumetricFogScatteringColor.x * sceneExposure,
++	                                  paramsPF.pVolumetricFogScatteringColor.y * sceneExposure,
++	                                  paramsPF.pVolumetricFogScatteringColor.z * sceneExposure,
++	                                  paramsPF.pVolumetricFogScatteringColor.w);
++	const Vec4 exposedScatteringSecondaryColor(paramsPF.pVolumetricFogScatteringSecondaryColor.x * sceneExposure,
++	                                           paramsPF.pVolumetricFogScatteringSecondaryColor.y * sceneExposure,
++	                                           paramsPF.pVolumetricFogScatteringSecondaryColor.z * sceneExposure,
++	                                           paramsPF.pVolumetricFogScatteringSecondaryColor.w);
++
+ 	if (enable)
+ 	{
+ 		forwardParams.vfSamplingParams = paramsPF.pVolumetricFogSamplingParams;
+ 		forwardParams.vfDistributionParams = paramsPF.pVolumetricFogDistributionParams;
+ 		forwardParams.vfScatteringParams = paramsPF.pVolumetricFogScatteringParams;
+ 		forwardParams.vfScatteringBlendParams = paramsPF.pVolumetricFogScatteringBlendParams;
+-		forwardParams.vfScatteringColor = paramsPF.pVolumetricFogScatteringColor;
+-		forwardParams.vfScatteringSecondaryColor = paramsPF.pVolumetricFogScatteringSecondaryColor;
++		forwardParams.vfScatteringColor = exposedScatteringColor;
++		forwardParams.vfScatteringSecondaryColor = exposedScatteringSecondaryColor;
+ 		forwardParams.vfHeightDensityParams = paramsPF.pVolumetricFogHeightDensityParams;
+ 		forwardParams.vfHeightDensityRampParams = paramsPF.pVolumetricFogHeightDensityRampParams;
+ 		forwardParams.vfDistanceParams = paramsPF.pVolumetricFogDistanceParams;
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Water.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Water.cpp
+index f35ff458..3a454ecb 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Water.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Water.cpp
+@@ -1346,8 +1346,14 @@ void CWaterStage::UpdatePerPassResources(EPass passId)
+ 		cbVolFog.vfDistributionParams = PF.pVolumetricFogDistributionParams;              // PB_VolumetricFogDistributionParams
+ 		cbVolFog.vfScatteringParams = PF.pVolumetricFogScatteringParams;                  // PB_VolumetricFogScatteringParams
+ 		cbVolFog.vfScatteringBlendParams = PF.pVolumetricFogScatteringBlendParams;        // PB_VolumetricFogScatteringBlendParams
+-		cbVolFog.vfScatteringColor = PF.pVolumetricFogScatteringColor;                    // PB_VolumetricFogScatteringColor
+-		cbVolFog.vfScatteringSecondaryColor = PF.pVolumetricFogScatteringSecondaryColor;  // PB_VolumetricFogScatteringSecondaryColor
++		// Analytical fog sun colour, pre-exposed on xyz (see CHWShader_D3D::mfSetParameters).
++		{
++			const float sceneExposure = gcpRendD3D->GetSceneReferredExposure();
++			const Vec4& c1 = PF.pVolumetricFogScatteringColor;
++			const Vec4& c2 = PF.pVolumetricFogScatteringSecondaryColor;
++			cbVolFog.vfScatteringColor = Vec4(c1.x * sceneExposure, c1.y * sceneExposure, c1.z * sceneExposure, c1.w);           // PB_VolumetricFogScatteringColor
++			cbVolFog.vfScatteringSecondaryColor = Vec4(c2.x * sceneExposure, c2.y * sceneExposure, c2.z * sceneExposure, c2.w);  // PB_VolumetricFogScatteringSecondaryColor
++		}
+ 		cbVolFog.vfHeightDensityParams = PF.pVolumetricFogHeightDensityParams;            // PB_VolumetricFogHeightDensityParams
+ 		cbVolFog.vfHeightDensityRampParams = PF.pVolumetricFogHeightDensityRampParams;    // PB_VolumetricFogHeightDensityRampParams
+ 		cbVolFog.vfDistanceParams = PF.pVolumetricFogDistanceParams;                      // PB_VolumetricFogDistanceParams
+-- 
+2.47.1.windows.1
+
