@@ -1,4 +1,4 @@
-# CinematicCamera
+﻿# CinematicCamera
 
 A physically based camera component driven by real lens parameters (Sandbox category:
 **Cameras / Cinematic Camera**):
@@ -261,10 +261,25 @@ is deliberately inert (above).
 
 ### Film Grain
 
+The camera drives a **capture-side** grain: grain has a size in micrometres **on the negative**, an
+amplitude that follows the tone through a response curve, an independent field per emulsion layer,
+and a fresh deterministic pattern per *captured* frame. The Film family generates that grain
+procedurally - one Gaussian draw per grain cell on a grid in film millimetres, shaped by a response
+curve that peaks in the lower midtones - so it ships with **no assets at all**; the digital families
+run a sensor model instead. See [FilmGrainSpec.md](FilmGrainSpec.md).
+`r_FilmGrain 0` falls back to the engine's own overlay grain at the same amount.
+
 | Property | Range | Default | Effect |
 | --- | --- | --- | --- |
-| Enable Film Grain | bool | true | Drive `FilterGrain_Amount` from ISO, aperture and shutter following a real sensor noise curve: clean at base ISO, climbing steeply past ISO 6400, boosted when the lens is starved of light. |
-| Grain Strength | 0-4 (slider 0-1) | 1.0 | Scales the computed grain before it reaches the renderer. |
+| Enable Film Grain | bool | true | Drive the grain from ISO, aperture and shutter following a real sensor noise curve: clean at base ISO, climbing steeply past ISO 6400, boosted when the lens is starved of light. The amount is published both as the capture-side block and as `FilterGrain_Amount`, so `r_FilmGrain 0` lands on the engine's own grain at the same strength. |
+| Family | Film / CMOS / CCD / Phone | Film | What the noise is **made of**. Film = silver halide grain of a physical size on the negative, with an independent field per emulsion layer (amplitudes B 1.3 / G 0.9 / R 1.0, layer radii B 1.25 / G 0.8 / R 1.0). CMOS / CCD / Phone = a **sensor**: shot noise plus read noise plus a static per-photosite pattern, run at the body's own photosite pitch and integrated down to the output pixel. See *The digital sensor model* below for the preset numbers. |
+| Grain Strength | 0-4 (slider 0-1) | 1.0 | Artistic multiplier. For **Film** it multiplies the amount ISO and the light the lens passes have already decided. For the **digital** families it is the only thing it does: there the ISO law is emergent from the electron count, so 1 = the sensor exactly as the model measures it. |
+| Chroma NR | 0-1 | 1.0 | Digital families only. How much of the body's own chroma noise reduction is applied. A sensor measures the three colours independently, so its raw noise is a per-pixel rainbow; every real camera denoises the colour part far harder than the brightness part, which is why digital noise reads as fine grey grit with a slow, faint colour blotch under it. 0 = none of it, i.e. the raw confetti - worth seeing once. |
+| Size | 0.25-4 | 1.0 | Multiplies the family's grain size, which is a **length on the negative** (6 um for the default medium film class; for the digital families the **photosite pitch**, so 2 gives photosites twice as wide, a quarter as many and four times the full well - i.e. cleaner), not a number of pixels. The same setting therefore gives the same grain at 1080p and at 4K - the 4K frame simply resolves it better - and a smaller sensor shows coarser grain relative to the frame, as it does in reality. |
+| Colour | 0-1 | 0.65 | Film family only. How **independent** the three layers' grain is. 1 = three independent fields, so the grain carries colour speckle the way a fast colour negative does; 0 = one field shared by all three channels, i.e. monochrome grain. The default is the 0.35 layer correlation of a colour negative. The digital families get their colour structure from the white balance and the chroma NR instead. |
+| Shot Seed | 0-65535 | 0 | A new number is a new roll of film: the whole pattern changes, and the same number always reproduces the same grain. Changing it restarts the capture frame count, so two takes with the same seed match frame for frame. |
+| Capture Frame Rate | 1-240 | 24 | Frames per second the pattern is meant to advance at when a sequence drives the camera. **Stored but not yet consulted**: the counter advances one per rendered frame until the TrackView sequence-time mapping lands. |
+| Camera Rolling While Paused | bool | true | Keep advancing the capture frame count while the game is paused, so the grain keeps moving on a frozen picture the way a camera left running does. Off holds the grain still with the picture. |
 
 ### Halation
 
@@ -1100,18 +1115,129 @@ Master cvar: `r_HDRStreaks` (2 = diagnostic force mode, analytic only).
 
 ## Film grain model
 
+**The amount** - how much grain there is - comes from the exposure triangle:
+
 ```
 sensorStops = log2(36 / sensorWidth)                    // full frame +0, APS-C ~ +0.6, M4/3 ~ +1.1
 g    = clamp((log2(ISO/100) + sensorStops) / 8, 0, 1)   // 8 stops, ISO 100-25600
 base = 0.25*g^1.2 + g^3.5                               // visible from ISO 400, top stops get dirty fast
 lightStops = log2((transmission*t / N^2) / ((1/50) / 5.6^2)) - NDstops
 boost = clamp(2^(-lightStops * 0.35), 0.6, 2.2)         // starved sensor noisier, flooded cleaner
-grain = clamp(base * boost, 0, 1.5) * GrainStrength
+amount = clamp(base * boost, 0, 1.5) * GrainStrength
 ```
 
-The reference exposure is f/5.6 at 1/50 s. The result goes to `FilterGrain_Amount`, which
-PostAA combines with the TOD environment grain by `max()`, so the per-frame write cannot be
-stomped.
+The reference exposure is f/5.6 at 1/50 s. The result goes two places. It goes to
+`FilterGrain_Amount`, which PostAA combines with the TOD environment grain by `max()`, so the
+per-frame write cannot be stomped - that is the path `r_FilmGrain 0` takes. And it goes, multiplied
+by the family's per-layer amplitudes, into the capture-side block below.
+
+**The grain itself** (`FilmGrainSpec.md`; `Engine/Shaders/HWScripts/CryFX/FilmGrain.cfi`) is
+applied in the PostAA composition pass, in the stock grain's slot, on the display-encoded value:
+
+```
+x  = inverse sRGB of the pixel
+t  = log2(max(x, 2^-14))                      // display-log axis
+g  = amount_c * R(t)                          // R peaks at t = -2.5, 3 stops wide, 0 at t >= 0 and t <= -9
+n  = Gaussian(hash(shotSeed, captureFrame, view, film-space cell, layer))
+x' = x * exp2(g*n - g*g*ln2/2)                // the second term keeps the mean, so grain is not exposure
+```
+
+with `n_c = sqrt(1-rho) * n_layer + sqrt(rho) * n_mono` for the channel correlation, and the
+coordinate in **film millimetres** - `(pixel - centre) * sensorWidth / outputWidth`, with the
+anamorphic squeeze undone on x, so grain stretches with a desqueezed frame. A grain cell smaller
+than an output pixel has its variance divided by the number of cells under the pixel, so fine grain
+on a low-resolution output goes quiet rather than merely small.
+
+Nothing in it reads a clock: the pattern is a pure function of the shot seed, the capture frame
+index and the pixel, so the same shot reproduces the same grain in any session and at any frame
+rate. `r_FilmGrainFreeze 1` pins the frame index; `r_FilmGrainDebug 1` puts the grain on a mid grey
+card with the picture removed, `2` turns the bottom sixth of the frame into a twelve-stop grey ramp
+with the grain and the effective response curve drawn on it, and `3` logs what it is doing once a
+second.
+
+#### The digital sensor model
+
+Choosing CMOS, CCD or Phone replaces the emulsion with a **sensor**, and nothing about it is a
+scaled grain. Per photosite, per channel:
+
+```
+e     = x * fullWell * (isoBase / iso)        // electrons; ISO is GAIN, so 4x the ISO is 1/4 the light
+shot ~ Poisson(e) - e                         // Gaussian of variance e above 20 electrons
+read ~ N(0, sigma_r^2)                        // per-ISO; a dual-gain body's floor DROPS at the step
+prnu  = 1 + k_prnu * H(photosite)             // static, multiplicative, hashed from the sensor index only
+dsnu  = k_dsnu * H'(photosite)                // static, additive, electrons
+row   = k_row * H''(row, seed)                // horizontal banding, one draw per row
+y     = ((e + shot) * prnu + read + dsnu + row) / fullWell * (iso / isoBase)
+```
+
+The ISO law is therefore **emergent**: no curve is consulted anywhere. Raising the ISO shrinks `e`,
+so shot noise grows relative to the signal and the read floor stops being negligible - shadows are
+loudest, highlights are cleanest, and the picture clips silently.
+
+The perturbation is **added**, not multiplied: `x' = clamp(x + GrainStrength * delta, 0, 1)`, with
+`delta` in display-linear units. That is the one place a sensor and an emulsion genuinely differ, and
+it matters most in the dark. Film grain modulates a density that is proportional to the exposure, so
+it is relative and belongs in the log domain (the film family still uses that blend). A sensor's
+readout ADDS electrons that do not know what the pixel's value is, so writing the same noise as a
+percentage of the value means dividing by a value that goes to zero - which is why the digital
+families used to fleck a dark frame with saturated magenta / cyan / white sparkles, and why they no
+longer do. What a dark frame shows now is a lifted, slightly grey floor with a faint colour blotch,
+which is what a real sensor's black looks like. `r_FilmGrainDebug 2` still draws the noise as a
+fraction of the value, because that is the shape the eye recognises: loud in the shadows, quiet in
+the highlights, and off the top of the scale wherever the read floor is louder than the signal.
+
+Three things happen between the photosite and the pixel:
+
+- **Integration.** The virtual sensor is wider than the frame - a full-frame body at 6 um is 6000
+  photosites across against a 1920-pixel output - so `nPix = (sensorWidth_px / outputWidth_px)^2`
+  photosites fall under one output pixel and the variance divides by `nPix^E`. `E` is the
+  **integration exponent**, a preset value: 1.0 is the textbook `1/nPix`, and 0.7 was the documented
+  compromise (demosaicing correlates neighbouring photosites, so a real downscaled raw frame measures
+  noisier than the textbook). **Every preset now carries `E = 0`** - the integration is off, one
+  photosite's noise lands on one output pixel whatever the downscale, the "pixel peeping at 1:1" look.
+  That is a judgement rather than a measurement: against real footage the CMOS family read too clean at
+  any downscale. Frame stacking (the phone's six frames) is a separate divisor and still applies.
+  Analytic; no supersampling, no loop.
+- **White balance.** A Bayer sensor is most sensitive in green, so developing multiplies red and
+  blue up - daylight is about 1.9 and 1.6 - and multiplies their noise with them. The camera's own
+  colour temperature tilts those gains, so tungsten in daylight makes the noise bluer.
+- **Chroma noise reduction.** Without it the result is per-pixel colour confetti, which no camera
+  has ever produced. The luma component of the noise is kept per pixel; the chroma component is
+  taken from a coarser cell (up to 4 output pixels) and attenuated. That is what turns the model
+  into the familiar "almost monochrome fine grit with a faint blotchy colour underneath".
+
+The presets, one per family (a C++ table today, the composable body preset later):
+
+| | photosites / reference body | pitch there | full well | base ISO | read noise | PRNU / DSNU / row | chroma NR | extra |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| CMOS | 6000 across 36 mm | 6.0 um | 60 000 e- | 800 | 3.0 e-, **1.5 e- at ISO 3200+** (dual conversion gain) | 0.5 % / 0.15 e- / 0.2 e- | 0.60 | - |
+| CCD | 4300 across 36 mm | 8.4 um | 40 000 e- | 200 | 12 e-, no dual gain | 0.8 % / 0.45 e- / 1.2 e- | 0.45 | vertical streak under a bright source |
+| Phone | 8000 across 7.6 mm | 0.95 um | 6 000 e- | 50 | 1.2 e- | 1.0 % / 0.06 e- / 0.3 e- | 0.90 | 6 frames stacked (variance / N) |
+
+The photosite **count** is the family's property and the **pitch follows the body**: a family has a
+resolution class, so a smaller body divides the same count into a smaller width and gets a smaller
+photosite. Full-well capacity is proportional to photosite area, so the well shrinks quadratically with
+the format, fewer electrons are collected at the same exposure and the picture is noisier - a Micro Four
+Thirds body is 2.08x a full frame at the same ISO, which is almost exactly the two stops of real-world
+"equivalence". Read noise, DSNU and the row term are amplifier properties in electrons and do not shrink,
+so their relative weight grows too. A body *wider* than the family's reference gets no bonus: a family's
+electronics are designed for a format. The **Size** property scales the photosite linearly (and the well
+quadratically) in both directions, and the count is capped at 6000-8000 because no body delivers more.
+
+The **DSNU / row / column** figures are quoted at the quiet end of the measured ranges (1-2 e- rms for
+row and column temporal noise, 0.5-1 % for PRNU) because every real body corrects them on the way out,
+with optical-black reference rows and columns. **DSNU is quoted as the post-calibration RESIDUAL**
+(0.15 / 0.45 / 0.06 e- against a raw 1-3 e-): it is hashed from the photosite index, so it is a static
+layer the picture slides across when the camera moves, and every real body subtracts a dark frame or
+sets its black level from the optical-black rows before the footage is delivered. What survives that is
+0.06-1.6 code values four stops under mid grey at ISO 12800 - present, but no longer a fixed speckle
+pattern riding over a moving shot. They are also almost **colourless**: one
+amplifier serves the whole line or column, so the offset it adds is a single number the three channels
+share - drawn as one shared value plus 10 % of per-channel variation. The CCD's vertical streak is a
+fraction of the **saturating column's charge at the current ISO**, gated so that nothing at all appears
+in a normally exposed scene and a faint streak (about one code value) appears only under a clipping
+source. `r_FilmGrainDebug 3` prints every one of these terms in **code values at mid grey and four stops
+down**, so their magnitudes are never argued about blind.
 
 ---
 

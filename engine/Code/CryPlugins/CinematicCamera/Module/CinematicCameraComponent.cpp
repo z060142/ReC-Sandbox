@@ -1041,9 +1041,51 @@ float CCinematicCameraComponent::ComputeFilmGrain01() const
 	return clamp_tpl(base * lowLightBoost, 0.0f, 1.5f);
 }
 
-// FilterGrain_Amount is combined with the environment (TOD) grain by max() in PostAA,
-// so writing it every frame from the finalize hook cannot be stomped and needs no
-// ordering tricks. Save once / restore on release, mirroring the DOF params.
+// One step of the capture-frame counter (FilmGrainSpec.md section 5.3). This is the camera's own
+// count of frames it has EXPOSED, and it is the only thing that makes the grain pattern move: the
+// shader has no clock and no renderer frame id, by design, so that the same shot seed and the same
+// frame index reproduce the same grain in any session, at any frame rate, on any machine.
+//
+// TODO (G1 or later): while a TrackView sequence drives the camera the index should be
+// floor(sequenceTime * captureFps) rather than a free-running count, so that scrubbing a sequence
+// back and forth shows the same grain on the same frame. There is no hook on this component that
+// reports the playing sequence's time - IMovieSystem would have to be queried and the sequence
+// this camera belongs to identified - and that is a topic of its own, so the counter free-runs for
+// now and the Capture Frame Rate property is stored but not consulted.
+void CCinematicCameraComponent::AdvanceCaptureFrame()
+{
+	if (!CanDriveRenderState())
+		return;
+
+	// A camera left running on a paused game keeps exposing film; a camera being used to inspect a
+	// frozen frame should not. Default is to keep rolling, which is what a real gate does.
+	if (!m_grain.bRollWhilePaused && gEnv->pSystem != nullptr && gEnv->pSystem->IsPaused())
+		return;
+
+	// Wrapped well inside the range a float carries exactly, because the index travels to the
+	// shader as a float on the post-effect bus. 2^24 frames is 7.7 days at 25 fps.
+	m_captureFrameIndex = (m_captureFrameIndex + 1) & 0x00FFFFFFu;
+}
+
+// The film grain the camera drives, in two parts.
+//
+// FilterGrain_Amount is the ENGINE's grain: an overlay of a white-noise volume, combined with the
+// environment (TOD) grain by max() in PostAA, so writing it every frame from the finalize hook
+// cannot be stomped and needs no ordering tricks. It is still written, unchanged, because
+// r_FilmGrain 0 falls straight back onto it.
+//
+// Grain_User_* is the CAPTURE-SIDE grain of FilmGrainSpec.md section 4: the same amount, plus
+// everything the engine's grain has no way to express - a size in micrometres on the negative, the
+// sensor width and squeeze that map the negative onto the frame, the per-layer amplitudes and
+// their correlation, and the seed and capture-frame index that make the pattern deterministic and
+// per-frame. The renderer forces the engine's amount to 0 while this block is active, so the two
+// never both apply.
+//
+// Save once / restore on release for both, under one flag, mirroring the DOF params.
+// Defined with the white-balance effect further down; the sensor model needs the same curve to
+// work out how far the raw red and blue gains are pushed, and with them the colour of the noise.
+static Vec3 KelvinToRGB(float kelvin);
+
 void CCinematicCameraComponent::ApplyFilmGrain()
 {
 	if (!CanDriveRenderState())
@@ -1058,10 +1100,239 @@ void CCinematicCameraComponent::ApplyFilmGrain()
 	if (!m_bGrainParamSaved)
 	{
 		gEnv->p3DEngine->GetPostEffectParam("FilterGrain_Amount", m_savedGrainAmount);
+		gEnv->p3DEngine->GetPostEffectParam("Grain_User_Active", m_savedGrainActive);
+		gEnv->p3DEngine->GetPostEffectParam("Grain_User_Family", m_savedGrainFamily);
+		gEnv->p3DEngine->GetPostEffectParamVec4("Grain_User_Amount", m_savedGrainAmountVec);
+		gEnv->p3DEngine->GetPostEffectParamVec4("Grain_User_Size", m_savedGrainSizeVec);
+		gEnv->p3DEngine->GetPostEffectParamVec4("Grain_User_Sensor", m_savedGrainSensorVec);
+		gEnv->p3DEngine->GetPostEffectParamVec4("Grain_User_Seed", m_savedGrainSeedVec);
+		gEnv->p3DEngine->GetPostEffectParamVec4("Grain_User_Digital0", m_savedGrainDigital0Vec);
+		gEnv->p3DEngine->GetPostEffectParamVec4("Grain_User_Digital1", m_savedGrainDigital1Vec);
+		gEnv->p3DEngine->GetPostEffectParamVec4("Grain_User_Digital2", m_savedGrainDigital2Vec);
+		gEnv->p3DEngine->GetPostEffectParamVec4("Grain_User_Digital3", m_savedGrainDigital3Vec);
 		m_bGrainParamSaved = true;
+
+		// Taking authority is loading a new magazine: the count starts at 0 so a shot always
+		// begins on the same frame of grain.
+		m_captureFrameIndex = 0;
+		m_lastShotSeed = (int)m_grain.shotSeed;
 	}
 
-	gEnv->p3DEngine->SetPostEffectParam("FilterGrain_Amount", ComputeFilmGrain01() * (float)m_grain.grainStrength);
+	// A new seed is a new roll of film, and a new roll starts at frame 0 - otherwise two takes
+	// with the same seed would not match frame for frame, which is the whole point of a seed.
+	if ((int)m_grain.shotSeed != m_lastShotSeed)
+	{
+		m_lastShotSeed = (int)m_grain.shotSeed;
+		m_captureFrameIndex = 0;
+	}
+
+	// The ENGINE's grain amount, unchanged: r_FilmGrain 0 falls straight back onto it, and it must
+	// keep behaving exactly as it did - the film-style ISO law times the strength.
+	const float legacyAmount = ComputeFilmGrain01() * (float)m_grain.grainStrength;
+	gEnv->p3DEngine->SetPostEffectParam("FilterGrain_Amount", legacyAmount);
+
+	// ------------------------------------------------------------------------------------------
+	// The family table (FilmGrainSpec.md section 5.2). A C++ table keyed by family for v1; the
+	// composable body preset replaces it later without the renderer noticing.
+	//
+	// Film: the layer amplitudes of a colour negative - the blue-sensitive layer is the fastest
+	// and the grainiest, green the finest - and the per-layer grain radii that go with them
+	// (section 3.3: B 1.25 / G 0.8 / R 1.0 of the class mean). The correlation comes from the
+	// Colour property, whose default 0.65 is the 0.35 layer correlation of a colour negative.
+	//
+	// Digital: a SENSOR, in the sensor's own units. Every number below is a physical quantity an
+	// EMVA 1288 datasheet carries, and the noise the shader produces is computed from them rather
+	// than dialled: how many electrons a photosite can hold, how many it collects for a given
+	// exposure at a given ISO, how many the amplifier adds, and how much the sites differ from one
+	// another. The three families differ only in those numbers plus two extra terms (the CCD's
+	// column streak, the phone's frame stacking).
+	// ------------------------------------------------------------------------------------------
+	const bool bFilm = (m_grain.family == EGrainFamily::Film);
+
+	// The medium size class, 6 um mean grain radius, times the Size property. Clamped to the
+	// 0.25 - 4 of the spec here rather than in the property, whose range bounds are integers.
+	const float sizeScale = clamp_tpl((float)m_grain.size, 0.25f, 4.0f);
+	const float kMediumClassUm = 6.0f;
+	const float baseSizeUm = kMediumClassUm * sizeScale;
+
+	const Vec3 layerAmp  = bFilm ? Vec3(1.0f, 0.9f, 1.3f) : Vec3(1.0f, 1.0f, 1.0f);
+	const Vec3 layerSize = bFilm ? Vec3(1.0f, 0.8f, 1.25f) : Vec3(1.0f, 1.0f, 1.0f);
+	const float rho = bFilm ? clamp_tpl(1.0f - (float)m_grain.colour, 0.0f, 1.0f) : 0.0f;
+
+	// The amount the block receives. Film keeps the computed ISO / light-starvation law; the
+	// digital families deliberately do NOT get it - their ISO behaviour is emergent from the
+	// electron count, and multiplying an emergent law by a modelled one would count the ISO twice.
+	// There Grain Strength is the whole of it: 1 = the sensor as the model measures it.
+	const float amount = bFilm ? legacyAmount : (float)m_grain.grainStrength;
+
+	gEnv->p3DEngine->SetPostEffectParam("Grain_User_Active", 1.0f);
+	gEnv->p3DEngine->SetPostEffectParam("Grain_User_Family", (float)(int)m_grain.family);
+	gEnv->p3DEngine->SetPostEffectParamVec4("Grain_User_Amount",
+		Vec4(amount * layerAmp.x, amount * layerAmp.y, amount * layerAmp.z, rho));
+	gEnv->p3DEngine->SetPostEffectParamVec4("Grain_User_Size",
+		Vec4(baseSizeUm * layerSize.x, baseSizeUm * layerSize.y, baseSizeUm * layerSize.z, 0.0f));
+
+	// ------------------------------------------------------------------------------------------
+	// The sensor presets. Sources, so the numbers can be argued with:
+	//   CMOS   - the spec's own section 5.1 defaults: 6 um pitch, 60 000 e- well, base ISO 800,
+	//            read noise 3 e-. The dual-gain step at ISO 3200 is what a modern cinema / stills
+	//            sensor does (ARRI ALEV dual gain, Sony dual conversion gain): a second, quieter
+	//            amplifier path switches in at a high ISO, so the read floor DROPS at the step
+	//            instead of climbing - which is why such a body is often cleaner at ISO 3200 than
+	//            a naive curve says.
+	//            The reference body is full frame: 6000 photosites across 36 mm is the 6 um pitch.
+	//   CCD    - a broadcast / early digital-cinema CCD's readout, quoted at the same full-frame
+	//            reference: 4300 sites across 36 mm = ~8.4 um, ~40 000 e- wells, no dual gain and
+	//            a read floor around 12 e-, which is the reason CCD footage is noisy in a way that
+	//            no ISO setting fixes. Plus the two CCD signatures: heavier fixed pattern, and a
+	//            vertical streak under a bright source (not a full-frame vertical texture).
+	//   Phone  - a 0.95 um photosite (the current small-pixel class: 8000 sites across a 7.6 mm
+	//            1/2.3-inch sensor), ~6 000 e- well, base ISO 50,
+	//            ~1.2 e- read. Collecting almost nothing, it is rescued computationally: HDR+
+	//            (Hasinoff et al. 2016) stacks a burst, which divides the variance by the number of
+	//            frames, and denoises chroma hard. Six frames is the middle of that paper's range.
+	// Every value here is a number, not a texture: the digital families carry no assets at all.
+	// ------------------------------------------------------------------------------------------
+	struct SGrainSensorPreset
+	{
+		float photositeCount;  // photosites ACROSS the family's reference body - fixed, the pitch follows
+		float refWidthMm;      // the body width the count and the full well are quoted for
+		float fullWell;        // electrons at clip, AT the reference width (scales with photosite area)
+		float isoBase;         // the ISO at which the well fills at clip
+		float sigmaReadLow;    // read noise in electrons below the dual-gain step
+		float sigmaReadHigh;   // read noise in electrons at and above it
+		float dualGainIso;     // 0 = no dual gain
+		float kPrnu;           // per-site gain spread, fraction
+		float kDsnuE;          // per-site dark offset spread, electrons
+		float kRowE;           // per-row banding, electrons rms (residual AFTER the body's own correction)
+		float chromaNR;        // 0 = none (raw colour confetti), 1 = maximum
+		float stackN;          // frames averaged by the body
+		float smear;           // CCD column streak strength, x 1 % of the saturating column charge
+		float integrationExp;  // sensor -> output integration exponent (0 = none, 1 = textbook 1/N)
+		float maxSensorPx;     // nothing delivers more than this, and real bodies bin above it
+	};
+	// The structured terms (DSNU, row, column) are quoted in the ELECTRONS an EMVA 1288 datasheet
+	// carries, and are deliberately at the quiet end of the measured ranges, because every one of
+	// them is corrected on the way out of a real body: row/column temporal noise is 1-2 e- rms
+	// before the optical-black reference rows and columns cancel most of it, DSNU is 1-3 e-, PRNU
+	// 0.5-1 % of the signal. They were previously tuned against a MULTIPLICATIVE path that clamped
+	// them; the additive path of 2026-09-10 shows their true size, and the true size of the old
+	// numbers was violent (see the smear discussion in FilmGrain.cfi).
+	//
+	// DSNU is a POST-CALIBRATION RESIDUAL (2026-09-11). The dsnu column used to carry the raw,
+	// uncalibrated dark-signal non-uniformity a datasheet quotes, and our field is hashed from the
+	// photosite index and is therefore seed-free and frame-independent by design - so a moving
+	// camera dragged the picture across a STATIC layer of speckles, which is exactly what a raw,
+	// uncalibrated sensor does and exactly what no delivered footage looks like. Every real body
+	// removes it: a dark frame is subtracted, or the optical-black rows set the black level per
+	// frame, and only a residual survives - the part the calibration frame's own noise cannot
+	// resolve. So the numbers below are that residual, not the raw figure.
+	//   CMOS  1.0 -> 0.15 e- (15 % residual after per-frame optical-black black-level correction)
+	//   CCD   3.0 -> 0.45 e- (15 %; a broadcast CCD is calibrated the same way, from more DSNU)
+	//   Phone 1.0 -> 0.06 e- (6 %; a phone ships a per-unit factory calibration table on top of
+	//                         the per-frame black level, and burst alignment smears what is left)
+	// In the r_FilmGrainDebug 3 per-term table, green, at -4 stops under mid grey and ISO 12800:
+	// CMOS 0.410 -> 0.061 CV, CCD 7.373 -> 1.106 CV, Phone 26.756 -> 1.605 CV. PRNU is unchanged
+	// and already below the same bar: 0.274 / 0.439 / 0.224 CV at mid grey, ISO 12800.
+	static const SGrainSensorPreset s_sensorPresets[3] =
+	{
+		//  count  refWmm    well   base  readLo readHi  dualISO  prnu    dsnu  row  chroma stack smear  integ  maxPx
+		{  6000.f,  36.0f, 60000.f, 800.f,  3.0f, 1.5f,  3200.f, 0.005f, 0.15f, 0.2f, 0.60f, 1.f, 0.0f, 0.0f, 8000.f }, // CMOS
+		{  4300.f,  36.0f, 40000.f, 200.f, 12.0f, 12.0f,    0.f, 0.008f, 0.45f, 1.2f, 0.45f, 1.f, 0.6f, 0.0f, 6000.f }, // CCD
+		{  8000.f,   7.6f,  6000.f,  50.f,  1.2f,  1.2f,    0.f, 0.010f, 0.06f, 0.3f, 0.90f, 6.f, 0.0f, 0.0f, 8000.f }, // Phone
+	};
+	const int familyIndex = clamp_tpl((int)m_grain.family - 1, 0, 2);
+	const SGrainSensorPreset& preset = s_sensorPresets[familyIndex];
+
+	// How many photosites fit across the body's negative, and how big each one is.
+	//
+	// This used to work the other way round: the PITCH was the preset's property and the count
+	// followed the format, so an APS-C body had fewer, identical photosites and was noisier only
+	// because it was downscaled less on the way to the output pixel. That argument dies with the
+	// integration exponent at 0 (the default since 2026-09-10, the "1:1" view): with E = 0 the
+	// downscale factor has no effect at all, so the format has to carry its own noise.
+	//
+	// It does, and physically: a family has a photosite COUNT (its resolution class), so a smaller
+	// body divides the same count into a smaller width and gets a SMALLER PHOTOSITE. Full-well
+	// capacity is proportional to photosite AREA, so the well shrinks quadratically, the electron
+	// count at a given exposure shrinks with it, and shot noise relative to the signal grows as the
+	// inverse square root - a M43 body is 2.08x noisier than a full frame at the same ISO, which is
+	// almost exactly the two stops of real-world "equivalence". Read noise, DSNU and the row term
+	// are amplifier properties in electrons and do NOT shrink, so their relative weight grows too.
+	//
+	// A body WIDER than the family's reference gets no bonus: the cap at 1 is there because a
+	// family's electronics are designed for a format, and a 2/3-inch CCD's readout scaled up to a
+	// full-frame photosite is not a body anyone has built. The Size property scales the photosite
+	// linearly (and therefore the well quadratically) in both directions, which is what it always
+	// meant. The count ceiling is unchanged: no body delivers more than about 8K.
+	const float bodyWidthMm = max(GetSensorWidth(), 1.0f);
+	const float sensorWidthPx = clamp_tpl(preset.photositeCount / sizeScale, 320.0f, preset.maxSensorPx);
+	const float refPitchUm = preset.refWidthMm * 1000.0f / max(preset.photositeCount, 1.0f);
+	const float pitchFactor = min(bodyWidthMm / preset.refWidthMm, 1.0f) * sizeScale;
+	const float pitchUm = refPitchUm * pitchFactor;
+	const float fullWellEff = max(preset.fullWell * pitchFactor * pitchFactor, 100.0f);
+
+	gEnv->p3DEngine->SetPostEffectParamVec4("Grain_User_Sensor",
+		Vec4(GetSensorWidth(), clamp_tpl((float)m_anamorphic.squeeze, 1.0f, 2.0f),
+		     bFilm ? 6000.0f : sensorWidthPx, 0.0f));
+
+	// shotSeed, captureFrameIndex, freeze, algorithmVersion. The freeze slot stays 0: the camera
+	// has no reason to pin its own grain, and r_FilmGrainFreeze is the diagnostic that does it.
+	gEnv->p3DEngine->SetPostEffectParamVec4("Grain_User_Seed",
+		Vec4((float)(int)m_grain.shotSeed, (float)m_captureFrameIndex, 0.0f, 1.0f));
+
+	// Read noise. A dual-gain body switches to its second, quieter conversion gain at the step,
+	// so the floor in electrons falls there rather than rising; below it the first gain is used.
+	const float iso = (float)max((int)m_body.iso, 25);
+	const float sigmaRead = (preset.dualGainIso > 0.0f && iso >= preset.dualGainIso)
+	                        ? preset.sigmaReadHigh : preset.sigmaReadLow;
+
+	gEnv->p3DEngine->SetPostEffectParamVec4("Grain_User_Digital0",
+		Vec4(fullWellEff, preset.isoBase, iso, sigmaRead));
+	gEnv->p3DEngine->SetPostEffectParamVec4("Grain_User_Digital1",
+		Vec4(preset.kPrnu, preset.kDsnuE, preset.kRowE,
+		     clamp_tpl(preset.chromaNR * (float)m_grain.chromaNR, 0.0f, 1.0f)));
+
+	// The raw white balance, which is where the COLOUR of digital noise comes from. A Bayer sensor
+	// is most sensitive in green, so developing a raw frame multiplies red and blue up to make grey
+	// grey - and multiplies their noise up with them. 1.9 / 1.6 are the daylight multipliers a
+	// full-frame body typically reports; the camera's own colour temperature then tilts them, using
+	// the same Kelvin curve the white-balance effect uses, so setting tungsten in daylight amplifies
+	// blue and makes the noise bluer, exactly as it does on a real body. Green is the reference and
+	// is always 1, so only red and blue travel.
+	float wbRawR = 1.9f, wbRawB = 1.6f;
+	if (m_whiteBalance.bEnableWhiteBalance)
+	{
+		const Vec3 reference = KelvinToRGB(6500.0f);
+		const Vec3 target = KelvinToRGB((float)(int)m_whiteBalance.colorTemperature);
+		const Vec3 tilt(reference.x / max(target.x, 0.01f),
+		                reference.y / max(target.y, 0.01f),
+		                reference.z / max(target.z, 0.01f));
+		wbRawR *= tilt.x / max(tilt.y, 0.01f);
+		wbRawB *= tilt.z / max(tilt.y, 0.01f);
+	}
+
+	gEnv->p3DEngine->SetPostEffectParamVec4("Grain_User_Digital2",
+		Vec4(clamp_tpl(wbRawR, 0.25f, 6.0f), clamp_tpl(wbRawB, 0.25f, 6.0f), preset.stackN, preset.smear));
+
+	// The sensor -> output integration exponent (FilmGrainSpec.md section 3.4). How much of the
+	// theoretical downsampling gain the body actually gets: averaging N photosites into one
+	// output pixel divides the variance by N on paper, but demosaicing correlates neighbouring
+	// photosites first, so a downscaled raw frame measures noisier than 1/N says. 1.0 is the
+	// textbook result and 0.7 was the documented compromise; every preset now carries **0.0**.
+	//
+	// That is a judgement, not a measurement, and it is the project's rule of visual feedback over
+	// maths: against real footage the CMOS family read too clean at any downscale, and 0 is the
+	// honest 1:1 statement - one photosite's noise on one output pixel, whatever the ratio between
+	// the virtual sensor and the frame. The knob stays on the bus, and the shader keeps 0.7 as its
+	// compile-time fallback for reference, so the old behaviour is one preset value away. Frame
+	// stacking (the phone's six frames) is a separate divisor and is unaffected.
+	//
+	// y carries the EFFECTIVE photosite pitch in um - the length the full well above is quoted
+	// for, after the format scaling. The shader ignores it; the debug report prints it, so the
+	// pitch and the well can never drift apart in the log.
+	gEnv->p3DEngine->SetPostEffectParamVec4("Grain_User_Digital3",
+		Vec4(clamp_tpl(preset.integrationExp, 0.0f, 2.0f), pitchUm, 0.0f, 0.0f));
 }
 
 // The renderer's motion blur exposure window is 1 / r_MotionBlurShutterSpeed, so pointing
@@ -3028,6 +3299,16 @@ void CCinematicCameraComponent::RestoreFilmGrain()
 		return;
 
 	gEnv->p3DEngine->SetPostEffectParam("FilterGrain_Amount", m_savedGrainAmount);
+	gEnv->p3DEngine->SetPostEffectParam("Grain_User_Active", m_savedGrainActive);
+	gEnv->p3DEngine->SetPostEffectParam("Grain_User_Family", m_savedGrainFamily);
+	gEnv->p3DEngine->SetPostEffectParamVec4("Grain_User_Amount", m_savedGrainAmountVec);
+	gEnv->p3DEngine->SetPostEffectParamVec4("Grain_User_Size", m_savedGrainSizeVec);
+	gEnv->p3DEngine->SetPostEffectParamVec4("Grain_User_Sensor", m_savedGrainSensorVec);
+	gEnv->p3DEngine->SetPostEffectParamVec4("Grain_User_Seed", m_savedGrainSeedVec);
+	gEnv->p3DEngine->SetPostEffectParamVec4("Grain_User_Digital0", m_savedGrainDigital0Vec);
+	gEnv->p3DEngine->SetPostEffectParamVec4("Grain_User_Digital1", m_savedGrainDigital1Vec);
+	gEnv->p3DEngine->SetPostEffectParamVec4("Grain_User_Digital2", m_savedGrainDigital2Vec);
+	gEnv->p3DEngine->SetPostEffectParamVec4("Grain_User_Digital3", m_savedGrainDigital3Vec);
 	m_bGrainParamSaved = false;
 }
 
@@ -3364,6 +3645,13 @@ void CCinematicCameraComponent::ApplyGameOnlyEffects()
 	if (m_dof.bEnableDOF)
 		ApplyDOF();
 
+	// One exposed frame, then the grain. Advanced before the grain is published so the frame the
+	// shader seeds from is the frame the picture belongs to. This list is the ONE activation path
+	// (S9, decisions/s9-editor-cinecam-preview.md): game mode reaches it from FinalizeGameCamera,
+	// the editor from the plugin's per-frame resolver once the viewport is looking through a
+	// cinecam entity. The grain therefore follows exactly the same editor policy as DOF and
+	// halation, and there is no second path to keep in step.
+	AdvanceCaptureFrame();
 	ApplyFilmGrain();
 	ApplyHalation();
 	ApplyMotionBlur();

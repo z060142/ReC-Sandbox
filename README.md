@@ -76,6 +76,29 @@ renders. It is deliberately the toolset of an on-set colourist rather than a ful
 - The previous, display-referred pipeline is kept on the `stock-pipeline` branch and the
   `stock-pipeline-base` tag.
 
+## Branch `film-grain` (experimental preview)
+
+This branch adds capture-side film grain to the cinematic camera, replacing the engine's own
+overlay grain whenever a cinematic camera drives the frame. It is additive to `main`
+(dev@a4fed24b plus the grain commits): with the block off the engine renders exactly as stock,
+and the stock grain path is byte-identical.
+
+- **Film family**: procedural grain generated per output pixel from a physical grain size given
+  in micrometres on the negative, with a tone response that fades out near display white and
+  nine stops under it, so it reads like an emulsion rather than a screen-space filter.
+- **CMOS / CCD / Phone families**: a real sensor-noise model instead — shot noise, read noise,
+  fixed-pattern noise and, for CCD, a column term — added in display-linear rather than blended
+  logarithmically, so ISO behaviour (more noise at higher gain, in a smaller sensor) falls out of
+  the physics instead of being hand-tuned per stop.
+- Grain is deterministic per capture frame: a stateless hash of the shot seed, capture-frame
+  index, view and cell, no wall clock, so a rendered sequence grains the same way on replay.
+- **Deploy note**: `engine/Engine/Shaders/RunTime.ext` must be deployed as a loose file next to
+  the shaders. It carries the `Precache` line for the new runtime flag the grain block uses; a
+  build without it leaves the technique masked off and the grain code never compiles in.
+- Full spec: `engine/Code/CryPlugins/CinematicCamera/FilmGrainSpec.md`.
+- **Parked**: grain plates (an offline Boolean-model synthesis tool, `tools/grain-plates/`) and
+  EXR grain metadata are not part of this branch yet.
+
 ## Documentation
 
 | Document | What it covers |

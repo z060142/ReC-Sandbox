@@ -492,6 +492,12 @@ public:
 
 	static float CV_r_HDRGrainAmount;
 
+	//! The capture-side film grain block (FilmGrainSpec.md). Master switch, diagnostics and the
+	//! capture-frame freeze. Ints, because all three are modes rather than amounts.
+	static int   CV_r_FilmGrain;
+	static int   CV_r_FilmGrainDebug;
+	static int   CV_r_FilmGrainFreeze;
+
 	static float CV_r_Sharpening;
 	static float CV_r_ChromaticAberration;
 

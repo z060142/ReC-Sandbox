@@ -1,0 +1,1279 @@
+From d654af0ca692d096de70115f1a0be7277ec1e418 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Sat, 5 Sep 2026 15:49:10 +0800
+Subject: [PATCH 164/174] feat: capture-side film grain, stage G0 - skeleton,
+ gating and the white-Gaussian generator
+
+The engine's film grain is an overlay of a 256x256x6 white-noise volume, pivoting on 0.5,
+addressed in FRAME coordinates and animated off the wall clock: six patterns cycling at 18 Hz,
+monochrome, no size, no tone response, and grain cells that double in pixels when the resolution
+doubles. This is the first stage of replacing it, for the cinematic camera only, with a
+capture-side model (FilmGrainSpec.md).
+
+What the new grain is. Grain has a size in MICROMETRES ON THE NEGATIVE, so the same camera gives
+the same grain at 1080p and at 4K and a smaller sensor shows coarser grain relative to the frame.
+Its amplitude follows the tone through a response curve that peaks in the mid-tones and falls to
+zero at display white and nine stops under it. Each emulsion layer gets its own field, mixed by a
+correlation, so the grain carries colour speckle rather than sitting on the picture as one grey
+layer. And the pattern is a pure function of (shot seed, capture frame index, view, film-space
+cell, layer) - no clock anywhere - so the same shot reproduces the same grain in any session, at
+any frame rate, and the grain changes every CAPTURED frame instead of eighteen times a second.
+
+Renderer
+
+- Grain_User_* post-effect params at manager level (PostProcess.cpp/.h): Active, Family, and the
+  Vec4s Amount / Size / Sensor / Seed / Digital0 / Digital1, plus the two texture-id slots
+  Response and Plates that G1 and G2 will fill. All no-transition - a grain parameter is a
+  property of the negative, not a value to cross-fade - and all inert by default.
+- r_FilmGrain (1), r_FilmGrainDebug (0) and r_FilmGrainFreeze (0) in RendererCVars, in the house
+  style of r_DepthOfFieldLensModel.
+- CPostAAStage::DoFinalComposition reads the block once per frame. When the camera asks for it,
+  the cvar allows it and the amount is non-zero, it forces the stock grain amount to 0, sets
+  %_RT_SAMPLE6 (the one free runtime flag on this technique) and uploads the seven vectors through
+  the pass' existing reflected per-primitive constant buffer. The flag travels in rtMask, which is
+  already part of the pass IsDirty tuple, so the permutation change rebuilds the primitive; no new
+  texture is bound, so nothing else joins the tuple. The freeze latch holds the published capture
+  frame index while r_FilmGrainFreeze is on without stopping the camera's own count.
+- r_FilmGrainDebug 3 prints a once-a-second plain-language report - family, per-channel amount,
+  size in um and in output pixels, what one output pixel covers of the negative, seed and frame
+  index, and what the grain is worth in 8-bit code values on a mid grey card, which is the number
+  that decides whether it is visible at all after the 8-bit write.
+
+Shader
+
+- New Engine/Shaders/HWScripts/CryFX/FilmGrain.cfi, included by PostAA.cfx and called from the
+  stock grain's own slot before the saturate under %_RT_SAMPLE6. It brings its own pcg3d integer
+  hash and Box-Muller Gaussian, because there is no hash, PRNG or blue-noise anywhere in
+  PostEffectsLib.cfi / ShadeLib.cfi / Common.cfi and 5.7.1 ships no blue-noise texture.
+- The blend is the spec's: decode sRGB, t = log2(x), g = amount * R(t), x' = x * exp2(g*n -
+  g*g*ln2/2), encode. The second exponent term is the analytic Jensen correction, so raising the
+  grain does not also raise the exposure. Above the clip point g is 0 and the pixel is returned
+  untouched rather than round-tripped through the encoding, which keeps clipped highlights and the
+  letterbox bars bit-identical.
+- Coordinates are film millimetres with the anamorphic squeeze undone on x, so grain stretches
+  with a desqueezed frame. The G0 generator is a white Gaussian on a film-space cell grid with the
+  output pixel's footprint integrated analytically (variance / max(1, (fp/size)^2)) - zero assets,
+  and it is the shot-noise core of the sensor model that comes next, so it is not throw-away.
+- r_FilmGrainDebug 1 replaces the picture with a mid grey card and runs the whole block on it.
+- The stock ApplyFilmGrain is untouched and is still what compiles with the flag clear, so every
+  stock permutation is byte for byte what it was.
+
+Cinematic camera
+
+- SCineGrainParams becomes the spec's property group: Family (Film / CMOS / CCD / Phone), Grain
+  Strength, Size, Colour, Shot Seed, Capture Frame Rate and Camera Rolling While Paused, next to
+  the existing Enable Film Grain.
+- ApplyFilmGrain publishes the whole block every frame under CanDriveRenderState(), saved once and
+  restored on release under the existing grain flag, and keeps writing FilterGrain_Amount so
+  r_FilmGrain 0 lands straight back on the engine's grain at the same strength.
+- Amount = ComputeFilmGrain01() * Grain Strength * the family's per-layer amplitude (Film: B 1.3 /
+  G 0.9 / R 1.0, correlation from the Colour property; the digital families are neutral until the
+  sensor model lands). Size is 6 um times the Size property, with the film layer radii B 1.25 /
+  G 0.8 / R 1.0. Sensor width and squeeze come from the body and the anamorphic group.
+- The capture-frame counter of section 5.3: one step per finalised game-camera frame, reset when
+  the component takes authority and when Shot Seed changes, held while paused unless Camera
+  Rolling While Paused. The TrackView sequence-time mapping is a TODO in AdvanceCaptureFrame -
+  no hook on this component reports the playing sequence's time, so Capture Frame Rate is stored
+  but not yet consulted.
+
+Docs: README.md's Film Grain property table and film grain model section, ConsoleReference.md's
+three new cvars and the Grain_User_* param block.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01QQ89XhSX1rRM69nEDRFats
+---
+ .../Common/PostProcess/PostProcess.cpp        |  38 ++-
+ .../Common/PostProcess/PostProcess.h          |  27 ++
+ .../RenderDll/Common/RendererCVars.cpp        |  30 +++
+ .../RenderDll/Common/RendererCVars.h          |   6 +
+ .../XRenderD3D9/GraphicsPipeline/PostAA.cpp   | 168 +++++++++++-
+ .../XRenderD3D9/GraphicsPipeline/PostAA.h     |  12 +
+ .../Module/CinematicCameraComponent.cpp       | 135 +++++++++-
+ .../Module/CinematicCameraComponent.h         | 111 +++++++-
+ Code/CryPlugins/CinematicCamera/README.md     |  48 +++-
+ .../CinematicCamera/docs/ConsoleReference.md  |  39 ++-
+ Engine/Shaders/CMakeLists.txt                 |   1 +
+ Engine/Shaders/HWScripts/CryFX/FilmGrain.cfi  | 243 ++++++++++++++++++
+ Engine/Shaders/HWScripts/CryFX/PostAA.cfx     |  14 +-
+ Engine/Shaders/hwscripts.waf_files            |   1 +
+ 14 files changed, 851 insertions(+), 22 deletions(-)
+ create mode 100644 Engine/Shaders/HWScripts/CryFX/FilmGrain.cfi
+
+diff --git a/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.cpp b/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.cpp
+index bebd3e90..68bc0282 100644
+--- a/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.cpp
++++ b/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.cpp
+@@ -1,7 +1,6 @@
+ // Copyright 2006-2021 Crytek GmbH / Crytek Group. All rights reserved.
+ 
+-/*=============================================================================
+-   PostProcess.cpp : Post process main interface
++/*======================================================================   PostProcess.cpp : Post process main interface
+ 
+    Revision history:
+ * Created by Tiago Sousa
+@@ -498,6 +497,41 @@ int CPostEffectsMgr::Init()
+ 	// the render thread (ToneMapping + StandardGraphicsPipeline), written by the camera on the main
+ 	// thread; the bus double-buffers it like every other Global_User_ param. Default 0 = stock.
+ 	AddParamFloatNoTransition("Global_User_SunShaftsSuppressed", m_pUserSunShaftsSuppressed, 0.0f);
++	// The capture-side film grain block (FilmGrainSpec.md section 4). One switch, one family
++	// selector, six vectors of numbers and two texture slots - everything the grain shader needs,
++	// published by the cinematic camera and read once per frame in the composition pass.
++	//
++	// No transition on any of them. A grain parameter is a property of the negative or of the
++	// sensor, not a value to cross-fade: the renderer easing from one grain size to another
++	// while a shot is running would be an invention nothing asked for, and the seed and the
++	// capture-frame index are integers carried in floats - interpolating them is meaningless.
++	//
++	// Active defaults to 0, so a stock frame, an unpublishing camera and a camera whose grain is
++	// switched off all take the engine's own grain path unchanged.
++	AddParamFloatNoTransition("Grain_User_Active", m_pUserGrainActive, 0.0f);
++	AddParamFloatNoTransition("Grain_User_Family", m_pUserGrainFamily, 0.0f);
++	// amount r, g, b (already ISO- and strength-scaled by the camera), and the channel
++	// correlation rho: 1 = monochrome grain, 0 = three independent layers.
++	AddParamVec4NoTransition("Grain_User_Amount", m_pUserGrainAmount, Vec4(0.0f, 0.0f, 0.0f, 0.0f));
++	// grain size in MICROMETRES ON THE NEGATIVE per channel, plus the plate texel size (0 =
++	// procedural generator, which is all G0 has).
++	AddParamVec4NoTransition("Grain_User_Size", m_pUserGrainSize, Vec4(6.0f, 6.0f, 6.0f, 0.0f));
++	// sensor width in mm, anamorphic squeeze, the virtual sensor width in photosites, and a
++	// manual output-pixel footprint override in um (0 = derive it from the render resolution).
++	AddParamVec4NoTransition("Grain_User_Sensor", m_pUserGrainSensor, Vec4(36.0f, 1.0f, 6000.0f, 0.0f));
++	// shot seed, capture frame index, freeze flag, algorithm version. All integers in floats;
++	// a float carries an exact integer far past the 65535 the seed can reach.
++	AddParamVec4NoTransition("Grain_User_Seed", m_pUserGrainSeed, Vec4(0.0f, 0.0f, 0.0f, 1.0f));
++	// The digital sensor model (section 3.4), unused by the G0 white-Gaussian generator:
++	// full well in electrons, base ISO, working ISO, read noise sigma in electrons.
++	AddParamVec4NoTransition("Grain_User_Digital0", m_pUserGrainDigital0, Vec4(60000.0f, 800.0f, 800.0f, 3.0f));
++	// PRNU, DSNU, row noise, chroma noise reduction.
++	AddParamVec4NoTransition("Grain_User_Digital1", m_pUserGrainDigital1, Vec4(0.005f, 0.001f, 0.0f, 0.6f));
++	// Renderer texture IDs of the plugin-owned 1D response LUT and the grain plate array,
++	// published the way the display LUTs are. 0 = not supplied; G0 uses the shader's built-in
++	// response and has no plates.
++	AddParamFloatNoTransition("Grain_User_Response", m_pUserGrainResponse, 0.0f);
++	AddParamFloatNoTransition("Grain_User_Plates", m_pUserGrainPlates, 0.0f);
+ 
+ 	// Register all post processes
+ 	AddEffect(CSunShafts);
+diff --git a/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.h b/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.h
+index 7d57e41c..7b3dcf40 100644
+--- a/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.h
++++ b/Code/CryEngine/RenderDll/Common/PostProcess/PostProcess.h
+@@ -532,6 +532,16 @@ public:
+ 		, m_pUserCurveSatA(nullptr)
+ 		, m_pUserCurveSatB(nullptr)
+ 		, m_pUserSunShaftsSuppressed(nullptr)
++		, m_pUserGrainActive(nullptr)
++		, m_pUserGrainFamily(nullptr)
++		, m_pUserGrainAmount(nullptr)
++		, m_pUserGrainSize(nullptr)
++		, m_pUserGrainSensor(nullptr)
++		, m_pUserGrainSeed(nullptr)
++		, m_pUserGrainDigital0(nullptr)
++		, m_pUserGrainDigital1(nullptr)
++		, m_pUserGrainResponse(nullptr)
++		, m_pUserGrainPlates(nullptr)
+ 	{
+ 		ClearCache();
+ #ifndef _RELEASE
+@@ -777,6 +787,23 @@ protected:
+ 	//! The sky's vote in the metering histogram, 0..1 (decisions/s8-metering-sky.md). An INPUT
+ 	//! like MeterMode.
+ 	CEffectParam*       m_pUserMeterSkyWeight;
++	// The capture-side film grain block (FilmGrainSpec.md section 4). Published by the cinematic
++	// camera every frame and read once per frame by CPostAAStage::DoFinalComposition, which is
++	// where the grain is applied. Active 0 - the state of every stock frame and of a camera that
++	// does not publish - leaves the stock grain path untouched, so the permutation, the constants
++	// and the picture are byte for byte the engine's own.
++	//
++	// Vec4s rather than eighteen floats because a grain parameter is naturally a triple plus one
++	// (per-channel amount plus the channel correlation, per-channel size plus the plate texel),
++	// and because the shader wants them as constants in exactly that shape.
++	CEffectParam*       m_pUserGrainActive, * m_pUserGrainFamily;
++	CEffectParam*       m_pUserGrainAmount, * m_pUserGrainSize, * m_pUserGrainSensor, * m_pUserGrainSeed;
++	CEffectParam*       m_pUserGrainDigital0, * m_pUserGrainDigital1;
++	// Texture IDs of the plugin-owned response LUT and grain plate array, resolved with
++	// CTexture::GetByID exactly like the display LUTs. Both 0 in G0: the response is the shader's
++	// built-in curve and the generator is procedural.
++	CEffectParam*       m_pUserGrainResponse, * m_pUserGrainPlates;
++
+ 	CEffectParam*       m_pUserColorC, * m_pUserColorY, * m_pUserColorM, * m_pUserColorK, * m_pUserColorHue;
+ 
+ 	CPostEffectVec      m_pEffects;
+diff --git a/Code/CryEngine/RenderDll/Common/RendererCVars.cpp b/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
+index af1d5ff6..e09568fc 100644
+--- a/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
++++ b/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
+@@ -210,6 +210,9 @@ int CRendererCVars::CV_r_HDREyeAdaptationMode;
+ 
+ float CRendererCVars::CV_r_HDRRangeAdaptationSpeed;
+ float CRendererCVars::CV_r_HDRGrainAmount;
++int CRendererCVars::CV_r_FilmGrain;
++int CRendererCVars::CV_r_FilmGrainDebug;
++int CRendererCVars::CV_r_FilmGrainFreeze;
+ AllocateConstIntCVar(CRendererCVars, CV_r_GrainEnableExposureThreshold);
+ 
+ float CRendererCVars::CV_r_Sharpening;
+@@ -1421,6 +1424,33 @@ void CRendererCVars::InitCVars()
+ 	                    "Usage: r_GrainEnableExposureThreshold [Value]\n"
+ 	                    "Default is 0");
+ 
++	REGISTER_CVAR3("r_FilmGrain", CV_r_FilmGrain, 1, VF_NULL,
++	               "Master switch for the CAPTURE-SIDE film grain (FilmGrainSpec.md), the grain "
++	               "that has a size in micrometres on the negative, an amplitude that follows the "
++	               "tone through a response curve, colour structure per layer and a fresh "
++	               "deterministic pattern per captured frame. It is a separate shader permutation "
++	               "that ONLY runs when the Cinematic Camera component asks for it (Enable Film "
++	               "Grain); while it runs, the engine's own overlay grain is forced to 0. "
++	               "1 = honour the request (default), 0 = ignore it and always take the stock "
++	               "path, which is then byte for byte the engine's own grain - the first thing to "
++	               "try if anything about the noise looks wrong.");
++	REGISTER_CVAR3("r_FilmGrainDebug", CV_r_FilmGrainDebug, 0, VF_NULL,
++	               "DIAGNOSTIC for the capture-side film grain. 0 = off (default). 1 = throw the "
++	               "picture away and apply the grain to a flat MID GREY card (linear 0.18) "
++	               "instead, so the pattern, its size and its amplitude can be read with nothing "
++	               "else on screen. 2 = the response curve as an overlay - not implemented until "
++	               "the response LUT arrives in G1, and behaves as 0 until then. 3 = log a "
++	               "plain-language report once a second: family, per-channel amount, grain size "
++	               "in micrometres and in output pixels, the output pixel's footprint on the "
++	               "negative, the seed, the capture frame index and whether it is frozen.");
++	REGISTER_CVAR3("r_FilmGrainFreeze", CV_r_FilmGrainFreeze, 0, VF_NULL,
++	               "Pin the capture-frame index of the capture-side film grain, so the pattern "
++	               "stops changing and the frame holds one still field of grain. The camera keeps "
++	               "counting - only what the shader seeds from is held - so nothing drifts when "
++	               "it is released. Use it to tell grain apart from temporal AA noise, and to "
++	               "compare two settings on the identical pattern. 0 = the grain rolls (default), "
++	               "1 = frozen.");
++
+ 	REGISTER_CVAR3("r_ChromaticAberration", CV_r_ChromaticAberration, 0.0f, VF_NULL,
+ 	               "Chromatic aberration amount\n"
+ 	               "Usage: r_ChromaticAberration [Value]");
+diff --git a/Code/CryEngine/RenderDll/Common/RendererCVars.h b/Code/CryEngine/RenderDll/Common/RendererCVars.h
+index 46ab9f47..26af5118 100644
+--- a/Code/CryEngine/RenderDll/Common/RendererCVars.h
++++ b/Code/CryEngine/RenderDll/Common/RendererCVars.h
+@@ -492,6 +492,12 @@ public:
+ 
+ 	static float CV_r_HDRGrainAmount;
+ 
++	//! The capture-side film grain block (FilmGrainSpec.md). Master switch, diagnostics and the
++	//! capture-frame freeze. Ints, because all three are modes rather than amounts.
++	static int   CV_r_FilmGrain;
++	static int   CV_r_FilmGrainDebug;
++	static int   CV_r_FilmGrainFreeze;
++
+ 	static float CV_r_Sharpening;
+ 	static float CV_r_ChromaticAberration;
+ 
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/PostAA.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/PostAA.cpp
+index 01081500..bb335f8e 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/PostAA.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/PostAA.cpp
+@@ -418,13 +418,71 @@ void CPostAAStage::DoFinalComposition(CTexture*& pCurrRT, CTexture* pDestRT, uin
+ 	// lateral chromatic aberration all stay: they are ours, or they are geometry rather than
+ 	// grading.
+ 	const bool bSceneReferred = CRendererResources::IsSceneReferredStage(5);
++	// ------------------------------------------------------------------------------------------
++	// Capture-side film grain (FilmGrainSpec.md). The cinematic camera publishes the whole block
++	// on the post-effect bus and this pass is its only consumer: a grain with a size in
++	// micrometres on the negative, a response over tone, colour structure per layer and a fresh
++	// deterministic pattern per CAPTURED frame, in place of the engine's overlay of a white-noise
++	// volume addressed in frame coordinates and animated off the wall clock.
++	//
++	// Three things have to be true before any of it happens - the camera asked (Active), the kill
++	// switch allows it (r_FilmGrain), and there is an amount to apply - so a stock frame, a frame
++	// with no cinematic camera, and r_FilmGrain 0 all fall through to the engine's own path with
++	// the permutation, the constants and the picture untouched.
++	// ------------------------------------------------------------------------------------------
++	const bool bCineGrainRequested = CRenderer::CV_r_FilmGrain != 0
++	                                 && PostEffectMgr()->GetByNameF("Grain_User_Active") >= 0.5f;
++
++	Vec4 grainAmountVec(ZERO), grainSizeVec(ZERO), grainSensorVec(ZERO), grainSeedVec(ZERO);
++	Vec4 grainDigital0Vec(ZERO), grainDigital1Vec(ZERO);
++	int  grainFamily = 0;
++	bool bCineGrain = false;
++	if (bCineGrainRequested)
++	{
++		grainAmountVec   = PostEffectMgr()->GetByNameVec4("Grain_User_Amount");
++		grainSizeVec     = PostEffectMgr()->GetByNameVec4("Grain_User_Size");
++		grainSensorVec   = PostEffectMgr()->GetByNameVec4("Grain_User_Sensor");
++		grainSeedVec     = PostEffectMgr()->GetByNameVec4("Grain_User_Seed");
++		grainDigital0Vec = PostEffectMgr()->GetByNameVec4("Grain_User_Digital0");
++		grainDigital1Vec = PostEffectMgr()->GetByNameVec4("Grain_User_Digital1");
++		grainFamily      = (int)(PostEffectMgr()->GetByNameF("Grain_User_Family") + 0.5f);
++
++		// An all-zero amount is the camera saying "no grain this frame" (grain switched off, ISO
++		// at base with strength 0). Taking the permutation for it would cost a shader switch to
++		// compute nothing, so it counts as inactive.
++		bCineGrain = (grainAmountVec.x + grainAmountVec.y + grainAmountVec.z) > 0.0f;
++	}
++
++	// The freeze holds the capture-frame index the shader seeds from. The CAMERA keeps counting -
++	// only what is published to the shader is held - so releasing the freeze does not rewind the
++	// grain to where it was pinned. Latched on the transition so the frozen frame is the one that
++	// was on screen when the freeze was thrown, not frame 0.
++	const bool bFreezeRequested = CRenderer::CV_r_FilmGrainFreeze != 0 || grainSeedVec.z >= 0.5f;
++	if (bCineGrain)
++	{
++		if (bFreezeRequested && !m_bFilmGrainFrozen)
++			m_fFilmGrainFrozenIndex = grainSeedVec.y;
++		m_bFilmGrainFrozen = bFreezeRequested;
++		if (bFreezeRequested)
++			grainSeedVec.y = m_fFilmGrainFrozenIndex;
++	}
++	else
++	{
++		m_bFilmGrainFrozen = false;
++	}
+ 
+ 	// Calculate grain amount
+ 	CEffectParam* pParamGrainAmount = PostEffectMgr()->GetByName("FilterGrain_Amount");
+ 	CEffectParam* pParamArtifactsGrain = PostEffectMgr()->GetByName("FilterArtifacts_Grain");
+ 	const float paramGrainAmount = max(pParamGrainAmount->GetParam(), pParamArtifactsGrain->GetParam());
+ 	const float environmentGrainAmount = hdrSetupParams[1].w * CRenderer::CV_r_HDRGrainAmount;
+-	const float grainAmount = bSceneReferred ? 0.0f : max(paramGrainAmount, environmentGrainAmount);
++	// While the capture-side block runs, the stock amount is forced to 0: two grains on one
++	// frame is not a look, it is a bug, and the camera is the authority over what the negative
++	// records. The plugin still writes FilterGrain_Amount every frame, so r_FilmGrain 0 lands
++	// straight back on the engine's grain at the amount the camera asked for. The scene-referred
++	// gate of D9 is unchanged and independent: on that path the stock overlay grain is inert
++	// whether or not a cinematic camera is driving, and our block is what takes the slot.
++	const float grainAmount = (bSceneReferred || bCineGrain) ? 0.0f : max(paramGrainAmount, environmentGrainAmount);
+ 
+ 	uint64 rtMask = 0;
+ 	if ((aaMode & (eAT_SMAA_2TX_MASK | eAT_TSAA_MASK)) && !bSceneReferred)
+@@ -433,6 +491,12 @@ void CPostAAStage::DoFinalComposition(CTexture*& pCurrRT, CTexture* pDestRT, uin
+ 		rtMask |= g_HWSR_MaskBit[HWSR_SAMPLE4];
+ 	if (grainAmount && CRenderer::CV_r_GrainEnableExposureThreshold) // enable legacy grain/exposure interaction
+ 		rtMask |= g_HWSR_MaskBit[HWSR_SAMPLE0];
++	// SAMPLE6 was the one free runtime flag on this technique (0 legacy grain exposure, 1 lens
++	// optics, 2 sharpen, 3 chroma shift, 4 range compression, 5 flare colour chart). It selects
++	// the capture-side grain block and nothing else, so it adds exactly one permutation and only
++	// when a cinematic camera is driving the frame.
++	if (bCineGrain)
++		rtMask |= g_HWSR_MaskBit[HWSR_SAMPLE6];
+ 
+ 	auto* pLensOpticStage = m_graphicsPipeline.GetStage<CLensOpticsStage>();
+ 	if (pLensOpticStage && pLensOpticStage->HasContent())
+@@ -509,6 +573,54 @@ void CPostAAStage::DoFinalComposition(CTexture*& pCurrRT, CTexture* pDestRT, uin
+ 		// it will be ignored if CV_r_GrainEnableExposureThreshold is 0
+ 		m_passComposition.SetConstant(hdrEyeAdaptationName, hdrSetupParams[4], eHWSC_Pixel);
+ 
++		// The capture-side grain block. Set only when the permutation that reads it is bound: the
++		// constants do not exist in the stock shader, and a reflected SetConstant for a name the
++		// shader does not declare is work for nothing. They travel in the pass' existing reflected
++		// per-primitive constant buffer, like every other constant here - a typed buffer would
++		// mean converting the whole pass, and there is nothing about seven vectors that needs one.
++		if (bCineGrain)
++		{
++			static CCryNameR grainAmountName("vGrainAmount");
++			static CCryNameR grainSizeName("vGrainSize");
++			static CCryNameR grainSensorName("vGrainSensor");
++			static CCryNameR grainSeedName("vGrainSeed");
++			static CCryNameR grainDigital0Name("vGrainDigital0");
++			static CCryNameR grainDigital1Name("vGrainDigital1");
++			static CCryNameR grainDebugName("vGrainDebug");
++
++			// The output width the film-space mapping divides by is the DISPLAY resolution, which
++			// is what this pass runs at and what PS_ScreenSize carries in it.
++			const int outputWidthPx = max(pDestRT->GetWidth(), 1);
++			const float sensorWidthMm = max(grainSensorVec.x, 1.0f);
++			const float fpUm = (grainSensorVec.w > 0.0f) ? grainSensorVec.w
++			                                             : (sensorWidthMm * 1000.0f / (float)outputWidthPx);
++
++			// The eye index decorrelates the two fields in stereo. Identical grain in both eyes
++			// fuses onto the screen plane instead of onto the negative, which is the one thing
++			// grain must never do.
++			const float viewIndex = (float)(int)RenderView()->GetCurrentEye();
++			const Vec4 grainDebug((float)CRenderer::CV_r_FilmGrainDebug, viewIndex, 0.0f, 0.0f);
++
++			m_passComposition.SetConstant(grainAmountName, grainAmountVec, eHWSC_Pixel);
++			m_passComposition.SetConstant(grainSizeName, grainSizeVec, eHWSC_Pixel);
++			m_passComposition.SetConstant(grainSensorName, grainSensorVec, eHWSC_Pixel);
++			m_passComposition.SetConstant(grainSeedName, grainSeedVec, eHWSC_Pixel);
++			m_passComposition.SetConstant(grainDigital0Name, grainDigital0Vec, eHWSC_Pixel);
++			m_passComposition.SetConstant(grainDigital1Name, grainDigital1Vec, eHWSC_Pixel);
++			m_passComposition.SetConstant(grainDebugName, grainDebug, eHWSC_Pixel);
++
++			if (CRenderer::CV_r_FilmGrainDebug == 3)
++			{
++				const float fNow = gEnv->pTimer->GetAsyncCurTime();
++				if ((fNow - m_fFilmGrainReportTime) >= 1.0f)
++				{
++					m_fFilmGrainReportTime = fNow;
++					PrintFilmGrainReport(grainAmountVec, grainSizeVec, grainSensorVec, grainSeedVec,
++					                     grainFamily, fpUm, outputWidthPx, bFreezeRequested);
++				}
++			}
++		}
++
+ 		{
+ 			// Radial lens distortion (r_LensDistortion / lens character): x = k1, y = aspect,
+ 			// z = letterbox aspect (r_LensLetterbox; 0 = off, negative = squeezed presentation),
+@@ -557,6 +669,60 @@ void CPostAAStage::DoFinalComposition(CTexture*& pCurrRT, CTexture* pDestRT, uin
+ 	m_passComposition.Execute();
+ }
+ 
++// The report r_FilmGrainDebug 3 prints once a second. Everything the block decided this frame,
++// said in the units the camera's own controls are in - micrometres on the negative, output pixels,
++// stops - and ending in the one sentence the mode exists to produce: whether the grain that is
++// being asked for is large enough to survive the 8-bit write at the end of this pass.
++//
++// It is several short lines rather than one long one, for the same reason the wave-glare report is.
++void CPostAAStage::PrintFilmGrainReport(const Vec4& amount, const Vec4& size, const Vec4& sensor,
++                                        const Vec4& seed, int family, float fpUm, int outputWidthPx,
++                                        bool bFrozen)
++{
++	static const char* const s_szFamily[] = { "Film", "CMOS", "CCD", "Phone" };
++	const char* szFamily = (family >= 0 && family < 4) ? s_szFamily[family] : "unknown";
++
++	// A grain cell in OUTPUT pixels. Below 1 the cell is smaller than a pixel and the pixel sees
++	// the mean of several of them, which is where the footprint integration takes the amplitude
++	// down; above 1 the cell is resolved and the grain has a visible texture.
++	const float cellPxR = size.x / max(fpUm, 1e-4f);
++	const float cellPxG = size.y / max(fpUm, 1e-4f);
++	const float cellPxB = size.z / max(fpUm, 1e-4f);
++
++	// What actually lands on the frame at the response's peak, as a fraction of the value, and
++	// then in 8-bit code values at mid grey - the number that decides whether it is visible at all.
++	// sigma(x') / x' = ln2 * g for small g; at x = 0.18 the sRGB slope carries it to code values.
++	const float gPeak = max(max(amount.x, amount.y), amount.z);
++	const float integration = min(1.0f, ((size.x + size.y + size.z) / 3.0f) / max(fpUm, 1e-4f));
++	const float sigmaRel = 0.6931472f * gPeak * integration;
++	// d(sRGB)/d(linear) at linear 0.18 is 1.055/2.4 * x^(1/2.4 - 1); times 255 for code values.
++	const float slope255 = 255.0f * (1.055f / 2.4f) * powf(0.18f, 1.0f / 2.4f - 1.0f);
++	const float codeValues = sigmaRel * 0.18f * slope255;
++
++	const char* szVerdict =
++	  (gPeak <= 0.0f)        ? "NOTHING is being asked for - the camera published an amount of 0" :
++	  (codeValues >= 3.0f)   ? "plainly visible" :
++	  (codeValues >= 1.0f)   ? "visible - about one to three code values, which is what film grain on a good transfer measures" :
++	  (codeValues >= 0.4f)   ? "faint: under one code value, so the 8-bit write eats most of it" :
++	                           "invisible: far below one code value at the 8-bit write - raise Grain Strength or the ISO";
++
++	CryLog("[POSTAA] ---- capture-side film grain, once a second (r_FilmGrainDebug 3) ----");
++	CryLog("[POSTAA]   FAMILY: %s%s", szFamily, bFrozen ? "  (capture frame index FROZEN by r_FilmGrainFreeze)" : "");
++	CryLog("[POSTAA]   AMOUNT: R %.3f  G %.3f  B %.3f   channel correlation %.2f (1 = one monochrome grain, 0 = three independent layers)",
++	       amount.x, amount.y, amount.z, amount.w);
++	CryLog("[POSTAA]   SIZE:   R %.2f  G %.2f  B %.2f um on the negative"
++	       " -- %.2f / %.2f / %.2f output pixels per grain cell",
++	       size.x, size.y, size.z, cellPxR, cellPxG, cellPxB);
++	CryLog("[POSTAA]   FILM:   sensor %.2f mm wide, squeeze %.2fx, output %d px"
++	       " -- one output pixel covers %.2f um of negative, so %.2f grain cells fall under it",
++	       sensor.x, sensor.y, outputWidthPx, fpUm, max(fpUm / max(size.y, 1e-4f), 0.0f));
++	CryLog("[POSTAA]   SEED:   shot %d, capture frame %d, algorithm version %d"
++	       " -- the same three numbers always give the same grain",
++	       (int)seed.x, (int)seed.y, (int)seed.w);
++	CryLog("[POSTAA]   RESULT: about %.2f%% of the value at the response peak, ~%.2f code values of 255 on a mid grey card -- %s",
++	       sigmaRel * 100.0f, codeValues, szVerdict);
++}
++
+ void CPostAAStage::Execute()
+ {
+ 	// TODO: Handle rapid camera position changes in a better way
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/PostAA.h b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/PostAA.h
+index f3ee937c..27244a86 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/PostAA.h
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/PostAA.h
+@@ -48,6 +48,11 @@ private:
+ 	void      ApplySRGB(CTexture*& pCurrRT, CTexture*& pDestRT);
+ 	void      ApplyTemporalAA(CTexture*& pCurrRT, CTexture*& pMgpuRT, uint32 aaMode);
+ 	void      DoFinalComposition(CTexture*& pCurrRT, CTexture* pDestRT, uint32 aaMode);
++	// The once-a-second plain-language report of r_FilmGrainDebug 3. Split out because it is a
++	// paragraph of formatting in the middle of a function that is otherwise pass setup.
++	void      PrintFilmGrainReport(const Vec4& amount, const Vec4& size, const Vec4& sensor,
++	                               const Vec4& seed, int family, float fpUm, int outputWidthPx,
++	                               bool bFrozen);
+ 
+ 	CTexture* GetAARenderTarget(const CRenderView* pRenderView, bool bCurrentFrame) const;
+ 
+@@ -71,6 +76,13 @@ private:
+ 	bool                 oldStereoEnabledState{ false };
+ 	int                  oldAAState{ 0 };
+ 
++	// Capture-side film grain (FilmGrainSpec.md). The freeze latch holds the capture-frame index
++	// the shader seeds from while r_FilmGrainFreeze is on: the camera keeps counting, so nothing
++	// jumps when the freeze is released. The report time is the once-a-second gate of debug 3.
++	float                m_fFilmGrainFrozenIndex{ 0.0f };
++	bool                 m_bFilmGrainFrozen{ false };
++	float                m_fFilmGrainReportTime{ 0.0f };
++
+ #ifndef _RELEASE
+ 	CFullscreenPass      m_passAntialiasingDebug;
+ #endif
+diff --git a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp
+index 5ba7ce41..9ba66276 100644
+--- a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp
++++ b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.cpp
+@@ -1041,9 +1041,47 @@ float CCinematicCameraComponent::ComputeFilmGrain01() const
+ 	return clamp_tpl(base * lowLightBoost, 0.0f, 1.5f);
+ }
+ 
+-// FilterGrain_Amount is combined with the environment (TOD) grain by max() in PostAA,
+-// so writing it every frame from the finalize hook cannot be stomped and needs no
+-// ordering tricks. Save once / restore on release, mirroring the DOF params.
++// One step of the capture-frame counter (FilmGrainSpec.md section 5.3). This is the camera's own
++// count of frames it has EXPOSED, and it is the only thing that makes the grain pattern move: the
++// shader has no clock and no renderer frame id, by design, so that the same shot seed and the same
++// frame index reproduce the same grain in any session, at any frame rate, on any machine.
++//
++// TODO (G1 or later): while a TrackView sequence drives the camera the index should be
++// floor(sequenceTime * captureFps) rather than a free-running count, so that scrubbing a sequence
++// back and forth shows the same grain on the same frame. There is no hook on this component that
++// reports the playing sequence's time - IMovieSystem would have to be queried and the sequence
++// this camera belongs to identified - and that is a topic of its own, so the counter free-runs for
++// now and the Capture Frame Rate property is stored but not consulted.
++void CCinematicCameraComponent::AdvanceCaptureFrame()
++{
++	if (!CanDriveRenderState())
++		return;
++
++	// A camera left running on a paused game keeps exposing film; a camera being used to inspect a
++	// frozen frame should not. Default is to keep rolling, which is what a real gate does.
++	if (!m_grain.bRollWhilePaused && gEnv->pSystem != nullptr && gEnv->pSystem->IsPaused())
++		return;
++
++	// Wrapped well inside the range a float carries exactly, because the index travels to the
++	// shader as a float on the post-effect bus. 2^24 frames is 7.7 days at 25 fps.
++	m_captureFrameIndex = (m_captureFrameIndex + 1) & 0x00FFFFFFu;
++}
++
++// The film grain the camera drives, in two parts.
++//
++// FilterGrain_Amount is the ENGINE's grain: an overlay of a white-noise volume, combined with the
++// environment (TOD) grain by max() in PostAA, so writing it every frame from the finalize hook
++// cannot be stomped and needs no ordering tricks. It is still written, unchanged, because
++// r_FilmGrain 0 falls straight back onto it.
++//
++// Grain_User_* is the CAPTURE-SIDE grain of FilmGrainSpec.md section 4: the same amount, plus
++// everything the engine's grain has no way to express - a size in micrometres on the negative, the
++// sensor width and squeeze that map the negative onto the frame, the per-layer amplitudes and
++// their correlation, and the seed and capture-frame index that make the pattern deterministic and
++// per-frame. The renderer forces the engine's amount to 0 while this block is active, so the two
++// never both apply.
++//
++// Save once / restore on release for both, under one flag, mirroring the DOF params.
+ void CCinematicCameraComponent::ApplyFilmGrain()
+ {
+ 	if (!CanDriveRenderState())
+@@ -1058,10 +1096,84 @@ void CCinematicCameraComponent::ApplyFilmGrain()
+ 	if (!m_bGrainParamSaved)
+ 	{
+ 		gEnv->p3DEngine->GetPostEffectParam("FilterGrain_Amount", m_savedGrainAmount);
++		gEnv->p3DEngine->GetPostEffectParam("Grain_User_Active", m_savedGrainActive);
++		gEnv->p3DEngine->GetPostEffectParam("Grain_User_Family", m_savedGrainFamily);
++		gEnv->p3DEngine->GetPostEffectParamVec4("Grain_User_Amount", m_savedGrainAmountVec);
++		gEnv->p3DEngine->GetPostEffectParamVec4("Grain_User_Size", m_savedGrainSizeVec);
++		gEnv->p3DEngine->GetPostEffectParamVec4("Grain_User_Sensor", m_savedGrainSensorVec);
++		gEnv->p3DEngine->GetPostEffectParamVec4("Grain_User_Seed", m_savedGrainSeedVec);
++		gEnv->p3DEngine->GetPostEffectParamVec4("Grain_User_Digital0", m_savedGrainDigital0Vec);
++		gEnv->p3DEngine->GetPostEffectParamVec4("Grain_User_Digital1", m_savedGrainDigital1Vec);
+ 		m_bGrainParamSaved = true;
++
++		// Taking authority is loading a new magazine: the count starts at 0 so a shot always
++		// begins on the same frame of grain.
++		m_captureFrameIndex = 0;
++		m_lastShotSeed = (int)m_grain.shotSeed;
++	}
++
++	// A new seed is a new roll of film, and a new roll starts at frame 0 - otherwise two takes
++	// with the same seed would not match frame for frame, which is the whole point of a seed.
++	if ((int)m_grain.shotSeed != m_lastShotSeed)
++	{
++		m_lastShotSeed = (int)m_grain.shotSeed;
++		m_captureFrameIndex = 0;
+ 	}
+ 
+-	gEnv->p3DEngine->SetPostEffectParam("FilterGrain_Amount", ComputeFilmGrain01() * (float)m_grain.grainStrength);
++	const float amount = ComputeFilmGrain01() * (float)m_grain.grainStrength;
++	gEnv->p3DEngine->SetPostEffectParam("FilterGrain_Amount", amount);
++
++	// ------------------------------------------------------------------------------------------
++	// The family table (FilmGrainSpec.md section 5.2). A C++ table keyed by family for v1; the
++	// composable body preset replaces it later without the renderer noticing.
++	//
++	// Film: the layer amplitudes of a colour negative - the blue-sensitive layer is the fastest
++	// and the grainiest, green the finest - and the per-layer grain radii that go with them
++	// (section 3.3: B 1.25 / G 0.8 / R 1.0 of the class mean). The correlation comes from the
++	// Colour property, whose default 0.65 is the 0.35 of a colour negative.
++	//
++	// Digital: neutral in G0. The real thing is shot noise scaled by the well and the ISO, read
++	// noise from a per-ISO table, and a fixed pattern - none of which is a scaled version of
++	// grain, and all of which is G1. Neutral amplitudes and no correlation are the honest
++	// placeholder: the slot works, and it does not pretend to be a sensor.
++	// ------------------------------------------------------------------------------------------
++	const bool bFilm = (m_grain.family == EGrainFamily::Film);
++
++	// The medium size class, 6 um mean grain radius, times the Size property. Clamped to the
++	// 0.25 - 4 of the spec here rather than in the property, whose range bounds are integers.
++	const float sizeScale = clamp_tpl((float)m_grain.size, 0.25f, 4.0f);
++	const float kMediumClassUm = 6.0f;
++	const float baseSizeUm = kMediumClassUm * sizeScale;
++
++	const Vec3 layerAmp  = bFilm ? Vec3(1.0f, 0.9f, 1.3f) : Vec3(1.0f, 1.0f, 1.0f);
++	const Vec3 layerSize = bFilm ? Vec3(1.0f, 0.8f, 1.25f) : Vec3(1.0f, 1.0f, 1.0f);
++	const float rho = bFilm ? clamp_tpl(1.0f - (float)m_grain.colour, 0.0f, 1.0f) : 0.0f;
++
++	gEnv->p3DEngine->SetPostEffectParam("Grain_User_Active", 1.0f);
++	gEnv->p3DEngine->SetPostEffectParam("Grain_User_Family", (float)(int)m_grain.family);
++	gEnv->p3DEngine->SetPostEffectParamVec4("Grain_User_Amount",
++		Vec4(amount * layerAmp.x, amount * layerAmp.y, amount * layerAmp.z, rho));
++	gEnv->p3DEngine->SetPostEffectParamVec4("Grain_User_Size",
++		Vec4(baseSizeUm * layerSize.x, baseSizeUm * layerSize.y, baseSizeUm * layerSize.z, 0.0f));
++
++	// The negative the grain lives on: its width in millimetres and the squeeze the anamorphic
++	// front element put on it, which is undone on presentation and stretches the grain with it.
++	// sensorWidth_px is the virtual photosite count of the digital families; nothing in G0 reads
++	// it, and it is published so the interface is complete from the first stage.
++	gEnv->p3DEngine->SetPostEffectParamVec4("Grain_User_Sensor",
++		Vec4(GetSensorWidth(), clamp_tpl((float)m_anamorphic.squeeze, 1.0f, 2.0f), 6000.0f, 0.0f));
++
++	// shotSeed, captureFrameIndex, freeze, algorithmVersion. The freeze slot stays 0: the camera
++	// has no reason to pin its own grain, and r_FilmGrainFreeze is the diagnostic that does it.
++	gEnv->p3DEngine->SetPostEffectParamVec4("Grain_User_Seed",
++		Vec4((float)(int)m_grain.shotSeed, (float)m_captureFrameIndex, 0.0f, 1.0f));
++
++	// The digital sensor model (section 3.4). Published from the CMOS defaults of section 5.1 with
++	// the camera's own ISO in it, so the numbers are already on the bus and correct when the G1
++	// generator starts reading them. Nothing in this build does.
++	const float iso = (float)max((int)m_body.iso, 25);
++	gEnv->p3DEngine->SetPostEffectParamVec4("Grain_User_Digital0", Vec4(60000.0f, 800.0f, iso, 3.0f));
++	gEnv->p3DEngine->SetPostEffectParamVec4("Grain_User_Digital1", Vec4(0.005f, 0.001f, 0.0f, 0.6f));
+ }
+ 
+ // The renderer's motion blur exposure window is 1 / r_MotionBlurShutterSpeed, so pointing
+@@ -3028,6 +3140,14 @@ void CCinematicCameraComponent::RestoreFilmGrain()
+ 		return;
+ 
+ 	gEnv->p3DEngine->SetPostEffectParam("FilterGrain_Amount", m_savedGrainAmount);
++	gEnv->p3DEngine->SetPostEffectParam("Grain_User_Active", m_savedGrainActive);
++	gEnv->p3DEngine->SetPostEffectParam("Grain_User_Family", m_savedGrainFamily);
++	gEnv->p3DEngine->SetPostEffectParamVec4("Grain_User_Amount", m_savedGrainAmountVec);
++	gEnv->p3DEngine->SetPostEffectParamVec4("Grain_User_Size", m_savedGrainSizeVec);
++	gEnv->p3DEngine->SetPostEffectParamVec4("Grain_User_Sensor", m_savedGrainSensorVec);
++	gEnv->p3DEngine->SetPostEffectParamVec4("Grain_User_Seed", m_savedGrainSeedVec);
++	gEnv->p3DEngine->SetPostEffectParamVec4("Grain_User_Digital0", m_savedGrainDigital0Vec);
++	gEnv->p3DEngine->SetPostEffectParamVec4("Grain_User_Digital1", m_savedGrainDigital1Vec);
+ 	m_bGrainParamSaved = false;
+ }
+ 
+@@ -3364,6 +3484,13 @@ void CCinematicCameraComponent::ApplyGameOnlyEffects()
+ 	if (m_dof.bEnableDOF)
+ 		ApplyDOF();
+ 
++	// One exposed frame, then the grain. Advanced before the grain is published so the frame the
++	// shader seeds from is the frame the picture belongs to. This list is the ONE activation path
++	// (S9, decisions/s9-editor-cinecam-preview.md): game mode reaches it from FinalizeGameCamera,
++	// the editor from the plugin's per-frame resolver once the viewport is looking through a
++	// cinecam entity. The grain therefore follows exactly the same editor policy as DOF and
++	// halation, and there is no second path to keep in step.
++	AdvanceCaptureFrame();
+ 	ApplyFilmGrain();
+ 	ApplyHalation();
+ 	ApplyMotionBlur();
+diff --git a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
+index b4913400..46550222 100644
+--- a/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
++++ b/Code/CryPlugins/CinematicCamera/Module/CinematicCameraComponent.h
+@@ -584,6 +584,36 @@ struct SCineDofParams
+ 	Schematyc::Range<0, 8, 0, 4> highlightSplatGain = 3.0f;
+ };
+ 
++// ---------------------------------------------------------------------------
++// Grain families (FilmGrainSpec.md section 5.1)
++//
++// The body a shot is taken on decides what its noise is made of, so the family is a property of
++// the camera rather than a look setting. Film is grain: silver halide crystals of a physical size
++// on the negative. The three digital families are a sensor: shot noise, read noise and fixed
++// pattern, which look nothing like grain and cannot be reached by scaling it.
++//
++// In G0 only the Film branch is modelled; the three digital families run the same white Gaussian
++// with neutral colour so the slot exists and can be selected, and G1 fills them in.
++// ---------------------------------------------------------------------------
++enum class EGrainFamily : uint32
++{
++	Film = 0,   // silver halide grain on a negative
++	CMOS,       // modern stacked sensor: dual gain, low read noise
++	CCD,        // no dual gain, higher read noise, coarser chroma blotch
++	Phone       // sub-micron pitch, frame stacking, heavy chroma noise reduction
++};
++
++static void ReflectType(Schematyc::CTypeDesc<EGrainFamily>& desc)
++{
++	desc.SetGUID("{7D41C9A6-2F0B-4E37-9C58-1A6E4B02D7F3}"_cry_guid);
++	desc.SetLabel("Grain Family");
++	desc.SetDefaultValue(EGrainFamily::Film);
++	desc.AddConstant(EGrainFamily::Film,  "Film",  "Film");
++	desc.AddConstant(EGrainFamily::CMOS,  "CMOS",  "CMOS Sensor");
++	desc.AddConstant(EGrainFamily::CCD,   "CCD",   "CCD Sensor");
++	desc.AddConstant(EGrainFamily::Phone, "Phone", "Phone Sensor");
++}
++
+ struct SCineGrainParams
+ {
+ 	inline bool operator==(const SCineGrainParams& rhs) const { return 0 == memcmp(this, &rhs, sizeof(rhs)); }
+@@ -594,16 +624,67 @@ struct SCineGrainParams
+ 		desc.SetLabel("Film Grain");
+ 		desc.AddMember(&SCineGrainParams::bEnableGrain,
+ 			'gren', "EnableFilmGrain", "Enable Film Grain",
+-			"Drive the film grain post effect from ISO, aperture and shutter, following a "
+-			"real sensor noise curve: clean at base ISO, climbing steeply past ISO 6400, "
+-			"boosted when the lens is starved of light.", true);
++			"Drive the film grain from ISO, aperture and shutter, following a real sensor noise "
++			"curve: clean at base ISO, climbing steeply past ISO 6400, boosted when the lens is "
++			"starved of light. With r_FilmGrain 1 (the default) this runs the CAPTURE-SIDE grain, "
++			"which has a size on the negative and a fresh pattern per captured frame; with "
++			"r_FilmGrain 0 the same amount drives the engine's own grain instead.", true);
++		desc.AddMember(&SCineGrainParams::family,
++			'gfam', "Family", "Family",
++			"What the noise is MADE OF. Film = silver halide grain of a physical size on the "
++			"negative, with an independent field per emulsion layer. CMOS / CCD / Phone = a "
++			"sensor, whose noise is shot noise plus read noise plus fixed pattern and looks "
++			"nothing like grain. The future body preset fills this in; until the sensor model "
++			"lands, the three digital families run the film generator with neutral colour.",
++			EGrainFamily::Film);
+ 		desc.AddMember(&SCineGrainParams::grainStrength,
+ 			'grst', "GrainStrength", "Grain Strength",
+-			"Scales the computed grain before it reaches the renderer.", 1.0f);
++			"Scales the computed grain before it reaches the renderer. The ISO and the light the "
++			"lens is passing decide the amount; this is the artistic multiplier on top of it.", 1.0f);
++		desc.AddMember(&SCineGrainParams::size,
++			'gsiz', "Size", "Size",
++			"Multiplies the family's grain size, which is a length ON THE NEGATIVE (6 um for the "
++			"default medium film class), NOT a number of pixels. So the same setting gives the "
++			"same grain at 1080p and at 4K - the 4K frame simply resolves it better - and a "
++			"smaller sensor at the same setting shows coarser grain relative to the frame, "
++			"exactly as it does in reality. Clamped to 0.25 - 4.", 1.0f);
++		desc.AddMember(&SCineGrainParams::colour,
++			'gclr', "Colour", "Colour",
++			"How INDEPENDENT the three layers' grain is. 1 = three independent fields, so the "
++			"grain carries colour speckle the way a fast colour negative does. 0 = one field "
++			"shared by all three channels, i.e. monochrome grain sitting on top of the picture. "
++			"The default 0.65 is the 0.35 layer correlation of a colour negative. Read only by "
++			"the Film family in this build.", 0.65f);
++		desc.AddMember(&SCineGrainParams::shotSeed,
++			'gsed', "ShotSeed", "Shot Seed",
++			"A new number is a new roll of film: the whole grain pattern changes, and the same "
++			"number always reproduces the same grain. Changing it also restarts the capture frame "
++			"count, so two takes with the same seed match frame for frame.", 0);
++		desc.AddMember(&SCineGrainParams::captureFps,
++			'gfps', "CaptureFps", "Capture Frame Rate",
++			"Frames per second the grain pattern advances at when a sequence drives the camera - "
++			"the rate the film is running through the gate, not the rate the engine is drawing "
++			"at. Not yet consulted: the counter advances one per rendered frame until the "
++			"sequence-time mapping lands.", 24);
++		desc.AddMember(&SCineGrainParams::bRollWhilePaused,
++			'grwp', "CameraRollingWhilePaused", "Camera Rolling While Paused",
++			"Keep advancing the capture frame count while the game is paused, so the grain keeps "
++			"moving on a frozen picture the way a camera left running does. Off holds the grain "
++			"still with the picture, which is what you want when inspecting a frame.", true);
+ 	}
+ 
+ 	bool bEnableGrain = true;
++	// Next to bEnableGrain rather than appended: two bools side by side add no new padding hole
++	// for the memcmp above to trip over. Schematyc keys saved values by member id, so order is free.
++	bool bRollWhilePaused = true;
++	EGrainFamily family = EGrainFamily::Film;
+ 	Schematyc::Range<0, 4, 0, 1> grainStrength = 1.0f;
++	// Range bounds are integer template parameters, so the 0.25 floor of the spec is applied where
++	// the value is consumed rather than declared here.
++	Schematyc::Range<0, 4, 0, 4> size = 1.0f;
++	Schematyc::Range<0, 1, 0, 1> colour = 0.65f;
++	Schematyc::Range<0, 65535, 0, 1024, int> shotSeed = 0;
++	Schematyc::Range<1, 240, 12, 60, int> captureFps = 24;
+ };
+ 
+ struct SCineMotionBlurParams
+@@ -1242,6 +1323,8 @@ private:
+ 	void RestoreExposure();
+ 	void ApplyFilmGrain();
+ 	void RestoreFilmGrain();
++	// One step of the capture-frame counter, taken once per finalised game-camera frame.
++	void AdvanceCaptureFrame();
+ 	void ApplyMotionBlur();
+ 	void RestoreMotionBlur();
+ 	void ApplySpriteBokeh();
+@@ -1379,9 +1462,27 @@ private:
+ 	Vec3 m_lastWrittenEyeAdaptation = Vec3(4.5f, 17.0f, 1.5f);
+ 	bool m_bExpParamsSaved    = false;
+ 
+-	// Film grain saved param (FilterGrain_Amount post effect)
++	// Film grain saved params. Two families of them under one flag, because they are saved,
++	// written and restored together: the legacy FilterGrain_Amount (which still drives the
++	// engine's own grain whenever r_FilmGrain is 0) and the Grain_User_* block of
++	// FilmGrainSpec.md section 4 that the capture-side grain reads.
+ 	float m_savedGrainAmount  = 0.f;
+ 	bool  m_bGrainParamSaved  = false;
++	float m_savedGrainActive  = 0.f;
++	float m_savedGrainFamily  = 0.f;
++	Vec4  m_savedGrainAmountVec   = Vec4(0.f, 0.f, 0.f, 0.f);
++	Vec4  m_savedGrainSizeVec     = Vec4(6.f, 6.f, 6.f, 0.f);
++	Vec4  m_savedGrainSensorVec   = Vec4(36.f, 1.f, 6000.f, 0.f);
++	Vec4  m_savedGrainSeedVec     = Vec4(0.f, 0.f, 0.f, 1.f);
++	Vec4  m_savedGrainDigital0Vec = Vec4(60000.f, 800.f, 800.f, 3.f);
++	Vec4  m_savedGrainDigital1Vec = Vec4(0.005f, 0.001f, 0.f, 0.6f);
++
++	// The capture-frame counter of FilmGrainSpec.md section 5.3. It is the camera's own count of
++	// frames it has EXPOSED, not the renderer's frame id: the grain pattern is seeded from it, so
++	// it has to be the number the shot is on, and it has to survive a frame the renderer skipped.
++	// Reset to 0 when this component takes authority and when Shot Seed changes.
++	uint32 m_captureFrameIndex = 0;
++	int    m_lastShotSeed      = -1;
+ 
+ 	// White balance saved state (E3DPARAM_HDR_COLORGRADING_COLOR_BALANCE). The base tracks
+ 	// external (TOD) writes so our per-frame multiply never compounds on itself.
+diff --git a/Code/CryPlugins/CinematicCamera/README.md b/Code/CryPlugins/CinematicCamera/README.md
+index a4842151..df944984 100644
+--- a/Code/CryPlugins/CinematicCamera/README.md
++++ b/Code/CryPlugins/CinematicCamera/README.md
+@@ -261,10 +261,21 @@ is deliberately inert (above).
+ 
+ ### Film Grain
+ 
++The camera drives a **capture-side** grain: grain has a size in micrometres **on the negative**, an
++amplitude that follows the tone through a response curve, an independent field per emulsion layer,
++and a fresh deterministic pattern per *captured* frame. See [FilmGrainSpec.md](FilmGrainSpec.md).
++`r_FilmGrain 0` falls back to the engine's own overlay grain at the same amount.
++
+ | Property | Range | Default | Effect |
+ | --- | --- | --- | --- |
+-| Enable Film Grain | bool | true | Drive `FilterGrain_Amount` from ISO, aperture and shutter following a real sensor noise curve: clean at base ISO, climbing steeply past ISO 6400, boosted when the lens is starved of light. |
+-| Grain Strength | 0-4 (slider 0-1) | 1.0 | Scales the computed grain before it reaches the renderer. |
++| Enable Film Grain | bool | true | Drive the grain from ISO, aperture and shutter following a real sensor noise curve: clean at base ISO, climbing steeply past ISO 6400, boosted when the lens is starved of light. The amount is published both as the capture-side block and as `FilterGrain_Amount`, so `r_FilmGrain 0` lands on the engine's own grain at the same strength. |
++| Family | Film / CMOS / CCD / Phone | Film | What the noise is **made of**. Film = silver halide grain of a physical size on the negative, with an independent field per emulsion layer (amplitudes B 1.3 / G 0.9 / R 1.0, layer radii B 1.25 / G 0.8 / R 1.0). CMOS / CCD / Phone = a sensor, whose noise is shot plus read plus fixed pattern and is not a scaled grain. **In this build the three digital families run the film generator with neutral colour** - the sensor model is the next stage. |
++| Grain Strength | 0-4 (slider 0-1) | 1.0 | Artistic multiplier on top of the amount ISO and the light the lens passes have already decided. |
++| Size | 0.25-4 | 1.0 | Multiplies the family's grain size, which is a **length on the negative** (6 um for the default medium film class), not a number of pixels. The same setting therefore gives the same grain at 1080p and at 4K - the 4K frame simply resolves it better - and a smaller sensor shows coarser grain relative to the frame, as it does in reality. |
++| Colour | 0-1 | 0.65 | How **independent** the three layers' grain is. 1 = three independent fields, so the grain carries colour speckle the way a fast colour negative does; 0 = one field shared by all three channels, i.e. monochrome grain. The default is the 0.35 layer correlation of a colour negative. Read only by the Film family in this build. |
++| Shot Seed | 0-65535 | 0 | A new number is a new roll of film: the whole pattern changes, and the same number always reproduces the same grain. Changing it restarts the capture frame count, so two takes with the same seed match frame for frame. |
++| Capture Frame Rate | 1-240 | 24 | Frames per second the pattern is meant to advance at when a sequence drives the camera. **Stored but not yet consulted**: the counter advances one per rendered frame until the TrackView sequence-time mapping lands. |
++| Camera Rolling While Paused | bool | true | Keep advancing the capture frame count while the game is paused, so the grain keeps moving on a frozen picture the way a camera left running does. Off holds the grain still with the picture. |
+ 
+ ### Halation
+ 
+@@ -1100,18 +1111,43 @@ Master cvar: `r_HDRStreaks` (2 = diagnostic force mode, analytic only).
+ 
+ ## Film grain model
+ 
++**The amount** - how much grain there is - comes from the exposure triangle:
++
+ ```
+ sensorStops = log2(36 / sensorWidth)                    // full frame +0, APS-C ~ +0.6, M4/3 ~ +1.1
+ g    = clamp((log2(ISO/100) + sensorStops) / 8, 0, 1)   // 8 stops, ISO 100-25600
+ base = 0.25*g^1.2 + g^3.5                               // visible from ISO 400, top stops get dirty fast
+ lightStops = log2((transmission*t / N^2) / ((1/50) / 5.6^2)) - NDstops
+ boost = clamp(2^(-lightStops * 0.35), 0.6, 2.2)         // starved sensor noisier, flooded cleaner
+-grain = clamp(base * boost, 0, 1.5) * GrainStrength
++amount = clamp(base * boost, 0, 1.5) * GrainStrength
++```
++
++The reference exposure is f/5.6 at 1/50 s. The result goes two places. It goes to
++`FilterGrain_Amount`, which PostAA combines with the TOD environment grain by `max()`, so the
++per-frame write cannot be stomped - that is the path `r_FilmGrain 0` takes. And it goes, multiplied
++by the family's per-layer amplitudes, into the capture-side block below.
++
++**The grain itself** (`FilmGrainSpec.md`; `Engine/Shaders/HWScripts/CryFX/FilmGrain.cfi`) is
++applied in the PostAA composition pass, in the stock grain's slot, on the display-encoded value:
++
+ ```
++x  = inverse sRGB of the pixel
++t  = log2(max(x, 2^-14))                      // display-log axis
++g  = amount_c * R(t)                          // R peaks at t = -2.5, 3 stops wide, 0 at t >= 0 and t <= -9
++n  = Gaussian(hash(shotSeed, captureFrame, view, film-space cell, layer))
++x' = x * exp2(g*n - g*g*ln2/2)                // the second term keeps the mean, so grain is not exposure
++```
++
++with `n_c = sqrt(1-rho) * n_layer + sqrt(rho) * n_mono` for the channel correlation, and the
++coordinate in **film millimetres** - `(pixel - centre) * sensorWidth / outputWidth`, with the
++anamorphic squeeze undone on x, so grain stretches with a desqueezed frame. A grain cell smaller
++than an output pixel has its variance divided by the number of cells under the pixel, so fine grain
++on a low-resolution output goes quiet rather than merely small.
+ 
+-The reference exposure is f/5.6 at 1/50 s. The result goes to `FilterGrain_Amount`, which
+-PostAA combines with the TOD environment grain by `max()`, so the per-frame write cannot be
+-stomped.
++Nothing in it reads a clock: the pattern is a pure function of the shot seed, the capture frame
++index and the pixel, so the same shot reproduces the same grain in any session and at any frame
++rate. `r_FilmGrainFreeze 1` pins the frame index; `r_FilmGrainDebug 1` puts the grain on a mid grey
++card with the picture removed, and `3` logs what it is doing once a second.
+ 
+ ---
+ 
+diff --git a/Code/CryPlugins/CinematicCamera/docs/ConsoleReference.md b/Code/CryPlugins/CinematicCamera/docs/ConsoleReference.md
+index 4e0dbd0a..7a8b5d2f 100644
+--- a/Code/CryPlugins/CinematicCamera/docs/ConsoleReference.md
++++ b/Code/CryPlugins/CinematicCamera/docs/ConsoleReference.md
+@@ -742,6 +742,30 @@ diagnostics outrank the mask. Kernel parameter changes are logged as
+ | Default | 1 |
+ | Purpose | Master switch for film halation — the red-orange halo around sources that overload the emulsion — driven by the `HDR_Halation_*` post effect params and composited into the bloom target right after the streaks. 0 = off (no passes issued), 1 = on (visibility decided by the game-side params), **2 = diagnostic force mode**: amount 1, threshold 0.5, radius 0.7, independent of the game-side params — use it to verify the halation pass itself runs. |
+ 
++### r_FilmGrain
++
++| | |
++| --- | --- |
++| Default | 1 |
++| Purpose | Master switch for the **capture-side film grain** ([FilmGrainSpec.md](../FilmGrainSpec.md)): grain with a size in micrometres **on the negative**, an amplitude that follows the tone through a response curve, an independent field per emulsion layer, and a fresh deterministic pattern per *captured* frame. It is a separate shader permutation (`%_RT_SAMPLE6` on `PostAAComposites`) that runs **only** when the Cinematic Camera component asks for it (`Enable Film Grain`, on by default), and while it runs the engine's own overlay grain amount is forced to 0 so the two never both apply. 1 = honour the request. 0 = ignore it and always take the stock path — the plugin still writes `FilterGrain_Amount`, so the engine's own grain comes back at the same strength, and the frame is then byte for byte the engine's own. The first thing to try if anything about the noise looks wrong. |
++
++### r_FilmGrainDebug
++
++| | |
++| --- | --- |
++| Default | 0 |
++| Purpose | Diagnostic for the capture-side film grain. 0 = off. |
++| 1 — grey card | Throws the picture away and applies the grain to a flat **mid grey card** (linear 0.18) instead. The block runs exactly as it would on the real frame — same film-space coordinates, same seed, same response — so what is on screen is the grain at the tone the response is tuned for, with nothing else to argue with. This is the mode to read grain *size* and *colour speckle* off, and to compare two Size or Colour settings. |
++| 2 — response | The response curve as an overlay. **Not implemented in this build** (the response is still the shader's built-in curve; the uploadable LUT arrives with the digital families) and behaves as 0. |
++| 3 — report | Logs a plain-language report once a second: family, per-channel amount, grain size in micrometres **and** in output pixels, the sensor width / squeeze / output width and how much negative one output pixel covers, the shot seed and capture frame index, and finally what the grain is worth in 8-bit code values on a mid grey card — which is the number that decides whether it is visible at all after the 8-bit write at the end of the pass. |
++
++### r_FilmGrainFreeze
++
++| | |
++| --- | --- |
++| Default | 0 |
++| Purpose | Pins the **capture frame index** the grain is seeded from, so the pattern stops changing and the frame holds one still field of grain. The camera keeps counting — only what is published to the shader is held — so releasing the freeze does not rewind the grain. Two uses: telling grain apart from temporal AA noise (grain freezes, TAA shimmer does not), and comparing two settings on the *identical* pattern instead of on two different rolls of the dice. |
++
+ ## Plugin cvars (`cinecam_*`)
+ 
+ Registered by the CinematicCamera plugin itself, not by the renderer. They are process-wide, so
+@@ -862,7 +886,6 @@ restart the fog is running. Density comes from the Time of Day's volumetric fog
+ (haze, 3.9 km) to 0.4 (mist, 1 km) is where shafts read clearly. The two renderer cvars above are
+ already at their ReCS defaults. A project that wants the analytical fog back sets
+ `e_VolumetricFog 0` in its `system.cfg` and restarts.
+-
+ ## Related post effect params (for reference)
+ 
+ Written by the plugin every frame; not cvars, and not meant to be driven by hand:
+@@ -883,7 +906,8 @@ Written by the plugin every frame; not cvars, and not meant to be driven by hand
+   and the composite all see the same bent focus
+ - `Dof_User_BokehShapeTex` (string param; rewritten every frame so both render command buffer
+   slots converge, unbound on restore)
+-- `FilterGrain_Amount` (combined with the TOD environment grain by `max()`)
++- `FilterGrain_Amount` (combined with the TOD environment grain by `max()`; still written every
++  frame, and it is what `r_FilmGrain 0` falls back to)
+ - `Global_User_LutODT` / `Global_User_LutODTSize`, `Global_User_LutLMT` /
+   `Global_User_LutLMTSize` - the display chain's two 3D LUTs (S4). The plugin parses the `.cube`
+   files, uploads fp16 3D textures through `IRenderer::UploadToVideoMemory3D` and publishes the
+@@ -897,7 +921,16 @@ Written by the plugin every frame; not cvars, and not meant to be driven by hand
+   All neutral by default, and neutral is exact: the white-balance matrix is built from the same
+   Planckian locus the setting is on, so 6500 K + tint 0 is the identity matrix rather than a
+   near-identity. Only the scene-referred branch reads them.
+-- `HDR_Streaks_Active` / `HDR_Streaks_Amount` / `HDR_Streaks_Count` / `HDR_Streaks_Angle` /
++- `Grain_User_Active`, `Grain_User_Family`, `Grain_User_Amount` (Vec4: per-channel amount + channel
++  correlation), `Grain_User_Size` (Vec4: per-channel grain size in um on the negative + plate texel
++  size), `Grain_User_Sensor` (Vec4: sensor width mm, squeeze, virtual sensor width in photosites,
++  footprint override), `Grain_User_Seed` (Vec4: shot seed, capture frame index, freeze, algorithm
++  version), `Grain_User_Digital0` / `-Digital1` (the sensor model's numbers, published but not yet
++  read), `Grain_User_Response` / `Grain_User_Plates` (texture IDs, 0 in this build) - the
++  capture-side film grain block of `FilmGrainSpec.md` section 4. Read once per frame by
++  `CPostAAStage::DoFinalComposition`, which forces the engine's own grain amount to 0 while the
++  block is active. All zero / inactive by default, so a frame with no cinematic camera is the
++  engine's own.- `HDR_Streaks_Active` / `HDR_Streaks_Amount` / `HDR_Streaks_Count` / `HDR_Streaks_Angle` /
+   `HDR_Streaks_Length` (unknown to an unmodified renderer: reads return 0, writes are silently
+   dropped)
+ - `HDR_Streaks_AnamorphicAmount` / `HDR_Streaks_AnamorphicLength` /
+diff --git a/Engine/Shaders/CMakeLists.txt b/Engine/Shaders/CMakeLists.txt
+index a3cdf88b..6332b8d6 100644
+--- a/Engine/Shaders/CMakeLists.txt
++++ b/Engine/Shaders/CMakeLists.txt
+@@ -141,6 +141,7 @@ add_sources("NoUberFile"
+ 		"HWScripts/CryFX/Stereo.cfx"
+ 		"HWScripts/CryFX/Sunshafts.cfx"
+ 	SOURCE_GROUP "CryFX\\\\PostProcess\\\\Include"
++		"HWScripts/CryFX/FilmGrain.cfi"
+ 		"HWScripts/CryFX/PostEffectsLib.cfi"
+ 	SOURCE_GROUP "CryFX\\\\SVO"
+ 		"HWScripts/CryFX/CommonSVO.cfi"
+diff --git a/Engine/Shaders/HWScripts/CryFX/FilmGrain.cfi b/Engine/Shaders/HWScripts/CryFX/FilmGrain.cfi
+new file mode 100644
+index 00000000..5e42e95e
+--- /dev/null
++++ b/Engine/Shaders/HWScripts/CryFX/FilmGrain.cfi
+@@ -0,0 +1,243 @@
++// Copyright 2026 Sherefox. Part of the ReC Sandbox cinematic camera.
++//
++//  Capture-side film grain - FilmGrainSpec.md, stage G0.
++//
++//  What this is, in one paragraph. The engine's own grain (ApplyFilmGrain in PostAA.cfx, left
++//  untouched next to this) is a Photoshop overlay of a 256x256x6 white-noise volume, pivoting on
++//  0.5, addressed in FRAME coordinates and animated off the wall clock. It has no size, no tone
++//  response, no colour structure, and six patterns cycling at 18 Hz. This block replaces it, for
++//  the cinematic camera only, with a capture-side model: grain has a size in MICROMETRES ON THE
++//  NEGATIVE, an amplitude that follows the tone through a response curve, an independent field
++//  per emulsion layer mixed by a correlation, and a fresh deterministic pattern per CAPTURED
++//  frame - no wall clock anywhere, so the same shot seed and the same frame index give the same
++//  grain every run.
++//
++//  Where it runs, and why here. PostAA resolves the temporal AA and THEN composites; grain
++//  injected before the resolve is exactly what the history clamp identifies as noise and averages
++//  away (the stock shader says so above ApplyFilmGrain). So this block sits in the composition
++//  pass, in the stock grain's own slot, before the saturate - which means it works on the
++//  DISPLAY-ENCODED value, not on the negative. That is approximation A1 of the spec: the response
++//  curve carries the toe and shoulder shaping that a print transform would otherwise have given
++//  the grain. When the temporal AA moves in front of the tone map the block moves with it and the
++//  response drops its explicit shoulder; the interface does not change.
++//
++//  The model (spec section 3), per pixel and per channel:
++//
++//      x  = DecodeDisplay(d)                     inverse sRGB
++//      t  = log2(max(x, 2^-14))                  display-log axis, -14 .. 0
++//      g  = amount_c * R(t)                      R = the response, 0 above the clip point
++//      n  = generator(p_mm, c, seed)             zero mean, unit variance, footprint-integrated
++//      x' = x * exp2(g*n - g*g*ln2/2)            the second term keeps E[x'] = x
++//      d' = EncodeDisplay(x')
++//
++//  G0's generator (spec section 3.5) is a white Gaussian on a film-space cell grid: zero assets,
++//  and it is also the shot-noise core of the digital sensor model that arrives in G1, so it is
++//  not throw-away. The grain plates of section 3.3 and the sensor model of section 3.4 replace
++//  the one function FilmGrainField() below without touching anything else in this file.
++
++// ------------------------------------------------------------------------------------------
++// Constants (FilmGrainSpec.md section 4). Published by the cinematic camera on the post-effect
++// bus and set by CPostAAStage::DoFinalComposition; nothing else writes them, and none of them is
++// read unless %_RT_SAMPLE6 selects this block.
++// ------------------------------------------------------------------------------------------
++
++float4 vGrainAmount;    // x,y,z = per-channel amount (ISO and strength already folded in), w = channel correlation rho
++float4 vGrainSize;      // x,y,z = grain size in um on the negative per channel, w = plate texel um (0 = procedural)
++float4 vGrainSensor;    // x = sensor width mm, y = anamorphic squeeze, z = virtual sensor width in photosites, w = footprint override um (0 = auto)
++float4 vGrainSeed;      // x = shot seed, y = capture frame index, z = freeze, w = algorithm version
++float4 vGrainDigital0;  // x = full well e-, y = base ISO, z = ISO, w = read noise sigma e-  (read by G1)
++float4 vGrainDigital1;  // x = PRNU, y = DSNU, z = row noise, w = chroma NR                  (read by G1)
++float4 vGrainDebug;     // x = r_FilmGrainDebug, y = view index (stereo decorrelation), zw unused
++
++// ------------------------------------------------------------------------------------------
++// Integer hash. There are no hash or PRNG helpers anywhere in PostEffectsLib.cfi, ShadeLib.cfi
++// or Common.cfi, and 5.7.1 ships no blue-noise texture, so the generator brings its own.
++//
++// pcg3d (Jarzynski and Olano, Hash Functions for GPU Rendering, JCGT 2020): three well-mixed
++// 32-bit words out of three, passing the statistical tests the ad-hoc sin(dot(...)) hashes fail,
++// for a handful of integer operations. Everything that decides the pattern is integer, so the
++// field is bit-identical between runs on the same GPU - which is what makes a shot reproducible,
++// and what makes the offline re-synthesis of G3 possible at all.
++// ------------------------------------------------------------------------------------------
++uint3 FilmGrainHash3(uint3 v)
++{
++	v = v * 1664525u + 1013904223u;
++	v.x += v.y * v.z;
++	v.y += v.z * v.x;
++	v.z += v.x * v.y;
++	v ^= v >> 16u;
++	v.x += v.y * v.z;
++	v.y += v.z * v.x;
++	v.z += v.x * v.y;
++	return v;
++}
++
++// [0,1) from the top 24 bits - the low bits of any LCG-derived word are the weakest, and 24 bits
++// is already far more resolution than an 8-bit target can show.
++float FilmGrainUnorm(uint h)
++{
++	return (float)(h >> 8u) * (1.0 / 16777216.0);
++}
++
++// Box-Muller: two independent uniforms in, one unit-variance Gaussian out. The sine branch of the
++// transform is thrown away - the hash hands us a third word for nothing, so there is no saving in
++// carrying it, and one value per call keeps the four fields below independent by construction.
++float FilmGrainGaussian(uint3 key)
++{
++	const uint3 h = FilmGrainHash3(key);
++	// u1 is never allowed to be 0: log(0) is -inf, and one inf pixel is a white dot on screen.
++	const float u1 = max(FilmGrainUnorm(h.x), 1.0 / 16777216.0);
++	const float u2 = FilmGrainUnorm(h.y);
++	return sqrt(-2.0 * log(u1)) * cos(6.283185307 * u2);
++}
++
++// ------------------------------------------------------------------------------------------
++// Display encoding. Written out here in FLOAT rather than calling CommonMath.cfi's half3
++// LinearToSRGB / SRGBToLinear: the whole point of the block is a signal a few code values tall,
++// and a half-precision round trip through a power of 2.4 loses more than that.
++// ------------------------------------------------------------------------------------------
++float3 FilmGrainDecode(float3 d)
++{
++	return (d <= 0.04045) ? (d / 12.92) : pow(abs(d + 0.055) / 1.055, 2.4);
++}
++
++float3 FilmGrainEncode(float3 x)
++{
++	return (x <= 0.0031308) ? (x * 12.92) : (1.055 * pow(abs(x), 1.0 / 2.4) - 0.055);
++}
++
++// ------------------------------------------------------------------------------------------
++// The built-in response R(t) (spec section 5.1 defaults). A smooth bump peaking at t = -2.5 - the
++// mid-tones, a couple of stops under display white - with a 3-stop full width at half maximum,
++// windowed to exactly 0 at t >= 0 and at t <= -9.
++//
++// Why a bump and not a constant: real grain is a property of the DEVELOPED DENSITY, so it is
++// strongest where the emulsion is half exposed and vanishes both in clear film and in maximum
++// density. The two windows are what make it vanish rather than merely become small - without them
++// the Gaussian still has 15 percent of its peak at display white, which reads as noise on a blown
++// highlight and, worse, as noise on the letterbox bars.
++//
++// G1 replaces this whole function with a 64-texel LUT the camera uploads, so a stock can carry
++// its own curve; the shape here is the default that LUT will be authored against.
++// ------------------------------------------------------------------------------------------
++float FilmGrainResponse(float t)
++{
++	const float kPeak  = -2.5;
++	const float kSigma = 1.274;    // FWHM = 2*sqrt(2*ln2)*sigma = 3.0 stops
++	const float d = (t - kPeak) / kSigma;
++	const float bump  = exp(-0.5 * d * d);
++	const float wLow  = smoothstep(-9.0, -7.5, t);          // 0 at and below -9
++	const float wHigh = 1.0 - smoothstep(-1.5, 0.0, t);     // 0 at and above 0
++	return saturate(bump * wLow * wHigh);
++}
++
++// ------------------------------------------------------------------------------------------
++// The G0 generator (spec section 3.5): a white Gaussian, sampled on a CELL GRID laid out in film
++// micrometres, with the output pixel's footprint integrated analytically.
++//
++// The cell grid is what gives grain a size that does not follow the resolution: a cell is sizeUm
++// across ON THE NEGATIVE, so the same camera at 1080p and at 4K puts the same grain on the same
++// piece of film and the 4K frame simply resolves it better. (The stock grain does the opposite -
++// its cells are frame-relative, so they double in pixels when the resolution doubles.)
++//
++// When a cell is SMALLER than an output pixel there are (fp/size)^2 of them under that pixel and
++// the pixel sees their mean, so the variance divides by that count - which is why fine grain on a
++// low-resolution output is quiet rather than merely small. Above one cell per pixel no
++// integration happens and the factor is 1.
++//
++// The cell index is integer and is hashed directly: no interpolation, no filtering, so the field
++// is exactly reproducible from (seed, cell, layer).
++// ------------------------------------------------------------------------------------------
++float FilmGrainField(float2 pUm, float sizeUm, float fpUm, uint uSeed, uint uLayer)
++{
++	const float s = max(sizeUm, 0.05);
++	const int2 cell = (int2)floor(pUm / s);
++	const float n = FilmGrainGaussian(uint3(asuint(cell.x), asuint(cell.y), uSeed + uLayer * 0x9E3779B9u));
++
++	// Footprint integration: variance / max(1, (fp/size)^2), i.e. amplitude * min(1, size/fp).
++	const float integration = min(1.0, s / max(fpUm, 1e-4));
++	return n * integration;
++}
++
++// ------------------------------------------------------------------------------------------
++// The block itself. Called from PostAAComposites_PS in the stock grain's own slot, before the
++// saturate, under %_RT_SAMPLE6.
++//
++// vPixel is SV_Position.xy, i.e. the pixel CENTRE at DISPLAY resolution - which is the resolution
++// PS_ScreenSize carries in this pass.
++// ------------------------------------------------------------------------------------------
++void ApplyCineFilmGrain(inout half4 cScene, float2 vPixel)
++{
++	const float3 vAmount = max(vGrainAmount.xyz, 0.0);
++	const float rho = saturate(vGrainAmount.w);
++	const int nDebug = (int)(vGrainDebug.x + 0.5);
++
++	// --- Film-space coordinates (spec section 3.1) -----------------------------------------
++	// p_mm = (pixel - centre) * sensorWidth_mm / outputWidth_px, and then the anamorphic squeeze
++	// is UNDONE on x: the negative was exposed squeezed, so grain that is round on the film comes
++	// out horizontally stretched once the frame is desqueezed for presentation. That is the real
++	// behaviour, and it is why the squeeze belongs here and not in the size.
++	const float sensorWidthMm = max(vGrainSensor.x, 1.0);
++	const float squeeze       = max(vGrainSensor.y, 0.01);
++	const float outputWidthPx = max(PS_ScreenSize.x, 1.0);
++	const float mmPerPx       = sensorWidthMm / outputWidthPx;
++
++	// The output pixel's footprint on the negative, in um. The override exists so that a capture
++	// at a different resolution can be made to carry the grain of the resolution it was framed at.
++	const float fpUm = (vGrainSensor.w > 0.0) ? vGrainSensor.w : (mmPerPx * 1000.0);
++
++	float2 pMm = (floor(vPixel) + 0.5 - 0.5 * PS_ScreenSize.xy) * mmPerPx;
++	pMm.x /= squeeze;
++	const float2 pUm = pMm * 1000.0;
++
++	// --- Seeding (spec section 3.2) --------------------------------------------------------
++	// seed = Hash(shotSeed, captureFrameIndex, viewIndex). No Time and no renderer frame counter:
++	// the CAPTURE frame index is the camera's, so a frozen or scrubbed shot gets the grain of the
++	// frame it is showing. The view index decorrelates the two eyes in stereo - identical grain in
++	// both eyes reads as dirt on the screen rather than as grain on the film.
++	const uint uSeed = FilmGrainHash3(uint3((uint)max(vGrainSeed.x, 0.0),
++	                                        (uint)max(vGrainSeed.y, 0.0),
++	                                        (uint)max(vGrainDebug.y, 0.0))).x;
++
++	// Four independent fields: one per emulsion layer, plus the monochrome field the correlation
++	// mixes in (spec section 3, the fourth independent field). rho = 1 gives monochrome grain,
++	// rho = 0 three independent layers, and the sqrt weights keep unit variance at every rho.
++	const float nR = FilmGrainField(pUm, vGrainSize.x, fpUm, uSeed, 0u);
++	const float nG = FilmGrainField(pUm, vGrainSize.y, fpUm, uSeed, 1u);
++	const float nB = FilmGrainField(pUm, vGrainSize.z, fpUm, uSeed, 2u);
++	const float nM = FilmGrainField(pUm, vGrainSize.y, fpUm, uSeed, 3u);
++
++	const float3 nC = sqrt(1.0 - rho) * float3(nR, nG, nB) + sqrt(rho) * nM;
++
++	// --- The blend (spec section 3) --------------------------------------------------------
++	const float3 dIn = max((float3)cScene.rgb, 0.0);
++	float3 x = FilmGrainDecode(dIn);
++
++	// r_FilmGrainDebug 1: throw the picture away and put the grain on a mid grey card. The whole
++	// block still runs exactly as it would on the real frame - same coordinates, same seed, same
++	// response - so what is on screen is the grain at the tone the response is tuned for.
++	if (nDebug == 1)
++		x = (float3)0.18;
++
++	const float3 t = log2(max(x, 6.103515625e-5));    // 2^-14
++	float3 g = vAmount * float3(FilmGrainResponse(t.x), FilmGrainResponse(t.y), FilmGrainResponse(t.z));
++
++	// Above the clip point the negative has nothing left to modulate (spec section 3), so g = 0 -
++	// and where g is 0 the pixel is returned untouched below rather than round-tripped through the
++	// encoding, which is what makes a clipped highlight and a black letterbox bar bit-identical to
++	// the stock path.
++	g = (x >= (1.0 - 1.0 / 1024.0)) ? (float3)0.0 : g;
++
++	// exp2(g*n - g*g*ln2/2): the second term is the analytic Jensen correction for E[2^(g n)] with
++	// n standard normal, so a flat grey field keeps its mean instead of drifting brighter as the
++	// amount rises. Without it a grain sweep doubles as an exposure sweep.
++	const float3 xg = x * exp2(g * nC - g * g * 0.34657359);
++	const float3 dOut = FilmGrainEncode(max(xg, 0.0));
++
++	// Debug 1 replaces the picture, so it has to write even where the response is 0 (otherwise the
++	// card would be the frame again wherever grain is absent).
++	const float3 dCard = FilmGrainEncode(max(x, 0.0));
++	const float3 dKeep = (nDebug == 1) ? dCard : dIn;
++
++	cScene.rgb = (half3)((g > 0.0) ? dOut : dKeep);
++}
+diff --git a/Engine/Shaders/HWScripts/CryFX/PostAA.cfx b/Engine/Shaders/HWScripts/CryFX/PostAA.cfx
+index 4cb2b2ec..3c6e5e85 100644
+--- a/Engine/Shaders/HWScripts/CryFX/PostAA.cfx
++++ b/Engine/Shaders/HWScripts/CryFX/PostAA.cfx
+@@ -3,6 +3,9 @@
+ #include "Common.cfi"
+ #include "PostEffectsLib.cfi"
+ #include "ShadeLib.cfi"
++// The capture-side film grain of the cinematic camera (FilmGrainSpec.md). Nothing in it is
++// referenced unless %_RT_SAMPLE6 is set, so every stock permutation is untouched by its presence.
++#include "FilmGrain.cfi"
+ 
+ // Shader global descriptions
+ float Script : STANDARDSGLOBAL
+@@ -1057,8 +1060,17 @@ pixout PostAAComposites_PS(vtxOut IN)
+ 	OUT.Color.rgb += cLensOptics;
+ #endif
+ 
+-	// Apply grain in screen color-space
++	// Apply grain in screen color-space.
++	//
++	// %_RT_SAMPLE6 selects the CAPTURE-SIDE grain of FilmGrainSpec.md, which the cinematic camera
++	// drives and for which the renderer has already forced the stock amount to 0. With the flag
++	// clear this is the engine's own call in the engine's own slot, so the stock permutation is
++	// byte for byte what it always was.
++#if %_RT_SAMPLE6
++	ApplyCineFilmGrain(OUT.Color, IN.WPos.xy);
++#else
+ 	ApplyFilmGrain(OUT.Color, OUT.Color, IN.WPos, IN.baseTC);
++#endif
+ 
+ 	// No out-of-gammut pixels from here on
+ 	OUT.Color = saturate(OUT.Color);
+diff --git a/Engine/Shaders/hwscripts.waf_files b/Engine/Shaders/hwscripts.waf_files
+index 0c1cd3a1..b185daca 100644
+--- a/Engine/Shaders/hwscripts.waf_files
++++ b/Engine/Shaders/hwscripts.waf_files
+@@ -146,6 +146,7 @@
+             "HWScripts/CryFX/Sunshafts.cfx"
+         ],
+         "CryFX/PostProcess/Include": [
++            "HWScripts/CryFX/FilmGrain.cfi",
+             "HWScripts/CryFX/PostEffectsLib.cfi"
+         ],
+         "CryFX/SVO": [
+-- 
+2.47.1.windows.1
+

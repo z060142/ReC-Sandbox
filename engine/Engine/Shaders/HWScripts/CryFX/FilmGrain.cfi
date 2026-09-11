@@ -1,0 +1,624 @@
+// Copyright 2026 Sherefox. Part of the ReC Sandbox cinematic camera.
+//
+//  Capture-side film grain - FilmGrainSpec.md, stage G0.
+//
+//  What this is, in one paragraph. The engine's own grain (ApplyFilmGrain in PostAA.cfx, left
+//  untouched next to this) is a Photoshop overlay of a 256x256x6 white-noise volume, pivoting on
+//  0.5, addressed in FRAME coordinates and animated off the wall clock. It has no size, no tone
+//  response, no colour structure, and six patterns cycling at 18 Hz. This block replaces it, for
+//  the cinematic camera only, with a capture-side model: grain has a size in MICROMETRES ON THE
+//  NEGATIVE, an amplitude that follows the tone through a response curve, an independent field
+//  per emulsion layer mixed by a correlation, and a fresh deterministic pattern per CAPTURED
+//  frame - no wall clock anywhere, so the same shot seed and the same frame index give the same
+//  grain every run.
+//
+//  Where it runs, and why here. PostAA resolves the temporal AA and THEN composites; grain
+//  injected before the resolve is exactly what the history clamp identifies as noise and averages
+//  away (the stock shader says so above ApplyFilmGrain). So this block sits in the composition
+//  pass, in the stock grain's own slot, before the saturate - which means it works on the
+//  DISPLAY-ENCODED value, not on the negative. That is approximation A1 of the spec: the response
+//  curve carries the toe and shoulder shaping that a print transform would otherwise have given
+//  the grain. When the temporal AA moves in front of the tone map the block moves with it and the
+//  response drops its explicit shoulder; the interface does not change.
+//
+//  The model (spec section 3), per pixel and per channel:
+//
+//      x  = DecodeDisplay(d)                     inverse sRGB
+//      t  = log2(max(x, 2^-14))                  display-log axis, -14 .. 0
+//      g  = amount_c * R(t)                      R = the response, 0 above the clip point
+//      n  = generator(p_mm, c, seed)             zero mean, unit variance, footprint-integrated
+//      x' = x * exp2(g*n - g*g*ln2/2)            the second term keeps E[x'] = x
+//      d' = EncodeDisplay(x')
+//
+//  G0's generator (spec section 3.5) is a white Gaussian on a film-space cell grid: zero assets,
+//  and it is also the shot-noise core of the digital sensor model that arrives in G1, so it is
+//  not throw-away. The grain plates of section 3.3 and the sensor model of section 3.4 replace
+//  the one function FilmGrainField() below without touching anything else in this file.
+
+// ------------------------------------------------------------------------------------------
+// Constants (FilmGrainSpec.md section 4). Published by the cinematic camera on the post-effect
+// bus and set by CPostAAStage::DoFinalComposition; nothing else writes them, and none of them is
+// read unless %_RT_SAMPLE6 selects this block.
+// ------------------------------------------------------------------------------------------
+
+float4 vGrainAmount;    // x,y,z = per-channel amount (ISO and strength already folded in), w = channel correlation rho
+float4 vGrainSize;      // x,y,z = grain size in um on the negative per channel, w = plate texel um (0 = procedural)
+float4 vGrainSensor;    // x = sensor width mm, y = anamorphic squeeze, z = virtual sensor width in photosites, w = footprint override um (0 = auto)
+float4 vGrainSeed;      // x = shot seed, y = capture frame index, z = freeze, w = algorithm version
+float4 vGrainDigital0;  // x = full well e-, y = base ISO, z = working ISO, w = read noise sigma e-
+float4 vGrainDigital1;  // x = PRNU (fraction), y = DSNU e-, z = row noise e-, w = chroma NR 0..1
+float4 vGrainDigital2;  // x = raw WB gain red, y = raw WB gain blue (green is the reference and is 1), z = stacked frames, w = CCD smear
+float4 vGrainDigital3;  // x = sensor->output integration exponent (0 = no downscale gain, 1 = textbook 1/N), y,z,w reserved
+float4 vGrainDebug;     // x = r_FilmGrainDebug, y = view index (stereo decorrelation), z = FAMILY (0 Film, 1 CMOS, 2 CCD, 3 Phone), w unused
+
+// ------------------------------------------------------------------------------------------
+// Integer hash. There are no hash or PRNG helpers anywhere in PostEffectsLib.cfi, ShadeLib.cfi
+// or Common.cfi, and 5.7.1 ships no blue-noise texture, so the generator brings its own.
+//
+// pcg3d (Jarzynski and Olano, Hash Functions for GPU Rendering, JCGT 2020): three well-mixed
+// 32-bit words out of three, passing the statistical tests the ad-hoc sin(dot(...)) hashes fail,
+// for a handful of integer operations. Everything that decides the pattern is integer, so the
+// field is bit-identical between runs on the same GPU - which is what makes a shot reproducible,
+// and what makes the offline re-synthesis of G3 possible at all.
+// ------------------------------------------------------------------------------------------
+uint3 FilmGrainHash3(uint3 v)
+{
+	v = v * 1664525u + 1013904223u;
+	v.x += v.y * v.z;
+	v.y += v.z * v.x;
+	v.z += v.x * v.y;
+	v ^= v >> 16u;
+	v.x += v.y * v.z;
+	v.y += v.z * v.x;
+	v.z += v.x * v.y;
+	return v;
+}
+
+// [0,1) from the top 24 bits - the low bits of any LCG-derived word are the weakest, and 24 bits
+// is already far more resolution than an 8-bit target can show.
+float FilmGrainUnorm(uint h)
+{
+	return (float)(h >> 8u) * (1.0 / 16777216.0);
+}
+
+// Box-Muller: two independent uniforms in, one unit-variance Gaussian out. The sine branch of the
+// transform is thrown away - the hash hands us a third word for nothing, so there is no saving in
+// carrying it, and one value per call keeps the four fields below independent by construction.
+float FilmGrainGaussian(uint3 key)
+{
+	const uint3 h = FilmGrainHash3(key);
+	// u1 is never allowed to be 0: log(0) is -inf, and one inf pixel is a white dot on screen.
+	const float u1 = max(FilmGrainUnorm(h.x), 1.0 / 16777216.0);
+	const float u2 = FilmGrainUnorm(h.y);
+	return sqrt(-2.0 * log(u1)) * cos(6.283185307 * u2);
+}
+
+// Three independent Gaussians out of one key, one per colour channel. The tag separates domains
+// that share a key: the PRNU field and the DSNU field are both hashed from the same sensor pixel
+// index and must not come out as the same three numbers.
+float3 FilmGrainGaussian3(uint3 key, uint tag)
+{
+	const uint t = key.z + tag * 0x85EBCA6Bu;
+	return float3(FilmGrainGaussian(uint3(key.x, key.y, t + 0x9E3779B9u)),
+	              FilmGrainGaussian(uint3(key.x, key.y, t + 0x3C6EF372u)),
+	              FilmGrainGaussian(uint3(key.x, key.y, t + 0xDAA66D2Bu)));
+}
+
+// Shot noise, in electrons, as a DEVIATION from the mean count e.
+//
+// Above ~20 electrons a Poisson variable is a Gaussian of variance e to well inside anything an
+// 8-bit write can show, and that is the whole frame at a normal exposure. Below it - the deep
+// shadows, and most of a phone frame at night - the distribution is visibly discrete and skewed,
+// and a Gaussian both underestimates the spread and lets the count go negative, which a photon
+// count cannot do. So under the threshold this draws a real Poisson variate by Knuth's product
+// method: multiply uniforms until the product falls below e^-e; the number of factors is the count.
+//
+// The loop is bounded at 24 iterations. Knuth needs about e + 1 of them, so with e < 20 the cap is
+// only reached by a tail that contributes nothing visible - and the cap is what stops a
+// pathological pixel from costing a thousand hashes. Only near-black pixels take this path at all:
+// at base ISO, e < 20 means a display-linear value under 0.0004.
+float FilmGrainShot(float e, uint3 key)
+{
+	if (e >= 20.0)
+		return sqrt(e) * FilmGrainGaussian(key);
+
+	const float L = exp(-e);
+	float p = 1.0;
+	int count = 0;
+	[loop] for (int i = 0; i < 24; ++i)
+	{
+		p *= FilmGrainUnorm(FilmGrainHash3(uint3(key.x, key.y, key.z + (uint)i * 747796405u)).x);
+		if (p <= L)
+			break;
+		++count;
+	}
+	return (float)count - e;
+}
+
+// ------------------------------------------------------------------------------------------
+// Display encoding. Written out here in FLOAT rather than calling CommonMath.cfi's half3
+// LinearToSRGB / SRGBToLinear: the whole point of the block is a signal a few code values tall,
+// and a half-precision round trip through a power of 2.4 loses more than that.
+// ------------------------------------------------------------------------------------------
+float3 FilmGrainDecode(float3 d)
+{
+	return (d <= 0.04045) ? (d / 12.92) : pow(abs(d + 0.055) / 1.055, 2.4);
+}
+
+float3 FilmGrainEncode(float3 x)
+{
+	return (x <= 0.0031308) ? (x * 12.92) : (1.055 * pow(abs(x), 1.0 / 2.4) - 0.055);
+}
+
+// ------------------------------------------------------------------------------------------
+// The built-in response R(t) (spec section 5.1 defaults). A smooth bump peaking at t = -2.5 - the
+// mid-tones, a couple of stops under display white - with a 3-stop full width at half maximum,
+// windowed to exactly 0 at t >= 0 and at t <= -9.
+//
+// Why a bump and not a constant: real grain is a property of the DEVELOPED DENSITY, so it is
+// strongest where the emulsion is half exposed and vanishes both in clear film and in maximum
+// density. The two windows are what make it vanish rather than merely become small - without them
+// the Gaussian still has 15 percent of its peak at display white, which reads as noise on a blown
+// highlight and, worse, as noise on the letterbox bars.
+//
+// G1 replaces this whole function with a 64-texel LUT the camera uploads, so a stock can carry
+// its own curve; the shape here is the default that LUT will be authored against.
+// ------------------------------------------------------------------------------------------
+float FilmGrainResponse(float t)
+{
+	const float kPeak  = -2.5;
+	const float kSigma = 1.274;    // FWHM = 2*sqrt(2*ln2)*sigma = 3.0 stops
+	const float d = (t - kPeak) / kSigma;
+	const float bump  = exp(-0.5 * d * d);
+	const float wLow  = smoothstep(-9.0, -7.5, t);          // 0 at and below -9
+	const float wHigh = 1.0 - smoothstep(-1.5, 0.0, t);     // 0 at and above 0
+	return saturate(bump * wLow * wHigh);
+}
+
+// ------------------------------------------------------------------------------------------
+// The G0 generator (spec section 3.5): a white Gaussian, sampled on a CELL GRID laid out in film
+// micrometres, with the output pixel's footprint integrated analytically.
+//
+// The cell grid is what gives grain a size that does not follow the resolution: a cell is sizeUm
+// across ON THE NEGATIVE, so the same camera at 1080p and at 4K puts the same grain on the same
+// piece of film and the 4K frame simply resolves it better. (The stock grain does the opposite -
+// its cells are frame-relative, so they double in pixels when the resolution doubles.)
+//
+// When a cell is SMALLER than an output pixel there are (fp/size)^2 of them under that pixel and
+// the pixel sees their mean, so the variance divides by that count - which is why fine grain on a
+// low-resolution output is quiet rather than merely small. Above one cell per pixel no
+// integration happens and the factor is 1.
+//
+// The cell index is integer and is hashed directly: no interpolation, no filtering, so the field
+// is exactly reproducible from (seed, cell, layer).
+// ------------------------------------------------------------------------------------------
+float FilmGrainField(float2 pUm, float sizeUm, float fpUm, uint uSeed, uint uLayer)
+{
+	const float s = max(sizeUm, 0.05);
+	const int2 cell = (int2)floor(pUm / s);
+	const float n = FilmGrainGaussian(uint3(asuint(cell.x), asuint(cell.y), uSeed + uLayer * 0x9E3779B9u));
+
+	// Footprint integration: variance / max(1, (fp/size)^2), i.e. amplitude * min(1, size/fp).
+	const float integration = min(1.0, s / max(fpUm, 1e-4));
+	return n * integration;
+}
+
+// ------------------------------------------------------------------------------------------
+// The digital generator (spec section 3.4): a sensor, not an emulsion.
+//
+// Nothing here is grain. A photosite collects electrons, and what a picture of a flat grey wall
+// actually carries is (a) the square root of that count, because photons arrive as a Poisson
+// process, (b) a fixed amount of read noise added by the amplifier and the ADC, and (c) a static
+// per-photosite pattern - each site has a slightly different gain (PRNU) and a slightly different
+// dark offset (DSNU). That is why sensor noise looks nothing like film: it is loudest in the
+// SHADOWS relative to the signal, it is cleanest in the highlights where the well is full, and it
+// does not have a size on the negative - it has the size of a photosite.
+//
+//     e     = x * fullWell * (isoBase / iso)          electrons; ISO is GAIN, not sensitivity, so
+//                                                     four times the ISO is a quarter of the light
+//     shot ~ Poisson(e) - e                           Gaussian of variance e above 20 electrons
+//     read ~ N(0, sigma_r^2)                          per-ISO; dual gain is handled on the CPU side
+//     prnu  = 1 + k_prnu * H(sensorPixel)             static, multiplicative, no seed
+//     dsnu  = k_dsnu * H'(sensorPixel)                static, additive, electrons
+//     row   = k_row * H''(row, seed)                  per-frame horizontal banding
+//     y     = ((e + shot) * prnu + read + dsnu + row) / fullWell * (iso / isoBase)
+//
+// The ISO law of a sensor is therefore EMERGENT: nothing in here reads a strength curve. Raising
+// the ISO shrinks e, so the shot term grows relative to the signal and the read floor stops being
+// negligible; that is the whole of "high ISO is noisy", and it comes out of the arithmetic rather
+// than out of a hand-drawn ramp.
+//
+// Output: the perturbation as an ADDITIVE quantity in DISPLAY-LINEAR units (`delta`), plus its
+// analytic standard deviation in the same units (`sigmaLin`, for the debug report and for the
+// per-channel "is there anything to apply" test). The caller applies it as
+//
+//      x' = clamp(x + amount * delta, 0, 1)
+//
+// and NOT through the film family's multiplicative exp2 blend. This is the fix of 2026-09-10 and
+// it is the whole difference between a sensor and an emulsion:
+//
+//   Film grain modulates the DENSITY that is already there. Nothing is developed where nothing was
+//   exposed, so the perturbation is proportional to the signal and a multiplicative (log-domain)
+//   blend is the right model - which is why the film path below is untouched.
+//
+//   Sensor noise is ADDED to the signal by the readout. Read noise, DSNU and the row/column terms
+//   are fixed electron counts that do not know what the pixel's value is, and shot noise is
+//   sqrt(e), which also does not vanish with the signal the way a relative term would. Writing any
+//   of that as a perturbation in STOPS means dividing by x, and as x goes to zero the quotient
+//   goes to infinity: g = sigma_y / (x * ln2). That is exactly what the previous version did, and
+//   the clamp on g did not save it, because the unit-variance field n = delta / sigma_y is itself
+//   unbounded in the deep shadows (the Poisson branch draws integer electron counts against a
+//   sub-electron sigma, so n of 5 to 10 is ordinary there). The product g*n then reached ten stops
+//   or more on a near-black pixel and exp2 turned it into a bright dot, coloured by the per-channel
+//   white-balance gains: the sparse saturated magenta / cyan / white sparkles the user photographed
+//   in a dark CMOS frame at ISO 777. A real sensor's black is a lifted, slightly grey floor with a
+//   faint chroma blotch - never sparkles - and that is what the additive path produces.
+//
+// Two consequences, both accepted deliberately:
+//
+//   Mean. Additive zero-mean noise preserves the mean IN LINEAR, so no Jensen bias term is needed
+//   or applied. The DISPLAY-ENCODED mean does shift down by a tiny amount, because the encoding is
+//   concave: E[enc(x+d)] ~ enc(x) + enc''(x) * sigma^2 / 2. At the sigma this model produces that
+//   is far under a code value everywhere it matters, and correcting it would re-introduce exactly
+//   the x-dependent division this change removes. Ignored, on purpose.
+//
+//   The clamp at 0. Deep black cannot go negative, so clipping the negative half of the
+//   distribution lifts the mean there. That is not an artefact to be cancelled - it is precisely
+//   what a real sensor's BLACK-LEVEL PEDESTAL exists to avoid, by offsetting the ADC so the noise
+//   has room to swing below the black point. We do not model a pedestal (the block runs on an
+//   already-encoded display value, where there is nowhere to put one), so the lifted black stays,
+//   and it is the honest look of a camera whose black level is set at zero.
+// ------------------------------------------------------------------------------------------
+
+// How much of the theoretical downsampling gain a real camera actually gets. Averaging N
+// independent photosites into one output pixel divides the VARIANCE by N; demosaicing correlates
+// neighbouring photosites first, so the measured fall-off of a downscaled raw frame is markedly
+// shallower than 1/N. The exponent is the documented compromise (0.7, so sigma falls as N^0.35);
+// 1.0 restores the textbook result, and 0.0 turns the integration off altogether - the "pixel
+// peeping at 1:1" look, where the noise of one photosite lands on one output pixel whatever the
+// downscale factor. It now travels on the bus as vGrainDigital3.x (a preset value, so a body can
+// carry its own); this define is the fallback for a bus that has not been written.
+#define FILMGRAIN_INTEGRATION_EXP 0.7
+
+void FilmGrainSensorField(float2 vPixel, float3 x, uint uSeed, out float3 delta, out float3 sigmaLin)
+{
+	const float fullWell  = max(vGrainDigital0.x, 1.0);
+	const float isoBase   = max(vGrainDigital0.y, 1.0);
+	const float iso       = max(vGrainDigital0.z, 1.0);
+	const float sigmaRead = max(vGrainDigital0.w, 0.0);
+	const float kPrnu     = max(vGrainDigital1.x, 0.0);
+	const float kDsnu     = max(vGrainDigital1.y, 0.0);
+	const float kRow      = max(vGrainDigital1.z, 0.0);
+	const float chromaNR  = saturate(vGrainDigital1.w);
+	// The raw white balance. A Bayer sensor is most sensitive in green, so a developer multiplies
+	// red and blue up to make grey grey - and multiplies THEIR NOISE up with them, which is why a
+	// digital picture's noise is bluest and reddest and almost never green. Green is the reference.
+	const float3 wb    = float3(max(vGrainDigital2.x, 0.01), 1.0, max(vGrainDigital2.y, 0.01));
+	const float stackN = max(vGrainDigital2.z, 1.0);
+	const float smear  = max(vGrainDigital2.w, 0.0);
+
+	const float wellScale = isoBase / iso;
+	const float3 e = x * fullWell * wellScale;
+	const float k  = 1.0 / max(fullWell * wellScale, 1e-6);      // electrons -> display-linear
+
+	// --- the two grids ---------------------------------------------------------------------
+	// The FIXED pattern is a property of the silicon, so it is hashed from the SENSOR photosite
+	// index and carries no seed: it is the same in every frame of every take, which is exactly
+	// what makes it fixed-pattern noise and not grain. Everything temporal is hashed from the
+	// output pixel and the seed - one draw per output pixel, with the photosites under it
+	// integrated analytically below rather than looped over.
+	const float outW = max(PS_ScreenSize.x, 1.0);
+	const float sensorPx = clamp(vGrainSensor.z, 64.0, 32768.0);
+	const float photositesPerPx = max(sensorPx / outW, 1e-3);
+	const float2 pix = floor(vPixel);
+	const int2 sIdx = (int2)floor((pix + 0.5) * photositesPerPx);
+
+	const uint3 kStatic = uint3(asuint(sIdx.x), asuint(sIdx.y), 0u);
+	const uint3 kFrame  = uint3(asuint((int)pix.x), asuint((int)pix.y), uSeed);
+
+	const float3 hPrnu = FilmGrainGaussian3(kStatic, 1u);
+	const float3 hDsnu = FilmGrainGaussian3(kStatic, 2u);
+	const float3 hRead = FilmGrainGaussian3(kFrame, 3u);
+
+	// The two STRUCTURED terms - a per-row offset and a per-column offset - are almost colourless.
+	// They come from ONE amplifier and ONE readout register serving the whole line or the whole
+	// column, so the offset they add is a single number that every photosite under them shares; the
+	// Bayer filter makes the three channels respond to it slightly differently, and that is all the
+	// colour there is. Drawing three independent numbers (which is what this did before) turned a
+	// luma band into a rainbow band, and after the additive path stopped clamping them that was the
+	// violent coloured streaking the user photographed.
+	//
+	// So: one shared draw plus a small per-channel one, sqrt(0.9) / sqrt(0.1), which keeps unit
+	// variance per channel and leaves 10 % of the energy as colour.
+	const float kStructMono   = 0.9486833;   // sqrt(0.9)
+	const float kStructChroma = 0.3162278;   // sqrt(0.1)
+
+	// Row noise is one draw per ROW, so every pixel of a line moves together: horizontal banding.
+	const float  hRowMono = FilmGrainGaussian(uint3(0u, asuint((int)pix.y), uSeed ^ 0x7F4A7C15u));
+	const float3 hRow = kStructMono * hRowMono
+	                  + kStructChroma * FilmGrainGaussian3(uint3(0u, asuint((int)pix.y), uSeed), 4u);
+
+	// The CCD term. A real vertical smear is charge from a saturated site bleeding along its column
+	// during readout, which needs the brightest value in the column and therefore a pass of its
+	// own; what this is instead is COLUMN-CORRELATED noise - one draw per column, gated by local
+	// brightness so it exists only where a CCD's vertical streak actually shows. Static within the
+	// frame, new every frame.
+	const float  hColMono = FilmGrainGaussian(uint3(asuint((int)pix.x), 0u, uSeed ^ 0x2545F491u));
+	const float3 hCol = kStructMono * hColMono
+	                  + kStructChroma * FilmGrainGaussian3(uint3(asuint((int)pix.x), 0u, uSeed), 5u);
+
+	// The gate. It used to sit on a FLOOR of 0.3, which meant a third of the column term was present
+	// on every pixel of every frame - a full-frame vertical texture, not a streak. A streak is
+	// something a BRIGHT SOURCE does to its own column, so the gate now starts at zero and only
+	// opens as the picture approaches clipping: nothing at all in a normally exposed scene, a faint
+	// streak under a blown highlight. (Correct would be the maximum of the whole column, which is a
+	// reduction pass of its own and is not worth one; local brightness is the cheap stand-in.)
+	const float3 w709 = float3(0.2126, 0.7152, 0.0722);
+	const float colGate = smoothstep(0.75, 1.0, dot(x, w709));
+
+	// The amplitude, as a fraction of the SATURATING COLUMN'S CHARGE - which is fullWell * wellScale,
+	// the charge a clipping photosite holds AT THIS ISO, not the bare full well. That distinction is
+	// the other half of the bug: with the bare fullWell the term kept its absolute electron count
+	// while the signal shrank with the ISO gain, so it grew by iso/isoBase against the picture - a
+	// factor of 4 at ISO 800 on a CCD and 64 at ISO 12800, which is how a term meant to be sub-code-
+	// value became tens of percent of the frame. Written this way it is ISO-invariant relative to
+	// the signal, which is what a charge-transfer artefact is.
+	//
+	// The datasheet figure for smear is 0.01-0.1 % of the saturating charge PER LINE TRANSFERRED;
+	// what a streak carries is that fraction accumulated over the lines it is clocked past, so the
+	// whole-column number is one to two orders of magnitude larger. 1 % is calibrated rather than
+	// derived: it puts the streak under a clipping source at about 1 code value at base ISO
+	// (0.9 CV red / 0.5 CV green on the CCD preset), which is faint-but-there - the look - while
+	// staying inside the ~2 code value ceiling the physics allows for a term this crude.
+	const float satCharge = fullWell * wellScale;
+	const float smearE = smear * 0.01 * satCharge * colGate;
+
+	const float3 shot = float3(FilmGrainShot(e.x, uint3(kFrame.x, kFrame.y, kFrame.z + 0x51D3u)),
+	                           FilmGrainShot(e.y, uint3(kFrame.x, kFrame.y, kFrame.z + 0xA2E7u)),
+	                           FilmGrainShot(e.z, uint3(kFrame.x, kFrame.y, kFrame.z + 0xF4BDu)));
+
+	// --- the model ---------------------------------------------------------------------------
+	const float3 prnu = 1.0 + kPrnu * hPrnu;
+	const float3 dE = shot * prnu + e * (prnu - 1.0) + sigmaRead * hRead + kDsnu * hDsnu
+	                + kRow * hRow + smearE * hCol;
+	const float3 dRaw = k * dE * wb;      // display-linear, before the photosite integration
+
+	// The same terms, analytically. Every draw above has unit variance, so this is the sum of the
+	// squares of their coefficients; prnu is treated as 1 inside the shot term, which it is to
+	// half a percent.
+	const float3 varRaw = (k * k) * (e + (e * kPrnu) * (e * kPrnu) + sigmaRead * sigmaRead
+	                                 + kDsnu * kDsnu + kRow * kRow + smearE * smearE) * (wb * wb);
+	const float3 sigmaRaw = sqrt(max(varRaw, 1e-24));
+
+	// Footprint integration (spec section 3.4): nPix photosites fall under one output pixel and the
+	// pixel sees their mean. Analytic - no loop, no supersampling. Frame stacking is the same
+	// arithmetic one level up: N aligned frames averaged divide the variance by N, which is all a
+	// computational phone body does to its noise.
+	const float nPix = max(photositesPerPx * photositesPerPx, 1.0);
+	// The exponent comes off the bus (a preset value, so a body can carry its own). 0 is a legal
+	// setting - it is the "1:1 pixel peeping" look - so it cannot double as "unset"; a NEGATIVE
+	// value is what selects the compile-time fallback.
+	const float integExp = (vGrainDigital3.x >= 0.0) ? min(vGrainDigital3.x, 2.0) : FILMGRAIN_INTEGRATION_EXP;
+	const float attenuation = 1.0 / sqrt(pow(nPix, integExp) * stackN);
+
+	// Both the draw and its analytic sigma are attenuated by the same factor, so the pair stays
+	// consistent and the reported sigma is the sigma of what is actually applied.
+	delta    = dRaw * attenuation;
+	sigmaLin = sigmaRaw * attenuation;
+
+	// --- chroma noise reduction --------------------------------------------------------------
+	// Without this the block is colour confetti: three independent channels at the photosite, then
+	// the white-balance gains pulling red and blue further apart, gives a per-pixel rainbow no
+	// camera has ever produced. Every real pipeline denoises chroma far harder than luma, because
+	// the eye's chroma acuity is low and the artefact is cheap to remove - so what survives is
+	// fine, almost monochrome grit plus a slow, faint colour blotch. That is exactly what this
+	// does: the luma component of the noise is kept per pixel, the chroma component is replaced by
+	// a field drawn on a COARSER cell (1 to 4 output pixels, from the preset's chromaNR) and
+	// attenuated, because a denoiser removes some of the chroma energy as well as spreading it.
+	//
+	// This is the same split as before, done in the SAME LINEAR UNITS as delta rather than in
+	// stops - which is the only change it needed, since it is a linear recombination either way.
+	const float cellPx = lerp(1.0, 4.0, chromaNR);
+	const int2 cell = (int2)floor(pix / cellPx);
+	const float3 nCoarse = FilmGrainGaussian3(uint3(asuint(cell.x), asuint(cell.y), uSeed), 6u) * sigmaLin;
+
+	const float lumFine = dot(delta, w709);
+	const float3 chromaFine = delta - lumFine;
+	const float3 chromaCoarse = nCoarse - dot(nCoarse, w709);
+	delta = lumFine + lerp(chromaFine, chromaCoarse * 0.6, chromaNR);
+
+	// No runaway guard, and none is needed: the perturbation is a bounded number of electrons
+	// converted to display-linear units, so it cannot grow as the signal shrinks. The clamp in the
+	// caller is the only limit, and it is a physical one (a code value cannot go below black).
+}
+
+// ------------------------------------------------------------------------------------------
+// The block itself. Called from PostAAComposites_PS in the stock grain's own slot, before the
+// saturate, under %_RT_SAMPLE6.
+//
+// vPixel is SV_Position.xy, i.e. the pixel CENTRE at DISPLAY resolution - which is the resolution
+// PS_ScreenSize carries in this pass.
+//
+// One blend serves both families. The film family brings an authored response R(t) and a field of
+// unit variance; the digital family brings a response it COMPUTES (the sensor's own sigma, in
+// stops) and a field of unit variance. Everything after the generator - the clip guard, the
+// exp2 blend, the encoded-domain bias, the untouched-pixel path - is shared and unchanged.
+// ------------------------------------------------------------------------------------------
+void ApplyCineFilmGrain(inout half4 cScene, float2 vPixel)
+{
+	const float3 vAmount = max(vGrainAmount.xyz, 0.0);
+	const float rho = saturate(vGrainAmount.w);
+	const int nDebug  = (int)(vGrainDebug.x + 0.5);
+	// The family travels in the DEBUG vector, not in a static flag. Two reasons: a %_RT_ bit is a
+	// shader permutation and there is exactly one free bit on this technique (SAMPLE6, already
+	// spent on the block itself); and the family is renderer-side knowledge already - the pass
+	// reads Grain_User_Family off the bus for its own report. A uniform branch on a constant costs
+	// nothing on any GPU this runs on, and it keeps Film and Digital in one permutation.
+	const int nFamily = (int)(vGrainDebug.z + 0.5);
+
+	// --- Film-space coordinates (spec section 3.1) -----------------------------------------
+	// p_mm = (pixel - centre) * sensorWidth_mm / outputWidth_px, and then the anamorphic squeeze
+	// is UNDONE on x: the negative was exposed squeezed, so grain that is round on the film comes
+	// out horizontally stretched once the frame is desqueezed for presentation. That is the real
+	// behaviour, and it is why the squeeze belongs here and not in the size.
+	const float sensorWidthMm = max(vGrainSensor.x, 1.0);
+	const float squeeze       = max(vGrainSensor.y, 0.01);
+	const float outputWidthPx = max(PS_ScreenSize.x, 1.0);
+	const float mmPerPx       = sensorWidthMm / outputWidthPx;
+
+	// The output pixel's footprint on the negative, in um. The override exists so that a capture
+	// at a different resolution can be made to carry the grain of the resolution it was framed at.
+	const float fpUm = (vGrainSensor.w > 0.0) ? vGrainSensor.w : (mmPerPx * 1000.0);
+
+	float2 pMm = (floor(vPixel) + 0.5 - 0.5 * PS_ScreenSize.xy) * mmPerPx;
+	pMm.x /= squeeze;
+	const float2 pUm = pMm * 1000.0;
+
+	// --- Seeding (spec section 3.2) --------------------------------------------------------
+	// seed = Hash(shotSeed, captureFrameIndex, viewIndex). No Time and no renderer frame counter:
+	// the CAPTURE frame index is the camera's, so a frozen or scrubbed shot gets the grain of the
+	// frame it is showing. The view index decorrelates the two eyes in stereo - identical grain in
+	// both eyes reads as dirt on the screen rather than as grain on the film.
+	const uint uSeed = FilmGrainHash3(uint3((uint)max(vGrainSeed.x, 0.0),
+	                                        (uint)max(vGrainSeed.y, 0.0),
+	                                        (uint)max(vGrainDebug.y, 0.0))).x;
+
+	const float3 dIn = max((float3)cScene.rgb, 0.0);
+	float3 x = FilmGrainDecode(dIn);
+
+	// r_FilmGrainDebug 1: throw the picture away and put the grain on a mid grey card. The whole
+	// block still runs exactly as it would on the real frame - same coordinates, same seed, same
+	// response - so what is on screen is the grain at the tone the response is tuned for.
+	if (nDebug == 1)
+		x = (float3)0.18;
+
+	// r_FilmGrainDebug 2: the response, made visible instead of plotted. The bottom sixth of the
+	// frame becomes a grey RAMP running twelve stops from black on the left to display white on
+	// the right, with the block running on it - so the grain is shown at every tone at once and
+	// the eye finds the peak without reading a number. The curve itself is drawn over the strip as
+	// a bright line: height is the effective per-channel g in stops on a logarithmic axis, ten
+	// stops from the top of the strip to the bottom, so both film (g of a few hundredths) and a
+	// pushed sensor (g of a whole stop) fit on the same scale. The picture above the strip is
+	// untouched, so the mode can be left on while working.
+	const float stripH   = max(floor(PS_ScreenSize.y * 0.16), 8.0);
+	const float stripTop = PS_ScreenSize.y - stripH;
+	const bool bStrip = (nDebug == 2) && (vPixel.y >= stripTop);
+	const float stripFrac = saturate((vPixel.y - stripTop) / max(stripH, 1.0));
+	if (bStrip)
+	{
+		const float u = saturate((floor(vPixel.x) + 0.5) / outputWidthPx);
+		x = (float3)exp2(lerp(-12.0, 0.0, u));
+	}
+
+	// --- The generator ---------------------------------------------------------------------
+	// Two families, two blends. Film is multiplicative in the log domain (grain modulates a density
+	// that is proportional to the signal); Digital is additive in display-linear units (the readout
+	// ADDS electrons that do not know the signal). See the header of FilmGrainSensorField.
+	const bool bDigital = (nFamily != 0);
+
+	float3 g      = (float3)0.0;   // film: per-channel amplitude in STOPS of sigma
+	float3 nField = (float3)0.0;   // film: per-channel field, unit variance
+	float3 dLin   = (float3)0.0;   // digital: additive perturbation, display-linear
+	float3 sLin   = (float3)0.0;   // digital: its sigma, display-linear
+
+	if (!bDigital)
+	{
+		// Film: four independent fields - one per emulsion layer, plus the monochrome field the
+		// correlation mixes in (spec section 3, the fourth independent field). rho = 1 gives
+		// monochrome grain, rho = 0 three independent layers, and the sqrt weights keep unit
+		// variance at every rho.
+		const float nR = FilmGrainField(pUm, vGrainSize.x, fpUm, uSeed, 0u);
+		const float nG = FilmGrainField(pUm, vGrainSize.y, fpUm, uSeed, 1u);
+		const float nB = FilmGrainField(pUm, vGrainSize.z, fpUm, uSeed, 2u);
+		const float nM = FilmGrainField(pUm, vGrainSize.y, fpUm, uSeed, 3u);
+		nField = sqrt(1.0 - rho) * float3(nR, nG, nB) + sqrt(rho) * nM;
+
+		const float3 t = log2(max(x, 6.103515625e-5));    // 2^-14
+		g = vAmount * float3(FilmGrainResponse(t.x), FilmGrainResponse(t.y), FilmGrainResponse(t.z));
+	}
+	else
+	{
+		// Digital: the sensor model computes its own amplitude, so there is no R(t) here at all.
+		// `amount` is the user's Grain Strength and nothing else - the ISO law is in the electrons.
+		float3 delta, sigmaLin;
+		FilmGrainSensorField(vPixel, max(x, 0.0), uSeed, delta, sigmaLin);
+		dLin = vAmount * delta;
+		sLin = vAmount * sigmaLin;
+	}
+
+	// Above the clip point the negative has nothing left to modulate, and a saturated photosite
+	// has no noise left either (spec section 3), so the amplitude is 0 - and where it is 0 the
+	// pixel is returned untouched below rather than round-tripped through the encoding, which is
+	// what makes a clipped highlight and a black letterbox bar bit-identical to the stock path.
+	const float3 clipMask = (x >= (1.0 - 1.0 / 1024.0)) ? (float3)0.0 : (float3)1.0;
+	g    *= clipMask;
+	dLin *= clipMask;
+	sLin *= clipMask;
+
+	// The gate mask. The additive path is the first thing in this block that puts something on a
+	// pixel whose value is ZERO - read noise does not care that the pixel was never exposed - and
+	// the anamorphic gate mask above writes exactly 0 into the letterbox bars (PostAA.cfx:1016).
+	// Grain on the bars is dirt on the print, not noise on the negative, so a pixel that is
+	// identically black in all three channels is left alone. A picture pixel that happens to be
+	// exactly 0.0 in float is caught by the same rule; that is a black void, and one where the
+	// difference is a fraction of a code value.
+	const bool bUnexposed = (dIn.x + dIn.y + dIn.z) <= 0.0;
+	if (bUnexposed && !bStrip && nDebug != 1)
+	{
+		dLin = (float3)0.0;
+		sLin = (float3)0.0;
+	}
+
+	// Film: exp2(g*n - bias). The bias is the analytic Jensen correction for a log-normal, taken in
+	// the DISPLAY-ENCODED domain (a power law of exponent ~1/2.4), not in linear. What the eye and
+	// an 8-bit capture average is the encoded value, and a log-normal is right-skewed: preserving
+	// the LINEAR mean (bias = g^2 ln2 / 2) pulls the encoded mean - the perceived brightness - down
+	// by an amount that grows with g^2, and since the three layers carry different amplitudes that
+	// showed up as a colour cast (blue, the strongest layer, went darkest: the picture turned
+	// yellow). E[(x 2^(g n))^(1/2.4)] = x^(1/2.4) 2^((g/2.4)^2 ln2 / 2), so the bias that keeps the
+	// encoded mean is (g/2.4)^2 ln2 / 2 = g^2 * 0.06017. Exact for a pure power law, close enough
+	// for sRGB's linear toe.
+	//
+	// Digital: x + delta, saturated. Zero-mean additive noise needs no bias term at all (it is
+	// mean-preserving in linear by construction); the clamp at 0 is the black-level discussion in
+	// the header of FilmGrainSensorField, and the clamp at 1 is the sensor clipping.
+	const float3 xg = bDigital ? saturate(x + dLin)
+	                           : (x * exp2(g * nField - g * g * 0.06017));
+	float3 dOut = FilmGrainEncode(max(xg, 0.0));
+
+	// The two debug modes replace the picture, so they have to write even where g is 0 (otherwise
+	// the card or the ramp would be the frame again wherever grain is absent).
+	const float3 dCard = FilmGrainEncode(max(x, 0.0));
+	const float3 dKeep = (nDebug == 1 || bStrip) ? dCard : dIn;
+
+	// "Is there anything to apply on this channel": the film amplitude in stops, or the digital
+	// sigma in display-linear units. Both are 0 exactly where the pixel must be left alone.
+	const float3 amp = bDigital ? sLin : g;
+
+	float3 dFinal = (amp > 0.0) ? dOut : dKeep;
+
+	if (bStrip)
+	{
+		// The curve over the ramp: ten stops on a log axis, one line per channel drawn in that
+		// channel's own colour, and below 2^-10 the curve sits on the strip floor.
+		//
+		// Both families plot the amplitude AS A FRACTION OF THE VALUE, which is what makes the two
+		// comparable on one axis. For film that is g itself (it is defined in stops of the value);
+		// for digital it is sigma_lin / (x * ln2) - the same number the old code used to APPLY, and
+		// which is now only ever displayed. That quotient is the point of the mode for a sensor: it
+		// rises without limit toward the dark end, because the read floor is a constant number of
+		// electrons and the signal under it is not, and the curve pinning to the top of the strip
+		// in the left third is the honest statement that the shadows are all noise. The picture on
+		// the strip is now additive, so the dark end shows a lifted, grainy grey floor instead of
+		// the sparkles this mode used to draw there.
+		const float3 curveQ = bDigital ? (sLin / max(x, 1e-6) * 1.442695) : g;
+		const float3 curveV = 1.0 - saturate((log2(max(curveQ, 1e-9)) + 10.0) / 10.0);
+		const float halfPx = 1.5 / max(stripH, 1.0);
+		const float3 hit = float3(abs(stripFrac - curveV.x) < halfPx ? 1.0 : 0.0,
+		                          abs(stripFrac - curveV.y) < halfPx ? 1.0 : 0.0,
+		                          abs(stripFrac - curveV.z) < halfPx ? 1.0 : 0.0);
+		dFinal = lerp(dOut, saturate(hit + 0.15), saturate(hit.x + hit.y + hit.z));
+	}
+
+	cScene.rgb = (half3)dFinal;
+}

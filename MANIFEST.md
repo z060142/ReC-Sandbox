@@ -1,11 +1,23 @@
-# Sync manifest
+﻿# Sync manifest
 
 Baseline : main @ a34100a9 (pristine CRYENGINE 5.7.1)
-Dev      : dev @ a4fed24b
-Synced   : 2026-09-10 21:46
+Dev      : grain @ 4248e526
+Synced   : 2026-09-11 08:38
 
 ## Commits (newest first)
 
+- 4248e526 docs: the film grain ships as G0 + G1; plates and EXR metadata are parked, and the docs say so
+- eca24095 fix: a moving camera dragged the picture over a static speckle layer - DSNU is a residual
+- 4a0bca57 fix: structured sensor noise was orders of magnitude too loud, and the integration exponent goes to 0
+- e273c308 fix: the digital film grain sparkled in the dark - sensor noise is additive, not a perturbation in stops
+- 03cfc671 docs: rebase the film grain onto the merged main line - spec status, the scene-referred gate, cinecam naming
+- c0669784 feat: capture-side film grain, stage G1 - the digital sensor model (CMOS / CCD / Phone)
+- 1b2f0dd8 fix: film grain kept the linear mean and so tinted the picture - keep the encoded mean instead
+- f9f19059 fix: RunTime.ext back to LF line endings
+- 8cd90b55 docs: the film grain spec is based on dev, not on the scene-referred tree
+- d57506d7 fix: let the PostAA composition shader see %_RT_SAMPLE6 - the film grain block never compiled
+- d654af0c feat: capture-side film grain, stage G0 - skeleton, gating and the white-Gaussian generator
+- 8c75bd52 docs: film grain specification for the cinematic camera
 - a4fed24b tune: the CineCam Grade panel puts the wheels beside the parameters in a wide dock
 - ebb2185e tune: fine control on every draggable control of the CineCam Grade panel
 - 524e1718 fix: the sprite bokeh report called its cutoff "stops over mid grey", which it is not
@@ -222,6 +234,7 @@ Synced   : 2026-09-10 21:46
 - M	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LensOptics.cpp
 - M	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/MotionBlur.cpp
 - M	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/PostAA.cpp
+- M	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/PostAA.h
 - M	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/PostEffects.cpp
 - M	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/PostEffects.h
 - M	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/SceneForward.cpp
@@ -277,6 +290,7 @@ Synced   : 2026-09-10 21:46
 - A	Code/CryPlugins/CinematicCamera/DofLensModelSpec.md
 - A	Code/CryPlugins/CinematicCamera/EffectAuthoritySpec.md
 - A	Code/CryPlugins/CinematicCamera/FieldPupilSpec.md
+- A	Code/CryPlugins/CinematicCamera/FilmGrainSpec.md
 - A	Code/CryPlugins/CinematicCamera/FilterPSFSpec.md
 - A	Code/CryPlugins/CinematicCamera/HalationSpec.md
 - A	Code/CryPlugins/CinematicCamera/HybridDofSpec.md
@@ -350,11 +364,13 @@ Synced   : 2026-09-10 21:46
 - A	Code/Sandbox/Plugins/CinematicCameraEditor/StdAfx.cpp
 - A	Code/Sandbox/Plugins/CinematicCameraEditor/StdAfx.h
 - M	Code/Tools/CryCommonTools/FileUtil.cpp
+- M	Engine/Shaders/CMakeLists.txt
 - M	Engine/Shaders/HWScripts/CryFX/Clouds.cfx
 - M	Engine/Shaders/HWScripts/CryFX/CommonMath.cfi
 - M	Engine/Shaders/HWScripts/CryFX/DepthOfField.cfx
 - M	Engine/Shaders/HWScripts/CryFX/Eye.cfx
 - M	Engine/Shaders/HWScripts/CryFX/FXConstantDefs.cfi
+- A	Engine/Shaders/HWScripts/CryFX/FilmGrain.cfi
 - M	Engine/Shaders/HWScripts/CryFX/Glass.cfx
 - M	Engine/Shaders/HWScripts/CryFX/HDRPostProcess.cfx
 - M	Engine/Shaders/HWScripts/CryFX/Hair.cfx
@@ -376,6 +392,8 @@ Synced   : 2026-09-10 21:46
 - M	Engine/Shaders/HWScripts/CryFX/WaterReflectionsPass.cfi
 - M	Engine/Shaders/HWScripts/CryFX/WaterVolume.cfx
 - M	Engine/Shaders/HWScripts/CryFX/shadeLib.cfi
+- M	Engine/Shaders/RunTime.ext
+- M	Engine/Shaders/hwscripts.waf_files
 - M	Tools/CMake/BuildEngine.cmake
 - M	Tools/CMake/BuildSandbox.cmake
 - M	Tools/CMake/CRYENGINE-MSVC.cmake

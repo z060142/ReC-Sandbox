@@ -499,6 +499,56 @@ int CPostEffectsMgr::Init()
 	// thread; the bus double-buffers it like every other Global_User_ param. Default 0 = stock.
 	AddParamFloatNoTransition("Global_User_SunShaftsSuppressed", m_pUserSunShaftsSuppressed, 0.0f);
 
+	// The capture-side film grain block (FilmGrainSpec.md section 4). One switch, one family
+	// selector, six vectors of numbers and two texture slots - everything the grain shader needs,
+	// published by the cinematic camera and read once per frame in the composition pass.
+	//
+	// No transition on any of them. A grain parameter is a property of the negative or of the
+	// sensor, not a value to cross-fade: the renderer easing from one grain size to another
+	// while a shot is running would be an invention nothing asked for, and the seed and the
+	// capture-frame index are integers carried in floats - interpolating them is meaningless.
+	//
+	// Active defaults to 0, so a stock frame, an unpublishing camera and a camera whose grain is
+	// switched off all take the engine's own grain path unchanged.
+	AddParamFloatNoTransition("Grain_User_Active", m_pUserGrainActive, 0.0f);
+	AddParamFloatNoTransition("Grain_User_Family", m_pUserGrainFamily, 0.0f);
+	// amount r, g, b (already ISO- and strength-scaled by the camera), and the channel
+	// correlation rho: 1 = monochrome grain, 0 = three independent layers.
+	AddParamVec4NoTransition("Grain_User_Amount", m_pUserGrainAmount, Vec4(0.0f, 0.0f, 0.0f, 0.0f));
+	// grain size in MICROMETRES ON THE NEGATIVE per channel, plus the plate texel size (0 =
+	// procedural generator, which is all G0 has).
+	AddParamVec4NoTransition("Grain_User_Size", m_pUserGrainSize, Vec4(6.0f, 6.0f, 6.0f, 0.0f));
+	// sensor width in mm, anamorphic squeeze, the virtual sensor width in photosites, and a
+	// manual output-pixel footprint override in um (0 = derive it from the render resolution).
+	AddParamVec4NoTransition("Grain_User_Sensor", m_pUserGrainSensor, Vec4(36.0f, 1.0f, 6000.0f, 0.0f));
+	// shot seed, capture frame index, freeze flag, algorithm version. All integers in floats;
+	// a float carries an exact integer far past the 65535 the seed can reach.
+	AddParamVec4NoTransition("Grain_User_Seed", m_pUserGrainSeed, Vec4(0.0f, 0.0f, 0.0f, 1.0f));
+	// The digital sensor model (section 3.4), unused by the G0 white-Gaussian generator:
+	// full well in electrons, base ISO, working ISO, read noise sigma in electrons.
+	AddParamVec4NoTransition("Grain_User_Digital0", m_pUserGrainDigital0, Vec4(60000.0f, 800.0f, 800.0f, 3.0f));
+	// PRNU (fraction), DSNU and row noise (both in ELECTRONS, like every other term of the
+	// sensor model), and the chroma noise reduction strength.
+	AddParamVec4NoTransition("Grain_User_Digital1", m_pUserGrainDigital1, Vec4(0.005f, 1.0f, 0.3f, 0.6f));
+	// The rest of the sensor model: the raw white-balance gains the sensor's red and blue
+	// channels are multiplied by (green is the reference and is always 1, as in every raw
+	// developer), the number of stacked frames a computational body averages, and the CCD
+	// vertical smear / column-noise strength. Neutral = (1, 1, 1 frame, no smear).
+	AddParamVec4NoTransition("Grain_User_Digital2", m_pUserGrainDigital2, Vec4(1.0f, 1.0f, 1.0f, 0.0f));
+	// The sensor -> output integration exponent, the one number in the sensor model that is a
+	// look choice rather than a datasheet value: averaging N photosites into one output pixel
+	// divides the variance by N in theory, but demosaicing correlates them first, so a real
+	// downscaled raw frame is measurably noisier than 1/N. 0.7 is the documented compromise
+	// (sigma falls as N^0.35), 1.0 is the textbook result, and 0.0 turns the integration off -
+	// the "pixel peeping at 1:1" look, one photosite's noise on one output pixel whatever the
+	// downscale factor. A NEGATIVE value selects the shader's own fallback. y, z, w reserved.
+	AddParamVec4NoTransition("Grain_User_Digital3", m_pUserGrainDigital3, Vec4(0.7f, 0.0f, 0.0f, 0.0f));
+	// Renderer texture IDs of the plugin-owned 1D response LUT and the grain plate array,
+	// published the way the display LUTs are. 0 = not supplied; G0 uses the shader's built-in
+	// response and has no plates.
+	AddParamFloatNoTransition("Grain_User_Response", m_pUserGrainResponse, 0.0f);
+	AddParamFloatNoTransition("Grain_User_Plates", m_pUserGrainPlates, 0.0f);
+
 	// Register all post processes
 	AddEffect(CSunShafts);
 	AddEffect(CDepthOfField);
