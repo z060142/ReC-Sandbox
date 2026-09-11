@@ -76,8 +76,9 @@ under it, plus **CMOS**, **CCD** and **Phone** families built on a real sensor-n
 noise, read noise, fixed-pattern noise) instead of a procedural texture. Grain is deterministic
 per capture frame: a stateless hash of the shot seed, capture-frame index, view and cell, no wall
 clock, so a rendered sequence grains the same way on replay. With the block off, engine grain is
-untouched and the stock path is byte-identical. Deploy note: `engine/shaders/RunTime.ext` must be
-deployed as a loose file, or the grain technique's runtime flag stays masked off. Full spec:
+untouched and the stock path is byte-identical. Deploy note: the repository's
+`engine/Engine/Shaders/RunTime.ext` must be deployed as a loose file into the engine's `engine/shaders/`,
+or the grain technique's runtime flag stays masked off and the grain block never compiles. Full spec:
 `engine/Code/CryPlugins/CinematicCamera/FilmGrainSpec.md`.
 
 ## Status
@@ -120,8 +121,10 @@ of this repository.
    `CinematicCameraEditor` (the Sandbox side).
 3. Copy the built DLLs into the engine's `bin/win_x64/` (`CinematicCameraEditor.dll` goes into
    `bin/win_x64/EditorPlugins/`), the changed `.cfx` / `.cfi` shaders into
-   `engine/shaders/HWScripts/CryFX/` (the engine compiles loose shader files at startup), and the
-   `Assets/cinecam/` tree next to your project's assets.
+   `engine/shaders/HWScripts/CryFX/` (the engine compiles loose shader files at startup),
+   `Engine/Shaders/RunTime.ext` into `engine/shaders/` as a loose file (it lists the runtime flag the
+   film grain needs; without it the grain never compiles in), and the `Assets/cinecam/` tree next to
+   your project's assets.
 4. Add the `CinematicCamera` and `CryPhoneTracker` plugins to your project's `.cryproject`.
 
 ## Repository layout
