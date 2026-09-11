@@ -1,0 +1,353 @@
+From bde12cd8671a6128c69ea92163b3a62442cb2b7d Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Fri, 11 Sep 2026 09:11:16 +0800
+Subject: [PATCH 163/175] fix: the CineCam Grade preset slot no longer keeps a
+ raw pointer to its component (S10 item 6)
+
+Sandbox died with a heap corruption (0xC0000374) around the CineCam Grade
+component's property data: four dumps on 2026-09-10, all on the main thread with
+the render thread idle, three of them freeing a CryString in the grade panel's
+idle poll and one in the inspector's Schematyc property snapshot. The freeing
+site was never the writer.
+
+Root cause, argued from the code (page heap could not be run, see below):
+
+SCineGradePresetSlot is a REFLECTED type, and it held a raw
+CCineGradeComponent* plus two Serialization::ActionButtons built with
+functor(*this, &member). Both are pointers into a component, embedded in a value
+that Schematyc and the editor copy, cache and outlive:
+
+  * CClassProperties::Read copy-constructs the slot into a CScratchpad on every
+    inspector widget build, and CEntityComponentsCache keeps one across a whole
+    game-mode round trip;
+  * CClassProperties::Apply copies that cached value back ONTO the live
+    component - the pointer with it - and Apply also runs before Initialize();
+  * PropertyRowActionButton clones the functor it is given and keeps the clone
+    for the life of the row, which survives revert, game mode, undo and a level
+    reload.
+
+OnExport() then wrote through that pointer: SetAppliedPath() is two
+CryStringT::operator=, i.e. a real CryModuleFree and a store. A free of a stale
+block and a store into freed memory, with no symptom until some later, innocent
+free - which is what the four dumps are.
+
+The fix: the way back becomes an EntityId instead of a pointer. Serialize() and
+both buttons resolve the component fresh on every use through
+gEnv->pEntitySystem->GetEntity(id)->GetComponent<>() and never store the result,
+and the buttons are lambdas capturing the id BY VALUE, so the row's cloned
+functor owns nothing at all. EntityId carries a salt, so a stale id resolves to
+nullptr rather than to a stranger's memory; copying, caching and Apply-ing the
+struct become meaningless instead of dangerous. Item 4b's behaviour is
+unchanged: the apply still happens inside the input serialization, so it is
+still inside the editor's save snapshot (EntityObject.cpp:912 before :928), the
+picker row still does apply()+revert() so the inspector redraws, and the undo
+transaction still covers the whole component.
+
+Containment, labelled as such: CineGradeBinding.cpp ReadOne/WriteOne now copy
+characters instead of assigning CryStrings, so the panel no longer co-owns a
+refcounted block with a component in another DLL and can no longer be the module
+that frees it from an idle timer.
+
+Everything else the integration audit listed as a candidate was read and
+excluded - the .cube parser, the LUT wrap and upload, the texture release by
+name, the curve bake, the panel's loops and raster, the asset sidecar writer,
+and the Schematyc scratchpad's sizing. Notes in
+scene-notes/research/s10-6-grade-heap-corruption.md, decision in
+scene-notes/decisions/s10-grade-component.md section "Item 6".
+
+Not confirmed by page heap: gflags is not installed, enabling page heap by hand
+needs elevation, and the reproduction is a GUI sequence the editor automation
+harness cannot drive. The WER dumps are minidumps and carry no heap pages, so
+the corrupting pattern could not be read post-mortem either.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01ADgAiBYv9AxSd54s1FPREm
+---
+ .../Module/CineGradeComponent.cpp             | 89 +++++++++++++------
+ .../Module/CineGradeComponent.h               | 53 +++++++++--
+ .../CineGradeBinding.cpp                      | 20 ++++-
+ 3 files changed, 122 insertions(+), 40 deletions(-)
+
+diff --git a/Code/CryPlugins/CinematicCamera/Module/CineGradeComponent.cpp b/Code/CryPlugins/CinematicCamera/Module/CineGradeComponent.cpp
+index bcd89cb4..a935f952 100644
+--- a/Code/CryPlugins/CinematicCamera/Module/CineGradeComponent.cpp
++++ b/Code/CryPlugins/CinematicCamera/Module/CineGradeComponent.cpp
+@@ -154,9 +154,13 @@ void SCineGradePresetSlot::Serialize(Serialization::IArchive& archive)
+ 
+ 	if (archive.isEdit())
+ 	{
+-		archive(Serialization::ActionButton(functor(*this, &SCineGradePresetSlot::OnExport)),
++		// BY VALUE, and that is the whole point of item 6: ActionButton's row clones the functor
++		// and keeps the clone for the life of the row, which outlives this struct across game
++		// mode, undo and a level reload. A lambda that captures an EntityId owns nothing.
++		const EntityId ownerEntity = m_ownerEntity;
++		archive(Serialization::ActionButton([ownerEntity]() { SCineGradePresetSlot::OnExport(ownerEntity); }),
+ 		        "ExportPreset", "Export Preset");
+-		archive(Serialization::ActionButton(functor(*this, &SCineGradePresetSlot::OnReapply)),
++		archive(Serialization::ActionButton([ownerEntity]() { SCineGradePresetSlot::OnReapply(ownerEntity); }),
+ 		        "ReapplyPreset", "Re-apply Preset");
+ 	}
+ 
+@@ -169,50 +173,79 @@ void SCineGradePresetSlot::Serialize(Serialization::IArchive& archive)
+ 	if (archive.isEdit() && value != m_applied)
+ 	{
+ 		m_applied = value;
+-		if (m_pOwner != nullptr && !value.empty() && m_pOwner->ApplyPreset(value.c_str()))
+-			m_pOwner->RefreshAfterApply();
++		// Resolved here and thrown away here. A copy of this struct that the inspector or the
++		// component cache is holding carries a stale id at worst, and a stale id resolves to
++		// nullptr (EntityId carries a salt, so a recycled index is not mistaken for the old
++		// entity) - it can never resolve to somebody else's memory.
++		if (CCineGradeComponent* const pOwner = Resolve(m_ownerEntity))
++		{
++			if (!value.empty() && pOwner->ApplyPreset(value.c_str()))
++				pOwner->RefreshAfterApply();
++		}
+ 	}
+ }
+ 
++CCineGradeComponent* SCineGradePresetSlot::Resolve(EntityId id)
++{
++	if (id == INVALID_ENTITYID || gEnv == nullptr || gEnv->pEntitySystem == nullptr)
++		return nullptr;
++
++	IEntity* const pEntity = gEnv->pEntitySystem->GetEntity(id);
++	return pEntity ? pEntity->GetComponent<CCineGradeComponent>() : nullptr;
++}
++
+ // The button path, unlike the picker path, does NOT run inside an input serialization
+ // (PropertyRowActionButton::onMouseUp calls the callback and then tree->revert(), which is an
+ // output pass), so both of these have to re-run the editor's save snapshot by hand.
+-void SCineGradePresetSlot::OnExport()
++//
++// Static, and reached through the entity: the button that calls this may belong to a property row
++// built for a component that no longer exists. The lookup is what turns that from a write into
++// freed memory into a no-op.
++void SCineGradePresetSlot::OnExport(EntityId id)
+ {
+-	if (m_pOwner == nullptr)
++	CCineGradeComponent* const pOwner = Resolve(id);
++	if (pOwner == nullptr)
+ 		return;
+ 
+-	const string written = m_pOwner->ExportPreset();
++	const string written = pOwner->ExportPreset();
+ 	if (written.empty())
+ 		return;
+ 
+ 	// SetAppliedPath and not a plain assignment: the next input pass must not read this as a fresh
+-	// pick and re-apply the file we have just written out of the very values we hold.
+-	SetAppliedPath(written.c_str());
+-	m_pOwner->SyncEditorPropertySnapshot();
++	// pick and re-apply the file we have just written out of the very values we hold. Written into
++	// the LIVE component's slot (pOwner->m_preset), never into whatever copy the row was built
++	// from - the two are not the same object once the inspector has cached anything.
++	pOwner->SetPresetAppliedPath(written.c_str());
++	pOwner->SyncEditorPropertySnapshot();
+ }
+ 
+-void SCineGradePresetSlot::OnReapply()
++void SCineGradePresetSlot::OnReapply(EntityId id)
+ {
+-	if (m_pOwner == nullptr || value.empty())
++	CCineGradeComponent* const pOwner = Resolve(id);
++	if (pOwner == nullptr)
+ 		return;
+ 
+-	if (m_pOwner->ApplyPreset(value.c_str()))
++	const string path = pOwner->GetPresetPath();
++	if (path.empty())
++		return;
++
++	if (pOwner->ApplyPreset(path.c_str()))
+ 	{
+-		m_applied = value;
+-		m_pOwner->SyncEditorPropertySnapshot();
+-		m_pOwner->RefreshAfterApply();
++		pOwner->SetPresetAppliedPath(path.c_str());
++		pOwner->SyncEditorPropertySnapshot();
++		pOwner->RefreshAfterApply();
+ 	}
+ }
+ 
+ // ---------------------------------------------------------------------------
+ // IEntityComponent
+ // ---------------------------------------------------------------------------
+-// The one thing initialisation is for: handing the preset slot the pointer its three rows need.
+-// Same place and same reason as CDebugSerializeHelper's SetComponent (TriggerComponent.cpp:132).
++// The one thing initialisation is for: handing the preset slot the entity its three rows need.
++// Same place and same reason as CDebugSerializeHelper's SetComponent (TriggerComponent.cpp:132) -
++// but an id and not a pointer, see the header comment on SCineGradePresetSlot.
+ void CCineGradeComponent::Initialize()
+ {
+-	m_preset.SetOwner(this);
++	m_preset.SetOwnerEntity(m_pEntity ? m_pEntity->GetId() : INVALID_ENTITYID);
+ }
+ 
+ bool CCineGradeComponent::ApplyPreset(const char* szRelPath)
+@@ -320,15 +353,15 @@ void CCineGradeComponent::ProcessEvent(const SEntityEvent& event)
+ 	if (event.event != ENTITY_EVENT_COMPONENT_PROPERTY_CHANGED || m_pEntity == nullptr)
+ 		return;
+ 
+-	// Re-arm the preset slot's back-pointer. It is set in Initialize(), and the Schematyc object
+-	// path applies stored properties BEFORE Initialize (Object.cpp:636-655) so that is normally
+-	// enough - but CEntityComponentsCache::LoadComponent (:100-108), which is what restores a
+-	// component's properties when the editor leaves game mode, calls CClassProperties::Apply on a
+-	// LIVE component and then sends exactly this event. Apply is a memberwise copy, so it
+-	// overwrites the pointer with whatever the cached copy held. One assignment here closes that
+-	// window; the alternative - keeping a raw owner pointer out of a serialised struct entirely -
+-	// would mean the buttons cannot exist.
+-	m_preset.SetOwner(this);
++	// Re-arm the preset slot's owner id. It is set in Initialize(), and the Schematyc object path
++	// applies stored properties BEFORE Initialize (Object.cpp:636-655) so that is normally enough -
++	// but CEntityComponentsCache::LoadComponent (:100-108), which is what restores a component's
++	// properties when the editor leaves game mode, calls CClassProperties::Apply on a LIVE
++	// component and then sends exactly this event. Apply is a memberwise copy, so it overwrites
++	// the id with whatever the cached copy held. This assignment closes that window - and since
++	// S10 item 6 the thing being overwritten is a HANDLE, so the window being open is a no-op
++	// (a stale id resolves to nullptr) instead of a write through a dangling pointer.
++	m_preset.SetOwnerEntity(m_pEntity->GetId());
+ 
+ 	// The editor sends this event to the EDITED component only (EntityObject.cpp:831/934), so the
+ 	// camera does not hear about a grade change by itself. This is the latency nudge from
+diff --git a/Code/CryPlugins/CinematicCamera/Module/CineGradeComponent.h b/Code/CryPlugins/CinematicCamera/Module/CineGradeComponent.h
+index aad4a79f..72ebd7ed 100644
+--- a/Code/CryPlugins/CinematicCamera/Module/CineGradeComponent.h
++++ b/Code/CryPlugins/CinematicCamera/Module/CineGradeComponent.h
+@@ -25,8 +25,10 @@
+ #include "CineCamLutTypes.h"
+ // Serialization::ActionButton - the two buttons in the preset slot below. Shipped precedent for a
+ // button on an entity component: CryDefaultEntities' CDebugSerializeHelper (TriggerComponent.h:68).
++// The buttons take lambdas and not CryEngine functors, so <CryCore/functor.h> is deliberately NOT
++// included here: a functor built from (*this, &member) is exactly the pointer capture item 6 removed.
+ #include <CrySerialization/Decorators/ActionButton.h>
+-#include <CryCore/functor.h>
++#include <CryEntitySystem/IEntitySystem.h>
+ // The shared definition of the two 1D curves: knot positions, the interpolator, the bake and the
+ // neutrality tests. The renderer's EXR exporter includes the SAME header to write the master curve
+ // out as a .cube beside a capture, so there is exactly one answer to "what is the curve between
+@@ -368,9 +370,26 @@ class CCineGradeComponent;
+ //
+ // Three rows: a Grade Preset asset picker, an Export button and a Re-apply button. It carries a
+ // hand-written Serialize() rather than reflected members because all three of them need something
+-// a plain reflected field cannot have: a pointer back to the component that owns it (the shipped
+-// precedent is CryDefaultEntities' CDebugSerializeHelper, TriggerComponent.h:68 / .cpp:295-322,
+-// wired in Initialize()).
++// a plain reflected field cannot have: a way back to the component that owns it.
++//
++// WHY THAT WAY BACK IS AN EntityId AND NOT A POINTER (S10 item 6, the heap-corruption fix;
++// decisions/s10-grade-component.md "Item 6", research/s10-6-grade-heap-corruption.md).
++// This struct is REFLECTED, and a reflected type in Schematyc is copied, cached and outlived:
++//   * Schematyc::CClassProperties::Read copy-constructs one into a CScratchpad every time the
++//     inspector builds a widget (ClassProperties.h:54/:101) and the editor's component cache keeps
++//     one for the whole of a game-mode round trip (EntityComponentsCache.cpp:77);
++//   * CClassProperties::Apply then copies that cached value back ONTO a live component, which
++//     means whatever the copy holds is written into the live one - a pointer included;
++//   * Serialization::ActionButton's row CLONES the functor it is given and keeps the clone for the
++//     life of the property row (PropertyRowActionButton), which outlives the component across
++//     game mode, undo and level reload.
++// A raw CCineGradeComponent* therefore goes stale in three ordinary ways and is then WRITTEN
++// THROUGH by the Export / Re-apply path (SetAppliedPath assigns two CryStrings through it, i.e. a
++// free and a store into freed memory) - heap corruption with no symptom until some later, innocent
++// free. An EntityId is a value: copying it is meaningless, a stale one resolves to nullptr through
++// the entity system's salt, and nothing is ever written through it without that lookup succeeding.
++// For the same reason the two buttons capture that id BY VALUE in a lambda instead of capturing
++// `this`, so the row's cloned functor owns no pointer into this struct at all.
+ //
+ // WHY THE APPLY HAPPENS IN HERE, AND WHY THIS MEMBER IS DECLARED LAST
+ // (decisions/s10-grade-component.md 4b.6, research/s10-4b-asset-system.md section 7).
+@@ -393,7 +412,10 @@ struct SCineGradePresetSlot
+ 	inline bool operator==(const SCineGradePresetSlot& rhs) const { return value == rhs.value; }
+ 
+ 	void        Serialize(Serialization::IArchive& archive);
+-	void        SetOwner(CCineGradeComponent* pOwner) { m_pOwner = pOwner; }
++	//! The entity this slot's component sits on. Re-armed in Initialize() and on every
++	//! property-changed event, because CClassProperties::Apply overwrites it memberwise from a
++	//! cached copy when the editor leaves game mode.
++	void        SetOwnerEntity(EntityId id) { m_ownerEntity = id; }
+ 	//! Called by the export path so that the picker shows what was just written without that
+ 	//! looking like a fresh user pick (which would re-apply the file we have just saved).
+ 	void        SetAppliedPath(const char* szPath) { value = szPath; m_applied = szPath; }
+@@ -402,14 +424,20 @@ struct SCineGradePresetSlot
+ 	string value;
+ 
+ private:
+-	void OnExport();
+-	void OnReapply();
++	//! Resolve the owning component from the id, or nullptr. The ONE place a pointer to the
++	//! component is produced, and it is produced fresh on every use and never stored.
++	static CCineGradeComponent* Resolve(EntityId id);
++	//! The two buttons, by value: they take the id rather than a `this`, so the functor the
++	//! property row clones and keeps holds nothing that can dangle.
++	static void OnExport(EntityId id);
++	static void OnReapply(EntityId id);
+ 
+ 	//! What value held the last time this slot was read out to the inspector. The inspector always
+ 	//! serialises OUT before it serialises IN, so this is how "the user just picked something new"
+ 	//! is told apart from "the user changed some other property and this row came along".
+-	string               m_applied;
+-	CCineGradeComponent* m_pOwner = nullptr;
++	string   m_applied;
++	//! A handle, never a pointer. See the header comment above this struct.
++	EntityId m_ownerEntity = INVALID_ENTITYID;
+ };
+ 
+ inline void ReflectType(Schematyc::CTypeDesc<SCineGradePresetSlot>& desc)
+@@ -472,6 +500,13 @@ public:
+ 	//! Write the current state to Assets/cinecam/grades/<entity>.cinegrade plus its .cryasset, and
+ 	//! point the preset slot at it. Returns the asset-relative path, or an empty string.
+ 	string ExportPreset();
++	//! The path the preset slot currently holds, by value. By value and not by reference: the
++	//! button path re-resolves the component and must not hand a reference into a member it is
++	//! about to overwrite.
++	string GetPresetPath() const { return m_preset.value; }
++	//! Point the slot at a file and mark it as already applied, so the next input pass does not
++	//! read it as a fresh user pick. Only ever called on a LIVE component.
++	void   SetPresetAppliedPath(const char* szPath) { m_preset.SetAppliedPath(szPath); }
+ 	//! Re-run the editor's own "read the component into the thing that gets saved" step - literally
+ 	//! the pair of calls at EntityObject.cpp:925/928. Needed after any write that did NOT happen
+ 	//! inside an input serialization (i.e. after a button), and a harmless no-op outside the editor
+diff --git a/Code/Sandbox/Plugins/CinematicCameraEditor/CineGradeBinding.cpp b/Code/Sandbox/Plugins/CinematicCameraEditor/CineGradeBinding.cpp
+index 83f182fd..ab36b4bb 100644
+--- a/Code/Sandbox/Plugins/CinematicCameraEditor/CineGradeBinding.cpp
++++ b/Code/Sandbox/Plugins/CinematicCameraEditor/CineGradeBinding.cpp
+@@ -210,9 +210,19 @@ static void ReadOne(const SMemberEntry& entry, const void* pSrc, SGradeValues& o
+ 	case EKind::LutSpace: *static_cast<uint32*>(pDst) = *static_cast<const uint32*>(pSrc); break;
+ 	case EKind::LutPath:
+ 	case EKind::PresetPath:
+-		*static_cast<string*>(pDst) = *static_cast<const string*>(pSrc);
++	{
++		// CHARACTERS, not the buffer. CryStringT::operator= shares the refcounted block
++		// (CryString.h:418-424), so a plain assignment would leave the panel co-owning a heap
++		// block whose other owner is a component in another DLL - and the panel's next poll would
++		// then FREE that block, in this module, from an idle timer. That is the shape of every
++		// crash in scene-notes/grain/reports/03-integration-audit.md section 1.3. Copying is a
++		// handful of bytes on a path and takes the panel out of that ownership entirely: it can
++		// no longer be the one that frees a component's string, whatever damaged it.
++		const string& src = *static_cast<const string*>(pSrc);
++		static_cast<string*>(pDst)->assign(src.c_str(), src.length());
+ 		break;
+ 	}
++	}
+ }
+ 
+ //! Writes only what actually differs, so an unchanged string is never reallocated and an
+@@ -239,9 +249,13 @@ static void WriteOne(const SMemberEntry& entry, void* pDst, const SGradeValues&
+ 			*static_cast<uint32*>(pDst) = *static_cast<const uint32*>(pSrc);
+ 		break;
+ 	case EKind::LutPath:
+-		if (*static_cast<string*>(pDst) != *static_cast<const string*>(pSrc))
+-			*static_cast<string*>(pDst) = *static_cast<const string*>(pSrc);
++	{
++		// \sa ReadOne - characters, so the component never ends up sharing a block with the panel.
++		const string& src = *static_cast<const string*>(pSrc);
++		if (*static_cast<string*>(pDst) != src)
++			static_cast<string*>(pDst)->assign(src.c_str(), src.length());
+ 		break;
++	}
+ 	case EKind::PresetPath:
+ 		// Read-only in the panel: the two preset buttons live on the component and cannot be
+ 		// called from here (decisions section 5.2), and writing the path alone would show a
+-- 
+2.47.1.windows.1
+
