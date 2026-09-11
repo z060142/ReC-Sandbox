@@ -532,6 +532,18 @@ public:
 		, m_pUserCurveSatA(nullptr)
 		, m_pUserCurveSatB(nullptr)
 		, m_pUserSunShaftsSuppressed(nullptr)
+		, m_pUserGrainActive(nullptr)
+		, m_pUserGrainFamily(nullptr)
+		, m_pUserGrainAmount(nullptr)
+		, m_pUserGrainSize(nullptr)
+		, m_pUserGrainSensor(nullptr)
+		, m_pUserGrainSeed(nullptr)
+		, m_pUserGrainDigital0(nullptr)
+		, m_pUserGrainDigital1(nullptr)
+		, m_pUserGrainDigital2(nullptr)
+		, m_pUserGrainDigital3(nullptr)
+		, m_pUserGrainResponse(nullptr)
+		, m_pUserGrainPlates(nullptr)
 	{
 		ClearCache();
 #ifndef _RELEASE
@@ -777,6 +789,26 @@ protected:
 	//! The sky's vote in the metering histogram, 0..1 (decisions/s8-metering-sky.md). An INPUT
 	//! like MeterMode.
 	CEffectParam*       m_pUserMeterSkyWeight;
+	// The capture-side film grain block (FilmGrainSpec.md section 4). Published by the cinematic
+	// camera every frame and read once per frame by CPostAAStage::DoFinalComposition, which is
+	// where the grain is applied. Active 0 - the state of every stock frame and of a camera that
+	// does not publish - leaves the stock grain path untouched, so the permutation, the constants
+	// and the picture are byte for byte the engine's own.
+	//
+	// Vec4s rather than eighteen floats because a grain parameter is naturally a triple plus one
+	// (per-channel amount plus the channel correlation, per-channel size plus the plate texel),
+	// and because the shader wants them as constants in exactly that shape.
+	CEffectParam*       m_pUserGrainActive, * m_pUserGrainFamily;
+	CEffectParam*       m_pUserGrainAmount, * m_pUserGrainSize, * m_pUserGrainSensor, * m_pUserGrainSeed;
+	CEffectParam*       m_pUserGrainDigital0, * m_pUserGrainDigital1, * m_pUserGrainDigital2;
+	//! x = the sensor -> output integration exponent (0 = none, 0.7 = default, 1 = the
+	//! textbook 1/N); y, z, w reserved. A preset value, so a body can carry its own.
+	CEffectParam*       m_pUserGrainDigital3;
+	// Texture IDs of the plugin-owned response LUT and grain plate array, resolved with
+	// CTexture::GetByID exactly like the display LUTs. Both 0 in G0: the response is the shader's
+	// built-in curve and the generator is procedural.
+	CEffectParam*       m_pUserGrainResponse, * m_pUserGrainPlates;
+
 	CEffectParam*       m_pUserColorC, * m_pUserColorY, * m_pUserColorM, * m_pUserColorK, * m_pUserColorHue;
 
 	CPostEffectVec      m_pEffects;

@@ -210,6 +210,9 @@ int CRendererCVars::CV_r_HDREyeAdaptationMode;
 
 float CRendererCVars::CV_r_HDRRangeAdaptationSpeed;
 float CRendererCVars::CV_r_HDRGrainAmount;
+int CRendererCVars::CV_r_FilmGrain;
+int CRendererCVars::CV_r_FilmGrainDebug;
+int CRendererCVars::CV_r_FilmGrainFreeze;
 AllocateConstIntCVar(CRendererCVars, CV_r_GrainEnableExposureThreshold);
 
 float CRendererCVars::CV_r_Sharpening;
@@ -1420,6 +1423,33 @@ void CRendererCVars::InitCVars()
 	                    "Enable/Disable Legacy Exposure-based grain threshold\n"
 	                    "Usage: r_GrainEnableExposureThreshold [Value]\n"
 	                    "Default is 0");
+
+	REGISTER_CVAR3("r_FilmGrain", CV_r_FilmGrain, 1, VF_NULL,
+	               "Master switch for the CAPTURE-SIDE film grain (FilmGrainSpec.md), the grain "
+	               "that has a size in micrometres on the negative, an amplitude that follows the "
+	               "tone through a response curve, colour structure per layer and a fresh "
+	               "deterministic pattern per captured frame. It is a separate shader permutation "
+	               "that ONLY runs when the Cinematic Camera component asks for it (Enable Film "
+	               "Grain); while it runs, the engine's own overlay grain is forced to 0. "
+	               "1 = honour the request (default), 0 = ignore it and always take the stock "
+	               "path, which is then byte for byte the engine's own grain - the first thing to "
+	               "try if anything about the noise looks wrong.");
+	REGISTER_CVAR3("r_FilmGrainDebug", CV_r_FilmGrainDebug, 0, VF_NULL,
+	               "DIAGNOSTIC for the capture-side film grain. 0 = off (default). 1 = throw the "
+	               "picture away and apply the grain to a flat MID GREY card (linear 0.18) "
+	               "instead, so the pattern, its size and its amplitude can be read with nothing "
+	               "else on screen. 2 = the response curve as an overlay - not implemented until "
+	               "the response LUT arrives in G1, and behaves as 0 until then. 3 = log a "
+	               "plain-language report once a second: family, per-channel amount, grain size "
+	               "in micrometres and in output pixels, the output pixel's footprint on the "
+	               "negative, the seed, the capture frame index and whether it is frozen.");
+	REGISTER_CVAR3("r_FilmGrainFreeze", CV_r_FilmGrainFreeze, 0, VF_NULL,
+	               "Pin the capture-frame index of the capture-side film grain, so the pattern "
+	               "stops changing and the frame holds one still field of grain. The camera keeps "
+	               "counting - only what the shader seeds from is held - so nothing drifts when "
+	               "it is released. Use it to tell grain apart from temporal AA noise, and to "
+	               "compare two settings on the identical pattern. 0 = the grain rolls (default), "
+	               "1 = frozen.");
 
 	REGISTER_CVAR3("r_ChromaticAberration", CV_r_ChromaticAberration, 0.0f, VF_NULL,
 	               "Chromatic aberration amount\n"

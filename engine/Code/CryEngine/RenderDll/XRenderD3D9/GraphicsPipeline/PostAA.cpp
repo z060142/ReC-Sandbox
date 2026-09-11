@@ -418,13 +418,73 @@ void CPostAAStage::DoFinalComposition(CTexture*& pCurrRT, CTexture* pDestRT, uin
 	// lateral chromatic aberration all stay: they are ours, or they are geometry rather than
 	// grading.
 	const bool bSceneReferred = CRendererResources::IsSceneReferredStage(5);
+	// ------------------------------------------------------------------------------------------
+	// Capture-side film grain (FilmGrainSpec.md). The cinematic camera publishes the whole block
+	// on the post-effect bus and this pass is its only consumer: a grain with a size in
+	// micrometres on the negative, a response over tone, colour structure per layer and a fresh
+	// deterministic pattern per CAPTURED frame, in place of the engine's overlay of a white-noise
+	// volume addressed in frame coordinates and animated off the wall clock.
+	//
+	// Three things have to be true before any of it happens - the camera asked (Active), the kill
+	// switch allows it (r_FilmGrain), and there is an amount to apply - so a stock frame, a frame
+	// with no cinematic camera, and r_FilmGrain 0 all fall through to the engine's own path with
+	// the permutation, the constants and the picture untouched.
+	// ------------------------------------------------------------------------------------------
+	const bool bCineGrainRequested = CRenderer::CV_r_FilmGrain != 0
+	                                 && PostEffectMgr()->GetByNameF("Grain_User_Active") >= 0.5f;
+
+	Vec4 grainAmountVec(ZERO), grainSizeVec(ZERO), grainSensorVec(ZERO), grainSeedVec(ZERO);
+	Vec4 grainDigital0Vec(ZERO), grainDigital1Vec(ZERO), grainDigital2Vec(ZERO), grainDigital3Vec(ZERO);
+	int  grainFamily = 0;
+	bool bCineGrain = false;
+	if (bCineGrainRequested)
+	{
+		grainAmountVec   = PostEffectMgr()->GetByNameVec4("Grain_User_Amount");
+		grainSizeVec     = PostEffectMgr()->GetByNameVec4("Grain_User_Size");
+		grainSensorVec   = PostEffectMgr()->GetByNameVec4("Grain_User_Sensor");
+		grainSeedVec     = PostEffectMgr()->GetByNameVec4("Grain_User_Seed");
+		grainDigital0Vec = PostEffectMgr()->GetByNameVec4("Grain_User_Digital0");
+		grainDigital1Vec = PostEffectMgr()->GetByNameVec4("Grain_User_Digital1");
+		grainDigital2Vec = PostEffectMgr()->GetByNameVec4("Grain_User_Digital2");
+		grainDigital3Vec = PostEffectMgr()->GetByNameVec4("Grain_User_Digital3");
+		grainFamily      = (int)(PostEffectMgr()->GetByNameF("Grain_User_Family") + 0.5f);
+
+		// An all-zero amount is the camera saying "no grain this frame" (grain switched off, ISO
+		// at base with strength 0). Taking the permutation for it would cost a shader switch to
+		// compute nothing, so it counts as inactive.
+		bCineGrain = (grainAmountVec.x + grainAmountVec.y + grainAmountVec.z) > 0.0f;
+	}
+
+	// The freeze holds the capture-frame index the shader seeds from. The CAMERA keeps counting -
+	// only what is published to the shader is held - so releasing the freeze does not rewind the
+	// grain to where it was pinned. Latched on the transition so the frozen frame is the one that
+	// was on screen when the freeze was thrown, not frame 0.
+	const bool bFreezeRequested = CRenderer::CV_r_FilmGrainFreeze != 0 || grainSeedVec.z >= 0.5f;
+	if (bCineGrain)
+	{
+		if (bFreezeRequested && !m_bFilmGrainFrozen)
+			m_fFilmGrainFrozenIndex = grainSeedVec.y;
+		m_bFilmGrainFrozen = bFreezeRequested;
+		if (bFreezeRequested)
+			grainSeedVec.y = m_fFilmGrainFrozenIndex;
+	}
+	else
+	{
+		m_bFilmGrainFrozen = false;
+	}
 
 	// Calculate grain amount
 	CEffectParam* pParamGrainAmount = PostEffectMgr()->GetByName("FilterGrain_Amount");
 	CEffectParam* pParamArtifactsGrain = PostEffectMgr()->GetByName("FilterArtifacts_Grain");
 	const float paramGrainAmount = max(pParamGrainAmount->GetParam(), pParamArtifactsGrain->GetParam());
 	const float environmentGrainAmount = hdrSetupParams[1].w * CRenderer::CV_r_HDRGrainAmount;
-	const float grainAmount = bSceneReferred ? 0.0f : max(paramGrainAmount, environmentGrainAmount);
+	// While the capture-side block runs, the stock amount is forced to 0: two grains on one
+	// frame is not a look, it is a bug, and the camera is the authority over what the negative
+	// records. The plugin still writes FilterGrain_Amount every frame, so r_FilmGrain 0 lands
+	// straight back on the engine's grain at the amount the camera asked for. The scene-referred
+	// gate of D9 is unchanged and independent: on that path the stock overlay grain is inert
+	// whether or not a cinematic camera is driving, and our block is what takes the slot.
+	const float grainAmount = (bSceneReferred || bCineGrain) ? 0.0f : max(paramGrainAmount, environmentGrainAmount);
 
 	uint64 rtMask = 0;
 	if ((aaMode & (eAT_SMAA_2TX_MASK | eAT_TSAA_MASK)) && !bSceneReferred)
@@ -433,6 +493,12 @@ void CPostAAStage::DoFinalComposition(CTexture*& pCurrRT, CTexture* pDestRT, uin
 		rtMask |= g_HWSR_MaskBit[HWSR_SAMPLE4];
 	if (grainAmount && CRenderer::CV_r_GrainEnableExposureThreshold) // enable legacy grain/exposure interaction
 		rtMask |= g_HWSR_MaskBit[HWSR_SAMPLE0];
+	// SAMPLE6 was the one free runtime flag on this technique (0 legacy grain exposure, 1 lens
+	// optics, 2 sharpen, 3 chroma shift, 4 range compression, 5 flare colour chart). It selects
+	// the capture-side grain block and nothing else, so it adds exactly one permutation and only
+	// when a cinematic camera is driving the frame.
+	if (bCineGrain)
+		rtMask |= g_HWSR_MaskBit[HWSR_SAMPLE6];
 
 	auto* pLensOpticStage = m_graphicsPipeline.GetStage<CLensOpticsStage>();
 	if (pLensOpticStage && pLensOpticStage->HasContent())
@@ -509,6 +575,64 @@ void CPostAAStage::DoFinalComposition(CTexture*& pCurrRT, CTexture* pDestRT, uin
 		// it will be ignored if CV_r_GrainEnableExposureThreshold is 0
 		m_passComposition.SetConstant(hdrEyeAdaptationName, hdrSetupParams[4], eHWSC_Pixel);
 
+		// The capture-side grain block. Set only when the permutation that reads it is bound: the
+		// constants do not exist in the stock shader, and a reflected SetConstant for a name the
+		// shader does not declare is work for nothing. They travel in the pass' existing reflected
+		// per-primitive constant buffer, like every other constant here - a typed buffer would
+		// mean converting the whole pass, and there is nothing about seven vectors that needs one.
+		if (bCineGrain)
+		{
+			static CCryNameR grainAmountName("vGrainAmount");
+			static CCryNameR grainSizeName("vGrainSize");
+			static CCryNameR grainSensorName("vGrainSensor");
+			static CCryNameR grainSeedName("vGrainSeed");
+			static CCryNameR grainDigital0Name("vGrainDigital0");
+			static CCryNameR grainDigital1Name("vGrainDigital1");
+			static CCryNameR grainDigital2Name("vGrainDigital2");
+			static CCryNameR grainDigital3Name("vGrainDigital3");
+			static CCryNameR grainDebugName("vGrainDebug");
+
+			// The output width the film-space mapping divides by is the DISPLAY resolution, which
+			// is what this pass runs at and what PS_ScreenSize carries in it.
+			const int outputWidthPx = max(pDestRT->GetWidth(), 1);
+			const float sensorWidthMm = max(grainSensorVec.x, 1.0f);
+			const float fpUm = (grainSensorVec.w > 0.0f) ? grainSensorVec.w
+			                                             : (sensorWidthMm * 1000.0f / (float)outputWidthPx);
+
+			// The eye index decorrelates the two fields in stereo. Identical grain in both eyes
+			// fuses onto the screen plane instead of onto the negative, which is the one thing
+			// grain must never do.
+			const float viewIndex = (float)(int)RenderView()->GetCurrentEye();
+			// z carries the FAMILY. It rides in this vector rather than in a static flag because
+			// there was exactly one free %_RT_ bit on this technique and the block itself spent it;
+			// a second family flag would double the permutation count of the composition pass for a
+			// branch on a value that is uniform over the whole frame. The shader reads it as
+			// 0 Film / 1 CMOS / 2 CCD / 3 Phone.
+			const Vec4 grainDebug((float)CRenderer::CV_r_FilmGrainDebug, viewIndex, (float)grainFamily, 0.0f);
+
+			m_passComposition.SetConstant(grainAmountName, grainAmountVec, eHWSC_Pixel);
+			m_passComposition.SetConstant(grainSizeName, grainSizeVec, eHWSC_Pixel);
+			m_passComposition.SetConstant(grainSensorName, grainSensorVec, eHWSC_Pixel);
+			m_passComposition.SetConstant(grainSeedName, grainSeedVec, eHWSC_Pixel);
+			m_passComposition.SetConstant(grainDigital0Name, grainDigital0Vec, eHWSC_Pixel);
+			m_passComposition.SetConstant(grainDigital1Name, grainDigital1Vec, eHWSC_Pixel);
+			m_passComposition.SetConstant(grainDigital2Name, grainDigital2Vec, eHWSC_Pixel);
+			m_passComposition.SetConstant(grainDigital3Name, grainDigital3Vec, eHWSC_Pixel);
+			m_passComposition.SetConstant(grainDebugName, grainDebug, eHWSC_Pixel);
+
+			if (CRenderer::CV_r_FilmGrainDebug == 3)
+			{
+				const float fNow = gEnv->pTimer->GetAsyncCurTime();
+				if ((fNow - m_fFilmGrainReportTime) >= 1.0f)
+				{
+					m_fFilmGrainReportTime = fNow;
+					PrintFilmGrainReport(grainAmountVec, grainSizeVec, grainSensorVec, grainSeedVec,
+					                     grainDigital0Vec, grainDigital1Vec, grainDigital2Vec, grainDigital3Vec,
+					                     grainFamily, fpUm, outputWidthPx, bFreezeRequested);
+				}
+			}
+		}
+
 		{
 			// Radial lens distortion (r_LensDistortion / lens character): x = k1, y = aspect,
 			// z = letterbox aspect (r_LensLetterbox; 0 = off, negative = squeezed presentation),
@@ -555,6 +679,195 @@ void CPostAAStage::DoFinalComposition(CTexture*& pCurrRT, CTexture* pDestRT, uin
 	}
 
 	m_passComposition.Execute();
+}
+
+// The report r_FilmGrainDebug 3 prints once a second. Everything the block decided this frame,
+// said in the units the camera's own controls are in - micrometres on the negative, output pixels,
+// stops - and ending in the one sentence the mode exists to produce: whether the grain that is
+// being asked for is large enough to survive the 8-bit write at the end of this pass.
+//
+// It is several short lines rather than one long one, for the same reason the wave-glare report is.
+void CPostAAStage::PrintFilmGrainReport(const Vec4& amount, const Vec4& size, const Vec4& sensor,
+                                        const Vec4& seed, const Vec4& digital0, const Vec4& digital1,
+                                        const Vec4& digital2, const Vec4& digital3, int family,
+                                        float fpUm, int outputWidthPx, bool bFrozen)
+{
+	static const char* const s_szFamily[] = { "Film", "CMOS", "CCD", "Phone" };
+	const char* szFamily = (family >= 0 && family < 4) ? s_szFamily[family] : "unknown";
+
+	// A grain cell in OUTPUT pixels. Below 1 the cell is smaller than a pixel and the pixel sees
+	// the mean of several of them, which is where the footprint integration takes the amplitude
+	// down; above 1 the cell is resolved and the grain has a visible texture.
+	const float cellPxR = size.x / max(fpUm, 1e-4f);
+	const float cellPxG = size.y / max(fpUm, 1e-4f);
+	const float cellPxB = size.z / max(fpUm, 1e-4f);
+
+	// What actually lands on the frame at the response's peak, as a fraction of the value, and
+	// then in 8-bit code values at mid grey - the number that decides whether it is visible at all.
+	// sigma(x') / x' = ln2 * g for small g; at x = 0.18 the sRGB slope carries it to code values.
+	const float gPeak = max(max(amount.x, amount.y), amount.z);
+	const float integration = min(1.0f, ((size.x + size.y + size.z) / 3.0f) / max(fpUm, 1e-4f));
+	const float sigmaRel = 0.6931472f * gPeak * integration;
+	// d(sRGB)/d(linear) at linear 0.18 is 1.055/2.4 * x^(1/2.4 - 1); times 255 for code values.
+	const float slope255 = 255.0f * (1.055f / 2.4f) * powf(0.18f, 1.0f / 2.4f - 1.0f);
+	const float codeValues = sigmaRel * 0.18f * slope255;
+
+	const char* szVerdict =
+	  (gPeak <= 0.0f)        ? "NOTHING is being asked for - the camera published an amount of 0" :
+	  (codeValues >= 3.0f)   ? "plainly visible" :
+	  (codeValues >= 1.0f)   ? "visible - about one to three code values, which is what film grain on a good transfer measures" :
+	  (codeValues >= 0.4f)   ? "faint: under one code value, so the 8-bit write eats most of it" :
+	                           "invisible: far below one code value at the 8-bit write - raise Grain Strength or the ISO";
+
+	CryLog("[POSTAA] ---- capture-side film grain, once a second (r_FilmGrainDebug 3) ----");
+	CryLog("[POSTAA]   FAMILY: %s%s", szFamily, bFrozen ? "  (capture frame index FROZEN by r_FilmGrainFreeze)" : "");
+	CryLog("[POSTAA]   AMOUNT: R %.3f  G %.3f  B %.3f   channel correlation %.2f (1 = one monochrome grain, 0 = three independent layers)",
+	       amount.x, amount.y, amount.z, amount.w);
+	CryLog("[POSTAA]   SIZE:   R %.2f  G %.2f  B %.2f um on the negative"
+	       " -- %.2f / %.2f / %.2f output pixels per grain cell",
+	       size.x, size.y, size.z, cellPxR, cellPxG, cellPxB);
+	CryLog("[POSTAA]   FILM:   sensor %.2f mm wide, squeeze %.2fx, output %d px"
+	       " -- one output pixel covers %.2f um of negative, so %.2f grain cells fall under it",
+	       sensor.x, sensor.y, outputWidthPx, fpUm, max(fpUm / max(size.y, 1e-4f), 0.0f));
+	CryLog("[POSTAA]   SEED:   shot %d, capture frame %d, algorithm version %d"
+	       " -- the same three numbers always give the same grain",
+	       (int)seed.x, (int)seed.y, (int)seed.w);
+	CryLog("[POSTAA]   RESULT: about %.2f%% of the value at the response peak, ~%.2f code values of 255 on a mid grey card -- %s",
+	       sigmaRel * 100.0f, codeValues, szVerdict);
+
+	if (family == 0)
+		return;
+
+	// The digital families run a sensor instead of an emulsion, and none of the numbers above says
+	// anything about it: the size that matters is the photosite, the amount is emergent from the
+	// electron count, and the interesting question is always "how many electrons is a mid grey
+	// here" - which is what decides everything else. So the same four questions are answered again
+	// in the sensor's own units, ending in the code values the shader will actually produce.
+	const float fullWell  = max(digital0.x, 1.0f);
+	const float isoBase   = max(digital0.y, 1.0f);
+	const float iso       = max(digital0.z, 1.0f);
+	const float sigmaRead = max(digital0.w, 0.0f);
+	const float sensorPx  = clamp_tpl(sensor.z, 64.0f, 32768.0f);
+	const float pitchUm   = sensor.x * 1000.0f / max(sensorPx, 1.0f);
+	const float photositesPerPx = max(sensorPx / (float)max(outputWidthPx, 1), 1e-3f);
+	const float nPix      = max(photositesPerPx * photositesPerPx, 1.0f);
+	const float stackN    = max(digital2.z, 1.0f);
+
+	// The sensor's sigma in DISPLAY-LINEAR units at a given value, green channel (white-balance
+	// gain 1 by definition, so this is the honest middle of the three; red and blue are louder by
+	// their gains, which is where the colour in the noise is). This is the shader's own
+	// FilmGrainSensorField arithmetic, analytic branch, written out once and evaluated twice.
+	//
+	// Since 2026-09-10 the digital families apply this ADDITIVELY (x' = x + amount*delta), so the
+	// number that matters is sigma in CODE VALUES, and it has to be quoted at more than one tone:
+	// sensor noise is a roughly constant number of electrons, so it is a roughly constant number of
+	// linear units, which the sRGB encoding then turns into MANY code values in the shadows and few
+	// in the highlights. One number at mid grey says nothing about where the noise actually lives.
+	const float wellScale = isoBase / iso;
+	const float k         = 1.0f / max(fullWell * wellScale, 1e-6f);
+	const float kPrnu     = max(digital1.x, 0.0f);
+	const float kDsnu     = max(digital1.y, 0.0f);
+	const float kRow      = max(digital1.z, 0.0f);
+	const float smear     = max(digital2.w, 0.0f);
+	// The exponent is a preset value on the bus now (Grain_User_Digital3.x); negative means "use
+	// the shader's compile-time fallback", which is the same 0.7.
+	const float integExp  = (digital3.x >= 0.0f) ? min(digital3.x, 2.0f) : 0.7f;
+	const float attenuation = 1.0f / sqrtf(powf(nPix, integExp) * stackN);
+	const float amountG   = max(amount.y, 0.0f);
+
+	// d(sRGB)/d(linear): the linear segment below the sRGB break, the power law above it.
+	const auto slopeAt = [](float xLin)
+	{
+		return (xLin <= 0.0031308f) ? 12.92f : ((1.055f / 2.4f) * powf(max(xLin, 1e-8f), 1.0f / 2.4f - 1.0f));
+	};
+	// The column / smear gate, exactly as the shader computes it: zero in a normally exposed scene,
+	// opening only as the picture approaches clipping. And the amplitude, as a fraction of the
+	// SATURATING COLUMN'S CHARGE at this ISO - fullWell * wellScale, not the bare full well.
+	const auto colGateAt = [](float xLin)
+	{
+		const float t = clamp_tpl((xLin - 0.75f) / 0.25f, 0.0f, 1.0f);
+		return t * t * (3.0f - 2.0f * t);
+	};
+	const auto smearEAt = [&](float xLin) { return smear * 0.01f * fullWell * wellScale * colGateAt(xLin); };
+	const auto eAt      = [&](float xLin) { return xLin * fullWell * wellScale; };
+
+	// ONE TERM, in 8-bit code values. Each term is a coefficient in ELECTRONS multiplying a
+	// unit-variance draw, so what it puts on the frame is coeff * k * attenuation * amount in
+	// display-linear units, and 255 * that * d(sRGB)/d(linear) in code values at that tone. Quoted
+	// on GREEN, whose raw white-balance gain is 1 by definition; red is louder by digital2.x and
+	// blue by digital2.y, which is where the colour of the noise comes from.
+	//
+	// This breakdown exists because the terms were once tuned blind against a multiplicative path
+	// that clamped them, and when the path went additive their true magnitudes turned out to be
+	// orders of magnitude apart. One line per term, at two tones, so that can never happen again.
+	const auto cvOf = [&](float sigmaE, float xLin)
+	{
+		return 255.0f * (sigmaE * k * attenuation * amountG) * slopeAt(xLin);
+	};
+
+	const auto sigmaLinAt = [&](float xLin)
+	{
+		const float e = eAt(xLin);
+		const float smearE = smearEAt(xLin);
+		const float var = k * k * (e + (e * kPrnu) * (e * kPrnu) + sigmaRead * sigmaRead
+		                           + kDsnu * kDsnu + kRow * kRow + smearE * smearE);
+		return sqrtf(max(var, 1e-24f)) * attenuation * amountG;
+	};
+
+	const float xMid    = 0.18f;
+	const float xShadow = 0.18f / 16.0f;                 // four stops under the card: a real shadow
+	const float xHot    = 0.90f;                         // just under the clip point: where a streak lives
+	const float sigmaMid    = sigmaLinAt(xMid);
+	const float sigmaShadow = sigmaLinAt(xShadow);
+	const float cvMid    = 255.0f * sigmaMid * slopeAt(xMid);
+	const float cvShadow = 255.0f * sigmaShadow * slopeAt(xShadow);
+
+	const float eMid      = eAt(xMid);
+	const float sigmaShot = k * sqrtf(eMid);
+	const float sigmaReadRel = k * sigmaRead;
+
+	const char* szDigitalVerdict =
+	  (amountG <= 0.0f)     ? "NOTHING is being asked for - the camera published an amount of 0" :
+	  (cvShadow >= 8.0f)    ? "loud: the shadows are visibly grainy, which is what a pushed sensor looks like" :
+	  (cvShadow >= 2.5f)    ? "right: shadows plainly textured, mid grey almost clean - a normal high-ISO frame" :
+	  (cvShadow >= 0.8f)    ? "quiet: about one code value in the shadows, at the edge of visibility" :
+	                          "invisible: under one code value even in the shadows - raise Grain Strength or the ISO";
+
+	CryLog("[POSTAA]   SENSOR: %.0f photosites across %.1f mm, effective pitch %.2f um (geometric %.2f um)"
+	       " -- %.1f photosites under one output pixel, so the noise is divided by %.2f"
+	       " (integration exponent %.2f, %.0f frames stacked)",
+	       sensorPx, sensor.x, (digital3.y > 0.0f) ? digital3.y : pitchUm, pitchUm,
+	       nPix, 1.0f / max(attenuation, 1e-6f), integExp, stackN);
+	CryLog("[POSTAA]   LIGHT:  ISO %.0f on a base of %.0f, full well %.0f e- "
+	       "-- a mid grey pixel collects %.0f e-, so shot noise alone is %.1f e- (%.2f%% of it)",
+	       iso, isoBase, fullWell, eMid, sqrtf(eMid), 100.0f / max(sqrtf(eMid), 1e-6f));
+	CryLog("[POSTAA]   NOISE:  shot %.4f + read %.4f (%.1f e-) + fixed pattern, in display-linear units"
+	       " -- PRNU %.3f%%, DSNU %.1f e-, row %.1f e-, chroma NR %.2f, WB gains R %.2f / B %.2f, smear %.2f",
+	       sigmaShot, sigmaReadRel, sigmaRead, digital1.x * 100.0f, digital1.y, digital1.z, digital1.w,
+	       digital2.x, digital2.y, digital2.w);
+
+	// The per-term table. sigma in CODE VALUES of 255, green channel, at mid grey and four stops
+	// under it. Anything at or above ~1 CV is visible; a STRUCTURED term (row, column) is visible
+	// well below that, because a coherent band or streak is far easier to see than random grit.
+	CryLog("[POSTAA]   PER TERM (green, code values of 255):   mid grey 0.18    -4 stops 0.01125");
+	CryLog("[POSTAA]     shot   (sqrt e)          %8.3f          %8.3f", cvOf(sqrtf(eAt(xMid)), xMid), cvOf(sqrtf(eAt(xShadow)), xShadow));
+	CryLog("[POSTAA]     read   (%5.1f e-)        %8.3f          %8.3f", sigmaRead, cvOf(sigmaRead, xMid), cvOf(sigmaRead, xShadow));
+	CryLog("[POSTAA]     PRNU   (%5.2f%% of e)     %8.3f          %8.3f", kPrnu * 100.0f, cvOf(eAt(xMid) * kPrnu, xMid), cvOf(eAt(xShadow) * kPrnu, xShadow));
+	CryLog("[POSTAA]     DSNU   (%5.1f e-)        %8.3f          %8.3f", kDsnu, cvOf(kDsnu, xMid), cvOf(kDsnu, xShadow));
+	CryLog("[POSTAA]     row    (%5.1f e-)        %8.3f          %8.3f   [structured: horizontal band]", kRow, cvOf(kRow, xMid), cvOf(kRow, xShadow));
+	CryLog("[POSTAA]     column (%5.1f e- at 0.9) %8.3f          %8.3f   [structured: vertical streak; %.3f CV at 0.9, gate %.2f]",
+	       smearEAt(xHot), cvOf(smearEAt(xMid), xMid), cvOf(smearEAt(xShadow), xShadow),
+	       cvOf(smearEAt(xHot), xHot), colGateAt(xHot));
+	CryLog("[POSTAA]     TOTAL  (quadrature)      %8.3f          %8.3f", cvMid, cvShadow);
+
+	CryLog("[POSTAA]   DIGITAL RESULT: green sigma is ADDED, not multiplied"
+	       " -- %.5f linear = %.2f code values on the mid grey card,"
+	       " and %.5f linear = %.2f code values four stops down in a shadow. %s",
+	       sigmaMid, cvMid, sigmaShadow, cvShadow, szDigitalVerdict);
+	CryLog("[POSTAA]                   (as a fraction of the value that is %.2f stops at the card and"
+	       " %.2f stops in the shadow - which is why it used to be applied in stops, and why doing so"
+	       " blew up on near-black pixels.)",
+	       sigmaMid / (xMid * 0.6931472f), sigmaShadow / (xShadow * 0.6931472f));
 }
 
 void CPostAAStage::Execute()

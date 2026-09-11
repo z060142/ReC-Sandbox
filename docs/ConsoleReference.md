@@ -1,4 +1,4 @@
-# CinematicCamera Console Reference
+﻿# CinematicCamera Console Reference
 
 Console commands registered by the plugin, plus the renderer cvars the Cinematic Camera system
 relies on (registered in `Code/CryEngine/RenderDll/Common/RendererCVars.cpp`).
@@ -742,6 +742,30 @@ diagnostics outrank the mask. Kernel parameter changes are logged as
 | Default | 1 |
 | Purpose | Master switch for film halation — the red-orange halo around sources that overload the emulsion — driven by the `HDR_Halation_*` post effect params and composited into the bloom target right after the streaks. 0 = off (no passes issued), 1 = on (visibility decided by the game-side params), **2 = diagnostic force mode**: amount 1, threshold 0.5, radius 0.7, independent of the game-side params — use it to verify the halation pass itself runs. |
 
+### r_FilmGrain
+
+| | |
+| --- | --- |
+| Default | 1 |
+| Purpose | Master switch for the **capture-side film grain** ([FilmGrainSpec.md](../FilmGrainSpec.md)): grain with a size in micrometres **on the negative**, an amplitude that follows the tone through a response curve, an independent field per emulsion layer, and a fresh deterministic pattern per *captured* frame. It is a separate shader permutation (`%_RT_SAMPLE6` on `PostAAComposites`) that runs **only** when the Cinematic Camera component asks for it (`Enable Film Grain`, on by default), and while it runs the engine's own overlay grain amount is forced to 0 so the two never both apply. 1 = honour the request. 0 = ignore it and always take the stock path — the plugin still writes `FilterGrain_Amount`, so the engine's own grain comes back at the same strength, and the frame is then byte for byte the engine's own. The first thing to try if anything about the noise looks wrong. |
+
+### r_FilmGrainDebug
+
+| | |
+| --- | --- |
+| Default | 0 |
+| Purpose | Diagnostic for the capture-side film grain. 0 = off. |
+| 1 — grey card | Throws the picture away and applies the grain to a flat **mid grey card** (linear 0.18) instead. The block runs exactly as it would on the real frame — same film-space coordinates, same seed, same response — so what is on screen is the grain at the tone the response is tuned for, with nothing else to argue with. This is the mode to read grain *size* and *colour speckle* off, and to compare two Size or Colour settings. |
+| 2 — response | The response, made visible instead of plotted. The bottom sixth of the frame becomes a **grey ramp** running twelve stops from black on the left to display white on the right, with the whole block running on it — so the grain is shown at every tone at once and the eye finds the peak without reading a number. The effective per-channel response `g` is drawn over the strip as a bright line in that channel's own colour, on a logarithmic axis ten stops tall (top of the strip = 1 stop of sigma, bottom = 2⁻¹⁰). Film shows the authored bump peaking in the mid-tones; a digital family shows its emergent curve, rising toward the dark end - loud in the shadows, quiet in the highlights - and pinned to the top of the strip wherever the read floor is larger than the signal, which is the honest statement that those tones are all noise. Since 2026-09-10 the digital grain on the strip is ADDED rather than multiplied, so the dark end of the ramp shows a lifted, grainy grey floor instead of the saturated sparkles it used to draw there. The picture above the strip is untouched, so the mode can be left on while working. The *uploaded* LUT of spec section 4 (`Grain_User_Response`) is not implemented and is **parked** with stage G2: it needs plugin texture-id plumbing that nothing shipped needs, so the response curve is the shader's built-in bump. |
+| 3 — report | Logs a plain-language report once a second: family, per-channel amount, grain size in micrometres **and** in output pixels, the sensor width / squeeze / output width and how much negative one output pixel covers, the shot seed and capture frame index, and finally what the grain is worth in 8-bit code values on a mid grey card — which is the number that decides whether it is visible at all after the 8-bit write at the end of the pass. For a digital family it then prints the sensor as well: photosite pitch and count, how many photosites fall under one output pixel and by how much that divides the noise, how many electrons a mid grey pixel collects, the shot and read sigmas in display-linear units, the fixed-pattern and white-balance numbers, and the resulting sigma on the green channel **in code values at two tones** - on the mid grey card and four stops under it, in a shadow - because sensor noise is a roughly constant number of electrons and therefore a roughly constant number of linear units, which the sRGB encoding turns into many code values in the shadows and few in the highlights. One number at mid grey would say nothing about where the noise lives. The line under it repeats both as a fraction of the value, in stops - the quantity the digital families used to be applied in, until doing so blew up on near-black pixels. |
+
+### r_FilmGrainFreeze
+
+| | |
+| --- | --- |
+| Default | 0 |
+| Purpose | Pins the **capture frame index** the grain is seeded from, so the pattern stops changing and the frame holds one still field of grain. The camera keeps counting — only what is published to the shader is held — so releasing the freeze does not rewind the grain. Two uses: telling grain apart from temporal AA noise (grain freezes, TAA shimmer does not), and comparing two settings on the *identical* pattern instead of on two different rolls of the dice. |
+
 ## Plugin cvars (`cinecam_*`)
 
 Registered by the CinematicCamera plugin itself, not by the renderer. They are process-wide, so
@@ -883,7 +907,8 @@ Written by the plugin every frame; not cvars, and not meant to be driven by hand
   and the composite all see the same bent focus
 - `Dof_User_BokehShapeTex` (string param; rewritten every frame so both render command buffer
   slots converge, unbound on restore)
-- `FilterGrain_Amount` (combined with the TOD environment grain by `max()`)
+- `FilterGrain_Amount` (combined with the TOD environment grain by `max()`; still written every
+  frame, and it is what `r_FilmGrain 0` falls back to)
 - `Global_User_LutODT` / `Global_User_LutODTSize`, `Global_User_LutLMT` /
   `Global_User_LutLMTSize` - the display chain's two 3D LUTs (S4). The plugin parses the `.cube`
   files, uploads fp16 3D textures through `IRenderer::UploadToVideoMemory3D` and publishes the
@@ -897,6 +922,21 @@ Written by the plugin every frame; not cvars, and not meant to be driven by hand
   All neutral by default, and neutral is exact: the white-balance matrix is built from the same
   Planckian locus the setting is on, so 6500 K + tint 0 is the identity matrix rather than a
   near-identity. Only the scene-referred branch reads them.
+- `Grain_User_Active`, `Grain_User_Family`, `Grain_User_Amount` (Vec4: per-channel amount + channel
+  correlation), `Grain_User_Size` (Vec4: per-channel grain size in um on the negative; w reserved for the
+  plate texel size, unused - G2 is parked), `Grain_User_Sensor` (Vec4: sensor width mm, squeeze, virtual sensor width in photosites,
+  footprint override), `Grain_User_Seed` (Vec4: shot seed, capture frame index, freeze, algorithm
+  version), `Grain_User_Digital0` (full well e-, base ISO, working ISO, read noise sigma e-),
+  `Grain_User_Digital1` (PRNU fraction, DSNU e-, row noise e-, chroma NR), `Grain_User_Digital2`
+  (raw white-balance gain red, gain blue — green is the reference and is 1 — frames stacked, CCD
+  smear), `Grain_User_Digital3` (sensor→output integration exponent E in x, y/z/w reserved: 0 = no
+  downscale gain at all, the "pixel peeping at 1:1" look, 0.7 = the default every preset carries,
+  1.0 = the textbook variance ÷ N; a negative value selects the shader's own fallback),
+  `Grain_User_Response` / `Grain_User_Plates` (texture IDs, always 0 - G2/G3 parked) - the
+  capture-side film grain block of `FilmGrainSpec.md` section 4. Read once per frame by
+  `CPostAAStage::DoFinalComposition`, which forces the engine's own grain amount to 0 while the
+  block is active. All zero / inactive by default, so a frame with no cinematic camera is the
+  engine's own.
 - `HDR_Streaks_Active` / `HDR_Streaks_Amount` / `HDR_Streaks_Count` / `HDR_Streaks_Angle` /
   `HDR_Streaks_Length` (unknown to an unmodified renderer: reads return 0, writes are silently
   dropped)

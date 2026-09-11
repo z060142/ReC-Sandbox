@@ -584,6 +584,36 @@ struct SCineDofParams
 	Schematyc::Range<0, 8, 0, 4> highlightSplatGain = 3.0f;
 };
 
+// ---------------------------------------------------------------------------
+// Grain families (FilmGrainSpec.md section 5.1)
+//
+// The body a shot is taken on decides what its noise is made of, so the family is a property of
+// the camera rather than a look setting. Film is grain: silver halide crystals of a physical size
+// on the negative. The three digital families are a sensor: shot noise, read noise and fixed
+// pattern, which look nothing like grain and cannot be reached by scaling it.
+//
+// In G0 only the Film branch is modelled; the three digital families run the same white Gaussian
+// with neutral colour so the slot exists and can be selected, and G1 fills them in.
+// ---------------------------------------------------------------------------
+enum class EGrainFamily : uint32
+{
+	Film = 0,   // silver halide grain on a negative
+	CMOS,       // modern stacked sensor: dual gain, low read noise
+	CCD,        // no dual gain, higher read noise, coarser chroma blotch
+	Phone       // sub-micron pitch, frame stacking, heavy chroma noise reduction
+};
+
+static void ReflectType(Schematyc::CTypeDesc<EGrainFamily>& desc)
+{
+	desc.SetGUID("{7D41C9A6-2F0B-4E37-9C58-1A6E4B02D7F3}"_cry_guid);
+	desc.SetLabel("Grain Family");
+	desc.SetDefaultValue(EGrainFamily::Film);
+	desc.AddConstant(EGrainFamily::Film,  "Film",  "Film");
+	desc.AddConstant(EGrainFamily::CMOS,  "CMOS",  "CMOS Sensor");
+	desc.AddConstant(EGrainFamily::CCD,   "CCD",   "CCD Sensor");
+	desc.AddConstant(EGrainFamily::Phone, "Phone", "Phone Sensor");
+}
+
 struct SCineGrainParams
 {
 	inline bool operator==(const SCineGrainParams& rhs) const { return 0 == memcmp(this, &rhs, sizeof(rhs)); }
@@ -594,16 +624,85 @@ struct SCineGrainParams
 		desc.SetLabel("Film Grain");
 		desc.AddMember(&SCineGrainParams::bEnableGrain,
 			'gren', "EnableFilmGrain", "Enable Film Grain",
-			"Drive the film grain post effect from ISO, aperture and shutter, following a "
-			"real sensor noise curve: clean at base ISO, climbing steeply past ISO 6400, "
-			"boosted when the lens is starved of light.", true);
+			"Drive the film grain from ISO, aperture and shutter, following a real sensor noise "
+			"curve: clean at base ISO, climbing steeply past ISO 6400, boosted when the lens is "
+			"starved of light. With r_FilmGrain 1 (the default) this runs the CAPTURE-SIDE grain, "
+			"which has a size on the negative and a fresh pattern per captured frame; with "
+			"r_FilmGrain 0 the same amount drives the engine's own grain instead.", true);
+		desc.AddMember(&SCineGrainParams::family,
+			'gfam', "Family", "Family",
+			"What the noise is MADE OF. Film = silver halide grain of a physical size on the "
+			"negative, with an independent field per emulsion layer. CMOS / CCD / Phone = a "
+			"sensor, whose noise is shot noise plus read noise plus a static per-photosite pattern "
+			"and looks nothing like grain: loudest in the shadows, cleanest in the highlights, the "
+			"size of a photosite rather than of a silver crystal, and almost monochrome once the "
+			"body's chroma noise reduction has run. CMOS = a modern cinema / stills sensor with "
+			"dual conversion gain. CCD = an older one, no dual gain, a much higher read floor, "
+			"vertical column streaks. Phone = a tiny photosite that collects almost nothing, "
+			"rescued by stacking several frames and denoising colour hard.",
+			EGrainFamily::Film);
 		desc.AddMember(&SCineGrainParams::grainStrength,
 			'grst', "GrainStrength", "Grain Strength",
-			"Scales the computed grain before it reaches the renderer.", 1.0f);
+			"The artistic multiplier on the noise. For the FILM family it scales an amount computed "
+			"from the ISO and the light the lens is passing. For the DIGITAL families it is the "
+			"only thing it does: there the ISO law is emergent - the sensor model counts electrons, "
+			"and how loud ISO 12800 is falls out of the count - so this multiplies the sensor's own "
+			"answer instead of replacing it. 1 = the sensor as it measures.", 1.0f);
+		desc.AddMember(&SCineGrainParams::size,
+			'gsiz', "Size", "Size",
+			"Multiplies the family's grain size, which is a length ON THE NEGATIVE (6 um for the "
+			"default medium film class), NOT a number of pixels. So the same setting gives the "
+			"same grain at 1080p and at 4K - the 4K frame simply resolves it better - and a "
+			"smaller sensor at the same setting shows coarser grain relative to the frame, "
+			"exactly as it does in reality. For the digital families it multiplies the PHOTOSITE "
+			"PITCH instead, so 2 gives a sensor with pixels twice as wide and a quarter as many of "
+			"them. Clamped to 0.25 - 4.", 1.0f);
+		desc.AddMember(&SCineGrainParams::colour,
+			'gclr', "Colour", "Colour",
+			"How INDEPENDENT the three layers' grain is. 1 = three independent fields, so the "
+			"grain carries colour speckle the way a fast colour negative does. 0 = one field "
+			"shared by all three channels, i.e. monochrome grain sitting on top of the picture. "
+			"The default 0.65 is the 0.35 layer correlation of a colour negative. Read only by "
+			"the Film family in this build.", 0.65f);
+		desc.AddMember(&SCineGrainParams::chromaNR,
+			'gcnr', "ChromaNoiseReduction", "Chroma NR",
+			"How much of the body's own chroma noise reduction is applied. Digital families only. "
+			"A sensor measures the three colours independently, so its raw noise is a per-pixel "
+			"rainbow; every real camera denoises the colour part of it far harder than the "
+			"brightness part, which is why digital noise looks like fine grey grit with a slow, "
+			"faint colour blotch under it. 1 = the body's own setting. 0 = none of it, i.e. the raw "
+			"colour confetti, which is worth seeing once to know what the setting is for.", 1.0f);
+		desc.AddMember(&SCineGrainParams::shotSeed,
+			'gsed', "ShotSeed", "Shot Seed",
+			"A new number is a new roll of film: the whole grain pattern changes, and the same "
+			"number always reproduces the same grain. Changing it also restarts the capture frame "
+			"count, so two takes with the same seed match frame for frame.", 0);
+		desc.AddMember(&SCineGrainParams::captureFps,
+			'gfps', "CaptureFps", "Capture Frame Rate",
+			"Frames per second the grain pattern advances at when a sequence drives the camera - "
+			"the rate the film is running through the gate, not the rate the engine is drawing "
+			"at. Not yet consulted: the counter advances one per rendered frame until the "
+			"sequence-time mapping lands.", 24);
+		desc.AddMember(&SCineGrainParams::bRollWhilePaused,
+			'grwp', "CameraRollingWhilePaused", "Camera Rolling While Paused",
+			"Keep advancing the capture frame count while the game is paused, so the grain keeps "
+			"moving on a frozen picture the way a camera left running does. Off holds the grain "
+			"still with the picture, which is what you want when inspecting a frame.", true);
 	}
 
 	bool bEnableGrain = true;
+	// Next to bEnableGrain rather than appended: two bools side by side add no new padding hole
+	// for the memcmp above to trip over. Schematyc keys saved values by member id, so order is free.
+	bool bRollWhilePaused = true;
+	EGrainFamily family = EGrainFamily::Film;
 	Schematyc::Range<0, 4, 0, 1> grainStrength = 1.0f;
+	// Range bounds are integer template parameters, so the 0.25 floor of the spec is applied where
+	// the value is consumed rather than declared here.
+	Schematyc::Range<0, 4, 0, 4> size = 1.0f;
+	Schematyc::Range<0, 1, 0, 1> colour = 0.65f;
+	Schematyc::Range<0, 1, 0, 1> chromaNR = 1.0f;
+	Schematyc::Range<0, 65535, 0, 1024, int> shotSeed = 0;
+	Schematyc::Range<1, 240, 12, 60, int> captureFps = 24;
 };
 
 struct SCineMotionBlurParams
@@ -1242,6 +1341,8 @@ private:
 	void RestoreExposure();
 	void ApplyFilmGrain();
 	void RestoreFilmGrain();
+	// One step of the capture-frame counter, taken once per finalised game-camera frame.
+	void AdvanceCaptureFrame();
 	void ApplyMotionBlur();
 	void RestoreMotionBlur();
 	void ApplySpriteBokeh();
@@ -1379,9 +1480,29 @@ private:
 	Vec3 m_lastWrittenEyeAdaptation = Vec3(4.5f, 17.0f, 1.5f);
 	bool m_bExpParamsSaved    = false;
 
-	// Film grain saved param (FilterGrain_Amount post effect)
+	// Film grain saved params. Two families of them under one flag, because they are saved,
+	// written and restored together: the legacy FilterGrain_Amount (which still drives the
+	// engine's own grain whenever r_FilmGrain is 0) and the Grain_User_* block of
+	// FilmGrainSpec.md section 4 that the capture-side grain reads.
 	float m_savedGrainAmount  = 0.f;
 	bool  m_bGrainParamSaved  = false;
+	float m_savedGrainActive  = 0.f;
+	float m_savedGrainFamily  = 0.f;
+	Vec4  m_savedGrainAmountVec   = Vec4(0.f, 0.f, 0.f, 0.f);
+	Vec4  m_savedGrainSizeVec     = Vec4(6.f, 6.f, 6.f, 0.f);
+	Vec4  m_savedGrainSensorVec   = Vec4(36.f, 1.f, 6000.f, 0.f);
+	Vec4  m_savedGrainSeedVec     = Vec4(0.f, 0.f, 0.f, 1.f);
+	Vec4  m_savedGrainDigital0Vec = Vec4(60000.f, 800.f, 800.f, 3.f);
+	Vec4  m_savedGrainDigital1Vec = Vec4(0.005f, 1.f, 0.3f, 0.6f);
+	Vec4  m_savedGrainDigital2Vec = Vec4(1.f, 1.f, 1.f, 0.f);
+	Vec4  m_savedGrainDigital3Vec = Vec4(0.7f, 0.f, 0.f, 0.f);
+
+	// The capture-frame counter of FilmGrainSpec.md section 5.3. It is the camera's own count of
+	// frames it has EXPOSED, not the renderer's frame id: the grain pattern is seeded from it, so
+	// it has to be the number the shot is on, and it has to survive a frame the renderer skipped.
+	// Reset to 0 when this component takes authority and when Shot Seed changes.
+	uint32 m_captureFrameIndex = 0;
+	int    m_lastShotSeed      = -1;
 
 	// White balance saved state (E3DPARAM_HDR_COLORGRADING_COLOR_BALANCE). The base tracks
 	// external (TOD) writes so our per-frame multiply never compounds on itself.

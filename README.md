@@ -67,6 +67,19 @@ renders. It is deliberately the toolset of an on-set colourist rather than a ful
   control while dragging and one undo step per gesture. Every grade value can be animated in
   TrackView.
 
+### Film grain
+
+Capture-side film grain for the cinematic camera, replacing the engine's own overlay grain
+whenever a cinematic camera drives the frame. It is a **Film** family with grain size given in
+micrometres on the negative and a tone response that fades out near display white and nine stops
+under it, plus **CMOS**, **CCD** and **Phone** families built on a real sensor-noise model (shot
+noise, read noise, fixed-pattern noise) instead of a procedural texture. Grain is deterministic
+per capture frame: a stateless hash of the shot seed, capture-frame index, view and cell, no wall
+clock, so a rendered sequence grains the same way on replay. With the block off, engine grain is
+untouched and the stock path is byte-identical. Deploy note: `engine/shaders/RunTime.ext` must be
+deployed as a loose file, or the grain technique's runtime flag stays masked off. Full spec:
+`engine/Code/CryPlugins/CinematicCamera/FilmGrainSpec.md`.
+
 ## Status
 
 - Verified on a physically lit interior and on the sample airfield in daylight.
@@ -74,7 +87,8 @@ renders. It is deliberately the toolset of an on-set colourist rather than a ful
 - Stock CRYENGINE content is lit in arbitrary units and looks wrong on the scene-referred path
   until it is re-lit in physical units. `docs/SceneReferredContent.md` explains how.
 - The previous, display-referred pipeline is kept on the `stock-pipeline` branch and the
-  `stock-pipeline-base` tag.
+  `stock-pipeline-base` tag. The `film-grain` branch is now merged into `main`; it is kept as a
+  historical branch.
 
 ## Documentation
 
