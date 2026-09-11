@@ -1,11 +1,12 @@
 # Sync manifest
 
 Baseline : main @ a34100a9 (pristine CRYENGINE 5.7.1)
-Dev      : dev @ a4fed24b
-Synced   : 2026-09-10 21:46
+Dev      : dev @ bde12cd8
+Synced   : 2026-09-11 10:12
 
 ## Commits (newest first)
 
+- bde12cd8 fix: the CineCam Grade preset slot no longer keeps a raw pointer to its component (S10 item 6)
 - a4fed24b tune: the CineCam Grade panel puts the wheels beside the parameters in a wide dock
 - ebb2185e tune: fine control on every draggable control of the CineCam Grade panel
 - 524e1718 fix: the sprite bokeh report called its cutoff "stops over mid grey", which it is not

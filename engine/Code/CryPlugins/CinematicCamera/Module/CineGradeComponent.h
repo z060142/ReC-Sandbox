@@ -25,8 +25,10 @@
 #include "CineCamLutTypes.h"
 // Serialization::ActionButton - the two buttons in the preset slot below. Shipped precedent for a
 // button on an entity component: CryDefaultEntities' CDebugSerializeHelper (TriggerComponent.h:68).
+// The buttons take lambdas and not CryEngine functors, so <CryCore/functor.h> is deliberately NOT
+// included here: a functor built from (*this, &member) is exactly the pointer capture item 6 removed.
 #include <CrySerialization/Decorators/ActionButton.h>
-#include <CryCore/functor.h>
+#include <CryEntitySystem/IEntitySystem.h>
 // The shared definition of the two 1D curves: knot positions, the interpolator, the bake and the
 // neutrality tests. The renderer's EXR exporter includes the SAME header to write the master curve
 // out as a .cube beside a capture, so there is exactly one answer to "what is the curve between
@@ -368,9 +370,26 @@ class CCineGradeComponent;
 //
 // Three rows: a Grade Preset asset picker, an Export button and a Re-apply button. It carries a
 // hand-written Serialize() rather than reflected members because all three of them need something
-// a plain reflected field cannot have: a pointer back to the component that owns it (the shipped
-// precedent is CryDefaultEntities' CDebugSerializeHelper, TriggerComponent.h:68 / .cpp:295-322,
-// wired in Initialize()).
+// a plain reflected field cannot have: a way back to the component that owns it.
+//
+// WHY THAT WAY BACK IS AN EntityId AND NOT A POINTER (S10 item 6, the heap-corruption fix;
+// decisions/s10-grade-component.md "Item 6", research/s10-6-grade-heap-corruption.md).
+// This struct is REFLECTED, and a reflected type in Schematyc is copied, cached and outlived:
+//   * Schematyc::CClassProperties::Read copy-constructs one into a CScratchpad every time the
+//     inspector builds a widget (ClassProperties.h:54/:101) and the editor's component cache keeps
+//     one for the whole of a game-mode round trip (EntityComponentsCache.cpp:77);
+//   * CClassProperties::Apply then copies that cached value back ONTO a live component, which
+//     means whatever the copy holds is written into the live one - a pointer included;
+//   * Serialization::ActionButton's row CLONES the functor it is given and keeps the clone for the
+//     life of the property row (PropertyRowActionButton), which outlives the component across
+//     game mode, undo and level reload.
+// A raw CCineGradeComponent* therefore goes stale in three ordinary ways and is then WRITTEN
+// THROUGH by the Export / Re-apply path (SetAppliedPath assigns two CryStrings through it, i.e. a
+// free and a store into freed memory) - heap corruption with no symptom until some later, innocent
+// free. An EntityId is a value: copying it is meaningless, a stale one resolves to nullptr through
+// the entity system's salt, and nothing is ever written through it without that lookup succeeding.
+// For the same reason the two buttons capture that id BY VALUE in a lambda instead of capturing
+// `this`, so the row's cloned functor owns no pointer into this struct at all.
 //
 // WHY THE APPLY HAPPENS IN HERE, AND WHY THIS MEMBER IS DECLARED LAST
 // (decisions/s10-grade-component.md 4b.6, research/s10-4b-asset-system.md section 7).
@@ -393,7 +412,10 @@ struct SCineGradePresetSlot
 	inline bool operator==(const SCineGradePresetSlot& rhs) const { return value == rhs.value; }
 
 	void        Serialize(Serialization::IArchive& archive);
-	void        SetOwner(CCineGradeComponent* pOwner) { m_pOwner = pOwner; }
+	//! The entity this slot's component sits on. Re-armed in Initialize() and on every
+	//! property-changed event, because CClassProperties::Apply overwrites it memberwise from a
+	//! cached copy when the editor leaves game mode.
+	void        SetOwnerEntity(EntityId id) { m_ownerEntity = id; }
 	//! Called by the export path so that the picker shows what was just written without that
 	//! looking like a fresh user pick (which would re-apply the file we have just saved).
 	void        SetAppliedPath(const char* szPath) { value = szPath; m_applied = szPath; }
@@ -402,14 +424,20 @@ struct SCineGradePresetSlot
 	string value;
 
 private:
-	void OnExport();
-	void OnReapply();
+	//! Resolve the owning component from the id, or nullptr. The ONE place a pointer to the
+	//! component is produced, and it is produced fresh on every use and never stored.
+	static CCineGradeComponent* Resolve(EntityId id);
+	//! The two buttons, by value: they take the id rather than a `this`, so the functor the
+	//! property row clones and keeps holds nothing that can dangle.
+	static void OnExport(EntityId id);
+	static void OnReapply(EntityId id);
 
 	//! What value held the last time this slot was read out to the inspector. The inspector always
 	//! serialises OUT before it serialises IN, so this is how "the user just picked something new"
 	//! is told apart from "the user changed some other property and this row came along".
-	string               m_applied;
-	CCineGradeComponent* m_pOwner = nullptr;
+	string   m_applied;
+	//! A handle, never a pointer. See the header comment above this struct.
+	EntityId m_ownerEntity = INVALID_ENTITYID;
 };
 
 inline void ReflectType(Schematyc::CTypeDesc<SCineGradePresetSlot>& desc)
@@ -472,6 +500,13 @@ public:
 	//! Write the current state to Assets/cinecam/grades/<entity>.cinegrade plus its .cryasset, and
 	//! point the preset slot at it. Returns the asset-relative path, or an empty string.
 	string ExportPreset();
+	//! The path the preset slot currently holds, by value. By value and not by reference: the
+	//! button path re-resolves the component and must not hand a reference into a member it is
+	//! about to overwrite.
+	string GetPresetPath() const { return m_preset.value; }
+	//! Point the slot at a file and mark it as already applied, so the next input pass does not
+	//! read it as a fresh user pick. Only ever called on a LIVE component.
+	void   SetPresetAppliedPath(const char* szPath) { m_preset.SetAppliedPath(szPath); }
 	//! Re-run the editor's own "read the component into the thing that gets saved" step - literally
 	//! the pair of calls at EntityObject.cpp:925/928. Needed after any write that did NOT happen
 	//! inside an input serialization (i.e. after a button), and a harmless no-op outside the editor

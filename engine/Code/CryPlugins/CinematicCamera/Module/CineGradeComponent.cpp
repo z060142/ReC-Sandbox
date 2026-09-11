@@ -154,9 +154,13 @@ void SCineGradePresetSlot::Serialize(Serialization::IArchive& archive)
 
 	if (archive.isEdit())
 	{
-		archive(Serialization::ActionButton(functor(*this, &SCineGradePresetSlot::OnExport)),
+		// BY VALUE, and that is the whole point of item 6: ActionButton's row clones the functor
+		// and keeps the clone for the life of the row, which outlives this struct across game
+		// mode, undo and a level reload. A lambda that captures an EntityId owns nothing.
+		const EntityId ownerEntity = m_ownerEntity;
+		archive(Serialization::ActionButton([ownerEntity]() { SCineGradePresetSlot::OnExport(ownerEntity); }),
 		        "ExportPreset", "Export Preset");
-		archive(Serialization::ActionButton(functor(*this, &SCineGradePresetSlot::OnReapply)),
+		archive(Serialization::ActionButton([ownerEntity]() { SCineGradePresetSlot::OnReapply(ownerEntity); }),
 		        "ReapplyPreset", "Re-apply Preset");
 	}
 
@@ -169,50 +173,79 @@ void SCineGradePresetSlot::Serialize(Serialization::IArchive& archive)
 	if (archive.isEdit() && value != m_applied)
 	{
 		m_applied = value;
-		if (m_pOwner != nullptr && !value.empty() && m_pOwner->ApplyPreset(value.c_str()))
-			m_pOwner->RefreshAfterApply();
+		// Resolved here and thrown away here. A copy of this struct that the inspector or the
+		// component cache is holding carries a stale id at worst, and a stale id resolves to
+		// nullptr (EntityId carries a salt, so a recycled index is not mistaken for the old
+		// entity) - it can never resolve to somebody else's memory.
+		if (CCineGradeComponent* const pOwner = Resolve(m_ownerEntity))
+		{
+			if (!value.empty() && pOwner->ApplyPreset(value.c_str()))
+				pOwner->RefreshAfterApply();
+		}
 	}
+}
+
+CCineGradeComponent* SCineGradePresetSlot::Resolve(EntityId id)
+{
+	if (id == INVALID_ENTITYID || gEnv == nullptr || gEnv->pEntitySystem == nullptr)
+		return nullptr;
+
+	IEntity* const pEntity = gEnv->pEntitySystem->GetEntity(id);
+	return pEntity ? pEntity->GetComponent<CCineGradeComponent>() : nullptr;
 }
 
 // The button path, unlike the picker path, does NOT run inside an input serialization
 // (PropertyRowActionButton::onMouseUp calls the callback and then tree->revert(), which is an
 // output pass), so both of these have to re-run the editor's save snapshot by hand.
-void SCineGradePresetSlot::OnExport()
+//
+// Static, and reached through the entity: the button that calls this may belong to a property row
+// built for a component that no longer exists. The lookup is what turns that from a write into
+// freed memory into a no-op.
+void SCineGradePresetSlot::OnExport(EntityId id)
 {
-	if (m_pOwner == nullptr)
+	CCineGradeComponent* const pOwner = Resolve(id);
+	if (pOwner == nullptr)
 		return;
 
-	const string written = m_pOwner->ExportPreset();
+	const string written = pOwner->ExportPreset();
 	if (written.empty())
 		return;
 
 	// SetAppliedPath and not a plain assignment: the next input pass must not read this as a fresh
-	// pick and re-apply the file we have just written out of the very values we hold.
-	SetAppliedPath(written.c_str());
-	m_pOwner->SyncEditorPropertySnapshot();
+	// pick and re-apply the file we have just written out of the very values we hold. Written into
+	// the LIVE component's slot (pOwner->m_preset), never into whatever copy the row was built
+	// from - the two are not the same object once the inspector has cached anything.
+	pOwner->SetPresetAppliedPath(written.c_str());
+	pOwner->SyncEditorPropertySnapshot();
 }
 
-void SCineGradePresetSlot::OnReapply()
+void SCineGradePresetSlot::OnReapply(EntityId id)
 {
-	if (m_pOwner == nullptr || value.empty())
+	CCineGradeComponent* const pOwner = Resolve(id);
+	if (pOwner == nullptr)
 		return;
 
-	if (m_pOwner->ApplyPreset(value.c_str()))
+	const string path = pOwner->GetPresetPath();
+	if (path.empty())
+		return;
+
+	if (pOwner->ApplyPreset(path.c_str()))
 	{
-		m_applied = value;
-		m_pOwner->SyncEditorPropertySnapshot();
-		m_pOwner->RefreshAfterApply();
+		pOwner->SetPresetAppliedPath(path.c_str());
+		pOwner->SyncEditorPropertySnapshot();
+		pOwner->RefreshAfterApply();
 	}
 }
 
 // ---------------------------------------------------------------------------
 // IEntityComponent
 // ---------------------------------------------------------------------------
-// The one thing initialisation is for: handing the preset slot the pointer its three rows need.
-// Same place and same reason as CDebugSerializeHelper's SetComponent (TriggerComponent.cpp:132).
+// The one thing initialisation is for: handing the preset slot the entity its three rows need.
+// Same place and same reason as CDebugSerializeHelper's SetComponent (TriggerComponent.cpp:132) -
+// but an id and not a pointer, see the header comment on SCineGradePresetSlot.
 void CCineGradeComponent::Initialize()
 {
-	m_preset.SetOwner(this);
+	m_preset.SetOwnerEntity(m_pEntity ? m_pEntity->GetId() : INVALID_ENTITYID);
 }
 
 bool CCineGradeComponent::ApplyPreset(const char* szRelPath)
@@ -320,15 +353,15 @@ void CCineGradeComponent::ProcessEvent(const SEntityEvent& event)
 	if (event.event != ENTITY_EVENT_COMPONENT_PROPERTY_CHANGED || m_pEntity == nullptr)
 		return;
 
-	// Re-arm the preset slot's back-pointer. It is set in Initialize(), and the Schematyc object
-	// path applies stored properties BEFORE Initialize (Object.cpp:636-655) so that is normally
-	// enough - but CEntityComponentsCache::LoadComponent (:100-108), which is what restores a
-	// component's properties when the editor leaves game mode, calls CClassProperties::Apply on a
-	// LIVE component and then sends exactly this event. Apply is a memberwise copy, so it
-	// overwrites the pointer with whatever the cached copy held. One assignment here closes that
-	// window; the alternative - keeping a raw owner pointer out of a serialised struct entirely -
-	// would mean the buttons cannot exist.
-	m_preset.SetOwner(this);
+	// Re-arm the preset slot's owner id. It is set in Initialize(), and the Schematyc object path
+	// applies stored properties BEFORE Initialize (Object.cpp:636-655) so that is normally enough -
+	// but CEntityComponentsCache::LoadComponent (:100-108), which is what restores a component's
+	// properties when the editor leaves game mode, calls CClassProperties::Apply on a LIVE
+	// component and then sends exactly this event. Apply is a memberwise copy, so it overwrites
+	// the id with whatever the cached copy held. This assignment closes that window - and since
+	// S10 item 6 the thing being overwritten is a HANDLE, so the window being open is a no-op
+	// (a stale id resolves to nullptr) instead of a write through a dangling pointer.
+	m_preset.SetOwnerEntity(m_pEntity->GetId());
 
 	// The editor sends this event to the EDITED component only (EntityObject.cpp:831/934), so the
 	// camera does not hear about a grade change by itself. This is the latency nudge from

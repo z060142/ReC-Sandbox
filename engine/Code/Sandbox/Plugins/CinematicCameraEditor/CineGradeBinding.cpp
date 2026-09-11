@@ -210,8 +210,18 @@ static void ReadOne(const SMemberEntry& entry, const void* pSrc, SGradeValues& o
 	case EKind::LutSpace: *static_cast<uint32*>(pDst) = *static_cast<const uint32*>(pSrc); break;
 	case EKind::LutPath:
 	case EKind::PresetPath:
-		*static_cast<string*>(pDst) = *static_cast<const string*>(pSrc);
+	{
+		// CHARACTERS, not the buffer. CryStringT::operator= shares the refcounted block
+		// (CryString.h:418-424), so a plain assignment would leave the panel co-owning a heap
+		// block whose other owner is a component in another DLL - and the panel's next poll would
+		// then FREE that block, in this module, from an idle timer. That is the shape of every
+		// crash in scene-notes/grain/reports/03-integration-audit.md section 1.3. Copying is a
+		// handful of bytes on a path and takes the panel out of that ownership entirely: it can
+		// no longer be the one that frees a component's string, whatever damaged it.
+		const string& src = *static_cast<const string*>(pSrc);
+		static_cast<string*>(pDst)->assign(src.c_str(), src.length());
 		break;
+	}
 	}
 }
 
@@ -239,9 +249,13 @@ static void WriteOne(const SMemberEntry& entry, void* pDst, const SGradeValues& 
 			*static_cast<uint32*>(pDst) = *static_cast<const uint32*>(pSrc);
 		break;
 	case EKind::LutPath:
-		if (*static_cast<string*>(pDst) != *static_cast<const string*>(pSrc))
-			*static_cast<string*>(pDst) = *static_cast<const string*>(pSrc);
+	{
+		// \sa ReadOne - characters, so the component never ends up sharing a block with the panel.
+		const string& src = *static_cast<const string*>(pSrc);
+		if (*static_cast<string*>(pDst) != src)
+			static_cast<string*>(pDst)->assign(src.c_str(), src.length());
 		break;
+	}
 	case EKind::PresetPath:
 		// Read-only in the panel: the two preset buttons live on the component and cannot be
 		// called from here (decisions section 5.2), and writing the path alone would show a
