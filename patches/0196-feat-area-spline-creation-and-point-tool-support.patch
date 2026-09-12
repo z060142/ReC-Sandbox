@@ -1,0 +1,290 @@
+From 93c31ca80d6ed57fc66a0d8c1d95693ba2310a2a Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Fri, 11 Sep 2026 23:55:38 +0800
+Subject: [PATCH 196/209] feat(area): spline creation and point-tool support
+
+Create Object -> Area -> Spline, and the one change the shared point tool needed
+in order to edit a curve without learning what a curve is.
+
+CSplineCreateTool is a ~30-line subclass of the stage 1b CShapeCreateTool:
+object class AreaShapeSpline, minimum two points (CSplineObject::GetMinPoints(),
+SplineObject.h:83). Everything else - first click spawns the entity with its
+shape component, further clicks append, double-click or Enter finishes, Esc
+discards, the whole draw is one undo step - is the base tool unchanged. One tool
+class per object class, because the Create panel hands a custom creation tool no
+user data (report 02). CAreaShapeSplineClassDesc puts the entry in the panel.
+
+CShapeEditTool gains one helper, GatherEdgePointsWorld(), which asks the kind
+for the SHAPE of an edge through the new IShapeComponentEdit::GetEdgePoints()
+and falls back to the chord when the kind answers 0 - which Box, Sphere and
+Polygon all do by inheriting the default, so none of them changed. It is used in
+exactly two places: the edge hit test now walks the edge's own samples, and the
+Ctrl-hover highlight is drawn as that polyline instead of a straight line.
+
+The effect is that Ctrl+click inserts a point ON the curve at the nearest place
+rather than on the chord under it, and the highlighted segment follows the
+curve - while the tool still never asks which kind of shape it is editing, which
+is the rule stage 1 set for it. Insert, delete (never below two points; the
+component refuses and warns) and drag ride the existing generic path.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ .../Objects/AreaShapeObjectClassDescs.cpp     | 28 ++++++++
+ .../Tools/ShapeEditTool.cpp                   | 70 ++++++++++++++-----
+ .../Tools/ShapeEditTool.h                     | 15 +++-
+ .../Tools/SplineCreateTool.cpp                | 17 +++++
+ .../Tools/SplineCreateTool.h                  | 34 +++++++++
+ 5 files changed, 143 insertions(+), 21 deletions(-)
+ create mode 100644 Code/Sandbox/Plugins/AreaComponentsEditor/Tools/SplineCreateTool.cpp
+ create mode 100644 Code/Sandbox/Plugins/AreaComponentsEditor/Tools/SplineCreateTool.h
+
+diff --git a/Code/Sandbox/Plugins/AreaComponentsEditor/Objects/AreaShapeObjectClassDescs.cpp b/Code/Sandbox/Plugins/AreaComponentsEditor/Objects/AreaShapeObjectClassDescs.cpp
+index d223e8f4..4fa9f9a8 100644
+--- a/Code/Sandbox/Plugins/AreaComponentsEditor/Objects/AreaShapeObjectClassDescs.cpp
++++ b/Code/Sandbox/Plugins/AreaComponentsEditor/Objects/AreaShapeObjectClassDescs.cpp
+@@ -30,6 +30,9 @@ const char* const szPolygonShapeComponentGuid = "6C3A81D5-0F47-4E9A-B4D1-72E5C8A
+ //! CSphereShapeComponent::ReflectType, Module/Shapes/SphereShapeComponent.h.
+ const char* const szSphereShapeComponentGuid = "6C3A81D5-0F47-4E9A-B4D1-72E5C8A96203";
+ 
++//! CSplineShapeComponent::ReflectType, Module/Shapes/SplineShapeComponent.h.
++const char* const szSplineShapeComponentGuid = "6C3A81D5-0F47-4E9A-B4D1-72E5C8A96204";
++
+ //! The object class every Area preset is created as. Resolved lazily: EditorQt registers its own
+ //! class descs before any plugin is loaded, but not necessarily before this plugin's statics run.
+ CRuntimeClass* GetEntityWithComponentRuntimeClass()
+@@ -124,3 +127,28 @@ public:
+ };
+ 
+ REGISTER_CLASS_DESC(CAreaShapeSphereClassDesc);
++
++//! "Create Object -> Area -> Spline": an entity carrying a CSplineShapeComponent, drawn
++//! click-click-double-click like the polygon - the same gesture CSplineObject::MouseCreateCallback
++//! has (SplineObject.cpp:1591-1647) - except that two points are already a spline.
++class CAreaShapeSplineClassDesc : public CObjectClassDesc
++{
++public:
++	virtual ObjectType     GetObjectType() override            { return OBJTYPE_SHAPE; }
++	virtual const char*    ClassName() override                { return "AreaShapeSpline"; }
++	virtual const char*    UIName() override                   { return "Spline"; }
++	virtual const char*    Category() override                 { return "Area"; }
++	virtual CRuntimeClass* GetRuntimeClass() override          { return Private_AreaShapeObjectClassDescs::GetEntityWithComponentRuntimeClass(); }
++	virtual const char*    GetFileSpec() override              { return Private_AreaShapeObjectClassDescs::szSplineShapeComponentGuid; }
++	virtual const char*    GetDataFilesFilterString() override { return ""; }
++	virtual const char*    GetToolClassName() override         { return "EditTool.AreaShapeSplineCreate"; }
++
++	virtual bool IsCreatedByListEnumeration() override { return false; }
++
++	virtual void EnumerateObjects(IObjectEnumerator* pEnumerator) override
++	{
++		pEnumerator->AddEntry("Spline", Private_AreaShapeObjectClassDescs::szSplineShapeComponentGuid);
++	}
++};
++
++REGISTER_CLASS_DESC(CAreaShapeSplineClassDesc);
+diff --git a/Code/Sandbox/Plugins/AreaComponentsEditor/Tools/ShapeEditTool.cpp b/Code/Sandbox/Plugins/AreaComponentsEditor/Tools/ShapeEditTool.cpp
+index 2f2a9e2b..a8ee885e 100644
+--- a/Code/Sandbox/Plugins/AreaComponentsEditor/Tools/ShapeEditTool.cpp
++++ b/Code/Sandbox/Plugins/AreaComponentsEditor/Tools/ShapeEditTool.cpp
+@@ -204,6 +204,36 @@ int CShapeEditTool::GatherPointsWorld(Vec3* pOut, int maxPoints) const
+ 	return count;
+ }
+ 
++int CShapeEditTool::GatherEdgePointsWorld(int edgeIndex, Vec3* pOut, int maxPoints) const
++{
++	IShapeComponentEdit* pEdit = ResolveShapeEdit();
++	if (pEdit == nullptr || pOut == nullptr || maxPoints < 2)
++		return 0;
++
++	const int count = pEdit->GetPointCount();
++	if (edgeIndex < 0 || edgeIndex >= count)
++		return 0;
++
++	const int capacity = min(maxPoints, kMaxEdgeSamples);
++
++	Vec3 local[kMaxEdgeSamples];
++	int  pointCount = pEdit->GetEdgePoints(edgeIndex, local, capacity);
++
++	if (pointCount < 2)
++	{
++		// The kind has no curved edges - the default answer - so the edge IS the chord.
++		local[0] = pEdit->GetPoint(edgeIndex);
++		local[1] = pEdit->GetPoint((edgeIndex + 1) % count);
++		pointCount = 2;
++	}
++
++	const Matrix34 shapeWorldTM = GetShapeWorldTM();
++	for (int i = 0; i < pointCount; ++i)
++		pOut[i] = shapeWorldTM.TransformPoint(local[i]);
++
++	return pointCount;
++}
++
+ // ---------------------------------------------------------------------------
+ // Hit testing
+ // ---------------------------------------------------------------------------
+@@ -264,15 +294,23 @@ bool CShapeEditTool::HitTestEdge(CViewport* pView, const Vec3& raySrc, const Vec
+ 		if (!bClosed && j == 0 && i != 0)
+ 			continue;
+ 
+-		float d = 0.0f;
+-		if (!RayToLineDistance(rayLineP1, rayLineP2, points[i], points[j], d, intPnt))
+-			continue;
++		// The edge as the KIND describes it: one chord for a polygon, the sampled curve for a
++		// spline. Testing the samples is what makes Ctrl+click land the new point on the curve.
++		Vec3      edge[kMaxEdgeSamples];
++		const int edgePoints = GatherEdgePointsWorld(i, edge, kMaxEdgeSamples);
+ 
+-		if (d < minDist)
++		for (int k = 0; k + 1 < edgePoints; ++k)
+ 		{
+-			minDist = d;
+-			bestIndex = i;
+-			bestPnt = intPnt;
++			float d = 0.0f;
++			if (!RayToLineDistance(rayLineP1, rayLineP2, edge[k], edge[k + 1], d, intPnt))
++				continue;
++
++			if (d < minDist)
++			{
++				minDist = d;
++				bestIndex = i;
++				bestPnt = intPnt;
++			}
+ 		}
+ 	}
+ 
+@@ -357,12 +395,14 @@ void CShapeEditTool::Display(SDisplayContext& dc)
+ 		dc.DrawPolyLine(contour, contourPoints, pEdit->IsContourClosed());
+ 	}
+ 
+-	// The edge under the cursor while Ctrl is held: the one a click would split.
+-	if (m_bHoverEdgeValid)
++	// The edge under the cursor while Ctrl is held: the one a click would split. Drawn as the
++	// polyline the hit test used, so a curved edge is highlighted along its curve.
++	if (m_bHoverEdgeValid && m_hoverEdgePointCount >= 2)
+ 	{
+ 		dc.SetColor(ColorB(255, 255, 0, 255));
+ 		dc.SetLineWidth(3);
+-		dc.DrawLine(m_hoverEdgeStart, m_hoverEdgeEnd);
++		for (int i = 0; i + 1 < m_hoverEdgePointCount; ++i)
++			dc.DrawLine(m_hoverEdgePoints[i], m_hoverEdgePoints[i + 1]);
+ 		dc.SetLineWidth(0);
+ 	}
+ 
+@@ -436,14 +476,8 @@ bool CShapeEditTool::MouseCallback(CViewport* pView, EMouseEvent event, CPoint&
+ 		Vec3 edgePoint;
+ 		if (HitTestEdge(pView, raySrc, rayDir, edgeIndex, edgePoint))
+ 		{
+-			Vec3      points[kMaxEditPoints];
+-			const int count = GatherPointsWorld(points, kMaxEditPoints);
+-			if (edgeIndex < count)
+-			{
+-				m_bHoverEdgeValid = true;
+-				m_hoverEdgeStart = points[edgeIndex];
+-				m_hoverEdgeEnd = points[(edgeIndex + 1) % count];
+-			}
++			m_hoverEdgePointCount = GatherEdgePointsWorld(edgeIndex, m_hoverEdgePoints, kMaxEdgeSamples);
++			m_bHoverEdgeValid = m_hoverEdgePointCount >= 2;
+ 
+ 			pView->ResetCursor();
+ 
+diff --git a/Code/Sandbox/Plugins/AreaComponentsEditor/Tools/ShapeEditTool.h b/Code/Sandbox/Plugins/AreaComponentsEditor/Tools/ShapeEditTool.h
+index e479f94c..b94b78f8 100644
+--- a/Code/Sandbox/Plugins/AreaComponentsEditor/Tools/ShapeEditTool.h
++++ b/Code/Sandbox/Plugins/AreaComponentsEditor/Tools/ShapeEditTool.h
+@@ -82,6 +82,11 @@ private:
+ 	int      HitTestPoints(CViewport* pView, const Vec3& raySrc, const Vec3& rayDir, float& distanceOut) const;
+ 	//! The edge under the cursor. Returns false when nothing is close enough.
+ 	bool     HitTestEdge(CViewport* pView, const Vec3& raySrc, const Vec3& rayDir, int& indexOut, Vec3& worldPointOut) const;
++	//! The SHAPE of one edge in world space: the kind's own sampling when it has a curved edge
++	//! (IShapeComponentEdit::GetEdgePoints), and the plain chord between the two points otherwise.
++	//! Returns how many points were written, at least 2 - which is what lets one hit test and one
++	//! highlight serve a straight polygon edge and a Bezier segment without knowing which it has.
++	int      GatherEdgePointsWorld(int edgeIndex, Vec3* pOut, int maxPoints) const;
+ 
+ 	void     SelectPoint(int index);
+ 	//! Ctrl+click on an edge: one undo step, the new point selected.
+@@ -113,10 +118,14 @@ private:
+ 	CPoint m_mouseDownPos = CPoint(0, 0);
+ 	Vec3   m_pointWorldPosAtDragStart = ZERO;
+ 
+-	//! The edge the cursor is on while Ctrl is held, in world space, for the Display highlight.
++	//! Largest number of samples one edge is described by (a curved edge needs more than two).
++	static constexpr int kMaxEdgeSamples = 32;
++
++	//! The edge the cursor is on while Ctrl is held, in world space, for the Display highlight. It
++	//! is a polyline, not a segment, so that a curved edge is highlighted along the curve.
+ 	bool m_bHoverEdgeValid = false;
+-	Vec3 m_hoverEdgeStart = ZERO;
+-	Vec3 m_hoverEdgeEnd = ZERO;
++	Vec3 m_hoverEdgePoints[kMaxEdgeSamples];
++	int  m_hoverEdgePointCount = 0;
+ 
+ 	ITransformManipulator* m_pManipulator = nullptr;
+ };
+diff --git a/Code/Sandbox/Plugins/AreaComponentsEditor/Tools/SplineCreateTool.cpp b/Code/Sandbox/Plugins/AreaComponentsEditor/Tools/SplineCreateTool.cpp
+new file mode 100644
+index 00000000..507b18ca
+--- /dev/null
++++ b/Code/Sandbox/Plugins/AreaComponentsEditor/Tools/SplineCreateTool.cpp
+@@ -0,0 +1,17 @@
++// Copyright 2026 ReC Sandbox. Distributed under the terms in LICENSE.md at the repository root.
++#include "StdAfx.h"
++#include "SplineCreateTool.h"
++
++#include <IEditorClassFactory.h>
++
++class CSplineCreateTool_ClassDesc : public IClassDesc
++{
++	virtual ESystemClassID SystemClassID() override   { return ESYSTEM_CLASS_EDITTOOL; }
++	virtual const char*    ClassName() override       { return "EditTool.AreaShapeSplineCreate"; }
++	virtual const char*    Category() override        { return "Area"; }
++	virtual CRuntimeClass* GetRuntimeClass() override { return RUNTIME_CLASS(CSplineCreateTool); }
++};
++
++REGISTER_CLASS_DESC(CSplineCreateTool_ClassDesc);
++
++IMPLEMENT_DYNCREATE(CSplineCreateTool, CShapeCreateTool);
+diff --git a/Code/Sandbox/Plugins/AreaComponentsEditor/Tools/SplineCreateTool.h b/Code/Sandbox/Plugins/AreaComponentsEditor/Tools/SplineCreateTool.h
+new file mode 100644
+index 00000000..1421e0af
+--- /dev/null
++++ b/Code/Sandbox/Plugins/AreaComponentsEditor/Tools/SplineCreateTool.h
+@@ -0,0 +1,34 @@
++// Copyright 2026 ReC Sandbox. Distributed under the terms in LICENSE.md at the repository root.
++#pragma once
++
++#include "ShapeCreateTool.h"
++
++//! "Create Object -> Area -> Spline": the click-click-double-click draw of CShapeCreateTool with
++//! the two things a spline needs differently from a polygon - it is created as the AreaShapeSpline
++//! object class, and two points are already a spline (a polygon needs three to have an interior).
++//!
++//! Everything else is the base tool unchanged: the first click spawns the entity with its spline
++//! shape component and makes that point 0, further clicks append, a double-click or Enter finishes,
++//! Esc throws the entity away again, and the whole draw is one undo step. One tool class per object
++//! class, because the Create panel hands a custom creation tool no user data (report 02).
++class CSplineCreateTool : public CShapeCreateTool
++{
++	DECLARE_DYNCREATE(CSplineCreateTool)
++
++public:
++	CSplineCreateTool() = default;
++
++	// CEditTool
++	virtual string GetDisplayName() const override { return "Create Spline"; }
++	// ~CEditTool
++
++protected:
++	virtual ~CSplineCreateTool() = default;
++
++	// CShapeCreateTool
++	virtual const char* GetObjectClassName() const override { return "AreaShapeSpline"; }
++	//! CSplineObject::GetMinPoints() is 2 (SplineObject.h:83): a two-point spline is a curve, and
++	//! refusing it would make the shortest useful path impossible to draw.
++	virtual int         GetMinPointCount() const override { return 2; }
++	// ~CShapeCreateTool
++};
+-- 
+2.47.1.windows.1
+

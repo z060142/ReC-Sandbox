@@ -1,0 +1,780 @@
+From f75669e077e92a1bd2af9e8fefe8f2d303470bd4 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Sat, 12 Sep 2026 14:00:32 +0800
+Subject: [PATCH 206/209] feat(area): spline smoothing and rotation-minimizing
+ frames
+
+Two additions to the spline shape, both defaulting to the legacy behaviour so
+that existing content keeps its silhouette exactly.
+
+1. SMOOTHING. SmoothIterations (0-4, default 0) subdivides the control polygon
+before the Bezier is fitted, and Tension (0-1, default 1) scales the derived
+handle lengths - 1 is legacy's lenB/lenOsn/3 unchanged, 0 collapses the curve
+onto its control polygon.
+
+The scheme is the 4-point INTERPOLATING subdivision (Dyn-Levin-Gregory, the
+subdivision form of a Catmull-Rom), not Chaikin. Chaikin corner-cutting is
+approximating: after one pass none of the authored points is on the curve and
+the whole shape shrinks inwards, which is the wrong trade when those points are
+what the user drags. The 4-point rule keeps every authored point on the curve
+and only inserts one point per edge at (-p0 + 9p1 + 9p2 - p3)/16. That choice
+also buys the exact mapping the tools need: each pass doubles the edges, so
+authored point i is evaluation point i * 2^n, and GetEdgePoints() hands the tool
+the run of evaluation segments an authored edge became. The point tool therefore
+still edits the original points, and Ctrl+click still inserts on the drawn curve.
+
+Smoothing is an EVALUATION transform, never a data change: m_points is
+untouched, and the cache grows an evaluation polygon that everything downstream
+- handles, samples, arc length, contour, hit test, previewer - reads instead.
+Angle and Width are subdivided in lockstep with the positions so the per-point
+attributes keep meaning; the "use the consumer's width" flag becomes a negative
+sentinel inside the cache. Samples per segment halve with each pass, so the
+contour buffer and the drawing cost stay roughly constant. The previewer draws
+the control polygon faintly whenever smoothing is on, so both are visible.
+
+2. ROTATION-MINIMIZING FRAMES. FrameMode { LegacyUp (default), ParallelTransport }.
+
+Legacy's normal is Vec3(0,0,1).Cross(tangent) - SplineMath::SegmentNormal, from
+CSplineObject::GetLocalBezierNormal (SplineObject.cpp:874 and :880). As the
+tangent approaches world up that cross product's LENGTH goes to zero, so its
+direction is decided by whatever horizontal component is left and swings through
+half a turn as the curve passes vertical. Everything oriented by it spins - which
+is what the user saw as distributed models rotating along the curve.
+
+ParallelTransport carries one normal along the sampled curve with the double
+reflection of Wang, Juttler, Zheng and Liu (2008): no preferred up vector, so it
+turns only as much as the curve does. It is seeded from legacy's own normal, so
+a flat spline is identical in both modes and only curves legacy cannot orient
+change. The per-point Angle is applied on top with legacy's own blend, so
+switching mode never loses authored banking. The known price, written into the
+header: a closed curve's frame does not generally close on itself, so a closed
+spline can show one twist at its seam.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SCUvWGLCsqzm3VNMzp4uiS
+---
+ .../AreaComponents/Module/Shapes/SplineMath.h | 176 ++++++++-
+ .../Module/Shapes/SplineShapeComponent.cpp    | 342 +++++++++++++-----
+ 2 files changed, 420 insertions(+), 98 deletions(-)
+
+diff --git a/Code/CryPlugins/AreaComponents/Module/Shapes/SplineMath.h b/Code/CryPlugins/AreaComponents/Module/Shapes/SplineMath.h
+index 5a98f43a..9b8e604f 100644
+--- a/Code/CryPlugins/AreaComponents/Module/Shapes/SplineMath.h
++++ b/Code/CryPlugins/AreaComponents/Module/Shapes/SplineMath.h
+@@ -109,7 +109,7 @@ inline float SegmentLength(const Vec3& p0, const Vec3& forw0, const Vec3& back1,
+ 
+ //! The interior rule (SplineObject.cpp:946-957): a Catmull-Rom style tangent parallel to the chord
+ //! p1->p3, expressed as two Bezier handles and scaled by the two chord lengths.
+-inline void DeriveInteriorHandles(const Vec3& p1, const Vec3& p2, const Vec3& p3, SHandles& out)
++inline void DeriveInteriorHandles(const Vec3& p1, const Vec3& p2, const Vec3& p3, SHandles& out, float tension = 1.0f)
+ {
+ 	const float lenOsn = (p3 - p1).GetLength();
+ 
+@@ -125,14 +125,17 @@ inline void DeriveInteriorHandles(const Vec3& p1, const Vec3& p2, const Vec3& p3
+ 	const float lenB = (p1 - p2).GetLength();
+ 	const float lenF = (p3 - p2).GetLength();
+ 
+-	out.back = p2 + (p1 - p3) * (lenB / lenOsn / 3.0f);
+-	out.forw = p2 + (p3 - p1) * (lenF / lenOsn / 3.0f);
++	// `tension` scales the handle LENGTH only, never its direction, so the curve keeps legacy's
++	// tangent everywhere and only changes how far it bulges between the points. 1 is legacy exactly;
++	// 0 collapses every handle onto its point, which turns the Bezier into the control polygon.
++	out.back = p2 + (p1 - p3) * (tension * lenB / lenOsn / 3.0f);
++	out.forw = p2 + (p3 - p1) * (tension * lenF / lenOsn / 3.0f);
+ }
+ 
+ //! Fills `pOut` (count entries) with the derived handles of the whole point list. A CLOSED spline
+ //! has no end points at all - every point is interior with wrapped neighbours - which is what makes
+ //! the closing segment join the first one smoothly instead of forming a corner.
+-inline void DeriveHandles(const Vec3* pPos, int count, bool bClosed, SHandles* pOut)
++inline void DeriveHandles(const Vec3* pPos, int count, bool bClosed, SHandles* pOut, float tension = 1.0f)
+ {
+ 	if (pPos == nullptr || pOut == nullptr || count <= 0)
+ 		return;
+@@ -148,7 +151,7 @@ inline void DeriveHandles(const Vec3* pPos, int count, bool bClosed, SHandles* p
+ 	{
+ 		for (int i = 0; i < count; ++i)
+ 		{
+-			DeriveInteriorHandles(pPos[(i + count - 1) % count], pPos[i], pPos[(i + 1) % count], pOut[i]);
++			DeriveInteriorHandles(pPos[(i + count - 1) % count], pPos[i], pPos[(i + 1) % count], pOut[i], tension);
+ 		}
+ 		return;
+ 	}
+@@ -158,7 +161,7 @@ inline void DeriveHandles(const Vec3* pPos, int count, bool bClosed, SHandles* p
+ 	// Interior first: these depend on point positions only (see the ORDER note at the top).
+ 	for (int i = 1; i < maxIndex; ++i)
+ 	{
+-		DeriveInteriorHandles(pPos[i - 1], pPos[i], pPos[i + 1], pOut[i]);
++		DeriveInteriorHandles(pPos[i - 1], pPos[i], pPos[i + 1], pOut[i], tension);
+ 	}
+ 
+ 	// The first point (SplineObject.cpp:908-925).
+@@ -168,7 +171,7 @@ inline void DeriveHandles(const Vec3* pPos, int count, bool bClosed, SHandles* p
+ 
+ 		if (maxIndex == 1)
+ 		{
+-			pOut[0].forw = p2 + (pPos[1] - p2) / 3.0f;
++			pOut[0].forw = p2 + (pPos[1] - p2) * (tension / 3.0f);
+ 		}
+ 		else
+ 		{
+@@ -257,6 +260,165 @@ inline float BlendWidthAlongSegment(float width0, float width1, float t)
+ 	return (1.0f - t) * width0 + t * width1;
+ }
+ 
++// ---------------------------------------------------------------------------
++// Smoothing - one pass of the 4-point INTERPOLATING subdivision scheme
++// ---------------------------------------------------------------------------
++
++//! Why this scheme and not Chaikin. Chaikin corner cutting is an APPROXIMATING scheme: it replaces
++//! every point with two points inside its corner, so after one pass none of the authored points is
++//! on the curve any more and the whole shape shrinks towards the inside of the control polygon.
++//! That is the wrong trade here, because those points are what the user drags - a smoothing slider
++//! that walks the curve off its own handles is a slider nobody can aim.
++//!
++//! The 4-point scheme (Dyn-Levin-Gregory, the subdivision form of a Catmull-Rom) KEEPS every
++//! existing point and only inserts one new point per edge, at
++//!     m = (-p0 + 9*p1 + 9*p2 - p3) / 16
++//! so the curve still passes through every authored point and only the corners are rounded off.
++//! Each pass doubles the number of edges, which is also what makes the mapping back to the authored
++//! points exact: after n passes, authored point i is subdivided point i * 2^n.
++inline int SubdivideInterpolating(const Vec3* pIn, int count, bool bClosed, Vec3* pOut, int maxOut)
++{
++	if (pIn == nullptr || pOut == nullptr || count < 2)
++		return 0;
++
++	const int outCount = bClosed ? (count * 2) : (count * 2 - 1);
++	if (outCount > maxOut)
++		return 0;
++
++	const int edgeCount = bClosed ? count : (count - 1);
++
++	for (int e = 0; e < edgeCount; ++e)
++	{
++		const int i1 = e;
++		const int i2 = (e + 1) % count;
++		// The two outer points of the four-point stencil, clamped at the ends of an open polygon,
++		// which is what makes an end segment keep its own straight direction.
++		const int i0 = bClosed ? ((e + count - 1) % count) : max(e - 1, 0);
++		const int i3 = bClosed ? ((e + 2) % count) : min(e + 2, count - 1);
++
++		pOut[e * 2] = pIn[i1];
++		pOut[e * 2 + 1] = (pIn[i0] * -1.0f + pIn[i1] * 9.0f + pIn[i2] * 9.0f + pIn[i3] * -1.0f) / 16.0f;
++	}
++
++	if (!bClosed)
++		pOut[outCount - 1] = pIn[count - 1];
++
++	return outCount;
++}
++
++//! Blends a per-point attribute (Angle, Width) the same way SubdivideInterpolating blends the
++//! positions, so that the two arrays stay in lockstep: existing values are kept where they are and
++//! an inserted point gets the midpoint of the edge it was inserted into. A plain midpoint, not the
++//! four-point stencil - overshooting a width into a negative number would be a bug, not a nicety.
++inline int SubdivideAttribute(const float* pIn, int count, bool bClosed, float* pOut, int maxOut)
++{
++	if (pIn == nullptr || pOut == nullptr || count < 2)
++		return 0;
++
++	const int outCount = bClosed ? (count * 2) : (count * 2 - 1);
++	if (outCount > maxOut)
++		return 0;
++
++	const int edgeCount = bClosed ? count : (count - 1);
++
++	for (int e = 0; e < edgeCount; ++e)
++	{
++		pOut[e * 2] = pIn[e];
++		pOut[e * 2 + 1] = (pIn[e] + pIn[(e + 1) % count]) * 0.5f;
++	}
++
++	if (!bClosed)
++		pOut[outCount - 1] = pIn[count - 1];
++
++	return outCount;
++}
++
++// ---------------------------------------------------------------------------
++// Rotation-minimizing frames (double reflection)
++// ---------------------------------------------------------------------------
++
++//! Legacy's normal is Vec3(0,0,1).Cross(tangent) - SegmentNormal above, and
++//! CSplineObject::GetLocalBezierNormal (SplineObject.cpp:874 and :880). That is a fine normal for a
++//! road lying on the ground and a bad one anywhere else: as the tangent approaches world up the
++//! cross product's LENGTH goes to zero, so its direction comes to be decided by whatever component
++//! of the tangent is still horizontal, and it swings through half a turn as the curve passes
++//! vertical. Everything oriented by that frame - every mesh the distributor places with "Follow
++//! Tangent" - spins with it.
++//!
++//! A rotation-minimizing frame has no preferred up vector at all: it carries one normal along the
++//! curve and turns it only as much as the curve itself turns. This is the double-reflection step of
++//! Wang, Juttler, Zheng and Liu (2008), the standard method, exact to second order: reflect the
++//! previous frame in the plane between the two positions, then again in the plane between the two
++//! tangents.
++//!
++//! The price, worth writing down: a CLOSED curve's frame does not generally return to where it
++//! started - the holonomy of a closed space curve is not zero - so a closed spline can show one
++//! twist at its seam. Legacy has no seam because it recomputes its frame from world up at every
++//! point, which is exactly the property that makes it flip.
++inline Vec3 PropagateNormal(const Vec3& prevPos, const Vec3& prevTangent, const Vec3& prevNormal,
++                            const Vec3& pos, const Vec3& tangent)
++{
++	const Vec3  v1 = pos - prevPos;
++	const float c1 = v1.Dot(v1);
++	if (c1 <= kEps * kEps)
++		return prevNormal;
++
++	// First reflection, in the plane bisecting the two positions.
++	const Vec3 reflectedNormal = prevNormal - v1 * ((2.0f / c1) * v1.Dot(prevNormal));
++	const Vec3 reflectedTangent = prevTangent - v1 * ((2.0f / c1) * v1.Dot(prevTangent));
++
++	// Second reflection, in the plane bisecting the reflected tangent and the real one.
++	const Vec3  v2 = tangent - reflectedTangent;
++	const float c2 = v2.Dot(v2);
++	if (c2 <= kEps * kEps)
++		return reflectedNormal;
++
++	Vec3 result = reflectedNormal - v2 * ((2.0f / c2) * v2.Dot(reflectedNormal));
++
++	// Keep it perpendicular and unit: the two reflections are exact in theory and drift in floats
++	// over a few hundred samples.
++	result -= tangent * result.Dot(tangent);
++	if (!result.IsZero(kEps))
++		result.Normalize();
++
++	return result;
++}
++
++//! A normal to seed a rotation-minimizing frame with: legacy's world-up cross product where that is
++//! well conditioned, and any perpendicular where it is not (a curve that starts out vertical).
++//! Seeding from legacy is what makes a flat spline look identical in both frame modes.
++inline Vec3 MakeSeedNormal(const Vec3& tangent)
++{
++	if (tangent.IsZero(kEps))
++		return Vec3(0.0f, 1.0f, 0.0f);
++
++	Vec3 normal = Vec3(0.0f, 0.0f, 1.0f).Cross(tangent);
++	if (normal.GetLength() < 0.1f)
++	{
++		normal = tangent.GetOrthogonal();
++	}
++
++	if (!normal.IsZero(kEps))
++		normal.Normalize();
++
++	return normal;
++}
++
++//! Rolls a frame normal about the tangent by `angleDegrees` - the per-point Angle that road banking
++//! and instance roll are authored with. It applies ON TOP of whichever frame mode produced `normal`,
++//! so switching frame mode never loses the authored banking.
++inline Vec3 ApplyRoll(const Vec3& normal, const Vec3& tangent, float angleDegrees)
++{
++	if (fabs_tpl(angleDegrees) <= kEps || normal.IsZero(kEps) || tangent.IsZero(kEps))
++		return normal;
++
++	Vec3 rolled = normal.GetRotated(tangent.GetNormalized(), DEG2RAD(angleDegrees));
++	if (!rolled.IsZero(kEps))
++		rolled.Normalize();
++
++	return rolled;
++}
++
+ } // namespace SplineMath
+ } // namespace AreaComponents
+ } // namespace Cry
+diff --git a/Code/CryPlugins/AreaComponents/Module/Shapes/SplineShapeComponent.cpp b/Code/CryPlugins/AreaComponents/Module/Shapes/SplineShapeComponent.cpp
+index c3470f17..80471806 100644
+--- a/Code/CryPlugins/AreaComponents/Module/Shapes/SplineShapeComponent.cpp
++++ b/Code/CryPlugins/AreaComponents/Module/Shapes/SplineShapeComponent.cpp
+@@ -23,45 +23,12 @@ const float kSplineDuplicatePointEpsilon = FLT_EPSILON;
+ const int   kSplineRandomPointAttempts = 64;
+ }
+ 
+-CSplineShapeComponent::CSplineShapeComponent()
+-{
+-	// The button's callback is bound in Initialize(), where the entity exists: it must capture an
+-	// EntityId and the component's GUID, never `this`. A reflected member is copied, cached and can
+-	// outlive the component (MEMORY.md, heap corruption fix bde12cd8), and a std::function holding
+-	// `this` would be exactly that hazard with a delayed fuse.
+-}
+-
+ void CSplineShapeComponent::Register(Schematyc::CEnvRegistrationScope& componentScope)
+ {
+ 	// No Schematyc functions yet - the same stage as the other kinds. The spline evaluators become
+ 	// Schematyc nodes when something outside C++ needs them.
+ }
+ 
+-void CSplineShapeComponent::Initialize()
+-{
+-	const EntityId entityId = GetEntityId();
+-	const CryGUID  componentGuid = GetGUID();
+-
+-	m_recenterButton = Serialization::ActionButton(std::function<void()>([entityId, componentGuid]()
+-	{
+-		IEntity* pEntity = (gEnv->pEntitySystem != nullptr) ? gEnv->pEntitySystem->GetEntity(entityId) : nullptr;
+-		if (pEntity == nullptr)
+-			return;
+-
+-		IEntityComponent* pComponent = pEntity->GetComponentByGUID(componentGuid);
+-		if (pComponent == nullptr)
+-			return;
+-
+-		// The GUID identifies one component instance, so this really is our own type; the kind check
+-		// is there so that a stale GUID reused by something else can never be reinterpreted.
+-		IShapeComponent* pShape = pEntity->GetComponent<IShapeComponent>();
+-		if (pShape == nullptr || pShape != static_cast<IShapeComponent*>(pComponent) || pShape->GetKind() != EShapeKind::Spline)
+-			return;
+-
+-		static_cast<CSplineShapeComponent*>(pShape)->RecenterPoints();
+-	}));
+-}
+-
+ // ---------------------------------------------------------------------------
+ // Basics and the derived cache
+ // ---------------------------------------------------------------------------
+@@ -73,7 +40,9 @@ Matrix34 CSplineShapeComponent::GetShapeWorldTM() const
+ 
+ int CSplineShapeComponent::GetSegmentCount() const
+ {
+-	const int count = static_cast<int>(m_points.points.size());
++	// Counted on the EVALUATION polygon, which is the authored points when smoothing is off and
++	// 2^SmoothIterations times as many when it is on.
++	const int count = static_cast<int>(GetCache().localPos.size());
+ 	if (count < 2)
+ 		return 0;
+ 
+@@ -84,12 +53,141 @@ int CSplineShapeComponent::GetSegmentCount() const
+ 
+ void CSplineShapeComponent::SegmentPoints(int segment, int& i0, int& i1) const
+ {
+-	const int count = static_cast<int>(m_points.points.size());
++	const int count = static_cast<int>(GetCache().localPos.size());
+ 
+ 	i0 = (count > 0) ? (segment % count) : 0;
+ 	i1 = (count > 0) ? ((segment + 1) % count) : 0;
+ }
+ 
++int CSplineShapeComponent::GetSamplesPerSegment() const
++{
++	// Smoothing multiplies the number of segments, so the samples per segment come down to match:
++	// the drawn curve stays just as smooth, the contour buffer stays the same size, and nothing
++	// downstream has to learn about smoothing.
++	const int iterations = clamp_tpl(m_smoothIterations, 0, kMaxSmoothIterations);
++	return max(1, kSamplesPerSegment >> iterations);
++}
++
++void CSplineShapeComponent::BuildEvalPolygon(SCache& cache) const
++{
++	const int authoredCount = static_cast<int>(m_points.points.size());
++
++	cache.evalStride = 1;
++	cache.localPos.resize(authoredCount);
++	cache.evalAngle.resize(authoredCount);
++	cache.evalWidth.resize(authoredCount);
++
++	for (int i = 0; i < authoredCount; ++i)
++	{
++		const SSplinePoint& point = m_points.points[i];
++		cache.localPos[i] = m_offset + point.pos;
++		cache.evalAngle[i] = point.angle;
++		// The width is resolved here, once: a point flagged "default width" contributes a negative
++		// sentinel, and GetLocalWidth() turns that back into the consumer's own width. Doing it this
++		// way is what lets the width be subdivided as a plain float array beside the positions.
++		cache.evalWidth[i] = point.defaultWidth ? -1.0f : point.width;
++	}
++
++	const int iterations = clamp_tpl(m_smoothIterations, 0, kMaxSmoothIterations);
++	if (iterations <= 0 || authoredCount < 2)
++		return;
++
++	std::vector<Vec3>  posScratch;
++	std::vector<float> angleScratch;
++	std::vector<float> widthScratch;
++
++	for (int pass = 0; pass < iterations; ++pass)
++	{
++		const int count = static_cast<int>(cache.localPos.size());
++		const int outCount = m_closed ? (count * 2) : (count * 2 - 1);
++		if (outCount > kMaxEvalPoints)
++		{
++			CryWarning(VALIDATOR_MODULE_ENTITYSYSTEM, VALIDATOR_WARNING,
++			           "Shape: Spline - Smooth Iterations %d would need %d evaluation points (limit %d); "
++			           "stopped after %d passes.",
++			           iterations, outCount, kMaxEvalPoints, pass);
++			break;
++		}
++
++		posScratch.resize(outCount);
++		angleScratch.resize(outCount);
++		widthScratch.resize(outCount);
++
++		const int written = SplineMath::SubdivideInterpolating(cache.localPos.data(), count, m_closed,
++		                                                       posScratch.data(), outCount);
++		if (written != outCount)
++			break;
++
++		SplineMath::SubdivideAttribute(cache.evalAngle.data(), count, m_closed, angleScratch.data(), outCount);
++		SplineMath::SubdivideAttribute(cache.evalWidth.data(), count, m_closed, widthScratch.data(), outCount);
++
++		cache.localPos.swap(posScratch);
++		cache.evalAngle.swap(angleScratch);
++		cache.evalWidth.swap(widthScratch);
++
++		cache.evalStride *= 2;
++	}
++}
++
++void CSplineShapeComponent::BuildFrameNormals(SCache& cache) const
++{
++	cache.frameNormals.clear();
++
++	if (m_frameMode != ESplineFrameMode::ParallelTransport)
++		return;
++
++	const int segmentCount = m_closed ? static_cast<int>(cache.localPos.size())
++	                                  : (static_cast<int>(cache.localPos.size()) - 1);
++	if (segmentCount <= 0)
++		return;
++
++	const int samplesPerSegment = GetSamplesPerSegment();
++	const int sampleCount = segmentCount * samplesPerSegment + 1;
++
++	cache.frameNormals.resize(sampleCount);
++
++	// Local space: the frame rides the shape, so a rotated entity rotates it with everything else.
++	const auto sampleAt = [&](int index, Vec3& pos, Vec3& tangent)
++	{
++		const float f = static_cast<float>(index) / static_cast<float>(samplesPerSegment);
++		int         segment = static_cast<int>(floorf(f));
++		float       t = f - static_cast<float>(segment);
++		if (segment >= segmentCount)
++		{
++			segment = segmentCount - 1;
++			t = 1.0f;
++		}
++
++		int i0, i1;
++		i0 = segment % static_cast<int>(cache.localPos.size());
++		i1 = (segment + 1) % static_cast<int>(cache.localPos.size());
++
++		pos = SplineMath::EvalSegmentPos(cache.localPos[i0], cache.localHandles[i0].forw,
++		                                 cache.localHandles[i1].back, cache.localPos[i1], t);
++		tangent = SplineMath::EvalSegmentTangent(cache.localPos[i0], cache.localHandles[i0].forw,
++		                                         cache.localHandles[i1].back, cache.localPos[i1], t);
++	};
++
++	Vec3 prevPos, prevTangent;
++	sampleAt(0, prevPos, prevTangent);
++
++	// Seeded from legacy's own normal, so a flat spline looks identical in both frame modes and
++	// only a curve that legacy cannot orient is changed.
++	cache.frameNormals[0] = SplineMath::MakeSeedNormal(prevTangent);
++
++	for (int i = 1; i < sampleCount; ++i)
++	{
++		Vec3 pos, tangent;
++		sampleAt(i, pos, tangent);
++
++		cache.frameNormals[i] = SplineMath::PropagateNormal(prevPos, prevTangent, cache.frameNormals[i - 1],
++		                                                    pos, tangent);
++
++		prevPos = pos;
++		prevTangent = tangent;
++	}
++}
++
+ const CSplineShapeComponent::SCache& CSplineShapeComponent::GetCache() const
+ {
+ 	const Matrix34 worldTM = GetShapeWorldTM();
+@@ -103,17 +201,17 @@ const CSplineShapeComponent::SCache& CSplineShapeComponent::GetCache() const
+ 	if (bSameTM)
+ 		return m_cache;
+ 
+-	const int count = static_cast<int>(m_points.points.size());
++	// The evaluation polygon first: the authored points, optionally subdivided (BuildEvalPolygon).
++	BuildEvalPolygon(m_cache);
++
++	const int count = static_cast<int>(m_cache.localPos.size());
+ 
+-	m_cache.localPos.resize(count);
+ 	m_cache.localHandles.resize(count);
+ 	m_cache.worldPos.resize(count);
+ 	m_cache.worldHandles.resize(count);
+ 
+-	for (int i = 0; i < count; ++i)
+-		m_cache.localPos[i] = m_offset + m_points.points[i].pos;
+-
+-	SplineMath::DeriveHandles(m_cache.localPos.data(), count, m_closed, m_cache.localHandles.data());
++	SplineMath::DeriveHandles(m_cache.localPos.data(), count, m_closed, m_cache.localHandles.data(),
++	                          clamp_tpl(m_tension, 0.0f, 1.0f));
+ 
+ 	// A Bezier is affine invariant, so transforming the four control points of a segment transforms
+ 	// the curve: the world copy is the local one put through the matrix, not a re-derivation (which
+@@ -126,8 +224,9 @@ const CSplineShapeComponent::SCache& CSplineShapeComponent::GetCache() const
+ 	}
+ 
+ 	// The arc-length table, measured in WORLD metres so that PosByDistance and TotalLength answer in
+-	// the units every consumer places things with.
+-	const int segmentCount = GetSegmentCount();
++	// the units every consumer places things with. Counted locally rather than through
++	// GetSegmentCount(), which reads the cache this function is still filling.
++	const int segmentCount = (count < 2) ? 0 : (m_closed ? count : (count - 1));
+ 	m_cache.segmentLength.resize(segmentCount);
+ 	m_cache.segmentStart.resize(segmentCount);
+ 	m_cache.totalLength = 0.0f;
+@@ -143,6 +242,9 @@ const CSplineShapeComponent::SCache& CSplineShapeComponent::GetCache() const
+ 		m_cache.totalLength += m_cache.segmentLength[s];
+ 	}
+ 
++	// Last, because it samples the curve the lines above just finished describing.
++	BuildFrameNormals(m_cache);
++
+ 	m_cache.worldTM = worldTM;
+ 	m_cache.bValid = true;
+ 
+@@ -223,8 +325,8 @@ Vec3 CSplineShapeComponent::EvalTangent(float t) const
+ 
+ Vec3 CSplineShapeComponent::GetLocalBezierNormal(float t) const
+ {
+-	const int count = static_cast<int>(m_points.points.size());
+-	if (count < 2)
++	const SCache& cache = GetCache();
++	if (cache.localPos.size() < 2)
+ 		return ZERO;
+ 
+ 	int   segment = 0;
+@@ -234,8 +336,42 @@ Vec3 CSplineShapeComponent::GetLocalBezierNormal(float t) const
+ 	int i0, i1;
+ 	SegmentPoints(segment, i0, i1);
+ 
+-	return SplineMath::SegmentNormal(SegmentTangent(segment, segmentT, false),
+-	                                 m_points.points[i0].angle, m_points.points[i1].angle, segmentT);
++	const Vec3  tangent = SegmentTangent(segment, segmentT, false);
++	const float angle0 = cache.evalAngle[i0];
++	const float angle1 = cache.evalAngle[i1];
++
++	if (m_frameMode == ESplineFrameMode::LegacyUp || cache.frameNormals.size() < 2)
++	{
++		// CSplineObject::GetLocalBezierNormal unchanged - the default, and byte for byte the legacy
++		// look. It blends the two points' Angle with the cubic ease legacy uses.
++		return SplineMath::SegmentNormal(tangent, angle0, angle1, segmentT);
++	}
++
++	// The carried frame, read at the same parameter. The normals are sampled uniformly along the
++	// curve's parameter, so the lookup is a straight lerp between neighbouring samples.
++	const int   sampleCount = static_cast<int>(cache.frameNormals.size());
++	const float f = clamp_tpl(t, 0.0f, 1.0f) * static_cast<float>(sampleCount - 1);
++	const int   index = clamp_tpl(static_cast<int>(floorf(f)), 0, sampleCount - 2);
++
++	Vec3 normal = Vec3::CreateLerp(cache.frameNormals[index], cache.frameNormals[index + 1], f - static_cast<float>(index));
++
++	// Re-orthogonalise against the real tangent at t: the lerp between two unit normals is neither
++	// unit nor exactly perpendicular.
++	if (!tangent.IsZero())
++	{
++		const Vec3 unitTangent = tangent.GetNormalized();
++		normal -= unitTangent * normal.Dot(unitTangent);
++	}
++
++	if (normal.IsZero(SplineMath::kEps))
++		return SplineMath::SegmentNormal(tangent, angle0, angle1, segmentT);
++
++	normal.Normalize();
++
++	// The authored roll goes on top, with the same blend legacy uses, so switching frame mode never
++	// loses a banked point.
++	const float blend = SplineMath::BlendAngleAlongSegment(segmentT);
++	return SplineMath::ApplyRoll(normal, tangent, (1.0f - blend) * angle0 + blend * angle1);
+ }
+ 
+ Vec3 CSplineShapeComponent::EvalNormal(float t) const
+@@ -256,8 +392,8 @@ Vec3 CSplineShapeComponent::EvalNormal(float t) const
+ 
+ float CSplineShapeComponent::GetLocalWidth(float t, float defaultWidth) const
+ {
+-	const int count = static_cast<int>(m_points.points.size());
+-	if (count < 2)
++	const SCache& cache = GetCache();
++	if (cache.localPos.size() < 2)
+ 		return defaultWidth;
+ 
+ 	int   segment = 0;
+@@ -267,8 +403,10 @@ float CSplineShapeComponent::GetLocalWidth(float t, float defaultWidth) const
+ 	int i0, i1;
+ 	SegmentPoints(segment, i0, i1);
+ 
+-	const float width0 = m_points.points[i0].defaultWidth ? defaultWidth : m_points.points[i0].width;
+-	const float width1 = m_points.points[i1].defaultWidth ? defaultWidth : m_points.points[i1].width;
++	// A negative stored width is the "use the consumer's own width" sentinel BuildEvalPolygon wrote
++	// for a point flagged Default Width.
++	const float width0 = (cache.evalWidth[i0] < 0.0f) ? defaultWidth : cache.evalWidth[i0];
++	const float width1 = (cache.evalWidth[i1] < 0.0f) ? defaultWidth : cache.evalWidth[i1];
+ 
+ 	return SplineMath::BlendWidthAlongSegment(width0, width1, segmentT);
+ }
+@@ -313,13 +451,13 @@ Vec3 CSplineShapeComponent::PosByDistance(float distance) const
+ 
+ int CSplineShapeComponent::GetSampleCount() const
+ {
+-	const int count = static_cast<int>(m_points.points.size());
++	const int count = static_cast<int>(GetCache().localPos.size());
+ 	if (count < 2)
+ 		return count;
+ 
+ 	// Every segment contributes its start point plus the samples inside it; an open curve adds the
+ 	// final end point, a closed one does not (its closing edge is implicit, as GetContour promises).
+-	return GetSegmentCount() * kSamplesPerSegment + (m_closed ? 0 : 1);
++	return GetSegmentCount() * GetSamplesPerSegment() + (m_closed ? 0 : 1);
+ }
+ 
+ int CSplineShapeComponent::SampleCurve(Vec3* pOut, int maxPoints, bool world) const
+@@ -340,9 +478,9 @@ int CSplineShapeComponent::SampleCurve(Vec3* pOut, int maxPoints, bool world) co
+ 	int written = 0;
+ 	for (int s = 0; s < segmentCount && written < maxPoints; ++s)
+ 	{
+-		for (int k = 0; k < kSamplesPerSegment && written < maxPoints; ++k)
++		for (int k = 0; k < GetSamplesPerSegment() && written < maxPoints; ++k)
+ 		{
+-			pOut[written++] = SegmentPos(s, static_cast<float>(k) / static_cast<float>(kSamplesPerSegment), world);
++			pOut[written++] = SegmentPos(s, static_cast<float>(k) / static_cast<float>(GetSamplesPerSegment()), world);
+ 		}
+ 	}
+ 
+@@ -697,17 +835,43 @@ int CSplineShapeComponent::GetEdgePoints(int index, Vec3* pOut, int maxPoints) c
+ {
+ 	// The tool asks this so that Ctrl+click inserts on the CURVE and the highlight follows it.
+ 	// Samples are in the shape's local space, both end points included.
+-	if (pOut == nullptr || maxPoints < 2 || index < 0 || index >= GetSegmentCount())
++	//
++	// `index` is an AUTHORED edge - the tool only ever knows the authored points. With smoothing on,
++	// that edge is 2^SmoothIterations evaluation segments wide, and the subdivision is interpolating,
++	// so authored point i is exactly evaluation point i * stride (SplineMath.h). That is the whole
++	// mapping, and it is why the scheme had to be an interpolating one.
++	const SCache& cache = GetCache();
++
++	const int authoredCount = static_cast<int>(m_points.points.size());
++	const int authoredEdges = (authoredCount < 2) ? 0 : (m_closed ? authoredCount : (authoredCount - 1));
++	if (pOut == nullptr || maxPoints < 2 || index < 0 || index >= authoredEdges)
+ 		return 0;
+ 
+-	const int steps = min(kSamplesPerSegment, maxPoints - 1);
++	const int stride = max(1, cache.evalStride);
++	const int firstSegment = index * stride;
++	const int segmentCount = GetSegmentCount();
++	if (firstSegment >= segmentCount)
++		return 0;
+ 
+-	for (int k = 0; k <= steps; ++k)
++	const int usedSegments = min(stride, segmentCount - firstSegment);
++	const int stepsPerSegment = max(1, min(GetSamplesPerSegment(), (maxPoints - 1) / usedSegments));
++
++	int written = 0;
++	for (int segment = 0; segment < usedSegments; ++segment)
+ 	{
+-		pOut[k] = SegmentPos(index, static_cast<float>(k) / static_cast<float>(steps), false);
++		for (int k = 0; k < stepsPerSegment && written < maxPoints; ++k)
++		{
++			const float t = static_cast<float>(k) / static_cast<float>(stepsPerSegment);
++			pOut[written++] = SegmentPos(firstSegment + segment, t, false);
++		}
+ 	}
+ 
+-	return steps + 1;
++	if (written < maxPoints)
++	{
++		pOut[written++] = SegmentPos(firstSegment + usedSegments - 1, 1.0f, false);
++	}
++
++	return (written >= 2) ? written : 0;
+ }
+ 
+ void CSplineShapeComponent::BeginEdit()
+@@ -747,34 +911,6 @@ void CSplineShapeComponent::RecordChange(EShapeChangeReason reason)
+ 	m_bChangedDuringEdit = true;
+ }
+ 
+-void CSplineShapeComponent::RecenterPoints()
+-{
+-	const int count = static_cast<int>(m_points.points.size());
+-	if (count == 0)
+-		return;
+-
+-	Vec3 centroid(ZERO);
+-	for (const SSplinePoint& point : m_points.points)
+-		centroid += point.pos;
+-	centroid /= static_cast<float>(count);
+-
+-	if (centroid.IsZero(0.0001f))
+-		return;
+-
+-	// Nothing moves in the world: the shift comes off every point and goes onto the offset. This is
+-	// deliberately NOT legacy's CalcBBox re-basing (SplineObject.cpp:1208-1217), which moves the
+-	// object transform and therefore makes every point edit a transform edit. Moving the ENTITY
+-	// pivot cannot be done from here at all: EditorQt's CEntityObject owns the transform and never
+-	// reads it back off the entity, so a component that called SetPos would be overwritten by the
+-	// object's next push. A true pivot move is an editor-side action and is still to come.
+-	for (SSplinePoint& point : m_points.points)
+-		point.pos -= centroid;
+-
+-	m_offset += centroid;
+-
+-	RecordChange(EShapeChangeReason::Geometry);
+-}
+-
+ // ---------------------------------------------------------------------------
+ // Listeners and events
+ // ---------------------------------------------------------------------------
+@@ -861,13 +997,34 @@ void CSplineShapeComponent::Render(const IEntity& entity, const IEntityComponent
+ 	{
+ 		const int j = (i + 1) % count;
+ 
+-		// Which authored segment this chord belongs to, so a sound-obstructing segment reads as one.
+-		const int    segment = i / kSamplesPerSegment;
++		// Which AUTHORED segment this chord belongs to, so a sound-obstructing segment reads as one.
++		// One authored segment is `evalStride` evaluation segments, each of GetSamplesPerSegment()
++		// chords, so the divisor is the product.
++		const int    chordsPerAuthoredSegment = max(1, GetSamplesPerSegment() * max(1, GetCache().evalStride));
++		const int    segment = i / chordsPerAuthoredSegment;
+ 		const ColorB chordColour = IsSegmentObstructing(segment) ? obstructColour : colour;
+ 
+ 		pAux->DrawLine(samples[i], chordColour, samples[j], chordColour);
+ 	}
+ 
++	// With smoothing on, the curve no longer hugs the control polygon, so the polygon is drawn
++	// faintly beside it: the user can see both what they authored and what it evaluates to, and the
++	// point handles the edit tool shows sit on the faint one.
++	if (m_smoothIterations > 0)
++	{
++		const Matrix34 shapeTM = GetShapeWorldTM();
++		const int      authoredCount = static_cast<int>(m_points.points.size());
++		const ColorB   polygonColour(colour.r, colour.g, colour.b, 70);
++
++		const int authoredEdges = m_closed ? authoredCount : (authoredCount - 1);
++		for (int i = 0; i < authoredEdges; ++i)
++		{
++			const Vec3 a = shapeTM.TransformPoint(m_offset + m_points.points[i].pos);
++			const Vec3 b = shapeTM.TransformPoint(m_offset + m_points.points[(i + 1) % authoredCount].pos);
++			pAux->DrawLine(a, polygonColour, b, polygonColour);
++		}
++	}
++
+ 	// A short tick across the curve wherever a point carries an explicit width, so that authored
+ 	// width is visible without opening the inspector. Half a width to each side, as a road is built.
+ 	const int pointCount = static_cast<int>(m_points.points.size());
+@@ -881,7 +1038,10 @@ void CSplineShapeComponent::Render(const IEntity& entity, const IEntityComponent
+ 		if (point.defaultWidth || point.width <= 0.0f)
+ 			continue;
+ 
+-		const float t = (segmentCount > 0) ? (static_cast<float>(min(i, segmentCount)) / static_cast<float>(segmentCount)) : 0.0f;
++		// Authored point i is evaluation point i * stride (the subdivision interpolates), so its
++		// parameter along the whole curve is that index over the number of evaluation segments.
++		const int   evalIndex = min(i * max(1, GetCache().evalStride), segmentCount);
++		const float t = static_cast<float>(evalIndex) / static_cast<float>(segmentCount);
+ 
+ 		const Vec3 normal = EvalNormal(t);
+ 		if (normal.IsZero())
+-- 
+2.47.1.windows.1
+

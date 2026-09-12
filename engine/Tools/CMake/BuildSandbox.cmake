@@ -71,6 +71,8 @@ add_subdirectory("Code/Sandbox/Plugins/MaterialEditorPlugin")
 add_subdirectory("Code/Sandbox/Plugins/PrefabAssetType")
 # ReC Sandbox: the cinematic camera's asset types (LUT / ASC CDL / grade preset), S10 item 4b.
 add_subdirectory("Code/Sandbox/Plugins/CinematicCameraEditor")
+# ReC Sandbox: the Area modernisation's editing tools (shape edit / create), stage 0.4.
+add_subdirectory("Code/Sandbox/Plugins/AreaComponentsEditor")
 add_subdirectory("Code/Sandbox/Plugins/CryTestRunnerPlugin")
 if(OPTION_SANDBOX_SUBSTANCE)
 	include("${CRYENGINE_DIR}/Tools/CMake/modules/Substance.cmake")

@@ -73,7 +73,8 @@ $docSources = @(
     "Code/CryPlugins/CinematicCamera/docs/SceneReferredContent.md",
     "Code/CryPlugins/CinematicCamera/docs/SceneReferredCalibration.md",
     "Code/CryPlugins/CinematicCamera/docs/SceneReferredLook.md",
-    "Code/CryPlugins/CinematicCamera/docs/SceneReferredExport.md"
+    "Code/CryPlugins/CinematicCamera/docs/SceneReferredExport.md",
+    "Code/CryPlugins/AreaComponents/README.md"
 )
 # Design specs are internal work orders and stay out of the public snapshot.
 foreach ($doc in ($docSources | Select-Object -Unique)) {
@@ -81,6 +82,7 @@ foreach ($doc in ($docSources | Select-Object -Unique)) {
     $name = Split-Path -Leaf $doc
     if ($doc -like "*CryPhoneTracker*" -and $name -eq "README.md") { $name = "CryPhoneTracker-README.md" }
     if ($doc -like "*CinematicCamera*" -and $name -eq "README.md") { $name = "CinematicCamera-README.md" }
+    if ($doc -like "*AreaComponents*" -and $name -eq "README.md") { $name = "AreaComponents-README.md" }
     Copy-BlobExact "${DevRef}:$doc" (Join-Path $docDir $name)
 }
 

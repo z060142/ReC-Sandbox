@@ -1,0 +1,532 @@
+From c340deead506bf646daefeada359026af4a5c3ca Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Sat, 12 Sep 2026 13:59:48 +0800
+Subject: [PATCH 204/209] feat(area): Recenter Pivot editor action with undo
+
+The engine-side "Recenter Points" button shipped in the spline shape was wrong
+for the user and is gone. It moved the curve visibly and could not be undone,
+because a reflected ActionButton runs inside the component: it can change the
+component's own members, and nothing else. Moving a PIVOT means moving the
+entity, and in Sandbox the editor object owns the transform - CEntityObject
+pushes its transform onto the entity and never reads one back (there is no
+ENTITY_EVENT_XFORM handler in EntityObject.cpp). So the button compensated by
+shifting the points and the Offset instead, which is not what "recenter pivot"
+means to anyone, and none of it went through the undo manager.
+
+It is now an editor action, through the generic mechanism stage 2 added: the
+component declares it in IEditorActionComponent::GetEditorAction and
+CEntityObject::CreateComponentWidget turns it into an SEditToolButton bound to
+that component instance. ShapeEditorActions.h holds the two actions a kind with
+an authored point list offers - the 1b point tool and this one - so Polygon and
+Spline each declare them in one line and Box and Sphere are untouched.
+
+CShapeRecenterTool is a one-shot: an inspector button starts a CEditTool, so the
+work happens on the first Display() - not in SetUserData(), which runs while the
+property tree is still installing the tool - and it then pops itself off the
+level editor. It remembers every point's WORLD position, calls
+CBaseObject::SetWorldPos(centroid), rewrites every point in the new local frame
+from the remembered positions so that nothing moves on screen, runs the 1a sync
+and accepts one CUndo. The object snapshot taken at the start covers both the
+transform and the serialized points, so Ctrl+Z puts the pivot and the points
+back together. A shape already centred to within a millimetre is left alone
+rather than given an undo step that changes nothing.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SCUvWGLCsqzm3VNMzp4uiS
+---
+ .../Module/Shapes/PolygonShapeComponent.h     |  10 +-
+ .../Module/Shapes/ShapeEditorActions.h        |  65 ++++++++
+ .../Module/Shapes/SplineShapeComponent.h      |  81 ++++++++--
+ .../Tools/ShapeRecenterTool.cpp               | 145 ++++++++++++++++++
+ .../Tools/ShapeRecenterTool.h                 |  62 ++++++++
+ 5 files changed, 347 insertions(+), 16 deletions(-)
+ create mode 100644 Code/CryPlugins/AreaComponents/Module/Shapes/ShapeEditorActions.h
+ create mode 100644 Code/Sandbox/Plugins/AreaComponentsEditor/Tools/ShapeRecenterTool.cpp
+ create mode 100644 Code/Sandbox/Plugins/AreaComponentsEditor/Tools/ShapeRecenterTool.h
+
+diff --git a/Code/CryPlugins/AreaComponents/Module/Shapes/PolygonShapeComponent.h b/Code/CryPlugins/AreaComponents/Module/Shapes/PolygonShapeComponent.h
+index 095d20c0..6f29669c 100644
+--- a/Code/CryPlugins/AreaComponents/Module/Shapes/PolygonShapeComponent.h
++++ b/Code/CryPlugins/AreaComponents/Module/Shapes/PolygonShapeComponent.h
+@@ -3,6 +3,7 @@
+ 
+ #include "../../Interface/IShapeComponent.h"
+ #include "ShapeKinds.h"
++#include "ShapeEditorActions.h"
+ 
+ #include <CrySchematyc/MathTypes.h>
+ #include <CrySchematyc/Reflection/TypeDesc.h>
+@@ -143,8 +144,13 @@ public:
+ 	// IEditorShapeComponent
+ 	virtual bool        GetEditorLocalBounds(AABB& out) const override;
+ 	virtual bool        EditorHitTest(const Ray& worldRay, float tolerance, float& distOut) const override;
+-	virtual const char* GetEditToolClassName() const override { return "EditTool.AreaShapeEdit"; }
+-	virtual const char* GetEditToolLabel() const override     { return "Edit Shape"; }
++	virtual const char* GetEditToolClassName() const override { return ShapeEditorActions::GetEditToolClassName(); }
++	virtual const char* GetEditToolLabel() const override     { return ShapeEditorActions::GetEditToolLabel(); }
++
++	//! A polygon has an authored point list, so it offers the pivot action beside the point tool
++	//! (ShapeEditorActions.h) - the same two buttons the spline shows, from the same place.
++	virtual int  GetEditorActionCount() const override { return ShapeEditorActions::GetPointShapeActionCount(); }
++	virtual bool GetEditorAction(int index, SEditorActionDesc& out) const override { return ShapeEditorActions::GetPointShapeAction(index, out); }
+ 	// ~IEditorShapeComponent
+ 
+ 	// IShapeComponentEdit - the real thing for this kind: a point list the tool edits directly.
+diff --git a/Code/CryPlugins/AreaComponents/Module/Shapes/ShapeEditorActions.h b/Code/CryPlugins/AreaComponents/Module/Shapes/ShapeEditorActions.h
+new file mode 100644
+index 00000000..e930f03a
+--- /dev/null
++++ b/Code/CryPlugins/AreaComponents/Module/Shapes/ShapeEditorActions.h
+@@ -0,0 +1,65 @@
++// Copyright 2026 ReC Sandbox. Distributed under the terms in LICENSE.md at the repository root.
++#pragma once
++
++//! The inspector buttons a point-list shape kind offers, in one place.
++//!
++//! A shape gets its buttons through IEditorActionComponent (CryCommon/CryEntitySystem/
++//! IEntityComponent.h): the component says how many actions it has and names the CEditTool class
++//! each one starts, and CEntityObject::CreateComponentWidget turns each into an SEditToolButton row
++//! bound to that component instance. IEditorShapeComponent already implements that interface in
++//! terms of the single "Edit Shape" tool a shape names, which is all Box and Sphere need; a kind
++//! with a real POINT LIST has a second action, and this header is what keeps Polygon and Spline
++//! from spelling it out twice.
++//!
++//! Why "Recenter Pivot" is an EDITOR action and not, as it briefly was, a reflected ActionButton on
++//! the component: moving the pivot means moving the ENTITY, and in Sandbox the editor object owns
++//! the transform - CEntityObject pushes its own transform onto the entity and never reads one back
++//! (there is no ENTITY_EVENT_XFORM handler in EntityObject.cpp). A component that called
++//! IEntity::SetPos would be silently overwritten by the object's next push, and nothing about it
++//! would be undoable. The engine-side button compensated by shifting the points and the offset
++//! instead, which moved the curve on screen and could not be undone - the bug this replaces. The
++//! editor tool does it the only correct way: CBaseObject::SetWorldPos inside one CUndo, with every
++//! point rewritten in the new local frame so that nothing moves in the world.
++
++#include <CryEntitySystem/IEntityComponent.h>
++
++namespace Cry
++{
++namespace AreaComponents
++{
++namespace ShapeEditorActions
++{
++
++//! The point tool of stage 1b, which every shape kind already names.
++inline const char* GetEditToolClassName()      { return "EditTool.AreaShapeEdit"; }
++inline const char* GetEditToolLabel()          { return "Edit Shape"; }
++
++//! The one-shot pivot action, implemented by CShapeRecenterTool in the editor plugin.
++inline const char* GetRecenterToolClassName()  { return "EditTool.AreaShapeRecenter"; }
++inline const char* GetRecenterToolLabel()      { return "Recenter Pivot"; }
++
++//! How many actions a kind with an authored point list offers.
++inline int GetPointShapeActionCount() { return 2; }
++
++//! Describes action `index` of a kind with an authored point list. The strings are literals with
++//! static storage, which is what SEditorActionDesc requires - the property tree keeps the pointers.
++inline bool GetPointShapeAction(int index, SEditorActionDesc& out)
++{
++	switch (index)
++	{
++	case 0:
++		out.szToolClassName = GetEditToolClassName();
++		out.szLabel = GetEditToolLabel();
++		return true;
++	case 1:
++		out.szToolClassName = GetRecenterToolClassName();
++		out.szLabel = GetRecenterToolLabel();
++		return true;
++	default:
++		return false;
++	}
++}
++
++} // namespace ShapeEditorActions
++} // namespace AreaComponents
++} // namespace Cry
+diff --git a/Code/CryPlugins/AreaComponents/Module/Shapes/SplineShapeComponent.h b/Code/CryPlugins/AreaComponents/Module/Shapes/SplineShapeComponent.h
+index 1a41cf20..f428c629 100644
+--- a/Code/CryPlugins/AreaComponents/Module/Shapes/SplineShapeComponent.h
++++ b/Code/CryPlugins/AreaComponents/Module/Shapes/SplineShapeComponent.h
+@@ -3,6 +3,7 @@
+ 
+ #include "../../Interface/IShapeComponent.h"
+ #include "ShapeKinds.h"
++#include "ShapeEditorActions.h"
+ #include "SplineMath.h"
+ 
+ #include <CrySchematyc/MathTypes.h>
+@@ -20,6 +21,29 @@ namespace Cry
+ namespace AreaComponents
+ {
+ 
++//! How the spline builds the normal that orients whatever rides on it - a road's banking, a
++//! distributed mesh's rotation.
++enum class ESplineFrameMode
++{
++	//! CSplineObject's rule: Vec3(0,0,1).Cross(tangent), recomputed at every point. Identical to
++	//! legacy, and the default, so existing content is untouched. It degenerates wherever the
++	//! tangent approaches world up - see SplineMath::PropagateNormal for what that does.
++	LegacyUp = 0,
++	//! A rotation-minimizing frame carried along the curve by double reflection. No preferred up
++	//! vector, so nothing flips through a vertical segment or a tight turn.
++	ParallelTransport,
++};
++
++inline void ReflectType(Schematyc::CTypeDesc<ESplineFrameMode>& desc)
++{
++	desc.SetGUID("{2B5F4C10-6A71-4B2E-9E37-4C1D0A5E7B22}"_cry_guid);
++	desc.SetLabel("Frame Mode");
++	desc.SetDescription("How the spline builds the normal that orients what rides on it");
++	desc.SetDefaultValue(ESplineFrameMode::LegacyUp);
++	desc.AddConstant(ESplineFrameMode::LegacyUp, "LegacyUp", "Legacy Up");
++	desc.AddConstant(ESplineFrameMode::ParallelTransport, "ParallelTransport", "Parallel Transport");
++}
++
+ //! One authored point of a spline shape, in the component's local space.
+ //!
+ //! It is CSplinePoint (SplineObject.h:9-23) minus the two Bezier handles: those are DERIVED from
+@@ -112,7 +136,7 @@ class CSplineShapeComponent final
+ #endif
+ {
+ public:
+-	CSplineShapeComponent();
++	CSplineShapeComponent() = default;
+ 	virtual ~CSplineShapeComponent() = default;
+ 
+ 	static void Register(Schematyc::CEnvRegistrationScope& componentScope);
+@@ -133,7 +157,9 @@ public:
+ 
+ 		desc.AddMember(&CSplineShapeComponent::m_closed, 'clsd', "Closed", "Closed", "Whether the last point connects back to the first, closing the curve smoothly.", false);
+ 		desc.AddMember(&CSplineShapeComponent::m_offset, 'offs', "Offset", "Offset", "Translation of the whole spline in the entity's local space", Vec3(0.0f, 0.0f, 0.0f));
+-		desc.AddMember(&CSplineShapeComponent::m_recenterButton, 'rctr', "RecenterPoints", "Recenter Points", "Rebase the point list on its own centroid, compensating with Offset so that nothing moves in the world.", Serialization::FunctorActionButton<std::function<void()>>());
++		desc.AddMember(&CSplineShapeComponent::m_smoothIterations, 'smth', "SmoothIterations", "Smooth Iterations", "Rounds the corners of the control polygon before the curve is fitted, 0 to 4 passes. The authored points stay on the curve and stay editable; 0 is the legacy curve exactly.", 0);
++		desc.AddMember(&CSplineShapeComponent::m_tension, 'tens', "Tension", "Tension", "How far the curve bulges between its points, 0 to 1. 1 is the legacy handle length exactly; 0 makes the curve the straight control polygon.", 1.0f);
++		desc.AddMember(&CSplineShapeComponent::m_frameMode, 'frmm', "FrameMode", "Frame Mode", "How the normal that orients roads and distributed meshes is built along the curve", ESplineFrameMode::LegacyUp);
+ 		desc.AddMember(&CSplineShapeComponent::m_points, 'pnts', "Points", "Points", "The spline's points, in the shape's local space", SSplinePoints());
+ 	}
+ 
+@@ -157,8 +183,13 @@ public:
+ 	// IEditorShapeComponent
+ 	virtual bool        GetEditorLocalBounds(AABB& out) const override;
+ 	virtual bool        EditorHitTest(const Ray& worldRay, float tolerance, float& distOut) const override;
+-	virtual const char* GetEditToolClassName() const override { return "EditTool.AreaShapeEdit"; }
+-	virtual const char* GetEditToolLabel() const override     { return "Edit Shape"; }
++	virtual const char* GetEditToolClassName() const override { return ShapeEditorActions::GetEditToolClassName(); }
++	virtual const char* GetEditToolLabel() const override     { return ShapeEditorActions::GetEditToolLabel(); }
++
++	//! A spline has an authored point list, so it offers the pivot action beside the point tool
++	//! (ShapeEditorActions.h). Both buttons are bound to THIS component instance by the inspector.
++	virtual int  GetEditorActionCount() const override { return ShapeEditorActions::GetPointShapeActionCount(); }
++	virtual bool GetEditorAction(int index, SEditorActionDesc& out) const override { return ShapeEditorActions::GetPointShapeAction(index, out); }
+ 	// ~IEditorShapeComponent
+ 
+ 	// ISplineShape - t is normalised over the WHOLE curve and maps onto the segments uniformly in
+@@ -192,7 +223,6 @@ public:
+ 
+ protected:
+ 	// IEntityComponent
+-	virtual void                    Initialize() override;
+ 	virtual void                    ProcessEvent(const SEntityEvent& event) override;
+ 	virtual Cry::Entity::EventFlags GetEventMask() const override;
+ 	virtual void                    OnShutDown() override;
+@@ -212,10 +242,23 @@ private:
+ 	//! the arc-length table. Rebuilt lazily, so a const query can ask for it.
+ 	struct SCache
+ 	{
++		//! The EVALUATION polygon: the authored points after SmoothIterations passes of subdivision.
++		//! With smoothing off it is the authored points themselves. Everything downstream - handles,
++		//! samples, lengths, contour, hit test, previewer - works on this and never on m_points, so
++		//! smoothing is a pure evaluation transform and the tool keeps editing the real points.
+ 		std::vector<Vec3>                 localPos;
+ 		std::vector<SplineMath::SHandles> localHandles;
+ 		std::vector<Vec3>                 worldPos;
+ 		std::vector<SplineMath::SHandles> worldHandles;
++		//! Angle and width per EVALUATION point, subdivided in lockstep with the positions.
++		std::vector<float>                evalAngle;
++		std::vector<float>                evalWidth;
++		//! How many evaluation points one authored point is worth: 2^SmoothIterations. It is what
++		//! maps an authored point or edge onto the evaluation polygon exactly.
++		int                               evalStride = 1;
++		//! Rotation-minimizing normals, one per curve sample, in the shape's local space. Empty
++		//! unless FrameMode is ParallelTransport.
++		std::vector<Vec3>                 frameNormals;
+ 		//! Arc length of each segment, in WORLD metres, and the distance each segment starts at.
+ 		std::vector<float>                segmentLength;
+ 		std::vector<float>                segmentStart;
+@@ -224,6 +267,14 @@ private:
+ 		bool                              bValid = false;
+ 	};
+ 
++	//! Fills the cache's evaluation polygon and its per-point attributes from the authored points.
++	void           BuildEvalPolygon(SCache& cache) const;
++	//! Fills cache.frameNormals by carrying one normal along the sampled curve.
++	void           BuildFrameNormals(SCache& cache) const;
++	//! How many samples one Bezier segment gets. Smoothing multiplies the number of SEGMENTS, so
++	//! the samples per segment come down to match and the total stays roughly constant.
++	int            GetSamplesPerSegment() const;
++
+ 	void           InvalidateCache() const { m_cache.bValid = false; }
+ 	const SCache&  GetCache() const;
+ 	int            GetSegmentCount() const;
+@@ -249,16 +300,17 @@ private:
+ 	//! Distance from a world point to the sampled curve, and the nearest sample position.
+ 	float          DistanceToCurve(const Vec3& world, Vec3* pNearestOut) const;
+ 
+-	//! "Recenter Points": shift every point so their centroid sits at the shape origin and add the
+-	//! shift to Offset, so the curve stays exactly where it is in the world.
+-	void           RecenterPoints();
+-
+ 	//! How finely one Bezier segment is sampled for drawing, contours and distance queries. Legacy
+ 	//! draws 8 chords per segment (SplineObject.cpp:1266) and hit-tests 6 (:1400); 8 everywhere
+ 	//! keeps the picked curve and the drawn curve the same curve.
+ 	static constexpr int   kSamplesPerSegment = 8;
+ 	//! Smallest number of points a spline may be reduced to (CSplineObject::GetMinPoints, :83).
+ 	static constexpr int   kMinPoints = 2;
++	//! Most smoothing passes offered. Each doubles the evaluation polygon, so 4 is 16x - past that
++	//! the curve stops changing visibly and only the cost grows.
++	static constexpr int   kMaxSmoothIterations = 4;
++	//! Largest evaluation polygon any amount of smoothing may produce.
++	static constexpr int   kMaxEvalPoints = 8192;
+ 	//! Largest point count any one call will process on the stack.
+ 	static constexpr int   kMaxStackPoints = 1024;
+ 	//! How close a ray must come to the curve for IntersectRay to call it a hit. The contract has no
+@@ -267,11 +319,12 @@ private:
+ 	//! instead and is unaffected.
+ 	static constexpr float kRayTolerance = 0.25f;
+ 
+-	SSplinePoints m_points;
+-	bool          m_closed = false;
+-	Vec3          m_offset = ZERO;
+-
+-	Serialization::FunctorActionButton<std::function<void()>> m_recenterButton;
++	SSplinePoints    m_points;
++	bool             m_closed = false;
++	Vec3             m_offset = ZERO;
++	int              m_smoothIterations = 0;
++	float            m_tension = 1.0f;
++	ESplineFrameMode m_frameMode = ESplineFrameMode::LegacyUp;
+ 
+ 	//! Set between BeginEdit() and EndEdit(): listeners hear one notification per gesture.
+ 	bool               m_bInEdit = false;
+diff --git a/Code/Sandbox/Plugins/AreaComponentsEditor/Tools/ShapeRecenterTool.cpp b/Code/Sandbox/Plugins/AreaComponentsEditor/Tools/ShapeRecenterTool.cpp
+new file mode 100644
+index 00000000..138ff9a7
+--- /dev/null
++++ b/Code/Sandbox/Plugins/AreaComponentsEditor/Tools/ShapeRecenterTool.cpp
+@@ -0,0 +1,145 @@
++// Copyright 2026 ReC Sandbox. Distributed under the terms in LICENSE.md at the repository root.
++#include "StdAfx.h"
++#include "ShapeRecenterTool.h"
++#include "ShapeToolCommon.h"
++
++#include <IEditor.h>
++#include <IEditorClassFactory.h>
++#include <IUndoManager.h>
++#include <LevelEditor/LevelEditorSharedState.h>
++#include <Objects/BaseObject.h>
++#include <Objects/DisplayContext.h>
++
++#include <CryEntitySystem/IEntity.h>
++
++#include <IShapeComponent.h>
++
++using Cry::AreaComponents::IShapeComponent;
++using Cry::AreaComponents::IShapeComponentEdit;
++
++class CShapeRecenterTool_ClassDesc : public IClassDesc
++{
++	virtual ESystemClassID SystemClassID() override   { return ESYSTEM_CLASS_EDITTOOL; }
++	virtual const char*    ClassName() override       { return "EditTool.AreaShapeRecenter"; }
++	virtual const char*    Category() override        { return "Area"; }
++	virtual CRuntimeClass* GetRuntimeClass() override { return RUNTIME_CLASS(CShapeRecenterTool); }
++};
++
++REGISTER_CLASS_DESC(CShapeRecenterTool_ClassDesc);
++
++IMPLEMENT_DYNCREATE(CShapeRecenterTool, CEditTool);
++
++void CShapeRecenterTool::SetUserData(const char* key, void* userData)
++{
++	if (userData == nullptr || key == nullptr || strcmp(key, SEntityComponentEditToolTarget::GetUserDataKey()) != 0)
++	{
++		return;
++	}
++
++	const SEntityComponentEditToolTarget* pTarget = static_cast<const SEntityComponentEditToolTarget*>(userData);
++	m_objectGuid = pTarget->objectGuid;
++	m_componentGuid = pTarget->componentGuid;
++}
++
++void CShapeRecenterTool::Display(SDisplayContext& dc)
++{
++	if (m_bDone)
++		return;
++
++	m_bDone = true;
++
++	RecenterPivot();
++
++	// Deletes this tool (CEditTool::Release -> DeleteThis). Nothing may touch a member after it,
++	// which is why it is the last statement - the same pattern CShapeEditTool::AbandonLostTarget
++	// and CShapeCreateTool::FinishCreation use.
++	GetIEditor()->GetLevelEditorSharedState()->SetEditTool(nullptr);
++}
++
++bool CShapeRecenterTool::RecenterPivot()
++{
++	CBaseObject* pObject = AreaShapeTools::FindObject(m_objectGuid);
++	IEntity*     pEntity = pObject != nullptr ? pObject->GetIEntity() : nullptr;
++	if (pEntity == nullptr || m_componentGuid == CryGUID::Null())
++		return false;
++
++	IEntityComponent* pComponent = pEntity->GetComponentByGUID(m_componentGuid);
++	IShapeComponent*  pShape = AreaShapeTools::AsShape(pComponent);
++	IShapeComponentEdit* pEdit = pShape != nullptr ? pShape->GetEditInterface() : nullptr;
++	if (pEdit == nullptr)
++	{
++		CryWarning(VALIDATOR_MODULE_EDITOR, VALIDATOR_WARNING,
++		           "Recenter Pivot: no editable shape component found - nothing was done.");
++		return false;
++	}
++
++	const int pointCount = pEdit->GetPointCount();
++	if (pointCount <= 0)
++		return false;
++
++	if (pointCount > kMaxPoints)
++	{
++		CryWarning(VALIDATOR_MODULE_EDITOR, VALIDATOR_WARNING,
++		           "Recenter Pivot: %d points is more than this action moves in one step (%d) - nothing was done.",
++		           pointCount, kMaxPoints);
++		return false;
++	}
++
++	// Where every point is in the world right now. This is the whole trick: the pivot moves, these
++	// do not, and the points are rewritten afterwards from these remembered positions.
++	//
++	// The vector is declared and freed in THIS module, and only Vec3 values cross the interface -
++	// the heap rule in IShapeComponent.h forbids handing a container to the engine module.
++	std::vector<Vec3> worldPoints(static_cast<size_t>(pointCount));
++
++	const Matrix34 shapeTM = pShape->GetWorldTransformMatrix();
++	Vec3           centroid(ZERO);
++
++	for (int i = 0; i < pointCount; ++i)
++	{
++		worldPoints[i] = shapeTM.TransformPoint(pEdit->GetPoint(i));
++		centroid += worldPoints[i];
++	}
++
++	centroid /= static_cast<float>(pointCount);
++
++	// Already centred: an undo step that changes nothing is worse than no undo step.
++	if (centroid.GetDistance(pObject->GetWorldPos()) < 0.001f)
++		return false;
++
++	IUndoManager* pUndoManager = GetIEditor()->GetIUndoManager();
++	if (pUndoManager == nullptr)
++		return false;
++
++	pUndoManager->Begin();
++
++	if (pUndoManager->IsUndoRecording())
++	{
++		// One CUndoBaseObject snapshot covers both halves - the object's transform AND the
++		// component's serialized points - so Ctrl+Z puts the pivot and the points back together.
++		pObject->StoreUndo("Recenter Pivot");
++	}
++
++	pObject->SetWorldPos(centroid);
++
++	// The shape's world transform has moved with the entity; rebuild the points in the new frame so
++	// that each one lands back on the world position it had a moment ago.
++	Matrix34 invShapeTM = pShape->GetWorldTransformMatrix();
++	invShapeTM.Invert();
++
++	pEdit->BeginEdit();
++	for (int i = 0; i < pointCount; ++i)
++	{
++		pEdit->SetPoint(i, invShapeTM.TransformPoint(worldPoints[i]));
++	}
++	pEdit->EndEdit();
++
++	AreaShapeTools::SyncEditedComponent(pObject, pComponent);
++
++	if (pUndoManager->IsUndoRecording())
++	{
++		pUndoManager->Accept("Recenter Pivot");
++	}
++
++	return true;
++}
+diff --git a/Code/Sandbox/Plugins/AreaComponentsEditor/Tools/ShapeRecenterTool.h b/Code/Sandbox/Plugins/AreaComponentsEditor/Tools/ShapeRecenterTool.h
+new file mode 100644
+index 00000000..c64fecaf
+--- /dev/null
++++ b/Code/Sandbox/Plugins/AreaComponentsEditor/Tools/ShapeRecenterTool.h
+@@ -0,0 +1,62 @@
++// Copyright 2026 ReC Sandbox. Distributed under the terms in LICENSE.md at the repository root.
++#pragma once
++
++#include <LevelEditor/Tools/EditTool.h>
++
++#include <CryExtension/CryGUID.h>
++
++//! "Recenter Pivot": move the entity to the centroid of its shape's points without moving the
++//! shape, in one undo step. Registered as "EditTool.AreaShapeRecenter", which is what the Polygon
++//! and Spline components name in their second SEditorActionDesc.
++//!
++//! It is a ONE-SHOT action wearing a tool's clothes, because a button in the component inspector is
++//! an SEditToolButton and an SEditToolButton starts a CEditTool - that is the whole mechanism
++//! stage 2 generalised. So the tool does its work on the first Display() and then pops itself off
++//! the level editor; it never handles a mouse event.
++//!
++//! Why Display() and not SetUserData(): SetUserData runs while the property tree is still
++//! installing the tool, so ending it there would leave the caller holding a deleted object.
++//! Display() is the first callback that runs with the tool fully installed - the same place
++//! CShapeEditTool notices a lost target and leaves.
++//!
++//! What it does, and why this is the only correct way to move a pivot:
++//!   * remember every point's WORLD position;
++//!   * CBaseObject::SetWorldPos() to the centroid - the editor object owns the transform in
++//!     Sandbox, and CEntityObject pushes it onto the entity (nothing reads a transform back off
++//!     the entity, which is why the engine-side version of this button could never work);
++//!   * rewrite every point in the new local frame from the remembered world positions, so nothing
++//!     moves on screen;
++//!   * the 1a sync, then accept the undo - so Ctrl+Z restores both halves together.
++class CShapeRecenterTool : public CEditTool
++{
++	DECLARE_DYNCREATE(CShapeRecenterTool)
++
++public:
++	CShapeRecenterTool() = default;
++
++	// CEditTool
++	virtual string GetDisplayName() const override { return "Recenter Pivot"; }
++	virtual void   SetUserData(const char* key, void* userData) override;
++	virtual void   Display(SDisplayContext& dc) override;
++	virtual bool   MouseCallback(CViewport* pView, EMouseEvent event, CPoint& point, int flags) override { return false; }
++	virtual bool   IsNeedMoveTool() override { return false; }
++	// ~CEditTool
++
++protected:
++	virtual ~CShapeRecenterTool() = default;
++	virtual void DeleteThis() override { delete this; }
++
++private:
++	//! The whole action. Returns false when there was nothing to do, which is not an error.
++	bool RecenterPivot();
++
++	CryGUID m_objectGuid = CryGUID::Null();
++	CryGUID m_componentGuid = CryGUID::Null();
++
++	//! The action runs once; Display() is called every frame.
++	bool m_bDone = false;
++
++	//! Most points any one recenter will move. A shape with more is refused rather than truncated:
++	//! silently leaving the tail behind would tear the shape apart.
++	static constexpr int kMaxPoints = 4096;
++};
+-- 
+2.47.1.windows.1
+

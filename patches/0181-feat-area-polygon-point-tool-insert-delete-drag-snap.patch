@@ -1,0 +1,958 @@
+From d54c4d15a8a5712c9799d25cd5a879eb38f9164e Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Fri, 11 Sep 2026 22:56:21 +0800
+Subject: [PATCH 181/209] feat(area): polygon point tool - insert, delete,
+ drag, snap
+
+CShapeEditTool now reproduces EditorQt's CEditShapeTool (ShapeObject.cpp:62-470)
+gesture for gesture, through IShapeComponentEdit alone, so one tool serves every
+shape kind and the box's two-corner resize keeps working unchanged:
+
+- click a point to select it (the handle highlights), click away to deselect;
+- drag it freely with the mouse on the construction plane, with grid snapping
+  and terrain riding when snap-to-terrain is on, or on an axis with the
+  transform manipulator - both paths exist in legacy and both are here;
+- Ctrl+click on an edge inserts a point there; the edge under the cursor is
+  highlighted while Ctrl is held, and on the closing edge the point is appended
+  rather than inserted before point 0 ("if last edge, insert at end", :302);
+- double-click on a point, or Delete with one selected, removes it; the
+  component refuses to drop a closed polygon below three points and warns, and
+  the tool then leaves no empty undo step behind;
+- Ctrl+Shift+click snaps the selected point onto terrain or geometry through
+  rwi_stop_at_pierceable, the legacy call (:440-469);
+- Esc leaves the tool.
+
+One CUndo per gesture (insert and remove are one step each), each followed by
+the snapshot sync a viewport edit has to perform by hand. The hull is drawn from
+GetContour with the new IsContourClosed() flag, so an open polygon no longer
+draws a closing edge that is not there.
+
+The resolve-from-GUID and sync helpers both tools need moved into
+Tools/ShapeToolCommon.{h,cpp}; no STL container crosses the plugin boundary
+anywhere - points are read into stack buffers (heap rule, IShapeComponent.h).
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SCUvWGLCsqzm3VNMzp4uiS
+---
+ .../AreaComponentsEditor/CMakeLists.txt       |   2 +
+ .../Tools/ShapeEditTool.cpp                   | 492 ++++++++++++++----
+ .../Tools/ShapeEditTool.h                     |  60 ++-
+ .../Tools/ShapeToolCommon.cpp                 |  95 ++++
+ .../Tools/ShapeToolCommon.h                   |  42 ++
+ 5 files changed, 574 insertions(+), 117 deletions(-)
+ create mode 100644 Code/Sandbox/Plugins/AreaComponentsEditor/Tools/ShapeToolCommon.cpp
+ create mode 100644 Code/Sandbox/Plugins/AreaComponentsEditor/Tools/ShapeToolCommon.h
+
+diff --git a/Code/Sandbox/Plugins/AreaComponentsEditor/CMakeLists.txt b/Code/Sandbox/Plugins/AreaComponentsEditor/CMakeLists.txt
+index 964c04fc..59f71f90 100644
+--- a/Code/Sandbox/Plugins/AreaComponentsEditor/CMakeLists.txt
++++ b/Code/Sandbox/Plugins/AreaComponentsEditor/CMakeLists.txt
+@@ -8,6 +8,8 @@ add_sources("NoUberFile"
+ 		"StdAfx.h"
+ 		"StdAfx.cpp"
+ 	SOURCE_GROUP "Tools"
++		"Tools/ShapeToolCommon.h"
++		"Tools/ShapeToolCommon.cpp"
+ 		"Tools/ShapeEditTool.h"
+ 		"Tools/ShapeEditTool.cpp"
+ 	SOURCE_GROUP "Objects"
+diff --git a/Code/Sandbox/Plugins/AreaComponentsEditor/Tools/ShapeEditTool.cpp b/Code/Sandbox/Plugins/AreaComponentsEditor/Tools/ShapeEditTool.cpp
+index 1d5898ad..1772b013 100644
+--- a/Code/Sandbox/Plugins/AreaComponentsEditor/Tools/ShapeEditTool.cpp
++++ b/Code/Sandbox/Plugins/AreaComponentsEditor/Tools/ShapeEditTool.cpp
+@@ -1,6 +1,7 @@
+ // Copyright 2026 ReC Sandbox. Distributed under the terms in LICENSE.md at the repository root.
+ #include "StdAfx.h"
+ #include "ShapeEditTool.h"
++#include "ShapeToolCommon.h"
+ 
+ #include <IEditor.h>
+ #include <IEditorClassFactory.h>
+@@ -12,13 +13,12 @@
+ #include <LevelEditor/LevelEditorSharedState.h>
+ #include <Objects/BaseObject.h>
+ #include <Objects/DisplayContext.h>
++#include <Preferences/SnappingPreferences.h>
++#include <Util/Math.h>
+ 
+ #include <CryEntitySystem/IEntity.h>
+ #include <CryEntitySystem/IEntitySystem.h>
+-#include <CrySchematyc/IObject.h>
+-#include <CrySchematyc/IObjectProperties.h>
+-#include <CrySchematyc/Utils/ClassProperties.h>
+-#include <CrySchematyc/Reflection/TypeDesc.h>
++#include <CryPhysics/IPhysics.h>
+ 
+ #include <IShapeComponent.h>
+ 
+@@ -29,16 +29,45 @@ using Cry::AreaComponents::IShapeComponentEdit;
+ 
+ namespace
+ {
+-//! How close, in the same units CShapeObject uses, the cursor must come to a handle to grab it.
+-const float kPointCloseDistance = 0.8f;
++//! How close, in the same units CShapeObject uses, the cursor must come to a handle or an edge to
++//! grab it (SHAPE_CLOSE_DISTANCE, ShapeObject.cpp:54).
++const float kShapeCloseDistance = 0.8f;
+ //! Half-edge of a point handle, in screen-constant units (CShapeObject draws its points this way).
+ const float kPointHandleSize = 0.8f;
++//! How far along a view ray the editor pretends the ray ends (RAY_DISTANCE in EditorQt).
++const float kRayDistance = 100000.0f;
+ //! Stack buffer the tool reads a contour into. Sampled splines get truncated for drawing, which is
+ //! a visual limit and never a correctness one; the alternative - a container the engine module
+ //! fills - is forbidden, see the heap rule in IShapeComponent.h.
+ const int kMaxContourPoints = 256;
+-//! Largest number of editable points the tool will draw handles for in one frame.
+-const int kMaxEditPoints = 4096;
++//! Largest number of editable points the tool will handle in one frame.
++const int kMaxEditPoints = 1024;
++
++//! Distance between the view ray (given as two points) and the segment pi-pj, plus the point on
++//! the ray. CShapeObject::RayToLineDistance, ShapeObject.cpp:2505, unchanged.
++bool RayToLineDistance(const Vec3& rayLineP1, const Vec3& rayLineP2, const Vec3& pi, const Vec3& pj,
++                       float& distance, Vec3& intPnt)
++{
++	Vec3  pa, pb;
++	float ua, ub;
++	if (!LineLineIntersect(pi, pj, rayLineP1, rayLineP2, pa, pb, ua, ub))
++		return false;
++
++	if (ub < 0.0f)
++		return false; // behind the ray origin
++
++	if (ua < 0.0f)
++		distance = PointToLineDistance(rayLineP1, rayLineP2, pi, intPnt);
++	else if (ua > 1.0f)
++		distance = PointToLineDistance(rayLineP1, rayLineP2, pj, intPnt);
++	else
++	{
++		intPnt = rayLineP1 + ub * (rayLineP2 - rayLineP1);
++		distance = (pb - pa).GetLength();
++	}
++
++	return true;
++}
+ }
+ 
+ // Same registration shape CryDesigner uses (DesignerEditor.cpp): a class desc in the
+@@ -121,11 +150,7 @@ void CShapeEditTool::SetUserData(const char* key, void* userData)
+ 
+ CBaseObject* CShapeEditTool::ResolveObject() const
+ {
+-	if (m_objectGuid == CryGUID::Null())
+-		return nullptr;
+-
+-	IObjectManager* pObjectManager = GetIEditor()->GetObjectManager();
+-	return pObjectManager != nullptr ? pObjectManager->FindObject(m_objectGuid) : nullptr;
++	return AreaShapeTools::FindObject(m_objectGuid);
+ }
+ 
+ IEntityComponent* CShapeEditTool::ResolveComponent() const
+@@ -134,22 +159,13 @@ IEntityComponent* CShapeEditTool::ResolveComponent() const
+ 		return nullptr;
+ 
+ 	CBaseObject* pObject = ResolveObject();
+-	IEntity* pEntity = pObject != nullptr ? pObject->GetIEntity() : nullptr;
++	IEntity*     pEntity = pObject != nullptr ? pObject->GetIEntity() : nullptr;
+ 	return pEntity != nullptr ? pEntity->GetComponentByGUID(m_componentGuid) : nullptr;
+ }
+ 
+ IShapeComponent* CShapeEditTool::ResolveShape() const
+ {
+-	IEntityComponent* pComponent = ResolveComponent();
+-	if (pComponent == nullptr)
+-		return nullptr;
+-
+-	// Only cast what really is one: the reflected base list is the cross-DLL proof that this
+-	// component implements the contract this tool is written against.
+-	if (pComponent->GetClassDesc().FindBaseByTypeID(Schematyc::GetTypeDesc<IShapeComponent>().GetGUID()) == nullptr)
+-		return nullptr;
+-
+-	return static_cast<IShapeComponent*>(pComponent);
++	return AreaShapeTools::AsShape(ResolveComponent());
+ }
+ 
+ IShapeComponentEdit* CShapeEditTool::ResolveShapeEdit() const
+@@ -173,13 +189,112 @@ Vec3 CShapeEditTool::GetPointWorldPos(int index) const
+ 	return GetShapeWorldTM().TransformPoint(pEdit->GetPoint(index));
+ }
+ 
++int CShapeEditTool::GatherPointsWorld(Vec3* pOut, int maxPoints) const
++{
++	IShapeComponentEdit* pEdit = ResolveShapeEdit();
++	if (pEdit == nullptr || pOut == nullptr || maxPoints <= 0)
++		return 0;
++
++	const Matrix34 shapeWorldTM = GetShapeWorldTM();
++	const int      count = min(pEdit->GetPointCount(), maxPoints);
++
++	for (int i = 0; i < count; ++i)
++		pOut[i] = shapeWorldTM.TransformPoint(pEdit->GetPoint(i));
++
++	return count;
++}
++
++// ---------------------------------------------------------------------------
++// Hit testing
++// ---------------------------------------------------------------------------
++
++int CShapeEditTool::HitTestPoints(CViewport* pView, const Vec3& raySrc, const Vec3& rayDir, float& distanceOut) const
++{
++	Vec3      points[kMaxEditPoints];
++	const int count = GatherPointsWorld(points, kMaxEditPoints);
++
++	int   nearestPoint = -1;
++	float nearestRayT = FLT_MAX;
++
++	for (int i = 0; i < count; ++i)
++	{
++		if (!points[i].IsValid())
++			continue;
++
++		const float rayT = max(0.0f, rayDir.Dot(points[i] - raySrc));
++		const float distance = (raySrc + rayDir * rayT - points[i]).GetLength();
++
++		const float tolerance = kShapeCloseDistance * pView->GetScreenScaleFactor(points[i]) * 0.01f + pView->GetSelectionTolerance();
++		if (distance <= tolerance && rayT < nearestRayT)
++		{
++			nearestRayT = rayT;
++			nearestPoint = i;
++		}
++	}
++
++	distanceOut = nearestRayT;
++	return nearestPoint;
++}
++
++bool CShapeEditTool::HitTestEdge(CViewport* pView, const Vec3& raySrc, const Vec3& rayDir, int& indexOut, Vec3& worldPointOut) const
++{
++	IShapeComponentEdit* pEdit = ResolveShapeEdit();
++	if (pEdit == nullptr)
++		return false;
++
++	Vec3      points[kMaxEditPoints];
++	const int count = GatherPointsWorld(points, kMaxEditPoints);
++	if (count < 2)
++		return false;
++
++	const bool bClosed = pEdit->IsContourClosed();
++	const Vec3 rayLineP1 = raySrc;
++	const Vec3 rayLineP2 = raySrc + rayDir * kRayDistance;
++
++	// CEditShapeTool asks CShapeObject::GetNearestEdge and then compares against the same
++	// screen-relative tolerance the point test uses (ShapeObject.cpp:277-290).
++	int   bestIndex = -1;
++	float minDist = FLT_MAX;
++	Vec3  intPnt(ZERO);
++	Vec3  bestPnt(ZERO);
++
++	for (int i = 0; i < count; ++i)
++	{
++		const int j = (i + 1) % count;
++		if (!bClosed && j == 0 && i != 0)
++			continue;
++
++		float d = 0.0f;
++		if (!RayToLineDistance(rayLineP1, rayLineP2, points[i], points[j], d, intPnt))
++			continue;
++
++		if (d < minDist)
++		{
++			minDist = d;
++			bestIndex = i;
++			bestPnt = intPnt;
++		}
++	}
++
++	if (bestIndex < 0)
++		return false;
++
++	const float tolerance = kShapeCloseDistance * pView->GetScreenScaleFactor(bestPnt) * 0.01f + pView->GetSelectionTolerance();
++	if (minDist > tolerance)
++		return false;
++
++	indexOut = bestIndex;
++	worldPointOut = bestPnt;
++	return true;
++}
++
+ // ---------------------------------------------------------------------------
+ // Drawing
+ // ---------------------------------------------------------------------------
+ 
+ void CShapeEditTool::Display(SDisplayContext& dc)
+ {
+-	IShapeComponent* pShape = ResolveShape();
++	IShapeComponent*     pShape = ResolveShape();
+ 	IShapeComponentEdit* pEdit = pShape != nullptr ? pShape->GetEditInterface() : nullptr;
+ 	if (pEdit == nullptr || dc.view == nullptr)
+ 		return;
+@@ -195,23 +310,31 @@ void CShapeEditTool::Display(SDisplayContext& dc)
+ 	if (contourPoints >= 2)
+ 	{
+ 		dc.SetColor(ColorB(0, 255, 0, 255));
+-		dc.DrawPolyLine(contour, contourPoints, true);
++		dc.DrawPolyLine(contour, contourPoints, pEdit->IsContourClosed());
++	}
++
++	// The edge under the cursor while Ctrl is held: the one a click would split.
++	if (m_bHoverEdgeValid)
++	{
++		dc.SetColor(ColorB(255, 255, 0, 255));
++		dc.SetLineWidth(3);
++		dc.DrawLine(m_hoverEdgeStart, m_hoverEdgeEnd);
++		dc.SetLineWidth(0);
+ 	}
+ 
+ 	// Screen-constant point handles, the look CShapeObject::DisplayNormal has
+ 	// (ShapeObject.cpp:1377-1398): depth test off so a handle inside geometry stays grabbable.
+ 	dc.DepthTestOff();
+ 
+-	const Matrix34 shapeWorldTM = pShape->GetWorldTransformMatrix();
+-	const int      pointCount = min(pEdit->GetPointCount(), kMaxEditPoints);
++	Vec3      points[kMaxEditPoints];
++	const int pointCount = GatherPointsWorld(points, kMaxEditPoints);
+ 
+ 	for (int i = 0; i < pointCount; ++i)
+ 	{
+-		const Vec3 worldPos = shapeWorldTM.TransformPoint(pEdit->GetPoint(i));
+-		if (!worldPos.IsValid())
++		if (!points[i].IsValid())
+ 			continue; // never hand the aux renderer a NaN
+ 
+-		const float size = kPointHandleSize * dc.view->GetScreenScaleFactor(worldPos) * 0.01f;
++		const float size = kPointHandleSize * dc.view->GetScreenScaleFactor(points[i]) * 0.01f;
+ 		if (!NumberValid(size) || size <= 0.0f)
+ 			continue;
+ 
+@@ -222,7 +345,7 @@ void CShapeEditTool::Display(SDisplayContext& dc)
+ 		else
+ 			dc.SetColor(ColorB(255, 255, 0, 255));
+ 
+-		dc.DrawWireBox(worldPos - half, worldPos + half);
++		dc.DrawWireBox(points[i] - half, points[i] + half);
+ 	}
+ 
+ 	dc.DepthTestOn();
+@@ -235,65 +358,142 @@ void CShapeEditTool::Display(SDisplayContext& dc)
+ bool CShapeEditTool::MouseCallback(CViewport* pView, EMouseEvent event, CPoint& point, int flags)
+ {
+ 	IShapeComponentEdit* pEdit = ResolveShapeEdit();
+-	if (pEdit == nullptr)
++	if (pEdit == nullptr || pView == nullptr)
+ 		return false;
+ 
+-	if (event != eMouseLDown && event != eMouseMove)
++	// Ctrl+Shift+click drops the selected point onto whatever the cursor is over.
++	if (event == eMouseLDown && (flags & MK_CONTROL) && (flags & MK_SHIFT))
++	{
++		return SnapSelectedPointToTerrainOrGeometry(pView, point);
++	}
++
++	if (event != eMouseLDown && event != eMouseMove && event != eMouseLUp && event != eMouseLDblClick)
++	{
+ 		return false;
++	}
++
++	if (event == eMouseLDown)
++	{
++		m_mouseDownPos = point;
++	}
+ 
+ 	Vec3 raySrc, rayDir;
+ 	pView->ViewToWorldRay(point, raySrc, rayDir);
+ 	rayDir.Normalize();
+ 
+-	// Nearest handle under the cursor, in the tolerance CEditShapeTool uses.
+-	int   nearestPoint = -1;
+-	float nearestDistance = FLT_MAX;
++	const Matrix34 shapeTM = GetShapeWorldTM();
+ 
+-	const Matrix34 shapeWorldTM = GetShapeWorldTM();
+-	const int      pointCount = min(pEdit->GetPointCount(), kMaxEditPoints);
+-
+-	for (int i = 0; i < pointCount; ++i)
++	// Ctrl (without Shift) means "edit edges": highlight the edge under the cursor, and insert a
++	// point into it on click (CEditShapeTool::MouseCallback, ShapeObject.cpp:287-322).
++	m_bHoverEdgeValid = false;
++	if ((flags & MK_CONTROL) && !m_modifying)
+ 	{
+-		const Vec3  worldPos = shapeWorldTM.TransformPoint(pEdit->GetPoint(i));
+-		const float rayT = max(0.0f, rayDir.Dot(worldPos - raySrc));
+-		const float distance = (raySrc + rayDir * rayT - worldPos).GetLength();
+-
+-		const float tolerance = kPointCloseDistance * pView->GetScreenScaleFactor(worldPos) * 0.01f + pView->GetSelectionTolerance();
+-		if (distance <= tolerance && rayT < nearestDistance)
++		int  edgeIndex = -1;
++		Vec3 edgePoint;
++		if (HitTestEdge(pView, raySrc, rayDir, edgeIndex, edgePoint))
+ 		{
+-			nearestDistance = rayT;
+-			nearestPoint = i;
++			Vec3      points[kMaxEditPoints];
++			const int count = GatherPointsWorld(points, kMaxEditPoints);
++			if (edgeIndex < count)
++			{
++				m_bHoverEdgeValid = true;
++				m_hoverEdgeStart = points[edgeIndex];
++				m_hoverEdgeEnd = points[(edgeIndex + 1) % count];
++			}
++
++			pView->ResetCursor();
++
++			if (event == eMouseLDown)
++			{
++				InsertPointOnEdge(pView, edgeIndex, edgePoint);
++			}
+ 		}
++		return true;
+ 	}
+ 
+-	if (event == eMouseMove)
++	float     pointDistance = FLT_MAX;
++	const int hitPoint = HitTestPoints(pView, raySrc, rayDir, pointDistance);
++
++	if (hitPoint >= 0)
+ 	{
+-		if (nearestPoint >= 0)
+-			pView->SetCurrentCursor(STD_CURSOR_HIT);
+-		else
+-			pView->ResetCursor();
++		if (event == eMouseLDown && !m_modifying)
++		{
++			SelectPoint(hitPoint);
+ 
+-		return false;
++			m_modifying = true;
++			m_pointWorldPosAtDragStart = GetPointWorldPos(hitPoint);
++
++			BeginGesture("Move Point");
++			pEdit->BeginEdit();
++
++			// Put the construction plane on the point, so a drag maps to the plane the user is
++			// looking at rather than to the world origin.
++			Matrix34 constructionMatrix(IDENTITY);
++			constructionMatrix.SetTranslation(m_pointWorldPosAtDragStart);
++			pView->SetConstructionMatrix(constructionMatrix);
++		}
++
++		// Delete a point with a double click, but only when the click really hit the point - so
++		// that using the move gizmo over a point never deletes it (ShapeObject.cpp:359-372).
++		if (event == eMouseLDblClick)
++		{
++			if (m_modifying)
++			{
++				if (IShapeComponentEdit* pOpenEdit = ResolveShapeEdit())
++					pOpenEdit->EndEdit();
++				m_modifying = false;
++				EndGesture(false);
++			}
++
++			SelectPoint(hitPoint);
++			RemoveSelectedPoint();
++			return true;
++		}
++
++		pView->SetCurrentCursor(STD_CURSOR_HIT);
++	}
++	else if (event == eMouseLDown && !m_modifying)
++	{
++		SelectPoint(-1);
++		pView->ResetCursor();
+ 	}
+ 
+-	// eMouseLDown: select the handle under the cursor (or drop the selection), and put the
+-	// construction plane on it so that a drag maps to the plane the user is looking at.
+-	if (nearestPoint != m_selectedPoint)
++	if (m_modifying && event == eMouseMove && m_selectedPoint >= 0)
+ 	{
+-		m_selectedPoint = nearestPoint;
+-		if (m_pManipulator != nullptr)
+-			m_pManipulator->Invalidate();
++		// The free drag of the legacy tool (ShapeObject.cpp:398-434): the point follows the cursor
++		// on the construction plane, with grid snapping, and rides the terrain when terrain
++		// snapping is on. The legacy "+ GetShapeZOffset()" is not reproduced because that offset
++		// is 0 for every CShapeObject (m_defaultZOffset, ShapeObject.cpp:880); only GameVolume
++		// overrode it, out of a Lua script - see report 02.
++		const Vec3 p1 = pView->MapViewToCP(m_mouseDownPos);
++		const Vec3 p2 = pView->MapViewToCP(point);
++		const Vec3 delta = pView->GetCPVector(p1, p2);
++
++		Vec3 newPos = m_pointWorldPosAtDragStart + delta;
++		if (gSnappingPreferences.IsSnapToTerrainEnabled())
++		{
++			newPos = pView->MapViewToCP(point);
++		}
++
++		newPos = pView->SnapToGrid(newPos);
++
++		Matrix34 invShapeTM = shapeTM;
++		invShapeTM.Invert();
++		pEdit->SetPoint(m_selectedPoint, invShapeTM.TransformPoint(newPos));
++
++		pView->SetCurrentCursor(STD_CURSOR_MOVE);
++		return true;
+ 	}
+ 
+-	if (m_selectedPoint >= 0)
++	if (m_modifying && event == eMouseLUp)
+ 	{
+-		Matrix34 constructionMatrix(IDENTITY);
+-		constructionMatrix.SetTranslation(GetPointWorldPos(m_selectedPoint));
+-		pView->SetConstructionMatrix(constructionMatrix);
++		m_modifying = false;
++		pEdit->EndEdit();
++		EndGesture(true);
+ 		return true;
+ 	}
+ 
+-	return false;
++	return hitPoint >= 0 || m_modifying;
+ }
+ 
+ bool CShapeEditTool::OnKeyDown(CViewport* pView, uint32 nChar, uint32 nRepCnt, uint32 nFlags)
+@@ -304,9 +504,126 @@ bool CShapeEditTool::OnKeyDown(CViewport* pView, uint32 nChar, uint32 nRepCnt, u
+ 		return true;
+ 	}
+ 
++	if (nChar == Qt::Key_Delete)
++	{
++		if (!m_modifying)
++		{
++			RemoveSelectedPoint();
++		}
++		return true;
++	}
++
+ 	return false;
+ }
+ 
++// ---------------------------------------------------------------------------
++// Point operations - one undo step each
++// ---------------------------------------------------------------------------
++
++void CShapeEditTool::SelectPoint(int index)
++{
++	if (index == m_selectedPoint)
++		return;
++
++	m_selectedPoint = index;
++	if (m_pManipulator != nullptr)
++		m_pManipulator->Invalidate();
++}
++
++void CShapeEditTool::InsertPointOnEdge(CViewport* pView, int edgeIndex, const Vec3& worldPoint)
++{
++	IShapeComponentEdit* pEdit = ResolveShapeEdit();
++	if (pEdit == nullptr || edgeIndex < 0)
++		return;
++
++	Matrix34 invShapeTM = GetShapeWorldTM();
++	invShapeTM.Invert();
++
++	BeginGesture("Insert Point");
++
++	// Insert BEFORE the edge's far end, so the new point lands between the two points the user
++	// clicked between. On the closing edge that far end is point 0, and inserting before point 0
++	// would move the new point to the front of the list - append instead, which is what legacy
++	// means by "if last edge, insert at end" (ShapeObject.cpp:302-303).
++	const int count = pEdit->GetPointCount();
++	const int insertBefore = ((edgeIndex + 1) % count == 0) ? count : (edgeIndex + 1);
++
++	const int newIndex = pEdit->InsertPoint(insertBefore, invShapeTM.TransformPoint(worldPoint));
++	if (newIndex < 0)
++	{
++		// A kind with a fixed point set (the box) refuses; nothing changed.
++		EndGesture(false);
++		return;
++	}
++
++	SelectPoint(newIndex);
++	EndGesture(true);
++
++	// Set the construction plane on the new point, so that the drag that usually follows works
++	// on the plane the user is looking at.
++	if (pView != nullptr)
++	{
++		Matrix34 constructionMatrix(IDENTITY);
++		constructionMatrix.SetTranslation(GetPointWorldPos(newIndex));
++		pView->SetConstructionMatrix(constructionMatrix);
++	}
++}
++
++void CShapeEditTool::RemoveSelectedPoint()
++{
++	IShapeComponentEdit* pEdit = ResolveShapeEdit();
++	if (pEdit == nullptr || m_selectedPoint < 0 || m_selectedPoint >= pEdit->GetPointCount())
++		return;
++
++	const int countBefore = pEdit->GetPointCount();
++
++	BeginGesture("Remove Point");
++	pEdit->RemovePoint(m_selectedPoint);
++
++	// The component is the authority on its own minimum point count and warns when it refuses
++	// (a closed polygon never drops below a triangle); an undo step for nothing is worse than none.
++	const bool bRemoved = pEdit->GetPointCount() < countBefore;
++	if (bRemoved)
++	{
++		SelectPoint(-1);
++	}
++
++	EndGesture(bRemoved);
++}
++
++bool CShapeEditTool::SnapSelectedPointToTerrainOrGeometry(CViewport* pView, CPoint& point)
++{
++	IShapeComponentEdit* pEdit = ResolveShapeEdit();
++	if (pEdit == nullptr || m_selectedPoint < 0 || m_selectedPoint >= pEdit->GetPointCount())
++		return false;
++
++	Vec3 raySrc, rayDir;
++	pView->ViewToWorldRay(point, raySrc, rayDir);
++	rayDir.Normalize();
++
++	IPhysicalWorld* pPhysicalWorld = gEnv->pPhysicalWorld;
++	if (pPhysicalWorld == nullptr)
++		return false;
++
++	// rwi_stop_at_pierceable makes every hit solid whatever the surface type says it is, the same
++	// call CEditShapeTool makes (ShapeObject.cpp:455-459).
++	ray_hit hit;
++	ZeroStruct(hit);
++	if (pPhysicalWorld->RayWorldIntersection(raySrc, rayDir * 1000.0f, ent_all, rwi_stop_at_pierceable, &hit, 1) == 0)
++		return false;
++
++	Matrix34 invShapeTM = GetShapeWorldTM();
++	invShapeTM.Invert();
++
++	BeginGesture("Snap Point");
++	pEdit->BeginEdit();
++	pEdit->SetPoint(m_selectedPoint, invShapeTM.TransformPoint(hit.pt));
++	pEdit->EndEdit();
++	EndGesture(true);
++
++	return true;
++}
++
+ // ---------------------------------------------------------------------------
+ // Manipulator - one gesture, one undo step
+ // ---------------------------------------------------------------------------
+@@ -349,7 +666,7 @@ void CShapeEditTool::OnManipulatorBeginDrag(IDisplayViewport* pView, ITransformM
+ 	if (pView != nullptr)
+ 		pView->SetConstructionMatrix(constructionMatrix);
+ 
+-	BeginGesture();
++	BeginGesture("Move Point");
+ 	pEdit->BeginEdit();
+ }
+ 
+@@ -381,7 +698,11 @@ void CShapeEditTool::OnManipulatorEndDrag(IDisplayViewport*, ITransformManipulat
+ 	EndGesture(true);
+ }
+ 
+-void CShapeEditTool::BeginGesture()
++// ---------------------------------------------------------------------------
++// Undo and the save-snapshot sync
++// ---------------------------------------------------------------------------
++
++void CShapeEditTool::BeginGesture(const char* szName)
+ {
+ 	if (m_gestureOpen)
+ 		return;
+@@ -399,7 +720,7 @@ void CShapeEditTool::BeginGesture()
+ 	{
+ 		// CUndoBaseObject serializes the whole entity, components included, so one snapshot per
+ 		// gesture is both enough and the most we can afford (research/06 section 5.1).
+-		pObject->StoreUndo("Edit Shape");
++		pObject->StoreUndo(szName);
+ 	}
+ 
+ 	m_gestureOpen = true;
+@@ -434,36 +755,5 @@ void CShapeEditTool::EndGesture(bool bChanged)
+ 
+ void CShapeEditTool::SyncEditedComponent()
+ {
+-	IEntityComponent* pComponent = ResolveComponent();
+-	if (pComponent == nullptr)
+-		return;
+-
+-	// The editor's save snapshot for a Schematyc entity is taken during the inspector's input pass
+-	// (EntityObject.cpp, CreateComponentWidget). A viewport tool writes outside that pass, so the
+-	// snapshot has to be refreshed by hand or the edit is lost on save, on undo and on game mode.
+-	// A legitimate no-op for an entity without a Schematyc object: the level then writes the live
+-	// component.
+-	if (IEntity* pEntity = pComponent->GetEntity())
+-	{
+-		if (Schematyc::IObject* pSchematycObject = pEntity->GetSchematycObject())
+-		{
+-			if (Schematyc::IObjectPropertiesPtr pProperties = pSchematycObject->GetObjectProperties())
+-			{
+-				if (Schematyc::CClassProperties* pClassProperties = pProperties->GetComponentProperties(pComponent->GetGUID()))
+-				{
+-					pClassProperties->SetOverridePolicy(Schematyc::EOverridePolicy::Override);
+-					pClassProperties->Read(pComponent->GetClassDesc(), pComponent);
+-				}
+-			}
+-		}
+-	}
+-
+-	SEntityEvent event(ENTITY_EVENT_COMPONENT_PROPERTY_CHANGED);
+-	pComponent->SendEvent(event);
+-
+-	if (CBaseObject* pObject = ResolveObject())
+-	{
+-		pObject->SetModified(false, false);
+-		pObject->UpdatePrefab();
+-	}
++	AreaShapeTools::SyncEditedComponent(ResolveObject(), ResolveComponent());
+ }
+diff --git a/Code/Sandbox/Plugins/AreaComponentsEditor/Tools/ShapeEditTool.h b/Code/Sandbox/Plugins/AreaComponentsEditor/Tools/ShapeEditTool.h
+index 90e44921..290f4d4b 100644
+--- a/Code/Sandbox/Plugins/AreaComponentsEditor/Tools/ShapeEditTool.h
++++ b/Code/Sandbox/Plugins/AreaComponentsEditor/Tools/ShapeEditTool.h
+@@ -22,11 +22,16 @@ struct IShapeComponentEdit;
+ //! "EditTool.AreaShapeEdit" - the name IEditorShapeComponent::GetEditToolClassName() returns, so
+ //! the "Edit Shape" row of the component inspector starts exactly this tool.
+ //!
++//! It reproduces EditorQt's CEditShapeTool (ShapeObject.cpp:62-470) gesture for gesture: click a
++//! point to select it, drag it (free with the mouse, or on an axis with the manipulator),
++//! Ctrl+click an edge to insert a point there, double-click or Delete to remove one,
++//! Ctrl+Shift+click to snap a point onto terrain or geometry, Esc to leave.
++//!
+ //! It is written against Cry::AreaComponents::IShapeComponentEdit alone and never against a
+-//! concrete shape class, so the same tool serves Box today and Sphere / Polygon / Spline later. It
+-//! holds no pointer across a frame: object and component are re-resolved from their GUIDs on every
+-//! use (MEMORY.md, fix bde12cd8), which is also what makes it survive an undo that re-creates the
+-//! entity underneath it.
++//! concrete shape class, so the same tool serves Box and Polygon today and Sphere / Spline later.
++//! It holds no pointer across a frame: object and component are re-resolved from their GUIDs on
++//! every use (MEMORY.md, fix bde12cd8), which is also what makes it survive an undo that
++//! re-creates the entity underneath it.
+ class CShapeEditTool : public CEditTool, public ITransformManipulatorOwner
+ {
+ 	DECLARE_DYNCREATE(CShapeEditTool)
+@@ -41,7 +46,8 @@ public:
+ 	virtual bool   MouseCallback(CViewport* pView, EMouseEvent event, CPoint& point, int flags) override;
+ 	virtual bool   OnKeyDown(CViewport* pView, uint32 nChar, uint32 nRepCnt, uint32 nFlags) override;
+ 	virtual bool   IsNeedMoveTool() override                 { return true; }
+-	virtual bool   IsNeedToSkipPivotBoxForObjects() override  { return true; }
++	virtual bool   IsNeedToSkipPivotBoxForObjects() override { return true; }
++	virtual bool   IsDisplayGrid() override                  { return false; }
+ 	// ~CEditTool
+ 
+ 	// ITransformManipulatorOwner
+@@ -59,8 +65,8 @@ private:
+ 	void OnManipulatorDrag(IDisplayViewport* pView, ITransformManipulator*, const SDragData& dragData);
+ 	void OnManipulatorEndDrag(IDisplayViewport* pView, ITransformManipulator*);
+ 
+-	CBaseObject*                             ResolveObject() const;
+-	IEntityComponent*                        ResolveComponent() const;
++	CBaseObject*                              ResolveObject() const;
++	IEntityComponent*                         ResolveComponent() const;
+ 	Cry::AreaComponents::IShapeComponent*     ResolveShape() const;
+ 	Cry::AreaComponents::IShapeComponentEdit* ResolveShapeEdit() const;
+ 
+@@ -68,19 +74,41 @@ private:
+ 	Matrix34 GetShapeWorldTM() const;
+ 	//! World position of an editable point, ZERO when out of range.
+ 	Vec3     GetPointWorldPos(int index) const;
+-
+-	void     BeginGesture();
++	//! Reads the editable points into a caller-owned buffer, in world space. Returns the count.
++	//! Never a container across the DLL boundary (heap rule, IShapeComponent.h).
++	int      GatherPointsWorld(Vec3* pOut, int maxPoints) const;
++
++	//! The point under the cursor, or -1. `distanceOut` is the distance along the ray.
++	int      HitTestPoints(CViewport* pView, const Vec3& raySrc, const Vec3& rayDir, float& distanceOut) const;
++	//! The edge under the cursor. Returns false when nothing is close enough.
++	bool     HitTestEdge(CViewport* pView, const Vec3& raySrc, const Vec3& rayDir, int& indexOut, Vec3& worldPointOut) const;
++
++	void     SelectPoint(int index);
++	//! Ctrl+click on an edge: one undo step, the new point selected.
++	void     InsertPointOnEdge(CViewport* pView, int edgeIndex, const Vec3& worldPoint);
++	//! Double-click or Delete: one undo step.
++	void     RemoveSelectedPoint();
++	//! Ctrl+Shift+click: put the selected point where the cursor hits the world
++	//! (CEditShapeTool::SnapSelectedPointToTerrainOrGeometry, ShapeObject.cpp:440-469).
++	bool     SnapSelectedPointToTerrainOrGeometry(CViewport* pView, CPoint& point);
++
++	void     BeginGesture(const char* szName);
+ 	void     EndGesture(bool bChanged);
+-	//! The sandwich a viewport edit has to repeat by hand, because it happens outside the
+-	//! inspector's serialization pass (research/06 section 5.3).
+ 	void     SyncEditedComponent();
+ 
+-	CryGUID                m_objectGuid = CryGUID::Null();
+-	CryGUID                m_componentGuid = CryGUID::Null();
++	CryGUID m_objectGuid = CryGUID::Null();
++	CryGUID m_componentGuid = CryGUID::Null();
++
++	int    m_selectedPoint = -1;
++	bool   m_gestureOpen = false;
++	bool   m_modifying = false;
++	CPoint m_mouseDownPos = CPoint(0, 0);
++	Vec3   m_pointWorldPosAtDragStart = ZERO;
+ 
+-	int                    m_selectedPoint = -1;
+-	bool                   m_gestureOpen = false;
+-	Vec3                   m_pointWorldPosAtDragStart = ZERO;
++	//! The edge the cursor is on while Ctrl is held, in world space, for the Display highlight.
++	bool m_bHoverEdgeValid = false;
++	Vec3 m_hoverEdgeStart = ZERO;
++	Vec3 m_hoverEdgeEnd = ZERO;
+ 
+ 	ITransformManipulator* m_pManipulator = nullptr;
+ };
+diff --git a/Code/Sandbox/Plugins/AreaComponentsEditor/Tools/ShapeToolCommon.cpp b/Code/Sandbox/Plugins/AreaComponentsEditor/Tools/ShapeToolCommon.cpp
+new file mode 100644
+index 00000000..df8f327c
+--- /dev/null
++++ b/Code/Sandbox/Plugins/AreaComponentsEditor/Tools/ShapeToolCommon.cpp
+@@ -0,0 +1,95 @@
++// Copyright 2026 ReC Sandbox. Distributed under the terms in LICENSE.md at the repository root.
++#include "StdAfx.h"
++#include "ShapeToolCommon.h"
++
++#include <IEditor.h>
++#include <IObjectManager.h>
++#include <Objects/BaseObject.h>
++
++#include <CryEntitySystem/IEntity.h>
++#include <CryEntitySystem/IEntityComponent.h>
++#include <CrySchematyc/IObject.h>
++#include <CrySchematyc/IObjectProperties.h>
++#include <CrySchematyc/Utils/ClassProperties.h>
++#include <CrySchematyc/Reflection/TypeDesc.h>
++
++#include <IShapeComponent.h>
++
++using Cry::AreaComponents::IShapeComponent;
++
++namespace AreaShapeTools
++{
++
++CBaseObject* FindObject(const CryGUID& objectGuid)
++{
++	if (objectGuid == CryGUID::Null())
++		return nullptr;
++
++	IObjectManager* pObjectManager = GetIEditor()->GetObjectManager();
++	return pObjectManager != nullptr ? pObjectManager->FindObject(objectGuid) : nullptr;
++}
++
++IShapeComponent* AsShape(IEntityComponent* pComponent)
++{
++	if (pComponent == nullptr)
++		return nullptr;
++
++	// Only cast what really is one: the reflected base list is the cross-DLL proof that this
++	// component implements the contract the tools are written against.
++	if (pComponent->GetClassDesc().FindBaseByTypeID(Schematyc::GetTypeDesc<IShapeComponent>().GetGUID()) == nullptr)
++		return nullptr;
++
++	return static_cast<IShapeComponent*>(pComponent);
++}
++
++IShapeComponent* FindShapeOnObject(CBaseObject* pObject, CryGUID* pComponentGuidOut)
++{
++	IEntity* pEntity = pObject != nullptr ? pObject->GetIEntity() : nullptr;
++	if (pEntity == nullptr)
++		return nullptr;
++
++	IEntityComponent* pComponent = pEntity->QueryComponentByInterfaceID(Schematyc::GetTypeDesc<IShapeComponent>().GetGUID());
++	IShapeComponent*  pShape = AsShape(pComponent);
++
++	if (pShape != nullptr && pComponentGuidOut != nullptr)
++		*pComponentGuidOut = pComponent->GetGUID();
++
++	return pShape;
++}
++
++void SyncEditedComponent(CBaseObject* pObject, IEntityComponent* pComponent)
++{
++	if (pComponent == nullptr)
++		return;
++
++	// The editor's save snapshot for a Schematyc entity is taken during the inspector's input
++	// pass (EntityObject.cpp, CreateComponentWidget). A viewport tool writes outside that pass, so
++	// the snapshot has to be refreshed by hand or the edit is lost on save, on undo and on game
++	// mode. A legitimate no-op for an entity without a Schematyc object: the level then writes the
++	// live component.
++	if (IEntity* pEntity = pComponent->GetEntity())
++	{
++		if (Schematyc::IObject* pSchematycObject = pEntity->GetSchematycObject())
++		{
++			if (Schematyc::IObjectPropertiesPtr pProperties = pSchematycObject->GetObjectProperties())
++			{
++				if (Schematyc::CClassProperties* pClassProperties = pProperties->GetComponentProperties(pComponent->GetGUID()))
++				{
++					pClassProperties->SetOverridePolicy(Schematyc::EOverridePolicy::Override);
++					pClassProperties->Read(pComponent->GetClassDesc(), pComponent);
++				}
++			}
++		}
++	}
++
++	SEntityEvent event(ENTITY_EVENT_COMPONENT_PROPERTY_CHANGED);
++	pComponent->SendEvent(event);
++
++	if (pObject != nullptr)
++	{
++		pObject->SetModified(false, false);
++		pObject->UpdatePrefab();
++	}
++}
++
++} // namespace AreaShapeTools
+diff --git a/Code/Sandbox/Plugins/AreaComponentsEditor/Tools/ShapeToolCommon.h b/Code/Sandbox/Plugins/AreaComponentsEditor/Tools/ShapeToolCommon.h
+new file mode 100644
+index 00000000..89ec03c2
+--- /dev/null
++++ b/Code/Sandbox/Plugins/AreaComponentsEditor/Tools/ShapeToolCommon.h
+@@ -0,0 +1,42 @@
++// Copyright 2026 ReC Sandbox. Distributed under the terms in LICENSE.md at the repository root.
++#pragma once
++
++#include <CryExtension/CryGUID.h>
++
++class CBaseObject;
++struct IEntity;
++struct IEntityComponent;
++
++namespace Cry
++{
++namespace AreaComponents
++{
++struct IShapeComponent;
++}
++}
++
++//! The few things every Area shape tool has to do, in one place: find the shape component on an
++//! editor object, and push a viewport edit into the places the editor saves from.
++//!
++//! Nothing here stores a pointer between calls - the tools resolve object and component from their
++//! GUIDs on every use (MEMORY.md, fix bde12cd8), which is also what lets a tool survive an undo
++//! that re-creates the entity underneath it.
++namespace AreaShapeTools
++{
++
++CBaseObject*                          FindObject(const CryGUID& objectGuid);
++
++//! The shape component of an entity, or nullptr. The cast is made only after the reflected base
++//! list proves the component really implements the contract - that is the cross-DLL proof.
++Cry::AreaComponents::IShapeComponent* AsShape(IEntityComponent* pComponent);
++
++//! The single shape component of an editor object (decision 01: there is at most one).
++//! `pComponentGuidOut` receives its instance GUID when it is not null.
++Cry::AreaComponents::IShapeComponent* FindShapeOnObject(CBaseObject* pObject, CryGUID* pComponentGuidOut);
++
++//! The sandwich a viewport edit has to repeat by hand, because it happens outside the inspector's
++//! serialization pass (research/06 section 5.3): refresh the Schematyc save snapshot, tell the
++//! component its properties changed, mark the object modified and update the prefab.
++void                                  SyncEditedComponent(CBaseObject* pObject, IEntityComponent* pComponent);
++
++} // namespace AreaShapeTools
+-- 
+2.47.1.windows.1
+

@@ -1,0 +1,328 @@
+From 98177ad04a3c88d839c031c57a4c554e5f2cccf9 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Fri, 11 Sep 2026 23:53:45 +0800
+Subject: [PATCH 191/209] feat(area): trigger bounds component
+
+A second consumer of the shape contract, deliberately small, and the proof
+that the contract is not secretly the Area component's private interface: it
+needs no engine change at all and never touches a CArea.
+
+"Trigger Bounds" takes the local AABB of whatever shape sits on the same
+entity and feeds it to the stock IEntityTriggerComponent, followed by
+InvalidateTrigger() so that entities already standing inside are caught rather
+than waiting for the next crossing. It binds by the same rule the Area
+component uses, listens for the same shape change notification, and creates
+its trigger flagged NoSave for the same reason - the box is derived from the
+shape, so it must not be written to the level a second time.
+
+It is a proximity trigger, not an area: CProximityTriggerSystem puts the
+triggering entity in nParam[1] where CArea puts its area id, so an entity
+should carry either this or the Area component, not both. That is a documented
+sharp edge of the engine, written down in the header rather than papered over.
+
+No per-frame work: the trigger follows the entity by itself, so the component
+only subscribes to property and reset events.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ .../AreaComponents/Module/CMakeLists.txt      |   2 +
+ .../Functions/TriggerBoundsComponent.cpp      | 162 ++++++++++++++++++
+ .../Module/Functions/TriggerBoundsComponent.h |  80 +++++++++
+ .../AreaComponents/Module/PluginDll.cpp       |   5 +
+ 4 files changed, 249 insertions(+)
+ create mode 100644 Code/CryPlugins/AreaComponents/Module/Functions/TriggerBoundsComponent.cpp
+ create mode 100644 Code/CryPlugins/AreaComponents/Module/Functions/TriggerBoundsComponent.h
+
+diff --git a/Code/CryPlugins/AreaComponents/Module/CMakeLists.txt b/Code/CryPlugins/AreaComponents/Module/CMakeLists.txt
+index 844c33bb..a9f1b251 100644
+--- a/Code/CryPlugins/AreaComponents/Module/CMakeLists.txt
++++ b/Code/CryPlugins/AreaComponents/Module/CMakeLists.txt
+@@ -27,6 +27,8 @@ add_sources("AreaComponents_uber_0.cpp"
+ 	SOURCE_GROUP "Functions"
+ 		"Functions/AreaFunctionComponent.h"
+ 		"Functions/AreaFunctionComponent.cpp"
++		"Functions/TriggerBoundsComponent.h"
++		"Functions/TriggerBoundsComponent.cpp"
+ 		"Functions/GravityVolumeComponent.h"
+ 		"Functions/GravityVolumeComponent.cpp"
+ 		"Functions/DistributorComponent.h"
+diff --git a/Code/CryPlugins/AreaComponents/Module/Functions/TriggerBoundsComponent.cpp b/Code/CryPlugins/AreaComponents/Module/Functions/TriggerBoundsComponent.cpp
+new file mode 100644
+index 00000000..350de40e
+--- /dev/null
++++ b/Code/CryPlugins/AreaComponents/Module/Functions/TriggerBoundsComponent.cpp
+@@ -0,0 +1,162 @@
++// Copyright 2026 ReC Sandbox. Distributed under the terms in LICENSE.md at the repository root.
++#include "StdAfx.h"
++#include "TriggerBoundsComponent.h"
++
++#include <CryEntitySystem/IEntitySystem.h>
++
++namespace Cry
++{
++namespace AreaComponents
++{
++
++void CTriggerBoundsComponent::Register(Schematyc::CEnvRegistrationScope& componentScope)
++{
++	// No Schematyc functions yet.
++}
++
++void CTriggerBoundsComponent::Initialize()
++{
++	EnsureBound();
++}
++
++void CTriggerBoundsComponent::OnShutDown()
++{
++	UnbindShape();
++}
++
++Cry::Entity::EventFlags CTriggerBoundsComponent::GetEventMask() const
++{
++	// No per-frame work: the trigger itself follows the entity (CEntityComponentTriggerBounds
++	// moves it on XFORM), so all this component has to hear about is a change of shape.
++	// XFORM is subscribed only so that an unbound component can still find a shape that was added
++	// after it - there is no entity event for "a component was added".
++	return ENTITY_EVENT_COMPONENT_PROPERTY_CHANGED | ENTITY_EVENT_XFORM | ENTITY_EVENT_RESET;
++}
++
++void CTriggerBoundsComponent::ProcessEvent(const SEntityEvent& event)
++{
++	switch (event.event)
++	{
++	case ENTITY_EVENT_XFORM:
++		if (!m_bBoundToShape)
++		{
++			EnsureBound();
++		}
++		break;
++
++	case ENTITY_EVENT_COMPONENT_PROPERTY_CHANGED:
++	case ENTITY_EVENT_RESET:
++		EnsureBound();
++		PushBounds();
++		break;
++
++	default:
++		break;
++	}
++}
++
++IShapeComponent* CTriggerBoundsComponent::FindShape() const
++{
++	IEntity* pEntity = GetEntity();
++	if (pEntity == nullptr)
++		return nullptr;
++
++	IEntityComponent* pComponent = pEntity->QueryComponentByInterfaceID(Schematyc::GetTypeDesc<IShapeComponent>().GetGUID());
++	return (pComponent != nullptr) ? static_cast<IShapeComponent*>(pComponent) : nullptr;
++}
++
++IEntityTriggerComponent* CTriggerBoundsComponent::FindTrigger() const
++{
++	IEntity* pEntity = GetEntity();
++	if (pEntity == nullptr || m_triggerGuid.IsNull())
++		return nullptr;
++
++	return static_cast<IEntityTriggerComponent*>(pEntity->GetComponentByGUID(m_triggerGuid));
++}
++
++void CTriggerBoundsComponent::EnsureBound()
++{
++	IEntity* pEntity = GetEntity();
++	if (pEntity == nullptr)
++		return;
++
++	IShapeComponent* pShape = FindShape();
++	if (pShape == nullptr)
++	{
++		UnbindShape();
++
++		if (!m_bWarnedNoShape)
++		{
++			m_bWarnedNoShape = true;
++			CryWarning(VALIDATOR_MODULE_ENTITYSYSTEM, VALIDATOR_WARNING,
++			           "Trigger Bounds on entity \"%s\" has no shape component - add one (Add Component -> Area) and the trigger "
++			           "takes its box from it.", pEntity->GetName());
++		}
++		return;
++	}
++
++	m_bWarnedNoShape = false;
++
++	if (m_triggerGuid.IsNull())
++	{
++		if (IEntityTriggerComponent* pTrigger = pEntity->GetOrCreateComponent<IEntityTriggerComponent>())
++		{
++			// Same reasoning as the Area function component's hidden area proxy: the trigger is
++			// ours to drive and its box is derived from the shape, so it must not be written to
++			// the level a second time.
++			pTrigger->GetComponentFlags().Add(EEntityComponentFlags::NoSave);
++			m_triggerGuid = pTrigger->GetGUID();
++		}
++	}
++
++	if (!m_bBoundToShape)
++	{
++		pShape->AddListener(this);
++		m_bBoundToShape = true;
++		PushBounds();
++	}
++}
++
++void CTriggerBoundsComponent::UnbindShape()
++{
++	if (!m_bBoundToShape)
++		return;
++
++	if (IShapeComponent* pShape = FindShape())
++	{
++		pShape->RemoveListener(this);
++	}
++
++	m_bBoundToShape = false;
++}
++
++void CTriggerBoundsComponent::OnShapeChanged(IShapeComponent& shape, EShapeChangeReason reason)
++{
++	// A proximity trigger has one AABB and nothing cheaper than replacing it, so every reason -
++	// including a pure transform, because the box is expressed in the entity's local space and a
++	// shape offset is part of it - takes the same path.
++	PushBounds();
++}
++
++void CTriggerBoundsComponent::PushBounds()
++{
++	IShapeComponent*         pShape = FindShape();
++	IEntityTriggerComponent* pTrigger = FindTrigger();
++	if (pShape == nullptr || pTrigger == nullptr)
++		return;
++
++	AABB localBounds(AABB::RESET);
++	pShape->GetLocalAABB(localBounds);
++	if (localBounds.IsReset())
++		return;
++
++	pTrigger->SetTriggerBounds(localBounds);
++	pTrigger->ForwardEventsTo(static_cast<EntityId>(m_forwardToEntityId));
++
++	// Without this an entity that is already standing inside the new box never gets its enter
++	// event - the trigger only reports crossings.
++	pTrigger->InvalidateTrigger();
++}
++
++} // namespace AreaComponents
++} // namespace Cry
+diff --git a/Code/CryPlugins/AreaComponents/Module/Functions/TriggerBoundsComponent.h b/Code/CryPlugins/AreaComponents/Module/Functions/TriggerBoundsComponent.h
+new file mode 100644
+index 00000000..f9745e3f
+--- /dev/null
++++ b/Code/CryPlugins/AreaComponents/Module/Functions/TriggerBoundsComponent.h
+@@ -0,0 +1,80 @@
++// Copyright 2026 ReC Sandbox. Distributed under the terms in LICENSE.md at the repository root.
++#pragma once
++
++#include "../../Interface/IShapeComponent.h"
++
++#include <CrySchematyc/MathTypes.h>
++#include <CrySchematyc/Reflection/TypeDesc.h>
++#include <CrySchematyc/Env/IEnvRegistrar.h>
++
++namespace Cry
++{
++namespace AreaComponents
++{
++
++//! "Trigger Bounds": the second consumer of the shape contract, and the one that proves the
++//! contract is not secretly the Area component's private interface - it needs no engine change at
++//! all and touches no CArea.
++//!
++//! It feeds the stock IEntityTriggerComponent, which is a CProximityTriggerSystem trigger, not an
++//! area: it fires ENTITY_EVENT_ENTERAREA / LEAVEAREA for any entity crossing an axis-aligned box
++//! in the entity's LOCAL space, with the entity's rotation and scale ignored (the documented
++//! contract of SetTriggerBounds). So this component takes the local AABB of whatever shape sits on
++//! the same entity and hands it over, on bind and on every geometry change, followed by
++//! InvalidateTrigger() so that entities already standing inside are caught.
++//!
++//! What it deliberately does NOT do is pretend to be an area. The proximity system's payload is
++//! incompatible with CArea's - it puts the triggering entity in nParam[1], where an area puts its
++//! id - so an entity should carry either this or the Area function component, not both. That is a
++//! documented sharp edge of the engine, not something this component can fix.
++class CTriggerBoundsComponent final
++	: public IEntityComponent
++	, public IShapeListener
++{
++public:
++	CTriggerBoundsComponent() = default;
++	virtual ~CTriggerBoundsComponent() = default;
++
++	static void Register(Schematyc::CEnvRegistrationScope& componentScope);
++
++	static void ReflectType(Schematyc::CTypeDesc<CTriggerBoundsComponent>& desc)
++	{
++		desc.SetGUID("{6C3A81D5-0F47-4E9A-B4D1-72E5C8A96211}"_cry_guid);
++		desc.SetEditorCategory("Area");
++		desc.SetLabel("Trigger Bounds");
++		desc.SetDescription("Feeds the shape on this entity to the entity's proximity trigger, so entities crossing it fire enter/leave events.");
++		desc.SetComponentFlags({ IEntityComponent::EFlags::Singleton });
++
++		desc.AddMember(&CTriggerBoundsComponent::m_forwardToEntityId, 'fwrd', "ForwardTo", "Forward Events To",
++		               "Entity id that should receive the enter/leave events instead of this entity. 0 keeps them here.", 0);
++	}
++
++	// IShapeListener
++	virtual void OnShapeChanged(IShapeComponent& shape, EShapeChangeReason reason) override;
++	// ~IShapeListener
++
++protected:
++	// IEntityComponent
++	virtual void                    Initialize() override;
++	virtual void                    OnShutDown() override;
++	virtual void                    ProcessEvent(const SEntityEvent& event) override;
++	virtual Cry::Entity::EventFlags GetEventMask() const override;
++	// ~IEntityComponent
++
++private:
++	IShapeComponent*         FindShape() const;
++	IEntityTriggerComponent* FindTrigger() const;
++
++	void EnsureBound();
++	void UnbindShape();
++	void PushBounds();
++
++	int     m_forwardToEntityId = 0;
++
++	CryGUID m_triggerGuid = CryGUID::Null();
++	bool    m_bBoundToShape = false;
++	bool    m_bWarnedNoShape = false;
++};
++
++} // namespace AreaComponents
++} // namespace Cry
+diff --git a/Code/CryPlugins/AreaComponents/Module/PluginDll.cpp b/Code/CryPlugins/AreaComponents/Module/PluginDll.cpp
+index e304eee5..64c98211 100644
+--- a/Code/CryPlugins/AreaComponents/Module/PluginDll.cpp
++++ b/Code/CryPlugins/AreaComponents/Module/PluginDll.cpp
+@@ -8,6 +8,7 @@
+ #include "Shapes/SplineShapeComponent.h"
+ 
+ #include "Functions/AreaFunctionComponent.h"
++#include "Functions/TriggerBoundsComponent.h"
+ #include "Functions/GravityVolumeComponent.h"
+ #include "Functions/DistributorComponent.h"
+ 
+@@ -93,6 +94,10 @@ void CAreaComponentsPlugin::RegisterComponents(Schematyc::IEnvRegistrar& registr
+ 		Schematyc::CEnvRegistrationScope componentScope = scope.Register(SCHEMATYC_MAKE_ENV_COMPONENT(CAreaFunctionComponent));
+ 		CAreaFunctionComponent::Register(componentScope);
+ 	}
++	{
++		Schematyc::CEnvRegistrationScope componentScope = scope.Register(SCHEMATYC_MAKE_ENV_COMPONENT(CTriggerBoundsComponent));
++		CTriggerBoundsComponent::Register(componentScope);
++	}
+ 	{
+ 		Schematyc::CEnvRegistrationScope componentScope = scope.Register(SCHEMATYC_MAKE_ENV_COMPONENT(CGravityVolumeComponent));
+ 		CGravityVolumeComponent::Register(componentScope);
+-- 
+2.47.1.windows.1
+

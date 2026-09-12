@@ -1,0 +1,186 @@
+From 9ca0c573abd9a570ac36487fda39573fd1e8a0bf Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Sat, 12 Sep 2026 13:50:53 +0800
+Subject: [PATCH 203/209] feat(area): trigger bounds logs events on request and
+ previews its box
+
+The component worked and there was no way to see that it did: a proximity
+trigger raises ENTERAREA / LEAVEAREA on its entity and nothing in the editor
+displays them, so "add Trigger Bounds and walk into it" had no observable
+result.
+
+Two additions, both in this component only.
+
+Log Events (reflected bool, default false) prints one line per crossing:
+"[TriggerBounds] entity '<host>': ENTERED|LEFT by entity <id> (<name>)". It
+reads nParam[0], which is CProximityTriggerSystem's payload and NOT CArea's -
+the proximity system puts the crossing entity in nParam[0], leaves nParam[1]
+at 0 and puts the trigger's own entity in nParam[2]
+(ProximityTriggerSystem.cpp, CProximityTriggerSystem::SendEvent), whereas an
+area puts its AREA ID in nParam[1]. That clash is the reason the header says an
+entity should carry either this component or the Area function component, and
+it is why the handler reads nParam[0] and nothing else. The two events are
+subscribed unconditionally rather than only while the flag is on: the event
+mask is sampled when the component is added, so making it depend on a reflected
+bool would be a second thing to keep in sync for no gain - the handler is two
+compares when logging is off.
+
+The previewer draws the trigger's box, read back from the trigger with
+GetTriggerBounds() rather than recomputed from the shape. That is deliberate:
+SetTriggerBounds takes an axis-aligned box in ENTITY space and the proximity
+system ignores the entity's rotation and scale, so on a rotated entity the
+trigger and the shape's outline genuinely do not line up - and the user should
+be able to see exactly what is being tested.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SCUvWGLCsqzm3VNMzp4uiS
+---
+ .../Functions/TriggerBoundsComponent.cpp      | 61 ++++++++++++++++++-
+ .../Module/Functions/TriggerBoundsComponent.h | 19 ++++++
+ 2 files changed, 79 insertions(+), 1 deletion(-)
+
+diff --git a/Code/CryPlugins/AreaComponents/Module/Functions/TriggerBoundsComponent.cpp b/Code/CryPlugins/AreaComponents/Module/Functions/TriggerBoundsComponent.cpp
+index 350de40e..8729bd75 100644
+--- a/Code/CryPlugins/AreaComponents/Module/Functions/TriggerBoundsComponent.cpp
++++ b/Code/CryPlugins/AreaComponents/Module/Functions/TriggerBoundsComponent.cpp
+@@ -3,6 +3,9 @@
+ #include "TriggerBoundsComponent.h"
+ 
+ #include <CryEntitySystem/IEntitySystem.h>
++#include <CryRenderer/IRenderAuxGeom.h>
++
++#include "../Shapes/ShapeDisplay.h"
+ 
+ namespace Cry
+ {
+@@ -30,7 +33,12 @@ Cry::Entity::EventFlags CTriggerBoundsComponent::GetEventMask() const
+ 	// moves it on XFORM), so all this component has to hear about is a change of shape.
+ 	// XFORM is subscribed only so that an unbound component can still find a shape that was added
+ 	// after it - there is no entity event for "a component was added".
+-	return ENTITY_EVENT_COMPONENT_PROPERTY_CHANGED | ENTITY_EVENT_XFORM | ENTITY_EVENT_RESET;
++	// ENTERAREA / LEAVEAREA are subscribed unconditionally rather than only while Log Events is on:
++	// the mask is read once when the component is added (and again on a property change), so a mask
++	// that depended on a reflected bool would be a second thing to keep in sync for no gain - the
++	// handler is two compares when logging is off.
++	return ENTITY_EVENT_COMPONENT_PROPERTY_CHANGED | ENTITY_EVENT_XFORM | ENTITY_EVENT_RESET
++	       | ENTITY_EVENT_ENTERAREA | ENTITY_EVENT_LEAVEAREA;
+ }
+ 
+ void CTriggerBoundsComponent::ProcessEvent(const SEntityEvent& event)
+@@ -50,6 +58,27 @@ void CTriggerBoundsComponent::ProcessEvent(const SEntityEvent& event)
+ 		PushBounds();
+ 		break;
+ 
++	case ENTITY_EVENT_ENTERAREA:
++	case ENTITY_EVENT_LEAVEAREA:
++		if (m_bLogEvents)
++		{
++			// CProximityTriggerSystem's payload, NOT CArea's: nParam[0] is the entity that crossed
++			// the box, nParam[1] is always 0, and nParam[2] is the trigger's own entity
++			// (ProximityTriggerSystem.cpp, CProximityTriggerSystem::SendEvent). An area puts its
++			// AREA ID in nParam[1], which is the payload clash documented in the header - so read
++			// nParam[0] and nothing else here.
++			const EntityId   crossingId = static_cast<EntityId>(event.nParam[0]);
++			const IEntity*   pCrossing = (gEnv->pEntitySystem != nullptr) ? gEnv->pEntitySystem->GetEntity(crossingId) : nullptr;
++			const IEntity*   pOwn = GetEntity();
++
++			CryLogAlways("[TriggerBounds] entity '%s': %s by entity %u (%s)",
++			             pOwn != nullptr ? pOwn->GetName() : "<none>",
++			             event.event == ENTITY_EVENT_ENTERAREA ? "ENTERED" : "LEFT",
++			             crossingId,
++			             pCrossing != nullptr ? pCrossing->GetName() : "<unknown>");
++		}
++		break;
++
+ 	default:
+ 		break;
+ 	}
+@@ -158,5 +187,35 @@ void CTriggerBoundsComponent::PushBounds()
+ 	pTrigger->InvalidateTrigger();
+ }
+ 
++#ifndef RELEASE
++void CTriggerBoundsComponent::Render(const IEntity& entity, const IEntityComponent& component, SEntityPreviewContext& context) const
++{
++	IRenderAuxGeom* pAux = gEnv->pAuxGeomRenderer;
++	if (pAux == nullptr)
++		return;
++
++	// What is drawn is the TRIGGER's box, read back from the trigger itself rather than recomputed
++	// from the shape: the point of the outline is to show what the proximity system actually tests,
++	// which is an axis-aligned box in entity space with the entity's rotation and scale IGNORED
++	// (IEntityTriggerComponent::SetTriggerBounds). On a rotated entity it therefore does not line
++	// up with the shape's outline, and that is the truth the user needs to see.
++	IEntityTriggerComponent* pTrigger = FindTrigger();
++	if (pTrigger == nullptr)
++		return;
++
++	AABB localBox(AABB::RESET);
++	pTrigger->GetTriggerBounds(localBox);
++	if (localBox.IsReset() || localBox.IsEmpty())
++		return;
++
++	// Axis aligned in ENTITY space: translation only, no rotation, no scale - the same transform
++	// the proximity system applies.
++	Matrix34 triggerTM(IDENTITY);
++	triggerTM.SetTranslation(entity.GetWorldTM().GetTranslation());
++
++	pAux->DrawAABB(localBox, triggerTM, false, ShapeDisplay::GetHighlightColour(context.bSelected), eBBD_Faceted);
++}
++#endif
++
+ } // namespace AreaComponents
+ } // namespace Cry
+diff --git a/Code/CryPlugins/AreaComponents/Module/Functions/TriggerBoundsComponent.h b/Code/CryPlugins/AreaComponents/Module/Functions/TriggerBoundsComponent.h
+index 1575d52e..065efec6 100644
+--- a/Code/CryPlugins/AreaComponents/Module/Functions/TriggerBoundsComponent.h
++++ b/Code/CryPlugins/AreaComponents/Module/Functions/TriggerBoundsComponent.h
+@@ -30,6 +30,9 @@ namespace AreaComponents
+ class CTriggerBoundsComponent final
+ 	: public IEntityComponent
+ 	, public IShapeListener
++#ifndef RELEASE
++	, public IEntityComponentPreviewer
++#endif
+ {
+ public:
+ 	CTriggerBoundsComponent() = default;
+@@ -62,12 +65,27 @@ public:
+ 
+ 		desc.AddMember(&CTriggerBoundsComponent::m_forwardToEntityId, 'fwrd', "ForwardTo", "Forward Events To",
+ 		               "Entity id that should receive the enter/leave events instead of this entity. 0 keeps them here.", 0);
++		desc.AddMember(&CTriggerBoundsComponent::m_bLogEvents, 'logv', "LogEvents", "Log Events",
++		               "Print one console line whenever an entity enters or leaves the trigger. The trigger raises entity "
++		               "events and nothing in the editor displays them, so this is how you see it working.", false);
+ 	}
+ 
+ 	// IShapeListener
+ 	virtual void OnShapeChanged(IShapeComponent& shape, EShapeChangeReason reason) override;
+ 	// ~IShapeListener
+ 
++#ifndef RELEASE
++	// IEntityComponentPreviewer - draws the trigger's own box, which is NOT the shape's outline:
++	// a proximity trigger is an axis-aligned box in entity space with rotation and scale ignored
++	// (IEntityTriggerComponent::SetTriggerBounds), so a rotated shape and its trigger disagree and
++	// the user should be able to see that they do.
++	virtual IEntityComponentPreviewer* GetPreviewer() override { return this; }
++
++	virtual void SerializeProperties(Serialization::IArchive& archive) override {}
++	virtual void Render(const IEntity& entity, const IEntityComponent& component, SEntityPreviewContext& context) const override;
++	// ~IEntityComponentPreviewer
++#endif
++
+ protected:
+ 	// IEntityComponent
+ 	virtual void                    Initialize() override;
+@@ -85,6 +103,7 @@ private:
+ 	void PushBounds();
+ 
+ 	int     m_forwardToEntityId = 0;
++	bool    m_bLogEvents = false;
+ 
+ 	CryGUID m_triggerGuid = CryGUID::Null();
+ 	bool    m_bBoundToShape = false;
+-- 
+2.47.1.windows.1
+

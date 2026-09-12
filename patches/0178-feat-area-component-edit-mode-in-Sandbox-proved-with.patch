@@ -1,0 +1,832 @@
+From 880345d9bfa230912ca1aa154392236191335617 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Fri, 11 Sep 2026 21:24:04 +0800
+Subject: [PATCH 178/209] feat(area): component edit mode in Sandbox, proved
+ with the box shape
+
+The editor half of scene-notes/area/decisions/02. Three hooks in CEntityObject,
+all of them no-ops for an entity whose components do not implement
+IEditorShapeComponent, so the legacy path is unchanged:
+
+- GetLocalBounds unions the bounds every such component reports, so framing (F),
+  GetBoundBox and rubber-band selection see geometry that owns no entity slot.
+  HitTestRect needed no change: it reaches GetLocalBounds through GetBoundBox.
+- HitTest gains HitTestEditorShapeComponents, tried after the slot walk and
+  before the physics early-out, because a shape volume is real geometry even on
+  an entity that also has a physical proxy. The tolerance is the one
+  CShapeObject::HitTest uses - screen scale factor plus the hit context's own
+  distance tolerance - so an edge stays clickable at any zoom.
+- CreateComponentWidget emits one SEditToolButton row per component that names
+  an edit tool, labelled by the component. The row resolves the tool by name
+  through the class factory, so EditorQt links nothing new, and hands it the
+  object and component GUIDs in a SEntityComponentEditToolTarget. Those payloads
+  live in a node-based map keyed by component instance, because SetUserData
+  takes a bare void* that must outlive a row the inspector rebuilds on every
+  selection change.
+
+CShapeEditTool in the editor plugin closes the loop. It is written against
+IShapeComponentEdit alone, so it will serve Sphere, Polygon and Spline unchanged;
+it draws the hull and screen-constant handles in Display, moves a handle with an
+ITransformManipulator, and wraps one gesture in one CUndo - Begin plus StoreUndo
+on drag start, Accept on drag end. After each gesture it repeats by hand the
+snapshot sandwich the inspector performs during its input pass
+(SetOverridePolicy + Read, COMPONENT_PROPERTY_CHANGED, UpdatePrefab), without
+which a viewport edit is lost on save, on undo and on game mode. Esc ends the
+tool; object and component are re-resolved from GUIDs on every use.
+
+CAreaShapeBoxClassDesc puts "Create Object -> Area -> Box" in the Create panel
+from the plugin, reusing EditorQt's CEntityObjectWithComponent machinery through
+the class factory rather than subclassing it, which keeps this DLL free of any
+link dependency on Sandbox.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SCUvWGLCsqzm3VNMzp4uiS
+---
+ .../Sandbox/EditorQt/Objects/EntityObject.cpp | 114 +++++
+ Code/Sandbox/EditorQt/Objects/EntityObject.h  |   3 +
+ .../AreaComponentsEditor/CMakeLists.txt       |   2 +
+ .../Objects/AreaShapeObjectClassDescs.cpp     |  67 +++
+ .../Tools/ShapeEditTool.cpp                   | 413 +++++++++++++++++-
+ .../Tools/ShapeEditTool.h                     |  77 +++-
+ 6 files changed, 668 insertions(+), 8 deletions(-)
+ create mode 100644 Code/Sandbox/Plugins/AreaComponentsEditor/Objects/AreaShapeObjectClassDescs.cpp
+
+diff --git a/Code/Sandbox/EditorQt/Objects/EntityObject.cpp b/Code/Sandbox/EditorQt/Objects/EntityObject.cpp
+index 1fa2c1f4..482f057f 100644
+--- a/Code/Sandbox/EditorQt/Objects/EntityObject.cpp
++++ b/Code/Sandbox/EditorQt/Objects/EntityObject.cpp
+@@ -832,6 +832,21 @@ void OnBnClickedRevertComponentProperties(IEntityComponent* pComponent)
+ 	pComponent->SendEvent(entityEvent);
+ }
+ 
++//! The payload the "Edit Shape" row hands to the tool (IEntityComponent.h). CEditTool::SetUserData
++//! takes a bare void* that must stay valid for as long as the row lives, and the row is rebuilt on
++//! every selection change - so the payloads live here, one per component instance, in a node-based
++//! container whose element addresses never move. Both fields are GUIDs, so a stale entry is inert:
++//! the tool re-resolves object and component through the managers on every use.
++static SEntityComponentEditToolTarget* GetComponentEditToolTarget(const CryGUID& objectGuid, const CryGUID& componentGuid)
++{
++	static std::map<CryGUID, SEntityComponentEditToolTarget> targets;
++
++	SEntityComponentEditToolTarget& target = targets[componentGuid];
++	target.objectGuid = objectGuid;
++	target.componentGuid = componentGuid;
++	return &target;
++}
++
+ void CreateComponentWidget(CEntityObject* pEntityObject, CryGUID componentTypeGUID, size_t typeInstanceIndex, Serialization::IArchive& archive)
+ {
+ 	// Query all components of this type in the entity
+@@ -876,6 +891,32 @@ void CreateComponentWidget(CEntityObject* pEntityObject, CryGUID componentTypeGU
+ 			}
+ 		}
+ 
++		// A component that owns editable geometry (IEditorShapeComponent) gets one button row that
++		// starts its edit tool for THIS component instance - Sandbox's equivalent of O3DE's
++		// "Edit" button on a shape component. Components that do not implement the interface, or
++		// that name no tool, add nothing and the inspector looks exactly as it did before.
++		if (archive.isEdit())
++		{
++			if (pComponent->GetClassDesc().FindBaseByTypeID(Schematyc::GetTypeDesc<IEditorShapeComponent>().GetGUID()) != nullptr)
++			{
++				const IEditorShapeComponent* pEditorShapeComponent = static_cast<const IEditorShapeComponent*>(pComponent);
++				if (const char* szEditToolClassName = pEditorShapeComponent->GetEditToolClassName())
++				{
++					const char* szEditToolLabel = pEditorShapeComponent->GetEditToolLabel();
++					if (szEditToolLabel == nullptr || szEditToolLabel[0] == '\0')
++					{
++						szEditToolLabel = "Edit";
++					}
++
++					Serialization::SEditToolButton editToolButton("");
++					editToolButton.SetToolName(szEditToolClassName, SEntityComponentEditToolTarget::GetUserDataKey(),
++					                           GetComponentEditToolTarget(pEntityObject->GetId(), pComponent->GetGUID()));
++
++					archive(editToolButton, "editGeometry", szEditToolLabel);
++				}
++			}
++		}
++
+ 		if (pComponent->GetClassDesc().GetMembers().size() > 0)
+ 		{
+ 			Schematyc::IObject* pSchematycObject = pComponent->GetEntity()->GetSchematycObject();
+@@ -1246,6 +1287,73 @@ void CEntityObject::GetLocalBounds(AABB& box)
+ 	{
+ 		box.Add(m_pHelperMesh->GetAABB());
+ 	}
++
++	// Components that own geometry without owning a slot (shape volumes, splines) contribute their
++	// own bounds, so that framing (F), GetBoundBox and rubber-band selection see the geometry the
++	// user can see. An entity with no such component leaves the slot walk above untouched.
++	if (m_pEntity != nullptr)
++	{
++		DynArray<IEditorShapeComponent*> editorShapeComponents;
++		m_pEntity->GetAllComponents(editorShapeComponents);
++
++		for (IEditorShapeComponent* pEditorShapeComponent : editorShapeComponents)
++		{
++			AABB componentBounds;
++			if (pEditorShapeComponent != nullptr && pEditorShapeComponent->GetEditorLocalBounds(componentBounds) && !componentBounds.IsReset())
++			{
++				box.Add(componentBounds);
++			}
++		}
++	}
++}
++
++//! Picking for components that own geometry without owning a slot: the legacy path in
++//! HitTestEntity() needs an IStatObj / character / geom cache to answer, so a shape volume would
++//! never be clickable without this. Returns the nearest component hit in world-space distance.
++bool CEntityObject::HitTestEditorShapeComponents(HitContext& hc)
++{
++	if (m_pEntity == nullptr)
++	{
++		return false;
++	}
++
++	DynArray<IEditorShapeComponent*> editorShapeComponents;
++	m_pEntity->GetAllComponents(editorShapeComponents);
++	if (editorShapeComponents.empty())
++	{
++		return false;
++	}
++
++	// The same tolerance CShapeObject::HitTest uses, so a wireframe edge stays as clickable here as
++	// it is on a legacy shape object.
++	float tolerance = hc.distanceTolerance;
++	if (hc.view != nullptr)
++	{
++		tolerance += 0.8f * hc.view->GetScreenScaleFactor(GetWorldPos()) * 0.01f;
++	}
++
++	const Ray worldRay(hc.raySrc, hc.rayDir.GetNormalized());
++
++	bool  bHit = false;
++	float nearestDistance = FLT_MAX;
++
++	for (IEditorShapeComponent* pEditorShapeComponent : editorShapeComponents)
++	{
++		float distance;
++		if (pEditorShapeComponent != nullptr && pEditorShapeComponent->EditorHitTest(worldRay, tolerance, distance) && distance < nearestDistance)
++		{
++			nearestDistance = distance;
++			bHit = true;
++		}
++	}
++
++	if (bHit)
++	{
++		hc.dist = nearestDistance;
++		hc.object = this;
++	}
++
++	return bHit;
+ }
+ 
+ void CEntityObject::SetModified(bool boModifiedTransformOnly, bool bNotifyObjectManager)
+@@ -1456,6 +1564,12 @@ bool CEntityObject::HitTest(HitContext& hc)
+ 				hc.object = this;
+ 				return true;
+ 			}
++			// Slotless component geometry is tested before the physics early-out below: a shape
++			// volume is real geometry even on an entity that also has a physical proxy.
++			if (HitTestEditorShapeComponents(hc))
++			{
++				return true;
++			}
+ 			if (bHavePhysics)
+ 			{
+ 				return false;
+diff --git a/Code/Sandbox/EditorQt/Objects/EntityObject.h b/Code/Sandbox/EditorQt/Objects/EntityObject.h
+index 39f9f148..7eaec6de 100644
+--- a/Code/Sandbox/EditorQt/Objects/EntityObject.h
++++ b/Code/Sandbox/EditorQt/Objects/EntityObject.h
+@@ -111,6 +111,9 @@ public:
+ 	virtual void SetModified(bool boModifiedTransformOnly, bool bNotifyObjectManager);
+ 
+ 	virtual bool HitTest(HitContext& hc);
++	//! Ray test against every component that implements IEditorShapeComponent, i.e. against
++	//! geometry that owns no entity slot and is therefore invisible to HitTestEntity().
++	bool         HitTestEditorShapeComponents(HitContext& hc);
+ 	virtual bool HitHelperTest(HitContext& hc);
+ 	virtual bool HitTestRect(HitContext& hc);
+ 	void         UpdateVisibility(bool bVisible);
+diff --git a/Code/Sandbox/Plugins/AreaComponentsEditor/CMakeLists.txt b/Code/Sandbox/Plugins/AreaComponentsEditor/CMakeLists.txt
+index 4e146645..964c04fc 100644
+--- a/Code/Sandbox/Plugins/AreaComponentsEditor/CMakeLists.txt
++++ b/Code/Sandbox/Plugins/AreaComponentsEditor/CMakeLists.txt
+@@ -10,6 +10,8 @@ add_sources("NoUberFile"
+ 	SOURCE_GROUP "Tools"
+ 		"Tools/ShapeEditTool.h"
+ 		"Tools/ShapeEditTool.cpp"
++	SOURCE_GROUP "Objects"
++		"Objects/AreaShapeObjectClassDescs.cpp"
+ )
+ 
+ end_sources()
+diff --git a/Code/Sandbox/Plugins/AreaComponentsEditor/Objects/AreaShapeObjectClassDescs.cpp b/Code/Sandbox/Plugins/AreaComponentsEditor/Objects/AreaShapeObjectClassDescs.cpp
+new file mode 100644
+index 00000000..618d341f
+--- /dev/null
++++ b/Code/Sandbox/Plugins/AreaComponentsEditor/Objects/AreaShapeObjectClassDescs.cpp
+@@ -0,0 +1,67 @@
++// Copyright 2026 ReC Sandbox. Distributed under the terms in LICENSE.md at the repository root.
++#include "StdAfx.h"
++
++#include <IEditor.h>
++#include <IEditorClassFactory.h>
++#include <IObjectEnumerator.h>
++#include <Objects/ClassDesc.h>
++
++//! The Create-panel entries of the Area modernisation (decision 02 section 5). They live in this
++//! editor plugin, not in EditorQt: a plugin CObjectClassDesc is registered through the deferred
++//! REGISTER_CLASS_DESC helper, which is exactly what CryDesigner does for its own object classes
++//! (Objects/DesignerObject.cpp:28-35).
++//!
++//! Creation reuses EditorQt's CEntityObjectWithComponent machinery instead of a new object class:
++//! that class already knows how to spawn a plain "Entity" and create one component on it from a
++//! GUID passed as the creation "file" string (EntityObjectWithComponent.cpp:83-113). Borrowing its
++//! runtime class through the editor's class factory keeps this DLL free of any link dependency on
++//! Sandbox, which is what lets it be deployed on its own.
++namespace Private_AreaShapeObjectClassDescs
++{
++
++//! CBoxShapeComponent::ReflectType, CryPlugins/AreaComponents/Module/Shapes/BoxShapeComponent.h.
++//! Written the way CryGUID::ToString() writes it, because that is the form
++//! CEntityObjectWithComponent::Init() parses back out of the creation file string.
++const char* const szBoxShapeComponentGuid = "6C3A81D5-0F47-4E9A-B4D1-72E5C8A96201";
++
++//! The object class every Area preset is created as. Resolved lazily: EditorQt registers its own
++//! class descs before any plugin is loaded, but not necessarily before this plugin's statics run.
++CRuntimeClass* GetEntityWithComponentRuntimeClass()
++{
++	static CRuntimeClass* pRuntimeClass = nullptr;
++	if (pRuntimeClass == nullptr)
++	{
++		if (IClassDesc* pClassDesc = GetIEditor()->GetClassFactory()->FindClass("EntityWithComponent"))
++		{
++			pRuntimeClass = pClassDesc->GetRuntimeClass();
++		}
++	}
++	return pRuntimeClass;
++}
++
++} // namespace Private_AreaShapeObjectClassDescs
++
++//! "Create Object -> Area -> Box": an entity carrying a CBoxShapeComponent, ready to be edited
++//! with the "Edit Shape" button of its inspector.
++class CAreaShapeBoxClassDesc : public CObjectClassDesc
++{
++public:
++	virtual ObjectType     GetObjectType() override           { return OBJTYPE_ENTITY; }
++	virtual const char*    ClassName() override               { return "AreaShapeBox"; }
++	virtual const char*    UIName() override                  { return "Box"; }
++	virtual const char*    Category() override                { return "Area"; }
++	virtual CRuntimeClass* GetRuntimeClass() override         { return Private_AreaShapeObjectClassDescs::GetEntityWithComponentRuntimeClass(); }
++	virtual const char*    GetFileSpec() override             { return Private_AreaShapeObjectClassDescs::szBoxShapeComponentGuid; }
++	virtual const char*    GetDataFilesFilterString() override { return ""; }
++
++	//! The entry is a single button, not a browsable list, so the Create panel asks
++	//! EnumerateObjects() for the buttons it should show.
++	virtual bool IsCreatedByListEnumeration() override { return false; }
++
++	virtual void EnumerateObjects(IObjectEnumerator* pEnumerator) override
++	{
++		pEnumerator->AddEntry("Box", Private_AreaShapeObjectClassDescs::szBoxShapeComponentGuid);
++	}
++};
++
++REGISTER_CLASS_DESC(CAreaShapeBoxClassDesc);
+diff --git a/Code/Sandbox/Plugins/AreaComponentsEditor/Tools/ShapeEditTool.cpp b/Code/Sandbox/Plugins/AreaComponentsEditor/Tools/ShapeEditTool.cpp
+index 778db487..f91c3ac2 100644
+--- a/Code/Sandbox/Plugins/AreaComponentsEditor/Tools/ShapeEditTool.cpp
++++ b/Code/Sandbox/Plugins/AreaComponentsEditor/Tools/ShapeEditTool.cpp
+@@ -2,7 +2,38 @@
+ #include "StdAfx.h"
+ #include "ShapeEditTool.h"
+ 
++#include <IEditor.h>
+ #include <IEditorClassFactory.h>
++#include <IObjectManager.h>
++#include <IUndoManager.h>
++#include <IDisplayViewport.h>
++#include <Viewport.h>
++#include <Gizmos/IGizmoManager.h>
++#include <LevelEditor/LevelEditorSharedState.h>
++#include <Objects/BaseObject.h>
++#include <Objects/DisplayContext.h>
++
++#include <CryEntitySystem/IEntity.h>
++#include <CryEntitySystem/IEntitySystem.h>
++#include <CrySchematyc/IObject.h>
++#include <CrySchematyc/IObjectProperties.h>
++#include <CrySchematyc/Utils/ClassProperties.h>
++#include <CrySchematyc/Reflection/TypeDesc.h>
++
++#include <IShapeComponent.h>
++
++#include <QtCore/Qt>
++
++using Cry::AreaComponents::IShapeComponent;
++using Cry::AreaComponents::IShapeComponentEdit;
++
++namespace
++{
++//! How close, in the same units CShapeObject uses, the cursor must come to a handle to grab it.
++const float kPointCloseDistance = 0.8f;
++//! Half-edge of a point handle, in screen-constant units (CShapeObject draws its points this way).
++const float kPointHandleSize = 0.8f;
++}
+ 
+ // Same registration shape CryDesigner uses (DesignerEditor.cpp): a class desc in the
+ // ESYSTEM_CLASS_EDITTOOL category, dropped into the editor's class factory by the auto-register
+@@ -19,8 +50,388 @@ REGISTER_CLASS_DESC(CShapeEditTool_ClassDesc);
+ 
+ IMPLEMENT_DYNCREATE(CShapeEditTool, CEditTool);
+ 
++CShapeEditTool::CShapeEditTool()
++{
++	m_pManipulator = GetIEditor()->GetGizmoManager()->AddManipulator(this);
++	m_pManipulator->signalBeginDrag.Connect(this, &CShapeEditTool::OnManipulatorBeginDrag);
++	m_pManipulator->signalDragging.Connect(this, &CShapeEditTool::OnManipulatorDrag);
++	m_pManipulator->signalEndDrag.Connect(this, &CShapeEditTool::OnManipulatorEndDrag);
++}
++
++CShapeEditTool::~CShapeEditTool()
++{
++	// A gesture that was still recording when the tool went away must not leave the undo manager
++	// half open - the same guard CEditShapeTool's destructor has (ShapeObject.cpp:143-144).
++	if (m_gestureOpen && GetIEditor()->GetIUndoManager()->IsUndoRecording())
++	{
++		GetIEditor()->GetIUndoManager()->Cancel();
++	}
++	m_gestureOpen = false;
++
++	if (m_pManipulator != nullptr)
++	{
++		m_pManipulator->signalBeginDrag.DisconnectAll();
++		m_pManipulator->signalDragging.DisconnectAll();
++		m_pManipulator->signalEndDrag.DisconnectAll();
++		GetIEditor()->GetGizmoManager()->RemoveManipulator(m_pManipulator);
++		m_pManipulator = nullptr;
++	}
++}
++
++void CShapeEditTool::SetUserData(const char* key, void* userData)
++{
++	if (userData == nullptr || key == nullptr || strcmp(key, SEntityComponentEditToolTarget::GetUserDataKey()) != 0)
++	{
++		return;
++	}
++
++	const SEntityComponentEditToolTarget* pTarget = static_cast<const SEntityComponentEditToolTarget*>(userData);
++	m_objectGuid = pTarget->objectGuid;
++	m_componentGuid = pTarget->componentGuid;
++	m_selectedPoint = -1;
++
++	if (m_pManipulator != nullptr)
++	{
++		m_pManipulator->Invalidate();
++	}
++}
++
++// ---------------------------------------------------------------------------
++// Resolving - always from GUIDs, never from a stored pointer
++// ---------------------------------------------------------------------------
++
++CBaseObject* CShapeEditTool::ResolveObject() const
++{
++	if (m_objectGuid == CryGUID::Null())
++		return nullptr;
++
++	IObjectManager* pObjectManager = GetIEditor()->GetObjectManager();
++	return pObjectManager != nullptr ? pObjectManager->FindObject(m_objectGuid) : nullptr;
++}
++
++IEntityComponent* CShapeEditTool::ResolveComponent() const
++{
++	if (m_componentGuid == CryGUID::Null())
++		return nullptr;
++
++	CBaseObject* pObject = ResolveObject();
++	IEntity* pEntity = pObject != nullptr ? pObject->GetIEntity() : nullptr;
++	return pEntity != nullptr ? pEntity->GetComponentByGUID(m_componentGuid) : nullptr;
++}
++
++IShapeComponent* CShapeEditTool::ResolveShape() const
++{
++	IEntityComponent* pComponent = ResolveComponent();
++	if (pComponent == nullptr)
++		return nullptr;
++
++	// Only cast what really is one: the reflected base list is the cross-DLL proof that this
++	// component implements the contract this tool is written against.
++	if (pComponent->GetClassDesc().FindBaseByTypeID(Schematyc::GetTypeDesc<IShapeComponent>().GetGUID()) == nullptr)
++		return nullptr;
++
++	return static_cast<IShapeComponent*>(pComponent);
++}
++
++IShapeComponentEdit* CShapeEditTool::ResolveShapeEdit() const
++{
++	IShapeComponent* pShape = ResolveShape();
++	return pShape != nullptr ? pShape->GetEditInterface() : nullptr;
++}
++
++Matrix34 CShapeEditTool::GetShapeWorldTM() const
++{
++	IShapeComponent* pShape = ResolveShape();
++	return pShape != nullptr ? pShape->GetWorldTransformMatrix() : Matrix34(IDENTITY);
++}
++
++Vec3 CShapeEditTool::GetPointWorldPos(int index) const
++{
++	IShapeComponentEdit* pEdit = ResolveShapeEdit();
++	if (pEdit == nullptr || index < 0 || index >= pEdit->GetPointCount())
++		return ZERO;
++
++	return GetShapeWorldTM().TransformPoint(pEdit->GetPoint(index));
++}
++
++// ---------------------------------------------------------------------------
++// Drawing
++// ---------------------------------------------------------------------------
++
++void CShapeEditTool::Display(SDisplayContext& dc)
++{
++	IShapeComponent* pShape = ResolveShape();
++	IShapeComponentEdit* pEdit = pShape != nullptr ? pShape->GetEditInterface() : nullptr;
++	if (pEdit == nullptr || dc.view == nullptr)
++		return;
++
++	// The hull outline. The component previewer draws it too, but it stops at the entity's
++	// selection state, and while the tool is up the outline has to be there whatever happens to
++	// the selection.
++	std::vector<Vec3> contour;
++	pShape->GetContour(contour, true);
++	if (contour.size() >= 2)
++	{
++		dc.SetColor(ColorB(0, 255, 0, 255));
++		dc.DrawPolyLine(contour.data(), static_cast<int>(contour.size()), true);
++	}
++
++	// Screen-constant point handles, the look CShapeObject::DisplayNormal has
++	// (ShapeObject.cpp:1377-1398): depth test off so a handle inside geometry stays grabbable.
++	dc.DepthTestOff();
++
++	const int pointCount = pEdit->GetPointCount();
++	for (int i = 0; i < pointCount; ++i)
++	{
++		const Vec3  worldPos = GetPointWorldPos(i);
++		const float size = kPointHandleSize * dc.view->GetScreenScaleFactor(worldPos) * 0.01f;
++		const Vec3  half(size, size, size);
++
++		if (i == m_selectedPoint)
++			dc.SetSelectedColor();
++		else
++			dc.SetColor(ColorB(255, 255, 0, 255));
++
++		dc.DrawSolidBox(worldPos - half, worldPos + half);
++	}
++
++	dc.DepthTestOn();
++}
++
++// ---------------------------------------------------------------------------
++// Input
++// ---------------------------------------------------------------------------
++
+ bool CShapeEditTool::MouseCallback(CViewport* pView, EMouseEvent event, CPoint& point, int flags)
+ {
+-	// Stage 0: swallow nothing, so the viewport keeps behaving exactly as it does today.
++	IShapeComponentEdit* pEdit = ResolveShapeEdit();
++	if (pEdit == nullptr)
++		return false;
++
++	if (event != eMouseLDown && event != eMouseMove)
++		return false;
++
++	Vec3 raySrc, rayDir;
++	pView->ViewToWorldRay(point, raySrc, rayDir);
++	rayDir.Normalize();
++
++	// Nearest handle under the cursor, in the tolerance CEditShapeTool uses.
++	int   nearestPoint = -1;
++	float nearestDistance = FLT_MAX;
++
++	const int pointCount = pEdit->GetPointCount();
++	for (int i = 0; i < pointCount; ++i)
++	{
++		const Vec3  worldPos = GetPointWorldPos(i);
++		const float rayT = max(0.0f, rayDir.Dot(worldPos - raySrc));
++		const float distance = (raySrc + rayDir * rayT - worldPos).GetLength();
++
++		const float tolerance = kPointCloseDistance * pView->GetScreenScaleFactor(worldPos) * 0.01f + pView->GetSelectionTolerance();
++		if (distance <= tolerance && rayT < nearestDistance)
++		{
++			nearestDistance = rayT;
++			nearestPoint = i;
++		}
++	}
++
++	if (event == eMouseMove)
++	{
++		if (nearestPoint >= 0)
++			pView->SetCurrentCursor(STD_CURSOR_HIT);
++		else
++			pView->ResetCursor();
++
++		return false;
++	}
++
++	// eMouseLDown: select the handle under the cursor (or drop the selection), and put the
++	// construction plane on it so that a drag maps to the plane the user is looking at.
++	if (nearestPoint != m_selectedPoint)
++	{
++		m_selectedPoint = nearestPoint;
++		if (m_pManipulator != nullptr)
++			m_pManipulator->Invalidate();
++	}
++
++	if (m_selectedPoint >= 0)
++	{
++		Matrix34 constructionMatrix(IDENTITY);
++		constructionMatrix.SetTranslation(GetPointWorldPos(m_selectedPoint));
++		pView->SetConstructionMatrix(constructionMatrix);
++		return true;
++	}
++
++	return false;
++}
++
++bool CShapeEditTool::OnKeyDown(CViewport* pView, uint32 nChar, uint32 nRepCnt, uint32 nFlags)
++{
++	if (nChar == Qt::Key_Escape)
++	{
++		GetIEditor()->GetLevelEditorSharedState()->SetEditTool(nullptr);
++		return true;
++	}
++
+ 	return false;
+ }
++
++// ---------------------------------------------------------------------------
++// Manipulator - one gesture, one undo step
++// ---------------------------------------------------------------------------
++
++bool CShapeEditTool::GetManipulatorMatrix(Matrix34& tm)
++{
++	IShapeComponent* pShape = ResolveShape();
++	if (pShape == nullptr)
++		return false;
++
++	tm = pShape->GetWorldTransformMatrix();
++	tm.OrthonormalizeFast();
++	return true;
++}
++
++void CShapeEditTool::GetManipulatorPosition(Vec3& position)
++{
++	position = GetPointWorldPos(m_selectedPoint);
++}
++
++bool CShapeEditTool::IsManipulatorVisible()
++{
++	IShapeComponentEdit* pEdit = ResolveShapeEdit();
++	return pEdit != nullptr && m_selectedPoint >= 0 && m_selectedPoint < pEdit->GetPointCount();
++}
++
++void CShapeEditTool::OnManipulatorBeginDrag(IDisplayViewport* pView, ITransformManipulator*, const Vec2i&, int flags)
++{
++	if (GetIEditor()->GetLevelEditorSharedState()->GetEditMode() != CLevelEditorSharedState::EditMode::Move)
++		return;
++
++	IShapeComponentEdit* pEdit = ResolveShapeEdit();
++	if (pEdit == nullptr || m_selectedPoint < 0 || m_selectedPoint >= pEdit->GetPointCount())
++		return;
++
++	m_pointWorldPosAtDragStart = GetPointWorldPos(m_selectedPoint);
++
++	Matrix34 constructionMatrix(IDENTITY);
++	constructionMatrix.SetTranslation(m_pointWorldPosAtDragStart);
++	if (pView != nullptr)
++		pView->SetConstructionMatrix(constructionMatrix);
++
++	BeginGesture();
++	pEdit->BeginEdit();
++}
++
++void CShapeEditTool::OnManipulatorDrag(IDisplayViewport*, ITransformManipulator*, const SDragData& dragData)
++{
++	if (!m_gestureOpen)
++		return;
++
++	IShapeComponentEdit* pEdit = ResolveShapeEdit();
++	if (pEdit == nullptr || m_selectedPoint < 0 || m_selectedPoint >= pEdit->GetPointCount())
++		return;
++
++	Matrix34 invShapeTM = GetShapeWorldTM();
++	invShapeTM.Invert();
++
++	pEdit->SetPoint(m_selectedPoint, invShapeTM.TransformPoint(m_pointWorldPosAtDragStart + dragData.accumulateDelta));
++}
++
++void CShapeEditTool::OnManipulatorEndDrag(IDisplayViewport*, ITransformManipulator*)
++{
++	if (!m_gestureOpen)
++		return;
++
++	if (IShapeComponentEdit* pEdit = ResolveShapeEdit())
++	{
++		pEdit->EndEdit();
++	}
++
++	EndGesture(true);
++}
++
++void CShapeEditTool::BeginGesture()
++{
++	if (m_gestureOpen)
++		return;
++
++	CBaseObject* pObject = ResolveObject();
++	if (pObject == nullptr)
++		return;
++
++	IUndoManager* pUndoManager = GetIEditor()->GetIUndoManager();
++	if (pUndoManager == nullptr)
++		return;
++
++	pUndoManager->Begin();
++	if (pUndoManager->IsUndoRecording())
++	{
++		// CUndoBaseObject serializes the whole entity, components included, so one snapshot per
++		// gesture is both enough and the most we can afford (research/06 section 5.1).
++		pObject->StoreUndo("Edit Shape");
++	}
++
++	m_gestureOpen = true;
++}
++
++void CShapeEditTool::EndGesture(bool bChanged)
++{
++	if (!m_gestureOpen)
++		return;
++
++	m_gestureOpen = false;
++
++	if (bChanged)
++	{
++		SyncEditedComponent();
++	}
++
++	IUndoManager* pUndoManager = GetIEditor()->GetIUndoManager();
++	if (pUndoManager != nullptr && pUndoManager->IsUndoRecording())
++	{
++		if (bChanged)
++			pUndoManager->Accept("Edit Shape");
++		else
++			pUndoManager->Cancel();
++	}
++
++	if (m_pManipulator != nullptr)
++	{
++		m_pManipulator->Invalidate();
++	}
++}
++
++void CShapeEditTool::SyncEditedComponent()
++{
++	IEntityComponent* pComponent = ResolveComponent();
++	if (pComponent == nullptr)
++		return;
++
++	// The editor's save snapshot for a Schematyc entity is taken during the inspector's input pass
++	// (EntityObject.cpp, CreateComponentWidget). A viewport tool writes outside that pass, so the
++	// snapshot has to be refreshed by hand or the edit is lost on save, on undo and on game mode.
++	// A legitimate no-op for an entity without a Schematyc object: the level then writes the live
++	// component.
++	if (IEntity* pEntity = pComponent->GetEntity())
++	{
++		if (Schematyc::IObject* pSchematycObject = pEntity->GetSchematycObject())
++		{
++			if (Schematyc::IObjectPropertiesPtr pProperties = pSchematycObject->GetObjectProperties())
++			{
++				if (Schematyc::CClassProperties* pClassProperties = pProperties->GetComponentProperties(pComponent->GetGUID()))
++				{
++					pClassProperties->SetOverridePolicy(Schematyc::EOverridePolicy::Override);
++					pClassProperties->Read(pComponent->GetClassDesc(), pComponent);
++				}
++			}
++		}
++	}
++
++	SEntityEvent event(ENTITY_EVENT_COMPONENT_PROPERTY_CHANGED);
++	pComponent->SendEvent(event);
++
++	if (CBaseObject* pObject = ResolveObject())
++	{
++		pObject->SetModified(false, false);
++		pObject->UpdatePrefab();
++	}
++}
+diff --git a/Code/Sandbox/Plugins/AreaComponentsEditor/Tools/ShapeEditTool.h b/Code/Sandbox/Plugins/AreaComponentsEditor/Tools/ShapeEditTool.h
+index 68469b06..90e44921 100644
+--- a/Code/Sandbox/Plugins/AreaComponentsEditor/Tools/ShapeEditTool.h
++++ b/Code/Sandbox/Plugins/AreaComponentsEditor/Tools/ShapeEditTool.h
+@@ -2,22 +2,85 @@
+ #pragma once
+ 
+ #include <LevelEditor/Tools/EditTool.h>
++#include <Gizmos/ITransformManipulator.h>
+ 
+-//! Stage 0 stub of the point-editing tool (decision 02 section 2). It registers itself as
+-//! "EditTool.AreaShapeEdit" so the class factory can hand it to SetEditTool, and does nothing
+-//! else yet. Stage 1 fills it in: handles, hover, drag with one CUndo per gesture, insert /
+-//! delete, snapping, all driven through Cry::AreaComponents::IShapeComponentEdit - never through
+-//! a concrete shape class, so one tool serves Box / Sphere / Polygon / Spline.
+-class CShapeEditTool : public CEditTool
++#include <CryExtension/CryGUID.h>
++
++class CBaseObject;
++struct IEntityComponent;
++
++namespace Cry
++{
++namespace AreaComponents
++{
++struct IShapeComponent;
++struct IShapeComponentEdit;
++}
++}
++
++//! The point-editing tool of the Area shape components (decision 02 section 2), registered as
++//! "EditTool.AreaShapeEdit" - the name IEditorShapeComponent::GetEditToolClassName() returns, so
++//! the "Edit Shape" row of the component inspector starts exactly this tool.
++//!
++//! It is written against Cry::AreaComponents::IShapeComponentEdit alone and never against a
++//! concrete shape class, so the same tool serves Box today and Sphere / Polygon / Spline later. It
++//! holds no pointer across a frame: object and component are re-resolved from their GUIDs on every
++//! use (MEMORY.md, fix bde12cd8), which is also what makes it survive an undo that re-creates the
++//! entity underneath it.
++class CShapeEditTool : public CEditTool, public ITransformManipulatorOwner
+ {
+ 	DECLARE_DYNCREATE(CShapeEditTool)
+ 
+ public:
+-	CShapeEditTool() = default;
++	CShapeEditTool();
+ 
++	// CEditTool
+ 	virtual string GetDisplayName() const override { return "Edit Shape"; }
++	virtual void   SetUserData(const char* key, void* userData) override;
++	virtual void   Display(SDisplayContext& dc) override;
+ 	virtual bool   MouseCallback(CViewport* pView, EMouseEvent event, CPoint& point, int flags) override;
++	virtual bool   OnKeyDown(CViewport* pView, uint32 nChar, uint32 nRepCnt, uint32 nFlags) override;
++	virtual bool   IsNeedMoveTool() override                 { return true; }
++	virtual bool   IsNeedToSkipPivotBoxForObjects() override  { return true; }
++	// ~CEditTool
++
++	// ITransformManipulatorOwner
++	virtual bool GetManipulatorMatrix(Matrix34& tm) override;
++	virtual void GetManipulatorPosition(Vec3& position) override;
++	virtual bool IsManipulatorVisible() override;
++	// ~ITransformManipulatorOwner
+ 
+ protected:
++	virtual ~CShapeEditTool();
+ 	virtual void DeleteThis() override { delete this; }
++
++private:
++	void OnManipulatorBeginDrag(IDisplayViewport* pView, ITransformManipulator*, const Vec2i&, int flags);
++	void OnManipulatorDrag(IDisplayViewport* pView, ITransformManipulator*, const SDragData& dragData);
++	void OnManipulatorEndDrag(IDisplayViewport* pView, ITransformManipulator*);
++
++	CBaseObject*                             ResolveObject() const;
++	IEntityComponent*                        ResolveComponent() const;
++	Cry::AreaComponents::IShapeComponent*     ResolveShape() const;
++	Cry::AreaComponents::IShapeComponentEdit* ResolveShapeEdit() const;
++
++	//! World transform of the shape's local space, identity when the shape cannot be resolved.
++	Matrix34 GetShapeWorldTM() const;
++	//! World position of an editable point, ZERO when out of range.
++	Vec3     GetPointWorldPos(int index) const;
++
++	void     BeginGesture();
++	void     EndGesture(bool bChanged);
++	//! The sandwich a viewport edit has to repeat by hand, because it happens outside the
++	//! inspector's serialization pass (research/06 section 5.3).
++	void     SyncEditedComponent();
++
++	CryGUID                m_objectGuid = CryGUID::Null();
++	CryGUID                m_componentGuid = CryGUID::Null();
++
++	int                    m_selectedPoint = -1;
++	bool                   m_gestureOpen = false;
++	Vec3                   m_pointWorldPosAtDragStart = ZERO;
++
++	ITransformManipulator* m_pManipulator = nullptr;
+ };
+-- 
+2.47.1.windows.1
+

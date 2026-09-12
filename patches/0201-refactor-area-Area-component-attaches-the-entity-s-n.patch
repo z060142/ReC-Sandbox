@@ -1,0 +1,937 @@
+From c7cc19a982a1383f737e4e04a414ed949e63e63f Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Sat, 12 Sep 2026 09:50:47 +0800
+Subject: [PATCH 201/209] refactor(area): Area component attaches the entity's
+ native links
+
+The Area component kept its own list of link GUIDs, with a Pick Link Target /
+Clear Links tool pair to author it. That reinvented a wheel the engine already
+turns: IEntity::GetEntityLinks() / AddEntityLink (IEntity.h:1269-1273,
+IEntityLink at :262-268) is the list Sandbox's own Link tool writes, the level
+serializes as <EntityLinks>, and CEntityLoadManager::OnBatchCreationCompleted
+(EntityLoadManager.cpp:690-711) resolves on load - and every link already
+carries BOTH an EntityId and an EntityGUID, which is the whole reason our list
+stored GUIDs.
+
+So the component no longer has a list. It has one reflected LinkName (empty
+means every link; otherwise only links with that name) and re-syncs the hidden
+area proxy's attached list to the entity's links on Initialize, LEVEL_LOADED,
+START_GAME, RESET, ENTITY_EVENT_LINK, ENTITY_EVENT_DELINK, LAYER_UNHIDE and
+IEntitySystemSink::OnSpawn. A link whose entityId is still 0 - a target in a
+layer that was not loaded - is resolved through FindEntityByGuid, the way the
+load manager resolves its own queued links, so late layers and late spawns
+still link. The host's self-attachment is never touched by the sync.
+
+Two engine details the sync has to respect: DELINK is sent while the link is
+still in the list (Entity.cpp:2992, RemoveEntityLink) but after it is unlinked
+in RemoveAllEntityLinks (:3021), so the link in nParam[0] is skipped
+explicitly; and CEntityObject::UpdateIEntityLinks (EntityObject.cpp:4394)
+removes every link and re-adds them on any edit, so the sync arrives in bursts
+and must be idempotent - it reconciles rather than appends.
+
+The inspector row is now a read-only count derived from the sync ("2 linked",
+"1 linked, 1 not loaded"); links are authored in the entity's own Links
+section. Tools/AreaLinkTools.*, Interface/IAreaFunctionComponent.h and the
+Area component's editor actions are deleted. The generic
+IEditorActionComponent mechanism stays - the shape kinds use it for
+"Edit Shape".
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ .../Interface/IAreaFunctionComponent.h        |  62 -----
+ .../AreaComponents/Module/CMakeLists.txt      |   1 -
+ .../Functions/AreaFunctionComponent.cpp       | 227 ++++++++----------
+ .../Module/Functions/AreaFunctionComponent.h  |  96 ++++----
+ .../AreaComponentsEditor/CMakeLists.txt       |   4 +-
+ .../Tools/AreaLinkTools.cpp                   | 192 ---------------
+ .../Tools/AreaLinkTools.h                     |  81 -------
+ 7 files changed, 142 insertions(+), 521 deletions(-)
+ delete mode 100644 Code/CryPlugins/AreaComponents/Interface/IAreaFunctionComponent.h
+ delete mode 100644 Code/Sandbox/Plugins/AreaComponentsEditor/Tools/AreaLinkTools.cpp
+ delete mode 100644 Code/Sandbox/Plugins/AreaComponentsEditor/Tools/AreaLinkTools.h
+
+diff --git a/Code/CryPlugins/AreaComponents/Interface/IAreaFunctionComponent.h b/Code/CryPlugins/AreaComponents/Interface/IAreaFunctionComponent.h
+deleted file mode 100644
+index 5096c70b..00000000
+--- a/Code/CryPlugins/AreaComponents/Interface/IAreaFunctionComponent.h
++++ /dev/null
+@@ -1,62 +0,0 @@
+-// Copyright 2026 ReC Sandbox. Distributed under the terms in LICENSE.md at the repository root.
+-#pragma once
+-
+-//! The editor-facing half of the Area function component (scene-notes/area/decisions/03-area-runtime.md).
+-//!
+-//! An area's "links" - the entities that receive ENTERAREA / LEAVEAREA / AREAFADE - are authored by
+-//! picking entities in the viewport, and there is no entity picker an engine component can put in
+-//! the inspector: Serialization::EntityTarget and its property row live in EditorQt
+-//! (Include/Serialization/Decorators/EntityLink.h), the same wall SEditToolButton stands behind.
+-//! So the engine component stores the GUIDs and the editor plugin owns the picking, reaching the
+-//! component through this interface.
+-//!
+-//! Like IShapeComponent it is a *reflected interface base*, and for the same reason: the lookup
+-//! from EditorQt or from a Sandbox plugin is by reflected type GUID, not by RTTI. It derives from
+-//! IEditorActionComponent (CryCommon/CryEntitySystem/IEntityComponent.h) rather than from
+-//! IEntityComponent directly, because a second IEntityComponent base would make the
+-//! entity-component base ambiguous and break the static_cast IEntity::GetAllComponents<>() does -
+-//! exactly the reasoning written down in IShapeComponent.h.
+-//!
+-//! HEAP RULE, as in IShapeComponent.h: no STL container ever crosses this interface. An engine
+-//! module allocates through CryModuleMalloc and a Sandbox editor plugin through the plain CRT
+-//! heap, so a container filled on one side and freed on the other is silent corruption. Links are
+-//! passed one CryGUID at a time.
+-//!
+-//! ABI: append-only. New virtuals go at the END and existing ones never change signature.
+-
+-#include <CryEntitySystem/IEntityComponent.h>
+-#include <CrySchematyc/Reflection/TypeDesc.h>
+-#include <CryExtension/CryGUID.h>
+-
+-namespace Cry
+-{
+-namespace AreaComponents
+-{
+-
+-struct IAreaFunctionComponent : public IEditorActionComponent
+-{
+-	static void ReflectType(Schematyc::CTypeDesc<IAreaFunctionComponent>& desc)
+-	{
+-		desc.SetGUID("{B4E27C09-8A16-4D53-9C70-1F5D3E8A4602}"_cry_guid);
+-		desc.SetLabel("Area");
+-	}
+-
+-	//! How many link targets are authored on this area. Unresolved GUIDs count too - a link to an
+-	//! entity in a layer that is not loaded yet is still a link.
+-	virtual int     GetLinkCount() const = 0;
+-
+-	//! The entity GUID of link `index`, or a null GUID when the index is out of range. This is the
+-	//! editor object's GUID (CBaseObject::GetId(), which becomes SEntitySpawnParams::guid), the
+-	//! same identity the legacy <Area><Entities><Entity GUID=.../> node stores.
+-	virtual CryGUID GetLink(int index) const = 0;
+-
+-	//! Append a link target. Returns false when the GUID is null or already linked, so the caller
+-	//! can tell "nothing changed" from "added" and skip an empty undo step.
+-	virtual bool    AddLinkTarget(const CryGUID& entityGuid) = 0;
+-
+-	//! Drop every link. Returns false when there was nothing to drop.
+-	virtual bool    ClearLinks() = 0;
+-};
+-
+-} // namespace AreaComponents
+-} // namespace Cry
+diff --git a/Code/CryPlugins/AreaComponents/Module/CMakeLists.txt b/Code/CryPlugins/AreaComponents/Module/CMakeLists.txt
+index a9f1b251..73fe5500 100644
+--- a/Code/CryPlugins/AreaComponents/Module/CMakeLists.txt
++++ b/Code/CryPlugins/AreaComponents/Module/CMakeLists.txt
+@@ -10,7 +10,6 @@ add_sources("AreaComponents_uber_0.cpp"
+ 		"resource.h"
+ 	SOURCE_GROUP "Interface"
+ 		"../Interface/IShapeComponent.h"
+-		"../Interface/IAreaFunctionComponent.h"
+ 	SOURCE_GROUP "Shapes"
+ 		"Shapes/ShapeGeometry.h"
+ 		"Shapes/ShapeKinds.h"
+diff --git a/Code/CryPlugins/AreaComponents/Module/Functions/AreaFunctionComponent.cpp b/Code/CryPlugins/AreaComponents/Module/Functions/AreaFunctionComponent.cpp
+index 17e6776c..4763e72b 100644
+--- a/Code/CryPlugins/AreaComponents/Module/Functions/AreaFunctionComponent.cpp
++++ b/Code/CryPlugins/AreaComponents/Module/Functions/AreaFunctionComponent.cpp
+@@ -18,60 +18,37 @@ namespace AreaComponents
+ // The link list in the inspector
+ // ---------------------------------------------------------------------------
+ 
+-bool Serialize(Serialization::IArchive& archive, SAreaLinks& value, const char* szName, const char* szLabel)
++bool Serialize(Serialization::IArchive& archive, SAreaLinkStatus& value, const char* szName, const char* szLabel)
+ {
+-	if (archive.isEdit())
++	if (!archive.isEdit())
+ 	{
+-		// A read-only summary, because the list is authored with the two buttons the component
+-		// declares as editor actions. Writing nothing here is deliberate: an inspector INPUT pass
+-		// must not push the display string back into the GUID list.
+-		string text;
+-
+-		if (value.guids.empty())
+-		{
+-			text = "(none - use Pick Link Target)";
+-		}
+-		else
+-		{
+-			for (const CryGUID& guid : value.guids)
+-			{
+-				const char* szEntityName = nullptr;
+-				if (gEnv->pEntitySystem != nullptr)
+-				{
+-					const EntityId id = gEnv->pEntitySystem->FindEntityByGuid(guid);
+-					if (const IEntity* pEntity = (id != INVALID_ENTITYID) ? gEnv->pEntitySystem->GetEntity(id) : nullptr)
+-					{
+-						szEntityName = pEntity->GetName();
+-					}
+-				}
+-
+-				if (!text.empty())
+-				{
+-					text += ", ";
+-				}
+-
+-				if (szEntityName != nullptr && szEntityName[0] != '\0')
+-				{
+-					text += szEntityName;
+-				}
+-				else
+-				{
+-					// Not loaded yet - a link into a layer that is not active is still a link.
+-					text += "<";
+-					text += guid.ToString().c_str();
+-					text += ">";
+-				}
+-			}
+-		}
+-
+-		// The '!' prefix is what makes the property tree render the row read-only.
+-		string readOnlyLabel = "!";
+-		readOnlyLabel += (szLabel != nullptr) ? szLabel : "Links";
+-		archive(text, szName, readOnlyLabel.c_str());
++		// Derived state: nothing to save, nothing to load, nothing to copy through the game-mode
++		// property round trip. It is recomputed on the next link sync.
+ 		return true;
+ 	}
+ 
+-	return archive(value.guids, szName, szLabel);
++	string text;
++	if (value.count == 0 && value.unresolved == 0)
++	{
++		text = "none - link entities to this one with the Link tool";
++	}
++	else if (value.unresolved == 0)
++	{
++		text.Format("%d linked", value.count);
++	}
++	else
++	{
++		text.Format("%d linked, %d not loaded", value.count, value.unresolved);
++	}
++
++	// Both strings passed to the archive are LITERALS. PropertyRow keeps the label as a bare
++	// const char* and never copies it (PropertyRow.h:352, PropertyRow::setLabel,
++	// PropertyRow.cpp:415), so a label built into a local string and handed over as .c_str() is a
++	// dangling pointer the moment this function returns: the row then renders whatever landed in
++	// that freed block, which is how an unrelated engine string ("...MergedMesh") turned up in the
++	// middle of the Area component's rows. The '!' prefix marks the row read-only.
++	archive(text, "linked", "!Linked");
++	return true;
+ }
+ 
+ // ---------------------------------------------------------------------------
+@@ -184,6 +161,8 @@ Cry::Entity::EventFlags CAreaFunctionComponent::GetEventMask() const
+ 	       | ENTITY_EVENT_XFORM
+ 	       | ENTITY_EVENT_RESET
+ 	       | ENTITY_EVENT_LEVEL_LOADED
++	       | ENTITY_EVENT_LINK
++	       | ENTITY_EVENT_DELINK
+ 	       | ENTITY_EVENT_START_GAME
+ 	       | ENTITY_EVENT_LAYER_UNHIDE;
+ }
+@@ -218,21 +197,32 @@ void CAreaFunctionComponent::ProcessEvent(const SEntityEvent& event)
+ 		// component cache does not snapshot and restore it - everything has to be re-pushed.
+ 		EnsureBound();
+ 		PushVolume();
+-		ResolveLinks();
++		SyncLinks();
+ 		break;
+ 
+ 	case ENTITY_EVENT_LEVEL_LOADED:
+ 	case ENTITY_EVENT_START_GAME:
+-		// The per-entity equivalent of the instant CArea::ResolveEntityIds runs at.
++		// The per-entity equivalent of the instant CArea::ResolveEntityIds runs at, and the first
++		// moment the entity's own links have been resolved by CEntityLoadManager.
+ 		EnsureBound();
+-		ResolveLinks();
++		SyncLinks();
++		break;
++
++	case ENTITY_EVENT_LINK:
++		SyncLinks();
++		break;
++
++	case ENTITY_EVENT_DELINK:
++		// Sent while the link is still in the list (Entity.cpp, RemoveEntityLink) - but not in
++		// RemoveAllEntityLinks, which unlinks first. Skipping it explicitly is correct either way.
++		SyncLinks(reinterpret_cast<const IEntityLink*>(event.nParam[0]));
+ 		break;
+ 
+ 	case ENTITY_EVENT_LAYER_UNHIDE:
+ 		// A layer that was not active at load time has just brought its entities in. Legacy links
+ 		// never recover from this (CArea resolves once, guarded by EAreaState::EntityIdsResolved);
+ 		// ours do.
+-		ResolveLinks();
++		SyncLinks();
+ 		break;
+ 
+ 	default:
+@@ -332,7 +322,7 @@ void CAreaFunctionComponent::EnsureBound()
+ 		m_bBoundToShape = true;
+ 
+ 		PushVolume();
+-		ResolveLinks();
++		SyncLinks();
+ 	}
+ 
+ 	if (!m_bRegisteredWithSpawnSink)
+@@ -525,76 +515,66 @@ void CAreaFunctionComponent::AttachSelf()
+ // Links
+ // ---------------------------------------------------------------------------
+ 
+-int CAreaFunctionComponent::GetLinkCount() const
+-{
+-	return static_cast<int>(m_links.guids.size());
+-}
+-
+-CryGUID CAreaFunctionComponent::GetLink(int index) const
+-{
+-	if (index < 0 || index >= static_cast<int>(m_links.guids.size()))
+-		return CryGUID::Null();
+-
+-	return m_links.guids[index];
+-}
+-
+-bool CAreaFunctionComponent::AddLinkTarget(const CryGUID& entityGuid)
+-{
+-	if (entityGuid.IsNull())
+-		return false;
+-
+-	if (std::find(m_links.guids.begin(), m_links.guids.end(), entityGuid) != m_links.guids.end())
+-		return false;
+-
+-	m_links.guids.push_back(entityGuid);
+-	ResolveLinks();
+-	return true;
+-}
+-
+-bool CAreaFunctionComponent::ClearLinks()
+-{
+-	if (m_links.guids.empty())
+-		return false;
+-
+-	m_links.guids.clear();
+-	ResolveLinks();
+-	return true;
+-}
+-
+ bool CAreaFunctionComponent::HasUnresolvedLinks() const
+ {
+ 	return m_unresolvedLinkCount > 0;
+ }
+ 
+-void CAreaFunctionComponent::ResolveLinks()
++void CAreaFunctionComponent::SyncLinks(const IEntityLink* pIgnoredLink)
+ {
++	IEntity*              pEntity = GetEntity();
+ 	IEntityAreaComponent* pArea = FindAreaProxy();
+-	if (pArea == nullptr || gEnv->pEntitySystem == nullptr)
++	if (pEntity == nullptr || pArea == nullptr)
+ 		return;
+ 
++	// The link list is the ENTITY's, authored with Sandbox's own Link tool and serialized by
++	// EditorQt (CEntityObject::UpdateIEntityLinks -> IEntity::AddEntityLink, and the <EntityLinks>
++	// node the level writes). This component keeps no list of its own: that is the wheel the
++	// engine already turns, and it is the same list every other consumer of entity links reads.
++	const char* const szWantedName = m_linkName.c_str();
++	const bool        bEveryLink = (szWantedName == nullptr || szWantedName[0] == '\0');
++
+ 	std::vector<EntityId> wanted;
+-	wanted.reserve(m_links.guids.size());
++	int                   unresolvedCount = 0;
+ 
+-	int unresolvedCount = 0;
+-	for (const CryGUID& guid : m_links.guids)
++	for (const IEntityLink* pLink = pEntity->GetEntityLinks(); pLink != nullptr; pLink = pLink->next)
+ 	{
+-		const EntityId id = gEnv->pEntitySystem->FindEntityByGuid(guid);
+-		if (id != INVALID_ENTITYID)
++		if (pLink == pIgnoredLink)
++			continue; // about to be deleted - see the note on the declaration
++
++		if (!bEveryLink && strcmp(pLink->name.c_str(), szWantedName) != 0)
++			continue;
++
++		EntityId id = pLink->entityId;
++
++		// A link written by the editor always carries both halves, but the id half is only filled
++		// in once the target exists: a link into a layer that was not loaded arrives with 0 and
++		// has to be resolved from the GUID, the way CEntityLoadManager resolves its own queued
++		// links (EntityLoadManager.cpp, OnBatchCreationCompleted).
++		if (id == INVALID_ENTITYID && !pLink->entityGuid.IsNull() && gEnv->pEntitySystem != nullptr)
+ 		{
+-			if (!stl::find(wanted, id))
+-			{
+-				wanted.push_back(id);
+-			}
++			id = gEnv->pEntitySystem->FindEntityByGuid(pLink->entityGuid);
+ 		}
+-		else
++
++		if (id == INVALID_ENTITYID)
+ 		{
+ 			++unresolvedCount;
++			continue;
++		}
++
++		if (id == pEntity->GetId())
++			continue; // the host is attached by AttachSelf(), and must not be detached with a link
++
++		if (!stl::find(wanted, id))
++		{
++			wanted.push_back(id);
+ 		}
+ 	}
+ 
+ 	// Detach what is no longer linked, attach what is new. Never twice: AddEntity de-duplicates
+ 	// inside CArea as well, but doing it here keeps the ATTACH_THIS events down to the real
+-	// changes.
++	// changes - and the editor re-pushes the WHOLE link list on every edit
++	// (CEntityObject::UpdateIEntityLinks removes all and re-adds), so this runs in bursts.
+ 	for (const EntityId id : m_resolvedLinks)
+ 	{
+ 		if (!stl::find(wanted, id))
+@@ -613,6 +593,9 @@ void CAreaFunctionComponent::ResolveLinks()
+ 
+ 	m_resolvedLinks = wanted;
+ 	m_unresolvedLinkCount = unresolvedCount;
++
++	m_linkStatus.count = static_cast<int>(wanted.size());
++	m_linkStatus.unresolved = unresolvedCount;
+ }
+ 
+ void CAreaFunctionComponent::OnEntitySpawned(EntityId spawnedId, const CryGUID& spawnedGuid)
+@@ -620,38 +603,18 @@ void CAreaFunctionComponent::OnEntitySpawned(EntityId spawnedId, const CryGUID&
+ 	if (m_unresolvedLinkCount <= 0 || spawnedId == INVALID_ENTITYID || spawnedGuid.IsNull())
+ 		return;
+ 
+-	if (std::find(m_links.guids.begin(), m_links.guids.end(), spawnedGuid) == m_links.guids.end())
+-		return;
+-
+-	if (stl::find(m_resolvedLinks, spawnedId))
++	IEntity* pEntity = GetEntity();
++	if (pEntity == nullptr)
+ 		return;
+ 
+-	if (IEntityAreaComponent* pArea = FindAreaProxy())
++	// Only pay for a full re-sync when the entity that just appeared is actually one of ours.
++	for (const IEntityLink* pLink = pEntity->GetEntityLinks(); pLink != nullptr; pLink = pLink->next)
+ 	{
+-		pArea->AddEntity(spawnedId);
+-		m_resolvedLinks.push_back(spawnedId);
+-		--m_unresolvedLinkCount;
+-	}
+-}
+-
+-// ---------------------------------------------------------------------------
+-// Editor actions
+-// ---------------------------------------------------------------------------
+-
+-bool CAreaFunctionComponent::GetEditorAction(int index, SEditorActionDesc& out) const
+-{
+-	switch (index)
+-	{
+-	case 0:
+-		out.szToolClassName = "EditTool.AreaPickLinkTarget";
+-		out.szLabel = "Pick Link Target";
+-		return true;
+-	case 1:
+-		out.szToolClassName = "EditTool.AreaClearLinks";
+-		out.szLabel = "Clear Links";
+-		return true;
+-	default:
+-		return false;
++		if (pLink->entityGuid == spawnedGuid)
++		{
++			SyncLinks();
++			return;
++		}
+ 	}
+ }
+ 
+diff --git a/Code/CryPlugins/AreaComponents/Module/Functions/AreaFunctionComponent.h b/Code/CryPlugins/AreaComponents/Module/Functions/AreaFunctionComponent.h
+index 59ca5d4a..ad31f459 100644
+--- a/Code/CryPlugins/AreaComponents/Module/Functions/AreaFunctionComponent.h
++++ b/Code/CryPlugins/AreaComponents/Module/Functions/AreaFunctionComponent.h
+@@ -2,10 +2,10 @@
+ #pragma once
+ 
+ #include "../../Interface/IShapeComponent.h"
+-#include "../../Interface/IAreaFunctionComponent.h"
+ 
+ #include <CrySchematyc/MathTypes.h>
+ #include <CrySchematyc/Reflection/TypeDesc.h>
++#include <CrySchematyc/Utils/SharedString.h>
+ #include <CrySchematyc/Env/IEnvRegistrar.h>
+ #include <CrySerialization/IArchive.h>
+ 
+@@ -16,34 +16,36 @@ namespace Cry
+ namespace AreaComponents
+ {
+ 
+-//! The authored link list: the entities that receive the six area events. A reflected std::vector
+-//! needs a wrapper with its own GUID, an operator== (the inspector and the game-mode property
+-//! round trip compare whole members) and a free Serialize - the SShapesArray pattern of
+-//! CAINavigationMarkupShapeComponent, and the same one SPolygonPoints uses.
++//! How many of the entity's links this area is currently attached to. DERIVED state, not authored:
++//! the component recomputes it whenever it re-syncs, and it exists only so that the inspector can
++//! show "how many entities will get this area's events" without the user having to count the rows
++//! in the entity's own Links section.
+ //!
+-//! GUIDs, not EntityIds: an EntityId is not stable across a save, and the GUID is exactly what the
+-//! legacy <Area><Entities><Entity GUID=.../> node stores, so the two are directly comparable.
+-//! No raw pointers live in here - MEMORY.md, fix bde12cd8: reflected values are copied into
+-//! scratchpads by CClassProperties::Read/Apply and outlive the component.
+-struct SAreaLinks
++//! It is therefore written in EDIT mode only and never saved - a save or a property round trip
++//! writes nothing here and recomputes it on the next sync instead.
++struct SAreaLinkStatus
+ {
+-	static void ReflectType(Schematyc::CTypeDesc<SAreaLinks>& desc)
++	static void ReflectType(Schematyc::CTypeDesc<SAreaLinkStatus>& desc)
+ 	{
+ 		desc.SetGUID("{B4E27C09-8A16-4D53-9C70-1F5D3E8A4610}"_cry_guid);
+ 		desc.SetLabel("Area Links");
+ 	}
+ 
+-	bool operator==(const SAreaLinks& other) const { return guids == other.guids; }
+-	bool operator!=(const SAreaLinks& other) const { return !(*this == other); }
++	bool operator==(const SAreaLinkStatus& other) const { return count == other.count && unresolved == other.unresolved; }
++	bool operator!=(const SAreaLinkStatus& other) const { return !(*this == other); }
+ 
+-	std::vector<CryGUID> guids;
++	int count = 0;
++	int unresolved = 0;
+ };
+ 
+-//! Save and load write the GUID list; the inspector shows a read-only summary instead, because the
+-//! list is authored with the "Pick Link Target" / "Clear Links" buttons the component declares as
+-//! editor actions, not by typing GUIDs. Writing nothing in edit mode is also what keeps an
+-//! inspector input pass from clobbering the list with whatever the read-only row contained.
+-bool Serialize(Serialization::IArchive& archive, SAreaLinks& value, const char* szName, const char* szLabel);
++//! Read-only row, edit mode only.
++//!
++//! NOTE, and the reason this takes no label from the caller: PropertyRow stores the label as a bare
++//! const char* and never copies it (PropertyRow.h:352, PropertyRow::setLabel, PropertyRow.cpp:415),
++//! so a label built into a local string and passed as .c_str() is a dangling pointer the moment the
++//! function returns - it renders as intermittent garbage or as nothing at all. Every label here is
++//! a string literal.
++bool Serialize(Serialization::IArchive& archive, SAreaLinkStatus& value, const char* szName, const char* szLabel);
+ 
+ //! "Area": the semantics that used to be baked into every legacy area object - an id, a group, a
+ //! priority, a near band, an inner fade and a list of linked entities - as one function component
+@@ -64,7 +66,7 @@ bool Serialize(Serialization::IArchive& archive, SAreaLinks& value, const char*
+ //! is in some area's attached list. The self-move trap that comes with it is fixed in the engine -
+ //! see the IsSelfHostedArea guard in EntityAudioProxy.cpp and DefaultComponents/Audio/AreaComponent.cpp.
+ class CAreaFunctionComponent final
+-	: public IAreaFunctionComponent
++	: public IEntityComponent
+ 	, public IShapeListener
+ {
+ public:
+@@ -89,40 +91,27 @@ public:
+ 		// kind may carry it. The shape it binds to is found by rule, not declared here.
+ 		desc.SetComponentFlags({ IEntityComponent::EFlags::Singleton });
+ 
+-		// The reflected interface bases - what makes a cross-DLL GetComponent<IAreaFunctionComponent>()
+-		// and EditorQt's inspector-action lookup find us (IAreaFunctionComponent.h).
+-		desc.AddBase<IAreaFunctionComponent>();
+-		desc.AddBase<IEditorActionComponent>();
+-
+ 		desc.AddMember(&CAreaFunctionComponent::m_areaId, 'arid', "AreaId", "Area Id", "Id handed to the linked entities with every area event", 0);
+ 		desc.AddMember(&CAreaFunctionComponent::m_group, 'grup', "Group", "Group", "Areas sharing a group are exclusive: an entity is only ever in the innermost one. -1 means no group.", -1);
+ 		desc.AddMember(&CAreaFunctionComponent::m_priority, 'prio', "Priority", "Priority", "Which area of the same group wins where they overlap. Higher wins.", 0);
+ 		desc.AddMember(&CAreaFunctionComponent::m_fadeDistance, 'fade', "FadeDistance", "Fade Distance", "Width in metres of the near band outside the shape, in which entities get near/fade events. 0 disables it.", 0.0f);
+ 		desc.AddMember(&CAreaFunctionComponent::m_innerFadeDistance, 'ifad', "InnerFadeDistance", "Inner Fade Distance", "Width in metres inside the shape over which a lower-priority area of the same group fades out.", 0.0f);
+-		desc.AddMember(&CAreaFunctionComponent::m_links, 'lnks', "Links", "Links", "Entities that receive this area's events. Authored with the Pick Link Target button.", SAreaLinks());
++		desc.AddMember(&CAreaFunctionComponent::m_linkName, 'lnkn', "LinkName", "Link Name",
++		               "Which of the entity's links this area sends its events to. Empty means every link. "
++		               "Link entities with Sandbox's own Link tool - this component does not keep a list of its own.", "");
++		desc.AddMember(&CAreaFunctionComponent::m_linkStatus, 'lnks', "Links", "Links", "How many linked entities this area is currently attached to", SAreaLinkStatus());
+ 	}
+ 
+-	// IAreaFunctionComponent
+-	virtual int     GetLinkCount() const override;
+-	virtual CryGUID GetLink(int index) const override;
+-	virtual bool    AddLinkTarget(const CryGUID& entityGuid) override;
+-	virtual bool    ClearLinks() override;
+-	// ~IAreaFunctionComponent
+-
+-	// IEditorActionComponent
+-	virtual int  GetEditorActionCount() const override { return 2; }
+-	virtual bool GetEditorAction(int index, SEditorActionDesc& out) const override;
+-	// ~IEditorActionComponent
+-
+ 	// IShapeListener
+ 	virtual void OnShapeChanged(IShapeComponent& shape, EShapeChangeReason reason) override;
+ 	// ~IShapeListener
+ 
+-	//! Called by the module-wide spawn sink when an entity appears after this area resolved its
+-	//! links, so that a link to it still takes effect. Public because the sink is not a member.
++	//! Called by the module-wide spawn sink when an entity appears after this area synced its
++	//! links, so that a link whose target was not loaded yet still takes effect. Public because the
++	//! sink is not a member.
+ 	void OnEntitySpawned(EntityId spawnedId, const CryGUID& spawnedGuid);
+-	//! Whether this area still has link GUIDs that resolved to nothing - the spawn sink only has
+-	//! to visit areas that answer true.
++	//! Whether some link of ours still points at an entity that does not exist yet - the spawn sink
++	//! only has to visit areas that answer true.
+ 	bool HasUnresolvedLinks() const;
+ 
+ protected:
+@@ -157,9 +146,13 @@ private:
+ 	//! Push id / group / priority / fade / inner fade.
+ 	void PushAreaProperties();
+ 
+-	//! Resolve every link GUID to an EntityId and reconcile the proxy's attached list with it.
+-	//! Idempotent: an entity that is already attached is never attached twice.
+-	void ResolveLinks();
++	//! Reconcile the proxy's attached list with the ENTITY's own links (IEntity::GetEntityLinks),
++	//! filtered by LinkName. Idempotent: an entity that is already attached is never attached
++	//! twice, and one that is no longer linked is detached. `pIgnoredLink` is the link that is
++	//! about to be deleted when this runs from ENTITY_EVENT_DELINK - that event is sent while the
++	//! link is still in the list (Entity.cpp, RemoveEntityLink), but not in RemoveAllEntityLinks,
++	//! so it has to be skipped explicitly rather than assumed absent.
++	void SyncLinks(const IEntityLink* pIgnoredLink = nullptr);
+ 	//! Attach this entity to its own area, so that sibling function components (the stock audio
+ 	//! Environment and Area components) receive the area's events.
+ 	void AttachSelf();
+@@ -170,9 +163,10 @@ private:
+ 	int        m_areaId = 0;
+ 	int        m_group = -1;
+ 	int        m_priority = 0;
+-	float      m_fadeDistance = 0.0f;
+-	float      m_innerFadeDistance = 0.0f;
+-	SAreaLinks m_links;
++	float           m_fadeDistance = 0.0f;
++	float           m_innerFadeDistance = 0.0f;
++	Schematyc::CSharedString m_linkName;
++	SAreaLinkStatus m_linkStatus;
+ 
+ 	// --- runtime state, never reflected ---
+ 
+@@ -185,10 +179,10 @@ private:
+ 	bool    m_bPushing = false;
+ 	//! True while we are registered as a listener of this entity's shape.
+ 	bool    m_bBoundToShape = false;
+-	//! The entity ids currently attached to the area because of m_links (self-attachment is not
+-	//! in here). Runtime only: ids, never pointers.
++	//! The entity ids currently attached to the area because of the entity's links
++	//! (self-attachment is not in here). Runtime only: ids, never pointers.
+ 	std::vector<EntityId> m_resolvedLinks;
+-	//! How many link GUIDs did not resolve at the last attempt.
++	//! How many links pointed at an entity that did not exist at the last sync.
+ 	int     m_unresolvedLinkCount = 0;
+ 	//! True once this component has been registered with the module-wide spawn sink.
+ 	bool    m_bRegisteredWithSpawnSink = false;
+diff --git a/Code/Sandbox/Plugins/AreaComponentsEditor/CMakeLists.txt b/Code/Sandbox/Plugins/AreaComponentsEditor/CMakeLists.txt
+index 7afdf7c0..e17e98ef 100644
+--- a/Code/Sandbox/Plugins/AreaComponentsEditor/CMakeLists.txt
++++ b/Code/Sandbox/Plugins/AreaComponentsEditor/CMakeLists.txt
+@@ -8,8 +8,6 @@ add_sources("NoUberFile"
+ 		"StdAfx.h"
+ 		"StdAfx.cpp"
+ 	SOURCE_GROUP "Tools"
+-		"Tools/AreaLinkTools.h"
+-		"Tools/AreaLinkTools.cpp"
+ 		"Tools/ShapeToolCommon.h"
+ 		"Tools/ShapeToolCommon.cpp"
+ 		"Tools/ShapeEditTool.h"
+@@ -18,6 +16,8 @@ add_sources("NoUberFile"
+ 		"Tools/ShapeCreateTool.cpp"
+ 		"Tools/ShapeDragCreateTool.h"
+ 		"Tools/ShapeDragCreateTool.cpp"
++		"Tools/SplineCreateTool.h"
++		"Tools/SplineCreateTool.cpp"
+ 	SOURCE_GROUP "Objects"
+ 		"Objects/AreaShapeObjectClassDescs.cpp"
+ )
+diff --git a/Code/Sandbox/Plugins/AreaComponentsEditor/Tools/AreaLinkTools.cpp b/Code/Sandbox/Plugins/AreaComponentsEditor/Tools/AreaLinkTools.cpp
+deleted file mode 100644
+index 52340a5b..00000000
+--- a/Code/Sandbox/Plugins/AreaComponentsEditor/Tools/AreaLinkTools.cpp
++++ /dev/null
+@@ -1,192 +0,0 @@
+-// Copyright 2026 ReC Sandbox. Distributed under the terms in LICENSE.md at the repository root.
+-#include "StdAfx.h"
+-#include "AreaLinkTools.h"
+-#include "ShapeToolCommon.h"
+-
+-#include <IEditor.h>
+-#include <IEditorClassFactory.h>
+-#include <IObjectManager.h>
+-#include <IUndoManager.h>
+-#include <LevelEditor/LevelEditorSharedState.h>
+-#include <Objects/BaseObject.h>
+-
+-#include <CryEntitySystem/IEntity.h>
+-#include <CrySchematyc/Reflection/TypeDesc.h>
+-
+-#include <IAreaFunctionComponent.h>
+-
+-using Cry::AreaComponents::IAreaFunctionComponent;
+-
+-namespace
+-{
+-
+-//! The Area function component of an editor object, resolved from the two GUIDs the inspector
+-//! button handed over. The reflected base list is the cross-DLL proof that the component really
+-//! implements the interface, exactly as AreaShapeTools::AsShape does for a shape.
+-IAreaFunctionComponent* ResolveAreaComponent(const CryGUID& objectGuid, const CryGUID& componentGuid, CBaseObject** ppObjectOut)
+-{
+-	if (ppObjectOut != nullptr)
+-	{
+-		*ppObjectOut = nullptr;
+-	}
+-
+-	CBaseObject* pObject = AreaShapeTools::FindObject(objectGuid);
+-	if (pObject == nullptr || componentGuid == CryGUID::Null())
+-		return nullptr;
+-
+-	IEntity* pEntity = pObject->GetIEntity();
+-	if (pEntity == nullptr)
+-		return nullptr;
+-
+-	IEntityComponent* pComponent = pEntity->GetComponentByGUID(componentGuid);
+-	if (pComponent == nullptr)
+-		return nullptr;
+-
+-	if (pComponent->GetClassDesc().FindBaseByTypeID(Schematyc::GetTypeDesc<IAreaFunctionComponent>().GetGUID()) == nullptr)
+-		return nullptr;
+-
+-	if (ppObjectOut != nullptr)
+-	{
+-		*ppObjectOut = pObject;
+-	}
+-
+-	return static_cast<IAreaFunctionComponent*>(pComponent);
+-}
+-
+-//! One undo step around one change to the link list, followed by the sync a viewport edit has to
+-//! perform by hand (research/06 section 5): the Schematyc save snapshot, the property-changed
+-//! event, the modified flag and the prefab.
+-void CommitLinkChange(CBaseObject* pObject, IEntityComponent* pComponent, const char* szUndoName)
+-{
+-	IUndoManager* pUndoManager = GetIEditor()->GetIUndoManager();
+-	if (pUndoManager != nullptr && !pUndoManager->IsUndoRecording())
+-	{
+-		pUndoManager->Begin();
+-		if (pObject != nullptr)
+-		{
+-			pObject->StoreUndo(szUndoName);
+-		}
+-		pUndoManager->Accept(szUndoName);
+-	}
+-
+-	AreaShapeTools::SyncEditedComponent(pObject, pComponent);
+-
+-	// The inspector shows the link list as a read-only row, so it has to be rebuilt to show the
+-	// change; the property tree does not poll.
+-	if (IObjectManager* pObjectManager = GetIEditor()->GetObjectManager())
+-	{
+-		pObjectManager->EmitPopulateInspectorEvent();
+-	}
+-}
+-
+-} // anonymous namespace
+-
+-// ---------------------------------------------------------------------------
+-// Pick Link Target
+-// ---------------------------------------------------------------------------
+-
+-class CAreaPickLinkTargetTool_ClassDesc : public IClassDesc
+-{
+-	virtual ESystemClassID SystemClassID() override   { return ESYSTEM_CLASS_EDITTOOL; }
+-	virtual const char*    ClassName() override       { return "EditTool.AreaPickLinkTarget"; }
+-	virtual const char*    Category() override        { return "Area"; }
+-	virtual CRuntimeClass* GetRuntimeClass() override { return RUNTIME_CLASS(CAreaPickLinkTargetTool); }
+-};
+-
+-REGISTER_CLASS_DESC(CAreaPickLinkTargetTool_ClassDesc);
+-
+-IMPLEMENT_DYNCREATE(CAreaPickLinkTargetTool, CPickObjectTool);
+-
+-CAreaPickLinkTargetTool::CAreaPickLinkTargetTool()
+-	: CPickObjectTool(this)
+-{
+-	// One pick, one link. Holding the mode open would need a way to end it that the inspector
+-	// button does not offer.
+-	SetMultiplePicks(false);
+-}
+-
+-CAreaPickLinkTargetTool::~CAreaPickLinkTargetTool()
+-{
+-}
+-
+-void CAreaPickLinkTargetTool::SetUserData(const char* key, void* userData)
+-{
+-	if (userData == nullptr || key == nullptr || strcmp(key, SEntityComponentEditToolTarget::GetUserDataKey()) != 0)
+-		return;
+-
+-	const SEntityComponentEditToolTarget* pTarget = static_cast<const SEntityComponentEditToolTarget*>(userData);
+-	m_objectGuid = pTarget->objectGuid;
+-	m_componentGuid = pTarget->componentGuid;
+-
+-	// Refuse a payload that does not resolve, instead of discovering it one virtual call later.
+-	if (ResolveAreaComponent(m_objectGuid, m_componentGuid, nullptr) == nullptr)
+-	{
+-		CryWarning(VALIDATOR_MODULE_EDITOR, VALIDATOR_WARNING,
+-		           "Pick Link Target: the Area component this button belongs to could not be resolved - the tool does nothing.");
+-		m_objectGuid = CryGUID::Null();
+-		m_componentGuid = CryGUID::Null();
+-	}
+-}
+-
+-bool CAreaPickLinkTargetTool::OnPickFilter(CBaseObject* pFilterObject)
+-{
+-	// Anything but the area itself: an area that links to its own entity is what AttachSelf()
+-	// already does, and doing it twice through the link list would make removing the link detach
+-	// the host from its own area.
+-	return pFilterObject != nullptr && pFilterObject->GetId() != m_objectGuid;
+-}
+-
+-void CAreaPickLinkTargetTool::OnPick(CBaseObject* pPicked)
+-{
+-	if (pPicked == nullptr)
+-		return;
+-
+-	CBaseObject*            pObject = nullptr;
+-	IAreaFunctionComponent* pArea = ResolveAreaComponent(m_objectGuid, m_componentGuid, &pObject);
+-	if (pArea == nullptr)
+-		return;
+-
+-	// The editor object's GUID is the entity's GUID (CEntityObject::CreateGameObject sets
+-	// SEntitySpawnParams::guid from GetId()), which is the identity the component resolves with
+-	// IEntitySystem::FindEntityByGuid - and the identity the legacy <Area> node stores.
+-	if (!pArea->AddLinkTarget(pPicked->GetId()))
+-		return;
+-
+-	CommitLinkChange(pObject, static_cast<IEntityComponent*>(pArea), "Add Area Link");
+-}
+-
+-// ---------------------------------------------------------------------------
+-// Clear Links
+-// ---------------------------------------------------------------------------
+-
+-class CAreaClearLinksTool_ClassDesc : public IClassDesc
+-{
+-	virtual ESystemClassID SystemClassID() override   { return ESYSTEM_CLASS_EDITTOOL; }
+-	virtual const char*    ClassName() override       { return "EditTool.AreaClearLinks"; }
+-	virtual const char*    Category() override        { return "Area"; }
+-	virtual CRuntimeClass* GetRuntimeClass() override { return RUNTIME_CLASS(CAreaClearLinksTool); }
+-};
+-
+-REGISTER_CLASS_DESC(CAreaClearLinksTool_ClassDesc);
+-
+-IMPLEMENT_DYNCREATE(CAreaClearLinksTool, CEditTool);
+-
+-void CAreaClearLinksTool::SetUserData(const char* key, void* userData)
+-{
+-	if (userData == nullptr || key == nullptr || strcmp(key, SEntityComponentEditToolTarget::GetUserDataKey()) != 0)
+-		return;
+-
+-	const SEntityComponentEditToolTarget* pTarget = static_cast<const SEntityComponentEditToolTarget*>(userData);
+-
+-	CBaseObject*            pObject = nullptr;
+-	IAreaFunctionComponent* pArea = ResolveAreaComponent(pTarget->objectGuid, pTarget->componentGuid, &pObject);
+-
+-	if (pArea != nullptr && pArea->ClearLinks())
+-	{
+-		CommitLinkChange(pObject, static_cast<IEntityComponent*>(pArea), "Clear Area Links");
+-	}
+-
+-	// This is an action, not a mode: leave immediately. SetEditTool(nullptr) destroys this tool,
+-	// so it has to be the last statement (the pattern CShapeCreateTool::FinishCreation uses).
+-	GetIEditor()->GetLevelEditorSharedState()->SetEditTool(nullptr);
+-}
+diff --git a/Code/Sandbox/Plugins/AreaComponentsEditor/Tools/AreaLinkTools.h b/Code/Sandbox/Plugins/AreaComponentsEditor/Tools/AreaLinkTools.h
+deleted file mode 100644
+index bf13fd22..00000000
+--- a/Code/Sandbox/Plugins/AreaComponentsEditor/Tools/AreaLinkTools.h
++++ /dev/null
+@@ -1,81 +0,0 @@
+-// Copyright 2026 ReC Sandbox. Distributed under the terms in LICENSE.md at the repository root.
+-#pragma once
+-
+-#include <LevelEditor/Tools/EditTool.h>
+-#include <LevelEditor/Tools/PickObjectTool.h>
+-#include <LevelEditor/LevelEditorSharedState.h>
+-
+-#include <CryExtension/CryGUID.h>
+-
+-//! The editor half of the Area function component's link list (decision 03).
+-//!
+-//! An area's links are the entities that receive its enter/leave/fade events, and they are
+-//! authored by pointing at an entity in the viewport - there is no inspector entity picker an
+-//! engine component can use, because Serialization::EntityTarget and its property row live in
+-//! EditorQt. The component therefore stores GUIDs and declares two editor ACTIONS
+-//! (IEditorActionComponent, CryCommon/CryEntitySystem/IEntityComponent.h); the inspector turns
+-//! each of them into a button that starts one of the tools below for that component instance,
+-//! handing it the object and component GUIDs in SEntityComponentEditToolTarget.
+-//!
+-//! Neither tool ever holds a pointer between calls: both resolve object and component from the two
+-//! GUIDs on every use (MEMORY.md, fix bde12cd8).
+-
+-//! "Pick Link Target": the standard pick-object mode, with the picked entity's GUID appended to
+-//! the area's link list. One pick, one undo step, then the tool ends - the same gesture
+-//! CShapeObject's legacy "Pick" row produces with ShapeTargetTool.
+-class CAreaPickLinkTargetTool : public CPickObjectTool, public IPickObjectCallback
+-{
+-	DECLARE_DYNCREATE(CAreaPickLinkTargetTool)
+-
+-public:
+-	CAreaPickLinkTargetTool();
+-
+-	// CEditTool
+-	virtual string GetDisplayName() const override { return "Pick Link Target"; }
+-	virtual void   SetUserData(const char* key, void* userData) override;
+-	// ~CEditTool
+-
+-	// IPickObjectCallback
+-	virtual void OnPick(CBaseObject* pPicked) override;
+-	virtual void OnCancelPick() override {}
+-	virtual bool OnPickFilter(CBaseObject* pFilterObject) override;
+-	// ~IPickObjectCallback
+-
+-protected:
+-	virtual ~CAreaPickLinkTargetTool();
+-	virtual void DeleteThis() override { delete this; }
+-
+-private:
+-	CryGUID m_objectGuid = CryGUID::Null();
+-	CryGUID m_componentGuid = CryGUID::Null();
+-};
+-
+-//! "Clear Links": not really a viewport mode at all - it clears the list, records one undo step and
+-//! immediately pops itself off the level editor.
+-//!
+-//! It is a tool rather than an ActionButton inside the reflected member's Serialize() because an
+-//! ActionButton would have to capture something that can reach the component, and the only thing
+-//! in scope there is the reflected struct itself - which must never hold a raw pointer (MEMORY.md:
+-//! reflected values are copied into scratchpads and outlive the component). Going through the
+-//! action/tool plumbing means the identity travels as two GUIDs, exactly as it does for every
+-//! other component action, and the undo and save sync are the ones every other tool here uses.
+-class CAreaClearLinksTool : public CEditTool
+-{
+-	DECLARE_DYNCREATE(CAreaClearLinksTool)
+-
+-public:
+-	CAreaClearLinksTool() = default;
+-
+-	// CEditTool
+-	virtual string GetDisplayName() const override { return "Clear Links"; }
+-	virtual void   SetUserData(const char* key, void* userData) override;
+-	virtual void   Display(SDisplayContext& dc) override {}
+-	virtual bool   MouseCallback(CViewport* pView, EMouseEvent event, CPoint& point, int flags) override { return false; }
+-	virtual bool   OnKeyDown(CViewport* pView, uint32 nChar, uint32 nRepCnt, uint32 nFlags) override     { return false; }
+-	virtual bool   IsNeedMoveTool() override { return false; }
+-	// ~CEditTool
+-
+-protected:
+-	virtual ~CAreaClearLinksTool() = default;
+-	virtual void DeleteThis() override { delete this; }
+-};
+-- 
+2.47.1.windows.1
+

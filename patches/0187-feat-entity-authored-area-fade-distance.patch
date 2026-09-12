@@ -1,0 +1,169 @@
+From 58fb63299a7f22ad9faa5bdf2723fbd63d74b0cf Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Fri, 11 Sep 2026 23:34:44 +0800
+Subject: [PATCH 187/209] feat(entity): authored area fade distance
+
+An area's near band - the ENTERNEARAREA / MOVENEARAREA band, and with it the
+area's footprint in CAreaGrid - was never a property of the area. CArea's
+three fade getters (GetFadeDistance, GetEnvironmentFadeDistance,
+GetGreatestFadeDistance) each compute the maximum over the entities LINKED to
+the area, reading IEntityAudioComponent::Get*FadeDistance() off every one of
+them. An area could therefore only have a near band if something audio-shaped
+was linked to it, which is the coupling that forces every consumer that wants
+a fade to pretend to be audio.
+
+Add an authored value beside it:
+
+- IEntityAreaComponent::SetFadeDistance / GetFadeDistance, two new virtuals
+  appended at the end of the interface (append-only, it crosses DLLs).
+- CArea::m_authoredFadeDistance, 0 by default, set through
+  CArea::SetAuthoredFadeDistance().
+- The three getters seed their maximum with it instead of with 0, i.e. they
+  now return max(authored, max-over-linked).
+
+Legacy arithmetic is unchanged: the default is 0 and max(0, x) == x, so every
+existing area computes exactly the value it computed before, and nothing in
+the tree calls the new setter yet.
+
+The setter invalidates the three cached maxima (negative means "not computed
+yet" outside the editor) and calls SetAreaDirty(), so a fade authored after
+the grid was built re-registers the area with its new footprint - otherwise
+CAreaGrid::AddArea, which sizes the footprint from GetGreatestFadeDistance(),
+would keep the old one.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SCUvWGLCsqzm3VNMzp4uiS
+---
+ .../CryEntitySystem/IEntityComponent.h        | 13 +++++++
+ Code/CryEngine/CryEntitySystem/Area.cpp       | 35 +++++++++++++++++--
+ Code/CryEngine/CryEntitySystem/Area.h         |  9 +++++
+ 3 files changed, 54 insertions(+), 3 deletions(-)
+
+diff --git a/Code/CryEngine/CryCommon/CryEntitySystem/IEntityComponent.h b/Code/CryEngine/CryCommon/CryEntitySystem/IEntityComponent.h
+index 84f0b437..d7391ec4 100644
+--- a/Code/CryEngine/CryCommon/CryEntitySystem/IEntityComponent.h
++++ b/Code/CryEngine/CryCommon/CryEntitySystem/IEntityComponent.h
+@@ -915,6 +915,19 @@ struct IEntityAreaComponent : public IEntityComponent
+ 	//! points already set, or an area that is not a shape, is ignored.
+ 	//! Appended at the end of this interface on purpose - it is called across DLL boundaries.
+ 	virtual void MovePoints(Vec3 const* const pPoints, size_t const numLocalPoints) = 0;
++
++	//! An AUTHORED near band for this area, in metres, independent of anything attached to it.
++	//! Historically the near band (and with it the area's footprint in the broad-phase grid) was
++	//! the maximum fade distance over the entities LINKED to the area, read off their
++	//! IEntityAudioComponent - so an area could only have a near band if something audio-shaped
++	//! was linked to it. This setter decouples the two: the three fade getters return
++	//! max(authored, max-over-linked), and the default of 0 leaves every existing area
++	//! arithmetically unchanged.
++	//! Appended at the end of this interface on purpose - it is called across DLL boundaries.
++	virtual void SetFadeDistance(float const distance) = 0;
++
++	//! The authored near band set with SetFadeDistance(), NOT the effective one.
++	virtual float GetFadeDistance() const = 0;
+ };
+ 
+ struct IClipVolumeComponent : public IEntityComponent
+diff --git a/Code/CryEngine/CryEntitySystem/Area.cpp b/Code/CryEngine/CryEntitySystem/Area.cpp
+index 9a514014..f931847f 100644
+--- a/Code/CryEngine/CryEntitySystem/Area.cpp
++++ b/Code/CryEngine/CryEntitySystem/Area.cpp
+@@ -19,6 +19,7 @@ CArea::CArea(CAreaManager* pManager)
+ 	, m_height(0.0f)
+ 	, m_pAreaManager(pManager)
+ 	, m_proximity(5.0f)
++	, m_authoredFadeDistance(0.0f)
+ 	, m_fadeDistance(-1.0f)
+ 	, m_environmentFadeDistance(-1.0f)
+ 	, m_greatestFadeDistance(-1.0f)
+@@ -2508,6 +2509,28 @@ void CArea::ReleaseCachedAreaData()
+ 	stl::free_container(m_mapEntityCachedAreaData);
+ }
+ 
++//////////////////////////////////////////////////////////////////////////
++void CArea::SetAuthoredFadeDistance(float const distance)
++{
++	float const clamped = max(0.0f, distance);
++
++	if (clamped != m_authoredFadeDistance)
++	{
++		m_authoredFadeDistance = clamped;
++
++		// Invalidate the three cached maxima so that the next getter recomputes. Outside the
++		// editor they are computed once and cached (< 0.0f means "not computed yet"), and
++		// CAreaGrid::AddArea reads GetGreatestFadeDistance() to size this area's footprint, so
++		// without this a fade authored after the grid was built would never widen the footprint.
++		m_fadeDistance = -1.0f;
++		m_environmentFadeDistance = -1.0f;
++		m_greatestFadeDistance = -1.0f;
++
++		// And re-register the area in the grid with its new footprint.
++		m_pAreaManager->SetAreaDirty(this);
++	}
++}
++
+ //////////////////////////////////////////////////////////////////////////
+ float CArea::GetFadeDistance()
+ {
+@@ -2515,7 +2538,9 @@ float CArea::GetFadeDistance()
+ 
+ 	if (m_fadeDistance < 0.0f || gEnv->IsEditor())
+ 	{
+-		m_fadeDistance = 0.0f;
++		// The maximum starts at the AUTHORED near band instead of zero, which is the whole of
++		// max(authored, max-over-linked). Default 0 => arithmetically the legacy expression.
++		m_fadeDistance = m_authoredFadeDistance;
+ 
+ 		for (const std::pair<EntityId, EntityGUID>& identifierPair : m_entityIdentifiers)
+ 		{
+@@ -2541,7 +2566,9 @@ float CArea::GetEnvironmentFadeDistance()
+ {
+ 	if (m_environmentFadeDistance < 0.0f || gEnv->IsEditor())
+ 	{
+-		m_environmentFadeDistance = 0.0f;
++		// The maximum starts at the AUTHORED near band instead of zero, which is the whole of
++		// max(authored, max-over-linked). Default 0 => arithmetically the legacy expression.
++		m_environmentFadeDistance = m_authoredFadeDistance;
+ 
+ 		for (const std::pair<EntityId, EntityGUID>& identifierPair : m_entityIdentifiers)
+ 		{
+@@ -2569,7 +2596,9 @@ float CArea::GetGreatestFadeDistance()
+ 
+ 	if (m_greatestFadeDistance < 0.0f || gEnv->IsEditor())
+ 	{
+-		m_greatestFadeDistance = 0.0f;
++		// The maximum starts at the AUTHORED near band instead of zero, which is the whole of
++		// max(authored, max-over-linked). Default 0 => arithmetically the legacy expression.
++		m_greatestFadeDistance = m_authoredFadeDistance;
+ 
+ 		for (const std::pair<EntityId, EntityGUID>& identifierPair : m_entityIdentifiers)
+ 		{
+diff --git a/Code/CryEngine/CryEntitySystem/Area.h b/Code/CryEngine/CryEntitySystem/Area.h
+index f0ff41a7..caf08ca0 100644
+--- a/Code/CryEngine/CryEntitySystem/Area.h
++++ b/Code/CryEngine/CryEntitySystem/Area.h
+@@ -217,6 +217,13 @@ public:
+ 	void                    SetProximity(float prx) { m_proximity = prx; }
+ 	float                   GetProximity()          { return m_proximity; }
+ 
++	//! The authored near band (IEntityAreaComponent::SetFadeDistance). It is folded into the three
++	//! fade getters below with a max(), so an area can have a near band of its own without an
++	//! audio component being linked to it. Setting it invalidates the three cached maxima, which
++	//! is also what makes the change reach CAreaGrid through the next SetAreaDirty().
++	void                    SetAuthoredFadeDistance(float const distance);
++	float                   GetAuthoredFadeDistance() const { return m_authoredFadeDistance; }
++
+ 	float                   GetFadeDistance();
+ 	float                   GetEnvironmentFadeDistance();
+ 	float                   GetGreatestFadeDistance();
+@@ -338,6 +345,8 @@ private:
+ 
+ 	CAreaManager* const m_pAreaManager;
+ 	float               m_proximity;
++	//! Authored near band, 0 by default so that the max() in the three fade getters is a no-op.
++	float               m_authoredFadeDistance;
+ 	float               m_fadeDistance;
+ 	float               m_environmentFadeDistance;
+ 	float               m_greatestFadeDistance;
+-- 
+2.47.1.windows.1
+

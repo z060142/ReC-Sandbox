@@ -1,0 +1,270 @@
+From 712ac8fa7e0fa72bd13ff62759b960f0d25be2f8 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Fri, 11 Sep 2026 22:12:35 +0800
+Subject: [PATCH 179/209] fix(area): no STL container may cross the shape
+ interface - it crashed the render thread
+
+Pressing "Edit Shape" killed Sandbox reproducibly, in the render thread, with an
+access violation on 0xFFFFFFFFFFFFFFFF in no enumerated module. That is the
+signature of heap corruption, and the corruption was ours.
+
+IShapeComponent::GetContour took a std::vector<Vec3>& and filled it. The vector
+was declared by CShapeEditTool, which lives in a Sandbox editor plugin compiled
+with NOT_USE_CRY_MEMORY_MANAGER (Tools/CMake/CommonMacros.cmake, CryEditorPlugin)
+and therefore uses the plain CRT heap; the buffer inside it was allocated by
+AreaComponents.dll, an engine module whose global new/delete route to
+CryModuleMalloc, i.e. the engine allocator. Every frame the tool was up, the
+tool asked the engine to allocate a buffer and then freed it on the wrong heap.
+The render thread, being the next heavy allocator, died first.
+
+GetContour now writes into a caller-owned buffer with an explicit capacity and
+returns the point count, which is also the form a caller can use with no
+allocation at all - the tool now reads into a stack array. An inline
+GetShapeContour() wrapper keeps the vector convenience for callers that want it;
+being inline, it is compiled into the caller and its vector never leaves that
+module. The rule is written at the top of IShapeComponent.h so the next shape
+kind does not have to learn it the same way.
+
+Also, so that a bad payload can never be the next mystery: CShapeEditTool
+refuses a SetUserData target that does not resolve to an editable shape and says
+so with a CryWarning instead of making virtual calls through it; the handle loop
+clamps the point count, skips non-finite positions and never hands the aux
+renderer a NaN; and both the tool's draw and its hit test now resolve the shape
+once per call instead of once per point.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SCUvWGLCsqzm3VNMzp4uiS
+---
+ .../Interface/IShapeComponent.h               | 34 +++++++++++-
+ .../Module/Shapes/BoxShapeComponent.cpp       | 28 +++++-----
+ .../Module/Shapes/BoxShapeComponent.h         |  2 +-
+ .../Tools/ShapeEditTool.cpp                   | 52 +++++++++++++++----
+ 4 files changed, 89 insertions(+), 27 deletions(-)
+
+diff --git a/Code/CryPlugins/AreaComponents/Interface/IShapeComponent.h b/Code/CryPlugins/AreaComponents/Interface/IShapeComponent.h
+index 6fcd6f45..3fd6d289 100644
+--- a/Code/CryPlugins/AreaComponents/Interface/IShapeComponent.h
++++ b/Code/CryPlugins/AreaComponents/Interface/IShapeComponent.h
+@@ -18,6 +18,16 @@
+ //! Memory rule (MEMORY.md, fix bde12cd8): reflected types must never hold raw pointers. Everything
+ //! stored across a frame here is an EntityId or a value; listeners are held by the implementation
+ //! as plain observer pointers that the owner un-registers in OnShutDown, never as reflected state.
++//!
++//! HEAP RULE - no STL container ever crosses this interface (learned the hard way, 2026-09-11).
++//! An engine module (CryEngineModule) overrides global new/delete to CryModuleMalloc, i.e. the
++//! engine allocator, while a Sandbox editor plugin is compiled with NOT_USE_CRY_MEMORY_MANAGER
++//! (Tools/CMake/CommonMacros.cmake, CryEditorPlugin) and so uses the plain CRT heap. A container
++//! that the editor declares and the engine fills is therefore allocated on one heap and freed on
++//! the other: silent corruption, and a render thread that dies somewhere else entirely. Every
++//! method here passes values, references to caller-owned storage, or caller-owned buffers with an
++//! explicit capacity. The convenience wrapper below is an inline free function on purpose - it is
++//! compiled into the caller, so the vector it grows and frees never leaves that module.
+ 
+ #include <CryEntitySystem/IEntityComponent.h>
+ #include <CrySchematyc/Reflection/TypeDesc.h>
+@@ -132,7 +142,12 @@ struct IShapeComponent : public IEditorShapeComponent
+ 
+ 	//! The footprint contour: the polygon/box outline, or the sampled spline. `world` selects the
+ 	//! space; the points come out in authoring order and the closing edge is implicit.
+-	virtual void       GetContour(std::vector<Vec3>& out, bool world) const = 0;
++	//!
++	//! The buffer belongs to the CALLER - see the heap rule at the top of this header. At most
++	//! `maxPoints` points are written; the return value is how many points the contour HAS, which
++	//! may be larger, so a caller that cannot use a fixed buffer calls it once with
++	//! (nullptr, 0) to learn the count and again with a buffer of that size.
++	virtual int        GetContour(Vec3* pOutPoints, int maxPoints, bool world) const = 0;
+ 
+ 	//! Change notification. AddListener is idempotent; RemoveListener on an unknown listener is a
+ 	//! no-op. The shape holds these as non-owning observers - see the memory rule at the top.
+@@ -146,6 +161,23 @@ struct IShapeComponent : public IEditorShapeComponent
+ 	virtual IShapeComponentEdit* GetEditInterface() { return nullptr; }
+ };
+ 
++//! Convenience wrapper around IShapeComponent::GetContour for callers that want a vector. Inline on
++//! purpose: it is compiled into the calling module, so the vector is allocated and freed on that
++//! module's heap and never crosses the DLL boundary (see the heap rule at the top).
++inline int GetShapeContour(const IShapeComponent& shape, std::vector<Vec3>& out, bool world)
++{
++	out.clear();
++
++	const int pointCount = shape.GetContour(nullptr, 0, world);
++	if (pointCount > 0)
++	{
++		out.resize(static_cast<size_t>(pointCount));
++		shape.GetContour(out.data(), pointCount, world);
++	}
++
++	return pointCount;
++}
++
+ //! The spline-only half of the contract. Declared here so consumers (gravity volume, distributor,
+ //! camera dolly) have one header to include; implemented only by the spline shape, beside
+ //! IShapeComponent.
+diff --git a/Code/CryPlugins/AreaComponents/Module/Shapes/BoxShapeComponent.cpp b/Code/CryPlugins/AreaComponents/Module/Shapes/BoxShapeComponent.cpp
+index 4fecc8b7..07525658 100644
+--- a/Code/CryPlugins/AreaComponents/Module/Shapes/BoxShapeComponent.cpp
++++ b/Code/CryPlugins/AreaComponents/Module/Shapes/BoxShapeComponent.cpp
+@@ -102,10 +102,11 @@ bool CBoxShapeComponent::GetRandomPointInside(Vec3& out) const
+ 	return true;
+ }
+ 
+-void CBoxShapeComponent::GetContour(std::vector<Vec3>& out, bool world) const
++int CBoxShapeComponent::GetContour(Vec3* pOutPoints, int maxPoints, bool world) const
+ {
+ 	// The footprint: the four bottom corners, counter-clockwise seen from above. The closing edge
+-	// is implicit, the same convention the polygon shape will use.
++	// is implicit, the same convention the polygon shape will use. The buffer is the caller's -
++	// see the heap rule in IShapeComponent.h - so nothing is allocated here.
+ 	const Vec3 half = m_size * 0.5f;
+ 	const Vec3 corners[4] =
+ 	{
+@@ -115,20 +116,17 @@ void CBoxShapeComponent::GetContour(std::vector<Vec3>& out, bool world) const
+ 		Vec3(-half.x, half.y,  -half.z),
+ 	};
+ 
+-	out.clear();
+-	out.reserve(4);
++	const int totalPoints = 4;
++	if (pOutPoints == nullptr || maxPoints <= 0)
++		return totalPoints;
+ 
+-	if (world)
+-	{
+-		const Matrix34 tm = GetShapeWorldTM();
+-		for (const Vec3& corner : corners)
+-			out.push_back(tm.TransformPoint(corner));
+-	}
+-	else
+-	{
+-		for (const Vec3& corner : corners)
+-			out.push_back(m_offset + corner);
+-	}
++	const int  writtenPoints = min(maxPoints, totalPoints);
++	const Matrix34 tm = GetShapeWorldTM();
++
++	for (int i = 0; i < writtenPoints; ++i)
++		pOutPoints[i] = world ? tm.TransformPoint(corners[i]) : (m_offset + corners[i]);
++
++	return totalPoints;
+ }
+ 
+ bool CBoxShapeComponent::GetEditorLocalBounds(AABB& out) const
+diff --git a/Code/CryPlugins/AreaComponents/Module/Shapes/BoxShapeComponent.h b/Code/CryPlugins/AreaComponents/Module/Shapes/BoxShapeComponent.h
+index 07e6a050..4816402c 100644
+--- a/Code/CryPlugins/AreaComponents/Module/Shapes/BoxShapeComponent.h
++++ b/Code/CryPlugins/AreaComponents/Module/Shapes/BoxShapeComponent.h
+@@ -65,7 +65,7 @@ public:
+ 	virtual float DistanceToHull(const Vec3& world) const override;
+ 	virtual bool  IntersectRay(const Ray& ray, float& dist) const override;
+ 	virtual bool  GetRandomPointInside(Vec3& out) const override;
+-	virtual void  GetContour(std::vector<Vec3>& out, bool world) const override;
++	virtual int   GetContour(Vec3* pOutPoints, int maxPoints, bool world) const override;
+ 	virtual void  AddListener(IShapeListener* pListener) override;
+ 	virtual void  RemoveListener(IShapeListener* pListener) override;
+ 
+diff --git a/Code/Sandbox/Plugins/AreaComponentsEditor/Tools/ShapeEditTool.cpp b/Code/Sandbox/Plugins/AreaComponentsEditor/Tools/ShapeEditTool.cpp
+index f91c3ac2..1d5898ad 100644
+--- a/Code/Sandbox/Plugins/AreaComponentsEditor/Tools/ShapeEditTool.cpp
++++ b/Code/Sandbox/Plugins/AreaComponentsEditor/Tools/ShapeEditTool.cpp
+@@ -33,6 +33,12 @@ namespace
+ const float kPointCloseDistance = 0.8f;
+ //! Half-edge of a point handle, in screen-constant units (CShapeObject draws its points this way).
+ const float kPointHandleSize = 0.8f;
++//! Stack buffer the tool reads a contour into. Sampled splines get truncated for drawing, which is
++//! a visual limit and never a correctness one; the alternative - a container the engine module
++//! fills - is forbidden, see the heap rule in IShapeComponent.h.
++const int kMaxContourPoints = 256;
++//! Largest number of editable points the tool will draw handles for in one frame.
++const int kMaxEditPoints = 4096;
+ }
+ 
+ // Same registration shape CryDesigner uses (DesignerEditor.cpp): a class desc in the
+@@ -90,6 +96,19 @@ void CShapeEditTool::SetUserData(const char* key, void* userData)
+ 	m_componentGuid = pTarget->componentGuid;
+ 	m_selectedPoint = -1;
+ 
++	// Refuse a payload that does not resolve instead of discovering it one virtual call later: a
++	// tool that cannot find its component has nothing to draw and nothing to edit.
++	if (ResolveShapeEdit() == nullptr)
++	{
++		CryWarning(VALIDATOR_MODULE_EDITOR, VALIDATOR_WARNING,
++		           "Edit Shape: no editable shape component found for object %s, component %s - the tool will do nothing.",
++		           m_objectGuid.ToString().c_str(), m_componentGuid.ToString().c_str());
++
++		m_objectGuid = CryGUID::Null();
++		m_componentGuid = CryGUID::Null();
++		return;
++	}
++
+ 	if (m_pManipulator != nullptr)
+ 	{
+ 		m_pManipulator->Invalidate();
+@@ -168,31 +187,42 @@ void CShapeEditTool::Display(SDisplayContext& dc)
+ 	// The hull outline. The component previewer draws it too, but it stops at the entity's
+ 	// selection state, and while the tool is up the outline has to be there whatever happens to
+ 	// the selection.
+-	std::vector<Vec3> contour;
+-	pShape->GetContour(contour, true);
+-	if (contour.size() >= 2)
++	//
++	// The buffer is on our stack, never a container handed to the other DLL: the engine module and
++	// this editor plugin use different heaps (see the heap rule in IShapeComponent.h).
++	Vec3      contour[kMaxContourPoints];
++	const int contourPoints = min(pShape->GetContour(contour, kMaxContourPoints, true), kMaxContourPoints);
++	if (contourPoints >= 2)
+ 	{
+ 		dc.SetColor(ColorB(0, 255, 0, 255));
+-		dc.DrawPolyLine(contour.data(), static_cast<int>(contour.size()), true);
++		dc.DrawPolyLine(contour, contourPoints, true);
+ 	}
+ 
+ 	// Screen-constant point handles, the look CShapeObject::DisplayNormal has
+ 	// (ShapeObject.cpp:1377-1398): depth test off so a handle inside geometry stays grabbable.
+ 	dc.DepthTestOff();
+ 
+-	const int pointCount = pEdit->GetPointCount();
++	const Matrix34 shapeWorldTM = pShape->GetWorldTransformMatrix();
++	const int      pointCount = min(pEdit->GetPointCount(), kMaxEditPoints);
++
+ 	for (int i = 0; i < pointCount; ++i)
+ 	{
+-		const Vec3  worldPos = GetPointWorldPos(i);
++		const Vec3 worldPos = shapeWorldTM.TransformPoint(pEdit->GetPoint(i));
++		if (!worldPos.IsValid())
++			continue; // never hand the aux renderer a NaN
++
+ 		const float size = kPointHandleSize * dc.view->GetScreenScaleFactor(worldPos) * 0.01f;
+-		const Vec3  half(size, size, size);
++		if (!NumberValid(size) || size <= 0.0f)
++			continue;
++
++		const Vec3 half(size, size, size);
+ 
+ 		if (i == m_selectedPoint)
+ 			dc.SetSelectedColor();
+ 		else
+ 			dc.SetColor(ColorB(255, 255, 0, 255));
+ 
+-		dc.DrawSolidBox(worldPos - half, worldPos + half);
++		dc.DrawWireBox(worldPos - half, worldPos + half);
+ 	}
+ 
+ 	dc.DepthTestOn();
+@@ -219,10 +249,12 @@ bool CShapeEditTool::MouseCallback(CViewport* pView, EMouseEvent event, CPoint&
+ 	int   nearestPoint = -1;
+ 	float nearestDistance = FLT_MAX;
+ 
+-	const int pointCount = pEdit->GetPointCount();
++	const Matrix34 shapeWorldTM = GetShapeWorldTM();
++	const int      pointCount = min(pEdit->GetPointCount(), kMaxEditPoints);
++
+ 	for (int i = 0; i < pointCount; ++i)
+ 	{
+-		const Vec3  worldPos = GetPointWorldPos(i);
++		const Vec3  worldPos = shapeWorldTM.TransformPoint(pEdit->GetPoint(i));
+ 		const float rayT = max(0.0f, rayDir.Dot(worldPos - raySrc));
+ 		const float distance = (raySrc + rayDir * rayT - worldPos).GetLength();
+ 
+-- 
+2.47.1.windows.1
+

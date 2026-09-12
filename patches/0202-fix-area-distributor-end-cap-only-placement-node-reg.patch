@@ -1,0 +1,461 @@
+From dc0547992018a219f386e10227ccde01e4c4e9ec Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Sat, 12 Sep 2026 09:53:56 +0800
+Subject: [PATCH 202/209] fix(area): distributor - end-cap-only placement, node
+ registration, rebuild storm
+
+A five-point spline produced exactly two instances, one at each end of the curve
+and nothing in between. Three things came out of chasing that.
+
+1. The shape of the symptom IS the end-cap path. The Meshes list is what gets
+distributed ALONG the curve; End Cap Mesh places exactly one instance at each
+end of an open curve and nothing between them. A distributor whose only mesh
+sits in End Cap Mesh therefore produces precisely two objects at the two ends -
+and said nothing about it, while the end cap is a single inviting mesh picker
+and the list needs a row to be added first. WarnIfNothingToDistribute() now says
+so once, naming the mistake, and separately reports "none of the N meshes could
+be loaded" and "the list is empty".
+
+The placement arithmetic itself was re-derived outside the engine against the
+same formulas (five points spanning ~48 m -> segments 11.5/14.8/16.2/14.7, total
+57.3 m, Fixed Step 4 m -> 15 instances), so TotalLength, the arc-length table and
+the step count are not the problem.
+
+2. Render nodes were registered on every instance of every rebuild.
+CBrush::SetMatrix already unregisters and re-registers a node whenever its
+matrix really changes (Brush.cpp:224-227), and that is also the only place
+CalcBBox() runs, so the world box the octree indexes by comes from there. The
+extra RegisterEntity() per apply re-indexed nodes the engine had just indexed.
+It is now done exactly once per node, on its first apply, which is what
+CEntitySlot::UpdateRenderNode does (EntitySlot.cpp:213-220) - and which also
+covers the matching trap on the other side: SetMatrix EARLY-OUTS on an unchanged
+matrix (Brush.cpp:203-204), so a brand new node whose instance matrix is the
+identity it was constructed with would otherwise never register at all.
+
+3. Rebuilds were a storm. ENTITY_EVENT_COMPONENT_PROPERTY_CHANGED arrives on
+every inspector serialization pass, not only when a value changed, so an open
+property panel tore every render node down and built it again many times a
+second - reloading stat objects and re-registering nodes each time.
+ComputeBuildSignature() digests every parameter, every mesh path and the curve's
+length and closed flag, and a rebuild whose signature is unchanged now returns
+immediately. OnShapeChanged forces one, because a point can move without
+changing the curve's length.
+
+Diagnostics, as asked: every real rebuild logs one line - curve length, spacing
+mode with its step/count/density, trim, skip, alignment, meshes listed vs
+loaded, whether an end cap is loaded, how many instances were asked for, how
+many were placed and how many nodes exist. "Nothing appeared" is now readable
+from the console without a debugger.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ .../Module/Functions/DistributorComponent.cpp | 239 +++++++++++++++++-
+ .../Module/Functions/DistributorComponent.h   |  38 ++-
+ 2 files changed, 261 insertions(+), 16 deletions(-)
+
+diff --git a/Code/CryPlugins/AreaComponents/Module/Functions/DistributorComponent.cpp b/Code/CryPlugins/AreaComponents/Module/Functions/DistributorComponent.cpp
+index 06939343..2b3ef411 100644
+--- a/Code/CryPlugins/AreaComponents/Module/Functions/DistributorComponent.cpp
++++ b/Code/CryPlugins/AreaComponents/Module/Functions/DistributorComponent.cpp
+@@ -262,6 +262,8 @@ void CDistributorComponent::BuildInstances(ISplineShape& spline, std::vector<SIn
+ {
+ 	out.clear();
+ 
++	m_lastRequestedCount = 0;
++
+ 	const float totalLength = spline.TotalLength();
+ 	if (totalLength <= 0.0f)
+ 		return;
+@@ -300,6 +302,7 @@ void CDistributorComponent::BuildInstances(ISplineShape& spline, std::vector<SIn
+ 	}
+ 
+ 	instanceCount = min(instanceCount, kMaxInstances);
++	m_lastRequestedCount = instanceCount;
+ 	if (instanceCount <= 0)
+ 		return;
+ 
+@@ -455,6 +458,7 @@ void CDistributorComponent::SetNodeCount(int count)
+ 	if (oldCount < count)
+ 	{
+ 		m_renderNodes.resize(count, nullptr);
++		m_nodeRegistered.resize(count, 0);
+ 
+ 		for (int i = oldCount; i < count; ++i)
+ 		{
+@@ -469,6 +473,7 @@ void CDistributorComponent::SetNodeCount(int count)
+ 
+ 			pBrush->SetOwnerEntity(m_pEntity);
+ 			m_renderNodes[i] = pBrush;
++			m_nodeRegistered[i] = 0;
+ 		}
+ 	}
+ 	else if (oldCount > count)
+@@ -479,6 +484,7 @@ void CDistributorComponent::SetNodeCount(int count)
+ 				gEnv->p3DEngine->DeleteRenderNode(m_renderNodes[i]); // unregisters first
+ 		}
+ 		m_renderNodes.resize(count);
++		m_nodeRegistered.resize(count);
+ 	}
+ }
+ 
+@@ -494,7 +500,9 @@ void CDistributorComponent::DestroyNodes()
+ 	}
+ 
+ 	m_renderNodes.clear();
++	m_nodeRegistered.clear();
+ 	m_instances.clear();
++	m_lastBuildSignature = 0;
+ }
+ 
+ void CDistributorComponent::ApplyInstance(int index, const SInstance& instance, bool bOnlyTransform)
+@@ -510,31 +518,167 @@ void CDistributorComponent::ApplyInstance(int index, const SInstance& instance,
+ 	                     ? m_statObjs[instance.meshIndex].get()
+ 	                     : nullptr;
+ 
++	// Flags and ratios BEFORE the geometry: SetEntityStatObj ends in CBrush::SetMatrix, which
++	// re-registers the node in the octree (Brush.cpp:224-227), and that registration should see the
++	// final flags rather than the ones the node was created with.
++	if (!bOnlyTransform)
++	{
++		pNode->SetRndFlags(static_cast<IRenderNode::RenderFlagsType>(BuildRenderFlags()));
++		pNode->SetViewDistRatio(m_viewDistRatio);
++		pNode->SetLodRatio(m_lodRatio);
++		pNode->SetMaterial(m_pEntity != nullptr ? m_pEntity->GetMaterial() : nullptr);
++
++		if (m_pEntity != nullptr)
++		{
++			// So that clicking an instance in the viewport selects the entity that owns it.
++			pNode->SetEditorObjectId(m_pEntity->GetEditorObjectID());
++		}
++	}
++
+ 	Matrix34A tm = instance.tm;
+ 	pNode->SetEntityStatObj(pStatObj, &tm);
+ 
+-	if (bOnlyTransform)
+-		return;
++	// Registered exactly ONCE, the first time this node carries geometry.
++	//
++	// CBrush::SetMatrix already unregisters and re-registers the node itself whenever the matrix
++	// really changes (Brush.cpp:224-227), and that is also the ONLY place CalcBBox() runs - so the
++	// world bounding box the octree indexes the node by comes from there. This function used to add
++	// its own RegisterEntity() for every instance of every rebuild on top of that, which is at best
++	// redundant (AsyncOctreeUpdate unregisters and re-inserts synchronously, 3dEngine.cpp:6580) and
++	// at worst re-indexes a node the engine has just indexed correctly. Doing it once, on the first
++	// apply, is what CEntitySlot::UpdateRenderNode does (EntitySlot.cpp:213-220) and is enough:
++	// every later move re-registers through SetMatrix.
++	//
++	// Note the matching trap on the other side: SetMatrix EARLY-OUTS when the matrix is unchanged
++	// (Brush.cpp:203-204), so a node whose placement happens to equal the matrix it already has
++	// gets no CalcBBox() and no registration from that call. The explicit first-apply registration
++	// below covers the only case where that can be the node's whole life - a brand new node whose
++	// instance matrix is the identity it was constructed with.
++	if (index < static_cast<int>(m_nodeRegistered.size()) && m_nodeRegistered[index] == 0)
++	{
++		gEnv->p3DEngine->RegisterEntity(pNode);
++		m_nodeRegistered[index] = 1;
++	}
++}
++
++// ---------------------------------------------------------------------------
++// Rebuild guard and diagnostics
++// ---------------------------------------------------------------------------
++
++uint64 CDistributorComponent::ComputeBuildSignature(ISplineShape& spline) const
++{
++	// A digest, not a hash of record: it only has to change whenever something a rebuild reads
++	// changes. Floats go in through their bit pattern so that a small difference is never rounded
++	// away, and the curve contributes its length so that a moved spline is noticed here too.
++	uint64 hash = 0xCBF29CE484222325ull;
+ 
+-	pNode->SetRndFlags(static_cast<IRenderNode::RenderFlagsType>(BuildRenderFlags()));
+-	pNode->SetViewDistRatio(m_viewDistRatio);
+-	pNode->SetLodRatio(m_lodRatio);
+-	pNode->SetMaterial(m_pEntity != nullptr ? m_pEntity->GetMaterial() : nullptr);
++	const auto mix = [&hash](uint64 value)
++	{
++		hash ^= value;
++		hash *= 0x100000001B3ull;
++	};
++
++	const auto mixFloat = [&mix](float value)
++	{
++		uint32 bits = 0;
++		memcpy(&bits, &value, sizeof(bits));
++		mix(bits);
++	};
++
++	const auto mixString = [&mix](const string& value)
++	{
++		for (const char* p = value.c_str(); *p != 0; ++p)
++			mix(static_cast<uint64>(static_cast<unsigned char>(*p)));
++		mix(0xFFull);
++	};
++
++	mix(m_bEnabled ? 1 : 0);
++	mix(m_seed);
++	mix(static_cast<uint64>(m_spacingMode));
++	mixFloat(m_step);
++	mix(static_cast<uint64>(m_count));
++	mixFloat(m_density);
++	mixFloat(m_spacingJitter);
++	mixFloat(m_trimStart);
++	mixFloat(m_trimEnd);
++	mixFloat(m_skipProbability);
++	mix(static_cast<uint64>(m_alignMode));
++	mixFloat(m_zAngle);
++	mixFloat(m_rotationJitter.x);
++	mixFloat(m_rotationJitter.y);
++	mixFloat(m_rotationJitter.z);
++	mixFloat(m_scaleMin);
++	mixFloat(m_scaleMax);
++	mixFloat(m_scaleRampStart);
++	mixFloat(m_scaleRampEnd);
++	mix(m_bWidthScales ? 1 : 0);
++	mixFloat(m_defaultWidth);
++	mixFloat(m_offsetMin.x);
++	mixFloat(m_offsetMin.y);
++	mixFloat(m_offsetMin.z);
++	mixFloat(m_offsetMax.x);
++	mixFloat(m_offsetMax.y);
++	mixFloat(m_offsetMax.z);
++	mix(m_bSnapToTerrain ? 1 : 0);
++
++	mix(m_bOutdoorOnly ? 1 : 0);
++	mix(m_bCastShadows ? 1 : 0);
++	mix(m_bRainOccluder ? 1 : 0);
++	mix(m_bRegisterByBBox ? 1 : 0);
++	mix(static_cast<uint64>(m_hideable));
++	mix(m_bExcludeFromTriangulation ? 1 : 0);
++	mix(m_bNoDecals ? 1 : 0);
++	mix(m_bRecvWind ? 1 : 0);
++	mix(m_bGoodOccluder ? 1 : 0);
++	mix(static_cast<uint64>(m_viewDistRatio));
++	mix(static_cast<uint64>(m_lodRatio));
++
++	for (const SDistributorMesh& entry : m_meshes.meshes)
++	{
++		mixFloat(entry.weight);
++		mixString(entry.mesh.value);
++	}
++	mixString(m_endCapMesh.value);
++
++	mixFloat(spline.TotalLength());
++	mix(spline.IsClosed() ? 1 : 0);
++
++	// Never 0: that value means "never built".
++	return hash != 0 ? hash : 1;
++}
+ 
+-	if (m_pEntity != nullptr)
++void CDistributorComponent::LogRebuild(float curveLength, int requestedCount, int placedCount) const
++{
++	static const char* const szSpacingNames[] = { "Fixed Step", "Fixed Count", "Density" };
++	static const char* const szAlignNames[] = { "Follow Tangent", "World Up", "Surface Normal", "Fixed" };
++
++	const int spacingIndex = clamp_tpl(static_cast<int>(m_spacingMode), 0, static_cast<int>(CRY_ARRAY_COUNT(szSpacingNames)) - 1);
++	const int alignIndex = clamp_tpl(static_cast<int>(m_alignMode), 0, static_cast<int>(CRY_ARRAY_COUNT(szAlignNames)) - 1);
++
++	int loadedMeshes = 0;
++	for (size_t i = 0; i < m_meshes.meshes.size() && i < m_statObjs.size(); ++i)
+ 	{
+-		// So that clicking an instance in the viewport selects the entity that owns it.
+-		pNode->SetEditorObjectId(m_pEntity->GetEditorObjectID());
++		if (m_statObjs[i] != nullptr)
++			++loadedMeshes;
+ 	}
+ 
+-	gEnv->p3DEngine->RegisterEntity(pNode);
++	const int  endCapIndex = GetEndCapMeshIndex();
++	const bool bEndCapLoaded = endCapIndex < static_cast<int>(m_statObjs.size()) && m_statObjs[endCapIndex] != nullptr;
++
++	CryLog("Distributor on entity \"%s\": curve %.2f m, %s (step %.2f, count %d, density %.3f), trim %.2f/%.2f, "
++	       "skip %.2f, align %s, meshes %d listed / %d loaded, end cap %s - %d asked for, %d placed, %d nodes.",
++	       (m_pEntity != nullptr) ? m_pEntity->GetName() : "<none>",
++	       curveLength, szSpacingNames[spacingIndex], m_step, m_count, m_density,
++	       m_trimStart, m_trimEnd, m_skipProbability, szAlignNames[alignIndex],
++	       static_cast<int>(m_meshes.meshes.size()), loadedMeshes, bEndCapLoaded ? "loaded" : "none",
++	       requestedCount, placedCount, static_cast<int>(m_renderNodes.size()));
+ }
+ 
+ // ---------------------------------------------------------------------------
+ // Rebuild
+ // ---------------------------------------------------------------------------
+ 
+-void CDistributorComponent::Rebuild()
++void CDistributorComponent::Rebuild(bool bForce)
+ {
+ 	if (!m_bEnabled)
+ 	{
+@@ -549,6 +693,18 @@ void CDistributorComponent::Rebuild()
+ 		return;
+ 	}
+ 
++	// ENTITY_EVENT_COMPONENT_PROPERTY_CHANGED arrives on every inspector serialization pass, not
++	// only when a value really changed, so an open property panel used to tear every render node
++	// down and build it again many times a second. Nothing good comes of that, and one of the bad
++	// things is losing a node between the octree's asynchronous unregister and the next register.
++	const uint64 signature = ComputeBuildSignature(*pSpline);
++	if (!bForce && signature == m_lastBuildSignature && m_renderNodes.size() == m_instances.size())
++	{
++		return;
++	}
++
++	m_lastBuildSignature = signature;
++
+ 	ReloadMeshes();
+ 
+ 	BuildInstances(*pSpline, m_instances);
+@@ -557,6 +713,63 @@ void CDistributorComponent::Rebuild()
+ 
+ 	for (int i = 0; i < static_cast<int>(m_instances.size()); ++i)
+ 		ApplyInstance(i, m_instances[i], false);
++
++	LogRebuild(pSpline->TotalLength(), m_lastRequestedCount, static_cast<int>(m_instances.size()));
++	WarnIfNothingToDistribute();
++}
++
++void CDistributorComponent::WarnIfNothingToDistribute()
++{
++	// The Meshes list is what gets distributed ALONG the curve. End Cap Mesh is a different thing:
++	// it places exactly one instance at each end and nothing in between, so a distributor whose
++	// only mesh is the end cap looks broken - two objects, one at the start, one at the end. That
++	// is an easy mistake to make, because the end cap is a single inviting mesh picker while the
++	// list needs a row to be added first, and until now it failed silently.
++	bool bAnyMeshLoaded = false;
++	for (size_t i = 0; i < m_meshes.meshes.size() && i < m_statObjs.size(); ++i)
++	{
++		if (m_statObjs[i] != nullptr)
++		{
++			bAnyMeshLoaded = true;
++			break;
++		}
++	}
++
++	if (bAnyMeshLoaded)
++	{
++		m_bWarnedNoMesh = false;
++		return;
++	}
++
++	if (m_bWarnedNoMesh)
++		return;
++
++	m_bWarnedNoMesh = true;
++
++	const int  endCapIndex = GetEndCapMeshIndex();
++	const bool bEndCapLoaded = endCapIndex < static_cast<int>(m_statObjs.size()) && m_statObjs[endCapIndex] != nullptr;
++
++	if (bEndCapLoaded)
++	{
++		CryWarning(VALIDATOR_MODULE_ENTITYSYSTEM, VALIDATOR_WARNING,
++		           "Distributor on entity \"%s\": the Meshes list is empty, so only the End Cap Mesh was placed - one "
++		           "instance at each end of the curve and nothing in between. Add the mesh to Meshes to distribute it "
++		           "along the curve.",
++		           (m_pEntity != nullptr) ? m_pEntity->GetName() : "<none>");
++	}
++	else if (!m_meshes.meshes.empty())
++	{
++		CryWarning(VALIDATOR_MODULE_ENTITYSYSTEM, VALIDATOR_WARNING,
++		           "Distributor on entity \"%s\": none of the %d meshes in the list could be loaded - nothing was placed.",
++		           (m_pEntity != nullptr) ? m_pEntity->GetName() : "<none>",
++		           static_cast<int>(m_meshes.meshes.size()));
++	}
++	else
++	{
++		CryWarning(VALIDATOR_MODULE_ENTITYSYSTEM, VALIDATOR_WARNING,
++		           "Distributor on entity \"%s\": the Meshes list is empty - nothing to place along the curve.",
++		           (m_pEntity != nullptr) ? m_pEntity->GetName() : "<none>");
++	}
+ }
+ 
+ void CDistributorComponent::RebuildTransformsOnly()
+@@ -623,7 +836,9 @@ void CDistributorComponent::OnShapeChanged(IShapeComponent& shape, EShapeChangeR
+ 		return;
+ 	}
+ 
+-	Rebuild();
++	// Forced: a point can move without changing the curve's length, and the length is all the
++	// signature can see of the shape.
++	Rebuild(true);
+ }
+ 
+ void CDistributorComponent::ProcessEvent(const SEntityEvent& event)
+diff --git a/Code/CryPlugins/AreaComponents/Module/Functions/DistributorComponent.h b/Code/CryPlugins/AreaComponents/Module/Functions/DistributorComponent.h
+index 9751f2d0..3e99ec4d 100644
+--- a/Code/CryPlugins/AreaComponents/Module/Functions/DistributorComponent.h
++++ b/Code/CryPlugins/AreaComponents/Module/Functions/DistributorComponent.h
+@@ -244,16 +244,27 @@ private:
+ 	ISplineShape* EnsureBound();
+ 	void          Unbind();
+ 
++	//! A cheap digest of everything a rebuild depends on. ENTITY_EVENT_COMPONENT_PROPERTY_CHANGED
++	//! arrives on EVERY inspector serialization pass, not only when a value really changed, so
++	//! without this the component would tear down and rebuild all its render nodes many times a
++	//! second while its panel is open - which is both wasteful and a good way to lose a node in the
++	//! octree's async register/unregister queue.
++	uint64        ComputeBuildSignature(ISplineShape& spline) const;
++
+ 	//! (Re)loads the stat objects named by the mesh list and the end cap.
+ 	void          ReloadMeshes();
+ 
+-	//! Works out where every instance goes and rewrites the render nodes.
+-	void          Rebuild();
++	//! Works out where every instance goes and rewrites the render nodes. `bForce` skips the
++	//! signature check, which is what a real geometry change needs (a point can move without
++	//! changing the curve's length, and the length is all the signature can see of the shape).
++	void          Rebuild(bool bForce = false);
+ 	//! The cheap path for a move: the same instances, new matrices.
+ 	void          RebuildTransformsOnly();
+ 
+ 	//! Fills `out` with the instances the current parameters ask for. Caller-owned vector, local to
+-	//! this module (the heap rule only bites across the DLL boundary).
++	//! this module (the heap rule only bites across the DLL boundary). It also records how many
++	//! instances the spacing mode ASKED for in m_lastRequestedCount, which the log line compares
++	//! against how many were actually placed.
+ 	void          BuildInstances(ISplineShape& spline, std::vector<SInstance>& out) const;
+ 
+ 	//! Grows or shrinks the render node list to `count` nodes.
+@@ -263,6 +274,14 @@ private:
+ 	//! Pushes one instance into one render node. `bOnlyTransform` skips the flag and material block.
+ 	void          ApplyInstance(int index, const SInstance& instance, bool bOnlyTransform);
+ 
++	//! One line per real rebuild, so that "nothing appeared" can be diagnosed from the console
++	//! without a debugger: curve length, mode, spacing, the count asked for and the count placed.
++	void          LogRebuild(float curveLength, int requestedCount, int placedCount) const;
++
++	//! Says so, once, when the Meshes list places nothing - including the case where the only mesh
++	//! sits in End Cap Mesh, which places one instance at each end and nothing in between.
++	void          WarnIfNothingToDistribute();
++
+ 	//! The brush render flags every instance carries, from the flag block below.
+ 	uint64        BuildRenderFlags() const;
+ 
+@@ -328,12 +347,23 @@ private:
+ 	//! Runtime only, never reflected (MEMORY.md).
+ 	IShapeComponent*               m_pBoundShape = nullptr;
+ 	std::vector<IRenderNode*>      m_renderNodes;
++	//! Whether each node has been handed to I3DEngine::RegisterEntity yet. A node is registered
++	//! exactly ONCE, when it first receives geometry: from then on CBrush::SetMatrix re-registers
++	//! it itself on every move (Brush.cpp:224-227), and a second RegisterEntity racing that call's
++	//! UnRegisterEntityAsJob in the same frame is how a node ends up in no octree node at all.
++	std::vector<char>              m_nodeRegistered;
+ 	std::vector<_smart_ptr<IStatObj>> m_statObjs;
+ 	//! The instance list of the last rebuild, so that a move can reuse it without re-deciding
+ 	//! anything random.
+ 	std::vector<SInstance>         m_instances;
+ 
+-	bool m_bWarnedNoSpline = false;
++	bool   m_bWarnedNoSpline = false;
++	//! One warning per "the Meshes list places nothing", released again when it does.
++	bool   m_bWarnedNoMesh = false;
++	//! Digest of the last rebuild's inputs; 0 means "never built".
++	uint64 m_lastBuildSignature = 0;
++	//! How many instances the spacing mode asked for in the last BuildInstances(), for the log.
++	mutable int m_lastRequestedCount = 0;
+ };
+ 
+ } // namespace AreaComponents
+-- 
+2.47.1.windows.1
+

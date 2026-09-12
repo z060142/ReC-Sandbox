@@ -1,0 +1,447 @@
+From eeb0a41ec9f9551839377aa5835e030a70cf6380 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Sat, 12 Sep 2026 14:45:03 +0800
+Subject: [PATCH 208/209] feat(area): distributor chord alignment,
+ stretch-to-fit, forward axis
+
+A fence panel is a chord, not a curve. Follow Tangent orients each instance by
+the tangent at its OWN sample point, so both of its ends sit off the line and
+the chain opens up at every bend - which is the row of short, separated sections
+the user photographed.
+
+Alignment gains "Point To Next" (EDistributorAlign::Chord): the instance still
+sits on its arc-length sample, but its forward axis aims at where the NEXT
+instance starts. The last one aims at the end of the usable curve, and if it is
+already there it keeps the tangent. The frame is otherwise the one
+CSplineDistributor builds - forward, roll-aware normal, their cross product - so
+per-point Angle still banks it and Frame Mode still decides the up vector. The
+normal is re-orthogonalised against the chord first, because it is only
+perpendicular to the TANGENT; using it raw would shear the frame and the mesh
+with it.
+
+Stretch To Fit (off by default, meaningful in Chord) scales the instance along
+its forward axis until its length equals the chord, so sections meet end to end
+with no gap. It needs the mesh's own extent, read from IStatObj::GetAABB(), and
+the scale is applied in MESH space - frame * axis fix * local scale - because
+"longer" has to mean longer along the fence, not taller.
+
+Forward Axis (+X default, +Y, -X, -Y) says which axis of the mesh runs along the
+curve. +X is the default because that is what the legacy object assumes:
+CSplineDistributor builds its matrix with SetFromVectors(tangent, normal,
+tangent x normal, pos) (SplineDistributor.cpp:286-293) and SetFromVectors puts
+its first argument in column 0, i.e. on local +X. The same .cgf that lined up
+under the legacy distributor lines up here untouched; a mesh modelled sideways
+now needs a dropdown rather than a re-export.
+
+Pivot At Start (on by default) puts the START FACE of the mesh's bounding box on
+the sample point instead of the mesh's own pivot. A section exported around its
+centre would otherwise begin half a section before the curve does and leave a
+half-section gap at every joint.
+
+The "Count" half of the fit request is a fourth spacing mode, Mesh Length: as
+many sections as the mesh's own length tiles into the curve, rounded, with the
+residual spread over the spacing - a few per cent of stretch with Stretch To Fit
+on, even small gaps without it. With a weighted list of mixed lengths the first
+loadable mesh sets the length, which is at least predictable.
+
+Follow Tangent is untouched, and the rebuild log now names the alignment, the
+forward axis and whether stretch and pivot-at-start are on.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SCUvWGLCsqzm3VNMzp4uiS
+---
+ .../Module/Functions/DistributorComponent.cpp | 197 +++++++++++++++++-
+ .../Module/Functions/DistributorComponent.h   |  60 +++++-
+ 2 files changed, 245 insertions(+), 12 deletions(-)
+
+diff --git a/Code/CryPlugins/AreaComponents/Module/Functions/DistributorComponent.cpp b/Code/CryPlugins/AreaComponents/Module/Functions/DistributorComponent.cpp
+index a38f44e3..e226a1ac 100644
+--- a/Code/CryPlugins/AreaComponents/Module/Functions/DistributorComponent.cpp
++++ b/Code/CryPlugins/AreaComponents/Module/Functions/DistributorComponent.cpp
+@@ -181,20 +181,132 @@ int CDistributorComponent::PickMesh(float random01) const
+ // Placement
+ // ---------------------------------------------------------------------------
+ 
++Matrix33 CDistributorComponent::GetForwardAxisFix() const
++{
++	// The frame's column 0 is the direction the instance should face. This rotation brings the
++	// MESH's chosen axis onto that column, so a fence whose length runs along local +Y needs no
++	// re-export - it needs one dropdown.
++	switch (m_forwardAxis)
++	{
++	case EDistributorForwardAxis::PlusY:
++		return Matrix33::CreateRotationZ(DEG2RAD(-90.0f));
++	case EDistributorForwardAxis::MinusX:
++		return Matrix33::CreateRotationZ(DEG2RAD(180.0f));
++	case EDistributorForwardAxis::MinusY:
++		return Matrix33::CreateRotationZ(DEG2RAD(90.0f));
++	case EDistributorForwardAxis::PlusX:
++	default:
++		return Matrix33(IDENTITY);
++	}
++}
++
++bool CDistributorComponent::GetMeshForwardExtent(int meshIndex, float& length, float& start) const
++{
++	length = 0.0f;
++	start = 0.0f;
++
++	if (meshIndex < 0 || meshIndex >= static_cast<int>(m_statObjs.size()) || m_statObjs[meshIndex] == nullptr)
++		return false;
++
++	const AABB box = m_statObjs[meshIndex]->GetAABB();
++	if (box.IsReset())
++		return false;
++
++	switch (m_forwardAxis)
++	{
++	case EDistributorForwardAxis::PlusX:  length = box.max.x - box.min.x; start = box.min.x; break;
++	case EDistributorForwardAxis::MinusX: length = box.max.x - box.min.x; start = box.max.x; break;
++	case EDistributorForwardAxis::PlusY:  length = box.max.y - box.min.y; start = box.min.y; break;
++	case EDistributorForwardAxis::MinusY: length = box.max.y - box.min.y; start = box.max.y; break;
++	}
++
++	return length > 0.0001f;
++}
++
++Matrix34 CDistributorComponent::BuildInstanceTransform(const Matrix33& frame, int meshIndex, float uniformScale,
++                                                       float forwardStretch, const Vec3& position, const Vec3& offset) const
++{
++	// Scale lives in MESH space, because "stretch along the forward axis" means the mesh's own
++	// forward axis: a fence panel gets longer, not taller. So the order is
++	//     frame (place and aim) * axis fix (bring the mesh's axis onto the frame's) * scale (local).
++	Matrix33 localScale(IDENTITY);
++	localScale.SetIdentity();
++	localScale.m00 = uniformScale;
++	localScale.m11 = uniformScale;
++	localScale.m22 = uniformScale;
++
++	switch (m_forwardAxis)
++	{
++	case EDistributorForwardAxis::PlusX:
++	case EDistributorForwardAxis::MinusX:
++		localScale.m00 = uniformScale * forwardStretch;
++		break;
++	case EDistributorForwardAxis::PlusY:
++	case EDistributorForwardAxis::MinusY:
++		localScale.m11 = uniformScale * forwardStretch;
++		break;
++	}
++
++	const Matrix33 rotation = frame * GetForwardAxisFix() * localScale;
++
++	Matrix34 tm(rotation);
++	Vec3     translation = position + frame * offset;
++
++	if (m_bPivotAtStart)
++	{
++		// Put the START FACE of the mesh's bounding box on the sample point rather than the mesh's
++		// own pivot. A section exported around its centre would otherwise begin half a section
++		// before the curve does, and every gap in the chain would be half a section wide.
++		float meshLength = 0.0f;
++		float meshStart = 0.0f;
++		if (GetMeshForwardExtent(meshIndex, meshLength, meshStart))
++		{
++			Vec3 localStart(ZERO);
++			switch (m_forwardAxis)
++			{
++			case EDistributorForwardAxis::PlusX:
++			case EDistributorForwardAxis::MinusX:
++				localStart.x = meshStart;
++				break;
++			case EDistributorForwardAxis::PlusY:
++			case EDistributorForwardAxis::MinusY:
++				localStart.y = meshStart;
++				break;
++			}
++
++			translation -= rotation * localStart;
++		}
++	}
++
++	tm.SetTranslation(translation);
++	return tm;
++}
++
+ Matrix33 CDistributorComponent::BuildFrame(const Vec3& position, const Vec3& tangent, const Vec3& normal) const
+ {
+ 	switch (m_alignMode)
+ 	{
++	case EDistributorAlign::Chord:
+ 	case EDistributorAlign::FollowTangent:
+ 		{
+ 			// The frame CSplineDistributor builds (SplineDistributor.cpp:286-293): X along the
+ 			// curve, Y the roll-aware normal, Z their cross product - so the per-point Angle rolls
+ 			// the instance for free, which is what banking a row of fence posts along a road means.
++			//
++			// Chord alignment arrives here too, with `tangent` already replaced by the direction of
++			// the chord to the next instance: same frame, different forward.
+ 			if (tangent.IsZero() || normal.IsZero())
+ 				break;
+ 
+ 			const Vec3 x = tangent.GetNormalized();
+-			const Vec3 y = normal.GetNormalized();
++
++			// The normal is not generally perpendicular to a chord, so it is re-orthogonalised
++			// rather than used raw - otherwise the frame shears and so does the mesh.
++			Vec3 y = normal - x * normal.Dot(x);
++			if (y.IsZero(0.0001f))
++				break;
++			y.Normalize();
++
+ 			const Vec3 z = x.Cross(y);
+ 			if (z.IsZero())
+ 				break;
+@@ -292,6 +404,33 @@ void CDistributorComponent::BuildInstances(ISplineShape& spline, std::vector<SIn
+ 		instanceCount = static_cast<int>(usable * max(0.0f, m_density) + 0.5f);
+ 		spacing = (instanceCount > 0) ? (usable / static_cast<float>(instanceCount)) : usable;
+ 		break;
++	case EDistributorSpacing::MeshLength:
++		{
++			// As many sections as the mesh's OWN length tiles into the curve, rounded, with the
++			// residual spread evenly over the spacing. Together with Stretch To Fit that residual
++			// disappears into a scale of at most a few per cent; without it, it shows as even gaps.
++			// The first loadable mesh sets the length - with a weighted list of mixed lengths there
++			// is no single answer, and picking the first is at least predictable.
++			float meshLength = 0.0f;
++			float meshStart = 0.0f;
++			for (int i = 0; i < static_cast<int>(m_meshes.meshes.size()); ++i)
++			{
++				if (GetMeshForwardExtent(i, meshLength, meshStart))
++					break;
++			}
++
++			if (meshLength > 0.0001f)
++			{
++				instanceCount = max(1, static_cast<int>(usable / meshLength + 0.5f));
++				spacing = usable / static_cast<float>(instanceCount);
++			}
++			else
++			{
++				spacing = max(0.01f, m_step);
++				instanceCount = static_cast<int>(usable / spacing) + 1;
++			}
++		}
++		break;
+ 	}
+ 
+ 	// A closed curve's last instance would sit on top of the first one; drop it.
+@@ -345,7 +484,29 @@ void CDistributorComponent::BuildInstances(ISplineShape& spline, std::vector<SIn
+ 		const Vec3 tangent = spline.EvalTangent(t);
+ 		const Vec3 normal = spline.EvalNormal(t);
+ 
+-		Matrix33 frame = BuildFrame(position, tangent, normal);
++		// Chord alignment aims the instance at where the NEXT one starts instead of along the
++		// tangent at its own sample. A straight mesh is a chord, not a curve: oriented by the
++		// tangent, both of its ends sit off the line and the chain opens at every bend. The last
++		// instance has no successor, so it aims at the end of the usable curve, and if that is where
++		// it already is it keeps the tangent.
++		Vec3  forward = tangent;
++		float chordLength = 0.0f;
++
++		if (m_alignMode == EDistributorAlign::Chord)
++		{
++			const float nextDistance = min(distance + spacing, trimStart + usable);
++			const Vec3  nextPosition = spline.PosByDistance(nextDistance);
++
++			Vec3 chord = nextPosition - position;
++			chordLength = chord.GetLength();
++
++			if (chordLength > 0.0001f)
++			{
++				forward = chord / chordLength;
++			}
++		}
++
++		Matrix33 frame = BuildFrame(position, forward, normal);
+ 
+ 		// The constant turn first, then the jitter - the same order legacy applies mv_zAngle in
+ 		// (SplineDistributor.cpp:274-279), so an existing setup keeps its look.
+@@ -375,10 +536,22 @@ void CDistributorComponent::BuildInstances(ISplineShape& spline, std::vector<SIn
+ 		                  m_offsetMin.y + (m_offsetMax.y - m_offsetMin.y) * offsetDraw.y,
+ 		                  m_offsetMin.z + (m_offsetMax.z - m_offsetMin.z) * offsetDraw.z);
+ 
++		// Stretch To Fit makes the section exactly as long as the gap it has to bridge, which is
++		// what closes a fence instead of merely aiming it.
++		float forwardStretch = 1.0f;
++		if (m_bStretchToFit && m_alignMode == EDistributorAlign::Chord && chordLength > 0.0001f)
++		{
++			float meshLength = 0.0f;
++			float meshStart = 0.0f;
++			if (GetMeshForwardExtent(meshIndex, meshLength, meshStart) && scale > 0.0f)
++			{
++				forwardStretch = chordLength / (meshLength * scale);
++			}
++		}
++
+ 		SInstance instance;
+ 		instance.meshIndex = meshIndex;
+-		instance.tm = Matrix34(frame * scale);
+-		instance.tm.SetTranslation(position + frame * offset);
++		instance.tm = BuildInstanceTransform(frame, meshIndex, scale, forwardStretch, position, offset);
+ 
+ 		out.push_back(instance);
+ 	}
+@@ -404,8 +577,7 @@ void CDistributorComponent::BuildInstances(ISplineShape& spline, std::vector<SIn
+ 
+ 			SInstance instance;
+ 			instance.meshIndex = endCapIndex;
+-			instance.tm = Matrix34(frame);
+-			instance.tm.SetTranslation(position);
++			instance.tm = BuildInstanceTransform(frame, endCapIndex, 1.0f, 1.0f, position, Vec3(ZERO));
+ 
+ 			out.push_back(instance);
+ 		}
+@@ -603,6 +775,9 @@ uint64 CDistributorComponent::ComputeBuildSignature(ISplineShape& spline) const
+ 	mixFloat(m_trimEnd);
+ 	mixFloat(m_skipProbability);
+ 	mix(static_cast<uint64>(m_alignMode));
++	mix(static_cast<uint64>(m_forwardAxis));
++	mix(m_bStretchToFit ? 1 : 0);
++	mix(m_bPivotAtStart ? 1 : 0);
+ 	mixFloat(m_zAngle);
+ 	mixFloat(m_rotationJitter.x);
+ 	mixFloat(m_rotationJitter.y);
+@@ -649,8 +824,9 @@ uint64 CDistributorComponent::ComputeBuildSignature(ISplineShape& spline) const
+ 
+ void CDistributorComponent::LogRebuild(float curveLength, int requestedCount, int placedCount) const
+ {
+-	static const char* const szSpacingNames[] = { "Fixed Step", "Fixed Count", "Density" };
+-	static const char* const szAlignNames[] = { "Follow Tangent", "World Up", "Surface Normal", "Fixed" };
++	static const char* const szSpacingNames[] = { "Fixed Step", "Fixed Count", "Density", "Mesh Length" };
++	static const char* const szAlignNames[] = { "Follow Tangent", "World Up", "Surface Normal", "Fixed", "Point To Next" };
++	static const char* const szAxisNames[] = { "+X", "+Y", "-X", "-Y" };
+ 
+ 	const int spacingIndex = clamp_tpl(static_cast<int>(m_spacingMode), 0, static_cast<int>(CRY_ARRAY_COUNT(szSpacingNames)) - 1);
+ 	const int alignIndex = clamp_tpl(static_cast<int>(m_alignMode), 0, static_cast<int>(CRY_ARRAY_COUNT(szAlignNames)) - 1);
+@@ -666,10 +842,13 @@ void CDistributorComponent::LogRebuild(float curveLength, int requestedCount, in
+ 	const bool bEndCapLoaded = endCapIndex < static_cast<int>(m_statObjs.size()) && m_statObjs[endCapIndex] != nullptr;
+ 
+ 	CryLog("Distributor on entity \"%s\": curve %.2f m, %s (step %.2f, count %d, density %.3f), trim %.2f/%.2f, "
+-	       "skip %.2f, align %s, meshes %d listed / %d loaded, end cap %s - %d asked for, %d placed, %d nodes.",
++	       "skip %.2f, align %s (forward %s%s%s), meshes %d listed / %d loaded, end cap %s - %d asked for, "
++	       "%d placed, %d nodes.",
+ 	       (m_pEntity != nullptr) ? m_pEntity->GetName() : "<none>",
+ 	       curveLength, szSpacingNames[spacingIndex], m_step, m_count, m_density,
+ 	       m_trimStart, m_trimEnd, m_skipProbability, szAlignNames[alignIndex],
++	       szAxisNames[clamp_tpl(static_cast<int>(m_forwardAxis), 0, static_cast<int>(CRY_ARRAY_COUNT(szAxisNames)) - 1)],
++	       m_bStretchToFit ? ", stretched" : "", m_bPivotAtStart ? ", pivot at start" : "",
+ 	       static_cast<int>(m_meshes.meshes.size()), loadedMeshes, bEndCapLoaded ? "loaded" : "none",
+ 	       requestedCount, placedCount, static_cast<int>(m_renderNodes.size()));
+ }
+diff --git a/Code/CryPlugins/AreaComponents/Module/Functions/DistributorComponent.h b/Code/CryPlugins/AreaComponents/Module/Functions/DistributorComponent.h
+index 38e1e212..3ce2f6e1 100644
+--- a/Code/CryPlugins/AreaComponents/Module/Functions/DistributorComponent.h
++++ b/Code/CryPlugins/AreaComponents/Module/Functions/DistributorComponent.h
+@@ -32,6 +32,7 @@ enum class EDistributorSpacing
+ 	FixedStep = 0, //!< one instance every Step metres - the only mode legacy had (mv_step)
+ 	FixedCount,    //!< exactly Count instances, evenly spread over the usable length
+ 	Density,       //!< Density instances per metre, with optional jitter around the even spacing
++	MeshLength,    //!< as many instances as the mesh's own length tiles into the curve
+ };
+ 
+ inline void ReflectType(Schematyc::CTypeDesc<EDistributorSpacing>& desc)
+@@ -43,6 +44,7 @@ inline void ReflectType(Schematyc::CTypeDesc<EDistributorSpacing>& desc)
+ 	desc.AddConstant(EDistributorSpacing::FixedStep, "FixedStep", "Fixed Step");
+ 	desc.AddConstant(EDistributorSpacing::FixedCount, "FixedCount", "Fixed Count");
+ 	desc.AddConstant(EDistributorSpacing::Density, "Density", "Density");
++	desc.AddConstant(EDistributorSpacing::MeshLength, "MeshLength", "Mesh Length");
+ }
+ 
+ //! How an instance is oriented.
+@@ -52,6 +54,11 @@ enum class EDistributorAlign
+ 	WorldUp,           //!< upright, turned to face along the curve on the ground plane
+ 	SurfaceNormal,     //!< upright along the surface under the instance, turned along the curve
+ 	Fixed,             //!< no turning at all; only Z Angle and the jitter apply
++	//! Point at the NEXT instance instead of along the tangent. A straight mesh - a fence panel, a
++	//! rail, a wall section - is a chord, not a curve, so orienting it by the tangent at its own
++	//! sample leaves both of its ends off the line and the chain opens up at every bend. Aiming it
++	//! at where the next one starts is what closes it, and with Stretch To Fit it closes exactly.
++	Chord,
+ };
+ 
+ inline void ReflectType(Schematyc::CTypeDesc<EDistributorAlign>& desc)
+@@ -64,6 +71,33 @@ inline void ReflectType(Schematyc::CTypeDesc<EDistributorAlign>& desc)
+ 	desc.AddConstant(EDistributorAlign::WorldUp, "WorldUp", "World Up");
+ 	desc.AddConstant(EDistributorAlign::SurfaceNormal, "SurfaceNormal", "Surface Normal");
+ 	desc.AddConstant(EDistributorAlign::Fixed, "Fixed", "Fixed");
++	desc.AddConstant(EDistributorAlign::Chord, "Chord", "Point To Next");
++}
++
++//! Which axis of the MESH points along the curve.
++//!
++//! +X is the default because it is what the legacy object assumes: CSplineDistributor builds its
++//! matrix with SetFromVectors(tangent, normal, tangent x normal, pos) (SplineDistributor.cpp:286-293)
++//! and SetFromVectors puts its first argument in COLUMN 0, i.e. on local +X. So the same fence .cgf
++//! that lined up under the legacy distributor lines up here with the default untouched.
++enum class EDistributorForwardAxis
++{
++	PlusX = 0,
++	PlusY,
++	MinusX,
++	MinusY,
++};
++
++inline void ReflectType(Schematyc::CTypeDesc<EDistributorForwardAxis>& desc)
++{
++	desc.SetGUID("{2B5F4C10-6A71-4B2E-9E37-4C1D0A5E7B35}"_cry_guid);
++	desc.SetLabel("Forward Axis");
++	desc.SetDescription("Which axis of the mesh points along the curve");
++	desc.SetDefaultValue(EDistributorForwardAxis::PlusX);
++	desc.AddConstant(EDistributorForwardAxis::PlusX, "PlusX", "+X");
++	desc.AddConstant(EDistributorForwardAxis::PlusY, "PlusY", "+Y");
++	desc.AddConstant(EDistributorForwardAxis::MinusX, "MinusX", "-X");
++	desc.AddConstant(EDistributorForwardAxis::MinusY, "MinusY", "-Y");
+ }
+ 
+ //! The three states of the legacy brush "Hideable" variable (SplineDistributor.cpp:245-248).
+@@ -195,6 +229,9 @@ public:
+ 		desc.AddMember(&CDistributorComponent::m_skipProbability, 'skip', "SkipProbability", "Skip Probability", "Chance (0..1) that any one instance is left out, for a broken-up line", 0.0f);
+ 
+ 		desc.AddMember(&CDistributorComponent::m_alignMode, 'algn', "Alignment", "Alignment", "How an instance is oriented", EDistributorAlign::FollowTangent);
++		desc.AddMember(&CDistributorComponent::m_forwardAxis, 'fwax', "ForwardAxis", "Forward Axis", "Which axis of the mesh points along the curve. +X is what the legacy spline distributor assumes.", EDistributorForwardAxis::PlusX);
++		desc.AddMember(&CDistributorComponent::m_bStretchToFit, 'strf', "StretchToFit", "Stretch To Fit", "In Point To Next alignment, stretch each instance along its forward axis until it reaches the next one, so sections meet with no gap.", false);
++		desc.AddMember(&CDistributorComponent::m_bPivotAtStart, 'pvst', "PivotAtStart", "Pivot At Start", "Place the START face of the mesh's bounding box on the sample point instead of the mesh's own pivot. On, this is what makes a chain of sections start where it should.", true);
+ 		desc.AddMember(&CDistributorComponent::m_zAngle, 'zang', "ZAngle", "Z Angle", "A constant turn about the instance's own up axis, in degrees", 0.0f);
+ 		desc.AddMember(&CDistributorComponent::m_rotationJitter, 'rjit', "RotationJitter", "Rotation Jitter", "Random rotation about each axis, in degrees, plus or minus", Vec3(0.0f, 0.0f, 0.0f));
+ 
+@@ -306,8 +343,22 @@ private:
+ 	//! Picks a mesh index from the weighted list, or -1 when nothing is loadable.
+ 	int           PickMesh(float random01) const;
+ 
+-	//! The frame an instance is built in, given the curve's data at that point.
+-	Matrix33      BuildFrame(const Vec3& position, const Vec3& tangent, const Vec3& normal) const;
++	//! The frame an instance is built in, given the curve's data at that point. `forward` is the
++	//! direction the instance's forward axis should end up pointing - the tangent in every mode but
++	//! Chord, where it is the direction of the chord to the next instance.
++	Matrix33      BuildFrame(const Vec3& position, const Vec3& forward, const Vec3& normal) const;
++
++	//! Rotation that brings the mesh's chosen forward axis onto the frame's forward (+X) axis.
++	Matrix33      GetForwardAxisFix() const;
++
++	//! The mesh's own extent along the chosen forward axis: `length` is how long it is, `start` the
++	//! coordinate of its start face in mesh local space (what Pivot At Start shifts away). False
++	//! when the mesh is not loaded or is degenerate along that axis.
++	bool          GetMeshForwardExtent(int meshIndex, float& length, float& start) const;
++
++	//! Builds an instance's full transform from the pieces every alignment mode produces.
++	Matrix34      BuildInstanceTransform(const Matrix33& frame, int meshIndex, float uniformScale,
++	                                     float forwardStretch, const Vec3& position, const Vec3& offset) const;
+ 
+ 	//! The end cap's slot in m_statObjs: it is loaded into the last entry so that one array serves
+ 	//! both, and a negative index can still mean "nothing".
+@@ -330,7 +381,10 @@ private:
+ 	float               m_trimEnd = 0.0f;
+ 	float               m_skipProbability = 0.0f;
+ 
+-	EDistributorAlign   m_alignMode = EDistributorAlign::FollowTangent;
++	EDistributorAlign       m_alignMode = EDistributorAlign::FollowTangent;
++	EDistributorForwardAxis m_forwardAxis = EDistributorForwardAxis::PlusX;
++	bool                    m_bStretchToFit = false;
++	bool                    m_bPivotAtStart = true;
+ 	float               m_zAngle = 0.0f;
+ 	Vec3                m_rotationJitter = ZERO;
+ 
+-- 
+2.47.1.windows.1
+

@@ -1,0 +1,709 @@
+From 530efcd66556c1174bed21a66ff4d7f8f0f821b6 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Fri, 11 Sep 2026 23:22:33 +0800
+Subject: [PATCH 185/209] feat(area): drag-to-size creation for box and sphere
+
+Create Object -> Area -> Box and -> Sphere are now drawn, not dropped: the
+press spawns the entity at the picked point, the drag sizes it live, the
+release finishes and selects it, Esc deletes it again. One undo step for the
+whole gesture, and a click with no drag still leaves the kind's default size
+rather than a degenerate shape.
+
+Why a creation TOOL and not CBaseObject::MouseCreateCallback, which is how
+legacy objects size themselves while being placed: that virtual belongs to the
+object class, and these entities are created as EditorQt's own
+CEntityObjectWithComponent (the class desc carries the component GUID as its
+file spec). Subclassing that object class to reach the virtual would mean the
+shape can only ever live on an entity created as that class - alternative B4 of
+decision 02, rejected there. A creation tool keeps the object class stock and
+the component addable to any entity.
+
+CShapeDragCreateTool subclasses the 1b polygon creation tool and reuses its
+spawn, undo-bracket, select and cancel code unchanged; two hooks were added to
+the base for it (GetMinPointCount, SeedShape), and the members it needs moved
+from private to protected. Sizing goes through IShapeComponentEdit::SetPoint
+alone, because both kinds already present their dimensions as the two-point set
+the point tool edits - box = (min corner, max corner), sphere = (centre, radius
+handle). So the drag reuses exactly the authoring path "Edit Shape" uses and
+there is no second way to resize a shape that could disagree with it.
+
+- Box: the drag rectangle is the XY footprint, and the box stands ON the drag
+  plane rather than straddling it, because an area box is nearly always meant
+  to cover the ground the user dragged over. Height is a default (2 m) and not
+  a second gesture: a drag gives two dimensions, and asking for a vertical drag
+  after the button is up is not what "drag to size" means to anyone.
+  SetPoint is called max, min, max - three times and in that order. Each
+  SetPoint keeps the other corner still and refuses to let the box collapse, so
+  a drag landing entirely on one side of the box's current position would
+  otherwise have its first corner clamped against the stale opposite one; after
+  the second call the fixed corner is already the dragged one, so the third is
+  unclamped.
+- Sphere: the press picks the centre, the drag distance is the radius.
+
+One tool class per object class, because the Create panel hands a custom
+creation tool no user data (report 02): "EditTool.AreaShapeBoxCreate" and
+"EditTool.AreaShapeSphereCreate". "AreaShapeBox" loses its default-size
+placement in favour of the drag; "AreaShapeSphere" is new.
+
+Two parity fixes of stage 1c ride along:
+
+- Bounds now refresh immediately after a viewport shape edit (F frames the new
+  volume without reselecting). CEntityObject::SetModified -> CalcBBox reads the
+  ENTITY's local bounds, which a shape component does not contribute to (it
+  owns no render slot), so CalcBBox saw no change and never reached its
+  InvalidateWorldBox(): the editor kept the cached world box from the last
+  selection. AreaShapeTools::SyncEditedComponent now calls InvalidateTM(0),
+  which is the public route to that cache - CBaseObject::InvalidateWorldBox is
+  protected and this is a plugin - and whose CEntityObject override re-pushes
+  an unchanged transform, i.e. does nothing else. Legacy does the same one
+  level down (CAreaBox calls InvalidateWorldBox after a size change,
+  AreaBox.cpp:523).
+- CShapeEditTool now leaves cleanly when its component is removed, or its
+  entity deleted, while the tool is up - the inspector's remove-component
+  button is one click away. Display() notices it (it runs every frame, while
+  MouseCallback and OnKeyDown already refuse to act on an unresolved target),
+  rolls back a half-open undo transaction, forgets the GUIDs and pops the tool.
+  No dangling access: the tool has never held a pointer across a frame.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SCUvWGLCsqzm3VNMzp4uiS
+---
+ .../AreaComponentsEditor/CMakeLists.txt       |   2 +
+ .../Objects/AreaShapeObjectClassDescs.cpp     |  34 ++-
+ .../Tools/ShapeCreateTool.cpp                 |  13 +-
+ .../Tools/ShapeCreateTool.h                   |  11 +-
+ .../Tools/ShapeDragCreateTool.cpp             | 257 ++++++++++++++++++
+ .../Tools/ShapeDragCreateTool.h               | 110 ++++++++
+ .../Tools/ShapeEditTool.cpp                   |  44 +++
+ .../Tools/ShapeEditTool.h                     |   8 +
+ .../Tools/ShapeToolCommon.cpp                 |  15 +
+ 9 files changed, 486 insertions(+), 8 deletions(-)
+ create mode 100644 Code/Sandbox/Plugins/AreaComponentsEditor/Tools/ShapeDragCreateTool.cpp
+ create mode 100644 Code/Sandbox/Plugins/AreaComponentsEditor/Tools/ShapeDragCreateTool.h
+
+diff --git a/Code/Sandbox/Plugins/AreaComponentsEditor/CMakeLists.txt b/Code/Sandbox/Plugins/AreaComponentsEditor/CMakeLists.txt
+index 00208911..3d44759a 100644
+--- a/Code/Sandbox/Plugins/AreaComponentsEditor/CMakeLists.txt
++++ b/Code/Sandbox/Plugins/AreaComponentsEditor/CMakeLists.txt
+@@ -14,6 +14,8 @@ add_sources("NoUberFile"
+ 		"Tools/ShapeEditTool.cpp"
+ 		"Tools/ShapeCreateTool.h"
+ 		"Tools/ShapeCreateTool.cpp"
++		"Tools/ShapeDragCreateTool.h"
++		"Tools/ShapeDragCreateTool.cpp"
+ 	SOURCE_GROUP "Objects"
+ 		"Objects/AreaShapeObjectClassDescs.cpp"
+ )
+diff --git a/Code/Sandbox/Plugins/AreaComponentsEditor/Objects/AreaShapeObjectClassDescs.cpp b/Code/Sandbox/Plugins/AreaComponentsEditor/Objects/AreaShapeObjectClassDescs.cpp
+index a84bd05f..abb4a598 100644
+--- a/Code/Sandbox/Plugins/AreaComponentsEditor/Objects/AreaShapeObjectClassDescs.cpp
++++ b/Code/Sandbox/Plugins/AreaComponentsEditor/Objects/AreaShapeObjectClassDescs.cpp
+@@ -27,6 +27,9 @@ const char* const szBoxShapeComponentGuid = "6C3A81D5-0F47-4E9A-B4D1-72E5C8A9620
+ //! CPolygonShapeComponent::ReflectType, Module/Shapes/PolygonShapeComponent.h.
+ const char* const szPolygonShapeComponentGuid = "6C3A81D5-0F47-4E9A-B4D1-72E5C8A96202";
+ 
++//! CSphereShapeComponent::ReflectType, Module/Shapes/SphereShapeComponent.h.
++const char* const szSphereShapeComponentGuid = "6C3A81D5-0F47-4E9A-B4D1-72E5C8A96203";
++
+ //! The object class every Area preset is created as. Resolved lazily: EditorQt registers its own
+ //! class descs before any plugin is loaded, but not necessarily before this plugin's statics run.
+ CRuntimeClass* GetEntityWithComponentRuntimeClass()
+@@ -44,8 +47,10 @@ CRuntimeClass* GetEntityWithComponentRuntimeClass()
+ 
+ } // namespace Private_AreaShapeObjectClassDescs
+ 
+-//! "Create Object -> Area -> Box": an entity carrying a CBoxShapeComponent, ready to be edited
+-//! with the "Edit Shape" button of its inspector.
++//! "Create Object -> Area -> Box": an entity carrying a CBoxShapeComponent, dragged out of the
++//! ground instead of dropped at a default size (stage 1c). The custom tool class name is what
++//! makes the Create panel start CShapeBoxCreateTool instead of the generic CObjectCreateTool
++//! (ObjectCreateToolPanel.cpp:383-402).
+ class CAreaShapeBoxClassDesc : public CObjectClassDesc
+ {
+ public:
+@@ -56,6 +61,7 @@ public:
+ 	virtual CRuntimeClass* GetRuntimeClass() override         { return Private_AreaShapeObjectClassDescs::GetEntityWithComponentRuntimeClass(); }
+ 	virtual const char*    GetFileSpec() override             { return Private_AreaShapeObjectClassDescs::szBoxShapeComponentGuid; }
+ 	virtual const char*    GetDataFilesFilterString() override { return ""; }
++	virtual const char*    GetToolClassName() override        { return "EditTool.AreaShapeBoxCreate"; }
+ 
+ 	//! The entry is a single button, not a browsable list, so the Create panel asks
+ 	//! EnumerateObjects() for the buttons it should show.
+@@ -94,3 +100,27 @@ public:
+ };
+ 
+ REGISTER_CLASS_DESC(CAreaShapePolygonClassDesc);
++
++//! "Create Object -> Area -> Sphere": an entity carrying a CSphereShapeComponent, dragged out of
++//! the ground - the press picks the centre, the drag distance is the radius.
++class CAreaShapeSphereClassDesc : public CObjectClassDesc
++{
++public:
++	virtual ObjectType     GetObjectType() override            { return OBJTYPE_ENTITY; }
++	virtual const char*    ClassName() override                { return "AreaShapeSphere"; }
++	virtual const char*    UIName() override                   { return "Sphere"; }
++	virtual const char*    Category() override                 { return "Area"; }
++	virtual CRuntimeClass* GetRuntimeClass() override          { return Private_AreaShapeObjectClassDescs::GetEntityWithComponentRuntimeClass(); }
++	virtual const char*    GetFileSpec() override              { return Private_AreaShapeObjectClassDescs::szSphereShapeComponentGuid; }
++	virtual const char*    GetDataFilesFilterString() override { return ""; }
++	virtual const char*    GetToolClassName() override         { return "EditTool.AreaShapeSphereCreate"; }
++
++	virtual bool IsCreatedByListEnumeration() override { return false; }
++
++	virtual void EnumerateObjects(IObjectEnumerator* pEnumerator) override
++	{
++		pEnumerator->AddEntry("Sphere", Private_AreaShapeObjectClassDescs::szSphereShapeComponentGuid);
++	}
++};
++
++REGISTER_CLASS_DESC(CAreaShapeSphereClassDesc);
+diff --git a/Code/Sandbox/Plugins/AreaComponentsEditor/Tools/ShapeCreateTool.cpp b/Code/Sandbox/Plugins/AreaComponentsEditor/Tools/ShapeCreateTool.cpp
+index 9703d339..474ac2ce 100644
+--- a/Code/Sandbox/Plugins/AreaComponentsEditor/Tools/ShapeCreateTool.cpp
++++ b/Code/Sandbox/Plugins/AreaComponentsEditor/Tools/ShapeCreateTool.cpp
+@@ -24,8 +24,6 @@ using Cry::AreaComponents::IShapeComponentEdit;
+ 
+ namespace
+ {
+-//! A closed polygon needs a triangle. GetMinPoints() of CShapeObject, ShapeObject.h:144.
+-const int kMinPolygonPoints = 3;
+ //! Two clicks closer together than this make one point, not two.
+ const float kMinPointSpacing = 0.01f;
+ //! Largest number of points drawn in one frame while the shape is being created.
+@@ -144,14 +142,19 @@ bool CShapeCreateTool::StartCreation(const Vec3& worldPos)
+ 
+ 	m_bCreating = true;
+ 
++	SeedShape();
++
++	return true;
++}
++
++void CShapeCreateTool::SeedShape()
++{
+ 	// The first point is the object's own origin, exactly as legacy starts a shape with
+ 	// InsertPoint(-1, Vec3(0,0,0)) (ShapeObject.cpp:1185-1188).
+ 	if (IShapeComponentEdit* pEdit = ResolveShapeEdit())
+ 	{
+ 		pEdit->InsertPoint(-1, ZERO);
+ 	}
+-
+-	return true;
+ }
+ 
+ void CShapeCreateTool::AppendPoint(const Vec3& worldPos)
+@@ -191,7 +194,7 @@ void CShapeCreateTool::FinishCreation()
+ 	IUndoManager*        pUndoManager = GetIEditor()->GetIUndoManager();
+ 
+ 	const int pointCount = pEdit != nullptr ? pEdit->GetPointCount() : 0;
+-	if (pObject == nullptr || pointCount < kMinPolygonPoints)
++	if (pObject == nullptr || pointCount < GetMinPointCount())
+ 	{
+ 		// Too few points is a cancelled draw, not a shape: legacy returns MOUSECREATE_ABORT and
+ 		// the object is thrown away (ShapeObject.cpp:1194-1205).
+diff --git a/Code/Sandbox/Plugins/AreaComponentsEditor/Tools/ShapeCreateTool.h b/Code/Sandbox/Plugins/AreaComponentsEditor/Tools/ShapeCreateTool.h
+index dd5c9bf9..6d857659 100644
+--- a/Code/Sandbox/Plugins/AreaComponentsEditor/Tools/ShapeCreateTool.h
++++ b/Code/Sandbox/Plugins/AreaComponentsEditor/Tools/ShapeCreateTool.h
+@@ -50,7 +50,16 @@ protected:
+ 	//! The object class the tool creates. A subclass changes this to serve another shape kind.
+ 	virtual const char* GetObjectClassName() const { return "AreaShapePolygon"; }
+ 
+-private:
++	//! Fewest points the finished shape must have, or the draw counts as cancelled. A kind with a
++	//! fixed point set (box, sphere) has nothing to count and answers 0.
++	virtual int  GetMinPointCount() const { return 3; }
++
++	//! Called right after the entity is spawned, to give the shape its first point. The polygon
++	//! starts at the object's own origin, exactly as legacy does
++	//! (CShapeObject::MouseCreateCallback, ShapeObject.cpp:1185-1188); a fixed-point kind
++	//! overrides this and sizes itself from the drag instead.
++	virtual void SeedShape();
++
+ 	CBaseObject*                              ResolveObject() const;
+ 	IEntityComponent*                         ResolveComponent() const;
+ 	Cry::AreaComponents::IShapeComponentEdit* ResolveShapeEdit() const;
+diff --git a/Code/Sandbox/Plugins/AreaComponentsEditor/Tools/ShapeDragCreateTool.cpp b/Code/Sandbox/Plugins/AreaComponentsEditor/Tools/ShapeDragCreateTool.cpp
+new file mode 100644
+index 00000000..437bd507
+--- /dev/null
++++ b/Code/Sandbox/Plugins/AreaComponentsEditor/Tools/ShapeDragCreateTool.cpp
+@@ -0,0 +1,257 @@
++// Copyright 2026 ReC Sandbox. Distributed under the terms in LICENSE.md at the repository root.
++#include "StdAfx.h"
++#include "ShapeDragCreateTool.h"
++#include "ShapeToolCommon.h"
++
++#include <IEditor.h>
++#include <IEditorClassFactory.h>
++#include <Viewport.h>
++#include <Objects/BaseObject.h>
++#include <Objects/DisplayContext.h>
++
++#include <IShapeComponent.h>
++
++using Cry::AreaComponents::IShapeComponent;
++using Cry::AreaComponents::IShapeComponentEdit;
++
++namespace
++{
++//! Largest number of contour points the tool draws in one frame (heap rule: a stack buffer, never
++//! a container the engine module fills - see IShapeComponent.h).
++const int kMaxDrawPoints = 256;
++}
++
++const float CShapeDragCreateTool::kMinDragDistance = 0.05f;
++
++const float CShapeBoxCreateTool::kDefaultHeight = 2.0f;
++const float CShapeBoxCreateTool::kDefaultHalfSize = 1.0f;
++
++const float CShapeSphereCreateTool::kDefaultRadius = 1.0f;
++
++IMPLEMENT_DYNAMIC(CShapeDragCreateTool, CShapeCreateTool)
++
++// ---------------------------------------------------------------------------
++// Registration - one tool class per object class, because the Create panel gives a custom
++// creation tool no user data (report 02, "Box creation left as a single click").
++// ---------------------------------------------------------------------------
++
++class CShapeBoxCreateTool_ClassDesc : public IClassDesc
++{
++	virtual ESystemClassID SystemClassID() override   { return ESYSTEM_CLASS_EDITTOOL; }
++	virtual const char*    ClassName() override       { return "EditTool.AreaShapeBoxCreate"; }
++	virtual const char*    Category() override        { return "Area"; }
++	virtual CRuntimeClass* GetRuntimeClass() override { return RUNTIME_CLASS(CShapeBoxCreateTool); }
++};
++
++REGISTER_CLASS_DESC(CShapeBoxCreateTool_ClassDesc);
++
++IMPLEMENT_DYNCREATE(CShapeBoxCreateTool, CShapeDragCreateTool);
++
++class CShapeSphereCreateTool_ClassDesc : public IClassDesc
++{
++	virtual ESystemClassID SystemClassID() override   { return ESYSTEM_CLASS_EDITTOOL; }
++	virtual const char*    ClassName() override       { return "EditTool.AreaShapeSphereCreate"; }
++	virtual const char*    Category() override        { return "Area"; }
++	virtual CRuntimeClass* GetRuntimeClass() override { return RUNTIME_CLASS(CShapeSphereCreateTool); }
++};
++
++REGISTER_CLASS_DESC(CShapeSphereCreateTool_ClassDesc);
++
++IMPLEMENT_DYNCREATE(CShapeSphereCreateTool, CShapeDragCreateTool);
++
++// ---------------------------------------------------------------------------
++// The gesture
++// ---------------------------------------------------------------------------
++
++Matrix34 CShapeDragCreateTool::GetShapeWorldTM() const
++{
++	if (IShapeComponent* pShape = AreaShapeTools::AsShape(ResolveComponent()))
++	{
++		return pShape->GetWorldTransformMatrix();
++	}
++
++	if (CBaseObject* pObject = ResolveObject())
++	{
++		return pObject->GetWorldTM();
++	}
++
++	return Matrix34(IDENTITY);
++}
++
++bool CShapeDragCreateTool::MouseCallback(CViewport* pView, EMouseEvent event, CPoint& point, int flags)
++{
++	if (pView == nullptr)
++		return false;
++
++	if (event != eMouseMove && event != eMouseLDown && event != eMouseLUp)
++		return false;
++
++	Vec3 worldPos;
++	if (!PickWorldPoint(pView, point, worldPos))
++		return false;
++
++	m_cursorWorldPos = worldPos;
++	m_bCursorValid = true;
++
++	switch (event)
++	{
++	case eMouseLDown:
++		{
++			if (m_bCreating)
++				break; // a second press during the same gesture changes nothing
++
++			if (!StartCreation(worldPos))
++				return true;
++
++			m_anchorWorld = worldPos;
++			m_bDragging = true;
++
++			// The whole drag is ONE gesture for the shape: listeners hear about it once, at the
++			// end, instead of once per mouse move.
++			if (IShapeComponentEdit* pEdit = ResolveShapeEdit())
++			{
++				pEdit->BeginEdit();
++			}
++
++			// A press that is released without moving still has to produce a usable shape.
++			SizeToDrag(m_anchorWorld, worldPos, true);
++			break;
++		}
++
++	case eMouseMove:
++		{
++			if (!m_bDragging)
++				break;
++
++			const bool bDefaultSize = m_anchorWorld.GetDistance(worldPos) < kMinDragDistance;
++			SizeToDrag(m_anchorWorld, worldPos, bDefaultSize);
++
++			pView->SetCurrentCursor(STD_CURSOR_MOVE);
++			break;
++		}
++
++	case eMouseLUp:
++		{
++			if (!m_bDragging)
++				break;
++
++			m_bDragging = false;
++
++			const bool bDefaultSize = m_anchorWorld.GetDistance(worldPos) < kMinDragDistance;
++			SizeToDrag(m_anchorWorld, worldPos, bDefaultSize);
++
++			if (IShapeComponentEdit* pEdit = ResolveShapeEdit())
++			{
++				pEdit->EndEdit();
++			}
++
++			pView->ResetCursor();
++
++			// Accepts the one undo transaction StartCreation opened, selects the entity and
++			// leaves the tool - all of it the polygon tool's code, unchanged.
++			FinishCreation();
++			break;
++		}
++
++	default:
++		break;
++	}
++
++	return true;
++}
++
++void CShapeDragCreateTool::Display(SDisplayContext& dc)
++{
++	if (!m_bCreating)
++		return;
++
++	IShapeComponent* pShape = AreaShapeTools::AsShape(ResolveComponent());
++	if (pShape == nullptr)
++		return;
++
++	// The component previewer already draws the shape itself every frame - the entity exists from
++	// the first press. What is added here is the contour in the "being created" yellow legacy uses
++	// for the part of a shape the mouse is still moving (ShapeObject.cpp:1322-1330), so that the
++	// shape under the cursor reads as unfinished.
++	Vec3      points[kMaxDrawPoints];
++	const int count = min(pShape->GetContour(points, kMaxDrawPoints, true), kMaxDrawPoints);
++	if (count < 2)
++		return;
++
++	dc.SetColor(ColorB(255, 255, 0, 255));
++	dc.DrawPolyLine(points, count, true);
++}
++
++// ---------------------------------------------------------------------------
++// Box: the drag rectangle is the footprint
++// ---------------------------------------------------------------------------
++
++void CShapeBoxCreateTool::SizeToDrag(const Vec3& anchorWorld, const Vec3& worldPos, bool bDefaultSize)
++{
++	IShapeComponentEdit* pEdit = ResolveShapeEdit();
++	if (pEdit == nullptr)
++		return;
++
++	Matrix34 invShapeTM = GetShapeWorldTM();
++	invShapeTM.Invert();
++
++	// Both ends of the drag in the shape's own space. The entity was spawned AT the anchor, so the
++	// anchor is the local origin unless the object class rotated it.
++	const Vec3 localAnchor = invShapeTM.TransformPoint(anchorWorld);
++
++	// The box stands ON the drag plane rather than straddling it - see kDefaultHeight in the
++	// header for why the third dimension is a default and not a second gesture.
++	Vec3 localMin;
++	Vec3 localMax;
++
++	if (bDefaultSize)
++	{
++		// A click with no drag is centred on the pick point, which is what a single-click
++		// placement gave before this tool existed.
++		localMin = Vec3(localAnchor.x - kDefaultHalfSize, localAnchor.y - kDefaultHalfSize, localAnchor.z);
++		localMax = Vec3(localAnchor.x + kDefaultHalfSize, localAnchor.y + kDefaultHalfSize, localAnchor.z + kDefaultHeight);
++	}
++	else
++	{
++		// A real drag spans exactly the rectangle the user dragged over.
++		const Vec3 localCursor = invShapeTM.TransformPoint(worldPos);
++
++		localMin = Vec3(min(localAnchor.x, localCursor.x), min(localAnchor.y, localCursor.y), localAnchor.z);
++		localMax = Vec3(max(localAnchor.x, localCursor.x), max(localAnchor.y, localCursor.y), localAnchor.z + kDefaultHeight);
++	}
++
++	// Point 0 is the minimum corner, point 1 the maximum one - the two-point set
++	// CBoxShapeComponent presents to the point tool.
++	//
++	// Three calls, in this order, and not two. Each SetPoint keeps the OTHER corner where it is
++	// and refuses to let the box collapse (CBoxShapeComponent::SetPoint pushes the dragged side
++	// back off the fixed one by kMinSize). A drag that lands entirely on one side of the box's
++	// current position therefore gets its first corner clamped against the stale opposite corner.
++	// Setting max, then min, then max again always converges: after the second call the fixed
++	// corner is already the one the user dragged to, so the third call is unclamped.
++	pEdit->SetPoint(1, localMax);
++	pEdit->SetPoint(0, localMin);
++	pEdit->SetPoint(1, localMax);
++}
++
++// ---------------------------------------------------------------------------
++// Sphere: the drag distance is the radius
++// ---------------------------------------------------------------------------
++
++void CShapeSphereCreateTool::SizeToDrag(const Vec3& anchorWorld, const Vec3& worldPos, bool bDefaultSize)
++{
++	IShapeComponentEdit* pEdit = ResolveShapeEdit();
++	if (pEdit == nullptr)
++		return;
++
++	Matrix34 invShapeTM = GetShapeWorldTM();
++	invShapeTM.Invert();
++
++	const Vec3  localCentre = invShapeTM.TransformPoint(anchorWorld);
++	const float radius = bDefaultSize ? kDefaultRadius : localCentre.GetDistance(invShapeTM.TransformPoint(worldPos));
++
++	// Point 0 is the centre, point 1 the radius handle on local +X - the two-point set
++	// CSphereShapeComponent presents to the point tool.
++	pEdit->SetPoint(0, localCentre);
++	pEdit->SetPoint(1, localCentre + Vec3(radius, 0.0f, 0.0f));
++}
+diff --git a/Code/Sandbox/Plugins/AreaComponentsEditor/Tools/ShapeDragCreateTool.h b/Code/Sandbox/Plugins/AreaComponentsEditor/Tools/ShapeDragCreateTool.h
+new file mode 100644
+index 00000000..06a1199d
+--- /dev/null
++++ b/Code/Sandbox/Plugins/AreaComponentsEditor/Tools/ShapeDragCreateTool.h
+@@ -0,0 +1,110 @@
++// Copyright 2026 ReC Sandbox. Distributed under the terms in LICENSE.md at the repository root.
++#pragma once
++
++#include "ShapeCreateTool.h"
++
++//! "Drag a new shape out of the ground": the press-drag-release creation of the shape kinds that
++//! have no point list - Box and Sphere.
++//!
++//! Why a tool and not CBaseObject::MouseCreateCallback, which is how legacy objects size
++//! themselves while being placed: that virtual belongs to the OBJECT class, and these entities are
++//! created as EditorQt's own CEntityObjectWithComponent (the class desc carries the component GUID
++//! as its file spec, see Objects/AreaShapeObjectClassDescs.cpp). Subclassing that object class to
++//! get the virtual would mean the shape can only ever exist on an entity created as that class,
++//! which is exactly what decision 02 rejects (alternative B4). Driving the same gesture from a
++//! creation tool keeps the object class stock and the component addable to any entity.
++//!
++//! The gesture, shared by both kinds:
++//!   mouse down  - spawn the entity at the picked point; that point is the anchor
++//!   drag        - size the shape from anchor to cursor, live, inside the same undo transaction
++//!   mouse up    - finish, select the entity, leave the tool
++//!   Esc         - delete the entity again and leave the tool
++//! A click with no drag leaves the kind's default size rather than a degenerate shape.
++//!
++//! Sizing goes through IShapeComponentEdit::SetPoint alone, because both kinds already present
++//! their dimensions as a two-point set for the point tool: box = (min corner, max corner),
++//! sphere = (centre, radius handle). So the drag reuses exactly the authoring path the "Edit
++//! Shape" tool uses, and there is no second way to resize a shape that could disagree with it.
++class CShapeDragCreateTool : public CShapeCreateTool
++{
++	// DYNAMIC, not DYNCREATE: this class is never instantiated by name - only the two concrete
++	// kinds below are registered as edit tools - but MFC needs a runtime class here so that
++	// IMPLEMENT_DYNCREATE on them has a base to point at.
++	DECLARE_DYNAMIC(CShapeDragCreateTool)
++
++public:
++	CShapeDragCreateTool() = default;
++
++	// CEditTool
++	virtual string GetDisplayName() const override { return "Create Shape"; }
++	virtual void   Display(SDisplayContext& dc) override;
++	virtual bool   MouseCallback(CViewport* pView, EMouseEvent event, CPoint& point, int flags) override;
++	// ~CEditTool
++
++protected:
++	virtual ~CShapeDragCreateTool() = default;
++
++	// CShapeCreateTool - a fixed point set has nothing to count and nothing to seed.
++	virtual int  GetMinPointCount() const override { return 0; }
++	virtual void SeedShape() override               {}
++	// ~CShapeCreateTool
++
++	//! Size the shape so that it spans from the anchor to `worldPos`. Called on every drag frame
++	//! and once at the end; `bDefaultSize` asks for the kind's default instead, which is what a
++	//! click with no drag gets.
++	virtual void SizeToDrag(const Vec3& anchorWorld, const Vec3& worldPos, bool bDefaultSize) = 0;
++
++	//! Shape-local space of the entity being created. Identity when it cannot be resolved.
++	Matrix34 GetShapeWorldTM() const;
++
++	//! Smallest drag, in metres, that counts as a drag rather than a click.
++	static const float kMinDragDistance;
++
++	Vec3 m_anchorWorld = ZERO;
++	bool m_bDragging = false;
++};
++
++//! Create Object -> Area -> Box: the drag rectangle is the box's XY footprint, and the box is
++//! extruded upward from the drag plane by a default height.
++class CShapeBoxCreateTool : public CShapeDragCreateTool
++{
++	DECLARE_DYNCREATE(CShapeBoxCreateTool)
++
++public:
++	CShapeBoxCreateTool() = default;
++
++protected:
++	virtual ~CShapeBoxCreateTool() = default;
++
++	virtual const char* GetObjectClassName() const override { return "AreaShapeBox"; }
++	virtual void        SizeToDrag(const Vec3& anchorWorld, const Vec3& worldPos, bool bDefaultSize) override;
++
++private:
++	//! How tall a dragged box is. A drag gives two dimensions and a volume needs three; a second,
++	//! vertical drag would need a second mouse gesture after the button is already up, which is
++	//! not what "drag to size" means to anyone. The box is created sitting ON the drag plane
++	//! (0 .. height in local Z) rather than centred on it, because an area box is almost always
++	//! meant to cover the ground the user dragged over. Height is then edited like any dimension.
++	static const float kDefaultHeight;
++	//! Half-extent of the box a click with no drag produces.
++	static const float kDefaultHalfSize;
++};
++
++//! Create Object -> Area -> Sphere: the drag distance is the radius.
++class CShapeSphereCreateTool : public CShapeDragCreateTool
++{
++	DECLARE_DYNCREATE(CShapeSphereCreateTool)
++
++public:
++	CShapeSphereCreateTool() = default;
++
++protected:
++	virtual ~CShapeSphereCreateTool() = default;
++
++	virtual const char* GetObjectClassName() const override { return "AreaShapeSphere"; }
++	virtual void        SizeToDrag(const Vec3& anchorWorld, const Vec3& worldPos, bool bDefaultSize) override;
++
++private:
++	//! Radius a click with no drag produces - the component's own default.
++	static const float kDefaultRadius;
++};
+diff --git a/Code/Sandbox/Plugins/AreaComponentsEditor/Tools/ShapeEditTool.cpp b/Code/Sandbox/Plugins/AreaComponentsEditor/Tools/ShapeEditTool.cpp
+index 1772b013..2f2a9e2b 100644
+--- a/Code/Sandbox/Plugins/AreaComponentsEditor/Tools/ShapeEditTool.cpp
++++ b/Code/Sandbox/Plugins/AreaComponentsEditor/Tools/ShapeEditTool.cpp
+@@ -292,8 +292,52 @@ bool CShapeEditTool::HitTestEdge(CViewport* pView, const Vec3& raySrc, const Vec
+ // Drawing
+ // ---------------------------------------------------------------------------
+ 
++bool CShapeEditTool::HasLostTarget() const
++{
++	return m_objectGuid != CryGUID::Null() && ResolveShapeEdit() == nullptr;
++}
++
++void CShapeEditTool::AbandonLostTarget()
++{
++	// A gesture may still be recording against an object that no longer exists; roll it back
++	// before anything else touches the undo stack.
++	if (m_gestureOpen)
++	{
++		m_gestureOpen = false;
++
++		IUndoManager* pUndoManager = GetIEditor()->GetIUndoManager();
++		if (pUndoManager != nullptr && pUndoManager->IsUndoRecording())
++		{
++			pUndoManager->Cancel();
++		}
++	}
++
++	m_modifying = false;
++	m_selectedPoint = -1;
++	m_bHoverEdgeValid = false;
++	m_objectGuid = CryGUID::Null();
++	m_componentGuid = CryGUID::Null();
++
++	CryLog("Edit Shape: the shape component being edited is gone - leaving the tool.");
++
++	// Deletes this tool (CEditTool::Release -> DeleteThis). Nothing may touch a member after it,
++	// which is why every caller returns immediately. It is the same call FinishCreation() makes
++	// from inside CShapeCreateTool::MouseCallback.
++	GetIEditor()->GetLevelEditorSharedState()->SetEditTool(nullptr);
++}
++
+ void CShapeEditTool::Display(SDisplayContext& dc)
+ {
++	// The component can be removed from the entity, or the entity deleted, while the tool is up -
++	// the inspector's "remove component" button is one click away. Display() runs every frame, so
++	// it is where that is noticed; MouseCallback and OnKeyDown already refuse to act without a
++	// resolved target.
++	if (HasLostTarget())
++	{
++		AbandonLostTarget();
++		return; // `this` is gone
++	}
++
+ 	IShapeComponent*     pShape = ResolveShape();
+ 	IShapeComponentEdit* pEdit = pShape != nullptr ? pShape->GetEditInterface() : nullptr;
+ 	if (pEdit == nullptr || dc.view == nullptr)
+diff --git a/Code/Sandbox/Plugins/AreaComponentsEditor/Tools/ShapeEditTool.h b/Code/Sandbox/Plugins/AreaComponentsEditor/Tools/ShapeEditTool.h
+index 290f4d4b..e479f94c 100644
+--- a/Code/Sandbox/Plugins/AreaComponentsEditor/Tools/ShapeEditTool.h
++++ b/Code/Sandbox/Plugins/AreaComponentsEditor/Tools/ShapeEditTool.h
+@@ -92,6 +92,14 @@ private:
+ 	//! (CEditShapeTool::SnapSelectedPointToTerrainOrGeometry, ShapeObject.cpp:440-469).
+ 	bool     SnapSelectedPointToTerrainOrGeometry(CViewport* pView, CPoint& point);
+ 
++	//! True once the tool had a target and that target is gone - the component was removed from
++	//! the entity, or the entity itself was deleted, while the tool was up.
++	bool     HasLostTarget() const;
++	//! Ends the tool without touching the vanished target: cancels a half-open undo transaction,
++	//! forgets the GUIDs and pops the tool off the level editor. MUST be the last thing a caller
++	//! does, because it deletes this tool.
++	void     AbandonLostTarget();
++
+ 	void     BeginGesture(const char* szName);
+ 	void     EndGesture(bool bChanged);
+ 	void     SyncEditedComponent();
+diff --git a/Code/Sandbox/Plugins/AreaComponentsEditor/Tools/ShapeToolCommon.cpp b/Code/Sandbox/Plugins/AreaComponentsEditor/Tools/ShapeToolCommon.cpp
+index df8f327c..15d01a63 100644
+--- a/Code/Sandbox/Plugins/AreaComponentsEditor/Tools/ShapeToolCommon.cpp
++++ b/Code/Sandbox/Plugins/AreaComponentsEditor/Tools/ShapeToolCommon.cpp
+@@ -88,6 +88,21 @@ void SyncEditedComponent(CBaseObject* pObject, IEntityComponent* pComponent)
+ 	if (pObject != nullptr)
+ 	{
+ 		pObject->SetModified(false, false);
++
++		// And the bounds. CEntityObject::SetModified -> CalcBBox reads the ENTITY's own local
++		// bounds, which a shape component does not contribute to (it owns no render slot), so
++		// CalcBBox sees no change and never reaches its InvalidateWorldBox(). The editor's cached
++		// world box would then keep the size the shape had when it was last selected: F frames
++		// the old volume and rubber-band selection uses the old box until something else
++		// invalidates it.
++		//
++		// InvalidateTM(0) is the public route to that cache (CBaseObject::InvalidateWorldBox is
++		// protected, and this is a plugin): it clears m_bWorldBoxValid, and CEntityObject's
++		// override re-pushes the entity's world transform, which is a no-op here because the
++		// transform did not change. Legacy does the same thing one level down - CAreaBox calls
++		// InvalidateWorldBox() itself after a size change (AreaBox.cpp:523).
++		pObject->InvalidateTM(0);
++
+ 		pObject->UpdatePrefab();
+ 	}
+ }
+-- 
+2.47.1.windows.1
+

@@ -34,5 +34,8 @@ add_subdirectory(CryHTTP/Module)
 # CinematicCamera: physically-based camera plugin (focal length, aperture, DOF, exposure)
 add_subdirectory(CinematicCamera/Module)
 
+# AreaComponents: shape components (box / sphere / polygon / spline) and the area functions on them
+add_subdirectory(AreaComponents/Module)
+
 # CryPhoneTracker: Android ARCore 6DoF pose + lens control receiver
 add_subdirectory(CryPhoneTracker/Module)

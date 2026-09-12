@@ -1,0 +1,1318 @@
+From 521beee892d22a12c92078e2915c877ad83ef2d1 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Fri, 11 Sep 2026 23:53:25 +0800
+Subject: [PATCH 190/209] feat(area): Area function component over the legacy
+ area proxy
+
+"Area" is the second half of the split decision 01 asks for: the shape
+components are pure geometry, and everything that used to be baked into a
+legacy area object beside its shape - an id, a group, a priority, a near band,
+an inner fade and a list of linked entities - lives here, on a function
+component that binds by rule to whatever shape sits on the same entity.
+
+How it drives the runtime (decision 03, research/07 option 1a)
+
+It owns a hidden legacy IEntityAreaComponent, created with
+GetOrCreateComponent and flagged NoSave + FLAG_NOT_SERIALIZE. That is the
+whole reason nothing else in the engine had to change: the six area events,
+the exclusive-group fade, the broad-phase grid, ExitAllAreas on teardown and
+every consumer that looks an area up with GetProxy(ENTITY_PROXY_AREA) -
+particles, the physics spline area, both audio components - keep working
+against the same CArea they always used. NoSave keeps the level free of a
+second copy of the geometry: CEntity::SerializeXML skips NoSave components, so
+no <Area> node is written and the privileged <Area> hook in EntityLoadManager
+has nothing to re-create on the next load.
+
+It also attaches its own entity to that area (CArea::AddEntity(own id), the
+BoidsProxy precedent). That is what makes the stock audio Environment and Area
+components work when they are added to this same entity: neither looks for a
+shape, both only require that their entity is in some area's attached list.
+The self-move feedback loop that comes with self-attachment was fixed in the
+engine one commit earlier.
+
+An entity that already carries a legacy area proxy is left alone, with a
+latched warning: taking it over would silently stop its <Area> node being
+saved.
+
+Geometry
+
+The kinds describe themselves through two new, non-pure virtuals on
+IShapeComponent - GetAreaVolume(SShapeAreaVolume&) and
+GetContourObstruction() - so the Area component never downcasts and never
+learns which kind it is talking to. A kind with no area volume (a spline is a
+path, not a volume) returns false and is skipped with a warning. SShapeAreaVolume
+is a flat POD and the contour travels in a caller-owned buffer: no container
+crosses the interface (heap rule).
+
+Pushing is split by how much changed. A moved point goes through the
+MovePoints path added earlier, which updates the a2DSegments in place and
+keeps the per-entity containment cache; a topology change, a box or a sphere
+takes the full SetPoints / SetBox / SetSphere path. The ENTITY's own movement
+is left to the legacy proxy's OnMove, which is already exactly those three
+cheap per-kind pushes over the local geometry we last pushed - so there is no
+second transform path that could disagree with it, and FLAG_NOT_UPDATE_AREA is
+deliberately not set. A re-entrancy flag breaks the loop SetPoints would
+otherwise close, because it broadcasts COMPONENT_PROPERTY_CHANGED to the whole
+entity and the shape answers that with a change notification.
+
+Links
+
+Stored as a reflected wrapper around std::vector<CryGUID> (the SShapesArray
+pattern), because a GUID is what survives a save and what the legacy <Area>
+node stores. They resolve on ENTITY_EVENT_LEVEL_LOADED - the per-entity
+equivalent of the instant CArea::ResolveEntityIds runs at - and, unlike
+legacy, again on ENTITY_EVENT_LAYER_UNHIDE and on IEntitySystemSink::OnSpawn,
+so a layer enabled after load and an entity spawned later still link. The
+module keeps one spawn sink for every area rather than one per component, and
+registers it with the entity system only while some area is waiting.
+
+No per-frame cost: the component subscribes to no update event, and an idle
+area is exactly the CArea the engine already had.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ .../Interface/IAreaFunctionComponent.h        |  62 ++
+ .../Interface/IShapeComponent.h               |  62 ++
+ .../AreaComponents/Module/CMakeLists.txt      |  11 +
+ .../Functions/AreaFunctionComponent.cpp       | 659 ++++++++++++++++++
+ .../Module/Functions/AreaFunctionComponent.h  | 199 ++++++
+ .../AreaComponents/Module/PluginDll.cpp       |  21 +
+ .../Module/Shapes/BoxShapeComponent.cpp       |  19 +
+ .../Module/Shapes/BoxShapeComponent.h         |   1 +
+ .../Module/Shapes/PolygonShapeComponent.cpp   |  34 +
+ .../Module/Shapes/PolygonShapeComponent.h     |   2 +
+ .../Module/Shapes/SphereShapeComponent.cpp    |  16 +
+ .../Module/Shapes/SphereShapeComponent.h      |   1 +
+ 12 files changed, 1087 insertions(+)
+ create mode 100644 Code/CryPlugins/AreaComponents/Interface/IAreaFunctionComponent.h
+ create mode 100644 Code/CryPlugins/AreaComponents/Module/Functions/AreaFunctionComponent.cpp
+ create mode 100644 Code/CryPlugins/AreaComponents/Module/Functions/AreaFunctionComponent.h
+
+diff --git a/Code/CryPlugins/AreaComponents/Interface/IAreaFunctionComponent.h b/Code/CryPlugins/AreaComponents/Interface/IAreaFunctionComponent.h
+new file mode 100644
+index 00000000..5096c70b
+--- /dev/null
++++ b/Code/CryPlugins/AreaComponents/Interface/IAreaFunctionComponent.h
+@@ -0,0 +1,62 @@
++// Copyright 2026 ReC Sandbox. Distributed under the terms in LICENSE.md at the repository root.
++#pragma once
++
++//! The editor-facing half of the Area function component (scene-notes/area/decisions/03-area-runtime.md).
++//!
++//! An area's "links" - the entities that receive ENTERAREA / LEAVEAREA / AREAFADE - are authored by
++//! picking entities in the viewport, and there is no entity picker an engine component can put in
++//! the inspector: Serialization::EntityTarget and its property row live in EditorQt
++//! (Include/Serialization/Decorators/EntityLink.h), the same wall SEditToolButton stands behind.
++//! So the engine component stores the GUIDs and the editor plugin owns the picking, reaching the
++//! component through this interface.
++//!
++//! Like IShapeComponent it is a *reflected interface base*, and for the same reason: the lookup
++//! from EditorQt or from a Sandbox plugin is by reflected type GUID, not by RTTI. It derives from
++//! IEditorActionComponent (CryCommon/CryEntitySystem/IEntityComponent.h) rather than from
++//! IEntityComponent directly, because a second IEntityComponent base would make the
++//! entity-component base ambiguous and break the static_cast IEntity::GetAllComponents<>() does -
++//! exactly the reasoning written down in IShapeComponent.h.
++//!
++//! HEAP RULE, as in IShapeComponent.h: no STL container ever crosses this interface. An engine
++//! module allocates through CryModuleMalloc and a Sandbox editor plugin through the plain CRT
++//! heap, so a container filled on one side and freed on the other is silent corruption. Links are
++//! passed one CryGUID at a time.
++//!
++//! ABI: append-only. New virtuals go at the END and existing ones never change signature.
++
++#include <CryEntitySystem/IEntityComponent.h>
++#include <CrySchematyc/Reflection/TypeDesc.h>
++#include <CryExtension/CryGUID.h>
++
++namespace Cry
++{
++namespace AreaComponents
++{
++
++struct IAreaFunctionComponent : public IEditorActionComponent
++{
++	static void ReflectType(Schematyc::CTypeDesc<IAreaFunctionComponent>& desc)
++	{
++		desc.SetGUID("{B4E27C09-8A16-4D53-9C70-1F5D3E8A4602}"_cry_guid);
++		desc.SetLabel("Area");
++	}
++
++	//! How many link targets are authored on this area. Unresolved GUIDs count too - a link to an
++	//! entity in a layer that is not loaded yet is still a link.
++	virtual int     GetLinkCount() const = 0;
++
++	//! The entity GUID of link `index`, or a null GUID when the index is out of range. This is the
++	//! editor object's GUID (CBaseObject::GetId(), which becomes SEntitySpawnParams::guid), the
++	//! same identity the legacy <Area><Entities><Entity GUID=.../> node stores.
++	virtual CryGUID GetLink(int index) const = 0;
++
++	//! Append a link target. Returns false when the GUID is null or already linked, so the caller
++	//! can tell "nothing changed" from "added" and skip an empty undo step.
++	virtual bool    AddLinkTarget(const CryGUID& entityGuid) = 0;
++
++	//! Drop every link. Returns false when there was nothing to drop.
++	virtual bool    ClearLinks() = 0;
++};
++
++} // namespace AreaComponents
++} // namespace Cry
+diff --git a/Code/CryPlugins/AreaComponents/Interface/IShapeComponent.h b/Code/CryPlugins/AreaComponents/Interface/IShapeComponent.h
+index 1f343859..00b5d087 100644
+--- a/Code/CryPlugins/AreaComponents/Interface/IShapeComponent.h
++++ b/Code/CryPlugins/AreaComponents/Interface/IShapeComponent.h
+@@ -99,6 +99,48 @@ struct IShapeListener
+ struct ISplineShape;
+ struct IShapeComponentEdit;
+ 
++//! Which legacy CArea volume a shape kind maps onto. It is deliberately NOT EShapeKind: several
++//! kinds could map onto one volume (a rounded box is still a box to CArea) and a kind may map onto
++//! none at all, which is what GetAreaVolume() returning false means.
++enum class EAreaVolumeForm
++{
++	Box = 0,
++	Sphere,
++	Polygon,
++};
++
++//! Everything the Area function component needs in order to build a legacy CArea out of a shape,
++//! in the shape's LOCAL space with the component's own offset already applied - i.e. exactly the
++//! space IEntityAreaComponent::SetBox / SetSphere / SetPoints expect.
++//!
++//! It is a flat POD on purpose. No container crosses this interface (heap rule at the top of this
++//! header), so the polygon's point list is not in here: the caller reads it with GetContour(false)
++//! into its own buffer and its per-edge obstruction flags with GetContourObstruction().
++//!
++//! Filling it is the KIND's job, which is what keeps function components free of downcasts: the
++//! Area component never learns whether it is talking to a box, a sphere or a polygon.
++struct SShapeAreaVolume
++{
++	EAreaVolumeForm form = EAreaVolumeForm::Box;
++
++	//! Box: the two extreme corners in the shape's local space, and per-side sound obstruction in
++	//! the order CArea::SetSoundObstructionOnAreaFace() indexes box sides (0..5).
++	Vec3  boxMin = ZERO;
++	Vec3  boxMax = ZERO;
++	bool  boxObstruct[6] = { false, false, false, false, false, false };
++
++	//! Sphere: centre in the shape's local space, radius in metres.
++	Vec3  sphereCentre = ZERO;
++	float sphereRadius = 0.0f;
++
++	//! Polygon: the scalars beside the contour. Height 0 means "infinite in Z", which is what a
++	//! legacy shape with mv_height == 0 means to CArea.
++	float height = 0.0f;
++	bool  closed = true;
++	bool  obstructRoof = false;
++	bool  obstructFloor = false;
++};
++
+ //! The contract every shape kind implements. All queries take and return WORLD space unless the
+ //! name says otherwise; the implementation owns the local-to-world transform (entity transform
+ //! composed with the component's own offset), so callers never repeat that maths.
+@@ -159,6 +201,26 @@ struct IShapeComponent : public IEditorShapeComponent
+ 	//! the kind does not offer them (only the spline shape answers GetSpline).
+ 	virtual ISplineShape*        GetSpline()        { return nullptr; }
+ 	virtual IShapeComponentEdit* GetEditInterface() { return nullptr; }
++
++	// --- appended 2026-09-11 with the Area function component (stage 2). Append-only from here
++	// on, and never pure: a kind that cannot answer keeps the default and says so by returning
++	// false / 0, which is how the Area component knows to skip it with a warning instead of
++	// building a broken volume.
++
++	//! Describe this shape as a legacy CArea volume, in the shape's LOCAL space. False means the
++	//! kind has no area volume at all (an open spline - a gravity volume is a different function),
++	//! and the caller must not build an area from it.
++	virtual bool GetAreaVolume(SShapeAreaVolume& out) const { return false; }
++
++	//! Per-EDGE sound obstruction for a polygon-shaped volume, one flag per contour point, for the
++	//! wall that STARTS at that point - the same ordering GetContour() uses and the same ordering
++	//! CArea::SetSoundObstructionOnAreaFace() indexes shape segments with. Roof and floor are not
++	//! in here; they are two scalars on SShapeAreaVolume.
++	//!
++	//! The buffer belongs to the caller (heap rule at the top of this header). At most `maxFlags`
++	//! flags are written; the return value is how many the shape HAS. Kinds without per-edge
++	//! obstruction answer 0 and the caller treats every edge as non-obstructing.
++	virtual int GetContourObstruction(bool* pOutFlags, int maxFlags) const { return 0; }
+ };
+ 
+ //! Convenience wrapper around IShapeComponent::GetContour for callers that want a vector. Inline on
+diff --git a/Code/CryPlugins/AreaComponents/Module/CMakeLists.txt b/Code/CryPlugins/AreaComponents/Module/CMakeLists.txt
+index 686f09b8..844c33bb 100644
+--- a/Code/CryPlugins/AreaComponents/Module/CMakeLists.txt
++++ b/Code/CryPlugins/AreaComponents/Module/CMakeLists.txt
+@@ -10,6 +10,7 @@ add_sources("AreaComponents_uber_0.cpp"
+ 		"resource.h"
+ 	SOURCE_GROUP "Interface"
+ 		"../Interface/IShapeComponent.h"
++		"../Interface/IAreaFunctionComponent.h"
+ 	SOURCE_GROUP "Shapes"
+ 		"Shapes/ShapeGeometry.h"
+ 		"Shapes/ShapeKinds.h"
+@@ -20,6 +21,16 @@ add_sources("AreaComponents_uber_0.cpp"
+ 		"Shapes/PolygonShapeComponent.cpp"
+ 		"Shapes/SphereShapeComponent.h"
+ 		"Shapes/SphereShapeComponent.cpp"
++		"Shapes/SplineMath.h"
++		"Shapes/SplineShapeComponent.h"
++		"Shapes/SplineShapeComponent.cpp"
++	SOURCE_GROUP "Functions"
++		"Functions/AreaFunctionComponent.h"
++		"Functions/AreaFunctionComponent.cpp"
++		"Functions/GravityVolumeComponent.h"
++		"Functions/GravityVolumeComponent.cpp"
++		"Functions/DistributorComponent.h"
++		"Functions/DistributorComponent.cpp"
+ )
+ 
+ end_sources()
+diff --git a/Code/CryPlugins/AreaComponents/Module/Functions/AreaFunctionComponent.cpp b/Code/CryPlugins/AreaComponents/Module/Functions/AreaFunctionComponent.cpp
+new file mode 100644
+index 00000000..17e6776c
+--- /dev/null
++++ b/Code/CryPlugins/AreaComponents/Module/Functions/AreaFunctionComponent.cpp
+@@ -0,0 +1,659 @@
++// Copyright 2026 ReC Sandbox. Distributed under the terms in LICENSE.md at the repository root.
++#include "StdAfx.h"
++#include "AreaFunctionComponent.h"
++
++#include <CryEntitySystem/IEntitySystem.h>
++#include <CryCore/StlUtils.h>
++#include <CrySerialization/STL.h>
++#include <CrySerialization/CryStrings.h>
++
++#include <algorithm>
++
++namespace Cry
++{
++namespace AreaComponents
++{
++
++// ---------------------------------------------------------------------------
++// The link list in the inspector
++// ---------------------------------------------------------------------------
++
++bool Serialize(Serialization::IArchive& archive, SAreaLinks& value, const char* szName, const char* szLabel)
++{
++	if (archive.isEdit())
++	{
++		// A read-only summary, because the list is authored with the two buttons the component
++		// declares as editor actions. Writing nothing here is deliberate: an inspector INPUT pass
++		// must not push the display string back into the GUID list.
++		string text;
++
++		if (value.guids.empty())
++		{
++			text = "(none - use Pick Link Target)";
++		}
++		else
++		{
++			for (const CryGUID& guid : value.guids)
++			{
++				const char* szEntityName = nullptr;
++				if (gEnv->pEntitySystem != nullptr)
++				{
++					const EntityId id = gEnv->pEntitySystem->FindEntityByGuid(guid);
++					if (const IEntity* pEntity = (id != INVALID_ENTITYID) ? gEnv->pEntitySystem->GetEntity(id) : nullptr)
++					{
++						szEntityName = pEntity->GetName();
++					}
++				}
++
++				if (!text.empty())
++				{
++					text += ", ";
++				}
++
++				if (szEntityName != nullptr && szEntityName[0] != '\0')
++				{
++					text += szEntityName;
++				}
++				else
++				{
++					// Not loaded yet - a link into a layer that is not active is still a link.
++					text += "<";
++					text += guid.ToString().c_str();
++					text += ">";
++				}
++			}
++		}
++
++		// The '!' prefix is what makes the property tree render the row read-only.
++		string readOnlyLabel = "!";
++		readOnlyLabel += (szLabel != nullptr) ? szLabel : "Links";
++		archive(text, szName, readOnlyLabel.c_str());
++		return true;
++	}
++
++	return archive(value.guids, szName, szLabel);
++}
++
++// ---------------------------------------------------------------------------
++// The spawn sink: entities that appear after an area resolved its links
++// ---------------------------------------------------------------------------
++
++namespace
++{
++
++//! One sink for the whole module, because IEntitySystem::AddSink is a global registration and a
++//! sink per area component would make every spawn walk every area twice. It only holds components
++//! that still have unresolved link GUIDs, and it is added to the entity system only while that
++//! list is not empty - so a level whose links all resolved pays nothing per spawn.
++class CAreaLinkSpawnSink final : public IEntitySystemSink
++{
++public:
++	static CAreaLinkSpawnSink& Get()
++	{
++		static CAreaLinkSpawnSink s_instance;
++		return s_instance;
++	}
++
++	void Register(CAreaFunctionComponent* pComponent)
++	{
++		if (pComponent == nullptr || stl::find(m_components, pComponent))
++			return;
++
++		m_components.push_back(pComponent);
++
++		if (m_components.size() == 1 && gEnv->pEntitySystem != nullptr)
++		{
++			gEnv->pEntitySystem->AddSink(this, IEntitySystem::OnSpawn);
++		}
++	}
++
++	void Unregister(CAreaFunctionComponent* pComponent)
++	{
++		if (!stl::find_and_erase(m_components, pComponent))
++			return;
++
++		if (m_components.empty() && gEnv->pEntitySystem != nullptr)
++		{
++			gEnv->pEntitySystem->RemoveSink(this);
++		}
++	}
++
++	// IEntitySystemSink
++	virtual bool OnBeforeSpawn(SEntitySpawnParams& params) override { return true; }
++
++	virtual void OnSpawn(IEntity* pEntity, SEntitySpawnParams& params) override
++	{
++		if (pEntity == nullptr || params.guid.IsNull())
++			return;
++
++		// Copy first: a component may unregister itself while being told.
++		const std::vector<CAreaFunctionComponent*> components = m_components;
++		for (CAreaFunctionComponent* pComponent : components)
++		{
++			pComponent->OnEntitySpawned(pEntity->GetId(), params.guid);
++		}
++	}
++
++	virtual bool OnRemove(IEntity* pEntity) override                       { return true; }
++	virtual void OnReused(IEntity* pEntity, SEntitySpawnParams& params) override {}
++	// ~IEntitySystemSink
++
++private:
++	std::vector<CAreaFunctionComponent*> m_components;
++};
++
++} // anonymous namespace
++
++// ---------------------------------------------------------------------------
++// Registration
++// ---------------------------------------------------------------------------
++
++void CAreaFunctionComponent::Register(Schematyc::CEnvRegistrationScope& componentScope)
++{
++	// No Schematyc functions yet.
++}
++
++// ---------------------------------------------------------------------------
++// Lifetime
++// ---------------------------------------------------------------------------
++
++void CAreaFunctionComponent::Initialize()
++{
++	EnsureBound();
++}
++
++void CAreaFunctionComponent::OnShutDown()
++{
++	UnbindShape();
++
++	if (m_bRegisteredWithSpawnSink)
++	{
++		CAreaLinkSpawnSink::Get().Unregister(this);
++		m_bRegisteredWithSpawnSink = false;
++	}
++
++	m_resolvedLinks.clear();
++}
++
++Cry::Entity::EventFlags CAreaFunctionComponent::GetEventMask() const
++{
++	// Deliberately NO ENTITY_EVENT_UPDATE: an idle area costs nothing per frame. The entity's own
++	// movement is handled by the legacy proxy's OnMove (the cheap per-kind push), so XFORM is only
++	// subscribed to give an unbound component a chance to find a shape that was added after it.
++	return ENTITY_EVENT_COMPONENT_PROPERTY_CHANGED
++	       | ENTITY_EVENT_XFORM
++	       | ENTITY_EVENT_RESET
++	       | ENTITY_EVENT_LEVEL_LOADED
++	       | ENTITY_EVENT_START_GAME
++	       | ENTITY_EVENT_LAYER_UNHIDE;
++}
++
++void CAreaFunctionComponent::ProcessEvent(const SEntityEvent& event)
++{
++	switch (event.event)
++	{
++	case ENTITY_EVENT_XFORM:
++		// The legacy proxy moves the area itself on this event (MovePoints for a shape, SetMatrix
++		// for a box, SetSphere for a sphere - the three cheap paths), and its local geometry is
++		// exactly what we pushed, so there is nothing to do here except notice a shape that was
++		// added after us. There is no entity event for "a component was added".
++		if (!m_bBoundToShape)
++		{
++			EnsureBound();
++		}
++		break;
++
++	case ENTITY_EVENT_COMPONENT_PROPERTY_CHANGED:
++		// IEntityAreaComponent::SetPoints() broadcasts this event to the whole entity, so without
++		// the guard our own push would come straight back to us.
++		if (!m_bPushing)
++		{
++			EnsureBound();
++			PushAreaProperties();
++		}
++		break;
++
++	case ENTITY_EVENT_RESET:
++		// Entering or leaving game mode. The hidden proxy is not UserAdded, so the editor's
++		// component cache does not snapshot and restore it - everything has to be re-pushed.
++		EnsureBound();
++		PushVolume();
++		ResolveLinks();
++		break;
++
++	case ENTITY_EVENT_LEVEL_LOADED:
++	case ENTITY_EVENT_START_GAME:
++		// The per-entity equivalent of the instant CArea::ResolveEntityIds runs at.
++		EnsureBound();
++		ResolveLinks();
++		break;
++
++	case ENTITY_EVENT_LAYER_UNHIDE:
++		// A layer that was not active at load time has just brought its entities in. Legacy links
++		// never recover from this (CArea resolves once, guarded by EAreaState::EntityIdsResolved);
++		// ours do.
++		ResolveLinks();
++		break;
++
++	default:
++		break;
++	}
++}
++
++// ---------------------------------------------------------------------------
++// Binding
++// ---------------------------------------------------------------------------
++
++IShapeComponent* CAreaFunctionComponent::FindShape() const
++{
++	IEntity* pEntity = GetEntity();
++	if (pEntity == nullptr)
++		return nullptr;
++
++	IEntityComponent* pComponent = pEntity->QueryComponentByInterfaceID(Schematyc::GetTypeDesc<IShapeComponent>().GetGUID());
++	if (pComponent == nullptr)
++		return nullptr;
++
++	return static_cast<IShapeComponent*>(pComponent);
++}
++
++IEntityAreaComponent* CAreaFunctionComponent::FindAreaProxy() const
++{
++	if (m_areaProxyGuid.IsNull())
++		return nullptr;
++
++	IEntity* pEntity = GetEntity();
++	if (pEntity == nullptr)
++		return nullptr;
++
++	return static_cast<IEntityAreaComponent*>(pEntity->GetComponentByGUID(m_areaProxyGuid));
++}
++
++void CAreaFunctionComponent::EnsureBound()
++{
++	IEntity* pEntity = GetEntity();
++	if (pEntity == nullptr)
++		return;
++
++	IShapeComponent* pShape = FindShape();
++
++	if (pShape == nullptr)
++	{
++		UnbindShape();
++
++		if (!m_bWarnedNoShape)
++		{
++			m_bWarnedNoShape = true;
++			CryWarning(VALIDATOR_MODULE_ENTITYSYSTEM, VALIDATOR_WARNING,
++			           "Area on entity \"%s\" has no shape component - add one (Add Component -> Area -> Shape: Box / Sphere / Polygon) "
++			           "and the area takes its volume from it.", pEntity->GetName());
++		}
++		return;
++	}
++
++	m_bWarnedNoShape = false;
++
++	// The hidden legacy area proxy. It is created once, here, and never again: the point of
++	// remembering its GUID is that "is there already an area proxy on this entity?" and "is it
++	// OURS?" are two different questions. An entity that already carried one when we arrived is a
++	// legacy area object, and taking it over would silently stop its <Area> node being saved.
++	if (m_areaProxyGuid.IsNull())
++	{
++		if (pEntity->GetComponent<IEntityAreaComponent>() != nullptr)
++		{
++			if (!m_bWarnedLegacyProxy)
++			{
++				m_bWarnedLegacyProxy = true;
++				CryWarning(VALIDATOR_MODULE_ENTITYSYSTEM, VALIDATOR_WARNING,
++				           "Area on entity \"%s\" found an existing legacy area proxy and did nothing: that entity is already a legacy "
++				           "area object. Put the Area component on an entity of its own.", pEntity->GetName());
++			}
++			return;
++		}
++
++		IEntityAreaComponent* pArea = pEntity->GetOrCreateComponent<IEntityAreaComponent>();
++		if (pArea == nullptr)
++			return;
++
++		// NoSave keeps the level free of a second copy of the geometry: CEntity::SerializeXML
++		// skips NoSave components entirely, so no <Area> node is written and the privileged
++		// <Area> hook in EntityLoadManager has nothing to re-create on the next load.
++		// FLAG_NOT_SERIALIZE makes the proxy's own LegacySerializeXML early-out as well, which
++		// covers the paths that reach it without going through the save loop.
++		pArea->GetComponentFlags().Add(EEntityComponentFlags::NoSave);
++		pArea->SetFlags(pArea->GetFlags() | IEntityAreaComponent::FLAG_NOT_SERIALIZE);
++
++		m_areaProxyGuid = pArea->GetGUID();
++	}
++
++	if (!m_bBoundToShape)
++	{
++		pShape->AddListener(this);
++		m_bBoundToShape = true;
++
++		PushVolume();
++		ResolveLinks();
++	}
++
++	if (!m_bRegisteredWithSpawnSink)
++	{
++		CAreaLinkSpawnSink::Get().Register(this);
++		m_bRegisteredWithSpawnSink = true;
++	}
++}
++
++void CAreaFunctionComponent::UnbindShape()
++{
++	if (!m_bBoundToShape)
++		return;
++
++	// Re-queried, never cached: if the shape is already gone there is nothing to unregister from.
++	if (IShapeComponent* pShape = FindShape())
++	{
++		pShape->RemoveListener(this);
++	}
++
++	m_bBoundToShape = false;
++}
++
++void CAreaFunctionComponent::OnShapeChanged(IShapeComponent& shape, EShapeChangeReason reason)
++{
++	if (m_bPushing)
++		return;
++
++	switch (reason)
++	{
++	case EShapeChangeReason::Transform:
++		// Handled by the legacy proxy's own OnMove - see ProcessEvent(ENTITY_EVENT_XFORM).
++		break;
++	case EShapeChangeReason::Geometry:
++		PushGeometry();
++		break;
++	case EShapeChangeReason::Topology:
++	default:
++		PushVolume();
++		break;
++	}
++}
++
++// ---------------------------------------------------------------------------
++// Pushing into the area
++// ---------------------------------------------------------------------------
++
++void CAreaFunctionComponent::PushVolume()
++{
++	IShapeComponent*      pShape = FindShape();
++	IEntityAreaComponent* pArea = FindAreaProxy();
++	if (pShape == nullptr || pArea == nullptr)
++		return;
++
++	SShapeAreaVolume volume;
++	if (!pShape->GetAreaVolume(volume))
++	{
++		if (!m_bWarnedNoVolume)
++		{
++			m_bWarnedNoVolume = true;
++			CryWarning(VALIDATOR_MODULE_ENTITYSYSTEM, VALIDATOR_WARNING,
++			           "Area on entity \"%s\": this shape kind has no area volume, so no area was built. A spline is a path, not a "
++			           "volume - use the gravity volume or the distributor function on it instead.",
++			           GetEntity() != nullptr ? GetEntity()->GetName() : "<none>");
++		}
++		return;
++	}
++
++	m_bWarnedNoVolume = false;
++	m_bPushing = true;
++
++	switch (volume.form)
++	{
++	case EAreaVolumeForm::Box:
++		pArea->SetBox(volume.boxMin, volume.boxMax, volume.boxObstruct, 6);
++		break;
++
++	case EAreaVolumeForm::Sphere:
++		pArea->SetSphere(volume.sphereCentre, volume.sphereRadius);
++		break;
++
++	case EAreaVolumeForm::Polygon:
++		{
++			Vec3 points[kMaxStackPoints];
++			int  pointCount = min(pShape->GetContour(points, kMaxStackPoints, false), kMaxStackPoints);
++
++			if (pointCount > 1)
++			{
++				// n edge flags plus "Roof" and "Floor", which is exactly the layout
++				// CArea::SetPoints expects (AreaProxy.cpp packs the same n + 2 array).
++				bool obstruction[kMaxStackPoints + 2] = { false };
++				pShape->GetContourObstruction(obstruction, pointCount);
++				obstruction[pointCount] = volume.obstructRoof;
++				obstruction[pointCount + 1] = volume.obstructFloor;
++
++				pArea->SetPoints(points, obstruction, static_cast<size_t>(pointCount), volume.closed, volume.height);
++			}
++		}
++		break;
++	}
++
++	m_bPushing = false;
++
++	PushAreaProperties();
++	AttachSelf();
++}
++
++void CAreaFunctionComponent::PushGeometry()
++{
++	IShapeComponent*      pShape = FindShape();
++	IEntityAreaComponent* pArea = FindAreaProxy();
++	if (pShape == nullptr || pArea == nullptr)
++		return;
++
++	SShapeAreaVolume volume;
++	if (!pShape->GetAreaVolume(volume))
++		return;
++
++	m_bPushing = true;
++
++	switch (volume.form)
++	{
++	case EAreaVolumeForm::Sphere:
++		// One field assignment plus a grid update - there is no cheaper path and no need for one.
++		pArea->SetSphere(volume.sphereCentre, volume.sphereRadius);
++		m_bPushing = false;
++		break;
++
++	case EAreaVolumeForm::Polygon:
++		{
++			Vec3 points[kMaxStackPoints];
++			int  pointCount = min(pShape->GetContour(points, kMaxStackPoints, false), kMaxStackPoints);
++
++			if (pointCount > 1 && pointCount == pArea->GetPointsCount())
++			{
++				// The cheap path: same point count, so the segments are updated in place instead
++				// of being released and rebuilt, and the per-entity containment cache survives.
++				pArea->MovePoints(points, static_cast<size_t>(pointCount));
++				m_bPushing = false;
++			}
++			else
++			{
++				m_bPushing = false;
++				PushVolume();
++			}
++		}
++		break;
++
++	case EAreaVolumeForm::Box:
++	default:
++		// A box area is local geometry plus a world matrix, and SetBox is the only route to
++		// either through the public interface.
++		m_bPushing = false;
++		PushVolume();
++		break;
++	}
++}
++
++void CAreaFunctionComponent::PushAreaProperties()
++{
++	IEntityAreaComponent* pArea = FindAreaProxy();
++	if (pArea == nullptr)
++		return;
++
++	pArea->SetID(m_areaId);
++	pArea->SetGroup(m_group);
++	pArea->SetPriority(m_priority);
++	pArea->SetInnerFadeDistance(m_innerFadeDistance);
++
++	// The authored near band. Before this existed an area could only have one if an entity with an
++	// audio component was linked to it - see IEntityAreaComponent::SetFadeDistance.
++	pArea->SetFadeDistance(m_fadeDistance);
++}
++
++void CAreaFunctionComponent::AttachSelf()
++{
++	IEntity*              pEntity = GetEntity();
++	IEntityAreaComponent* pArea = FindAreaProxy();
++	if (pEntity == nullptr || pArea == nullptr)
++		return;
++
++	// The host entity in its own area's attached list. CArea::AddEntity de-duplicates, so calling
++	// this on every volume push is safe. This is what makes the stock audio Environment and Area
++	// components work when they are added to THIS entity: neither of them ever looks for a shape,
++	// they only require that their entity receives the area's events.
++	pArea->AddEntity(pEntity->GetId());
++}
++
++// ---------------------------------------------------------------------------
++// Links
++// ---------------------------------------------------------------------------
++
++int CAreaFunctionComponent::GetLinkCount() const
++{
++	return static_cast<int>(m_links.guids.size());
++}
++
++CryGUID CAreaFunctionComponent::GetLink(int index) const
++{
++	if (index < 0 || index >= static_cast<int>(m_links.guids.size()))
++		return CryGUID::Null();
++
++	return m_links.guids[index];
++}
++
++bool CAreaFunctionComponent::AddLinkTarget(const CryGUID& entityGuid)
++{
++	if (entityGuid.IsNull())
++		return false;
++
++	if (std::find(m_links.guids.begin(), m_links.guids.end(), entityGuid) != m_links.guids.end())
++		return false;
++
++	m_links.guids.push_back(entityGuid);
++	ResolveLinks();
++	return true;
++}
++
++bool CAreaFunctionComponent::ClearLinks()
++{
++	if (m_links.guids.empty())
++		return false;
++
++	m_links.guids.clear();
++	ResolveLinks();
++	return true;
++}
++
++bool CAreaFunctionComponent::HasUnresolvedLinks() const
++{
++	return m_unresolvedLinkCount > 0;
++}
++
++void CAreaFunctionComponent::ResolveLinks()
++{
++	IEntityAreaComponent* pArea = FindAreaProxy();
++	if (pArea == nullptr || gEnv->pEntitySystem == nullptr)
++		return;
++
++	std::vector<EntityId> wanted;
++	wanted.reserve(m_links.guids.size());
++
++	int unresolvedCount = 0;
++	for (const CryGUID& guid : m_links.guids)
++	{
++		const EntityId id = gEnv->pEntitySystem->FindEntityByGuid(guid);
++		if (id != INVALID_ENTITYID)
++		{
++			if (!stl::find(wanted, id))
++			{
++				wanted.push_back(id);
++			}
++		}
++		else
++		{
++			++unresolvedCount;
++		}
++	}
++
++	// Detach what is no longer linked, attach what is new. Never twice: AddEntity de-duplicates
++	// inside CArea as well, but doing it here keeps the ATTACH_THIS events down to the real
++	// changes.
++	for (const EntityId id : m_resolvedLinks)
++	{
++		if (!stl::find(wanted, id))
++		{
++			pArea->RemoveEntity(id);
++		}
++	}
++
++	for (const EntityId id : wanted)
++	{
++		if (!stl::find(m_resolvedLinks, id))
++		{
++			pArea->AddEntity(id);
++		}
++	}
++
++	m_resolvedLinks = wanted;
++	m_unresolvedLinkCount = unresolvedCount;
++}
++
++void CAreaFunctionComponent::OnEntitySpawned(EntityId spawnedId, const CryGUID& spawnedGuid)
++{
++	if (m_unresolvedLinkCount <= 0 || spawnedId == INVALID_ENTITYID || spawnedGuid.IsNull())
++		return;
++
++	if (std::find(m_links.guids.begin(), m_links.guids.end(), spawnedGuid) == m_links.guids.end())
++		return;
++
++	if (stl::find(m_resolvedLinks, spawnedId))
++		return;
++
++	if (IEntityAreaComponent* pArea = FindAreaProxy())
++	{
++		pArea->AddEntity(spawnedId);
++		m_resolvedLinks.push_back(spawnedId);
++		--m_unresolvedLinkCount;
++	}
++}
++
++// ---------------------------------------------------------------------------
++// Editor actions
++// ---------------------------------------------------------------------------
++
++bool CAreaFunctionComponent::GetEditorAction(int index, SEditorActionDesc& out) const
++{
++	switch (index)
++	{
++	case 0:
++		out.szToolClassName = "EditTool.AreaPickLinkTarget";
++		out.szLabel = "Pick Link Target";
++		return true;
++	case 1:
++		out.szToolClassName = "EditTool.AreaClearLinks";
++		out.szLabel = "Clear Links";
++		return true;
++	default:
++		return false;
++	}
++}
++
++} // namespace AreaComponents
++} // namespace Cry
+diff --git a/Code/CryPlugins/AreaComponents/Module/Functions/AreaFunctionComponent.h b/Code/CryPlugins/AreaComponents/Module/Functions/AreaFunctionComponent.h
+new file mode 100644
+index 00000000..4545889f
+--- /dev/null
++++ b/Code/CryPlugins/AreaComponents/Module/Functions/AreaFunctionComponent.h
+@@ -0,0 +1,199 @@
++// Copyright 2026 ReC Sandbox. Distributed under the terms in LICENSE.md at the repository root.
++#pragma once
++
++#include "../../Interface/IShapeComponent.h"
++#include "../../Interface/IAreaFunctionComponent.h"
++
++#include <CrySchematyc/MathTypes.h>
++#include <CrySchematyc/Reflection/TypeDesc.h>
++#include <CrySchematyc/Env/IEnvRegistrar.h>
++#include <CrySerialization/IArchive.h>
++
++#include <vector>
++
++namespace Cry
++{
++namespace AreaComponents
++{
++
++//! The authored link list: the entities that receive the six area events. A reflected std::vector
++//! needs a wrapper with its own GUID, an operator== (the inspector and the game-mode property
++//! round trip compare whole members) and a free Serialize - the SShapesArray pattern of
++//! CAINavigationMarkupShapeComponent, and the same one SPolygonPoints uses.
++//!
++//! GUIDs, not EntityIds: an EntityId is not stable across a save, and the GUID is exactly what the
++//! legacy <Area><Entities><Entity GUID=.../> node stores, so the two are directly comparable.
++//! No raw pointers live in here - MEMORY.md, fix bde12cd8: reflected values are copied into
++//! scratchpads by CClassProperties::Read/Apply and outlive the component.
++struct SAreaLinks
++{
++	static void ReflectType(Schematyc::CTypeDesc<SAreaLinks>& desc)
++	{
++		desc.SetGUID("{B4E27C09-8A16-4D53-9C70-1F5D3E8A4610}"_cry_guid);
++		desc.SetLabel("Area Links");
++	}
++
++	bool operator==(const SAreaLinks& other) const { return guids == other.guids; }
++	bool operator!=(const SAreaLinks& other) const { return !(*this == other); }
++
++	std::vector<CryGUID> guids;
++};
++
++//! Save and load write the GUID list; the inspector shows a read-only summary instead, because the
++//! list is authored with the "Pick Link Target" / "Clear Links" buttons the component declares as
++//! editor actions, not by typing GUIDs. Writing nothing in edit mode is also what keeps an
++//! inspector input pass from clobbering the list with whatever the read-only row contained.
++bool Serialize(Serialization::IArchive& archive, SAreaLinks& value, const char* szName, const char* szLabel);
++
++//! "Area": the semantics that used to be baked into every legacy area object - an id, a group, a
++//! priority, a near band, an inner fade and a list of linked entities - as one function component
++//! that takes its VOLUME from whatever shape component sits on the same entity (decision 01: one
++//! shape per entity, function components bind by rule).
++//!
++//! Underneath it owns a hidden legacy IEntityAreaComponent (research/07 option 1a). That is
++//! deliberate and is the whole reason the six area events, the exclusive-group fade, the broad-
++//! phase grid, ExitAllAreas on teardown and every existing consumer that looks an area up with
++//! GetProxy(ENTITY_PROXY_AREA) - particles, the physics spline area, the audio components - keep
++//! working without a single line of theirs changing. The hidden proxy is flagged NoSave, so the
++//! level never contains two copies of the geometry and the privileged <Area> loader hook never
++//! re-creates it.
++//!
++//! It also ATTACHES ITS OWN ENTITY to that area (CArea::AddEntity(own id), the BoidsProxy
++//! precedent). That is what lets the stock audio Environment and Area components work when they
++//! are added to this same entity: they never look for a shape, they only require that their entity
++//! is in some area's attached list. The self-move trap that comes with it is fixed in the engine -
++//! see the IsSelfHostedArea guard in EntityAudioProxy.cpp and DefaultComponents/Audio/AreaComponent.cpp.
++class CAreaFunctionComponent final
++	: public IAreaFunctionComponent
++	, public IShapeListener
++{
++public:
++	CAreaFunctionComponent() = default;
++	virtual ~CAreaFunctionComponent() = default;
++
++	static void Register(Schematyc::CEnvRegistrationScope& componentScope);
++
++	static void ReflectType(Schematyc::CTypeDesc<CAreaFunctionComponent>& desc)
++	{
++		desc.SetGUID("{6C3A81D5-0F47-4E9A-B4D1-72E5C8A96210}"_cry_guid);
++		desc.SetEditorCategory("Area");
++		desc.SetLabel("Area");
++		desc.SetDescription("Turns the shape on this entity into an area: it sends enter/leave/fade events to the entities linked below.");
++
++		// Singleton, but NOT incompatible with anything: an entity has one area, and any shape
++		// kind may carry it. The shape it binds to is found by rule, not declared here.
++		desc.SetComponentFlags({ IEntityComponent::EFlags::Singleton });
++
++		// The reflected interface bases - what makes a cross-DLL GetComponent<IAreaFunctionComponent>()
++		// and EditorQt's inspector-action lookup find us (IAreaFunctionComponent.h).
++		desc.AddBase<IAreaFunctionComponent>();
++		desc.AddBase<IEditorActionComponent>();
++
++		desc.AddMember(&CAreaFunctionComponent::m_areaId, 'arid', "AreaId", "Area Id", "Id handed to the linked entities with every area event", 0);
++		desc.AddMember(&CAreaFunctionComponent::m_group, 'grup', "Group", "Group", "Areas sharing a group are exclusive: an entity is only ever in the innermost one. -1 means no group.", -1);
++		desc.AddMember(&CAreaFunctionComponent::m_priority, 'prio', "Priority", "Priority", "Which area of the same group wins where they overlap. Higher wins.", 0);
++		desc.AddMember(&CAreaFunctionComponent::m_fadeDistance, 'fade', "FadeDistance", "Fade Distance", "Width in metres of the near band outside the shape, in which entities get near/fade events. 0 disables it.", 0.0f);
++		desc.AddMember(&CAreaFunctionComponent::m_innerFadeDistance, 'ifad', "InnerFadeDistance", "Inner Fade Distance", "Width in metres inside the shape over which a lower-priority area of the same group fades out.", 0.0f);
++		desc.AddMember(&CAreaFunctionComponent::m_links, 'lnks', "Links", "Links", "Entities that receive this area's events. Authored with the Pick Link Target button.", SAreaLinks());
++	}
++
++	// IAreaFunctionComponent
++	virtual int     GetLinkCount() const override;
++	virtual CryGUID GetLink(int index) const override;
++	virtual bool    AddLinkTarget(const CryGUID& entityGuid) override;
++	virtual bool    ClearLinks() override;
++	// ~IAreaFunctionComponent
++
++	// IEditorActionComponent
++	virtual int  GetEditorActionCount() const override { return 2; }
++	virtual bool GetEditorAction(int index, SEditorActionDesc& out) const override;
++	// ~IEditorActionComponent
++
++	// IShapeListener
++	virtual void OnShapeChanged(IShapeComponent& shape, EShapeChangeReason reason) override;
++	// ~IShapeListener
++
++	//! Called by the module-wide spawn sink when an entity appears after this area resolved its
++	//! links, so that a link to it still takes effect. Public because the sink is not a member.
++	void OnEntitySpawned(EntityId spawnedId, const CryGUID& spawnedGuid);
++	//! Whether this area still has link GUIDs that resolved to nothing - the spawn sink only has
++	//! to visit areas that answer true.
++	bool HasUnresolvedLinks() const;
++
++protected:
++	// IEntityComponent
++	virtual void                    Initialize() override;
++	virtual void                    OnShutDown() override;
++	virtual void                    ProcessEvent(const SEntityEvent& event) override;
++	virtual Cry::Entity::EventFlags GetEventMask() const override;
++	// ~IEntityComponent
++
++private:
++	//! The shape component on this entity, or nullptr. Never cached across a frame: a component
++	//! pointer is not ours to keep (MEMORY.md), and one query of the entity's component list is
++	//! far cheaper than the bugs the alternative buys.
++	IShapeComponent*      FindShape() const;
++	//! The hidden legacy area proxy, or nullptr when we have not created one yet.
++	IEntityAreaComponent* FindAreaProxy() const;
++
++	//! Create the hidden proxy if needed, subscribe to the shape and push everything. Cheap and
++	//! idempotent, so it can be called from every event handler - which is how a shape component
++	//! added AFTER this one still gets picked up (there is no entity event for "a component was
++	//! added").
++	void EnsureBound();
++	void UnbindShape();
++
++	//! Push the whole volume, the expensive path: SetBox / SetSphere / SetPoints plus the
++	//! per-face obstruction. Used on bind, on a topology change and after a game-mode reset.
++	void PushVolume();
++	//! Push moved points only, the cheap path (IEntityAreaComponent::MovePoints). Falls back to
++	//! PushVolume() for kinds and situations the cheap path cannot express.
++	void PushGeometry();
++	//! Push id / group / priority / fade / inner fade.
++	void PushAreaProperties();
++
++	//! Resolve every link GUID to an EntityId and reconcile the proxy's attached list with it.
++	//! Idempotent: an entity that is already attached is never attached twice.
++	void ResolveLinks();
++	//! Attach this entity to its own area, so that sibling function components (the stock audio
++	//! Environment and Area components) receive the area's events.
++	void AttachSelf();
++
++	static constexpr int kMaxStackPoints = 256;
++
++	// --- reflected state ---
++	int        m_areaId = 0;
++	int        m_group = -1;
++	int        m_priority = 0;
++	float      m_fadeDistance = 0.0f;
++	float      m_innerFadeDistance = 0.0f;
++	SAreaLinks m_links;
++
++	// --- runtime state, never reflected ---
++
++	//! GUID of the hidden legacy area proxy we created, so that it can be found again without
++	//! holding a pointer to it. Null when we have not created one.
++	CryGUID m_areaProxyGuid = CryGUID::Null();
++	//! True while we are pushing into the proxy. IEntityAreaComponent::SetPoints() broadcasts
++	//! ENTITY_EVENT_COMPONENT_PROPERTY_CHANGED to the WHOLE entity, which the shape component
++	//! answers with an OnShapeChanged - straight back into us. One flag breaks the loop.
++	bool    m_bPushing = false;
++	//! True while we are registered as a listener of this entity's shape.
++	bool    m_bBoundToShape = false;
++	//! The entity ids currently attached to the area because of m_links (self-attachment is not
++	//! in here). Runtime only: ids, never pointers.
++	std::vector<EntityId> m_resolvedLinks;
++	//! How many link GUIDs did not resolve at the last attempt.
++	int     m_unresolvedLinkCount = 0;
++	//! True once this component has been registered with the module-wide spawn sink.
++	bool    m_bRegisteredWithSpawnSink = false;
++
++	//! Latched warnings - a component with no shape, or with a shape that has no area volume,
++	//! must say so once and then be quiet, not once per frame or per property edit.
++	bool    m_bWarnedNoShape = false;
++	bool    m_bWarnedNoVolume = false;
++	bool    m_bWarnedLegacyProxy = false;
++};
++
++} // namespace AreaComponents
++} // namespace Cry
+diff --git a/Code/CryPlugins/AreaComponents/Module/PluginDll.cpp b/Code/CryPlugins/AreaComponents/Module/PluginDll.cpp
+index 53fd2e68..e304eee5 100644
+--- a/Code/CryPlugins/AreaComponents/Module/PluginDll.cpp
++++ b/Code/CryPlugins/AreaComponents/Module/PluginDll.cpp
+@@ -5,6 +5,11 @@
+ #include "Shapes/BoxShapeComponent.h"
+ #include "Shapes/PolygonShapeComponent.h"
+ #include "Shapes/SphereShapeComponent.h"
++#include "Shapes/SplineShapeComponent.h"
++
++#include "Functions/AreaFunctionComponent.h"
++#include "Functions/GravityVolumeComponent.h"
++#include "Functions/DistributorComponent.h"
+ 
+ #include <CrySchematyc/Env/IEnvRegistry.h>
+ #include <CrySchematyc/Env/EnvPackage.h>
+@@ -80,6 +85,22 @@ void CAreaComponentsPlugin::RegisterComponents(Schematyc::IEnvRegistrar& registr
+ 		Schematyc::CEnvRegistrationScope componentScope = scope.Register(SCHEMATYC_MAKE_ENV_COMPONENT(CSphereShapeComponent));
+ 		CSphereShapeComponent::Register(componentScope);
+ 	}
++	{
++		Schematyc::CEnvRegistrationScope componentScope = scope.Register(SCHEMATYC_MAKE_ENV_COMPONENT(CSplineShapeComponent));
++		CSplineShapeComponent::Register(componentScope);
++	}
++	{
++		Schematyc::CEnvRegistrationScope componentScope = scope.Register(SCHEMATYC_MAKE_ENV_COMPONENT(CAreaFunctionComponent));
++		CAreaFunctionComponent::Register(componentScope);
++	}
++	{
++		Schematyc::CEnvRegistrationScope componentScope = scope.Register(SCHEMATYC_MAKE_ENV_COMPONENT(CGravityVolumeComponent));
++		CGravityVolumeComponent::Register(componentScope);
++	}
++	{
++		Schematyc::CEnvRegistrationScope componentScope = scope.Register(SCHEMATYC_MAKE_ENV_COMPONENT(CDistributorComponent));
++		CDistributorComponent::Register(componentScope);
++	}
+ }
+ 
+ CRYREGISTER_SINGLETON_CLASS(CAreaComponentsPlugin)
+diff --git a/Code/CryPlugins/AreaComponents/Module/Shapes/BoxShapeComponent.cpp b/Code/CryPlugins/AreaComponents/Module/Shapes/BoxShapeComponent.cpp
+index 9bc45cff..535b10e7 100644
+--- a/Code/CryPlugins/AreaComponents/Module/Shapes/BoxShapeComponent.cpp
++++ b/Code/CryPlugins/AreaComponents/Module/Shapes/BoxShapeComponent.cpp
+@@ -103,6 +103,25 @@ bool CBoxShapeComponent::GetRandomPointInside(Vec3& out) const
+ 	return true;
+ }
+ 
++bool CBoxShapeComponent::GetAreaVolume(SShapeAreaVolume& out) const
++{
++	// A box maps straight onto ENTITY_AREA_TYPE_BOX: local min/max plus the entity's world matrix,
++	// which is the one legacy area type whose containment stays correct under a non-uniform scale
++	// (CArea keeps the local geometry and inverts the matrix instead of baking world points).
++	const Vec3 half = m_size * 0.5f;
++
++	out.form = EAreaVolumeForm::Box;
++	out.boxMin = m_offset - half;
++	out.boxMax = m_offset + half;
++
++	// Per-side obstruction is not authored on the box shape yet (the polygon carries it per edge);
++	// six non-obstructing sides is what a legacy AreaBox has until someone ticks a side.
++	for (int i = 0; i < 6; ++i)
++		out.boxObstruct[i] = false;
++
++	return true;
++}
++
+ int CBoxShapeComponent::GetContour(Vec3* pOutPoints, int maxPoints, bool world) const
+ {
+ 	// The footprint: the four bottom corners, counter-clockwise seen from above. The closing edge
+diff --git a/Code/CryPlugins/AreaComponents/Module/Shapes/BoxShapeComponent.h b/Code/CryPlugins/AreaComponents/Module/Shapes/BoxShapeComponent.h
+index 9332a35d..9cc06147 100644
+--- a/Code/CryPlugins/AreaComponents/Module/Shapes/BoxShapeComponent.h
++++ b/Code/CryPlugins/AreaComponents/Module/Shapes/BoxShapeComponent.h
+@@ -75,6 +75,7 @@ public:
+ 	virtual void  RemoveListener(IShapeListener* pListener) override;
+ 
+ 	virtual IShapeComponentEdit* GetEditInterface() override { return this; }
++	virtual bool                 GetAreaVolume(SShapeAreaVolume& out) const override;
+ 	// ~IShapeComponent
+ 
+ 	// IEditorShapeComponent
+diff --git a/Code/CryPlugins/AreaComponents/Module/Shapes/PolygonShapeComponent.cpp b/Code/CryPlugins/AreaComponents/Module/Shapes/PolygonShapeComponent.cpp
+index 32855c70..3048d2cd 100644
+--- a/Code/CryPlugins/AreaComponents/Module/Shapes/PolygonShapeComponent.cpp
++++ b/Code/CryPlugins/AreaComponents/Module/Shapes/PolygonShapeComponent.cpp
+@@ -273,6 +273,40 @@ bool CPolygonShapeComponent::GetRandomPointInside(Vec3& out) const
+ 	return false;
+ }
+ 
++bool CPolygonShapeComponent::GetAreaVolume(SShapeAreaVolume& out) const
++{
++	// A closed polygon is ENTITY_AREA_TYPE_SHAPE. An OPEN one has no interior - IsPointInside()
++	// already answers false for it, and CArea says the same (an unclosed shape is never inside) -
++	// but it is still a legal area: legacy shapes carry the closed flag straight through to
++	// CArea::SetPoints(), so the flag travels and the caller does not special-case it.
++	if (m_points.points.size() < 2)
++		return false;
++
++	out.form = EAreaVolumeForm::Polygon;
++	out.height = m_height;
++	out.closed = m_closed;
++	out.obstructRoof = m_obstructRoof;
++	out.obstructFloor = m_obstructFloor;
++
++	return true;
++}
++
++int CPolygonShapeComponent::GetContourObstruction(bool* pOutFlags, int maxFlags) const
++{
++	// One flag per point, for the wall that STARTS at it - the same ordering GetContour() writes
++	// its points in, and the ordering CArea indexes shape segments with. The buffer is the
++	// caller's (heap rule, IShapeComponent.h): nothing is allocated here.
++	const int totalFlags = static_cast<int>(m_points.points.size());
++	if (pOutFlags == nullptr || maxFlags <= 0)
++		return totalFlags;
++
++	const int writtenFlags = min(maxFlags, totalFlags);
++	for (int i = 0; i < writtenFlags; ++i)
++		pOutFlags[i] = m_points.points[i].obstructSound;
++
++	return totalFlags;
++}
++
+ int CPolygonShapeComponent::GetContour(Vec3* pOutPoints, int maxPoints, bool world) const
+ {
+ 	// The buffer belongs to the caller (heap rule, IShapeComponent.h): nothing is allocated here,
+diff --git a/Code/CryPlugins/AreaComponents/Module/Shapes/PolygonShapeComponent.h b/Code/CryPlugins/AreaComponents/Module/Shapes/PolygonShapeComponent.h
+index 5992eda9..095d20c0 100644
+--- a/Code/CryPlugins/AreaComponents/Module/Shapes/PolygonShapeComponent.h
++++ b/Code/CryPlugins/AreaComponents/Module/Shapes/PolygonShapeComponent.h
+@@ -136,6 +136,8 @@ public:
+ 	virtual void  RemoveListener(IShapeListener* pListener) override;
+ 
+ 	virtual IShapeComponentEdit* GetEditInterface() override { return this; }
++	virtual bool                 GetAreaVolume(SShapeAreaVolume& out) const override;
++	virtual int                  GetContourObstruction(bool* pOutFlags, int maxFlags) const override;
+ 	// ~IShapeComponent
+ 
+ 	// IEditorShapeComponent
+diff --git a/Code/CryPlugins/AreaComponents/Module/Shapes/SphereShapeComponent.cpp b/Code/CryPlugins/AreaComponents/Module/Shapes/SphereShapeComponent.cpp
+index af4aaafb..ad14b363 100644
+--- a/Code/CryPlugins/AreaComponents/Module/Shapes/SphereShapeComponent.cpp
++++ b/Code/CryPlugins/AreaComponents/Module/Shapes/SphereShapeComponent.cpp
+@@ -138,6 +138,22 @@ bool CSphereShapeComponent::GetRandomPointInside(Vec3& out) const
+ 	return true;
+ }
+ 
++bool CSphereShapeComponent::GetAreaVolume(SShapeAreaVolume& out) const
++{
++	out.form = EAreaVolumeForm::Sphere;
++
++	// The centre is local - IEntityAreaComponent::SetSphere() puts it through the entity's world
++	// matrix itself. The RADIUS is the world radius, not the authored one: legacy never scales a
++	// sphere area's radius (AreaProxy.cpp), so a scaled legacy sphere area and its drawn shape
++	// disagree. Feeding the world radius is what keeps the area exactly the ball this component
++	// draws, tests and reports distances against under any uniform scale, and it applies the same
++	// largest-axis rule the rest of this component uses for a non-uniform one.
++	out.sphereCentre = m_offset;
++	out.sphereRadius = GetWorldRadius();
++
++	return true;
++}
++
+ int CSphereShapeComponent::GetContour(Vec3* pOutPoints, int maxPoints, bool world) const
+ {
+ 	// A sphere has no footprint in the sense a polygon has one, and the contract owes every
+diff --git a/Code/CryPlugins/AreaComponents/Module/Shapes/SphereShapeComponent.h b/Code/CryPlugins/AreaComponents/Module/Shapes/SphereShapeComponent.h
+index de5f7891..f3d8d975 100644
+--- a/Code/CryPlugins/AreaComponents/Module/Shapes/SphereShapeComponent.h
++++ b/Code/CryPlugins/AreaComponents/Module/Shapes/SphereShapeComponent.h
+@@ -76,6 +76,7 @@ public:
+ 	virtual void  RemoveListener(IShapeListener* pListener) override;
+ 
+ 	virtual IShapeComponentEdit* GetEditInterface() override { return this; }
++	virtual bool                 GetAreaVolume(SShapeAreaVolume& out) const override;
+ 	// ~IShapeComponent
+ 
+ 	// IEditorShapeComponent
+-- 
+2.47.1.windows.1
+

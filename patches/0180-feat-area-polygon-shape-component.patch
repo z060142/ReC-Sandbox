@@ -1,0 +1,1224 @@
+From 4448fac757681878827671befaf0cb0ec0fdd913 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Fri, 11 Sep 2026 22:56:02 +0800
+Subject: [PATCH 180/209] feat(area): polygon shape component
+
+CPolygonShapeComponent is the component form of EditorQt's CShapeObject, minus
+everything that was area semantics: a point list in the component's local space,
+a Height that extrudes it (0 = infinite in Z, what a legacy shape with
+mv_height == 0 means to CArea), a Closed flag, an Offset, and per-face sound
+obstruction.
+
+Per decision 03, obstruction lives on the point struct (SPolygonPoint { Vec3
+pos; bool obstructSound; }) instead of in a parallel std::vector<bool> the way
+legacy does it (ShapeObject.h:246): one point, one flag, so no insert or remove
+can desync the two lists. Roof and floor are two members on the component.
+The point list is reflected as SPolygonPoints, the GUID + operator== + free
+Serialize wrapper a std::vector member needs (research/04 section 5.3, the
+CAINavigationMarkupShapeComponent::SShapesArray pattern).
+
+The contract is implemented in full: point-in-polygon on XY plus the height
+band for containment (floor = the lowest point's Z, Area.cpp:2298-2302), a
+prism signed-distance field for DistanceToHull, ray versus walls and caps,
+rejection sampling in the footprint AABB for a random point, the points as the
+contour, and listeners with the coarsest EShapeChangeReason a gesture produced.
+ENTITY_EVENT_XFORM notifies Transform; an inspector edit notifies Topology when
+the point count changed and Geometry otherwise.
+
+EditorHitTest picks the shape by its drawn lines only - footprint, roof ring
+and vertical edges - which is what CShapeObject::HitTest does (:1085-1150); the
+box's solid fallback would make a large polygon swallow every click inside it.
+The geometry it needs is copied into Shapes/ShapeGeometry.h rather than taken
+from EditorCommon/Util/Math.h, because an engine module cannot link the editor.
+
+Box and Polygon declare each other incompatible (decision 01: one shape per
+entity; the check at EntityObject.cpp:729 is one-directional, so both sides
+declare it), and IShapeComponentEdit gains IsContourClosed() at the end of the
+interface - the point tool needs it to know which edges exist.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SCUvWGLCsqzm3VNMzp4uiS
+---
+ .../Interface/IShapeComponent.h               |   7 +
+ .../AreaComponents/Module/CMakeLists.txt      |   3 +
+ .../AreaComponents/Module/PluginDll.cpp       |   5 +
+ .../Module/Shapes/BoxShapeComponent.h         |   8 +
+ .../Module/Shapes/PolygonShapeComponent.cpp   | 604 ++++++++++++++++++
+ .../Module/Shapes/PolygonShapeComponent.h     | 227 +++++++
+ .../Module/Shapes/ShapeGeometry.h             | 236 +++++++
+ 7 files changed, 1090 insertions(+)
+ create mode 100644 Code/CryPlugins/AreaComponents/Module/Shapes/PolygonShapeComponent.cpp
+ create mode 100644 Code/CryPlugins/AreaComponents/Module/Shapes/PolygonShapeComponent.h
+ create mode 100644 Code/CryPlugins/AreaComponents/Module/Shapes/ShapeGeometry.h
+
+diff --git a/Code/CryPlugins/AreaComponents/Interface/IShapeComponent.h b/Code/CryPlugins/AreaComponents/Interface/IShapeComponent.h
+index 3fd6d289..1f343859 100644
+--- a/Code/CryPlugins/AreaComponents/Interface/IShapeComponent.h
++++ b/Code/CryPlugins/AreaComponents/Interface/IShapeComponent.h
+@@ -227,6 +227,13 @@ struct IShapeComponentEdit
+ 
+ 	virtual void BeginEdit() = 0;
+ 	virtual void EndEdit() = 0;
++
++	//! Whether the contour the points describe closes back on itself. The point tool needs it to
++	//! know which edges exist: it is what tells "insert a point on the edge under the cursor" that
++	//! the edge between the last point and the first is real (a closed polygon) or not (an open
++	//! polyline). Kinds with a fixed point set answer for their drawn footprint - the box's
++	//! footprint is a closed quad - so that the same flag also drives the hull the tool draws.
++	virtual bool IsContourClosed() const = 0;
+ };
+ 
+ } // namespace AreaComponents
+diff --git a/Code/CryPlugins/AreaComponents/Module/CMakeLists.txt b/Code/CryPlugins/AreaComponents/Module/CMakeLists.txt
+index 193b937c..e350232d 100644
+--- a/Code/CryPlugins/AreaComponents/Module/CMakeLists.txt
++++ b/Code/CryPlugins/AreaComponents/Module/CMakeLists.txt
+@@ -11,8 +11,11 @@ add_sources("AreaComponents_uber_0.cpp"
+ 	SOURCE_GROUP "Interface"
+ 		"../Interface/IShapeComponent.h"
+ 	SOURCE_GROUP "Shapes"
++		"Shapes/ShapeGeometry.h"
+ 		"Shapes/BoxShapeComponent.h"
+ 		"Shapes/BoxShapeComponent.cpp"
++		"Shapes/PolygonShapeComponent.h"
++		"Shapes/PolygonShapeComponent.cpp"
+ )
+ 
+ end_sources()
+diff --git a/Code/CryPlugins/AreaComponents/Module/PluginDll.cpp b/Code/CryPlugins/AreaComponents/Module/PluginDll.cpp
+index e7098445..53983cbc 100644
+--- a/Code/CryPlugins/AreaComponents/Module/PluginDll.cpp
++++ b/Code/CryPlugins/AreaComponents/Module/PluginDll.cpp
+@@ -3,6 +3,7 @@
+ #include "PluginDll.h"
+ 
+ #include "Shapes/BoxShapeComponent.h"
++#include "Shapes/PolygonShapeComponent.h"
+ 
+ #include <CrySchematyc/Env/IEnvRegistry.h>
+ #include <CrySchematyc/Env/EnvPackage.h>
+@@ -70,6 +71,10 @@ void CAreaComponentsPlugin::RegisterComponents(Schematyc::IEnvRegistrar& registr
+ 		Schematyc::CEnvRegistrationScope componentScope = scope.Register(SCHEMATYC_MAKE_ENV_COMPONENT(CBoxShapeComponent));
+ 		CBoxShapeComponent::Register(componentScope);
+ 	}
++	{
++		Schematyc::CEnvRegistrationScope componentScope = scope.Register(SCHEMATYC_MAKE_ENV_COMPONENT(CPolygonShapeComponent));
++		CPolygonShapeComponent::Register(componentScope);
++	}
+ }
+ 
+ CRYREGISTER_SINGLETON_CLASS(CAreaComponentsPlugin)
+diff --git a/Code/CryPlugins/AreaComponents/Module/Shapes/BoxShapeComponent.h b/Code/CryPlugins/AreaComponents/Module/Shapes/BoxShapeComponent.h
+index 4816402c..97c316b0 100644
+--- a/Code/CryPlugins/AreaComponents/Module/Shapes/BoxShapeComponent.h
++++ b/Code/CryPlugins/AreaComponents/Module/Shapes/BoxShapeComponent.h
+@@ -52,6 +52,12 @@ public:
+ 		desc.AddBase<IShapeComponent>();
+ 		desc.AddBase<IEditorShapeComponent>();
+ 
++		// One shape per entity (decision 01): every kind declares the other kinds incompatible.
++		// The check is one-directional (EntityObject.cpp:729 walks the components already
++		// present), so the pair is declared on both sides. The GUID is
++		// CPolygonShapeComponent's, spelled out to avoid a header cycle between the kinds.
++		desc.AddComponentInteraction(SEntityComponentRequirements::EType::Incompatibility, "{6C3A81D5-0F47-4E9A-B4D1-72E5C8A96202}"_cry_guid);
++
+ 		desc.AddMember(&CBoxShapeComponent::m_size, 'size', "Size", "Size", "Full size of the box in metres", Vec3(1.0f, 1.0f, 1.0f));
+ 		desc.AddMember(&CBoxShapeComponent::m_offset, 'offs', "Offset", "Offset", "Translation of the box centre in the entity's local space", Vec3(0.0f, 0.0f, 0.0f));
+ 	}
+@@ -88,6 +94,8 @@ public:
+ 	virtual void RemovePoint(int index) override                    {}             // fixed point set
+ 	virtual void BeginEdit() override;
+ 	virtual void EndEdit() override;
++	//! The box's drawn footprint is its closed bottom quad.
++	virtual bool IsContourClosed() const override { return true; }
+ 	// ~IShapeComponentEdit
+ 
+ protected:
+diff --git a/Code/CryPlugins/AreaComponents/Module/Shapes/PolygonShapeComponent.cpp b/Code/CryPlugins/AreaComponents/Module/Shapes/PolygonShapeComponent.cpp
+new file mode 100644
+index 00000000..c96a4e2b
+--- /dev/null
++++ b/Code/CryPlugins/AreaComponents/Module/Shapes/PolygonShapeComponent.cpp
+@@ -0,0 +1,604 @@
++// Copyright 2026 ReC Sandbox. Distributed under the terms in LICENSE.md at the repository root.
++#include "StdAfx.h"
++#include "PolygonShapeComponent.h"
++#include "ShapeGeometry.h"
++
++#include <CryRenderer/IRenderAuxGeom.h>
++#include <CryMath/Random.h>
++
++#include <algorithm>
++#include <limits>
++
++namespace Cry
++{
++namespace AreaComponents
++{
++
++namespace
++{
++//! Two points closer than this to each other are the same point, the test legacy makes before it
++//! accepts an inserted point (ShapeObject.cpp:2069-2081 compares each axis against FLT_EPSILON).
++const float kDuplicatePointEpsilon = FLT_EPSILON;
++//! How many times GetRandomPointInside draws from the footprint AABB before it gives up. A
++//! polygon whose area is a thousandth of its bounding box is pathological; answering false is
++//! better than spinning.
++const int kRandomPointAttempts = 64;
++}
++
++void CPolygonShapeComponent::Register(Schematyc::CEnvRegistrationScope& componentScope)
++{
++	// No Schematyc functions yet - the same stage as the box: IsPointInside /
++	// GetRandomPointInside are exposed once the Area function component needs them.
++}
++
++// ---------------------------------------------------------------------------
++// Basics
++// ---------------------------------------------------------------------------
++
++Matrix34 CPolygonShapeComponent::GetShapeWorldTM() const
++{
++	return GetWorldTransformMatrix() * Matrix34::CreateTranslationMat(m_offset);
++}
++
++float CPolygonShapeComponent::GetOriginZ() const
++{
++	if (m_points.points.empty())
++		return m_offset.z;
++
++	float originZ = m_points.points[0].pos.z;
++	for (const SPolygonPoint& point : m_points.points)
++		originZ = min(originZ, point.pos.z);
++
++	return originZ + m_offset.z;
++}
++
++bool CPolygonShapeComponent::HasInterior() const
++{
++	return m_closed && static_cast<int>(m_points.points.size()) >= kMinClosedPoints;
++}
++
++int CPolygonShapeComponent::GatherPoints(Vec3* pOut, int maxPoints, bool world) const
++{
++	if (pOut == nullptr || maxPoints <= 0)
++		return 0;
++
++	const int      count = min(static_cast<int>(m_points.points.size()), maxPoints);
++	const Matrix34 tm = GetShapeWorldTM();
++
++	for (int i = 0; i < count; ++i)
++	{
++		const Vec3& pos = m_points.points[i].pos;
++		pOut[i] = world ? tm.TransformPoint(pos) : (m_offset + pos);
++	}
++
++	return count;
++}
++
++bool CPolygonShapeComponent::IsEdgeObstructing(int index) const
++{
++	if (index < 0 || index >= static_cast<int>(m_points.points.size()))
++		return false;
++
++	return m_points.points[index].obstructSound;
++}
++
++// ---------------------------------------------------------------------------
++// IShapeComponent - geometry
++// ---------------------------------------------------------------------------
++
++void CPolygonShapeComponent::GetLocalAABB(AABB& out) const
++{
++	out.Reset();
++
++	if (m_points.points.empty())
++	{
++		out = AABB(m_offset, m_offset);
++		return;
++	}
++
++	for (const SPolygonPoint& point : m_points.points)
++		out.Add(m_offset + point.pos);
++
++	if (m_height > 0.0f)
++	{
++		// The roof sits at the LOWEST point plus the height, the way CArea reads a legacy shape
++		// (Area.cpp:2298-2302 with m_origin = min z). A shape whose points climb higher than that
++		// keeps its own extent, which is what CShapeObject::CalcBBox does too.
++		out.max.z = max(out.max.z, GetOriginZ() + m_height);
++	}
++}
++
++void CPolygonShapeComponent::GetWorldAABB(AABB& out) const
++{
++	AABB local;
++	GetLocalAABB(local);
++	out = AABB::CreateTransformedAABB(GetWorldTransformMatrix(), local);
++}
++
++bool CPolygonShapeComponent::IsPointInside(const Vec3& world) const
++{
++	if (!HasInterior())
++		return false;
++
++	const Vec3 local = GetShapeWorldTM().GetInverted().TransformPoint(world);
++
++	if (m_height > 0.0f)
++	{
++		// The band is expressed in shape space, so the origin has to lose the offset it carries
++		// for the world-space users.
++		const float originZ = GetOriginZ() - m_offset.z;
++		if (local.z < originZ || local.z > originZ + m_height)
++			return false;
++	}
++
++	Vec3      points[kMaxStackPoints];
++	const int count = min(static_cast<int>(m_points.points.size()), kMaxStackPoints);
++	for (int i = 0; i < count; ++i)
++		points[i] = m_points.points[i].pos;
++
++	return ShapeGeo::IsPointInPolygon2D(points, count, local);
++}
++
++float CPolygonShapeComponent::DistanceToHull(const Vec3& world) const
++{
++	if (m_points.points.empty())
++		return FLT_MAX;
++
++	const Vec3 local = GetShapeWorldTM().GetInverted().TransformPoint(world);
++
++	Vec3      points[kMaxStackPoints];
++	const int count = min(static_cast<int>(m_points.points.size()), kMaxStackPoints);
++	for (int i = 0; i < count; ++i)
++		points[i] = m_points.points[i].pos;
++
++	// The usual prism distance field, in two parts: a signed distance to the footprint on XY and
++	// a signed distance to the height band on Z, combined the way a signed box field combines its
++	// axes - positive parts outside, the largest negative part inside.
++	float distance2D = ShapeGeo::DistanceToContour2D(points, count, m_closed, local);
++	if (HasInterior() && ShapeGeo::IsPointInPolygon2D(points, count, local))
++		distance2D = -distance2D;
++
++	if (m_height <= 0.0f)
++		return distance2D; // infinite in Z: the footprint IS the hull
++
++	const float originZ = GetOriginZ() - m_offset.z;
++	const float distanceZ = max(originZ - local.z, local.z - (originZ + m_height));
++
++	const float outside = Vec2(max(distance2D, 0.0f), max(distanceZ, 0.0f)).GetLength();
++	const float inside = min(max(distance2D, distanceZ), 0.0f);
++	return outside + inside;
++}
++
++bool CPolygonShapeComponent::IntersectRay(const Ray& ray, float& dist) const
++{
++	const int count = min(static_cast<int>(m_points.points.size()), kMaxStackPoints);
++	if (count < 2)
++		return false;
++
++	// The inverse transform is affine, so the ray parameter survives it and the local direction
++	// must not be re-normalised: t comes out in the caller's units.
++	const Matrix34 invTM = GetShapeWorldTM().GetInverted();
++	const Vec3     origin = invTM.TransformPoint(ray.origin);
++	const Vec3     dir = invTM.TransformVector(ray.direction);
++
++	Vec3 points[kMaxStackPoints];
++	for (int i = 0; i < count; ++i)
++		points[i] = m_points.points[i].pos;
++
++	const float originZ = GetOriginZ() - m_offset.z;
++	const float roofZ = originZ + m_height;
++
++	float best = FLT_MAX;
++
++	// The walls.
++	for (int i = 0; i < count; ++i)
++	{
++		const int j = (i + 1) % count;
++		if (!m_closed && j == 0 && i != 0)
++			continue;
++
++		float t;
++		if (!ShapeGeo::RayToWall2D(origin, dir, points[i], points[j], t))
++			continue;
++
++		if (m_height > 0.0f)
++		{
++			const float hitZ = origin.z + dir.z * t;
++			if (hitZ < originZ || hitZ > roofZ)
++				continue;
++		}
++
++		best = min(best, t);
++	}
++
++	// The caps, which only exist on a closed shape with a finite height.
++	if (m_height > 0.0f && HasInterior() && fabs_tpl(dir.z) > FLT_EPSILON)
++	{
++		const float capZ[2] = { originZ, roofZ };
++		for (const float z : capZ)
++		{
++			const float t = (z - origin.z) / dir.z;
++			if (t < 0.0f || t >= best)
++				continue;
++
++			const Vec3 hit = origin + dir * t;
++			if (ShapeGeo::IsPointInPolygon2D(points, count, hit))
++				best = t;
++		}
++	}
++
++	if (best == FLT_MAX)
++		return false;
++
++	dist = best;
++	return true;
++}
++
++bool CPolygonShapeComponent::GetRandomPointInside(Vec3& out) const
++{
++	if (!HasInterior())
++		return false;
++
++	Vec3      points[kMaxStackPoints];
++	const int count = min(static_cast<int>(m_points.points.size()), kMaxStackPoints);
++
++	AABB footprint;
++	footprint.Reset();
++	for (int i = 0; i < count; ++i)
++	{
++		points[i] = m_points.points[i].pos;
++		footprint.Add(points[i]);
++	}
++
++	const float originZ = GetOriginZ() - m_offset.z;
++	const float minZ = (m_height > 0.0f) ? originZ : footprint.min.z;
++	const float maxZ = (m_height > 0.0f) ? (originZ + m_height) : footprint.max.z;
++
++	// Rejection sampling in the footprint AABB: uniform inside the polygon by construction, and
++	// the only method that stays correct for a concave footprint without triangulating it.
++	for (int attempt = 0; attempt < kRandomPointAttempts; ++attempt)
++	{
++		const Vec3 candidate(cry_random(footprint.min.x, footprint.max.x),
++		                     cry_random(footprint.min.y, footprint.max.y),
++		                     cry_random(minZ, maxZ));
++
++		if (!ShapeGeo::IsPointInPolygon2D(points, count, candidate))
++			continue;
++
++		out = GetShapeWorldTM().TransformPoint(candidate);
++		return true;
++	}
++
++	return false;
++}
++
++int CPolygonShapeComponent::GetContour(Vec3* pOutPoints, int maxPoints, bool world) const
++{
++	// The buffer belongs to the caller (heap rule, IShapeComponent.h): nothing is allocated here,
++	// and the return value is the full count so that a caller with a short buffer can ask again.
++	const int totalPoints = static_cast<int>(m_points.points.size());
++	if (pOutPoints == nullptr || maxPoints <= 0)
++		return totalPoints;
++
++	GatherPoints(pOutPoints, maxPoints, world);
++	return totalPoints;
++}
++
++// ---------------------------------------------------------------------------
++// IEditorShapeComponent
++// ---------------------------------------------------------------------------
++
++bool CPolygonShapeComponent::GetEditorLocalBounds(AABB& out) const
++{
++	if (m_points.points.empty())
++		return false;
++
++	// CEntityObject::GetLocalBounds works in the ENTITY's local space, so the component's own
++	// transform (identity unless the Transform flag is set) has to be applied here.
++	AABB local;
++	GetLocalAABB(local);
++	out = AABB::CreateTransformedAABB(GetTransformMatrix(), local);
++	return true;
++}
++
++bool CPolygonShapeComponent::EditorHitTest(const Ray& worldRay, float tolerance, float& distOut) const
++{
++	// CShapeObject::HitTest (ShapeObject.cpp:1085-1150) in component form: a shape is picked by
++	// its drawn lines - the footprint, and with a height also the roof ring and the vertical
++	// edges - and never by its interior. That is deliberately unlike the box, whose solid slab
++	// test is its second chance: a polygon with a large footprint would otherwise swallow every
++	// click inside it.
++	Vec3      points[kMaxStackPoints];
++	const int count = GatherPoints(points, kMaxStackPoints, true);
++	if (count < 2)
++		return false;
++
++	const Vec3 rayDir = worldRay.direction.GetNormalized();
++	const Vec3 rayLineP1 = worldRay.origin;
++	const Vec3 rayLineP2 = worldRay.origin + rayDir * ShapeGeo::kRayDistance;
++
++	// The roof offset is a world-space Z lift only while the entity is unrotated, which is what
++	// legacy assumes as well (it adds Vec3(0, 0, mv_height) to world points).
++	const Vec3 up(0.0f, 0.0f, m_height);
++
++	bool  bHit = false;
++	float minDist = FLT_MAX;
++	Vec3  intPnt(ZERO);
++	Vec3  bestPnt(ZERO);
++
++	for (int i = 0; i < count; ++i)
++	{
++		const int j = (i + 1) % count;
++		const bool bWrapEdge = (j == 0 && i != 0);
++
++		float d = 0.0f;
++
++		if (!(!m_closed && bWrapEdge))
++		{
++			if (ShapeGeo::RayToLineDistance(rayLineP1, rayLineP2, points[i], points[j], d, intPnt) && d < minDist)
++			{
++				minDist = d;
++				bestPnt = intPnt;
++				bHit = true;
++			}
++
++			if (m_height > 0.0f &&
++			    ShapeGeo::RayToLineDistance(rayLineP1, rayLineP2, points[i] + up, points[j] + up, d, intPnt) && d < minDist)
++			{
++				minDist = d;
++				bestPnt = intPnt;
++				bHit = true;
++			}
++		}
++
++		if (m_height > 0.0f &&
++		    ShapeGeo::RayToLineDistance(rayLineP1, rayLineP2, points[i], points[i] + up, d, intPnt) && d < minDist)
++		{
++			minDist = d;
++			bestPnt = intPnt;
++			bHit = true;
++		}
++	}
++
++	if (!bHit || minDist > tolerance)
++		return false;
++
++	distOut = worldRay.origin.GetDistance(bestPnt);
++	return true;
++}
++
++// ---------------------------------------------------------------------------
++// IShapeComponentEdit
++// ---------------------------------------------------------------------------
++
++int CPolygonShapeComponent::GetPointCount() const
++{
++	return static_cast<int>(m_points.points.size());
++}
++
++Vec3 CPolygonShapeComponent::GetPoint(int index) const
++{
++	if (index < 0 || index >= static_cast<int>(m_points.points.size()))
++		return ZERO;
++
++	// Component-local space, offset included - the same convention the box uses, so that the
++	// tool's single "transform by the component's world matrix" is right for every kind.
++	return m_offset + m_points.points[index].pos;
++}
++
++void CPolygonShapeComponent::SetPoint(int index, const Vec3& local)
++{
++	if (index < 0 || index >= static_cast<int>(m_points.points.size()))
++		return;
++
++	m_points.points[index].pos = local - m_offset;
++	RecordChange(EShapeChangeReason::Geometry);
++}
++
++int CPolygonShapeComponent::InsertPoint(int index, const Vec3& local)
++{
++	const Vec3 pos = local - m_offset;
++	const int  count = static_cast<int>(m_points.points.size());
++
++	// Legacy refuses a point that lands on an existing one and says so, rather than creating a
++	// zero-length edge nobody can grab again (ShapeObject.cpp:2064-2083).
++	for (int i = 0; i < count; ++i)
++	{
++		const Vec3 diff = m_points.points[i].pos - pos;
++		if (fabs_tpl(diff.x) < kDuplicatePointEpsilon &&
++		    fabs_tpl(diff.y) < kDuplicatePointEpsilon &&
++		    fabs_tpl(diff.z) < kDuplicatePointEpsilon)
++		{
++			CryWarning(VALIDATOR_MODULE_ENTITYSYSTEM, VALIDATOR_WARNING, "Shape: Polygon - the point is too close to another point!");
++			return i;
++		}
++	}
++
++	SPolygonPoint point;
++	point.pos = pos;
++	point.obstructSound = false;
++
++	int newIndex;
++	if (index < 0 || index >= count)
++	{
++		m_points.points.push_back(point);
++		newIndex = static_cast<int>(m_points.points.size()) - 1;
++	}
++	else
++	{
++		m_points.points.insert(m_points.points.begin() + index, point);
++		newIndex = index;
++	}
++
++	RecordChange(EShapeChangeReason::Topology);
++	return newIndex;
++}
++
++void CPolygonShapeComponent::RemovePoint(int index)
++{
++	const int count = static_cast<int>(m_points.points.size());
++	if (index < 0 || index >= count)
++		return;
++
++	const int minPoints = m_closed ? kMinClosedPoints : kMinOpenPoints;
++	if (count <= minPoints)
++	{
++		CryWarning(VALIDATOR_MODULE_ENTITYSYSTEM, VALIDATOR_WARNING,
++		           "Shape: Polygon - a %s shape needs at least %d points, the point was not removed.",
++		           m_closed ? "closed" : "open", minPoints);
++		return;
++	}
++
++	m_points.points.erase(m_points.points.begin() + index);
++	RecordChange(EShapeChangeReason::Topology);
++}
++
++void CPolygonShapeComponent::BeginEdit()
++{
++	m_bInEdit = true;
++	m_bChangedDuringEdit = false;
++	m_editReason = EShapeChangeReason::Geometry;
++}
++
++void CPolygonShapeComponent::EndEdit()
++{
++	const bool               bChanged = m_bChangedDuringEdit;
++	const EShapeChangeReason reason = m_editReason;
++
++	m_bInEdit = false;
++	m_bChangedDuringEdit = false;
++	m_editReason = EShapeChangeReason::Geometry;
++
++	if (bChanged)
++		NotifyListeners(reason);
++}
++
++void CPolygonShapeComponent::RecordChange(EShapeChangeReason reason)
++{
++	if (!m_bInEdit)
++	{
++		NotifyListeners(reason);
++		return;
++	}
++
++	// Coarsest reason wins: a gesture that both moved and inserted points is a topology change.
++	if (!m_bChangedDuringEdit || static_cast<int>(reason) > static_cast<int>(m_editReason))
++		m_editReason = reason;
++
++	m_bChangedDuringEdit = true;
++}
++
++// ---------------------------------------------------------------------------
++// Listeners and events
++// ---------------------------------------------------------------------------
++
++void CPolygonShapeComponent::AddListener(IShapeListener* pListener)
++{
++	if (pListener == nullptr)
++		return;
++	if (std::find(m_listeners.begin(), m_listeners.end(), pListener) == m_listeners.end())
++		m_listeners.push_back(pListener);
++}
++
++void CPolygonShapeComponent::RemoveListener(IShapeListener* pListener)
++{
++	m_listeners.erase(std::remove(m_listeners.begin(), m_listeners.end(), pListener), m_listeners.end());
++}
++
++void CPolygonShapeComponent::NotifyListeners(EShapeChangeReason reason)
++{
++	m_lastNotifiedPointCount = static_cast<int>(m_points.points.size());
++
++	// Copy first: a listener is allowed to remove itself while being told.
++	const std::vector<IShapeListener*> listeners = m_listeners;
++	for (IShapeListener* pListener : listeners)
++		pListener->OnShapeChanged(*this, reason);
++}
++
++void CPolygonShapeComponent::ProcessEvent(const SEntityEvent& event)
++{
++	switch (event.event)
++	{
++	case ENTITY_EVENT_XFORM:
++		// The hull is unchanged in local space; only the placement moved.
++		NotifyListeners(EShapeChangeReason::Transform);
++		break;
++	case ENTITY_EVENT_COMPONENT_PROPERTY_CHANGED:
++		{
++			// An inspector edit can be anything. Rows added to or removed from the point list are
++			// a topology change and force a full rebuild downstream; everything else - a point
++			// dragged in a numeric row, Height, Closed, the offset - is a cheap geometry change.
++			const int pointCount = static_cast<int>(m_points.points.size());
++			NotifyListeners(pointCount != m_lastNotifiedPointCount ? EShapeChangeReason::Topology
++			                                                       : EShapeChangeReason::Geometry);
++		}
++		break;
++	default:
++		break;
++	}
++}
++
++Cry::Entity::EventFlags CPolygonShapeComponent::GetEventMask() const
++{
++	return ENTITY_EVENT_XFORM | ENTITY_EVENT_COMPONENT_PROPERTY_CHANGED;
++}
++
++void CPolygonShapeComponent::OnShutDown()
++{
++	m_listeners.clear();
++}
++
++// ---------------------------------------------------------------------------
++// Previewer
++// ---------------------------------------------------------------------------
++
++#ifndef RELEASE
++void CPolygonShapeComponent::Render(const IEntity& entity, const IEntityComponent& component, SEntityPreviewContext& context) const
++{
++	IRenderAuxGeom* pAux = gEnv->pAuxGeomRenderer;
++	if (pAux == nullptr)
++		return;
++
++	Vec3      points[kMaxStackPoints];
++	const int count = GatherPoints(points, kMaxStackPoints, true);
++	if (count < 2)
++		return;
++
++	// Colours follow CShapeObject::DisplayNormal: brighter when the entity is selected. An edge
++	// that obstructs sound is drawn in legacy's highlight orange instead, so the obstruction
++	// pattern is readable without opening the inspector.
++	const ColorB colour = context.bSelected ? ColorB(0, 255, 0, 255) : ColorB(0, 160, 0, 160);
++	const ColorB obstructColour = context.bSelected ? ColorB(255, 120, 0, 255) : ColorB(200, 90, 0, 160);
++
++	const Vec3 up(0.0f, 0.0f, m_height);
++
++	for (int i = 0; i < count; ++i)
++	{
++		const int j = (i + 1) % count;
++		const bool bWrapEdge = (j == 0 && i != 0);
++		if (!m_closed && bWrapEdge)
++			continue; // an open polyline stops at the last point
++
++		const ColorB edgeColour = IsEdgeObstructing(i) ? obstructColour : colour;
++
++		pAux->DrawLine(points[i], edgeColour, points[j], edgeColour);
++
++		if (m_height > 0.0f)
++		{
++			// The top ring, and the vertical edge that carries it - the legacy extrusion drawing
++			// (ShapeObject.cpp:1336-1360), without the per-vertex-height variant, which no
++			// component member exposes.
++			pAux->DrawLine(points[i] + up, edgeColour, points[j] + up, edgeColour);
++		}
++	}
++
++	if (m_height > 0.0f)
++	{
++		for (int i = 0; i < count; ++i)
++			pAux->DrawLine(points[i], colour, points[i] + up, colour);
++	}
++}
++#endif
++
++} // namespace AreaComponents
++} // namespace Cry
+diff --git a/Code/CryPlugins/AreaComponents/Module/Shapes/PolygonShapeComponent.h b/Code/CryPlugins/AreaComponents/Module/Shapes/PolygonShapeComponent.h
+new file mode 100644
+index 00000000..be5e01c9
+--- /dev/null
++++ b/Code/CryPlugins/AreaComponents/Module/Shapes/PolygonShapeComponent.h
+@@ -0,0 +1,227 @@
++// Copyright 2026 ReC Sandbox. Distributed under the terms in LICENSE.md at the repository root.
++#pragma once
++
++#include "../../Interface/IShapeComponent.h"
++
++#include <CrySchematyc/MathTypes.h>
++#include <CrySchematyc/Reflection/TypeDesc.h>
++#include <CrySchematyc/Env/IEnvRegistrar.h>
++#include <CrySerialization/IArchive.h>
++
++#include <vector>
++
++namespace Cry
++{
++namespace AreaComponents
++{
++
++//! One authored point of a polygon shape, in the component's local space.
++//!
++//! Per-face sound obstruction lives HERE, on the point, and not on a parallel array beside it
++//! (decision 03, "Per-face obstruction"): legacy keeps a std::vector<bool> of numPoints + 2
++//! entries next to its point list (ShapeObject.h:246) and has to patch both lists in step on
++//! every insert and remove (ShapeObject.cpp:2096-2112). One point, one flag, and a topology edit
++//! can no longer desync them. The flag belongs to the edge that STARTS at this point, matching
++//! legacy's "Side:%d" ordering; roof and floor are two separate members on the component.
++struct SPolygonPoint
++{
++	static void ReflectType(Schematyc::CTypeDesc<SPolygonPoint>& desc)
++	{
++		desc.SetGUID("{2B5F4C10-6A71-4B2E-9E37-4C1D0A5E7B10}"_cry_guid);
++		desc.SetLabel("Polygon Point");
++	}
++
++	//! The element type of a reflected std::vector is serialized through this member function,
++	//! the pattern CAINavigationMarkupShapeComponent::SMarkupShapeProperties uses
++	//! (NavigationMarkupShapeComponent.cpp:13-40).
++	void Serialize(Serialization::IArchive& archive)
++	{
++		archive(pos, "pos", "Position");
++		archive.doc("Position of the point in the shape's local space.");
++
++		archive(obstructSound, "obstructSound", "Obstruct Sound");
++		archive.doc("Whether the wall that starts at this point obstructs sound.");
++	}
++
++	bool operator==(const SPolygonPoint& other) const
++	{
++		return pos == other.pos && obstructSound == other.obstructSound;
++	}
++
++	bool operator!=(const SPolygonPoint& other) const { return !(*this == other); }
++
++	Vec3 pos = ZERO;
++	bool obstructSound = false;
++};
++
++//! The reflected wrapper a std::vector member needs: a GUID, an operator== (the game-mode
++//! property round trip compares whole members) and a free Serialize. research/04 section 5.3.
++struct SPolygonPoints
++{
++	static void ReflectType(Schematyc::CTypeDesc<SPolygonPoints>& desc)
++	{
++		desc.SetGUID("{2B5F4C10-6A71-4B2E-9E37-4C1D0A5E7B11}"_cry_guid);
++		desc.SetLabel("Polygon Points");
++	}
++
++	bool operator==(const SPolygonPoints& other) const { return points == other.points; }
++	bool operator!=(const SPolygonPoints& other) const { return !(*this == other); }
++
++	std::vector<SPolygonPoint> points;
++};
++
++inline bool Serialize(Serialization::IArchive& archive, SPolygonPoints& value, const char* szName, const char* szLabel)
++{
++	return archive(value.points, szName, szLabel);
++}
++
++//! A polygon prism: a point list on the XY plane of the component's local space, extruded upward
++//! by Height. Height 0 means "infinite in Z", exactly what a legacy shape with mv_height == 0
++//! means to CArea (Area.cpp:442-444 only applies the Z band when m_height > 0). The floor of the
++//! band is the lowest point's Z, again as legacy (Area.cpp:2298-2302).
++//!
++//! This is the component form of EditorQt's CShapeObject, minus everything that was area
++//! semantics: id, group, priority, fade and links belong to the Area function component
++//! (decision 03), and this component is pure geometry.
++class CPolygonShapeComponent final
++	: public IShapeComponent
++	, public IShapeComponentEdit
++#ifndef RELEASE
++	, public IEntityComponentPreviewer
++#endif
++{
++public:
++	CPolygonShapeComponent() = default;
++	virtual ~CPolygonShapeComponent() = default;
++
++	static void Register(Schematyc::CEnvRegistrationScope& componentScope);
++
++	static void ReflectType(Schematyc::CTypeDesc<CPolygonShapeComponent>& desc)
++	{
++		desc.SetGUID("{6C3A81D5-0F47-4E9A-B4D1-72E5C8A96202}"_cry_guid);
++		desc.SetEditorCategory("Area");
++		desc.SetLabel("Shape: Polygon");
++		desc.SetDescription("A polygon shape, optionally extruded in Z. Area functions on the same entity use it as their volume.");
++		desc.SetComponentFlags({ IEntityComponent::EFlags::Singleton });
++
++		// The reflected interface bases - what makes a cross-DLL GetComponent<IShapeComponent>()
++		// and EditorQt's GetAllComponents<IEditorShapeComponent>() find us (IShapeComponent.h).
++		desc.AddBase<IShapeComponent>();
++		desc.AddBase<IEditorShapeComponent>();
++
++		// One shape per entity (decision 01): every kind is Singleton and declares the other
++		// kinds incompatible. The check is one-directional (EntityObject.cpp:729 walks the
++		// components already present), so the pair has to be declared on BOTH sides.
++		// The GUID is CBoxShapeComponent's, spelled out to avoid a header cycle between kinds.
++		desc.AddComponentInteraction(SEntityComponentRequirements::EType::Incompatibility, "{6C3A81D5-0F47-4E9A-B4D1-72E5C8A96201}"_cry_guid);
++
++		desc.AddMember(&CPolygonShapeComponent::m_height, 'hght', "Height", "Height", "Extrusion of the polygon in metres. 0 means the shape is infinite in Z.", 0.0f);
++		desc.AddMember(&CPolygonShapeComponent::m_closed, 'clsd', "Closed", "Closed", "Whether the last point connects back to the first. An open polygon has no interior.", true);
++		desc.AddMember(&CPolygonShapeComponent::m_obstructRoof, 'roof', "ObstructRoof", "Obstruct Roof", "Whether the top cap obstructs sound", false);
++		desc.AddMember(&CPolygonShapeComponent::m_obstructFloor, 'flor', "ObstructFloor", "Obstruct Floor", "Whether the bottom cap obstructs sound", false);
++		desc.AddMember(&CPolygonShapeComponent::m_offset, 'offs', "Offset", "Offset", "Translation of the whole polygon in the entity's local space", Vec3(0.0f, 0.0f, 0.0f));
++		desc.AddMember(&CPolygonShapeComponent::m_points, 'pnts', "Points", "Points", "The polygon's points, in the shape's local space", SPolygonPoints());
++	}
++
++	// IShapeComponent
++	virtual EShapeKind GetKind() const override { return EShapeKind::Polygon; }
++
++	virtual void  GetLocalAABB(AABB& out) const override;
++	virtual void  GetWorldAABB(AABB& out) const override;
++	virtual bool  IsPointInside(const Vec3& world) const override;
++	virtual float DistanceToHull(const Vec3& world) const override;
++	virtual bool  IntersectRay(const Ray& ray, float& dist) const override;
++	virtual bool  GetRandomPointInside(Vec3& out) const override;
++	virtual int   GetContour(Vec3* pOutPoints, int maxPoints, bool world) const override;
++	virtual void  AddListener(IShapeListener* pListener) override;
++	virtual void  RemoveListener(IShapeListener* pListener) override;
++
++	virtual IShapeComponentEdit* GetEditInterface() override { return this; }
++	// ~IShapeComponent
++
++	// IEditorShapeComponent
++	virtual bool        GetEditorLocalBounds(AABB& out) const override;
++	virtual bool        EditorHitTest(const Ray& worldRay, float tolerance, float& distOut) const override;
++	virtual const char* GetEditToolClassName() const override { return "EditTool.AreaShapeEdit"; }
++	virtual const char* GetEditToolLabel() const override     { return "Edit Shape"; }
++	// ~IEditorShapeComponent
++
++	// IShapeComponentEdit - the real thing for this kind: a point list the tool edits directly.
++	virtual int  GetPointCount() const override;
++	virtual Vec3 GetPoint(int index) const override;
++	virtual void SetPoint(int index, const Vec3& local) override;
++	virtual int  InsertPoint(int index, const Vec3& local) override;
++	virtual void RemovePoint(int index) override;
++	virtual void BeginEdit() override;
++	virtual void EndEdit() override;
++	virtual bool IsContourClosed() const override { return m_closed; }
++	// ~IShapeComponentEdit
++
++	//! Per-face obstruction, used by the Area function component and by the drawing below. Not
++	//! part of IShapeComponentEdit: the point tool needs no access to it, and appending to that
++	//! ABI is reserved for things every shape kind can answer.
++	bool IsEdgeObstructing(int index) const;
++	bool IsRoofObstructing() const  { return m_obstructRoof; }
++	bool IsFloorObstructing() const { return m_obstructFloor; }
++
++protected:
++	// IEntityComponent
++	virtual void                    ProcessEvent(const SEntityEvent& event) override;
++	virtual Cry::Entity::EventFlags GetEventMask() const override;
++	virtual void                    OnShutDown() override;
++	// ~IEntityComponent
++
++#ifndef RELEASE
++	// IEntityComponentPreviewer
++	virtual IEntityComponentPreviewer* GetPreviewer() override { return this; }
++
++	virtual void SerializeProperties(Serialization::IArchive& archive) override {}
++	virtual void Render(const IEntity& entity, const IEntityComponent& component, SEntityPreviewContext& context) const override;
++	// ~IEntityComponentPreviewer
++#endif
++
++private:
++	void     NotifyListeners(EShapeChangeReason reason);
++	//! Raises the reason of the currently open gesture to the coarsest one seen so far.
++	void     RecordChange(EShapeChangeReason reason);
++
++	//! World transform of the shape's own space: the component's world transform with the offset.
++	Matrix34 GetShapeWorldTM() const;
++	//! Lowest Z of the point list, the floor of the height band (Area.cpp:2298-2302).
++	float    GetOriginZ() const;
++	//! Whether the shape has an interior at all: closed and at least a triangle.
++	bool     HasInterior() const;
++
++	//! Fills a caller-owned buffer with the points in shape space (offset applied) or in world
++	//! space. Returns how many were written, never more than maxPoints.
++	int      GatherPoints(Vec3* pOut, int maxPoints, bool world) const;
++
++	//! Smallest number of points a closed polygon may be reduced to.
++	static constexpr int kMinClosedPoints = 3;
++	//! Smallest number of points an open polyline may be reduced to.
++	static constexpr int kMinOpenPoints = 2;
++	//! Largest point count any one call will process on the stack.
++	static constexpr int kMaxStackPoints = 1024;
++
++	SPolygonPoints m_points;
++	float          m_height = 0.0f;
++	bool           m_closed = true;
++	bool           m_obstructRoof = false;
++	bool           m_obstructFloor = false;
++	Vec3           m_offset = ZERO;
++
++	//! Set between BeginEdit() and EndEdit(): listeners hear one notification per gesture.
++	bool               m_bInEdit = false;
++	bool               m_bChangedDuringEdit = false;
++	EShapeChangeReason m_editReason = EShapeChangeReason::Geometry;
++
++	//! Point count as the last notification saw it, so that an inspector edit can tell a moved
++	//! point (Geometry) from an added or removed one (Topology).
++	mutable int m_lastNotifiedPointCount = 0;
++
++	//! Runtime only, never reflected: non-owning observers that un-register themselves.
++	std::vector<IShapeListener*> m_listeners;
++};
++
++} // namespace AreaComponents
++} // namespace Cry
+diff --git a/Code/CryPlugins/AreaComponents/Module/Shapes/ShapeGeometry.h b/Code/CryPlugins/AreaComponents/Module/Shapes/ShapeGeometry.h
+new file mode 100644
+index 00000000..ab0609b6
+--- /dev/null
++++ b/Code/CryPlugins/AreaComponents/Module/Shapes/ShapeGeometry.h
+@@ -0,0 +1,236 @@
++// Copyright 2026 ReC Sandbox. Distributed under the terms in LICENSE.md at the repository root.
++#pragma once
++
++//! Small geometry helpers shared by the shape components.
++//!
++//! Everything here is a copy of what EditorQt's CShapeObject uses (ShapeObject.cpp:2456-2560 and
++//! Sandbox/Plugins/EditorCommon/Util/Math.h), brought into this plugin on purpose: the shape
++//! components answer editor questions (EditorHitTest) from an ENGINE module, which must not link
++//! - and cannot link - EditorQt or EditorCommon. Keeping the maths identical is what makes a
++//! component shape feel exactly like a legacy shape under the cursor.
++//!
++//! All functions take caller-owned arrays; nothing here allocates (heap rule, IShapeComponent.h).
++
++#include <CryMath/Cry_Math.h>
++#include <CryMath/Cry_Geo.h>
++
++namespace Cry
++{
++namespace AreaComponents
++{
++namespace ShapeGeo
++{
++
++//! How far along a view ray the editor pretends the ray ends (CShapeObject uses RAY_DISTANCE).
++constexpr float kRayDistance = 100000.0f;
++//! Line-degeneracy epsilon of Util/Math.h (LINE_EPS).
++constexpr float kLineEps = 0.0000001f;
++
++//! Distance from p3 to the segment p1-p2, plus the closest point on the segment.
++//! EditorCommon/Util/Math.h:63, unchanged.
++inline float PointToSegmentDistance(const Vec3& p1, const Vec3& p2, const Vec3& p3, Vec3& intersectPoint)
++{
++	const Vec3  d = p2 - p1;
++	const float lengthSq = d.GetLengthSquared();
++
++	if (lengthSq < 0.00001f)
++	{
++		intersectPoint = p1;
++		return (p3 - p1).GetLength();
++	}
++
++	const float u = d.Dot(p3 - p1) / lengthSq;
++	if (u < 0.0f)
++	{
++		intersectPoint = p1;
++		return (p3 - p1).GetLength();
++	}
++	if (u > 1.0f)
++	{
++		intersectPoint = p2;
++		return (p3 - p2).GetLength();
++	}
++
++	intersectPoint = p1 + u * d;
++	return (p3 - intersectPoint).GetLength();
++}
++
++//! Shortest segment between the two lines p1-p2 and p3-p4. EditorCommon/Util/Math.h:104, unchanged.
++inline bool LineLineIntersect(const Vec3& p1, const Vec3& p2, const Vec3& p3, const Vec3& p4,
++                              Vec3& pa, Vec3& pb, float& mua, float& mub)
++{
++	const Vec3 p13 = p1 - p3;
++	const Vec3 p43 = p4 - p3;
++	if (fabs_tpl(p43.x) < kLineEps && fabs_tpl(p43.y) < kLineEps && fabs_tpl(p43.z) < kLineEps)
++		return false;
++
++	const Vec3 p21 = p2 - p1;
++	if (fabs_tpl(p21.x) < kLineEps && fabs_tpl(p21.y) < kLineEps && fabs_tpl(p21.z) < kLineEps)
++		return false;
++
++	const float d1343 = p13.Dot(p43);
++	const float d4321 = p43.Dot(p21);
++	const float d1321 = p13.Dot(p21);
++	const float d4343 = p43.Dot(p43);
++	const float d2121 = p21.Dot(p21);
++
++	const float denominator = d2121 * d4343 - d4321 * d4321;
++	if (fabs_tpl(denominator) < kLineEps)
++		return false;
++
++	const float numerator = d1343 * d4321 - d1321 * d4343;
++
++	mua = numerator / denominator;
++	mub = (d1343 + d4321 * mua) / d4343;
++
++	pa = p1 + mua * p21;
++	pb = p3 + mub * p43;
++	return true;
++}
++
++//! Distance between the view ray (given as two points) and the segment pi-pj, plus the point on
++//! the ray. CShapeObject::RayToLineDistance, ShapeObject.cpp:2505, unchanged.
++inline bool RayToLineDistance(const Vec3& rayLineP1, const Vec3& rayLineP2, const Vec3& pi, const Vec3& pj,
++                              float& distance, Vec3& intPnt)
++{
++	Vec3  pa, pb;
++	float ua, ub;
++	if (!LineLineIntersect(pi, pj, rayLineP1, rayLineP2, pa, pb, ua, ub))
++		return false;
++
++	if (ub < 0.0f)
++		return false; // behind the ray origin
++
++	if (ua < 0.0f)
++		distance = PointToSegmentDistance(rayLineP1, rayLineP2, pi, intPnt);
++	else if (ua > 1.0f)
++		distance = PointToSegmentDistance(rayLineP1, rayLineP2, pj, intPnt);
++	else
++	{
++		intPnt = rayLineP1 + ub * (rayLineP2 - rayLineP1);
++		distance = (pb - pa).GetLength();
++	}
++
++	return true;
++}
++
++//! The edge of a world-space contour nearest to a view ray. CShapeObject::GetNearestEdge
++//! (ray flavour), ShapeObject.cpp:2531. p1/p2 come back as -1 when nothing was found.
++inline void GetNearestEdge(const Vec3* pWorldPoints, int pointCount, bool bClosed,
++                           const Vec3& raySrc, const Vec3& rayDir,
++                           int& p1, int& p2, float& distance, Vec3& intersectPoint)
++{
++	p1 = -1;
++	p2 = -1;
++	distance = FLT_MAX;
++
++	if (pWorldPoints == nullptr || pointCount < 2)
++		return;
++
++	const Vec3 rayLineP1 = raySrc;
++	const Vec3 rayLineP2 = raySrc + rayDir * kRayDistance;
++
++	float minDist = FLT_MAX;
++	Vec3  intPnt;
++
++	for (int i = 0; i < pointCount; ++i)
++	{
++		const int j = (i + 1) % pointCount;
++		if (!bClosed && j == 0 && i != 0)
++			continue;
++
++		float d = 0.0f;
++		if (!RayToLineDistance(rayLineP1, rayLineP2, pWorldPoints[i], pWorldPoints[j], d, intPnt))
++			continue;
++
++		if (d < minDist)
++		{
++			minDist = d;
++			p1 = i;
++			p2 = j;
++			intersectPoint = intPnt;
++		}
++	}
++
++	distance = minDist;
++}
++
++//! Even-odd point-in-polygon on XY. The contour is treated as closed whatever the closed flag
++//! says - an open polyline has no interior, and the callers check that before asking.
++inline bool IsPointInPolygon2D(const Vec3* pPoints, int pointCount, const Vec3& point)
++{
++	if (pPoints == nullptr || pointCount < 3)
++		return false;
++
++	bool bInside = false;
++	for (int i = 0, j = pointCount - 1; i < pointCount; j = i++)
++	{
++		const Vec3& a = pPoints[i];
++		const Vec3& b = pPoints[j];
++
++		if (((a.y > point.y) != (b.y > point.y)) &&
++		    (point.x < (b.x - a.x) * (point.y - a.y) / (b.y - a.y) + a.x))
++		{
++			bInside = !bInside;
++		}
++	}
++
++	return bInside;
++}
++
++//! Unsigned distance from a point to the contour's edges, measured on XY only.
++inline float DistanceToContour2D(const Vec3* pPoints, int pointCount, bool bClosed, const Vec3& point)
++{
++	if (pPoints == nullptr || pointCount <= 0)
++		return FLT_MAX;
++
++	if (pointCount == 1)
++		return Vec2(point.x - pPoints[0].x, point.y - pPoints[0].y).GetLength();
++
++	const Vec3 flatPoint(point.x, point.y, 0.0f);
++
++	float minDist = FLT_MAX;
++	for (int i = 0; i < pointCount; ++i)
++	{
++		const int j = (i + 1) % pointCount;
++		if (!bClosed && j == 0 && i != 0)
++			continue;
++
++		const Vec3 a(pPoints[i].x, pPoints[i].y, 0.0f);
++		const Vec3 b(pPoints[j].x, pPoints[j].y, 0.0f);
++
++		Vec3        closest;
++		const float d = PointToSegmentDistance(a, b, flatPoint, closest);
++		minDist = min(minDist, d);
++	}
++
++	return minDist;
++}
++
++//! Ray versus one contour edge treated as an infinite vertical wall, on XY. Returns the ray
++//! parameter of the crossing; false when the ray is parallel to the wall or crosses behind it.
++inline bool RayToWall2D(const Vec3& origin, const Vec3& dir, const Vec3& a, const Vec3& b, float& t)
++{
++	const Vec2 rayOrigin(origin.x, origin.y);
++	const Vec2 rayDir(dir.x, dir.y);
++	const Vec2 segStart(a.x, a.y);
++	const Vec2 segDir(b.x - a.x, b.y - a.y);
++
++	const float denominator = rayDir.x * segDir.y - rayDir.y * segDir.x;
++	if (fabs_tpl(denominator) < 1e-8f)
++		return false;
++
++	const Vec2  diff = segStart - rayOrigin;
++	const float rayT = (diff.x * segDir.y - diff.y * segDir.x) / denominator;
++	const float segT = (diff.x * rayDir.y - diff.y * rayDir.x) / denominator;
++
++	if (rayT < 0.0f || segT < 0.0f || segT > 1.0f)
++		return false;
++
++	t = rayT;
++	return true;
++}
++
++} // namespace ShapeGeo
++} // namespace AreaComponents
++} // namespace Cry
+-- 
+2.47.1.windows.1
+

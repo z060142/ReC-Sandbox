@@ -1,0 +1,358 @@
+From 61324df1b668d8634e39edc83cf210837a17cc4d Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Sat, 12 Sep 2026 14:29:51 +0800
+Subject: [PATCH 207/209] fix(area): spline evaluation with fewer than three
+ points
+
+Create -> Area -> Spline crashed Sandbox on the second click. Stack overflow
+from unbounded recursion, and the exact line is the arc-length loop inside
+CSplineShapeComponent::GetCache():
+
+    for (int s = 0; s < segmentCount; ++s)
+    {
+        int i0, i1;
+        SegmentPoints(s, i0, i1);      // <- this
+
+f75669e0 changed SegmentPoints() to read GetCache().localPos.size(), which it
+has to: with smoothing on, the evaluation polygon is no longer the authored
+point list. But GetCache() is the function that loop is inside, still building,
+with m_cache.bValid still false - so SegmentPoints() called GetCache(), which
+started another build, which called SegmentPoints() again, until the stack ran
+out. It could only fire once there was at least one segment, i.e. from the
+second point onwards, which is exactly when the crash appeared. One point, the
+state the first click leaves behind, has segmentCount 0 and never enters the
+loop.
+
+The fix is one rule and one line: nothing inside a cache build may read the
+cache, so the segment's two end indices are computed in place from the local
+count. A re-entry guard (m_bBuildingCache) is added on top, because half the
+evaluation helpers legitimately read the cache and this is easy to break again;
+if it ever is, the caller gets the half-built cache for one frame instead of a
+stack overflow.
+
+The degenerate cases the create tool walks through are now explicit rather than
+implied. SegmentPos() with fewer than two evaluation points answers the single
+point (or the origin with none) instead of relying on GetSegmentCount(), and
+SegmentTangent() answers zero rather than normalising nothing - which is what
+keeps NaN out of every frame built downstream. The rest of the audit came back
+clean: SubdivideInterpolating clamps its outer stencil indices for an open
+polygon (max(e-1,0) / min(e+2,count-1)) and is skipped entirely at the default
+0 iterations, MakeSeedNormal answers a fixed perpendicular for a zero tangent
+rather than normalising it, PropagateNormal guards both reflection divisors, and
+PosByDistance is a linear scan over a table that is empty when there are no
+segments.
+
+Added `area_SplineSelfTest`, a console command that walks the maths through the
+shapes a half-drawn spline produces - 1 point, 2 coincident points, 2 points,
+3 collinear, 3 vertical, 3 general - open and closed, 0 to 2 smoothing passes,
+both frame modes, and reports the first non-finite position, tangent, handle,
+length or normal. It exercises SplineMath directly rather than a live component,
+because the states that matter are the ones with no entity yet.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SCUvWGLCsqzm3VNMzp4uiS
+---
+ .../Module/Shapes/SplineShapeComponent.cpp    | 210 +++++++++++++++++-
+ .../Module/Shapes/SplineShapeComponent.h      |   3 +
+ 2 files changed, 207 insertions(+), 6 deletions(-)
+
+diff --git a/Code/CryPlugins/AreaComponents/Module/Shapes/SplineShapeComponent.cpp b/Code/CryPlugins/AreaComponents/Module/Shapes/SplineShapeComponent.cpp
+index 80471806..f3f1110a 100644
+--- a/Code/CryPlugins/AreaComponents/Module/Shapes/SplineShapeComponent.cpp
++++ b/Code/CryPlugins/AreaComponents/Module/Shapes/SplineShapeComponent.cpp
+@@ -5,6 +5,8 @@
+ #include "ShapeGeometry.h"
+ 
+ #include <CryRenderer/IRenderAuxGeom.h>
++#include <CrySystem/IConsole.h>
++#include <CrySystem/ConsoleRegistration.h>
+ #include <CryMath/Random.h>
+ 
+ #include <algorithm>
+@@ -23,10 +25,175 @@ const float kSplineDuplicatePointEpsilon = FLT_EPSILON;
+ const int   kSplineRandomPointAttempts = 64;
+ }
+ 
++namespace
++{
++
++//! `area_SplineSelfTest` - walks the spline maths through every degenerate shape the create tool can
++//! produce mid-gesture and reports the first NaN, infinity or wrong count.
++//!
++//! It exercises SplineMath directly rather than a live component, because the shapes that matter
++//! here are the ones with no entity yet: one point, two coincident points, two real points. Those
++//! are exactly the states a user walks through between the first click and the third, and the
++//! states in which a normalise, a division by a chord length or a subdivision stencil can produce a
++//! NaN that only shows up as a crash several frames later.
++void SplineSelfTest(IConsoleCmdArgs*)
++{
++	struct SCase
++	{
++		const char* szName;
++		Vec3        points[4];
++		int         count;
++	};
++
++	const SCase cases[] =
++	{
++		{ "1 point",            { Vec3(3, 4, 5) },                                                  1 },
++		{ "2 coincident",       { Vec3(3, 4, 5), Vec3(3, 4, 5) },                                   2 },
++		{ "2 points",           { Vec3(0, 0, 0), Vec3(10, 0, 0) },                                  2 },
++		{ "3 collinear",        { Vec3(0, 0, 0), Vec3(5, 0, 0), Vec3(10, 0, 0) },                   3 },
++		{ "3 points vertical",  { Vec3(0, 0, 0), Vec3(0, 0, 5), Vec3(0, 0, 10) },                   3 },
++		{ "3 points",           { Vec3(0, 0, 0), Vec3(5, 5, 1), Vec3(10, 0, 0) },                   3 },
++	};
++
++	int failures = 0;
++	int checks = 0;
++
++	const auto check = [&failures, &checks](bool bOk, const char* szWhat, const char* szCase, int iterations, bool bClosed)
++	{
++		++checks;
++		if (bOk)
++			return;
++
++		++failures;
++		CryWarning(VALIDATOR_MODULE_ENTITYSYSTEM, VALIDATOR_ERROR,
++		           "area_SplineSelfTest FAILED: %s [%s, %d iteration(s), %s]",
++		           szWhat, szCase, iterations, bClosed ? "closed" : "open");
++	};
++
++	for (const SCase& testCase : cases)
++	{
++		for (int closed = 0; closed <= 1; ++closed)
++		{
++			const bool bClosed = closed != 0;
++
++			for (int iterations = 0; iterations <= 2; ++iterations)
++			{
++				Vec3 poly[512];
++				int  count = testCase.count;
++				for (int i = 0; i < count; ++i)
++					poly[i] = testCase.points[i];
++
++				// Subdivision, the same loop BuildEvalPolygon runs.
++				for (int pass = 0; pass < iterations && count >= 2; ++pass)
++				{
++					Vec3      scratch[512];
++					const int written = SplineMath::SubdivideInterpolating(poly, count, bClosed, scratch, CRY_ARRAY_COUNT(scratch));
++					if (written < 2)
++						break;
++
++					const int expected = bClosed ? (count * 2) : (count * 2 - 1);
++					check(written == expected, "subdivision produced the wrong count", testCase.szName, iterations, bClosed);
++
++					for (int i = 0; i < written; ++i)
++						check(scratch[i].IsValid(), "subdivision produced a non-finite point", testCase.szName, iterations, bClosed);
++
++					memcpy(poly, scratch, sizeof(Vec3) * written);
++					count = written;
++				}
++
++				SplineMath::SHandles handles[512];
++				SplineMath::DeriveHandles(poly, count, bClosed, handles, 1.0f);
++
++				for (int i = 0; i < count; ++i)
++				{
++					check(handles[i].back.IsValid() && handles[i].forw.IsValid(),
++					      "handle derivation produced a non-finite point", testCase.szName, iterations, bClosed);
++				}
++
++				const int segmentCount = (count < 2) ? 0 : (bClosed ? count : (count - 1));
++
++				// Evaluation, lengths and both frame modes over every segment.
++				Vec3 prevPos(ZERO), prevTangent(ZERO), normal(ZERO);
++				bool bHavePrevious = false;
++
++				for (int segment = 0; segment < segmentCount; ++segment)
++				{
++					const int i0 = segment % count;
++					const int i1 = (segment + 1) % count;
++
++					const float length = SplineMath::SegmentLength(poly[i0], handles[i0].forw, handles[i1].back, poly[i1]);
++					check(NumberValid(length) && length >= 0.0f, "segment length is not a finite, non-negative number",
++					      testCase.szName, iterations, bClosed);
++
++					for (int step = 0; step <= 4; ++step)
++					{
++						const float t = static_cast<float>(step) / 4.0f;
++
++						const Vec3 pos = SplineMath::EvalSegmentPos(poly[i0], handles[i0].forw, handles[i1].back, poly[i1], t);
++						const Vec3 tangent = SplineMath::EvalSegmentTangent(poly[i0], handles[i0].forw, handles[i1].back, poly[i1], t);
++
++						check(pos.IsValid(), "evaluated position is not finite", testCase.szName, iterations, bClosed);
++						check(tangent.IsValid(), "evaluated tangent is not finite", testCase.szName, iterations, bClosed);
++
++						// LegacyUp.
++						const Vec3 legacyNormal = SplineMath::SegmentNormal(tangent, 0.0f, 30.0f, t);
++						check(legacyNormal.IsValid(), "legacy normal is not finite", testCase.szName, iterations, bClosed);
++
++						// ParallelTransport.
++						if (!bHavePrevious)
++						{
++							normal = SplineMath::MakeSeedNormal(tangent);
++							check(normal.IsValid(), "seed normal is not finite", testCase.szName, iterations, bClosed);
++							bHavePrevious = true;
++						}
++						else
++						{
++							normal = SplineMath::PropagateNormal(prevPos, prevTangent, normal, pos, tangent);
++							check(normal.IsValid(), "propagated normal is not finite", testCase.szName, iterations, bClosed);
++						}
++
++						const Vec3 rolled = SplineMath::ApplyRoll(normal, tangent, 30.0f);
++						check(rolled.IsValid(), "rolled normal is not finite", testCase.szName, iterations, bClosed);
++
++						prevPos = pos;
++						prevTangent = tangent;
++					}
++				}
++			}
++		}
++	}
++
++	if (failures == 0)
++	{
++		CryLog("area_SplineSelfTest: %d checks, all passed.", checks);
++	}
++	else
++	{
++		CryWarning(VALIDATOR_MODULE_ENTITYSYSTEM, VALIDATOR_ERROR,
++		           "area_SplineSelfTest: %d of %d checks FAILED.", failures, checks);
++	}
++}
++
++} // namespace
++
+ void CSplineShapeComponent::Register(Schematyc::CEnvRegistrationScope& componentScope)
+ {
+ 	// No Schematyc functions yet - the same stage as the other kinds. The spline evaluators become
+ 	// Schematyc nodes when something outside C++ needs them.
++
++	// Registered here because Register() runs once, at Schematyc environment registration, by which
++	// time the console exists. It costs nothing until somebody types it.
++	// IConsole::AddCommand is protected and befriends ConsoleRegistrationHelper, so the registration
++	// goes through REGISTER_COMMAND like every other console command in the engine. Guarded, because
++	// Register() can run again when the Schematyc environment is reloaded.
++	static bool s_bSelfTestRegistered = false;
++	if (!s_bSelfTestRegistered && gEnv != nullptr && gEnv->pConsole != nullptr)
++	{
++		s_bSelfTestRegistered = true;
++		REGISTER_COMMAND("area_SplineSelfTest", SplineSelfTest, VF_NULL,
++		                 "Checks the spline maths against 1-, 2- and 3-point open and closed splines, "
++		                 "0 to 2 smoothing passes, both frame modes. Reports any non-finite result.");
++	}
+ }
+ 
+ // ---------------------------------------------------------------------------
+@@ -168,9 +335,13 @@ void CSplineShapeComponent::BuildFrameNormals(SCache& cache) const
+ 		                                         cache.localHandles[i1].back, cache.localPos[i1], t);
+ 	};
+ 
+-	Vec3 prevPos, prevTangent;
++	Vec3 prevPos(ZERO), prevTangent(ZERO);
+ 	sampleAt(0, prevPos, prevTangent);
+ 
++	// A curve whose first two points coincide - which the create tool can produce for one frame -
++	// has a zero tangent there. MakeSeedNormal answers a fixed perpendicular for that case rather
++	// than normalising a zero vector, and PropagateNormal carries it until the tangent is real.
++
+ 	// Seeded from legacy's own normal, so a flat spline looks identical in both frame modes and
+ 	// only a curve that legacy cannot orient is changed.
+ 	cache.frameNormals[0] = SplineMath::MakeSeedNormal(prevTangent);
+@@ -192,6 +363,13 @@ const CSplineShapeComponent::SCache& CSplineShapeComponent::GetCache() const
+ {
+ 	const Matrix34 worldTM = GetShapeWorldTM();
+ 
++	// Re-entry guard. The rule above - nothing inside a cache build may read the cache - is easy to
++	// break again, because half the evaluation helpers legitimately read it. If it is ever broken,
++	// this hands the caller the half-built cache instead of recursing until the stack ends: a wrong
++	// answer for one frame is recoverable, a stack overflow is not.
++	if (m_bBuildingCache)
++		return m_cache;
++
+ 	const bool bSameTM = m_cache.bValid &&
+ 	                     IsEquivalent(m_cache.worldTM.GetColumn0(), worldTM.GetColumn0(), 0.0001f) &&
+ 	                     IsEquivalent(m_cache.worldTM.GetColumn1(), worldTM.GetColumn1(), 0.0001f) &&
+@@ -201,6 +379,8 @@ const CSplineShapeComponent::SCache& CSplineShapeComponent::GetCache() const
+ 	if (bSameTM)
+ 		return m_cache;
+ 
++	m_bBuildingCache = true;
++
+ 	// The evaluation polygon first: the authored points, optionally subdivided (BuildEvalPolygon).
+ 	BuildEvalPolygon(m_cache);
+ 
+@@ -233,8 +413,16 @@ const CSplineShapeComponent::SCache& CSplineShapeComponent::GetCache() const
+ 
+ 	for (int s = 0; s < segmentCount; ++s)
+ 	{
+-		int i0, i1;
+-		SegmentPoints(s, i0, i1);
++		// The two end points of this segment, computed HERE and not through SegmentPoints().
++		//
++		// This is the bug that crashed spline creation on the second click. SegmentPoints() reads
++		// GetCache().localPos.size() - it has to, because with smoothing on the evaluation polygon
++		// is not the authored point list any more - and GetCache() is this function, still building,
++		// with m_cache.bValid still false. So the call recursed into itself until the stack ran out.
++		// It could only fire once there was at least one segment, i.e. from the second point on,
++		// which is exactly when the crash appeared. Nothing inside a cache build may read the cache.
++		const int i0 = s % count;
++		const int i1 = (s + 1) % count;
+ 
+ 		m_cache.segmentStart[s] = m_cache.totalLength;
+ 		m_cache.segmentLength[s] = SplineMath::SegmentLength(m_cache.worldPos[i0], m_cache.worldHandles[i0].forw,
+@@ -247,6 +435,7 @@ const CSplineShapeComponent::SCache& CSplineShapeComponent::GetCache() const
+ 
+ 	m_cache.worldTM = worldTM;
+ 	m_cache.bValid = true;
++	m_bBuildingCache = false;
+ 
+ 	return m_cache;
+ }
+@@ -254,8 +443,13 @@ const CSplineShapeComponent::SCache& CSplineShapeComponent::GetCache() const
+ Vec3 CSplineShapeComponent::SegmentPos(int segment, float t, bool world) const
+ {
+ 	const SCache& cache = GetCache();
+-	if (GetSegmentCount() <= 0)
+-		return cache.localPos.empty() ? ZERO : (world ? cache.worldPos[0] : cache.localPos[0]);
++
++	// Fewer than two evaluation points is not a curve: answer the single point, or the origin when
++	// there is not even one. The create tool drives exactly this state between the first click and
++	// the second, so it is a normal case and not an error.
++	const int count = static_cast<int>(cache.localPos.size());
++	if (count < 2 || segment < 0)
++		return (count == 0) ? Vec3(ZERO) : (world ? cache.worldPos[0] : cache.localPos[0]);
+ 
+ 	int i0, i1;
+ 	SegmentPoints(segment, i0, i1);
+@@ -269,7 +463,11 @@ Vec3 CSplineShapeComponent::SegmentPos(int segment, float t, bool world) const
+ Vec3 CSplineShapeComponent::SegmentTangent(int segment, float t, bool world) const
+ {
+ 	const SCache& cache = GetCache();
+-	if (GetSegmentCount() <= 0)
++
++	// A single point has no direction. Returning zero rather than normalising nothing is what keeps
++	// NaN out of every frame built downstream.
++	const int count = static_cast<int>(cache.localPos.size());
++	if (count < 2 || segment < 0)
+ 		return ZERO;
+ 
+ 	int i0, i1;
+diff --git a/Code/CryPlugins/AreaComponents/Module/Shapes/SplineShapeComponent.h b/Code/CryPlugins/AreaComponents/Module/Shapes/SplineShapeComponent.h
+index f428c629..f7bf8e2a 100644
+--- a/Code/CryPlugins/AreaComponents/Module/Shapes/SplineShapeComponent.h
++++ b/Code/CryPlugins/AreaComponents/Module/Shapes/SplineShapeComponent.h
+@@ -336,6 +336,9 @@ private:
+ 	mutable int m_lastNotifiedPointCount = 0;
+ 
+ 	mutable SCache m_cache;
++	//! Set while GetCache() is filling m_cache. Nothing inside a cache build may read the cache;
++	//! this is the belt on top of that rule - see the comment in the arc-length loop.
++	mutable bool   m_bBuildingCache = false;
+ 
+ 	//! Runtime only, never reflected: non-owning observers that un-register themselves.
+ 	std::vector<IShapeListener*> m_listeners;
+-- 
+2.47.1.windows.1
+

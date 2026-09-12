@@ -81,6 +81,17 @@ untouched and the stock path is byte-identical. Deploy note: the repository's
 or the grain technique's runtime flag stays masked off and the grain block never compiles. Full spec:
 `engine/Code/CryPlugins/CinematicCamera/FilmGrainSpec.md`.
 
+### Area components (branch `area-components`)
+
+Shapes and functions as entity components, next to the untouched legacy "Area" objects. One
+shape per entity (Box, Sphere, Polygon, Spline) drawn and edited in the viewport from an
+**Edit Shape** button; function components on the same entity use it: Area (the classic area
+events, priorities and fade, linked through the stock Link tool), Trigger Bounds, Gravity Volume
+and a Distributor that places meshes along a spline (chord alignment, stretch to fit, smoothing,
+bake to brushes). The editor core gained a generic "component owns editable geometry" hook that
+any component can use. Vis areas, portals and occluders stay as they are. See
+`docs/AreaComponents-README.md`.
+
 ## Status
 
 - Verified on a physically lit interior and on the sample airfield in daylight.
@@ -102,6 +113,7 @@ or the grain technique's runtime flag stays masked off and the grain block never
 | `docs/SceneReferredExport.md` | EXR capture, the sidecar files, the Resolve round trip. |
 | `docs/SceneReferredCalibration.md` | Checking the sky, sun and fog against measured values. |
 | `docs/CryPhoneTracker-README.md` | The phone rig. |
+| `docs/AreaComponents-README.md` | Shape and function components: creating, editing, every property, limits. |
 
 ## Installing it into CRYENGINE 5.7.1
 

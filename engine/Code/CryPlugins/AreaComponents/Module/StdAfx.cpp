@@ -1,0 +1,3 @@
+// Copyright 2026 ReC Sandbox. Distributed under the terms in LICENSE.md at the repository root.
+
+#include "StdAfx.h"

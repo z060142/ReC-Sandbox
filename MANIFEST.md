@@ -1,11 +1,45 @@
-﻿# Sync manifest
+# Sync manifest
 
 Baseline : main @ a34100a9 (pristine CRYENGINE 5.7.1)
-Dev      : dev @ 6003e211
-Synced   : 2026-09-11 10:42
+Dev      : area @ 3b182ffb
+Synced   : 2026-09-12 15:08
 
 ## Commits (newest first)
 
+- 3b182ffb docs(area): AreaComponents README
+- eeb0a41e feat(area): distributor chord alignment, stretch-to-fit, forward axis
+- 61324df1 fix(area): spline evaluation with fewer than three points
+- f75669e0 feat(area): spline smoothing and rotation-minimizing frames
+- 099e1973 feat(area): Bake To Brushes
+- c340deea feat(area): Recenter Pivot editor action with undo
+- 9ca0c573 feat(area): trigger bounds logs events on request and previews its box
+- dc054799 fix(area): distributor - end-cap-only placement, node registration, rebuild storm
+- c7cc19a9 refactor(area): Area component attaches the entity's native links
+- c9aa9eea fix(area): trigger bounds GUID gets its own hipart
+- a347acc4 fix(sandbox): inspector keys component widgets by the full GUID
+- 1427e306 fix(area): unique GUID hiparts for the gravity volume and the distributor
+- facfe144 fix(area): stage 2 function components collided with stage 3's GUIDs
+- 93c31ca8 feat(area): spline creation and point-tool support
+- e0248de6 feat(area): distributor function component
+- 819c85b4 feat(area): Create -> Area presets add the Area function
+- b7704f72 feat(area): gravity volume function component
+- eeebe562 feat(area): spline shape component (legacy Bezier rule, closed flag)
+- 98177ad0 feat(area): trigger bounds component
+- 521beee8 feat(area): Area function component over the legacy area proxy
+- fd19d066 feat(sandbox): generic per-component editor actions + bound box refresh on typed edits
+- fe764cb8 fix(audio): area components do not move their own host entity
+- 58fb6329 feat(entity): authored area fade distance
+- 08649ff2 feat(entity): IEntityAreaComponent::MovePoints
+- 530efcd6 feat(area): drag-to-size creation for box and sphere
+- b4ce3c2e feat(area): sphere shape component
+- 35068d61 refactor(area): pairwise shape incompatibility helper
+- 05317650 feat(area): click-click-double-click creation of a polygon shape
+- d54c4d15 feat(area): polygon point tool - insert, delete, drag, snap
+- 4448fac7 feat(area): polygon shape component
+- 712ac8fa fix(area): no STL container may cross the shape interface - it crashed the render thread
+- 880345d9 feat(area): component edit mode in Sandbox, proved with the box shape
+- b560b239 feat(area): IEditorShapeComponent contract and the box that implements it
+- 0b546c54 feat(area): AreaComponents engine plugin + AreaComponentsEditor skeletons (stage 0.4)
 - 6003e211 docs: the film grain ships as G0 + G1; plates and EXR metadata are parked, and the docs say so
 - 65c9ba67 fix: a moving camera dragged the picture over a static speckle layer - DSNU is a residual
 - ab5dd01c fix: structured sensor noise was orders of magnitude too loud, and the integration exponent goes to 0
@@ -195,8 +229,15 @@ Synced   : 2026-09-11 10:42
 - M	Code/CryEngine/Cry3DEngine/cvars.cpp
 - M	Code/CryEngine/CryCommon/CMakeLists.txt
 - M	Code/CryEngine/CryCommon/Cry3DEngine/I3DEngine.h
+- M	Code/CryEngine/CryCommon/CryEntitySystem/IEntityComponent.h
 - M	Code/CryEngine/CryCommon/CryRenderer/IRenderer.h
 - A	Code/CryEngine/CryCommon/CryRenderer/SceneReferredCurves.h
+- M	Code/CryEngine/CryEntitySystem/Area.cpp
+- M	Code/CryEngine/CryEntitySystem/Area.h
+- M	Code/CryEngine/CryEntitySystem/AreaProxy.cpp
+- M	Code/CryEngine/CryEntitySystem/AreaProxy.h
+- M	Code/CryEngine/CryEntitySystem/EntityAudioProxy.cpp
+- M	Code/CryEngine/CryEntitySystem/EntityAudioProxy.h
 - M	Code/CryEngine/RenderDll/Common/Include_HLSL_CPP_Shared.h
 - M	Code/CryEngine/RenderDll/Common/PostProcess/PostEffects.cpp
 - M	Code/CryEngine/RenderDll/Common/PostProcess/PostEffects.h
@@ -257,6 +298,36 @@ Synced   : 2026-09-11 10:42
 - M	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Water.cpp
 - M	Code/CryEngine/RenderDll/XRenderD3D9/PostProcessDOF.cpp
 - M	Code/CryEngine/RenderDll/XRenderD3D9/core_renderer.waf_files
+- A	Code/CryPlugins/AreaComponents/Interface/IDistributorBake.h
+- A	Code/CryPlugins/AreaComponents/Interface/IShapeComponent.h
+- A	Code/CryPlugins/AreaComponents/Module/CMakeLists.txt
+- A	Code/CryPlugins/AreaComponents/Module/Functions/AreaFunctionComponent.cpp
+- A	Code/CryPlugins/AreaComponents/Module/Functions/AreaFunctionComponent.h
+- A	Code/CryPlugins/AreaComponents/Module/Functions/DistributorComponent.cpp
+- A	Code/CryPlugins/AreaComponents/Module/Functions/DistributorComponent.h
+- A	Code/CryPlugins/AreaComponents/Module/Functions/GravityVolumeComponent.cpp
+- A	Code/CryPlugins/AreaComponents/Module/Functions/GravityVolumeComponent.h
+- A	Code/CryPlugins/AreaComponents/Module/Functions/TriggerBoundsComponent.cpp
+- A	Code/CryPlugins/AreaComponents/Module/Functions/TriggerBoundsComponent.h
+- A	Code/CryPlugins/AreaComponents/Module/PluginDll.cpp
+- A	Code/CryPlugins/AreaComponents/Module/PluginDll.h
+- A	Code/CryPlugins/AreaComponents/Module/Shapes/BoxShapeComponent.cpp
+- A	Code/CryPlugins/AreaComponents/Module/Shapes/BoxShapeComponent.h
+- A	Code/CryPlugins/AreaComponents/Module/Shapes/PolygonShapeComponent.cpp
+- A	Code/CryPlugins/AreaComponents/Module/Shapes/PolygonShapeComponent.h
+- A	Code/CryPlugins/AreaComponents/Module/Shapes/ShapeDisplay.h
+- A	Code/CryPlugins/AreaComponents/Module/Shapes/ShapeEditorActions.h
+- A	Code/CryPlugins/AreaComponents/Module/Shapes/ShapeGeometry.h
+- A	Code/CryPlugins/AreaComponents/Module/Shapes/ShapeKinds.h
+- A	Code/CryPlugins/AreaComponents/Module/Shapes/SphereShapeComponent.cpp
+- A	Code/CryPlugins/AreaComponents/Module/Shapes/SphereShapeComponent.h
+- A	Code/CryPlugins/AreaComponents/Module/Shapes/SplineMath.h
+- A	Code/CryPlugins/AreaComponents/Module/Shapes/SplineShapeComponent.cpp
+- A	Code/CryPlugins/AreaComponents/Module/Shapes/SplineShapeComponent.h
+- A	Code/CryPlugins/AreaComponents/Module/StdAfx.cpp
+- A	Code/CryPlugins/AreaComponents/Module/StdAfx.h
+- A	Code/CryPlugins/AreaComponents/Module/resource.h
+- A	Code/CryPlugins/AreaComponents/README.md
 - M	Code/CryPlugins/CMakeLists.txt
 - A	Code/CryPlugins/CinematicCamera/AnamorphicSpec.md
 - A	Code/CryPlugins/CinematicCamera/Assets/Environment/ReC_Physical.env
@@ -328,6 +399,7 @@ Synced   : 2026-09-11 10:42
 - A	Code/CryPlugins/CinematicCamera/docs/SceneReferredContent.md
 - A	Code/CryPlugins/CinematicCamera/docs/SceneReferredExport.md
 - A	Code/CryPlugins/CinematicCamera/docs/SceneReferredLook.md
+- M	Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Audio/AreaComponent.cpp
 - M	Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Lights/EnvironmentProbeComponent.h
 - A	Code/CryPlugins/CryPhoneTracker/Module/CMakeLists.txt
 - A	Code/CryPlugins/CryPhoneTracker/Module/PhoneTrackerComponent.cpp
@@ -349,6 +421,28 @@ Synced   : 2026-09-11 10:42
 - A	Code/Libs/tinyexr/tinyexr_impl.cpp
 - M	Code/Sandbox/EditorQt/LevelEditor/LevelEditorViewport.cpp
 - M	Code/Sandbox/EditorQt/LevelEditor/LevelEditorViewport.h
+- M	Code/Sandbox/EditorQt/Objects/EntityObject.cpp
+- M	Code/Sandbox/EditorQt/Objects/EntityObject.h
+- A	Code/Sandbox/Plugins/AreaComponentsEditor/CMakeLists.txt
+- A	Code/Sandbox/Plugins/AreaComponentsEditor/Objects/AreaShapeObjectClassDescs.cpp
+- A	Code/Sandbox/Plugins/AreaComponentsEditor/Plugin.cpp
+- A	Code/Sandbox/Plugins/AreaComponentsEditor/Plugin.h
+- A	Code/Sandbox/Plugins/AreaComponentsEditor/StdAfx.cpp
+- A	Code/Sandbox/Plugins/AreaComponentsEditor/StdAfx.h
+- A	Code/Sandbox/Plugins/AreaComponentsEditor/Tools/DistributorBakeTool.cpp
+- A	Code/Sandbox/Plugins/AreaComponentsEditor/Tools/DistributorBakeTool.h
+- A	Code/Sandbox/Plugins/AreaComponentsEditor/Tools/ShapeCreateTool.cpp
+- A	Code/Sandbox/Plugins/AreaComponentsEditor/Tools/ShapeCreateTool.h
+- A	Code/Sandbox/Plugins/AreaComponentsEditor/Tools/ShapeDragCreateTool.cpp
+- A	Code/Sandbox/Plugins/AreaComponentsEditor/Tools/ShapeDragCreateTool.h
+- A	Code/Sandbox/Plugins/AreaComponentsEditor/Tools/ShapeEditTool.cpp
+- A	Code/Sandbox/Plugins/AreaComponentsEditor/Tools/ShapeEditTool.h
+- A	Code/Sandbox/Plugins/AreaComponentsEditor/Tools/ShapeRecenterTool.cpp
+- A	Code/Sandbox/Plugins/AreaComponentsEditor/Tools/ShapeRecenterTool.h
+- A	Code/Sandbox/Plugins/AreaComponentsEditor/Tools/ShapeToolCommon.cpp
+- A	Code/Sandbox/Plugins/AreaComponentsEditor/Tools/ShapeToolCommon.h
+- A	Code/Sandbox/Plugins/AreaComponentsEditor/Tools/SplineCreateTool.cpp
+- A	Code/Sandbox/Plugins/AreaComponentsEditor/Tools/SplineCreateTool.h
 - A	Code/Sandbox/Plugins/CinematicCameraEditor/CMakeLists.txt
 - A	Code/Sandbox/Plugins/CinematicCameraEditor/CineCamAssetRegistration.cpp
 - A	Code/Sandbox/Plugins/CinematicCameraEditor/CineCamAssetRegistration.h

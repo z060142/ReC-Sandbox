@@ -1,0 +1,617 @@
+From 099e1973abe8484bde91e781b44dbae941ff88f8 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Sat, 12 Sep 2026 14:00:09 +0800
+Subject: [PATCH 205/209] feat(area): Bake To Brushes
+
+Decision 04's D4, which shipped as a warning that said "not implemented yet".
+
+IDistributorBake.h is the contract: IBakeableComponent, a reflected interface
+base deriving from IEditorActionComponent, plus SBakeInstance - a flat POD with
+a fixed-size mesh path, a world transform, the render flags and the two ratios.
+No STL crosses it and nothing reflected holds a pointer, the same two rules the
+shape contract obeys. Any component that generates placed geometry from
+parameters can implement it and get the button; today that is the distributor,
+which also loses its old reflected ActionButton in favour of the generic
+mechanism.
+
+CDistributorBakeTool is a one-shot tool like CShapeRecenterTool, for the same
+reason and with the same Display()-not-SetUserData() timing. Inside one CUndo it
+takes the object's snapshot, creates one brush per instance through
+IEditor::NewObject("Brush", <cgf>) - "Brush" is CBrushObject's class name
+(BrushObject.h:175) and its file spec is the .cgf - places each with
+CBaseObject::SetWorldTM, names them "<entity>_baked*", then switches the
+distributor's own reflected Enabled member off and runs the 1a sync. One Ctrl+Z
+therefore removes every brush AND brings the live instances back. The baked
+objects are selected at the end.
+
+Two deliberate limits, both logged rather than hidden. The brushes are placed
+through the generic CBaseObject API only, because this plugin does not link
+EditorQt: CBrushObject's own variables - the render-flag block, view distance,
+LOD, material layers - are out of reach, so a baked brush gets a hand-placed
+brush's defaults, and the log line names the flags and ratios that were not
+carried. And the brushes are created flat with a shared name prefix rather than
+inside a CGroup: CGroup lives in EditorQt and its AddMember contract is not
+reachable through CBaseObject, and the single undo transaction already does what
+grouping was wanted for.
+
+Disabling rather than deleting is the point: the parameters, the seed and the
+curve all survive a bake, so switching Enabled back on returns exactly the same
+layout.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SCUvWGLCsqzm3VNMzp4uiS
+---
+ .../Interface/IDistributorBake.h              |  71 ++++++
+ .../AreaComponents/Module/CMakeLists.txt      |   2 +
+ .../Module/Functions/DistributorComponent.cpp |  80 +++++--
+ .../Module/Functions/DistributorComponent.h   |  26 ++-
+ .../AreaComponentsEditor/CMakeLists.txt       |   4 +
+ .../Tools/DistributorBakeTool.cpp             | 203 ++++++++++++++++++
+ .../Tools/DistributorBakeTool.h               |  68 ++++++
+ 7 files changed, 432 insertions(+), 22 deletions(-)
+ create mode 100644 Code/CryPlugins/AreaComponents/Interface/IDistributorBake.h
+ create mode 100644 Code/Sandbox/Plugins/AreaComponentsEditor/Tools/DistributorBakeTool.cpp
+ create mode 100644 Code/Sandbox/Plugins/AreaComponentsEditor/Tools/DistributorBakeTool.h
+
+diff --git a/Code/CryPlugins/AreaComponents/Interface/IDistributorBake.h b/Code/CryPlugins/AreaComponents/Interface/IDistributorBake.h
+new file mode 100644
+index 00000000..02bcd614
+--- /dev/null
++++ b/Code/CryPlugins/AreaComponents/Interface/IDistributorBake.h
+@@ -0,0 +1,71 @@
++// Copyright 2026 ReC Sandbox. Distributed under the terms in LICENSE.md at the repository root.
++#pragma once
++
++//! What the editor needs in order to turn a component's generated instances into real, editable
++//! editor objects - decision 04's D4, "bake to brushes as an extra button, never the mechanism".
++//!
++//! It is a separate header from IShapeComponent.h because the thing being baked is not a shape:
++//! any component that generates placed geometry from parameters can implement this and get the
++//! button. Today that is the distributor.
++//!
++//! Same two rules as the shape contract. HEAP RULE: no STL container crosses this interface - the
++//! editor plugin and the engine module use different allocators, so the instance description is a
++//! flat POD the caller owns, filled one at a time. MEMORY RULE: nothing reflected holds a raw
++//! pointer.
++//!
++//! ABI: append-only. The editor plugin never links this module; this header is the whole contract
++//! between them, so new virtuals go at the END and existing ones never change signature.
++
++#include <CryEntitySystem/IEntityComponent.h>
++#include <CrySchematyc/Reflection/TypeDesc.h>
++#include <CryMath/Cry_Math.h>
++
++namespace Cry
++{
++namespace AreaComponents
++{
++
++//! One generated instance, in the form the editor needs to build a brush object out of it.
++//! A plain POD with a fixed-size path: the editor fills its own copy and never sees our strings.
++struct SBakeInstance
++{
++	//! World transform - rotation, scale and position as the generator placed it.
++	Matrix34 tm = Matrix34(IDENTITY);
++	//! Path of the .cgf, null-terminated. Empty means "this instance has no mesh", which a caller
++	//! should skip rather than treat as an error.
++	char     meshPath[256] = { 0 };
++	//! The engine render flags the live instance carries (ERF_*), so a baked brush can be given the
++	//! same ones where the editor object exposes them.
++	uint64   renderFlags = 0;
++	int      viewDistRatio = 100;
++	int      lodRatio = 100;
++};
++
++//! Implemented by a component whose generated instances can be turned into editor objects.
++//!
++//! It derives from IEditorActionComponent, not from IEntityComponent, so that an implementation has
++//! ONE inheritance chain to IEntityComponent (a second base would make the entity-component base
++//! ambiguous and break the static_cast that GetAllComponents<>() performs) and so that a bakeable
++//! component declares its button through the same generic mechanism every other action uses.
++struct IBakeableComponent : public IEditorActionComponent
++{
++	static void ReflectType(Schematyc::CTypeDesc<IBakeableComponent>& desc)
++	{
++		desc.SetGUID("{7E4C1A96-3B85-4D27-91F0-6D2A8C45E713}"_cry_guid);
++		desc.SetLabel("Bakeable");
++	}
++
++	//! How many instances would be baked right now. 0 is a legitimate answer.
++	virtual int  GetBakeInstanceCount() const = 0;
++	//! Describes instance `index` into caller-owned storage. False when the index is out of range.
++	virtual bool GetBakeInstance(int index, SBakeInstance& out) const = 0;
++
++	//! Whether the component is currently generating instances at all. Baking switches this off, so
++	//! that the baked objects do not sit inside a live copy of themselves; it is the component's own
++	//! reflected "Enabled" member, so an undo of the bake restores it with the entity's snapshot.
++	virtual bool IsBakeEnabled() const = 0;
++	virtual void SetBakeEnabled(bool bEnabled) = 0;
++};
++
++} // namespace AreaComponents
++} // namespace Cry
+diff --git a/Code/CryPlugins/AreaComponents/Module/CMakeLists.txt b/Code/CryPlugins/AreaComponents/Module/CMakeLists.txt
+index 73fe5500..5e8a8b64 100644
+--- a/Code/CryPlugins/AreaComponents/Module/CMakeLists.txt
++++ b/Code/CryPlugins/AreaComponents/Module/CMakeLists.txt
+@@ -10,10 +10,12 @@ add_sources("AreaComponents_uber_0.cpp"
+ 		"resource.h"
+ 	SOURCE_GROUP "Interface"
+ 		"../Interface/IShapeComponent.h"
++		"../Interface/IDistributorBake.h"
+ 	SOURCE_GROUP "Shapes"
+ 		"Shapes/ShapeGeometry.h"
+ 		"Shapes/ShapeKinds.h"
+ 		"Shapes/ShapeDisplay.h"
++		"Shapes/ShapeEditorActions.h"
+ 		"Shapes/BoxShapeComponent.h"
+ 		"Shapes/BoxShapeComponent.cpp"
+ 		"Shapes/PolygonShapeComponent.h"
+diff --git a/Code/CryPlugins/AreaComponents/Module/Functions/DistributorComponent.cpp b/Code/CryPlugins/AreaComponents/Module/Functions/DistributorComponent.cpp
+index 2b3ef411..a38f44e3 100644
+--- a/Code/CryPlugins/AreaComponents/Module/Functions/DistributorComponent.cpp
++++ b/Code/CryPlugins/AreaComponents/Module/Functions/DistributorComponent.cpp
+@@ -805,27 +805,73 @@ void CDistributorComponent::RebuildTransformsOnly()
+ 
+ void CDistributorComponent::Initialize()
+ {
+-	const EntityId entityId = GetEntityId();
+-	const CryGUID  componentGuid = GetGUID();
++	Rebuild();
++}
++
++// ---------------------------------------------------------------------------
++// Editor actions and baking
++// ---------------------------------------------------------------------------
++
++bool CDistributorComponent::GetEditorAction(int index, SEditorActionDesc& out) const
++{
++	if (index != 0)
++		return false;
++
++	// String literals: the property tree keeps the pointers SEditorActionDesc hands it.
++	out.szToolClassName = "EditTool.AreaDistributorBake";
++	out.szLabel = "Bake To Brushes";
++	return true;
++}
++
++int CDistributorComponent::GetBakeInstanceCount() const
++{
++	return static_cast<int>(m_instances.size());
++}
++
++bool CDistributorComponent::GetBakeInstance(int index, SBakeInstance& out) const
++{
++	if (index < 0 || index >= static_cast<int>(m_instances.size()))
++		return false;
++
++	const SInstance& instance = m_instances[index];
+ 
+-	// An EntityId and a GUID, never `this`: a reflected member is copied and cached and can outlive
+-	// the component (MEMORY.md, fix bde12cd8).
+-	m_bakeButton = Serialization::ActionButton(std::function<void()>([entityId, componentGuid]()
++	out = SBakeInstance();
++	out.tm = instance.tm;
++	out.renderFlags = BuildRenderFlags();
++	out.viewDistRatio = m_viewDistRatio;
++	out.lodRatio = m_lodRatio;
++
++	// The path, copied into the caller's fixed buffer - no string crosses the boundary (heap rule,
++	// IDistributorBake.h). The end cap lives one past the mesh list, which is how ReloadMeshes
++	// lays m_statObjs out.
++	const char* szPath = nullptr;
++	if (instance.meshIndex >= 0 && instance.meshIndex < static_cast<int>(m_meshes.meshes.size()))
++	{
++		szPath = m_meshes.meshes[instance.meshIndex].mesh.value.c_str();
++	}
++	else if (instance.meshIndex == GetEndCapMeshIndex())
+ 	{
+-		IEntity* pEntity = (gEnv->pEntitySystem != nullptr) ? gEnv->pEntitySystem->GetEntity(entityId) : nullptr;
+-		const char* szName = (pEntity != nullptr) ? pEntity->GetName() : "<none>";
++		szPath = m_endCapMesh.value.c_str();
++	}
+ 
+-		// The seam, deliberately left open. Baking means CREATING EDITOR OBJECTS - one CBrushObject
+-		// per instance, inside one undo step - and an engine module cannot reach the object manager
+-		// to do that. It belongs in the AreaComponentsEditor plugin, driven from a tool, which is
+-		// where the "Edit Shape" button already goes. Until then this says so rather than pretending.
+-		CryWarning(VALIDATOR_MODULE_ENTITYSYSTEM, VALIDATOR_WARNING,
+-		           "Distributor on entity \"%s\": \"Bake To Brushes\" is not implemented yet - baking has to create editor "
+-		           "objects, which only the editor plugin can do. The instances keep their live link to the spline.",
+-		           szName);
+-	}));
++	if (szPath != nullptr)
++	{
++		cry_strcpy(out.meshPath, szPath);
++	}
+ 
+-	Rebuild();
++	return true;
++}
++
++void CDistributorComponent::SetBakeEnabled(bool bEnabled)
++{
++	if (m_bEnabled == bEnabled)
++		return;
++
++	m_bEnabled = bEnabled;
++
++	// Forced: Enabled is part of the signature, but going through the guard would be one more thing
++	// to get wrong on a path whose whole job is to make the live instances disappear.
++	Rebuild(true);
+ }
+ 
+ void CDistributorComponent::OnShapeChanged(IShapeComponent& shape, EShapeChangeReason reason)
+diff --git a/Code/CryPlugins/AreaComponents/Module/Functions/DistributorComponent.h b/Code/CryPlugins/AreaComponents/Module/Functions/DistributorComponent.h
+index 3e99ec4d..38e1e212 100644
+--- a/Code/CryPlugins/AreaComponents/Module/Functions/DistributorComponent.h
++++ b/Code/CryPlugins/AreaComponents/Module/Functions/DistributorComponent.h
+@@ -2,6 +2,7 @@
+ #pragma once
+ 
+ #include "../../Interface/IShapeComponent.h"
++#include "../../Interface/IDistributorBake.h"
+ 
+ #include <CrySchematyc/MathTypes.h>
+ #include <CrySchematyc/ResourceTypes.h>
+@@ -154,7 +155,7 @@ inline bool Serialize(Serialization::IArchive& archive, SDistributorMeshes& valu
+ //! (already coalesced to one notification per edit gesture by the shape), on a property change, and
+ //! transform-only on a move.
+ class CDistributorComponent final
+-	: public IEntityComponent
++	: public IBakeableComponent
+ 	, public IShapeListener
+ {
+ public:
+@@ -174,6 +175,12 @@ public:
+ 		desc.SetDescription("Places meshes along the spline shape on this entity.");
+ 		desc.SetComponentFlags({ IEntityComponent::EFlags::Singleton });
+ 
++		// The reflected interface bases: IBakeableComponent is how the editor's bake tool finds this
++		// component across the DLL boundary, and IEditorActionComponent is what puts its button in
++		// the inspector (CEntityObject::CreateComponentWidget looks the base up by type GUID).
++		desc.AddBase<IBakeableComponent>();
++		desc.AddBase<IEditorActionComponent>();
++
+ 		desc.AddMember(&CDistributorComponent::m_bEnabled, 'enbl', "Enabled", "Enabled", "Whether any instances are placed at all", true);
+ 		desc.AddMember(&CDistributorComponent::m_seed, 'seed', "Seed", "Seed", "Seed of everything random here. The same seed always gives the same placement.", 1u);
+ 
+@@ -214,8 +221,6 @@ public:
+ 		desc.AddMember(&CDistributorComponent::m_viewDistRatio, 'vdst', "ViewDistRatio", "View Distance Ratio", "Brush view distance ratio, 0..255", 100);
+ 		desc.AddMember(&CDistributorComponent::m_lodRatio, 'lodr', "LodRatio", "LOD Ratio", "Brush LOD ratio, 0..255", 100);
+ 
+-		desc.AddMember(&CDistributorComponent::m_bakeButton, 'bake', "BakeToBrushes", "Bake To Brushes", "Turn the instances into real, individually editable brush objects. Not implemented yet - see the report.", Serialization::FunctorActionButton<std::function<void()>>());
+-
+ 		// Resource-name members last (see SDistributorMesh above).
+ 		desc.AddMember(&CDistributorComponent::m_meshes, 'mesh', "Meshes", "Meshes", "The meshes placed along the curve, with their relative weights", SDistributorMeshes());
+ 		desc.AddMember(&CDistributorComponent::m_endCapMesh, 'ecap', "EndCapMesh", "End Cap Mesh", "An optional mesh placed once at each end of the curve", Schematyc::GeomFileName());
+@@ -225,6 +230,19 @@ public:
+ 	virtual void OnShapeChanged(IShapeComponent& shape, EShapeChangeReason reason) override;
+ 	// ~IShapeListener
+ 
++	// IEditorActionComponent - one button, "Bake To Brushes", which starts the editor plugin's
++	// one-shot bake tool for this component instance.
++	virtual int  GetEditorActionCount() const override { return 1; }
++	virtual bool GetEditorAction(int index, SEditorActionDesc& out) const override;
++	// ~IEditorActionComponent
++
++	// IBakeableComponent
++	virtual int  GetBakeInstanceCount() const override;
++	virtual bool GetBakeInstance(int index, SBakeInstance& out) const override;
++	virtual bool IsBakeEnabled() const override { return m_bEnabled; }
++	virtual void SetBakeEnabled(bool bEnabled) override;
++	// ~IBakeableComponent
++
+ protected:
+ 	// IEntityComponent
+ 	virtual void                    Initialize() override;
+@@ -339,8 +357,6 @@ private:
+ 	int                  m_viewDistRatio = 100;
+ 	int                  m_lodRatio = 100;
+ 
+-	Serialization::FunctorActionButton<std::function<void()>> m_bakeButton;
+-
+ 	SDistributorMeshes      m_meshes;
+ 	Schematyc::GeomFileName m_endCapMesh;
+ 
+diff --git a/Code/Sandbox/Plugins/AreaComponentsEditor/CMakeLists.txt b/Code/Sandbox/Plugins/AreaComponentsEditor/CMakeLists.txt
+index e17e98ef..1302d8db 100644
+--- a/Code/Sandbox/Plugins/AreaComponentsEditor/CMakeLists.txt
++++ b/Code/Sandbox/Plugins/AreaComponentsEditor/CMakeLists.txt
+@@ -18,6 +18,10 @@ add_sources("NoUberFile"
+ 		"Tools/ShapeDragCreateTool.cpp"
+ 		"Tools/SplineCreateTool.h"
+ 		"Tools/SplineCreateTool.cpp"
++		"Tools/ShapeRecenterTool.h"
++		"Tools/ShapeRecenterTool.cpp"
++		"Tools/DistributorBakeTool.h"
++		"Tools/DistributorBakeTool.cpp"
+ 	SOURCE_GROUP "Objects"
+ 		"Objects/AreaShapeObjectClassDescs.cpp"
+ )
+diff --git a/Code/Sandbox/Plugins/AreaComponentsEditor/Tools/DistributorBakeTool.cpp b/Code/Sandbox/Plugins/AreaComponentsEditor/Tools/DistributorBakeTool.cpp
+new file mode 100644
+index 00000000..feb0d72c
+--- /dev/null
++++ b/Code/Sandbox/Plugins/AreaComponentsEditor/Tools/DistributorBakeTool.cpp
+@@ -0,0 +1,203 @@
++// Copyright 2026 ReC Sandbox. Distributed under the terms in LICENSE.md at the repository root.
++#include "StdAfx.h"
++#include "DistributorBakeTool.h"
++#include "ShapeToolCommon.h"
++
++#include <IEditor.h>
++#include <IEditorClassFactory.h>
++#include <IObjectManager.h>
++#include <IUndoManager.h>
++#include <LevelEditor/LevelEditorSharedState.h>
++#include <Objects/BaseObject.h>
++#include <Objects/DisplayContext.h>
++
++#include <CryEntitySystem/IEntity.h>
++#include <CrySchematyc/Reflection/TypeDesc.h>
++
++#include <IDistributorBake.h>
++
++#include <vector>
++
++using Cry::AreaComponents::IBakeableComponent;
++using Cry::AreaComponents::SBakeInstance;
++
++namespace
++{
++
++//! Only cast what really is one: the reflected base list is the cross-DLL proof that this component
++//! implements the contract, exactly as AreaShapeTools::AsShape does for the shape contract.
++IBakeableComponent* AsBakeable(IEntityComponent* pComponent)
++{
++	if (pComponent == nullptr)
++		return nullptr;
++
++	if (pComponent->GetClassDesc().FindBaseByTypeID(Schematyc::GetTypeDesc<IBakeableComponent>().GetGUID()) == nullptr)
++		return nullptr;
++
++	return static_cast<IBakeableComponent*>(pComponent);
++}
++
++} // namespace
++
++class CDistributorBakeTool_ClassDesc : public IClassDesc
++{
++	virtual ESystemClassID SystemClassID() override   { return ESYSTEM_CLASS_EDITTOOL; }
++	virtual const char*    ClassName() override       { return "EditTool.AreaDistributorBake"; }
++	virtual const char*    Category() override        { return "Area"; }
++	virtual CRuntimeClass* GetRuntimeClass() override { return RUNTIME_CLASS(CDistributorBakeTool); }
++};
++
++REGISTER_CLASS_DESC(CDistributorBakeTool_ClassDesc);
++
++IMPLEMENT_DYNCREATE(CDistributorBakeTool, CEditTool);
++
++void CDistributorBakeTool::SetUserData(const char* key, void* userData)
++{
++	if (userData == nullptr || key == nullptr || strcmp(key, SEntityComponentEditToolTarget::GetUserDataKey()) != 0)
++	{
++		return;
++	}
++
++	const SEntityComponentEditToolTarget* pTarget = static_cast<const SEntityComponentEditToolTarget*>(userData);
++	m_objectGuid = pTarget->objectGuid;
++	m_componentGuid = pTarget->componentGuid;
++}
++
++void CDistributorBakeTool::Display(SDisplayContext& dc)
++{
++	if (m_bDone)
++		return;
++
++	m_bDone = true;
++
++	Bake();
++
++	// Deletes this tool. Last statement, always.
++	GetIEditor()->GetLevelEditorSharedState()->SetEditTool(nullptr);
++}
++
++bool CDistributorBakeTool::Bake()
++{
++	CBaseObject* pObject = AreaShapeTools::FindObject(m_objectGuid);
++	IEntity*     pEntity = pObject != nullptr ? pObject->GetIEntity() : nullptr;
++	if (pEntity == nullptr || m_componentGuid == CryGUID::Null())
++		return false;
++
++	IEntityComponent*   pComponent = pEntity->GetComponentByGUID(m_componentGuid);
++	IBakeableComponent* pBakeable = AsBakeable(pComponent);
++	if (pBakeable == nullptr)
++	{
++		CryWarning(VALIDATOR_MODULE_EDITOR, VALIDATOR_WARNING,
++		           "Bake To Brushes: no bakeable component found - nothing was done.");
++		return false;
++	}
++
++	const int instanceCount = pBakeable->GetBakeInstanceCount();
++	if (instanceCount <= 0)
++	{
++		CryWarning(VALIDATOR_MODULE_EDITOR, VALIDATOR_WARNING,
++		           "Bake To Brushes: this distributor has placed no instances, so there is nothing to bake.");
++		return false;
++	}
++
++	if (instanceCount > kMaxBakedObjects)
++	{
++		CryWarning(VALIDATOR_MODULE_EDITOR, VALIDATOR_WARNING,
++		           "Bake To Brushes: %d instances is more than one bake will turn into editor objects (%d). "
++		           "Raise the spacing, or bake a shorter spline.",
++		           instanceCount, kMaxBakedObjects);
++		return false;
++	}
++
++	IObjectManager* pObjectManager = GetIEditor()->GetObjectManager();
++	IUndoManager*   pUndoManager = GetIEditor()->GetIUndoManager();
++	if (pObjectManager == nullptr || pUndoManager == nullptr || !pObjectManager->CanCreateObject())
++		return false;
++
++	const string baseName = string(pObject->GetName()) + "_baked";
++
++	pUndoManager->Begin();
++
++	if (pUndoManager->IsUndoRecording())
++	{
++		// Taken BEFORE Enabled is switched off, so the undo restores the live distributor. Every
++		// NewObject below records its own CUndoBaseObjectNew inside the same transaction, so one
++		// Ctrl+Z removes the brushes and brings the instances back together.
++		pObject->StoreUndo("Bake To Brushes");
++	}
++
++	std::vector<CBaseObject*> created;
++	created.reserve(static_cast<size_t>(instanceCount));
++
++	int skipped = 0;
++
++	for (int i = 0; i < instanceCount; ++i)
++	{
++		SBakeInstance instance;
++		if (!pBakeable->GetBakeInstance(i, instance))
++			continue;
++
++		if (instance.meshPath[0] == '\0')
++		{
++			++skipped;
++			continue;
++		}
++
++		// "Brush" is CBrushObject's class name (BrushObject.h:175) and its file spec is the .cgf,
++		// which is exactly what the create panel passes when a brush is dragged into the level.
++		CBaseObject* pBrush = GetIEditor()->NewObject("Brush", instance.meshPath);
++		if (pBrush == nullptr)
++		{
++			++skipped;
++			continue;
++		}
++
++		// One call carries position, rotation and scale, which is all the generic CBaseObject API
++		// can carry (see the header for what is deliberately not carried).
++		pBrush->SetWorldTM(instance.tm);
++		pBrush->SetName(pObjectManager->GenUniqObjectName(baseName));
++
++		created.push_back(pBrush);
++	}
++
++	if (created.empty())
++	{
++		pUndoManager->Cancel();
++
++		CryWarning(VALIDATOR_MODULE_EDITOR, VALIDATOR_WARNING,
++		           "Bake To Brushes: none of the %d instances could be turned into a brush object - nothing was done.",
++		           instanceCount);
++		return false;
++	}
++
++	// Read before disabling: SetBakeEnabled(false) throws the instance list away.
++	SBakeInstance first;
++	const bool    bHaveFirst = pBakeable->GetBakeInstance(0, first);
++
++	// The live instances go away, but the distributor keeps its parameters, its seed and its curve:
++	// switching Enabled back on regenerates exactly the same layout.
++	pBakeable->SetBakeEnabled(false);
++	AreaShapeTools::SyncEditedComponent(pObject, pComponent);
++
++	if (pUndoManager->IsUndoRecording())
++	{
++		pUndoManager->Accept("Bake To Brushes");
++	}
++
++	pObjectManager->ClearSelection();
++	for (CBaseObject* pBrush : created)
++	{
++		pObjectManager->SelectObject(pBrush);
++	}
++
++	CryLog("Bake To Brushes on entity \"%s\": %d instances -> %d brush objects named \"%s*\", %d skipped for want of a "
++	       "mesh. The distributor is now disabled; switch Enabled back on to return to generated instances. "
++	       "Render flags 0x%llx, view distance ratio %d and LOD ratio %d were NOT carried - a baked brush gets the "
++	       "defaults of a hand-placed one.",
++	       pObject->GetName().c_str(), instanceCount, static_cast<int>(created.size()), baseName.c_str(), skipped,
++	       bHaveFirst ? first.renderFlags : 0ull,
++	       bHaveFirst ? first.viewDistRatio : 0,
++	       bHaveFirst ? first.lodRatio : 0);
++
++	return true;
++}
+diff --git a/Code/Sandbox/Plugins/AreaComponentsEditor/Tools/DistributorBakeTool.h b/Code/Sandbox/Plugins/AreaComponentsEditor/Tools/DistributorBakeTool.h
+new file mode 100644
+index 00000000..da06bbf2
+--- /dev/null
++++ b/Code/Sandbox/Plugins/AreaComponentsEditor/Tools/DistributorBakeTool.h
+@@ -0,0 +1,68 @@
++// Copyright 2026 ReC Sandbox. Distributed under the terms in LICENSE.md at the repository root.
++#pragma once
++
++#include <LevelEditor/Tools/EditTool.h>
++
++#include <CryExtension/CryGUID.h>
++
++//! "Bake To Brushes": turn a distributor's live instances into real brush objects, once, in one
++//! undo step. Registered as "EditTool.AreaDistributorBake", which is what CDistributorComponent
++//! names in its SEditorActionDesc.
++//!
++//! Decision 04 called this D4 - "an extra button, never the mechanism". The live link to the spline
++//! is what makes a distributor worth having; baking is for the moment an author wants to stop
++//! generating and start hand-editing. So the bake switches the distributor's own reflected
++//! `Enabled` member off rather than deleting the component: the parameters, the seed and the curve
++//! all survive, and turning Enabled back on brings the generated instances back.
++//!
++//! One-shot, like CShapeRecenterTool, and for the same reason: an inspector button is an
++//! SEditToolButton and an SEditToolButton starts a CEditTool. The work happens on the first
++//! Display() - not in SetUserData(), which runs while the property tree is still installing the
++//! tool - and the tool then pops itself off the level editor.
++//!
++//! WHAT IS CARRIED and what is not. The brushes are created through IEditor::NewObject("Brush",
++//! <cgf path>) and placed with CBaseObject::SetWorldTM, i.e. through the generic CBaseObject API
++//! only: this plugin deliberately does not link EditorQt, so CBrushObject's own variables - the
++//! render-flag block, view-distance and LOD ratios, material layers - are not reachable and the
++//! baked brushes get the defaults a hand-placed brush gets. The instance's flags and ratios are
++//! read out of the component (SBakeInstance carries them) and reported in the log line, so nothing
++//! is silently lost. Linking EditorQt would fix it; that is a bigger decision than this button.
++//!
++//! The brushes are created FLAT, not inside a group, sharing one name prefix
++//! "<entity name>_baked". A CGroup lives in EditorQt and its AddMember contract is not reachable
++//! through CBaseObject alone, and a half-working group is worse than none: the single CUndo already
++//! makes Ctrl+Z remove every brush and re-enable the distributor in one step, which is what
++//! grouping was wanted for.
++class CDistributorBakeTool : public CEditTool
++{
++	DECLARE_DYNCREATE(CDistributorBakeTool)
++
++public:
++	CDistributorBakeTool() = default;
++
++	// CEditTool
++	virtual string GetDisplayName() const override { return "Bake To Brushes"; }
++	virtual void   SetUserData(const char* key, void* userData) override;
++	virtual void   Display(SDisplayContext& dc) override;
++	virtual bool   MouseCallback(CViewport* pView, EMouseEvent event, CPoint& point, int flags) override { return false; }
++	virtual bool   IsNeedMoveTool() override { return false; }
++	// ~CEditTool
++
++protected:
++	virtual ~CDistributorBakeTool() = default;
++	virtual void DeleteThis() override { delete this; }
++
++private:
++	//! The whole action. Returns false when there was nothing to bake, which is not an error.
++	bool Bake();
++
++	CryGUID m_objectGuid = CryGUID::Null();
++	CryGUID m_componentGuid = CryGUID::Null();
++
++	bool m_bDone = false;
++
++	//! Most instances one bake will turn into objects. A distributor can legitimately generate tens
++	//! of thousands; making that many editor objects in one undo step is not a favour to anybody,
++	//! so past this it refuses and says so.
++	static constexpr int kMaxBakedObjects = 5000;
++};
+-- 
+2.47.1.windows.1
+

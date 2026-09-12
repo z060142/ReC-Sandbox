@@ -1,0 +1,238 @@
+From fd19d066911b79f44fe77783b172ef93880a6581 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Fri, 11 Sep 2026 23:52:18 +0800
+Subject: [PATCH 189/209] feat(sandbox): generic per-component editor actions +
+ bound box refresh on typed edits
+
+Two changes to the inspector side of the component-edit bridge that stage 1a
+put in.
+
+1. IEditorActionComponent (CryCommon/CryEntitySystem/IEntityComponent.h).
+
+Stage 1a gave a component ONE inspector button, hard-wired to
+IEditorShapeComponent::GetEditToolClassName(). That is the right idea and the
+wrong shape: an Area function component wants two buttons ("Pick Link Target",
+"Clear Links") and neither of them edits geometry.
+
+So the button contract is now its own reflected interface base - a count and a
+{tool class name, label} descriptor per action - and IEditorShapeComponent
+derives from it and implements it in terms of the single tool a shape already
+names. Every existing shape kind therefore keeps its "Edit Shape" button with
+no change to its own code, and CreateComponentWidget emits one SEditToolButton
+row per declared action instead of one row per shape.
+
+The lookup accepts either reflected base, so a component that declares only
+AddBase<IEditorShapeComponent>() (all three shape kinds do) is still found;
+both casts walk one single-inheritance chain from IEntityComponent. One
+SEntityComponentEditToolTarget payload per component instance is enough,
+because every action of a component hands its tool the same two GUIDs and the
+tool class name travels in SetToolName().
+
+2. Bound box refresh after an inspector-typed edit.
+
+Report 03 left this as a known gap. CEntityObject::SetModified -> CalcBBox
+reads the ENTITY's own local bounds; a shape component owns no render slot and
+contributes nothing to them, so CalcBBox sees no change and never reaches its
+InvalidateWorldBox(). After typing a new Radius or Height, F framed the OLD
+volume and rubber-band selection used the old box until something else
+invalidated it. The viewport tools already call InvalidateTM(0) at the end of a
+gesture; CreateComponentWidget now does the same after it has sent
+ENTITY_EVENT_COMPONENT_PROPERTY_CHANGED, guarded on the component implementing
+IEditorShapeComponent so every other entity takes exactly the path it took
+before.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ .../CryEntitySystem/IEntityComponent.h        | 65 ++++++++++++++++-
+ .../Sandbox/EditorQt/Objects/EntityObject.cpp | 70 +++++++++++++++----
+ 2 files changed, 121 insertions(+), 14 deletions(-)
+
+diff --git a/Code/CryEngine/CryCommon/CryEntitySystem/IEntityComponent.h b/Code/CryEngine/CryCommon/CryEntitySystem/IEntityComponent.h
+index d7391ec4..21b43c3c 100644
+--- a/Code/CryEngine/CryCommon/CryEntitySystem/IEntityComponent.h
++++ b/Code/CryEngine/CryCommon/CryEntitySystem/IEntityComponent.h
+@@ -1024,6 +1024,45 @@ struct IEditorEntityComponent : public IEntityComponent
+ 	virtual bool SetMaterial(int slotId, const char* szMaterial) = 0;
+ };
+ 
++//! One button the inspector shows for a component: a label, and the CEditTool class name that
++//! button starts for THIS component instance.
++struct SEditorActionDesc
++{
++	//! Class name of the CEditTool to start, e.g. "EditTool.AreaShapeEdit". Never null.
++	const char* szToolClassName = nullptr;
++	//! Label of the button row, e.g. "Edit Shape". Never null.
++	const char* szLabel = nullptr;
++};
++
++//! Implemented by any component that wants one or more action buttons in the entity inspector,
++//! each of which starts an edit tool for that component instance. It is the generic form of what
++//! IEditorShapeComponent below needed for its single "Edit Shape" button: a shape has one action,
++//! an area has "Pick Link Target" and "Clear Links", and a future component may have others.
++//!
++//! Like IEditorEntityComponent it is a *reflected* interface base: implementations pull it in with
++//! desc.AddBase<IEditorActionComponent>() (or inherit it through IEditorShapeComponent, which
++//! implements it in terms of its own single tool), which is what lets EditorQt find them across a
++//! DLL boundary.
++//!
++//! The tool receives SEntityComponentEditToolTarget through CEditTool::SetUserData(), i.e. the
++//! GUIDs of the editor object and of the component - never a pointer.
++//!
++//! ABI: append-only. Every method here is called from EditorQt against an implementation in
++//! another DLL, so new virtuals go at the END and existing ones never change signature.
++struct IEditorActionComponent : public IEntityComponent
++{
++	static void ReflectType(Schematyc::CTypeDesc<IEditorActionComponent>& desc)
++	{
++		desc.SetGUID("{5A1E9D73-2C64-4F08-BD35-1E7C4A0B92D7}"_cry_guid);
++	}
++
++	//! How many action buttons this component contributes. 0 means none.
++	virtual int  GetEditorActionCount() const = 0;
++
++	//! Describe action `index`. Returning false drops that button.
++	virtual bool GetEditorAction(int index, SEditorActionDesc& out) const = 0;
++};
++
+ //! Implemented by any component that owns geometry the level editor should be able to frame, click
+ //! and edit - a shape volume, a spline, a decal projector, an emitter's region. It is the Sandbox
+ //! side of O3DE's "component mode" contract, kept deliberately generic: nothing here knows what the
+@@ -1040,13 +1079,37 @@ struct IEditorEntityComponent : public IEntityComponent
+ //!
+ //! ABI: append-only. Every method here is called from EditorQt against an implementation that
+ //! lives in another DLL, so new virtuals go at the END and existing ones never change signature.
+-struct IEditorShapeComponent : public IEntityComponent
++struct IEditorShapeComponent : public IEditorActionComponent
+ {
+ 	static void ReflectType(Schematyc::CTypeDesc<IEditorShapeComponent>& desc)
+ 	{
+ 		desc.SetGUID("{3C8D5E14-7A96-4B20-9F41-8E0D2B75A6C3}"_cry_guid);
+ 	}
+ 
++	//! IEditorActionComponent, expressed with the single tool a shape already names. A shape kind
++	//! therefore keeps implementing GetEditToolClassName() / GetEditToolLabel() and gets its
++	//! inspector button through the generic path for free.
++	virtual int GetEditorActionCount() const override
++	{
++		const char* szToolClassName = GetEditToolClassName();
++		return (szToolClassName != nullptr && szToolClassName[0] != '\0') ? 1 : 0;
++	}
++
++	virtual bool GetEditorAction(int index, SEditorActionDesc& out) const override
++	{
++		if (index != 0)
++			return false;
++
++		const char* szToolClassName = GetEditToolClassName();
++		if (szToolClassName == nullptr || szToolClassName[0] == '\0')
++			return false;
++
++		const char* szLabel = GetEditToolLabel();
++		out.szToolClassName = szToolClassName;
++		out.szLabel = (szLabel != nullptr && szLabel[0] != '\0') ? szLabel : "Edit";
++		return true;
++	}
++
+ 	//! Bounds of the geometry in the ENTITY's local space (the component's own transform, if it has
+ 	//! one, already applied). Return false when there is nothing to contribute, and the editor's
+ 	//! bounding box is left exactly as the legacy slot walk computed it.
+diff --git a/Code/Sandbox/EditorQt/Objects/EntityObject.cpp b/Code/Sandbox/EditorQt/Objects/EntityObject.cpp
+index 482f057f..9376ba6a 100644
+--- a/Code/Sandbox/EditorQt/Objects/EntityObject.cpp
++++ b/Code/Sandbox/EditorQt/Objects/EntityObject.cpp
+@@ -891,28 +891,58 @@ void CreateComponentWidget(CEntityObject* pEntityObject, CryGUID componentTypeGU
+ 			}
+ 		}
+ 
+-		// A component that owns editable geometry (IEditorShapeComponent) gets one button row that
+-		// starts its edit tool for THIS component instance - Sandbox's equivalent of O3DE's
+-		// "Edit" button on a shape component. Components that do not implement the interface, or
+-		// that name no tool, add nothing and the inspector looks exactly as it did before.
++		// A component that implements IEditorActionComponent gets one button row per action it
++		// declares, each starting that action's edit tool for THIS component instance - Sandbox's
++		// equivalent of O3DE's "Edit" button on a shape component, generalised: a shape has one
++		// action ("Edit Shape"), the Area function component has "Pick Link Target" and "Clear
++		// Links". Components that do not implement the interface, or that declare no action, add
++		// nothing and the inspector looks exactly as it did before.
++		//
++		// IEditorShapeComponent derives from IEditorActionComponent and implements it in terms of
++		// the single tool a shape already names, so a component that declares only the shape base
++		// still reaches this through the second lookup below. Both casts walk one single
++		// inheritance chain from IEntityComponent, so they are valid downcasts.
+ 		if (archive.isEdit())
+ 		{
+-			if (pComponent->GetClassDesc().FindBaseByTypeID(Schematyc::GetTypeDesc<IEditorShapeComponent>().GetGUID()) != nullptr)
++			const CEntityComponentClassDesc& classDesc = pComponent->GetClassDesc();
++			const IEditorActionComponent*    pActionComponent = nullptr;
++
++			if (classDesc.FindBaseByTypeID(Schematyc::GetTypeDesc<IEditorActionComponent>().GetGUID()) != nullptr)
++			{
++				pActionComponent = static_cast<const IEditorActionComponent*>(pComponent);
++			}
++			else if (classDesc.FindBaseByTypeID(Schematyc::GetTypeDesc<IEditorShapeComponent>().GetGUID()) != nullptr)
++			{
++				pActionComponent = static_cast<const IEditorShapeComponent*>(pComponent);
++			}
++
++			if (pActionComponent != nullptr)
+ 			{
+-				const IEditorShapeComponent* pEditorShapeComponent = static_cast<const IEditorShapeComponent*>(pComponent);
+-				if (const char* szEditToolClassName = pEditorShapeComponent->GetEditToolClassName())
++				// One payload per component instance is enough: every action of a component hands
++				// its tool the same two GUIDs, and which tool to start travels in SetToolName().
++				SEntityComponentEditToolTarget* pTarget = GetComponentEditToolTarget(pEntityObject->GetId(), pComponent->GetGUID());
++
++				// The row names have to be stable string literals for the property tree, so the
++				// number of actions one component may show is bounded here.
++				static const char* const szActionRowNames[] = { "editAction0", "editAction1", "editAction2", "editAction3" };
++				const int                maxActionCount = CRY_ARRAY_COUNT(szActionRowNames);
++				const int                actionCount = min(pActionComponent->GetEditorActionCount(), maxActionCount);
++
++				for (int actionIndex = 0; actionIndex < actionCount; ++actionIndex)
+ 				{
+-					const char* szEditToolLabel = pEditorShapeComponent->GetEditToolLabel();
+-					if (szEditToolLabel == nullptr || szEditToolLabel[0] == '\0')
++					SEditorActionDesc action;
++					if (!pActionComponent->GetEditorAction(actionIndex, action) ||
++					    action.szToolClassName == nullptr || action.szToolClassName[0] == '\0')
+ 					{
+-						szEditToolLabel = "Edit";
++						continue;
+ 					}
+ 
++					const char* szLabel = (action.szLabel != nullptr && action.szLabel[0] != '\0') ? action.szLabel : "Edit";
++
+ 					Serialization::SEditToolButton editToolButton("");
+-					editToolButton.SetToolName(szEditToolClassName, SEntityComponentEditToolTarget::GetUserDataKey(),
+-					                           GetComponentEditToolTarget(pEntityObject->GetId(), pComponent->GetGUID()));
++					editToolButton.SetToolName(action.szToolClassName, SEntityComponentEditToolTarget::GetUserDataKey(), pTarget);
+ 
+-					archive(editToolButton, "editGeometry", szEditToolLabel);
++					archive(editToolButton, szActionRowNames[actionIndex], szLabel);
+ 				}
+ 			}
+ 		}
+@@ -974,6 +1004,20 @@ void CreateComponentWidget(CEntityObject* pEntityObject, CryGUID componentTypeGU
+ 				// Notify this component.
+ 				SEntityEvent entityEvent(ENTITY_EVENT_COMPONENT_PROPERTY_CHANGED);
+ 				pComponent->SendEvent(entityEvent);
++
++				// A component that owns geometry has just changed shape, and the editor's cached
++				// world bounding box does not know it. SetModified -> CalcBBox reads the ENTITY's
++				// own local bounds, which such a component does not contribute to (it owns no
++				// render slot), so CalcBBox sees no change and never reaches its
++				// InvalidateWorldBox(): after typing a new Radius or Height, F would frame the OLD
++				// volume and rubber-band selection would use the old box until something else
++				// invalidated it. The viewport tools of the Area plugin already do this by hand at
++				// the end of a drag; this is the same fix for an edit typed into the inspector.
++				if (bChangedProperties &&
++				    pComponent->GetClassDesc().FindBaseByTypeID(Schematyc::GetTypeDesc<IEditorShapeComponent>().GetGUID()) != nullptr)
++				{
++					pEntityObject->InvalidateTM(0);
++				}
+ 			}
+ 		}
+ 	}
+-- 
+2.47.1.windows.1
+
