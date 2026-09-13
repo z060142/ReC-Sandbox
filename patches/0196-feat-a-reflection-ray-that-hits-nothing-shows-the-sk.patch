@@ -1,0 +1,445 @@
+From bbf8f196561379c9ce38017f02e9729377999acd Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Mon, 14 Sep 2026 03:36:39 +0800
+Subject: [PATCH 196/213] feat: a reflection ray that hits nothing shows the
+ sky, not a second sun
+
+A missed ray used to be handed a fake surface - albedo 1, F0 1, smoothness 1, a
+normal of -rayDir at an arbitrary point MaxDistRay along the ray - and then run
+through the whole forward lighting stack. That put a mirror-sharp GGX lobe at
+F0 = 1 on top of an env probe that already contains the sun, i.e. a SECOND sun
+in every reflected sky, plus specular sparks wherever a lamp sat near the ray.
+Energy audit item 7 / E7, decision 09 section 9.1.
+
+Now a miss runs no sun and no local-light loop at all (a new bDirectLights
+parameter on Fwd_StandardOpaqueShading_Raytracing gates both), and an
+above-horizon miss is resolved by the engine's own sky along the ray direction.
+
+There is no sky render target to sample: CSkyStage::Execute runs SkyPassPS
+straight into the HDR colour target from the sky-light manager's two lat-long
+Nishita textures and, on a skybox level, from the level's skybox texture. So
+ShadePass binds those three (t34/t35/t36, a wrap-U clamp-V linear sampler at s3)
+and SVO_RT_SampleSky evaluates the same closed form Stars.cfx SkyPassPS does:
+the Mie/Rayleigh phase-weighted dome, the night gradient, the skybox lerp and
+the SkyDome_ScenePeakClamp ceiling. The sun disc needs no separate term - in
+CE 5.7.1 the procedural sky has no sun sprite, what reads as the sun IS the Mie
+phase function peaking at cosine 1, so the disc comes out with the same shape
+and the same ceiling the direct view gets; on a skybox level it is painted in.
+
+Exposure was checked against the pass rather than assumed: SetSkyParameters and
+SetHDRSkyParameters multiply every radiance constant by GetSceneReferredExposure()
+on the CPU and leave the textures unexposed, so the constants here are uploaded
+the same way and the shader returns EXPOSED radiance - the units ShadePS's acc
+is already in, whose single divide then cancels ApplyGI's multiply for a net x1,
+the emissive rule of decision 06 section 6.4. Exactly 1.0 off the switch.
+
+Below-horizon misses keep the env probe with the roughness mip, unchanged: a
+lat-long dome says nothing below the horizon and what is down there is ground
+the ray failed to reach inside e_svoTI_RT_MaxDistRay. With no sky bound at all
+(interior level, sky stage inactive) SVO_SkyParams stays zero and every miss
+keeps the probe. The SVO's analytic GetSkyColor is deliberately not the
+fallback: it reads SvoParamsSkyColor and globalSpecCM, neither of which
+ShadePass uploads or may bind.
+
+Known gaps, documented in the shader: the moon, the stars and SkyPassPS's fog
+blend are not carried. Cloud shadow is irrelevant to a sky lookup.
+
+Sky.h gains two const accessors for the dome textures; nothing else outside
+D3D_SVO.* and the SVO shaders is touched, and all of it is behind
+e_svoTI_RT_Active.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SCUvWGLCsqzm3VNMzp4uiS
+---
+ .../RenderDll/XRenderD3D9/D3D_SVO.cpp         | 119 ++++++++++++++++++
+ .../CryEngine/RenderDll/XRenderD3D9/D3D_SVO.h |   8 ++
+ .../XRenderD3D9/GraphicsPipeline/Sky.h        |   7 ++
+ .../HWScripts/CryFX/Total_Illumination.cfx    |  25 +++-
+ .../CryFX/Total_Illumination_Shading.cfi      | 117 ++++++++++++++++-
+ 5 files changed, 271 insertions(+), 5 deletions(-)
+
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/D3D_SVO.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/D3D_SVO.cpp
+index 247df143..2a400ac9 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/D3D_SVO.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/D3D_SVO.cpp
+@@ -24,6 +24,9 @@
+ 	#include "GraphicsPipeline/Fog.h"
+ 	#include "GraphicsPipeline/VolumetricFog.h"
+ 	#include "GraphicsPipeline/SceneForward.h"
++	// rt stage 4A (decision 09 section 9.1): a ray that misses is shaded with the engine's own
++	// sky, which means binding the sky stage's two Nishita dome textures.
++	#include "GraphicsPipeline/Sky.h"
+ 	#include "Common/ShadowUtils.h"
+ 
+ // Must match cbuffer CBPerPassForward (b5) in Engine/Shaders/HWScripts/CryFX/ForwardShading.cfi,
+@@ -800,6 +803,120 @@ void CSvoRenderer::SetupShadeForwardResources(CSvoFullscreenPass& rp)
+ 	rp.SetInlineConstantBuffer(eConstantBufferShaderSlot_PerPass, m_pShadeForwardCB, EShaderStage_Pixel);
+ }
+ 
++// rt stage 4A (decision 09 section 9.1, energy audit item 7): the sky a MISSED ray sees.
++//
++// There is no "sky render target" to sample: CSkyStage::Execute runs SkyPassPS straight into the
++// HDR colour target from the sky-light manager's two lat-long Nishita textures (and, on a skybox
++// level, from the level's skybox texture). So the ray tracer binds the same three textures and
++// SVO_RT_SampleSky evaluates the same closed form.
++//
++// Both halves of the exposure question were checked against the pass itself rather than assumed:
++// CSkyStage::SetSkyParameters (Sky.cpp:158) and SetHDRSkyParameters (Sky.cpp:211) multiply every
++// RADIANCE constant by GetSceneReferredExposure() on the CPU and leave the textures unexposed, so
++// the constants below are uploaded the same way and SVO_RT_SampleSky returns EXPOSED radiance -
++// the same units ShadePS's `acc` is in, which its single divide then hands to ApplyGI's multiply
++// for a net x1. GetSceneReferredExposure() is numerically PS_HDR_RANGE_ADAPT_MAX
++// (GraphicsPipeline.cpp:1303 publishes it as CV_SceneExposure.x + 1), and it is exactly 1.0 off
++// the scene-referred switch.
++//
++// m_bSkyBound records whether anything was bound at all; with no sky (an interior level, or the
++// sky stage inactive) SVO_SkyParams stays zero, SVO_RT_SampleSky returns false and the shader
++// keeps the env-probe fallback - which is the right answer for a ray that left a room rather
++// than the world. The SVO's analytic GetSkyColor is NOT used as that fallback: it reads
++// SvoParamsSkyColor / globalSpecCM, neither of which ShadePass uploads or may bind (globalSpecCM
++// sits in the SVO resource set this technique aliases away).
++void CSvoRenderer::SetupShadeSkyTextures(CSvoFullscreenPass& rp)
++{
++	const int threadID = gRenDev->GetRenderThreadID();
++	const N3DEngineCommon::SSkyInfo& skyInfo = gcpRendD3D->m_p3DEngineCommon[threadID].m_SkyInfo;
++
++	auto* pSkyStage = RenderView()->GetGraphicsPipeline()->GetStage<CSkyStage>();
++
++	CTexture* pMie = pSkyStage ? pSkyStage->GetSkyDomeTextureMie() : nullptr;
++	CTexture* pRay = pSkyStage ? pSkyStage->GetSkyDomeTextureRayleigh() : nullptr;
++	CTexture* pBox = skyInfo.m_pSkyBoxTexture.get();
++
++	m_bSkyDomeBound = skyInfo.m_bIsVisible && skyInfo.m_bApplySkyDome && pMie && pRay && pMie->GetDevTexture() && pRay->GetDevTexture();
++	m_bSkyBoxBound = skyInfo.m_bIsVisible && skyInfo.m_bApplySkyBox && pBox && pBox->GetDevTexture();
++
++	rp.SetTexture(34, m_bSkyDomeBound ? pMie : CRendererResources::s_ptexBlack);
++	rp.SetTexture(35, m_bSkyDomeBound ? pRay : CRendererResources::s_ptexBlack);
++	rp.SetTexture(36, m_bSkyBoxBound ? pBox : CRendererResources::s_ptexBlack);
++
++	// The dome is a lat-long map: azimuth wraps, elevation must not. Same state the sky pass
++	// builds for its own dome fetch (Sky.cpp:424).
++	static SamplerStateHandle skySampler = EDefaultSamplerStates::Unspecified;
++	if (skySampler == EDefaultSamplerStates::Unspecified)
++	{
++		const SSamplerState desc(FILTER_LINEAR, eSamplerAddressMode_Wrap, eSamplerAddressMode_Clamp, eSamplerAddressMode_Clamp, 0);
++		skySampler = GetDeviceObjectFactory().GetOrCreateSamplerStateHandle(desc);
++	}
++	rp.SetSampler(3, skySampler);
++}
++
++void CSvoRenderer::SetupShadeSkyConstants(CSvoFullscreenPass& rp)
++{
++	const int threadID = gRenDev->GetRenderThreadID();
++	const N3DEngineCommon::SSkyInfo& skyInfo = gcpRendD3D->m_p3DEngineCommon[threadID].m_SkyInfo;
++	const float sceneExposure = gcpRendD3D->GetSceneReferredExposure();
++
++	Vec4 vParams(m_bSkyDomeBound ? 1.f : 0.f, m_bSkyBoxBound ? 1.f : 0.f,
++	             DEG2RAD(skyInfo.m_fSkyBoxAngle), skyInfo.m_fSkyBoxStretching);
++	Vec4 vPeakClamp(CRendererResources::GetSceneReferredSkyPeakClamp(sceneExposure), 0.f, 0.f, 0.f);
++
++	Vec4 vMie(0, 0, 0, 0), vRayleigh(0, 0, 0, 0), vSunDir(0, 0, 0, 0), vPhase(0, 0, 0, 0);
++	Vec4 vNightBase(0, 0, 0, 0), vNightDelta(0, 0, 0, 0), vNightShift(0, 0, 0, 0);
++
++	if (m_bSkyDomeBound)
++	{
++		I3DEngine* const p3DEngine = gEnv->p3DEngine;
++		const SSkyLightRenderParams* const pRenderParams = p3DEngine->GetSkyLightRenderParams();
++
++		vMie = pRenderParams->m_partialMieInScatteringConst * sceneExposure;
++		vRayleigh = pRenderParams->m_partialRayleighInScatteringConst * sceneExposure;
++		vSunDir = pRenderParams->m_sunDirection;
++		vPhase = pRenderParams->m_phaseFunctionConsts;
++
++		Vec3 nightSkyHorizonCol, nightSkyZenithCol;
++		p3DEngine->GetGlobalParameter(E3DPARAM_NIGHSKY_HORIZON_COLOR, nightSkyHorizonCol);
++		p3DEngine->GetGlobalParameter(E3DPARAM_NIGHSKY_ZENITH_COLOR, nightSkyZenithCol);
++		const float nightSkyZenithColShift = p3DEngine->GetGlobalParameter(E3DPARAM_NIGHSKY_ZENITH_SHIFT);
++		const float minNightSkyZenithGradient = -0.1f;
++
++		vNightBase = Vec4(nightSkyHorizonCol * sceneExposure, 0);
++		vNightDelta = Vec4((nightSkyZenithCol - nightSkyHorizonCol) * sceneExposure, 0);
++		vNightShift = Vec4(1.0f / (nightSkyZenithColShift - minNightSkyZenithGradient),
++		                   -minNightSkyZenithGradient / (nightSkyZenithColShift - minNightSkyZenithGradient), 0, 0);
++	}
++
++	Vec4 vBoxExposure(skyInfo.m_vSkyBoxEmittance * sceneExposure, 1.0f);
++	Vec4 vBoxOpacity(skyInfo.m_vSkyBoxFilter, 1.0f);
++
++	static CCryNameR nameParams("SVO_SkyParams");
++	static CCryNameR namePeak("SVO_SkyPeakClamp");
++	static CCryNameR nameMie("SVO_SkyMieConst");
++	static CCryNameR nameRayleigh("SVO_SkyRayleighConst");
++	static CCryNameR nameSunDir("SVO_SkySunDirection");
++	static CCryNameR namePhase("SVO_SkyPhaseConst");
++	static CCryNameR nameNightBase("SVO_SkyNightColBase");
++	static CCryNameR nameNightDelta("SVO_SkyNightColDelta");
++	static CCryNameR nameNightShift("SVO_SkyNightZenithColShift");
++	static CCryNameR nameBoxExposure("SVO_SkyBoxExposure");
++	static CCryNameR nameBoxOpacity("SVO_SkyBoxOpacity");
++
++	rp.SetConstantArray(nameParams, &vParams, 1);
++	rp.SetConstantArray(namePeak, &vPeakClamp, 1);
++	rp.SetConstantArray(nameMie, &vMie, 1);
++	rp.SetConstantArray(nameRayleigh, &vRayleigh, 1);
++	rp.SetConstantArray(nameSunDir, &vSunDir, 1);
++	rp.SetConstantArray(namePhase, &vPhase, 1);
++	rp.SetConstantArray(nameNightBase, &vNightBase, 1);
++	rp.SetConstantArray(nameNightDelta, &vNightDelta, 1);
++	rp.SetConstantArray(nameNightShift, &vNightShift, 1);
++	rp.SetConstantArray(nameBoxExposure, &vBoxExposure, 1);
++	rp.SetConstantArray(nameBoxOpacity, &vBoxOpacity, 1);
++}
++
+ // Hit shading. Reads the four g-data targets, runs CE's own forward lighting at the hit world
+ // position, writes the ALD + RGB pair DemosaicPass consumes.
+ void CSvoRenderer::ShadePass(SSvoTargetsSet* pTS)
+@@ -829,10 +946,12 @@ void CSvoRenderer::ShadePass(SSvoTargetsSet* pTS)
+ 	rp.SetSampler(0, EDefaultSamplerStates::PointClamp);   // ssSvoPointClamp
+ 
+ 	SetupShadeForwardResources(rp);
++	SetupShadeSkyTextures(rp);
+ 
+ 	rp.BeginConstantUpdate();
+ 
+ 	SetupRTLightGridConstants(rp);
++	SetupShadeSkyConstants(rp);
+ 
+ 	{
+ 		static CCryNameR paramName("SVO_ShadeParams0");
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/D3D_SVO.h b/Code/CryEngine/RenderDll/XRenderD3D9/D3D_SVO.h
+index 89a184d0..da64a048 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/D3D_SVO.h
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/D3D_SVO.h
+@@ -146,6 +146,9 @@ protected:
+ 	void                   BuildRTLightGridPass();
+ 	void                   ShadePass(SSvoTargetsSet* pTS);
+ 	void                   SetupShadeForwardResources(CSvoFullscreenPass& rp);
++	// rt stage 4A (decision 09 section 9.1): the engine's own sky for a ray that misses.
++	void                   SetupShadeSkyTextures(CSvoFullscreenPass& rp);
++	void                   SetupShadeSkyConstants(CSvoFullscreenPass& rp);
+ 	template<class T> void SetupRTLightGridConstants(T& rp);
+ 
+ 	template<class T> void SetupCommonSamplers(T& rp);
+@@ -242,6 +245,11 @@ protected:
+ 	Vec4               m_rtLightGridDims = Vec4(ZERO);
+ 	CConstantBufferPtr m_pShadeForwardCB;   // CBPerPassForward (b5) for ShadePass
+ 
++	// rt stage 4A: what SetupShadeSkyTextures actually managed to bind this frame. The shader
++	// branches on these through SVO_SkyParams.xy; with neither set a miss keeps the env probe.
++	bool               m_bSkyDomeBound = false;
++	bool               m_bSkyBoxBound = false;
++
+ 	// cvar values
+ 	#define INIT_ALL_SVO_CVARS                                      \
+ 	  INIT_SVO_CVAR(int, e_svoDVR);                                 \
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Sky.h b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Sky.h
+index 73a77968..601e668d 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Sky.h
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Sky.h
+@@ -46,6 +46,13 @@ public:
+ 	};
+ 	const SSceneReferredDebug& GetSceneReferredDebug() const { return m_srDebug; }
+ 
++	// rt stage 4A (scene-notes/rt/decisions/09 section 9.1): the software ray tracer needs the
++	// same two Nishita dome textures this pass samples, so a reflection ray that misses shows
++	// the engine's own sky instead of a fake surface. Read-only; the pass owns them and refills
++	// them from the sky-light manager on its own timestamp.
++	CTexture* GetSkyDomeTextureMie() const      { return m_pSkyDomeTextureMie; }
++	CTexture* GetSkyDomeTextureRayleigh() const { return m_pSkyDomeTextureRayleigh; }
++
+ private:
+ 	void CreateSkyDomeTextures(int32 width, int32 height);
+ 	void LoadStarsDataAsync();
+diff --git a/Engine/Shaders/HWScripts/CryFX/Total_Illumination.cfx b/Engine/Shaders/HWScripts/CryFX/Total_Illumination.cfx
+index 2db21e6a..b8c28eee 100644
+--- a/Engine/Shaders/HWScripts/CryFX/Total_Illumination.cfx
++++ b/Engine/Shaders/HWScripts/CryFX/Total_Illumination.cfx
+@@ -2026,12 +2026,31 @@ pixoutShade ShadePS(vtxOutWPOS IN)
+ 		// traced sun shadow rays are stage 4; the cascades do the work today
+ 		fwdAttribs.custom.SunShadowRT   = 1.f;
+ 
++		// rt stage 4A (energy audit item 7, decision 09 section 9.1). A ray that hit nothing is
++		// looking at the sky, so it gets the ENGINE'S OWN sky along its direction - the same
++		// Nishita dome (or skybox) the deferred sky pass draws, including the Mie peak that IS
++		// the sun disc - and no sun / local-light loop at all. What it used to get was a fake
++		// surface with F0 = 1 and smoothness 1 run through the full direct lighting, which put a
++		// mirror-sharp second sun into every reflected sky.
++		//
++		// Below the horizon the sky texture says nothing useful (a lat-long dome is only defined
++		// above it, and what is actually down there is ground the ray failed to reach inside
++		// e_svoTI_RT_MaxDistRay), so a downward miss keeps the env-probe fallback with the
++		// roughness mip exactly as before.
++		float3 vSkyRadiance = (float3)0.f;
++		const bool bMissSky = bNoHit && (vGLD.z > 0.f) && SVO_RT_SampleSky(normalize(vGLD.xyz), vSkyRadiance);
++
+ 		float3 diffuseAcc = 0.0f;
+ 		float3 specularAcc = 0.0f;
+-		SRTShadeProbe dbgShade;
+-		Fwd_StandardOpaqueShading_Raytracing(commonAttribs, fwdAttribs, diffuseAcc, specularAcc, dbgShade);
++		SRTShadeProbe dbgShade = (SRTShadeProbe)0;
++		dbgShade.sunVisibility = 1;
++
++		if (!bMissSky)
++			Fwd_StandardOpaqueShading_Raytracing(commonAttribs, fwdAttribs, diffuseAcc, specularAcc, dbgShade, true, !bNoHit);
+ 
+-		float3 acc = diffuseAcc + specularAcc + SVO_ShadeParams0.x * fwdAttribs.albedo + .0001f;
++		float3 acc = bMissSky
++		             ? (vSkyRadiance + .0001f)
++		             : (diffuseAcc + specularAcc + SVO_ShadeParams0.x * fwdAttribs.albedo + .0001f);
+ 
+ 		// Emissive, exactly Illum.cfx IlluminationPS:
+ 		//     emittance = MatEmissiveColor.rgb * MatEmissiveColor.w * MAT_EMISSIVE_UNIT_SCALE
+diff --git a/Engine/Shaders/HWScripts/CryFX/Total_Illumination_Shading.cfi b/Engine/Shaders/HWScripts/CryFX/Total_Illumination_Shading.cfi
+index 54bbffb0..2a50180c 100644
+--- a/Engine/Shaders/HWScripts/CryFX/Total_Illumination_Shading.cfi
++++ b/Engine/Shaders/HWScripts/CryFX/Total_Illumination_Shading.cfi
+@@ -62,6 +62,111 @@ float4 SVO_RTLightGridDims;
+ // (ambientAlbedoAdd, debugAlbedo, aoRange, isSpecularSet)
+ float4 SVO_ShadeParams0;
+ 
++///////////////////////////////////////////////////////////////////////////////////
++// rt stage 4A - the sky a ray sees when it misses (decision 09 section 9.1, energy audit
++// item 7 / E7).
++//
++// The deferred sky is NOT a render target we can sample: CSkyStage::Execute runs SkyPassPS
++// (Stars.cfx) straight into the HDR colour target, from the two Nishita dome textures the
++// sky-light manager uploads (Mie / Rayleigh, lat-long, 64 x 32) and, for a skybox level, from
++// the level's lat-long skybox texture. So the only way to give a reflection ray the SAME sky
++// the camera sees is to bind those textures here and evaluate the same closed form. This is
++// Stars.cfx SkyPassPS's day-sky gradient + night gradient + skybox lerp + peak clamp, verbatim.
++//
++// THE SUN DISC IS NOT A SEPARATE TERM. In CE 5.7.1 the procedural sky has no sun sprite at all:
++// what reads as the sun IS the Mie phase function peaking at cosine = 1 (see the long comment
++// at the end of SkyPassPS). Evaluating the phase function therefore gives the sun disc for
++// free, with exactly the same shape and the same SkyDome_ScenePeakClamp ceiling the direct
++// view gets. On a skybox level the sun is painted into the skybox texture. Nothing is added
++// on top - adding a sun lobe here is precisely the second-sun bug this replaces.
++//
++// EXPOSURE. Every radiance constant below is uploaded ALREADY MULTIPLIED by
++// CD3D9Renderer::GetSceneReferredExposure(), which is exactly what CSkyStage::SetSkyParameters
++// and SetHDRSkyParameters do for the deferred pass (Sky.cpp:158, :211) and is numerically the
++// same factor as PS_HDR_RANGE_ADAPT_MAX (= 1 + CV_SceneExposure.x, GraphicsPipeline.cpp:1303).
++// So the value this returns is EXPOSED radiance, in the same units as everything else `acc`
++// is built from, and ShadePS's single divide then cancels ApplyGI's multiply: net x1, the
++// emissive rule of decision 06 section 6.4. Off the scene-referred switch the factor is 1.0
++// and nothing moves.
++//
++// Not carried (documented gaps, not silent): the moon, the stars, and the fog blend SkyPassPS
++// applies with %_RT_FOG. Cloud shadow is deliberately absent - it darkens ground lighting, not
++// a sky lookup.
++///////////////////////////////////////////////////////////////////////////////////
++
++Texture2D SVO_SkyDomeMie      : register(t34);
++Texture2D SVO_SkyDomeRayleigh : register(t35);
++Texture2D SVO_SkyBoxTex       : register(t36);
++
++SamplerState ssSvoSkyLinear : register(s3);
++
++// (bProcedural, bSkyBox, skyBoxAngle, skyBoxStretching)
++float4 SVO_SkyParams;
++// (peak clamp in EXPOSED units, 0 = off; the sky pass's SkyDome_ScenePeakClamp)
++float4 SVO_SkyPeakClamp;
++float4 SVO_SkyMieConst;
++float4 SVO_SkyRayleighConst;
++float4 SVO_SkySunDirection;
++float4 SVO_SkyPhaseConst;
++float4 SVO_SkyNightColBase;
++float4 SVO_SkyNightColDelta;
++float4 SVO_SkyNightZenithColShift;
++float4 SVO_SkyBoxExposure;
++float4 SVO_SkyBoxOpacity;
++
++// Stars.cfx:154 GetSkyUV, byte for byte.
++float2 SVO_RT_GetSkyUV(float3 vSkyDir, float fAngleOffset, float fStretching)
++{
++	float2 langlatTC = float2((atan2(-vSkyDir.y, -vSkyDir.x) + fAngleOffset) / PI * 0.5f + 0.5f, asin(vSkyDir.z) / PI + 0.5f);
++	langlatTC.y = (1.f - langlatTC.y) * fStretching;
++	return langlatTC;
++}
++
++// Returns false when this level has no sky the pass could bind (an interior, or the sky stage
++// was never active); the caller then keeps the env-probe fallback, which is the right answer
++// for a ray that leaves a room rather than the world.
++bool SVO_RT_SampleSky(const float3 vDir, out float3 vRadiance)
++{
++	vRadiance = (float3)0.f;
++
++	const bool bProcedural = (SVO_SkyParams.x > 0.f);
++	const bool bSkyBox     = (SVO_SkyParams.y > 0.f);
++
++	if (!bProcedural && !bSkyBox)
++		return false;
++
++	if (bProcedural)
++	{
++		const float2 tcDome = SVO_RT_GetSkyUV(vDir, 0.f, 2.f);
++		const float3 cMie = SVO_SkyDomeMie.SampleLevel(ssSvoSkyLinear, tcDome, 0).rgb;
++		const float3 cRay = SVO_SkyDomeRayleigh.SampleLevel(ssSvoSkyLinear, tcDome, 0).rgb;
++
++		const float fCos  = -dot(SVO_SkySunDirection.xyz, vDir);
++		const float fCos2 = fCos * fCos;
++		const float fMieTmp = SVO_SkyPhaseConst.y + SVO_SkyPhaseConst.x * fCos;
++		const float fMiePhase = (fMieTmp > 0.f) ? (1.f + fCos2) * pow(fMieTmp, -1.5f) : 0.f;
++		const float fRayPhase = 0.75f * (1.f + fCos2);
++
++		vRadiance = cMie * SVO_SkyMieConst.rgb * fMiePhase + cRay * SVO_SkyRayleighConst.rgb * fRayPhase;
++
++		float fGr = saturate(vDir.z * SVO_SkyNightZenithColShift.x + SVO_SkyNightZenithColShift.y);
++		fGr *= 2.f - fGr;
++		vRadiance += SVO_SkyNightColBase.rgb + SVO_SkyNightColDelta.rgb * fGr;
++	}
++
++	if (bSkyBox)
++	{
++		const float2 tcBox = SVO_RT_GetSkyUV(vDir, SVO_SkyParams.z, SVO_SkyParams.w);
++		const float3 cBox = SVO_SkyBoxExposure.rgb * SVO_SkyBoxTex.SampleLevel(ssSvoSkyLinear, tcBox, 0).rgb;
++		vRadiance = lerp(vRadiance, cBox, SVO_SkyBoxOpacity.rgb);
++	}
++
++	if (SVO_SkyPeakClamp.x > 0.f)
++		vRadiance = any(isnan(vRadiance)) ? (float3)0.f : min(vRadiance, (float3)SVO_SkyPeakClamp.x);
++
++	return true;
++}
++
+ ///////////////////////////////////////////////////////////////////////////////////
+ 
+ // Neo reads (worldPos - min) / cellSize with no clamp, so any hit outside the grid box
+@@ -286,9 +391,16 @@ void TiledForwardShading_Raytracing(in ForwardShadingAttribs attribs, inout floa
+ 	}
+ }
+ 
++// bDirectLights: energy audit item 7 / E7. A MISS has no surface - RT_ProcessBestHit hands it
++// albedo 1, F0 1, smoothness 1 and a normal of -rayDir at an arbitrary point MaxDistRay along
++// the ray. Running the sun and the tiled light loop over that adds a mirror-sharp GGX lobe at
++// F0 = 1 on top of a sky that already contains the sun, i.e. a SECOND sun, plus a scatter of
++// specular sparks wherever a lamp happens to sit near the ray. A miss is resolved by the sky
++// (decision 09 section 9.1) or, below the horizon, by the probes - never by re-lighting a
++// surface that is not there.
+ void Fwd_StandardOpaqueShading_Raytracing(in MaterialAttribsCommon commonAttribs, inout ForwardShadingAttribs fwdAttribs,
+                                           inout float3 diffuseAcc, inout float3 specularAcc, out SRTShadeProbe dbg,
+-                                          bool bSunShadows = true)
++                                          bool bSunShadows = true, bool bDirectLights = true)
+ {
+ 	dbg = (SRTShadeProbe)0;
+ 	dbg.sunVisibility = 1;
+@@ -305,6 +417,7 @@ void Fwd_StandardOpaqueShading_Raytracing(in MaterialAttribsCommon commonAttribs
+ 	// The sun colour is plain CV_SunColor - the SVO's own sun / PI (SceneTree.cpp:2500) exists
+ 	// only so the RGBM brick codec does not clip, and the hit never goes through RGBM
+ 	// (research/06 section 7.3e). The 1/PI arrives inside the BRDFs via SCENE_BRDF_NORM_FACTOR.
++	if (bDirectLights)
+ 	{
+ 		float shadowMask = 0;
+ 		if (bSunShadows)
+@@ -329,7 +442,7 @@ void Fwd_StandardOpaqueShading_Raytracing(in MaterialAttribsCommon commonAttribs
+ 	}
+ 
+ 	// unconditional: %_RT_TILED_SHADING means "trace voxels" on this shader
+-	TiledForwardShading_Raytracing(fwdAttribs, diffuseAcc, specularAcc, ssFwdBilinearWrap, ssFwdComparison, true, true, false, dbg);
++	TiledForwardShading_Raytracing(fwdAttribs, diffuseAcc, specularAcc, ssFwdBilinearWrap, ssFwdComparison, true, bDirectLights, false, dbg);
+ 
+ 	// Apply albedo (using simple energy conservation between specular and diffuse).
+ 	// Byte-identical to ForwardShading.cfi:337 - the reflected wall must be graded by the
+-- 
+2.47.1.windows.1
+

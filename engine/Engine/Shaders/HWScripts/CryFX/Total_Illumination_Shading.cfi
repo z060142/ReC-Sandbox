@@ -63,6 +63,522 @@ float4 SVO_RTLightGridDims;
 float4 SVO_ShadeParams0;
 
 ///////////////////////////////////////////////////////////////////////////////////
+// rt stage 4A - the sky a ray sees when it misses (decision 09 section 9.1, energy audit
+// item 7 / E7).
+//
+// The deferred sky is NOT a render target we can sample: CSkyStage::Execute runs SkyPassPS
+// (Stars.cfx) straight into the HDR colour target, from the two Nishita dome textures the
+// sky-light manager uploads (Mie / Rayleigh, lat-long, 64 x 32) and, for a skybox level, from
+// the level's lat-long skybox texture. So the only way to give a reflection ray the SAME sky
+// the camera sees is to bind those textures here and evaluate the same closed form. This is
+// Stars.cfx SkyPassPS's day-sky gradient + night gradient + skybox lerp + peak clamp, verbatim.
+//
+// THE SUN DISC IS NOT A SEPARATE TERM. In CE 5.7.1 the procedural sky has no sun sprite at all:
+// what reads as the sun IS the Mie phase function peaking at cosine = 1 (see the long comment
+// at the end of SkyPassPS). Evaluating the phase function therefore gives the sun disc for
+// free, with exactly the same shape and the same SkyDome_ScenePeakClamp ceiling the direct
+// view gets. On a skybox level the sun is painted into the skybox texture. Nothing is added
+// on top - adding a sun lobe here is precisely the second-sun bug this replaces.
+//
+// EXPOSURE. Every radiance constant below is uploaded ALREADY MULTIPLIED by
+// CD3D9Renderer::GetSceneReferredExposure(), which is exactly what CSkyStage::SetSkyParameters
+// and SetHDRSkyParameters do for the deferred pass (Sky.cpp:158, :211) and is numerically the
+// same factor as PS_HDR_RANGE_ADAPT_MAX (= 1 + CV_SceneExposure.x, GraphicsPipeline.cpp:1303).
+// So the value this returns is EXPOSED radiance, in the same units as everything else `acc`
+// is built from, and ShadePS's single divide then cancels ApplyGI's multiply: net x1, the
+// emissive rule of decision 06 section 6.4. Off the scene-referred switch the factor is 1.0
+// and nothing moves.
+//
+// Not carried (documented gaps, not silent): the moon, the stars, and the fog blend SkyPassPS
+// applies with %_RT_FOG. Cloud shadow is deliberately absent - it darkens ground lighting, not
+// a sky lookup.
+///////////////////////////////////////////////////////////////////////////////////
+
+Texture2D SVO_SkyDomeMie      : register(t34);
+Texture2D SVO_SkyDomeRayleigh : register(t35);
+Texture2D SVO_SkyBoxTex       : register(t36);
+
+SamplerState ssSvoSkyLinear : register(s3);
+
+// (bProcedural, bSkyBox, skyBoxAngle, skyBoxStretching)
+float4 SVO_SkyParams;
+// (peak clamp in EXPOSED units, 0 = off; the sky pass's SkyDome_ScenePeakClamp)
+float4 SVO_SkyPeakClamp;
+float4 SVO_SkyMieConst;
+float4 SVO_SkyRayleighConst;
+float4 SVO_SkySunDirection;
+float4 SVO_SkyPhaseConst;
+float4 SVO_SkyNightColBase;
+float4 SVO_SkyNightColDelta;
+float4 SVO_SkyNightZenithColShift;
+float4 SVO_SkyBoxExposure;
+float4 SVO_SkyBoxOpacity;
+
+// Stars.cfx:154 GetSkyUV, byte for byte.
+float2 SVO_RT_GetSkyUV(float3 vSkyDir, float fAngleOffset, float fStretching)
+{
+	float2 langlatTC = float2((atan2(-vSkyDir.y, -vSkyDir.x) + fAngleOffset) / PI * 0.5f + 0.5f, asin(vSkyDir.z) / PI + 0.5f);
+	langlatTC.y = (1.f - langlatTC.y) * fStretching;
+	return langlatTC;
+}
+
+// Returns false when this level has no sky the pass could bind (an interior, or the sky stage
+// was never active); the caller then keeps the env-probe fallback, which is the right answer
+// for a ray that leaves a room rather than the world.
+bool SVO_RT_SampleSky(const float3 vDir, out float3 vRadiance)
+{
+	vRadiance = (float3)0.f;
+
+	const bool bProcedural = (SVO_SkyParams.x > 0.f);
+	const bool bSkyBox     = (SVO_SkyParams.y > 0.f);
+
+	if (!bProcedural && !bSkyBox)
+		return false;
+
+	if (bProcedural)
+	{
+		const float2 tcDome = SVO_RT_GetSkyUV(vDir, 0.f, 2.f);
+		const float3 cMie = SVO_SkyDomeMie.SampleLevel(ssSvoSkyLinear, tcDome, 0).rgb;
+		const float3 cRay = SVO_SkyDomeRayleigh.SampleLevel(ssSvoSkyLinear, tcDome, 0).rgb;
+
+		const float fCos  = -dot(SVO_SkySunDirection.xyz, vDir);
+		const float fCos2 = fCos * fCos;
+		const float fMieTmp = SVO_SkyPhaseConst.y + SVO_SkyPhaseConst.x * fCos;
+		const float fMiePhase = (fMieTmp > 0.f) ? (1.f + fCos2) * pow(fMieTmp, -1.5f) : 0.f;
+		const float fRayPhase = 0.75f * (1.f + fCos2);
+
+		vRadiance = cMie * SVO_SkyMieConst.rgb * fMiePhase + cRay * SVO_SkyRayleighConst.rgb * fRayPhase;
+
+		float fGr = saturate(vDir.z * SVO_SkyNightZenithColShift.x + SVO_SkyNightZenithColShift.y);
+		fGr *= 2.f - fGr;
+		vRadiance += SVO_SkyNightColBase.rgb + SVO_SkyNightColDelta.rgb * fGr;
+	}
+
+	if (bSkyBox)
+	{
+		const float2 tcBox = SVO_RT_GetSkyUV(vDir, SVO_SkyParams.z, SVO_SkyParams.w);
+		const float3 cBox = SVO_SkyBoxExposure.rgb * SVO_SkyBoxTex.SampleLevel(ssSvoSkyLinear, tcBox, 0).rgb;
+		vRadiance = lerp(vRadiance, cBox, SVO_SkyBoxOpacity.rgb);
+	}
+
+	if (SVO_SkyPeakClamp.x > 0.f)
+		vRadiance = any(isnan(vRadiance)) ? (float3)0.f : min(vRadiance, (float3)SVO_SkyPeakClamp.x);
+
+	return true;
+}
+
+///////////////////////////////////////////////////////////////////////////////////
+// rt stage 5E - VOLUMETRIC FOG ON THE REFLECTED SEGMENT (decision 09 section 9.3).
+//
+// WHICH VOLUME, AND WHY THE PREVIOUS FRAME IS NOT A COMPROMISE.
+// CVolumetricFogStage::Execute runs at StandardGraphicsPipeline.cpp:536, i.e. AFTER
+// CSceneForwardStage::ExecuteOpaque at :523. So the froxel volume CE's OWN forward shading
+// path samples is already one frame old - Fwd_ApplyFog reads a texture last frame wrote.
+// Sampling last frame's volume from SVOGI (:460) is therefore not a hack we invented, it is
+// exactly the staleness the engine already ships with, and it needs no pipeline reordering:
+// the stock frame order is untouched, so the native path cannot move.
+//
+// WHICH OF THE TWO VOLUMES. There are two:
+//   * CRendererResources::s_ptexVolumetricFog - the raymarch OUTPUT. At (x,y,k) it holds
+//     in-scatter ACCUMULATED FROM THE CAMERA to slice k, premultiplied by the camera
+//     transmittance, and .w = that transmittance. This is what Fwd_volFogTex / GetVolumetricFogValue
+//     read. It answers exactly one question: "how much fog is between the camera and this point".
+//   * CVolumetricFogStage::GetInscatterTex() - the raymarch INPUT, after temporal reprojection.
+//     At (x,y,k) it holds the LOCAL in-scattered radiance of that froxel (range-shifted) and the
+//     LOCAL extinction density. Both are per-unit-length fields: VolumeLighting.cfi:2107-2116
+//     multiplies them by a step size it computes itself.
+// A reflected segment is not a camera ray, so the accumulated volume cannot answer for it. The
+// endpoint difference fog(hit) - fog(surface) is only valid when the two endpoints lie on the
+// SAME camera ray, and it fails in the single most common mirror shot there is: a mirror on a
+// back wall reflecting something in FRONT of it puts the hit nearer the camera than the surface,
+// the difference goes negative, and the reflection gets no fog at all. A mirror reflecting
+// sideways gives two endpoints at nearly the same depth and, again, no fog - while the direct
+// view of the same object is fogged. So we take the LOCAL volume and run CE's own integrator
+// (VolumeLighting.cfi RaymarchVolumetricFogCS, the four lines below, unchanged) along OUR
+// segment instead of along the camera ray.
+//
+// WHAT THIS STILL CANNOT DO, stated rather than hidden:
+//   1. The froxel volume only exists inside the camera frustum and only out to farDistCenter.
+//      A sample point that projects off screen, behind the near plane, or past that range has no
+//      froxel data at all. Those steps are counted and the analytic global fog covers their share
+//      of the segment (see the pow() in ShadePS). A mirror reflecting something off screen is
+//      therefore fogged analytically, not by the froxels - that is a property of froxel fog, not
+//      a bug we can fix here.
+//   2. The phase function is baked into the volume for the CAMERA direction
+//      (CombineInscatteringSunAndRegularLights takes normalizedEyeRay). A reflected ray sees the
+//      wrong anisotropic lobe. Isotropic fog is exact; a strong sun lobe is not.
+//   3. One frame of lag, and it is the PREVIOUS frame's camera space (the temporal reprojection
+//      wrote it in frame N-1's grid) while we project with frame N's SVO_ViewProj. Fog is low
+//      frequency and this is the same lag the forward pass lives with.
+//
+// EXPOSURE. The volume is written by the injection pass from CVolumetricFogStage's own
+// cbVolFogInj, whose scattering colour FillForwardParams (VolumetricFog.cpp:2513) multiplies by
+// GetSceneReferredExposure() on the CPU, and whose local lights come from the tiled list, which
+// is pre-exposed too. So the in-scatter this returns is EXPOSED radiance, the same units `acc`
+// is in and the same units GetVolumetricFogColorInternal's own PS_HDR_RANGE_ADAPT_MAX multiply
+// produces for the analytic fog. It goes in before ShadePS's single divide. The transmittance is
+// unit free and carries no exposure either way.
+///////////////////////////////////////////////////////////////////////////////////
+
+// VolumeLighting.cfi:19 VOLUMETRIC_FOG_RANGE_SHIFT_INSCATTER. Repeated here because
+// VolumeLighting.cfi cannot be included - it declares u0 / t0 / t1 at file scope and would
+// collide with everything this technique binds.
+#define SVO_VOLFOG_INSCATTER_SHIFT (16.0f)
+
+Texture3D<float4> SVO_VolFogInscatter : register(t41);
+Texture3D<float4> SVO_VolFogDensity   : register(t50);
+
+// (bound, separate density volume, step count, 0). Set by CSvoRenderer::SetupShadeFogConstants
+// only when e_svoTI_RT_Active and the fog stage really has live volumes; .x = 0 means ShadePS
+// keeps the analytic global fog it has always used.
+float4 SVO_VolFogParams;
+
+// CE's own froxel integrator (VolumeLighting.cfi:2104-2118), walked along an arbitrary world
+// space segment instead of along the camera ray.
+//   vStartAbs  absolute world position of the REFLECTING surface
+//   vDirN      unit direction of the reflected ray
+//   fLen       length of the reflected segment (surface -> hit)
+// Returns the in-scatter added along the segment (exposed radiance, already attenuated by the
+// fog in front of it), the transmittance of the segment, and the fraction of the segment the
+// froxel volume actually covered.
+void SVO_RT_MarchSegmentFog(in SVolumetricFogParams vfp, in float3 vStartAbs, in float3 vDirN, in float fLen,
+                            out float3 vInscatter, out float fTransmittance, out float fCovered)
+{
+	vInscatter = (float3)0.f;
+	fTransmittance = 1.f;
+	fCovered = 0.f;
+
+	const float fSteps = max(SVO_VolFogParams.z, 1.f);
+	const int   nSteps = (int)fSteps;
+	const float fStep = fLen / fSteps;
+	const bool  bSepDensity = (SVO_VolFogParams.y > 0.f);
+
+	// the volume reaches farDistCenter at the centre of the screen and further towards the
+	// corners; farDistCenter is the conservative choice - a step past it is handed to the
+	// analytic fog rather than clamped onto the last slice, which would smear the edge slice
+	// across the whole remaining segment.
+	const float fMaxDepth = min(vfp.farDistCenter, vfp.nearDist + vfp.farMinusNearDist);
+
+	[loop] for (int i = 0; i < nSteps; ++i)
+	{
+		const float3 vP = vStartAbs + vDirN * (fStep * ((float)i + 0.5f));
+
+		// same matrix, same transpose as debug view 13: .w of a view-projection product is the
+		// linear view depth, which is exactly what GetVolumetricFogDepthTexcoord wants.
+		const float4 vProj = mul(SVO_ViewProj, float4(vP, 1));
+		if (vProj.w <= vfp.nearDist || vProj.w >= fMaxDepth)
+			continue;
+
+		float2 vUV = (vProj.xy / vProj.w) * 0.5f + 0.5f;
+		vUV.y = 1.f - vUV.y;
+		if (any(vUV != saturate(vUV)))
+			continue;
+
+		float3 tc;
+		tc.xy = vUV;
+		tc.z = saturate(GetVolumetricFogDepthTexcoord(vfp, vProj.w));
+
+		const float4 vRaw = SVO_VolFogInscatter.SampleLevel(SampStateTrilinearClamp, tc, 0.f);
+		const float fDensity = bSepDensity ? SVO_VolFogDensity.SampleLevel(SampStateTrilinearClamp, tc, 0.f).x : vRaw.w;
+
+		const float3 S = vfp.scatterCoefficient * (vRaw.xyz / SVO_VOLFOG_INSCATTER_SHIFT);
+		const float muE = max(0.000000001f, vfp.extinctionCoefficient * fDensity);
+		const float trns = exp(-muE * fStep);
+		const float3 Sint = ((-S * trns) + S) / muE;
+
+		vInscatter += fTransmittance * Sint;
+		fTransmittance *= trns;
+		fCovered += 1.f;
+	}
+
+	fCovered /= fSteps;
+}
+
+///////////////////////////////////////////////////////////////////////////////////
+// rt stage 5F - VOLUMETRIC CLOUDS ON A RAY THAT MISSES ABOVE THE HORIZON
+// (decision 09 section 9.2).
+//
+// WHY A SECOND MARCH AND NOT THE CLOUD IMAGE. CVolumetricCloudsStage::Execute runs at
+// StandardGraphicsPipeline.cpp:544, i.e. AFTER the SVO block at :460, and it renders into a
+// screen space target anyway - there is no image of "the sky in that direction" to sample, only
+// an image of "the sky the camera saw in that pixel". A reflection ray leaves the camera's
+// pixel entirely, so the only correct source is the DENSITY FIELD itself. That field is now
+// shared: CloudsCommon.cfi holds exactly the functions Clouds.cfx uses, so a cloud in a mirror
+// is the same cloud, from the same noise, at the same wind offset.
+//
+// WHAT IS AVAILABLE AT :460 AND WHAT IS NOT.
+//   * ExecuteShadowGen() runs at :457-458, THREE LINES BEFORE the SVO block, so
+//     m_pTexVolCloudShadow (the tiled 3 channel optical thickness volume: x along the sun, y to
+//     the top of the layer, z to the bottom) is THIS frame's, not last frame's. That is the one
+//     piece of cloud data that is fresh here, and it is precisely the one decision 09 section
+//     9.2 asked for.
+//   * The per frame cloud constants are NOT available - they live in the stage's own b3 inline
+//     constant buffer, filled at :544. So CSvoRenderer::SetupShadeCloudConstants rebuilds the
+//     same values from the same E3DPARAM_VOLCLOUD_* globals and the same
+//     SRenderViewShaderConstants, with the same exposure multiplies. Same source, same frame,
+//     same numbers.
+//
+// THE MARCH. N = e_svoTI_RT_CloudSteps steps (default 12) between the ray's entry into the
+// layer and its exit, distributed by vcGetLinearDepth exactly as Clouds.cfx distributes its own
+// (quadratic, so the near part of the layer is sampled finer), no jitter - the RT path has its
+// own temporal accumulation and a second dither would fight it. Per step: one GetCloudDensity
+// (three 3D noise taps) and one cloud shadow tap, then AccumulateRadiance's arithmetic verbatim
+// - Beer for the sun, the multi scatter preservation lerp for the sky and ground terms, the
+// powder effect on the sum, and the precise in-scattering integral. Early out at transmittance
+// below 0.01, and a step whose density is zero costs only the density taps.
+//
+// SUN TRANSMITTANCE. Inside the cloud shadow map's tiling region: one tap, which is what
+// GetOpticalThicknessCombined's own lowDetail path does. Outside it: a 3 step light march along
+// the sun direction with GetCloudDensity (Clouds.cfx uses 6 at full detail, 3 coarse) plus the
+// analytic to-top / to-bottom thickness of the local density, which is the !inShadowTex branch
+// of GetOpticalThicknessCombined.
+//
+// EXPOSURE, verified rather than assumed. CVolumetricCloudsStage::GenerateCloudShaderParam
+// multiplies shadeColorFromSun (VolumetricClouds.cpp:1486), skylightRayleighInScatter (:1518)
+// and sunIntensityForAtmospheric (:1544) by GetSceneReferredExposure() on the CPU and leaves the
+// scattering/extinction COEFFICIENTS alone, because those live inside exp(). The constants below
+// are uploaded exactly the same way, so the in-scatter this returns is EXPOSED radiance - the
+// same units as SVO_RT_SampleSky's result and as everything else `acc` is built from, and it
+// goes in before ShadePS's single divide. The transmittance is unit free.
+//
+// NOT CARRIED, deliberately, each with its reason:
+//   * GetAtmosphericInscattering (the Rayleigh haze between the viewer and the cloud deck). The
+//     sky lookup this composites over already carries the dome's own aerial perspective; adding
+//     the cloud pass's copy of it would count that haze twice in a reflection.
+//   * The cirrus layer (ENABLE_CIRRUS_CLOUD_LAYER is off in Clouds.cfx anyway) and the stereo
+//     reprojection path.
+//   * The sky-ray edge fade of decisions/s9-cloud-edge.md. It fades the cloud contribution out
+//     over the last kilometres of a march that was cut short by the DEPTH BUFFER or the max
+//     viewable distance - both camera-space limits a reflection ray does not have. A reflection
+//     ray's march ends at the real layer exit, so there is no seam to fade.
+///////////////////////////////////////////////////////////////////////////////////
+
+#define VC_NO_BASE_DENSITY_TEX
+#define VC_NO_CLOUD_BLOCKERS
+#include "CloudsCommon.cfi"
+
+Texture3D SVO_CloudNoiseTex     : register(t51);
+Texture3D SVO_CloudEdgeNoiseTex : register(t52);
+Texture3D SVO_CloudShadowTex    : register(t53);
+Texture2D SVO_CloudMiePhaseTex  : register(t54);
+
+SamplerState ssSvoCloudWrap   : register(s4);
+SamplerState ssSvoCloudShadow : register(s5);
+
+// (bound, layer bottom altitude, layer thickness, cloudiness)
+float4 SVO_CloudParams0;
+// (scatter coefficient, extinction coefficient, powder factor, cloud sphere radius)
+float4 SVO_CloudParams1;
+// (march steps, max viewable distance, max ray-march distance, clouds-on-a-hit distance, 0 = off)
+float4 SVO_CloudParams2;
+// (noise scale xyz, 0)
+float4 SVO_CloudNoiseScale;
+// (base density texture tiling xyz, 0) - the base texture branch is compiled out here
+float4 SVO_CloudBaseScale;
+// (wind / tiling offset xyz, 0). THE ANIMATION: the same lane the direct view uses, so a cloud
+// drifts identically in the mirror and in the sky.
+float4 SVO_CloudBaseOffset;
+// (max global density, density remap min, density remap max, additional noise intensity)
+float4 SVO_CloudDensityParams;
+// (edge noise scale xyz, 0)
+float4 SVO_CloudEdgeNoiseScale;
+// (edge turbulence, edge threshold, enable erode, enable abs)
+float4 SVO_CloudEdgeTurbulence;
+// (1 / cloud shadow tiling size xyz, 0)
+float4 SVO_CloudInvTiling;
+// (cloud shadow world alignment offset xy, 0, 0)
+float4 SVO_CloudShadowOffset;
+// (sun shading colour xyz EXPOSED, 0)
+float4 SVO_CloudSunLight;
+// (sun direction xyz, pointing AT the sun, 0)
+float4 SVO_CloudSunDir;
+// (sky Rayleigh in-scatter xyz EXPOSED, sky lighting factor)
+float4 SVO_CloudSkyLight;
+// (ground albedo xyz, ground lighting factor)
+float4 SVO_CloudGroundLight;
+// (sun single scatter, sun low order scatter, low order anisotropy, sun high order scatter)
+float4 SVO_CloudScatterParams;
+// (multi-scatter attenuation, multi-scatter preservation, 0, 0)
+float4 SVO_CloudMultiScatter;
+
+CloudGenParam SVO_RT_GetCloudGenParam()
+{
+	// NOT "(CloudGenParam)0": the struct carries two Texture3D members and a SamplerState, and a
+	// resource object has no zero to cast from (fxc X3017). Every field the density chain reads
+	// is set below; cloudBlockerPos / cloudBlockerParam are the only ones left alone and they are
+	// unreachable here, because VC_NO_CLOUD_BLOCKERS compiles that branch out.
+	CloudGenParam param;
+
+	param.cloudiness               = SVO_CloudParams0.w;
+	param.altitude                 = SVO_CloudParams0.y;
+	param.thickness                = SVO_CloudParams0.z;
+	param.noiseSizeScale           = SVO_CloudNoiseScale.xyz;
+	param.baseSizeScale            = SVO_CloudBaseScale.xyz;
+	param.baseOffset               = SVO_CloudBaseOffset.xyz;
+	param.edgeNoiseSizeScale       = SVO_CloudEdgeNoiseScale.xyz;
+	param.baseTexRemap             = SVO_CloudDensityParams.yz;
+	param.edgeErode                = SVO_CloudEdgeTurbulence;
+	param.cloudDensityScale        = SVO_CloudDensityParams.x;
+	param.additionalNoiseIntensity = SVO_CloudDensityParams.w;
+	param.noiseTex                 = SVO_CloudNoiseTex;
+	param.edgeNoiseTex             = SVO_CloudEdgeNoiseTex;
+	param.linearWrapSampler        = ssSvoCloudWrap;
+
+	return param;
+}
+
+// Clouds.cfx GetOpticalThickness with the step count opened up, so the secondary march can use
+// the coarse count (3) the direct view uses for its own coarse shadow rays. The body is that
+// function's, unchanged.
+float SVO_RT_CloudSunThickness(in float3 vOriginAbs, in float3 vSunDir, in float fExtinction,
+                               CloudGenParam param, const float fMaxSteps)
+{
+	const float4 vPlaneBottom = float4(0.0f, 0.0f, 1.0f, param.altitude);
+	const float4 vPlaneTop    = float4(0.0f, 0.0f, 1.0f, param.altitude + param.thickness);
+	const float tb = vcGetIntersectionPlane(vOriginAbs, vSunDir, vPlaneBottom);
+	const float tt = vcGetIntersectionPlane(vOriginAbs, vSunDir, vPlaneTop);
+
+	const float fEnd = min(4000.0f, max(tb, tt));
+	const float fStart = max(min(tb, tt), 0.0f);
+	const float fSteps = (fStart >= fEnd) ? 0.0f : fMaxSteps;
+
+	float fThickness = 0.0f;
+	for (float i = 0.0f; i < fSteps; ++i)
+	{
+		const float d = vcGetLinearDepth(i, fSteps, fStart, fEnd);
+		const float dNext = vcGetLinearDepth(i + 1.0f, fSteps, fStart, fEnd);
+		const float3 vP = vSunDir * d + vOriginAbs;
+		fThickness += fExtinction * GetCloudDensity(vP, param) * (dNext - d);
+	}
+
+	return fThickness;
+}
+
+// The three optical thicknesses the radiance accumulation needs at one sample: x along the sun,
+// y to the top of the layer, z to the bottom. Inside the cloud shadow map's tiling region this
+// is one tap (GetOpticalThicknessCombined's lowDetail path); outside it, the coarse fallback of
+// that same function's !inShadowTex branch.
+float3 SVO_RT_CloudOpticalThickness(in float3 vPosAbs, in float fDensity, in float fExtinction,
+                                    CloudGenParam param)
+{
+	float3 vTC = (vPosAbs - float3(SVO_CloudShadowOffset.xy, param.altitude)) * SVO_CloudInvTiling.xyz;
+	vTC.xy += 0.5f;
+
+	if (all(vTC >= 0.0f) && all(vTC <= 1.0f))
+		return SVO_CloudShadowTex.SampleLevel(ssSvoCloudShadow, vTC, 0.0f).xyz;
+
+	float3 vThickness;
+	vThickness.x = SVO_RT_CloudSunThickness(vPosAbs, SVO_CloudSunDir.xyz, fExtinction, param, 3.0f);
+	vThickness.y = fExtinction * fDensity * min(4000.0f, max(0.0f, (param.altitude + param.thickness) - vPosAbs.z));
+	vThickness.z = fExtinction * fDensity * min(4000.0f, max(0.0f, vPosAbs.z - param.altitude));
+	return vThickness;
+}
+
+// Marches the cloud layer along vDirN starting at vStartAbs. Returns false when there is nothing
+// to do (clouds off, the ray points down, or the ray never meets the layer). vInscatter is
+// EXPOSED radiance; fTransmittance is what is left of whatever lies behind the layer.
+bool SVO_RT_MarchClouds(in float3 vStartAbs, in float3 vDirN, out float3 vInscatter, out float fTransmittance)
+{
+	vInscatter = (float3)0.f;
+	fTransmittance = 1.f;
+
+	if (SVO_CloudParams0.x <= 0.f || vDirN.z <= 0.f)
+		return false;
+
+	const float fAltitude   = SVO_CloudParams0.y;
+	const float fThickness  = SVO_CloudParams0.z;
+	const float fScatter    = SVO_CloudParams1.x;
+	const float fExtinction = SVO_CloudParams1.y;
+	const float fPowder     = SVO_CloudParams1.z;
+	const float fRadius     = SVO_CloudParams1.w;
+
+	// ENABLE_ORIGIN_MOVE_WITH_CAMERA, as Clouds.cfx builds it: the spherical layer's centre
+	// follows the camera, so the layer is a shell of constant altitude around the viewer.
+	float3 vCentre = GetWorldViewPos();
+	vCentre.z = -fRadius;
+
+	const float2 vHit = vcGetIntersectionWithCloudLayer(vStartAbs, vDirN, fAltitude, fThickness, fRadius, vCentre);
+	float fEnd = min(SVO_CloudParams2.y, max(vHit.x, vHit.y));
+	const float fStart = max(min(vHit.x, vHit.y), 0.f);
+	fEnd = ((fEnd - fStart) > SVO_CloudParams2.z) ? (fStart + SVO_CloudParams2.z) : fEnd;
+
+	if (fStart >= fEnd)
+		return false;
+
+	const float fSteps = max(SVO_CloudParams2.x, 1.f);
+	const int   nSteps = (int)fSteps;
+
+	CloudGenParam param = SVO_RT_GetCloudGenParam();
+
+	// Clouds.cfx's own sun / sky / ground terms for this direction, from the same constants.
+	const float3 vSunDir = SVO_CloudSunDir.xyz;
+	const float3 cSun = SVO_CloudSunLight.xyz;
+	const float  fDotLE = dot(vDirN, vSunDir);
+
+	const float fAngle = acos_fast(fDotLE) * ONE_OVER_PI;
+	const float fMieNorm = 1.0f / 12.71f;
+	const float3 vMiePhase = SVO_CloudMiePhaseTex.SampleLevel(SampStateTrilinearClamp, float2(fAngle, 0.f), 0.f).rgb
+	                         * SVO_CloudScatterParams.x * fMieNorm;
+
+	const float g = SVO_CloudScatterParams.z;
+	const float fMultiPhase = GetVolumetricFogInscatteringSchlickPhaseFunction(fDotLE, g, 1.f - g * g);
+	const float3 cSunLight = (cSun * vMiePhase) + (SVO_CloudScatterParams.y * fMultiPhase) * cSun;
+	const float3 cSunHigh = (SVO_CloudScatterParams.w * (0.25f * ONE_OVER_PI)) * cSun;
+
+	const float3 vSkyRayleigh = SVO_CloudSkyLight.xyz;
+	const float3 cGroundSrc = (saturate(vSunDir.z) * cSun) + vSkyRayleigh;
+	const float3 cGroundLight = SVO_CloudGroundLight.w * (0.25f * ONE_OVER_PI) * cGroundSrc * SVO_CloudGroundLight.xyz;
+	const float3 cSkyLight = SVO_CloudSkyLight.w * (0.25f * ONE_OVER_PI) * vSkyRayleigh;
+
+	const float fMsAttenuation = SVO_CloudMultiScatter.x;
+	const float fMsPreservation = SVO_CloudMultiScatter.y;
+
+	float fTotalThickness = 0.f;
+
+	[loop] for (int i = 0; i < nSteps; ++i)
+	{
+		if (fTransmittance < 0.01f)
+			break;
+
+		const float d = vcGetLinearDepth((float)i, fSteps, fStart, fEnd);
+		const float dNext = vcGetLinearDepth((float)i + 1.f, fSteps, fStart, fEnd);
+		const float fStepSize = dNext - d;
+
+		float3 vPosAbs = vStartAbs + vDirN * d;
+		// ENABLE_SPHERICAL_CLOUD_LAYER: the density field is evaluated in the flattened space of
+		// the shell, exactly as the direct view evaluates it.
+		vPosAbs = vcTranslateWorldPosToCloudPos(vPosAbs, vCentre, fRadius, fAltitude);
+
+		const float fDensity = GetCloudDensity(vPosAbs, param);
+		if (fDensity <= 0.f)
+			continue;
+
+		const float3 vOptThickness = SVO_RT_CloudOpticalThickness(vPosAbs, fDensity, fExtinction, param);
+
+		const float fShadow       = exp(-vOptThickness.x);
+		const float fSkyShadow    = lerp(fMsPreservation, 0.f, exp(-vOptThickness.y * fMsAttenuation));
+		const float fGroundShadow = lerp(fMsPreservation, 0.f, exp(-vOptThickness.z * fMsAttenuation));
+
+		fTotalThickness += fExtinction * fDensity * fStepSize;
+		const float fPowderEffect = 1.f - exp(-fTotalThickness * fPowder);
+
+		const float fSigmaS = fScatter * fDensity;
+		float3 S = fSigmaS * (fShadow * cSunLight + fSkyShadow * cSunHigh + fSkyShadow * cSkyLight + fGroundShadow * cGroundLight);
+		S *= fPowderEffect;
+
+		const float muE = max(0.000000001f, fExtinction * fDensity);
+		const float trns = exp(-muE * fStepSize);
+		const float3 Sint = ((-S * trns) + S) / muE;
+
+		vInscatter += fTransmittance * Sint;
+		fTransmittance *= trns;
+	}
+
+	return true;
+}
+
+
+///////////////////////////////////////////////////////////////////////////////////
 
 // Neo reads (worldPos - min) / cellSize with no clamp, so any hit outside the grid box
 // wraps and reads another cell's mask (research/06 section 3.4, gap 3). We clamp: a hit
@@ -93,7 +609,7 @@ struct SRTShadeProbe
 void TiledForwardShading_Raytracing(in ForwardShadingAttribs attribs, inout float3 diffuseAcc, inout float3 specularAcc,
                                     SamplerState ssTrilinearClamp, SamplerComparisonState ssComparison,
                                     const bool applyProbes, const bool applyNonProbes, const bool bSkipSpecularProbes,
-                                    inout SRTShadeProbe dbg)
+                                    inout SRTShadeProbe dbg, const bool bUseHitGI, const float4 vHitGI)
 {
 	const float3 worldPosAbs = attribs.worldPos + GetWorldViewPos();
 
@@ -111,8 +627,16 @@ void TiledForwardShading_Raytracing(in ForwardShadingAttribs attribs, inout floa
 	float2 envBRDF = Fwd_EnvironmentBRDF.SampleLevel(ssTrilinearClamp, float2(NdotV, attribs.smoothness), 0).xy;
 	envFresnel = lerp(envBRDF.xxx, envBRDF.yyy, attribs.reflectance);
 
-	// bOpaque is false at a hit, so there is no screen-space AO term to read
-	const float2 occlusion = float2(1, 1);
+	// energy audit error 2 / E3. bOpaque is false at a hit, so there is no SCREEN-SPACE AO term
+	// to read - but "no screen-space AO" was implemented as "no occlusion at all", i.e. (1,1),
+	// while the same surface seen directly is multiplied by occlDiff squared and by
+	// DeriveSpecularOcclusion (TiledShading.cfi:841-852). That is a x1.7 to x5 gap in any corner.
+	// The voxel AO the tracer measured at the hit (HITGI.w) stands in for the screen-space one,
+	// through CE's own formula and CE's own max(ao*ao, 0.3) floor, so the reflected corner darkens
+	// the same way the corner does.
+	const float fHitAO = bUseHitGI ? saturate(vHitGI.w) : 1.f;
+	const float fHitSpecOcc = bUseHitGI ? DeriveSpecularOcclusion(NdotV, max(fHitAO * fHitAO, 0.3f), attribs.smoothness) : 1.f;
+	const float2 occlusion = float2(fHitAO, fHitSpecOcc);
 
 	int lightIndex = -1;
 	uint maskIndex = 0;
@@ -156,10 +680,18 @@ void TiledForwardShading_Raytracing(in ForwardShadingAttribs attribs, inout floa
 					uint4 resIndexClamps = GetResourceIndexAndMipClamps(Fwd_TiledLightsShadeInfo[lightShadeInfoIdx].resIndex);
 					float probeWeight = (1 - probeWeightSum) * attenuation;
 
-					// Diffuse
-					float4 diffuseProbe = Fwd_DiffuseCubeArray.SampleLevel( ssTrilinearClamp, float4( attribs.normal, resIndexClamps.x ), resIndexClamps.y );
-					diffuseProbe.rgb = DecodeHDRCubemap( diffuseProbe );
-					diffuseAcc += diffuseProbe.rgb * (lightColor.rgb * probeWeight) * occlusion.x;
+					// Diffuse. energy audit error 1 / E1: SKIPPED when the hit carries SVO GI,
+					// because that is exactly what ApplyGI mode 2 does to the primary surface -
+					// GI replaces the probe diffuse, TiledShading.cfi:139. The probe diffuse used
+					// to be added here in full, which is a different, and usually much brighter
+					// and flatter, indirect model than the one the same wall gets when the camera
+					// looks at it directly.
+					if (!bUseHitGI)
+					{
+						float4 diffuseProbe = Fwd_DiffuseCubeArray.SampleLevel( ssTrilinearClamp, float4( attribs.normal, resIndexClamps.x ), resIndexClamps.y );
+						diffuseProbe.rgb = DecodeHDRCubemap( diffuseProbe );
+						diffuseAcc += diffuseProbe.rgb * (lightColor.rgb * probeWeight) * occlusion.x;
+					}
 
 					if (!bSkipSpecularProbes)
 					{
@@ -286,9 +818,18 @@ void TiledForwardShading_Raytracing(in ForwardShadingAttribs attribs, inout floa
 	}
 }
 
+// bDirectLights: energy audit item 7 / E7. A MISS has no surface - RT_ProcessBestHit hands it
+// albedo 1, F0 1, smoothness 1 and a normal of -rayDir at an arbitrary point MaxDistRay along
+// the ray. Running the sun and the tiled light loop over that adds a mirror-sharp GGX lobe at
+// F0 = 1 on top of a sky that already contains the sun, i.e. a SECOND sun, plus a scatter of
+// specular sparks wherever a lamp happens to sit near the ray. A miss is resolved by the sky
+// (decision 09 section 9.1) or, below the horizon, by the probes - never by re-lighting a
+// surface that is not there.
 void Fwd_StandardOpaqueShading_Raytracing(in MaterialAttribsCommon commonAttribs, inout ForwardShadingAttribs fwdAttribs,
                                           inout float3 diffuseAcc, inout float3 specularAcc, out SRTShadeProbe dbg,
-                                          bool bSunShadows = true)
+                                          bool bSunShadows = true, bool bDirectLights = true,
+                                          bool bUseHitGI = false, float4 vHitGI = (float4)0.f,
+                                          bool bSkipSpecularProbes = false)
 {
 	dbg = (SRTShadeProbe)0;
 	dbg.sunVisibility = 1;
@@ -305,6 +846,7 @@ void Fwd_StandardOpaqueShading_Raytracing(in MaterialAttribsCommon commonAttribs
 	// The sun colour is plain CV_SunColor - the SVO's own sun / PI (SceneTree.cpp:2500) exists
 	// only so the RGBM brick codec does not clip, and the hit never goes through RGBM
 	// (research/06 section 7.3e). The 1/PI arrives inside the BRDFs via SCENE_BRDF_NORM_FACTOR.
+	if (bDirectLights)
 	{
 		float shadowMask = 0;
 		if (bSunShadows)
@@ -328,8 +870,23 @@ void Fwd_StandardOpaqueShading_Raytracing(in MaterialAttribsCommon commonAttribs
 		dbg.directSpec += sunSpec;
 	}
 
-	// unconditional: %_RT_TILED_SHADING means "trace voxels" on this shader
-	TiledForwardShading_Raytracing(fwdAttribs, diffuseAcc, specularAcc, ssFwdBilinearWrap, ssFwdComparison, true, true, false, dbg);
+	// unconditional: %_RT_TILED_SHADING means "trace voxels" on this shader.
+	// rt stage 5B: bSkipSpecularProbes was always false here; WATER passes true when the sky
+	// answered along the reflected direction, because the probe specular and that sky lookup are
+	// two estimates of the same reflection (decision 09 section 9.4).
+	TiledForwardShading_Raytracing(fwdAttribs, diffuseAcc, specularAcc, ssFwdBilinearWrap, ssFwdComparison, true, bDirectLights, bSkipSpecularProbes, dbg, bUseHitGI, vHitGI);
+
+	// energy audit error 1 / E1. The indirect DIFFUSE at the hit, taking the place the probe
+	// diffuse just vacated: the SVO's own voxel irradiance, which is exactly what ApplyGI mode 2
+	// hands the primary surface (TiledShading.cfi:139). It arrives UNEXPOSED, in TexGiDiffuse's
+	// units, so the multiply by PS_HDR_RANGE_ADAPT_MAX is ApplyGI's own multiply happening here
+	// instead - one exposure, in the same place, so a reflected wall and the wall cannot drift.
+	// The AO rides on the GI term only, which is where the deferred path applies its own
+	// (TiledShading.cfi:841-848 multiplies diffuseAcc while it still holds nothing but GI, and
+	// the direct lights are added afterwards). It goes in BEFORE the energy split below, so it
+	// is multiplied by albedo * (1 - luminance(F0)) exactly as the deferred surfAlbedo is.
+	if (bUseHitGI)
+		diffuseAcc += vHitGI.xyz * PS_HDR_RANGE_ADAPT_MAX * saturate(vHitGI.w);
 
 	// Apply albedo (using simple energy conservation between specular and diffuse).
 	// Byte-identical to ForwardShading.cfi:337 - the reflected wall must be graded by the

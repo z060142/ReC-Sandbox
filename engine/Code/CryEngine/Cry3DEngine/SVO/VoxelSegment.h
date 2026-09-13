@@ -29,6 +29,21 @@
 	#define SVO_RT_SEG_PARTICLES       32768  // sprite BVH (stage 4)
 	#define SVO_RT_SEG_STATIC          49152  // per SVO cell static blocks - record 0 is never a valid static root
 	#define SVO_RT_CHUNK_GRANULARITY   64     // chunk allocator granularity, in records
+	#define SVO_RT_DYN_MESH_COUNT      (SVO_RT_SEG_DYN_MATS - SVO_RT_SEG_DYN_MESH)       // 30720 records
+	#define SVO_RT_DYN_MATS_COUNT      (SVO_RT_SEG_PARTICLES - SVO_RT_SEG_DYN_MATS)      // 2048 records
+// Depth budget of the two level dynamic tree: the consumer stack is sized for e_svoTI_RT_MaxDepth + 2,
+// so the top level over objects and the cached per object subtrees have to share those 18 levels.
+	#define SVO_RT_DYN_TOP_MAX_DEPTH   6      // <= 64 objects before the overflow leaf policy kicks in
+
+// Shading tags written into the material record's matInfo3.z (rt decision 10). Float valued small
+// ints; 0.25 is the legacy vegetation-leaves value and is KEPT so the current consumer still works.
+	#define SVO_RT_TAG_ILLUM           0.f
+	#define SVO_RT_TAG_VEG_LEAVES      0.25f
+	#define SVO_RT_TAG_HUMAN_SKIN      2.f
+	#define SVO_RT_TAG_GLASS           3.f
+	#define SVO_RT_TAG_WATER           4.f    // ocean plane / water volume surface (decision 09 9.4)
+	#define SVO_RT_TAG_TERRAIN         5.f
+	#define SVO_RT_TAG_EMISSIVE_ONLY   6.f    // reserved - CE has no usable "emissive but unlit" flag
 
 //! One triangle as handed to the static BVH builder (world space, already resolved from the soup).
 struct SRTBuildTri
@@ -38,6 +53,26 @@ struct SRTBuildTri
 	Vec2 t[3];         //!< per vertex UVs, already normalised into [0, 16)
 	Vec3 faceNorm;     //!< plane normal
 	int  matRecord;    //!< absolute record index of the material record
+};
+
+//! One material as the pool stores it (rt decision 10): the 4 texel base record, an optional 4 texel
+//! "extras" record carrying everything the base record has no lane for (detail map, blend layer,
+//! transmittance, glass / skin parameters) and, for a %BLENDLAYER material, a second full base record
+//! describing the blend layer's own texture set. The three are written consecutively:
+//!     base at R, extras at R + 1, blend base at R + 2.
+//! base[0].z's LOW ExtractUint2 field holds the extras offset + 1 (0 = no extras, 1 = extras at R + 1);
+//! extras[1].x holds the ABSOLUTE record index of the blend base (0 = none).
+struct SRTMatRecordSet
+{
+	Vec4 base[SVO_RT_RECORD_TEXELS];
+	Vec4 extras[SVO_RT_RECORD_TEXELS];
+	Vec4 blend[SVO_RT_RECORD_TEXELS];
+	bool bExtras;
+	bool bBlend;
+
+	//! Records this material occupies in the pool (1, 2 or 3).
+	//! A blend record only exists behind an extras record, so the count follows the writer exactly.
+	int  RecordCount() const { return 1 + (bExtras ? 1 : 0) + ((bExtras && bBlend) ? 1 : 0); }
 };
 
 //! Statistics of one static BVH build, accumulated over the level in CSvoEnv.
@@ -55,7 +90,33 @@ struct SRTBuildStats
 	int   mats;         //!< material records written
 	int   uvClamped;    //!< triangles whose UV span did not fit [0, 16)
 	int   trisSkipped;  //!< triangles rejected (degenerate or out of the quantisation range)
+	int   extras;       //!< material extras records written (rt decision 10)
+	int   blends;       //!< blend layer material records written (rt decision 10)
 	float buildMs;      //!< accumulated build time
+};
+
+//! Statistics of the per frame dynamic BVH (rt decision 07, stage 3A).
+struct SRTDynStats
+{
+	void Reset() { ZeroStruct(*this); }
+
+	int   objs;        //!< objects emitted into the dynamic tree
+	int   objsFound;   //!< objects that qualified before the budget was applied
+	int   tris;        //!< triangles emitted
+	int   records;     //!< records written into DYN_MESH
+	int   mats;        //!< material records written into DYN_MATS (base + extras + blend layer)
+	int   overflowed;  //!< objects merged into an overflow leaf because the top level hit its depth cap
+	int   cached;      //!< per object BVHs held in the cache
+	int   waterObjs;   //!< water surfaces emitted (ocean ring + water volumes, rt decision 09 9.4)
+	int   waterTris;   //!< triangles of those water surfaces (a subset of tris)
+
+	// character skinning (rt decision 07, stage 3B)
+	int   skinnedChars;//!< skin attachments CPU skinned this frame
+	int   skinnedVerts;//!< vertices those attachments skinned
+	int   skinReused;  //!< attachments that kept an older pose because their skinning data was not ready
+
+	float skinMs;      //!< CPU cost of the skinning alone; part of ms
+	float ms;          //!< CPU cost of the last frame
 };
 	
 typedef uint16 ObjectLayerIdType;
@@ -268,7 +329,7 @@ public:
 	static void  ErrorTerminate(const char* format, ...);
 	Vec3i        GetDxtDim();
 	void         AddTriangle(const SRayHitTriangleIndexed& ht, int trId, PodArray<int>*& rpNodeTrisXYZ, PodArrayRT<SRayHitVertex>* pVertInArea);
-	int          CheckStoreTextureInPool(SShaderItem* pShItem, EEfResTextures texSlot, uint16& nTexW, uint16& nTexH);
+	static int   CheckStoreTextureInPool(SShaderItem* pShItem, EEfResTextures texSlot, uint16& nTexW, uint16& nTexH, PodArray<int>& arrTexSlicesOut, EEfResTextures eEncodeAs = EFTT_UNKNOWN, EEfResTextures eSmoothnessSlot = EFTT_SMOOTHNESS);
 	ColorB*      ApplyHighPass(uint16& nTexW, uint16& nTexH, const ColorB* pTexRgbOr);
 	void         ComputeDistancesFast_MinDistToSurf(ColorB* pTex3dOptRGBA, ColorB* pTex3dOptNorm, ColorB* pTex3dOptOpac, int threadId);
 	void         CropVoxTexture(int threadId, bool bCompSurfDist);
@@ -285,9 +346,14 @@ public:
 	void         SetID(int32 nID)          { m_segmentID = nID; }
 	void         BuildStaticBVH();
 	void         ReleaseRTChunk();
-	void         FillRTMaterialRecord(const SRayHitTriangleIndexed& tr, Vec4* pOut);
+	void         FillRTMaterialRecord(const SRayHitTriangleIndexed& tr, SRTMatRecordSet& out);
+	static void  RTFillMaterialRecord(IMaterial* pMat, bool bTerrain, PodArray<int>& arrTexSlicesOut, SRTMatRecordSet& out);
 	static bool  BuildStaticBVHRecords(const PodArray<SRTBuildTri>& arrTris, const Vec4& qb, int recordBase, PodArray<Vec4>& arrOut, PodArray<int>* pRelocFloats, SRTBuildStats& stats);
 	static void  RunRTSelfTest();
+
+	//! Dynamic mesh BVH (rt decision 07, stage 3A) - main thread, once per frame, from CSvoEnv::Render.
+	static void  RTUpdateDynamic();
+	static void  RTClearDynamicCache();
 	void         StreamAsyncOnComplete(IReadStream* pStream, unsigned nError) override;
 	void         StreamOnComplete(IReadStream* pStream, unsigned nError) override;
 	void         UnloadStreamableData();

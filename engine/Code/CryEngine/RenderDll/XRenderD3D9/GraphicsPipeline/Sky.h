@@ -46,6 +46,13 @@ public:
 	};
 	const SSceneReferredDebug& GetSceneReferredDebug() const { return m_srDebug; }
 
+	// rt stage 4A (scene-notes/rt/decisions/09 section 9.1): the software ray tracer needs the
+	// same two Nishita dome textures this pass samples, so a reflection ray that misses shows
+	// the engine's own sky instead of a fake surface. Read-only; the pass owns them and refills
+	// them from the sky-light manager on its own timestamp.
+	CTexture* GetSkyDomeTextureMie() const      { return m_pSkyDomeTextureMie; }
+	CTexture* GetSkyDomeTextureRayleigh() const { return m_pSkyDomeTextureRayleigh; }
+
 private:
 	void CreateSkyDomeTextures(int32 width, int32 height);
 	void LoadStarsDataAsync();

@@ -1,0 +1,750 @@
+From 0cf232d64a1110137c6b93d11a2b58d9d57c4ea0 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Mon, 14 Sep 2026 05:02:16 +0800
+Subject: [PATCH 212/213] feat: factor the volumetric cloud shape and density
+ functions into CloudsCommon.cfi
+
+Preparation for decision 09 section 9.2 (volumetric clouds in ray traced
+reflections): the secondary cloud march in ShadePS must evaluate the SAME
+density field the direct view does, so the shape/density block of Clouds.cfx
+becomes a shared .cfi instead of being duplicated.
+
+Moved verbatim out of Clouds.cfx (its lines 56-372) into the new
+Engine/Shaders/HWScripts/CryFX/CloudsCommon.cfi, included by Clouds.cfx at
+exactly the place the code used to sit:
+
+  acos_fast
+  vcGetLinearDepth
+  GetVdC
+  vcTranslateWorldPosToCloudPos
+  vcGetIntersectionPlane
+  vcGetIntersectionWithCloudLayer
+  GetFBM
+  vcGetCloudBlockerInfluence
+  vcGetAllCloudBlockersInfluence
+  struct CloudGenParam
+  GetCloudDensity
+  GetOpticalThickness
+
+CloudBaseDensityTexture (t15) deliberately stays declared in Clouds.cfx, above
+the include: it is a resource declaration and does not belong in a file a
+second shader includes.
+
+The only text added to the moved block is two opt-outs for an includer whose
+%_RT_SAMPLE3 / %_RT_SAMPLE4 bits mean something else - in Total_Illumination.cfx
+the same two bits are "pre-baked diffuse cache" and "diffuse pass", and letting
+SAMPLE3 through there would sample CloudBaseDensityTexture at a register the
+ShadePass technique has bound to something else. Clouds.cfx defines neither
+symbol, so its preprocessed text is unchanged.
+
+No behaviour change. Verified by expanding the include back into Clouds.cfx,
+resolving the two opt-outs as Clouds.cfx resolves them, and diffing against
+3f33313a: IDENTICAL (scene-notes/rt/tools/clouds_move_check.py). cryfx_lint.py
+reports 0 findings on both files.
+
+This is the merge point for the paused clouds branch: its edits to those twelve
+functions move into CloudsCommon.cfi unchanged.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SCUvWGLCsqzm3VNMzp4uiS
+---
+ Engine/Shaders/HWScripts/CryFX/Clouds.cfx     | 318 +---------------
+ .../Shaders/HWScripts/CryFX/CloudsCommon.cfi  | 357 ++++++++++++++++++
+ 2 files changed, 358 insertions(+), 317 deletions(-)
+ create mode 100644 Engine/Shaders/HWScripts/CryFX/CloudsCommon.cfi
+
+diff --git a/Engine/Shaders/HWScripts/CryFX/Clouds.cfx b/Engine/Shaders/HWScripts/CryFX/Clouds.cfx
+index 48dc525c..f163c861 100644
+--- a/Engine/Shaders/HWScripts/CryFX/Clouds.cfx
++++ b/Engine/Shaders/HWScripts/CryFX/Clouds.cfx
+@@ -53,323 +53,7 @@ float4 vcCloudBlockerParam[4]; // x: reciprocal of length between decay start an
+ ///////////////// Textures //////////////////
+ Texture3D<float4> CloudBaseDensityTexture : register(t15);
+ 
+-////////////////////////////////////////////////////////////////////////////////////////////
+-// Functions
+-
+-// Approximate acos function
+-float acos_fast(float x)
+-{
+-	return sqrt(1.0 - x) * (1.5707963267948966192313216916398f + x * (-0.213300989f + x * (0.077980478f + x * -0.02164095f)));
+-}
+-
+-float vcGetLinearDepth(in float index, in float maxIndex, in float near, in float far)
+-{
+-	float farMinusNear = far - near;
+-	float invMaxIndexMinusOne = rcp(maxIndex - 1.0f);
+-	const float c = 2.0f;
+-	return farMinusNear * pow(saturate(index * invMaxIndexMinusOne), c) + near;
+-}
+-
+-// calculate Van der Corput sequence
+-float GetVdC(uint index)
+-{
+-	index = (index << 16u) | (index >> 16u);
+-	index = ((index & 0x55555555u) << 1u) | ((index & 0xAAAAAAAAu) >> 1u);
+-	index = ((index & 0x33333333u) << 2u) | ((index & 0xCCCCCCCCu) >> 2u);
+-	index = ((index & 0x0F0F0F0Fu) << 4u) | ((index & 0xF0F0F0F0u) >> 4u);
+-	index = ((index & 0x00FF00FFu) << 8u) | ((index & 0xFF00FF00u) >> 8u);
+-	return float(index) / float(0xFFFFFFFFu);
+-}
+-
+-float3 vcTranslateWorldPosToCloudPos(
+-	in float3 samplePosWS,
+-	in float3 centerSphere,
+-	in float sphereRadius,
+-	in float cloudAltitude)
+-{
+-	float3 cpos;
+-
+-	// translate height on a spherical surface to height on a plane.
+-	float3 centerToSamplePos = samplePosWS - centerSphere;
+-	cpos.z = length(centerToSamplePos) - sphereRadius;
+-	cpos.xy = samplePosWS.xy;
+-
+-	return cpos;
+-}
+-
+-float vcGetIntersectionPlane(in float3 rayOrigin, in float3 rayDir, in float4 plane)
+-{
+-	return ((plane.w - dot(plane.xyz, rayOrigin.xyz)) / dot(plane.xyz, rayDir.xyz));
+-}
+-
+-float2 vcGetIntersectionWithCloudLayer(
+-	in float3 rayOrigin,
+-	in float3 rayDir,
+-	in float cloudAltitude,
+-	in float cloudThickness, 
+-	in float sphereRadius,
+-	in float3 centerSphere)
+-{
+-#if !ENABLE_SPHERICAL_CLOUD_LAYER
+-	// intersect with cloud layer's bottom and top plane.
+-	float4 cloudPlaneBottom = float4(0.0f, 0.0f, 1.0f, cloudAltitude);
+-	float4 cloudPlaneTop = float4(0.0f, 0.0f, 1.0f, cloudAltitude + cloudThickness);
+-	float tb = vcGetIntersectionPlane(rayOrigin, rayDir, cloudPlaneBottom);
+-	float tt = vcGetIntersectionPlane(rayOrigin, rayDir, cloudPlaneTop);
+-#else
+-	// intersect with the bottom and top of spherical cloud layer.
+-	const float2 altitudeLayers = float2(cloudAltitude, cloudAltitude + cloudThickness);
+-
+-	float2 result0;
+-	float2 result1;
+-	for(int i = 0; i < 2; ++i)
+-	{
+-		float r = sphereRadius + altitudeLayers[i];
+-		float3 centerToRayOrigin = rayOrigin.xyz - centerSphere;
+-		float b = dot(centerToRayOrigin, rayDir);
+-		float c = dot(centerToRayOrigin, centerToRayOrigin) - (r * r);
+-		float discr = b * b - c;
+-		float det = sqrt(discr);
+-		float t0 = -b - det;
+-		float t1 = -b + det;
+-		if((c > 0.0f && b > 0.0f) || (discr < 0.0f))
+-		{
+-			// no intersection
+-			result0[i] = 0.0f;
+-			result1[i] = 0.0f;
+-		}
+-		else
+-		{
+-			//results[i] = (t0 >= 0.0f && t1 >= 0.0f) ? t0 : t1;
+-			result0[i] = max(0.0f, t0);
+-			result1[i] = max(0.0f, t1);
+-		}
+-	}
+-
+-	float tb;
+-	float tt;
+-	if(result0.x > 0.0f && result1.x > 0.0f)
+-	{
+-#if 0
+-		tb = result0.x;
+-		tt = (result0.y > 0.0f) ? result0.y : result1.y;
+-#else
+-		tb = result0.x;
+-		tt = result0.y;
+-#endif
+-	}
+-	else if(result1.x > 0.0f)
+-	{
+-		tb = result1.x;
+-		tt = result1.y;
+-	}
+-	else //if(result0.x <= 0.0f && result1.x <= 0.0f)
+-	{
+-		tb = result0.y;
+-		tt = result1.y;
+-	}
+-#endif
+-
+-	return float2(tt, tb);
+-}
+-
+-float GetFBM(Texture3D noiseTex, SamplerState noiseSampler, float3 pos, const float maxOctaves, const float frequency, bool turbulence = false)
+-{
+-	const float normalizationFactorNoise3DTex = 1.66f;
+-
+-	const float3x3 rot = float3x3(0.0f, 0.8f, 0.6f, -0.8f, 0.36f, -0.48f, -0.6f, -0.48f, 0.64f);
+-	pos.xyz = mul(pos.xyz, rot);
+-
+-	float f = 0.0f;
+-	float amplitude = 1.0f;
+-	float sum = 0.0f;
+-
+-	for(float i = 0.0f; i < maxOctaves; ++i)
+-	{
+-		if(turbulence)
+-		{
+-			//f += amplitude * (noiseTex.SampleLevel(noiseSampler, pos.xyz, 0.0f).w * 2.0f - 1.0f);
+-			f += amplitude * abs((noiseTex.SampleLevel(noiseSampler, pos.xyz, 0.0f).w * 2.0f - 1.0f) * normalizationFactorNoise3DTex);
+-		}
+-		else
+-		{
+-			//f += amplitude * (noiseTex.SampleLevel(noiseSampler, pos.xyz, 0.0f).w * 2.0f - 1.0f);
+-			f += amplitude * ((noiseTex.SampleLevel(noiseSampler, pos.xyz, 0.0f).w * 2.0f - 1.0f) * normalizationFactorNoise3DTex);
+-		}
+-		sum += amplitude;
+-
+-		amplitude *= 0.5f;
+-		//amplitude *= 1.0f/frequency;
+-
+-		pos.xyz = mul(pos.xyz, rot) * frequency;
+-		//pos.xyz *= frequency;
+-		//frequency += 0.011f;
+-	}
+-
+-	f /= sum;
+-
+-	return f;
+-}
+-
+-float vcGetCloudBlockerInfluence(in float3 posWS, in float3 posBlocker, in float4 paramBlocker)
+-{
+-	const float invDecayLength = paramBlocker.x;
+-	const float decayStart = paramBlocker.y;
+-	const float decayInfluence = paramBlocker.z;
+-	const float invDecayInfluence = paramBlocker.w;
+-	float t = saturate((length(posBlocker.xyz - posWS.xyz) - decayStart) * invDecayLength);
+-	return (t * decayInfluence + invDecayInfluence);
+-}
+-
+-float vcGetAllCloudBlockersInfluence(
+-	in float3 posWS,
+-	in float4 cloudBlockerPos[4],
+-	in float4 cloudBlockerParam[4])
+-{
+-	int numBlocker = cloudBlockerPos[0].w;
+-	float decay = (numBlocker <= 0) ? 1.0f : 0.0f;
+-#if 0
+-	for(int i = 0; i < numBlocker; ++i)
+-	{
+-		decay = max(decay, vcGetCloudBlockerInfluence(posWS, cloudBlockerPos[i].xyz, cloudBlockerParam[i]));
+-	}
+-#else
+-	// faster on AMD GPU.
+-	decay = max(decay, vcGetCloudBlockerInfluence(posWS, cloudBlockerPos[0].xyz, cloudBlockerParam[0]));
+-	[branch] if(numBlocker > 1)
+-	{
+-		decay = max(decay, vcGetCloudBlockerInfluence(posWS, cloudBlockerPos[1].xyz, cloudBlockerParam[1]));
+-	}
+-	[branch] if(numBlocker > 2)
+-	{
+-		decay = max(decay, vcGetCloudBlockerInfluence(posWS, cloudBlockerPos[2].xyz, cloudBlockerParam[2]));
+-	}
+-	[branch] if(numBlocker > 3)
+-	{
+-		decay = max(decay, vcGetCloudBlockerInfluence(posWS, cloudBlockerPos[3].xyz, cloudBlockerParam[3]));
+-	}
+-#endif
+-	return decay;
+-}
+-
+-struct CloudGenParam
+-{
+-	float cloudiness;
+-	float altitude;
+-	float thickness;
+-	float3 noiseSizeScale;
+-
+-	float3 baseSizeScale;
+-	float3 baseOffset;
+-	float3 edgeNoiseSizeScale;
+-	float2 baseTexRemap;
+-	float4 edgeErode;
+-	float cloudDensityScale;
+-	float additionalNoiseIntensity;
+-
+-	float4 cloudBlockerPos[4]; // xyz: the center position of the cloud blocker, w: number of blockers
+-	float4 cloudBlockerParam[4]; // x: reciprocal of length between decay start and end, y: decay start, z: decay influence, w: one minus decay influence
+-
+-	Texture3D noiseTex;
+-	Texture3D edgeNoiseTex;
+-	SamplerState linearWrapSampler;
+-};
+-
+-float GetCloudDensity(in float3 posWS, CloudGenParam param)
+-{
+-	float3 posCloudSpace = posWS.xyz + param.baseOffset.xyz; // baseOffset.z includes negative altitude.
+-	float3 cpos = posCloudSpace * param.noiseSizeScale;
+-
+-	const float baseTexMin = param.baseTexRemap.x;
+-	const float baseTexMax = param.baseTexRemap.y;
+-	const float3 erodeNoiseSizeScale = param.edgeNoiseSizeScale;
+-	const float edgeTurbulence = param.edgeErode.x;
+-	const float edgeThreshold = param.edgeErode.y;
+-	const bool bErode = param.edgeErode.z > 0.0f;
+-	const bool bAbs = param.edgeErode.w > 0.0f;
+-	const float cloudMaxDensityScale = param.cloudDensityScale;
+-	const float additionalNoiseIntensity = param.additionalNoiseIntensity;
+-
+-#if %_RT_SAMPLE3
+-	float3 tcBase = posCloudSpace.xyz * param.baseSizeScale.xyz;
+-	tcBase.xy += 0.5f;
+-	float baseTexDensity = CloudBaseDensityTexture.SampleLevel(param.linearWrapSampler, tcBase.xyz, 0.0f).w;
+-	float f = smoothstep(baseTexMin, baseTexMax, baseTexDensity);
+-
+-	const float octaves = 1;
+-	const float frequency = 2.71285739f;
+-	const float nz = GetFBM(param.noiseTex, param.linearWrapSampler, cpos, octaves, frequency);
+-	f = f + saturate(nz) * additionalNoiseIntensity;
+-#else
+-	const float octaves = 2;
+-	const float frequency = 2.71285739f;
+-	float f = GetFBM(param.noiseTex, param.linearWrapSampler, cpos, octaves, frequency);
+-#endif
+-
+-	f = saturate(f);
+-
+-	// height density gradation
+-	const float heightVariation = 1.0f;
+-	const float th = heightVariation * param.thickness;
+-	const float thresholdHeight = th * 0.5f;
+-	const float start = (posCloudSpace.z > thresholdHeight) ? th : 0.0f;
+-	const float end = (posCloudSpace.z > thresholdHeight) ? th * 0.7f : th * 0.3f;
+-	float heightGradient = smoothstep(start, end, posCloudSpace.z);
+-	f *= heightGradient;
+-
+-	// erode cloud's edge or add fine-grained clouds around edge.
+-	float erode = GetFBM(param.edgeNoiseTex, param.linearWrapSampler, posCloudSpace * erodeNoiseSizeScale, 1.0f, 2.31285739f, bAbs);
+-	const float edgeFactor = saturate(f / edgeThreshold);
+-	const float erodeFactor = -(1.0f - edgeFactor) * edgeTurbulence;
+-	const float accumFactor = edgeFactor * edgeTurbulence;
+-	f += saturate(erode) * (bErode ? erodeFactor : accumFactor);
+-
+-	f = saturate(f);
+-
+-	f *= param.cloudiness * param.cloudiness;
+-
+-	f *= cloudMaxDensityScale;
+-
+-#if %_RT_SAMPLE4
+-	// decay cloud density with cloud blocker entity.
+-	f *= vcGetAllCloudBlockersInfluence(posWS, param.cloudBlockerPos, param.cloudBlockerParam);
+-#endif
+-
+-	return f;
+-}
+-
+-float GetOpticalThickness(in float3 rayOriginWS, in float3 rayDir, in float extinctionCoefficient, 
+-	CloudGenParam cloudGenParam, 
+-	in uint typeShadow = 0, in float3 invTilingShadowTex = float3(0,0,0), in float2 worldAlignmentOffset = float2(0,0))
+-{
+-	const float MaxStepRaymarch = 6.0f;
+-
+-	// intersect with cloud layer's bottom and top plane.
+-	float4 cloudPlaneBottom = float4(0.0f, 0.0f, 1.0f, cloudGenParam.altitude);
+-	float4 cloudPlaneTop = float4(0.0f, 0.0f, 1.0f, cloudGenParam.altitude + cloudGenParam.thickness);
+-	float tb = vcGetIntersectionPlane(rayOriginWS, rayDir, cloudPlaneBottom);
+-	float tt = vcGetIntersectionPlane(rayOriginWS, rayDir, cloudPlaneTop);
+-
+-	float distanceEnd = min(4000.0f, max(tb, tt));
+-	float minD = min(tb, tt);
+-	float distanceStart = max(minD, 0.0f);
+-	float maxStepNum = (distanceStart >= distanceEnd) ? 0.0f : MaxStepRaymarch;
+-
+-	float transmittance = 1.0f;
+-	float opticalThickness = 0.0f;
+-	float d = distanceStart;
+-	for(float i = 0.0f; i < maxStepNum; ++i)
+-	{
+-		d = vcGetLinearDepth(i, maxStepNum, distanceStart, distanceEnd);
+-		float dNext = vcGetLinearDepth(i + 1, maxStepNum, distanceStart, distanceEnd);
+-		float stepSize = dNext - d;
+-		float3 posWS = rayDir.xyz * d + rayOriginWS;
+-		float density = GetCloudDensity(posWS, cloudGenParam);
+-		opticalThickness += extinctionCoefficient * density.x * stepSize;
+-	}
+-
+-	return opticalThickness;
+-}
++#include "CloudsCommon.cfi"
+ 
+ 
+ ////////////////////////////////////////////////////////////////////////////////////////////
+diff --git a/Engine/Shaders/HWScripts/CryFX/CloudsCommon.cfi b/Engine/Shaders/HWScripts/CryFX/CloudsCommon.cfi
+new file mode 100644
+index 00000000..a95c7dfa
+--- /dev/null
++++ b/Engine/Shaders/HWScripts/CryFX/CloudsCommon.cfi
+@@ -0,0 +1,357 @@
++// Copyright 2004-2021 Crytek GmbH / Crytek Group. All rights reserved.
++
++////////////////////////////////////////////////////////////////////////////////////////////
++// Volumetric cloud SHAPE and DENSITY, shared between the cloud passes of Clouds.cfx and the
++// secondary cloud march of the software triangle ray tracer (Total_Illumination_Shading.cfi,
++// decision 09 section 9.2).
++//
++// Everything here was MOVED OUT OF Clouds.cfx verbatim (it was lines 56-372 there) so that both
++// consumers evaluate the same density field and a cloud seen in a reflection is the same cloud
++// the camera sees. Clouds.cfx includes this file at exactly the place the code used to sit, so
++// its compiled output is unchanged; the clouds branch merges by moving its own edits here.
++//
++// The block is fully parameterised already: every function takes its noise textures, its
++// sampler and its layer parameters through the CloudGenParam struct, and reads no cbuffer and
++// no global except CloudBaseDensityTexture, which is still declared by Clouds.cfx immediately
++// above the include and is only reachable through %_RT_SAMPLE3.
++//
++// TWO OPT-OUTS, for an includer whose %_RT_SAMPLE3 / %_RT_SAMPLE4 mean something else.
++// In Clouds.cfx SAMPLE3 = "a user cloud volume texture is bound" and SAMPLE4 = "there are cloud
++// blocker entities". In Total_Illumination.cfx the very same two bits mean "pre-baked diffuse
++// cache" and "diffuse pass", so a ray tracing build must not let them reach this code - with
++// e_svoTI_Diffuse_Cache on it would sample CloudBaseDensityTexture at t15, a register the
++// ShadePass technique has bound to something else entirely. Define either symbol before the
++// include to compile that branch out:
++//
++//   VC_NO_BASE_DENSITY_TEX   never sample CloudBaseDensityTexture; always the 2 octave FBM
++//   VC_NO_CLOUD_BLOCKERS     never apply the cloud blocker entity decay
++//
++// Clouds.cfx defines NEITHER, so for Clouds.cfx the preprocessed text below is byte for byte
++// what it had before the move.
++////////////////////////////////////////////////////////////////////////////////////////////
++
++////////////////////////////////////////////////////////////////////////////////////////////
++// Functions
++
++// Approximate acos function
++float acos_fast(float x)
++{
++	return sqrt(1.0 - x) * (1.5707963267948966192313216916398f + x * (-0.213300989f + x * (0.077980478f + x * -0.02164095f)));
++}
++
++float vcGetLinearDepth(in float index, in float maxIndex, in float near, in float far)
++{
++	float farMinusNear = far - near;
++	float invMaxIndexMinusOne = rcp(maxIndex - 1.0f);
++	const float c = 2.0f;
++	return farMinusNear * pow(saturate(index * invMaxIndexMinusOne), c) + near;
++}
++
++// calculate Van der Corput sequence
++float GetVdC(uint index)
++{
++	index = (index << 16u) | (index >> 16u);
++	index = ((index & 0x55555555u) << 1u) | ((index & 0xAAAAAAAAu) >> 1u);
++	index = ((index & 0x33333333u) << 2u) | ((index & 0xCCCCCCCCu) >> 2u);
++	index = ((index & 0x0F0F0F0Fu) << 4u) | ((index & 0xF0F0F0F0u) >> 4u);
++	index = ((index & 0x00FF00FFu) << 8u) | ((index & 0xFF00FF00u) >> 8u);
++	return float(index) / float(0xFFFFFFFFu);
++}
++
++float3 vcTranslateWorldPosToCloudPos(
++	in float3 samplePosWS,
++	in float3 centerSphere,
++	in float sphereRadius,
++	in float cloudAltitude)
++{
++	float3 cpos;
++
++	// translate height on a spherical surface to height on a plane.
++	float3 centerToSamplePos = samplePosWS - centerSphere;
++	cpos.z = length(centerToSamplePos) - sphereRadius;
++	cpos.xy = samplePosWS.xy;
++
++	return cpos;
++}
++
++float vcGetIntersectionPlane(in float3 rayOrigin, in float3 rayDir, in float4 plane)
++{
++	return ((plane.w - dot(plane.xyz, rayOrigin.xyz)) / dot(plane.xyz, rayDir.xyz));
++}
++
++float2 vcGetIntersectionWithCloudLayer(
++	in float3 rayOrigin,
++	in float3 rayDir,
++	in float cloudAltitude,
++	in float cloudThickness, 
++	in float sphereRadius,
++	in float3 centerSphere)
++{
++#if !ENABLE_SPHERICAL_CLOUD_LAYER
++	// intersect with cloud layer's bottom and top plane.
++	float4 cloudPlaneBottom = float4(0.0f, 0.0f, 1.0f, cloudAltitude);
++	float4 cloudPlaneTop = float4(0.0f, 0.0f, 1.0f, cloudAltitude + cloudThickness);
++	float tb = vcGetIntersectionPlane(rayOrigin, rayDir, cloudPlaneBottom);
++	float tt = vcGetIntersectionPlane(rayOrigin, rayDir, cloudPlaneTop);
++#else
++	// intersect with the bottom and top of spherical cloud layer.
++	const float2 altitudeLayers = float2(cloudAltitude, cloudAltitude + cloudThickness);
++
++	float2 result0;
++	float2 result1;
++	for(int i = 0; i < 2; ++i)
++	{
++		float r = sphereRadius + altitudeLayers[i];
++		float3 centerToRayOrigin = rayOrigin.xyz - centerSphere;
++		float b = dot(centerToRayOrigin, rayDir);
++		float c = dot(centerToRayOrigin, centerToRayOrigin) - (r * r);
++		float discr = b * b - c;
++		float det = sqrt(discr);
++		float t0 = -b - det;
++		float t1 = -b + det;
++		if((c > 0.0f && b > 0.0f) || (discr < 0.0f))
++		{
++			// no intersection
++			result0[i] = 0.0f;
++			result1[i] = 0.0f;
++		}
++		else
++		{
++			//results[i] = (t0 >= 0.0f && t1 >= 0.0f) ? t0 : t1;
++			result0[i] = max(0.0f, t0);
++			result1[i] = max(0.0f, t1);
++		}
++	}
++
++	float tb;
++	float tt;
++	if(result0.x > 0.0f && result1.x > 0.0f)
++	{
++#if 0
++		tb = result0.x;
++		tt = (result0.y > 0.0f) ? result0.y : result1.y;
++#else
++		tb = result0.x;
++		tt = result0.y;
++#endif
++	}
++	else if(result1.x > 0.0f)
++	{
++		tb = result1.x;
++		tt = result1.y;
++	}
++	else //if(result0.x <= 0.0f && result1.x <= 0.0f)
++	{
++		tb = result0.y;
++		tt = result1.y;
++	}
++#endif
++
++	return float2(tt, tb);
++}
++
++float GetFBM(Texture3D noiseTex, SamplerState noiseSampler, float3 pos, const float maxOctaves, const float frequency, bool turbulence = false)
++{
++	const float normalizationFactorNoise3DTex = 1.66f;
++
++	const float3x3 rot = float3x3(0.0f, 0.8f, 0.6f, -0.8f, 0.36f, -0.48f, -0.6f, -0.48f, 0.64f);
++	pos.xyz = mul(pos.xyz, rot);
++
++	float f = 0.0f;
++	float amplitude = 1.0f;
++	float sum = 0.0f;
++
++	for(float i = 0.0f; i < maxOctaves; ++i)
++	{
++		if(turbulence)
++		{
++			//f += amplitude * (noiseTex.SampleLevel(noiseSampler, pos.xyz, 0.0f).w * 2.0f - 1.0f);
++			f += amplitude * abs((noiseTex.SampleLevel(noiseSampler, pos.xyz, 0.0f).w * 2.0f - 1.0f) * normalizationFactorNoise3DTex);
++		}
++		else
++		{
++			//f += amplitude * (noiseTex.SampleLevel(noiseSampler, pos.xyz, 0.0f).w * 2.0f - 1.0f);
++			f += amplitude * ((noiseTex.SampleLevel(noiseSampler, pos.xyz, 0.0f).w * 2.0f - 1.0f) * normalizationFactorNoise3DTex);
++		}
++		sum += amplitude;
++
++		amplitude *= 0.5f;
++		//amplitude *= 1.0f/frequency;
++
++		pos.xyz = mul(pos.xyz, rot) * frequency;
++		//pos.xyz *= frequency;
++		//frequency += 0.011f;
++	}
++
++	f /= sum;
++
++	return f;
++}
++
++float vcGetCloudBlockerInfluence(in float3 posWS, in float3 posBlocker, in float4 paramBlocker)
++{
++	const float invDecayLength = paramBlocker.x;
++	const float decayStart = paramBlocker.y;
++	const float decayInfluence = paramBlocker.z;
++	const float invDecayInfluence = paramBlocker.w;
++	float t = saturate((length(posBlocker.xyz - posWS.xyz) - decayStart) * invDecayLength);
++	return (t * decayInfluence + invDecayInfluence);
++}
++
++float vcGetAllCloudBlockersInfluence(
++	in float3 posWS,
++	in float4 cloudBlockerPos[4],
++	in float4 cloudBlockerParam[4])
++{
++	int numBlocker = cloudBlockerPos[0].w;
++	float decay = (numBlocker <= 0) ? 1.0f : 0.0f;
++#if 0
++	for(int i = 0; i < numBlocker; ++i)
++	{
++		decay = max(decay, vcGetCloudBlockerInfluence(posWS, cloudBlockerPos[i].xyz, cloudBlockerParam[i]));
++	}
++#else
++	// faster on AMD GPU.
++	decay = max(decay, vcGetCloudBlockerInfluence(posWS, cloudBlockerPos[0].xyz, cloudBlockerParam[0]));
++	[branch] if(numBlocker > 1)
++	{
++		decay = max(decay, vcGetCloudBlockerInfluence(posWS, cloudBlockerPos[1].xyz, cloudBlockerParam[1]));
++	}
++	[branch] if(numBlocker > 2)
++	{
++		decay = max(decay, vcGetCloudBlockerInfluence(posWS, cloudBlockerPos[2].xyz, cloudBlockerParam[2]));
++	}
++	[branch] if(numBlocker > 3)
++	{
++		decay = max(decay, vcGetCloudBlockerInfluence(posWS, cloudBlockerPos[3].xyz, cloudBlockerParam[3]));
++	}
++#endif
++	return decay;
++}
++
++struct CloudGenParam
++{
++	float cloudiness;
++	float altitude;
++	float thickness;
++	float3 noiseSizeScale;
++
++	float3 baseSizeScale;
++	float3 baseOffset;
++	float3 edgeNoiseSizeScale;
++	float2 baseTexRemap;
++	float4 edgeErode;
++	float cloudDensityScale;
++	float additionalNoiseIntensity;
++
++	float4 cloudBlockerPos[4]; // xyz: the center position of the cloud blocker, w: number of blockers
++	float4 cloudBlockerParam[4]; // x: reciprocal of length between decay start and end, y: decay start, z: decay influence, w: one minus decay influence
++
++	Texture3D noiseTex;
++	Texture3D edgeNoiseTex;
++	SamplerState linearWrapSampler;
++};
++
++float GetCloudDensity(in float3 posWS, CloudGenParam param)
++{
++	float3 posCloudSpace = posWS.xyz + param.baseOffset.xyz; // baseOffset.z includes negative altitude.
++	float3 cpos = posCloudSpace * param.noiseSizeScale;
++
++	const float baseTexMin = param.baseTexRemap.x;
++	const float baseTexMax = param.baseTexRemap.y;
++	const float3 erodeNoiseSizeScale = param.edgeNoiseSizeScale;
++	const float edgeTurbulence = param.edgeErode.x;
++	const float edgeThreshold = param.edgeErode.y;
++	const bool bErode = param.edgeErode.z > 0.0f;
++	const bool bAbs = param.edgeErode.w > 0.0f;
++	const float cloudMaxDensityScale = param.cloudDensityScale;
++	const float additionalNoiseIntensity = param.additionalNoiseIntensity;
++
++#ifndef VC_NO_BASE_DENSITY_TEX
++#if %_RT_SAMPLE3
++	float3 tcBase = posCloudSpace.xyz * param.baseSizeScale.xyz;
++	tcBase.xy += 0.5f;
++	float baseTexDensity = CloudBaseDensityTexture.SampleLevel(param.linearWrapSampler, tcBase.xyz, 0.0f).w;
++	float f = smoothstep(baseTexMin, baseTexMax, baseTexDensity);
++
++	const float octaves = 1;
++	const float frequency = 2.71285739f;
++	const float nz = GetFBM(param.noiseTex, param.linearWrapSampler, cpos, octaves, frequency);
++	f = f + saturate(nz) * additionalNoiseIntensity;
++#else
++	const float octaves = 2;
++	const float frequency = 2.71285739f;
++	float f = GetFBM(param.noiseTex, param.linearWrapSampler, cpos, octaves, frequency);
++#endif
++#else
++	const float octaves = 2;
++	const float frequency = 2.71285739f;
++	float f = GetFBM(param.noiseTex, param.linearWrapSampler, cpos, octaves, frequency);
++#endif
++
++	f = saturate(f);
++
++	// height density gradation
++	const float heightVariation = 1.0f;
++	const float th = heightVariation * param.thickness;
++	const float thresholdHeight = th * 0.5f;
++	const float start = (posCloudSpace.z > thresholdHeight) ? th : 0.0f;
++	const float end = (posCloudSpace.z > thresholdHeight) ? th * 0.7f : th * 0.3f;
++	float heightGradient = smoothstep(start, end, posCloudSpace.z);
++	f *= heightGradient;
++
++	// erode cloud's edge or add fine-grained clouds around edge.
++	float erode = GetFBM(param.edgeNoiseTex, param.linearWrapSampler, posCloudSpace * erodeNoiseSizeScale, 1.0f, 2.31285739f, bAbs);
++	const float edgeFactor = saturate(f / edgeThreshold);
++	const float erodeFactor = -(1.0f - edgeFactor) * edgeTurbulence;
++	const float accumFactor = edgeFactor * edgeTurbulence;
++	f += saturate(erode) * (bErode ? erodeFactor : accumFactor);
++
++	f = saturate(f);
++
++	f *= param.cloudiness * param.cloudiness;
++
++	f *= cloudMaxDensityScale;
++
++#ifndef VC_NO_CLOUD_BLOCKERS
++#if %_RT_SAMPLE4
++	// decay cloud density with cloud blocker entity.
++	f *= vcGetAllCloudBlockersInfluence(posWS, param.cloudBlockerPos, param.cloudBlockerParam);
++#endif
++#endif
++
++	return f;
++}
++
++float GetOpticalThickness(in float3 rayOriginWS, in float3 rayDir, in float extinctionCoefficient, 
++	CloudGenParam cloudGenParam, 
++	in uint typeShadow = 0, in float3 invTilingShadowTex = float3(0,0,0), in float2 worldAlignmentOffset = float2(0,0))
++{
++	const float MaxStepRaymarch = 6.0f;
++
++	// intersect with cloud layer's bottom and top plane.
++	float4 cloudPlaneBottom = float4(0.0f, 0.0f, 1.0f, cloudGenParam.altitude);
++	float4 cloudPlaneTop = float4(0.0f, 0.0f, 1.0f, cloudGenParam.altitude + cloudGenParam.thickness);
++	float tb = vcGetIntersectionPlane(rayOriginWS, rayDir, cloudPlaneBottom);
++	float tt = vcGetIntersectionPlane(rayOriginWS, rayDir, cloudPlaneTop);
++
++	float distanceEnd = min(4000.0f, max(tb, tt));
++	float minD = min(tb, tt);
++	float distanceStart = max(minD, 0.0f);
++	float maxStepNum = (distanceStart >= distanceEnd) ? 0.0f : MaxStepRaymarch;
++
++	float transmittance = 1.0f;
++	float opticalThickness = 0.0f;
++	float d = distanceStart;
++	for(float i = 0.0f; i < maxStepNum; ++i)
++	{
++		d = vcGetLinearDepth(i, maxStepNum, distanceStart, distanceEnd);
++		float dNext = vcGetLinearDepth(i + 1, maxStepNum, distanceStart, distanceEnd);
++		float stepSize = dNext - d;
++		float3 posWS = rayDir.xyz * d + rayOriginWS;
++		float density = GetCloudDensity(posWS, cloudGenParam);
++		opticalThickness += extinctionCoefficient * density.x * stepSize;
++	}
++
++	return opticalThickness;
++}
+-- 
+2.47.1.windows.1
+

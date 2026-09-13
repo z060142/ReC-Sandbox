@@ -1,0 +1,1065 @@
+From aba6b745f0a9e933795a6a6bb3a584438519e23e Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Mon, 14 Sep 2026 04:44:45 +0800
+Subject: [PATCH 210/213] feat: real skinning of characters in the software
+ triangle ray tracer (decision 07, stage 3B)
+
+Characters used to reflect in their bind pose: CE 5.7.1 skins on the GPU or, in the vertex
+animation fallback, into a write only discard mapped vertex buffer, and the skin -> skeleton
+bone remap table never left CryAnimation. The data was all there; only the interface was
+missing.
+
+CryAnimation
+- IAttachmentSkin::GetSkinnedVertexCount(lod) and GetSkinnedVertices(lod, pos, norm, tang,
+  capacity), appended at the VERY END of the interface so the vtable only grows at the back and
+  every slot an already compiled module resolved keeps its index. All buffers are owned and
+  sized by the caller - no STL crosses the module boundary.
+- CAttachmentSKIN implements them by driving the very same VertexCommandSkin the software
+  skinning path compiles into its command buffer, with the master character's current
+  SSkinningData::pBoneQuatsS and this attachment's m_arrRemapTable, over the CSoftwareMesh
+  CModelMesh keeps (or lazily builds) for that LOD. Same dual quaternions, same blend, same
+  tangent frame, and the render mesh offset is included exactly as the vertex shader adds it.
+  Returns 0 when the character has no skinning data yet, so the caller can keep an older pose.
+- CAttachmentVCLOTH returns 0: cloth is simulated, not skinned, and has no CPU side result.
+- ca_RTSkinSelfTest: synthetic two bone skin (three quads - identity, 90 deg X, 50-50 blend)
+  through the same function, compared against the analytic transform.
+
+Cry3DEngine
+- The cached per object BVH now optionally keeps the three SOURCE vertex indices per triangle,
+  permuted with the triangles, so a deformed copy can be looked up per vertex.
+- RTUpdateDynamic CPU skins the kept characters nearest first under e_svoTI_RT_SkinMaxTris
+  (new cvar, 30000 triangles per frame), swaps the skinned positions and normals in before the
+  instance matrix and refits the cached topology onto them - no rebuild. A skinned instance
+  takes its world box and quantisation bounds from the refit's exact root box, because an
+  animated pose leaves the bind pose box.
+- Per attachment skinned vertex cache, so an attachment whose skinning data is not ready keeps
+  its last good pose instead of snapping back to the bind pose mid animation.
+- RT dyn: stats line gains "skinned N chars, T K verts, S stale, X.XX ms".
+
+CryAnimation and Cry3DEngine both build Profile with 0 errors / 0 warnings. The engine was not
+run and nothing was deployed.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SCUvWGLCsqzm3VNMzp4uiS
+---
+ Code/CryEngine/Cry3DEngine/SVO/SceneTree.cpp  |   6 +-
+ .../Cry3DEngine/SVO/SceneTreeCVars.inl        |   5 +
+ .../Cry3DEngine/SVO/VoxelSegment.cpp          | 295 ++++++++++++++++--
+ Code/CryEngine/Cry3DEngine/SVO/VoxelSegment.h |   6 +
+ .../CryEngine/CryAnimation/AttachmentSkin.cpp | 285 +++++++++++++++++
+ Code/CryEngine/CryAnimation/AttachmentSkin.h  |   9 +
+ .../CryEngine/CryAnimation/AttachmentVCloth.h |   7 +
+ Code/CryEngine/CryAnimation/cvars.cpp         |   4 +
+ .../CryCommon/CryAnimation/IAttachment.h      |  26 ++
+ 9 files changed, 619 insertions(+), 24 deletions(-)
+
+diff --git a/Code/CryEngine/Cry3DEngine/SVO/SceneTree.cpp b/Code/CryEngine/Cry3DEngine/SVO/SceneTree.cpp
+index b188b88d..23170e1d 100644
+--- a/Code/CryEngine/Cry3DEngine/SVO/SceneTree.cpp
++++ b/Code/CryEngine/Cry3DEngine/SVO/SceneTree.cpp
+@@ -2646,8 +2646,10 @@ void CSvoEnv::RTFormatDynLine(char* szOut, size_t bufSize) const
+ {
+ 	const SRTDynStats& st = m_rtDynStats;
+ 
+-	cry_sprintf(szOut, bufSize, "RT dyn: %d of %d objs, %d K tris, %d records, %d mats, ovf %d, cache %d, water %d tris, %.2f ms",
+-	            st.objs, st.objsFound, st.tris / 1000, st.records, st.mats, st.overflowed, st.cached, st.waterTris, st.ms);
++	cry_sprintf(szOut, bufSize, "RT dyn: %d of %d objs, %d K tris, %d records, %d mats, ovf %d, cache %d, water %d tris, "
++	                            "skinned %d chars, %d K verts, %d stale, %.2f ms, %.2f ms",
++	            st.objs, st.objsFound, st.tris / 1000, st.records, st.mats, st.overflowed, st.cached, st.waterTris,
++	            st.skinnedChars, st.skinnedVerts / 1000, st.skinReused, st.skinMs, st.ms);
+ }
+ 
+ //! Belt and braces for the HUD: print the same two lines to the log once, when a voxelization pass
+diff --git a/Code/CryEngine/Cry3DEngine/SVO/SceneTreeCVars.inl b/Code/CryEngine/Cry3DEngine/SVO/SceneTreeCVars.inl
+index 4654a295..fbc6f23d 100644
+--- a/Code/CryEngine/Cry3DEngine/SVO/SceneTreeCVars.inl
++++ b/Code/CryEngine/Cry3DEngine/SVO/SceneTreeCVars.inl
+@@ -277,6 +277,11 @@ REGISTER_CVAR_AUTO(float, e_svoTI_RT_DynObjDistRatio, 1.f, VF_EXPERIMENTAL, "Con
+ REGISTER_CVAR_AUTO(int, e_svoTI_RT_DynMaxTris, 200000, VF_EXPERIMENTAL, "Triangle budget of the per frame dynamic BVH; objects are added by projected size until it is reached\nThe DYN_MESH pool segment is the harder limit and caps this further");
+ REGISTER_CVAR_AUTO(int, e_svoTI_RT_LodRatio, 1, VF_EXPERIMENTAL, "Controls LOD of movable meshes used for RT\n0 = full detail");
+ 
++// Real skinning of characters in the ray traced reflections (decision 07, stage 3B). The skin mesh is
++// CPU skinned through IAttachmentSkin::GetSkinnedVertices with the current frame's bone transforms and
++// the cached per object BVH is refit onto the result, so a character animates in the reflection.
++REGISTER_CVAR_AUTO(int, e_svoTI_RT_SkinMaxTris, 30000, VF_EXPERIMENTAL, "Per frame CPU skinning budget for ray traced characters, in triangles over all characters\nThe nearest characters are skinned first; once the budget is spent the rest are traced in their bind pose\n0 = no skinning at all (bind pose, the behaviour before stage 3B)");
++
+ // Water surfaces as traceable geometry (rt decision 09 9.4, stage 5C). The ocean plane and the
+ // water volume surfaces are emitted into the per frame dynamic segment, tagged 4 (Water) in the
+ // material record, so a reflection ray sees the water the direct view draws.
+diff --git a/Code/CryEngine/Cry3DEngine/SVO/VoxelSegment.cpp b/Code/CryEngine/Cry3DEngine/SVO/VoxelSegment.cpp
+index b88695d0..e3a9f10f 100644
+--- a/Code/CryEngine/Cry3DEngine/SVO/VoxelSegment.cpp
++++ b/Code/CryEngine/Cry3DEngine/SVO/VoxelSegment.cpp
+@@ -4183,6 +4183,8 @@ struct SRTDynMesh
+ {
+ 	_smart_ptr<IRenderMesh> pRM;      //!< holds a reference, so the cache key pointer can never be recycled
+ 	PodArray<SRTBuildTri>   tris;     //!< local space, permuted into leaf order; matRecord = sub material id
++	PodArray<int>           triVertIds; //!< 3 SOURCE vertex indices per triangle, same permutation as tris; only
++	                                    //!< filled for meshes that can be skinned (rt decision 07, stage 3B)
+ 	PodArray<SRTDynNode>    nodes;    //!< nodes[0] is the root, a child always has a higher index than its parent
+ 	AABB                    localBox;
+ 	int                     depth = 0;
+@@ -4191,6 +4193,22 @@ struct SRTDynMesh
+ 
+ typedef std::map<std::pair<const void*, int>, SRTDynMesh*> TRTDynCache;
+ 
++//! One character skin's CPU skinned vertices for this frame, kept across frames so that a character
++//! whose skinning data is not ready (it has not been submitted to the renderer yet, or its bone job
++//! is still queued) keeps the LAST GOOD pose instead of snapping back to the bind pose.
++//! Keyed by (skin attachment, lod) - two characters sharing one skin asset are two entries, because
++//! two characters in different poses are two different sets of positions.
++struct SRTSkinVerts
++{
++	PodArray<Vec3> pos;                //!< object local, in the skin's own space (the character matrix still applies)
++	PodArray<Vec3> norm;
++	uint           lastUsedFrame = 0;
++	uint           lastSkinnedFrame = 0;  //!< the frame GetSkinnedVertices() was last ATTEMPTED
++	bool           bValid = false;        //!< pos / norm hold a real pose (this frame's or an older one)
++};
++
++typedef std::map<std::pair<const void*, int>, SRTSkinVerts*> TRTSkinCache;
++
+ //! One object instance collected for this frame.
+ struct SRTDynInst
+ {
+@@ -4203,6 +4221,11 @@ struct SRTDynInst
+ 	int         waterMat;    //!< -1 = a normal mesh; else the index of this water surface's ready made material record set (rt decision 09 9.4)
+ 	int         triOfs;      //!< first world space triangle of this instance
+ 	int         boxOfs;      //!< first node box of this instance
++
++	// character skinning (rt decision 07, stage 3B)
++	IAttachmentSkin*    pSkinAtt;  //!< the skin attachment this instance came from, else null
++	int                 skinLod;   //!< the LOD pSkinAtt was resolved at
++	const SRTSkinVerts* pSkin;     //!< the skinned vertices to refit onto, else null (bind pose)
+ };
+ 
+ //! Everything the emitter needs; frame local, main thread only.
+@@ -4221,6 +4244,7 @@ struct SRTDynFrame
+ };
+ 
+ TRTDynCache   g_rtDynCache;
++TRTSkinCache  g_rtSkinCache;
+ PodArray<int> g_rtDynPrevTexSlices;
+ int           g_rtDynPrevRecords = 0;
+ int           g_rtDynPrevMats = 0;
+@@ -4237,7 +4261,7 @@ Vec4 RT_DynQuantBounds(const AABB& box)
+ //! This is the same stream set CE's own SVO triangle collector uses (RenderMeshUtils.cpp
+ //! ProcessBoxIntersection): GetPosPtr / GetUVPtr return float32 caches even for half float vertex
+ //! formats, and the vertex normal comes out of the tangent frame stream.
+-bool RT_ExtractMeshTris(IRenderMesh* pRM, IMaterial* pMat, PodArray<SRTBuildTri>& arrOut, int maxTris)
++bool RT_ExtractMeshTris(IRenderMesh* pRM, IMaterial* pMat, PodArray<SRTBuildTri>& arrOut, int maxTris, PodArray<int>* pVertIdsOut)
+ {
+ 	if (!pRM || pRM->GetVerticesCount() <= 0 || pRM->GetIndicesCount() < 3)
+ 		return false;
+@@ -4331,6 +4355,15 @@ bool RT_ExtractMeshTris(IRenderMesh* pRM, IMaterial* pMat, PodArray<SRTBuildTri>
+ 
+ 				bt.matRecord = matId;   // sub material id here; made an absolute record index per frame
+ 
++				// the three source vertex indices, so a deformed copy of this mesh can be looked up
++				// per vertex later (rt decision 07, stage 3B); kept in step with arrOut exactly
++				if (pVertIdsOut)
++				{
++					pVertIdsOut->Add(I[0]);
++					pVertIdsOut->Add(I[1]);
++					pVertIdsOut->Add(I[2]);
++				}
++
+ 				arrOut.Add(bt);
+ 			}
+ 		}
+@@ -4347,7 +4380,7 @@ bool RT_ExtractMeshTris(IRenderMesh* pRM, IMaterial* pMat, PodArray<SRTBuildTri>
+ 
+ //! Builds the cached topology of one object: the static SAH builder, then the triangles permuted
+ //! into leaf order so a node's (first, count) indexes them directly. Local space, boxes discarded.
+-void RT_BuildDynMeshTopology(PodArray<SRTBuildTri>& arrSrc, SRTDynMesh& out)
++void RT_BuildDynMeshTopology(PodArray<SRTBuildTri>& arrSrc, const PodArray<int>* pVertIds, SRTDynMesh& out)
+ {
+ 	// The top level over the objects and this subtree share the 18 levels the consumer's stack is
+ 	// sized for, so the object build is capped at maxDepth - SVO_RT_DYN_TOP_MAX_DEPTH.
+@@ -4379,6 +4412,20 @@ void RT_BuildDynMeshTopology(PodArray<SRTBuildTri>& arrSrc, SRTDynMesh& out)
+ 	for (int i = 0; i < bld.refs.Count(); i++)
+ 		out.tris.Add(arrSrc[bld.refs[i].triId]);
+ 
++	// the source vertex ids follow the very same permutation, so triVertIds[3 * t + v] always belongs
++	// to tris[t] whatever the builder did with the order
++	if (pVertIds && pVertIds->Count() == arrSrc.Count() * 3)
++	{
++		out.triVertIds.PreAllocate(arrSrc.Count() * 3, 0);
++		for (int i = 0; i < bld.refs.Count(); i++)
++		{
++			const int t = bld.refs[i].triId;
++			out.triVertIds.Add((*pVertIds)[t * 3 + 0]);
++			out.triVertIds.Add((*pVertIds)[t * 3 + 1]);
++			out.triVertIds.Add((*pVertIds)[t * 3 + 2]);
++		}
++	}
++
+ 	out.nodes.PreAllocate(bld.nodes.Count(), 0);
+ 	for (int n = 0; n < bld.nodes.Count(); n++)
+ 	{
+@@ -4401,7 +4448,7 @@ void RT_BuildDynMeshTopology(PodArray<SRTBuildTri>& arrSrc, SRTDynMesh& out)
+ }
+ 
+ //! Builds (or returns) the cached local space BVH of one render mesh.
+-SRTDynMesh* RT_GetDynMesh(IRenderMesh* pRM, IMaterial* pMat, int lod)
++SRTDynMesh* RT_GetDynMesh(IRenderMesh* pRM, IMaterial* pMat, int lod, bool bWantVertIds = false)
+ {
+ 	if (!pRM)
+ 		return nullptr;
+@@ -4412,7 +4459,16 @@ SRTDynMesh* RT_GetDynMesh(IRenderMesh* pRM, IMaterial* pMat, int lod)
+ 	if (it != g_rtDynCache.end())
+ 	{
+ 		it->second->lastUsedFrame = GetCurrPassMainFrameID();
+-		return it->second;
++
++		// an entry built before anything asked for a deformable copy of this mesh has no vertex ids;
++		// rebuilding it once is cheaper than carrying 12 bytes per triangle for every rigid prop
++		const bool bNeedsRebuild = bWantVertIds && it->second->tris.Count() && !it->second->triVertIds.Count();
++
++		if (!bNeedsRebuild)
++			return it->second;
++
++		delete it->second;
++		g_rtDynCache.erase(key);
+ 	}
+ 
+ 	SRTDynMesh* pOut = new SRTDynMesh();
+@@ -4420,11 +4476,12 @@ SRTDynMesh* RT_GetDynMesh(IRenderMesh* pRM, IMaterial* pMat, int lod)
+ 	pOut->lastUsedFrame = GetCurrPassMainFrameID();
+ 
+ 	PodArray<SRTBuildTri> arrSrc;
++	PodArray<int>         arrVertIds;
+ 
+ 	// one object may not eat the whole segment on its own
+ 	const int maxTris = SVO_RT_DYN_MESH_COUNT / 2;
+ 
+-	if (!RT_ExtractMeshTris(pRM, pMat, arrSrc, maxTris))
++	if (!RT_ExtractMeshTris(pRM, pMat, arrSrc, maxTris, bWantVertIds ? &arrVertIds : nullptr))
+ 	{
+ 		// cache the failure too, so a mesh without CPU accessible streams is not retried every frame
+ 		pOut->localBox.Reset();
+@@ -4432,7 +4489,7 @@ SRTDynMesh* RT_GetDynMesh(IRenderMesh* pRM, IMaterial* pMat, int lod)
+ 		return pOut;
+ 	}
+ 
+-	RT_BuildDynMeshTopology(arrSrc, *pOut);
++	RT_BuildDynMeshTopology(arrSrc, bWantVertIds ? &arrVertIds : nullptr, *pOut);
+ 
+ 	g_rtDynCache[key] = pOut;
+ 	return pOut;
+@@ -4457,6 +4514,94 @@ void RT_EvictDynCache()
+ 	}
+ }
+ 
++//! CPU skins one skin attachment's LOD for this frame, or returns the last pose it managed to skin.
++//!
++//! The skinning itself is CryAnimation's - IAttachmentSkin::GetSkinnedVertices() drives the very same
++//! VertexCommandSkin the engine's software skinning path uses, with the character's CURRENT bone dual
++//! quaternions and CryAnimation's own skin -> skeleton remap table. We only own the buffers.
++//!
++//! Returns null when there is nothing usable at all (no CPU mesh, or the character has never been
++//! submitted to the renderer, so no bone transforms exist yet) - the caller then traces the bind pose,
++//! which is where stage 3A left it.
++SRTSkinVerts* RT_GetSkinnedVerts(IAttachmentSkin* pSkinAtt, int lod, int& skinnedCharsOut, int& skinnedVertsOut, int& reusedOut)
++{
++	if (!pSkinAtt)
++		return nullptr;
++
++	const uint                        frameId = GetCurrPassMainFrameID();
++	const std::pair<const void*, int> key(pSkinAtt, lod);
++
++	SRTSkinVerts*          pEntry = nullptr;
++	TRTSkinCache::iterator it = g_rtSkinCache.find(key);
++
++	if (it != g_rtSkinCache.end())
++	{
++		pEntry = it->second;
++	}
++	else
++	{
++		pEntry = new SRTSkinVerts();
++		g_rtSkinCache[key] = pEntry;
++	}
++
++	pEntry->lastUsedFrame = frameId;
++
++	// two instances of one attachment cannot happen, but a second call in the same frame can (the
++	// object is collected twice); skin once per frame and hand the same buffer out again
++	if (pEntry->lastSkinnedFrame == frameId)
++		return pEntry->bValid ? pEntry : nullptr;
++
++	pEntry->lastSkinnedFrame = frameId;
++
++	const uint32 vertexCount = pSkinAtt->GetSkinnedVertexCount((uint32)lod);
++
++	if (!vertexCount)
++		return pEntry->bValid ? pEntry : nullptr;
++
++	// PodArray::PreAllocate reallocates and KEEPS what is there, so a failed attempt below leaves the
++	// previous frame's pose in place instead of a half written one
++	pEntry->pos.PreAllocate((int)vertexCount, (int)vertexCount);
++	pEntry->norm.PreAllocate((int)vertexCount, (int)vertexCount);
++
++	// tangents are not requested: the ray tracer rebuilds the tangent frame from the world space UV
++	// gradient at the hit, so skinning them would be work nobody reads
++	const uint32 written = pSkinAtt->GetSkinnedVertices((uint32)lod, pEntry->pos.GetElements(), pEntry->norm.GetElements(), nullptr, vertexCount);
++
++	if (written == vertexCount)
++	{
++		pEntry->bValid = true;
++		skinnedCharsOut++;
++		skinnedVertsOut += (int)written;
++		return pEntry;
++	}
++
++	// not ready this frame (no skinning data yet, or the pose is still being computed): keep the last
++	// good one rather than snap the reflection back to the bind pose in the middle of an animation
++	if (pEntry->bValid)
++		reusedOut++;
++
++	return pEntry->bValid ? pEntry : nullptr;
++}
++
++//! Same eviction rule as the mesh cache: an attachment nothing referenced for a while is gone.
++void RT_EvictSkinCache()
++{
++	const uint frameId = GetCurrPassMainFrameID();
++
++	for (TRTSkinCache::iterator it = g_rtSkinCache.begin(); it != g_rtSkinCache.end(); )
++	{
++		if (frameId > it->second->lastUsedFrame + 600)
++		{
++			delete it->second;
++			it = g_rtSkinCache.erase(it);
++		}
++		else
++		{
++			++it;
++		}
++	}
++}
++
+ //! Refit: recompute the cached node boxes of one instance bottom up from its transformed triangles.
+ //! A child always has a higher index than its parent (SRTBuilder appends children after the parent),
+ //! so one reverse pass is enough. Recomputing is exact; transforming the cached boxes would not be.
+@@ -4658,10 +4803,11 @@ bool RT_IsDynamicForRT(IRenderNode* pRN)
+ //! One (mesh, material, transform) triple to add to this frame.
+ struct SRTDynSource
+ {
+-	IRenderMesh* pRM;
+-	IMaterial*   pMat;
+-	Matrix34     worldTM;    //!< object (or sub object, or bone) to world; the cache stays local space
+-	int          lod;
++	IRenderMesh*     pRM;
++	IMaterial*       pMat;
++	Matrix34         worldTM;   //!< object (or sub object, or bone) to world; the cache stays local space
++	int              lod;
++	IAttachmentSkin* pSkinAtt;  //!< set only for a skin attachment, so its vertices can be CPU skinned (stage 3B)
+ };
+ 
+ //! Resolves one render node into the meshes it contributes.
+@@ -4682,6 +4828,7 @@ void RT_CollectNodeSources(IRenderNode* pRN, int lodWanted, PodArray<SRTDynSourc
+ 			src.pMat = pNodeMat ? pNodeMat : pChar->GetIMaterial();
+ 			src.worldTM = nodeTM;
+ 			src.lod = 0;
++			src.pSkinAtt = nullptr;
+ 			arrOut.Add(src);
+ 		}
+ 
+@@ -4721,13 +4868,16 @@ void RT_CollectNodeSources(IRenderNode* pRN, int lodWanted, PodArray<SRTDynSourc
+ 					SRTDynSource src;
+ 					src.pRM = pRM;
+ 					src.pMat = pMat;
+-					// STAGE 3A LIMIT: this is the BIND POSE mesh, placed by the character's world
+-					// matrix. CE 5.7.1 skins on the GPU (compute deformation) or, in the CPU
+-					// fallback, straight into a write only dynamic vertex buffer - neither leaves a
+-					// CPU readable skinned position anywhere, and the skin -> skeleton bone remap
+-					// table is private to CryAnimation. See the report for the path to real skinning.
++					// The BIND POSE mesh and its topology, placed by the character's world matrix.
++					// Stage 3B then replaces its vertex POSITIONS per frame with the CPU skinned ones
++					// (IAttachmentSkin::GetSkinnedVertices, see the skinning budget in
++					// RTUpdateDynamic) and refits the cached BVH onto them; the world matrix stays
++					// the character's, exactly as it is for a software skinned character.
++					// Without a skinning budget, or when the character has no skinning data yet, the
++					// bind pose is what gets traced - the stage 3A behaviour.
+ 					src.worldTM = nodeTM;
+ 					src.lod = lod;
++					src.pSkinAtt = pSkinAtt;
+ 					arrOut.Add(src);
+ 				}
+ 				else if (type == IAttachmentObject::eAttachment_StatObj)
+@@ -4756,6 +4906,7 @@ void RT_CollectNodeSources(IRenderNode* pRN, int lodWanted, PodArray<SRTDynSourc
+ 					// bone attachments DO follow the animation - the joint transform is world space
+ 					src.worldTM = Matrix34(pAtt->GetAttWorldAbsolute());
+ 					src.lod = lodWanted;
++					src.pSkinAtt = nullptr;
+ 					arrOut.Add(src);
+ 				}
+ 			}
+@@ -4786,6 +4937,7 @@ void RT_CollectNodeSources(IRenderNode* pRN, int lodWanted, PodArray<SRTDynSourc
+ 		src.pMat = pMat;
+ 		src.worldTM = nodeTM;
+ 		src.lod = lodWanted;
++		src.pSkinAtt = nullptr;
+ 		arrOut.Add(src);
+ 		return;
+ 	}
+@@ -4809,6 +4961,7 @@ void RT_CollectNodeSources(IRenderNode* pRN, int lodWanted, PodArray<SRTDynSourc
+ 		// so two sub objects sharing one render mesh still share one cache entry
+ 		src.worldTM = pSub->bIdentityMatrix ? Matrix34(nodeTM) : (Matrix34(nodeTM) * pSub->localTM);
+ 		src.lod = lodWanted;
++		src.pSkinAtt = nullptr;
+ 		arrOut.Add(src);
+ 	}
+ }
+@@ -5048,7 +5201,7 @@ void RT_CollectWaterSurfaces(const Vec3& camPos, float distCam, float distRay, P
+ 				RT_AddWaterQuad(arrSrc, Vec3(-radius, -radius, 0.f), Vec3(2.f * radius, 0.f, 0.f), Vec3(0.f, 2.f * radius, 0.f), gridDim);
+ 				for (int i = 0; i < arrSrc.Count(); i++)
+ 					RT_NormalizeTriUV(arrSrc[i]);
+-				RT_BuildDynMeshTopology(arrSrc, pEntry->mesh);
++				RT_BuildDynMeshTopology(arrSrc, nullptr, pEntry->mesh);
+ 			}
+ 
+ 			if (SRTDynMesh* pMesh = RT_GetCachedWaterMesh(&g_rtOceanKey))
+@@ -5195,7 +5348,7 @@ void RT_CollectWaterSurfaces(const Vec3& camPos, float distCam, float distRay, P
+ 			}
+ 
+ 			if (arrSrc.Count())
+-				RT_BuildDynMeshTopology(arrSrc, pEntry->mesh);
++				RT_BuildDynMeshTopology(arrSrc, nullptr, pEntry->mesh);
+ 		}
+ 
+ 		SRTDynMesh* pMesh = RT_GetCachedWaterMesh(pRN);
+@@ -5241,6 +5394,11 @@ void CVoxelSegment::RTClearDynamicCache()
+ 		delete it->second;
+ 
+ 	g_rtDynCache.clear();
++
++	for (TRTSkinCache::iterator itS = g_rtSkinCache.begin(); itS != g_rtSkinCache.end(); ++itS)
++		delete itS->second;
++
++	g_rtSkinCache.clear();
+ 	RT_ClearWaterCache();
+ 	g_rtDynPrevTexSlices.Reset();
+ 	g_rtDynPrevRecords = 0;
+@@ -5267,6 +5425,12 @@ void CVoxelSegment::RTUpdateDynamic()
+ 
+ 	const float startTime = GetCurAsyncTimeSec();
+ 
++	// character skinning tallies (rt decision 07, stage 3B)
++	int   skinnedChars = 0;
++	int   skinnedVerts = 0;
++	int   skinReused = 0;
++	float skinMs = 0.f;
++
+ 	SRTDynFrame f;
+ 
+ 	if (bEnabled)
+@@ -5345,6 +5509,9 @@ void CVoxelSegment::RTUpdateDynamic()
+ 				inst.boxOfs = 0;
+ 				inst.worldBox = nodeBox;
+ 				inst.qb = Vec4(0, 0, 0, 1);
++				inst.pSkinAtt = arrSources[s].pSkinAtt;
++				inst.skinLod = arrSources[s].lod;
++				inst.pSkin = nullptr;
+ 				f.insts.Add(inst);
+ 			}
+ 		}
+@@ -5381,7 +5548,8 @@ void CVoxelSegment::RTUpdateDynamic()
+ 			SRTDynInst inst = f.insts[arrOrder[o]];
+ 			const SRTDynSource& src = arrSources[inst.triOfs];
+ 
+-			SRTDynMesh* pMesh = RT_GetDynMesh(src.pRM, src.pMat, src.lod);
++			const bool  bCanSkin = (src.pSkinAtt != nullptr) && (GetCVars()->e_svoTI_RT_SkinMaxTris > 0);
++			SRTDynMesh* pMesh = RT_GetDynMesh(src.pRM, src.pMat, src.lod, bCanSkin);
+ 
+ 			if (!pMesh || !pMesh->tris.Count())
+ 				continue;
+@@ -5450,6 +5618,9 @@ void CVoxelSegment::RTUpdateDynamic()
+ 				inst.boxOfs = 0;
+ 				inst.worldBox = ws.worldBox;
+ 				inst.qb = RT_DynQuantBounds(ws.worldBox);
++				inst.pSkinAtt = nullptr;
++				inst.skinLod = 0;
++				inst.pSkin = nullptr;
+ 
+ 				f.waterMats.Add(ws.matSet);
+ 				arrKept.Add(inst);
+@@ -5459,6 +5630,39 @@ void CVoxelSegment::RTUpdateDynamic()
+ 			}
+ 		}
+ 
++		// ---- CPU skin the kept characters, nearest first, under e_svoTI_RT_SkinMaxTris ----------
++		// arrKept is already in descending projected size order, so the budget naturally spends itself
++		// on the characters that matter most in the picture; the rest keep their bind pose, which is
++		// exactly what stage 3A did for all of them.
++		{
++			const float skinStart = GetCurAsyncTimeSec();
++			const int   skinMaxTris = max(0, GetCVars()->e_svoTI_RT_SkinMaxTris);
++			int         skinTris = 0;
++
++			for (int i = 0; i < arrKept.Count(); i++)
++			{
++				SRTDynInst& inst = arrKept[i];
++
++				if (!inst.pSkinAtt || !inst.pMesh)
++					continue;
++
++				// the cached topology has to carry the source vertex ids, or there is nothing to map
++				// the skinned positions onto
++				if (inst.pMesh->triVertIds.Count() != inst.pMesh->tris.Count() * 3)
++					continue;
++
++				if (skinTris + inst.pMesh->tris.Count() > skinMaxTris)
++					continue;
++
++				inst.pSkin = RT_GetSkinnedVerts(inst.pSkinAtt, inst.skinLod, skinnedChars, skinnedVerts, skinReused);
++
++				if (inst.pSkin)
++					skinTris += inst.pMesh->tris.Count();
++			}
++
++			skinMs = (GetCurAsyncTimeSec() - skinStart) * 1000.f;
++		}
++
+ 		f.insts.Clear();
+ 		f.insts.AddList(arrKept);
+ 
+@@ -5477,6 +5681,14 @@ void CVoxelSegment::RTUpdateDynamic()
+ 			// A water surface brings its own ready made record set (rt decision 09 9.4), appended
+ 			// once per surface and never deduplicated: the ocean and every volume carry their own fog
+ 			// colour and density, so two of them are almost never the same record.
++			// this instance's skinned vertices, when it has any (rt decision 07, stage 3B). The cached
++			// topology is untouched: only the positions and normals a leaf's triangles are built from
++			// change, and the node boxes are recomputed from them by the refit below.
++			const Vec3* pSkinPos = inst.pSkin ? inst.pSkin->pos.GetElements() : nullptr;
++			const Vec3* pSkinNorm = inst.pSkin ? inst.pSkin->norm.GetElements() : nullptr;
++			const int   skinVertCount = inst.pSkin ? inst.pSkin->pos.Count() : 0;
++			const int*  pTriVertIds = (pSkinPos && mesh.triVertIds.Count() == mesh.tris.Count() * 3) ? mesh.triVertIds.GetElements() : nullptr;
++
+ 			int waterRecord = 0;
+ 
+ 			if (inst.waterMat >= 0)
+@@ -5528,6 +5740,24 @@ void CVoxelSegment::RTUpdateDynamic()
+ 					}
+ 				}
+ 
++				// swap the bind pose vertices for this frame's skinned ones, before the instance matrix
++				if (pTriVertIds)
++				{
++					const int i0 = pTriVertIds[t * 3 + 0];
++					const int i1 = pTriVertIds[t * 3 + 1];
++					const int i2 = pTriVertIds[t * 3 + 2];
++
++					if (i0 >= 0 && i1 >= 0 && i2 >= 0 && i0 < skinVertCount && i1 < skinVertCount && i2 < skinVertCount)
++					{
++						bt.v[0] = pSkinPos[i0];
++						bt.v[1] = pSkinPos[i1];
++						bt.v[2] = pSkinPos[i2];
++						bt.n[0] = pSkinNorm[i0];
++						bt.n[1] = pSkinNorm[i1];
++						bt.n[2] = pSkinNorm[i2];
++					}
++				}
++
+ 				for (int v = 0; v < 3; v++)
+ 				{
+ 					bt.v[v] = inst.mat.TransformPoint(bt.v[v]);
+@@ -5549,6 +5779,16 @@ void CVoxelSegment::RTUpdateDynamic()
+ 			}
+ 
+ 			RT_RefitDynInst(f, inst);
++
++			// A deformed mesh leaves its bind pose box: the world box and the quantisation bounds were
++			// derived from the cached LOCAL box in the budget loop, which an animated pose can stick
++			// out of - and a triangle outside qb quantises wrong. The refit has just produced the exact
++			// root box, so take it. Rigid instances keep the corner-transformed box they always had.
++			if (inst.pSkin)
++			{
++				inst.worldBox = f.nodeBoxes[inst.boxOfs];
++				inst.qb = RT_DynQuantBounds(inst.worldBox);
++			}
+ 		}
+ 	}
+ 
+@@ -5637,6 +5877,7 @@ void CVoxelSegment::RTUpdateDynamic()
+ 	g_rtDynPrevTexSlices.AddList(f.texSlices);
+ 
+ 	RT_EvictDynCache();
++	RT_EvictSkinCache();
+ 	RT_EvictWaterCache();
+ 
+ 	gSvoEnv->m_rtDynStats.objs = f.insts.Count();
+@@ -5647,6 +5888,10 @@ void CVoxelSegment::RTUpdateDynamic()
+ 	gSvoEnv->m_rtDynStats.cached = (int)g_rtDynCache.size();
+ 	gSvoEnv->m_rtDynStats.waterObjs = f.waterObjs;
+ 	gSvoEnv->m_rtDynStats.waterTris = f.waterTris;
++	gSvoEnv->m_rtDynStats.skinnedChars = skinnedChars;
++	gSvoEnv->m_rtDynStats.skinnedVerts = skinnedVerts;
++	gSvoEnv->m_rtDynStats.skinReused = skinReused;
++	gSvoEnv->m_rtDynStats.skinMs = skinMs;
+ 	gSvoEnv->m_rtDynStats.ms = (GetCurAsyncTimeSec() - startTime) * 1000.f;
+ }
+ 
+@@ -6336,8 +6581,8 @@ void CVoxelSegment::RunRTSelfTest()
+ 			SAddQuad::Add(arrA, Vec3(-1, -1, 0), Vec3(2, 0, 0), Vec3(0, 2, 0), 5);   // 50 tris
+ 			SAddQuad::Add(arrB, Vec3(-2, -2, 0), Vec3(4, 0, 0), Vec3(0, 4, 0), 3);   // 18 tris
+ 			SAddQuad::Add(arrB, Vec3(-2, -2, 0), Vec3(4, 0, 0), Vec3(0, 0, 3), 3);   // + a wall
+-			RT_BuildDynMeshTopology(arrA, meshA);
+-			RT_BuildDynMeshTopology(arrB, meshB);
++			RT_BuildDynMeshTopology(arrA, nullptr, meshA);
++			RT_BuildDynMeshTopology(arrB, nullptr, meshB);
+ 		}
+ 
+ 		dynTrisTotal = meshA.tris.Count() + meshB.tris.Count();
+@@ -6396,6 +6641,9 @@ void CVoxelSegment::RunRTSelfTest()
+ 				inst.waterMat = -1;
+ 				inst.triOfs = 0;
+ 				inst.boxOfs = 0;
++				inst.pSkinAtt = nullptr;
++				inst.skinLod = 0;
++				inst.pSkin = nullptr;
+ 				inst.worldBox.Reset();
+ 				for (int c = 0; c < 8; c++)
+ 				{
+@@ -6591,8 +6839,8 @@ void CVoxelSegment::RunRTSelfTest()
+ 				RT_NormalizeTriUV(arrO[i]);
+ 			for (int i = 0; i < arrV.Count(); i++)
+ 				RT_NormalizeTriUV(arrV[i]);
+-			RT_BuildDynMeshTopology(arrO, meshOcean);
+-			RT_BuildDynMeshTopology(arrV, meshVol);
++			RT_BuildDynMeshTopology(arrO, nullptr, meshOcean);
++			RT_BuildDynMeshTopology(arrV, nullptr, meshVol);
+ 		}
+ 
+ 		waterTrisTotal = meshOcean.tris.Count() + meshVol.tris.Count();
+@@ -6681,6 +6929,9 @@ void CVoxelSegment::RunRTSelfTest()
+ 			inst.waterMat = i;
+ 			inst.triOfs = 0;
+ 			inst.boxOfs = 0;
++			inst.pSkinAtt = nullptr;
++			inst.skinLod = 0;
++			inst.pSkin = nullptr;
+ 			inst.worldBox.Reset();
+ 			for (int c = 0; c < 8; c++)
+ 			{
+diff --git a/Code/CryEngine/Cry3DEngine/SVO/VoxelSegment.h b/Code/CryEngine/Cry3DEngine/SVO/VoxelSegment.h
+index dbcbb690..e1017736 100644
+--- a/Code/CryEngine/Cry3DEngine/SVO/VoxelSegment.h
++++ b/Code/CryEngine/Cry3DEngine/SVO/VoxelSegment.h
+@@ -110,6 +110,12 @@ struct SRTDynStats
+ 	int   waterObjs;   //!< water surfaces emitted (ocean ring + water volumes, rt decision 09 9.4)
+ 	int   waterTris;   //!< triangles of those water surfaces (a subset of tris)
+ 
++	// character skinning (rt decision 07, stage 3B)
++	int   skinnedChars;//!< skin attachments CPU skinned this frame
++	int   skinnedVerts;//!< vertices those attachments skinned
++	int   skinReused;  //!< attachments that kept an older pose because their skinning data was not ready
++
++	float skinMs;      //!< CPU cost of the skinning alone; part of ms
+ 	float ms;          //!< CPU cost of the last frame
+ };
+ 	
+diff --git a/Code/CryEngine/CryAnimation/AttachmentSkin.cpp b/Code/CryEngine/CryAnimation/AttachmentSkin.cpp
+index 0221fb4c..10c91217 100644
+--- a/Code/CryEngine/CryAnimation/AttachmentSkin.cpp
++++ b/Code/CryEngine/CryAnimation/AttachmentSkin.cpp
+@@ -921,6 +921,291 @@ SSkinningData* CAttachmentSKIN::GetVertexTransformationData(bool useSwSkinningCp
+ 	return pSkinningData;
+ }
+ 
++///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
++// Self test for the CPU skinning path (console command "ca_RTSkinSelfTest").
++//
++// A synthetic two bone skin: three quads of four vertices each, all four corners of a quad bound to
++// the same bone(s). Bone 0 is the identity, bone 1 is a 90 degree rotation about X through the
++// origin. Quad A is bound to bone 0, quad B to bone 1, quad C half to each - so its analytic result
++// is a 45 degree rotation, because the dual quaternion blend of two unit rotations with equal
++// weights normalises to their bisector.
++//
++// The test drives the SAME VertexCommandSkin::Execute() and the SAME tangent decode that
++// GetSkinnedVertices() uses, with the same argument shapes (strided pointers into an array of
++// SSoftwareVertexFormat, which is exactly what CSoftwareMesh hands out), and compares against the
++// analytic transform of every vertex position and normal.
++///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
++
++//! Registered as the console command "ca_RTSkinSelfTest" in cvars.cpp.
++void CryAnimation_RTSkinSelfTest(IConsoleCmdArgs*)
++{
++	const uint32 quadCount = 3;
++	const uint32 vertexCount = quadCount * 4;
++
++	// bone 1: 90 degrees about X, through the origin
++	const Quat  boneRot = Quat::CreateRotationX(gf_PI * 0.5f);
++	const QuatT bones[2] = { QuatT(IDENTITY), QuatT(boneRot, Vec3(ZERO)) };
++
++	DualQuat    boneDQ[2] = { DualQuat(bones[0]), DualQuat(bones[1]) };
++	JointIdType remapTable[2] = { 0, 1 };
++
++	// the analytic rotation each quad's vertices must end up under
++	const Quat quadRot[quadCount] =
++	{
++		Quat(IDENTITY),
++		boneRot,
++		Quat::CreateRotationX(gf_PI * 0.25f)
++	};
++
++	DynArray<SSoftwareVertexFormat> verts;
++	verts.resize(vertexCount);
++
++	for (uint32 q = 0; q < quadCount; q++)
++	{
++		for (uint32 c = 0; c < 4; c++)
++		{
++			SSoftwareVertexFormat& v = verts[q * 4 + c];
++
++			// a unit quad in the XY plane, offset per quad so no two vertices coincide
++			v.position = Vec3((c & 1) ? 1.f : 0.f, (c & 2) ? 1.f : 0.f, (float)q);
++			v.color = 0xffffffff;
++			v.coord = Vec2(0.f, 0.f);
++			v.tangent = Quat(IDENTITY);   // tangent = +X, bitangent = +Y, normal = +Z
++
++			for (uint32 j = 0; j < 8; j++)
++			{
++				v.indices[j] = 0;
++				v.weights[j] = 0;
++			}
++
++			if (q == 0)
++			{
++				v.indices[0] = 0;
++				v.weights[0] = 255;
++			}
++			else if (q == 1)
++			{
++				v.indices[0] = 1;
++				v.weights[0] = 255;
++			}
++			else
++			{
++				v.indices[0] = 0;
++				v.weights[0] = 128;
++				v.indices[1] = 1;
++				v.weights[1] = 128;
++			}
++		}
++	}
++
++	DynArray<Vec3>          positions;
++	DynArray<Vec3>          normals;
++	DynArray<SPipTangents>  tangents;
++	positions.resize(vertexCount);
++	normals.resize(vertexCount);
++	tangents.resize(vertexCount);
++
++	CVertexData vertexData;
++	vertexData.m_vertexCount = vertexCount;
++	vertexData.pPositions = strided_pointer<Vec3>(&positions[0], sizeof(Vec3));
++	vertexData.pTangents = strided_pointer<SPipTangents>(&tangents[0], sizeof(SPipTangents));
++
++	VertexCommandSkin command;
++	command.pTransformations = boneDQ;
++	command.pTransformationRemapTable = remapTable;
++	command.transformationCount = 2;
++	command.pVertexPositions = strided_pointer<const Vec3>(&verts[0].position, sizeof(verts[0]));
++	command.pVertexQTangents = strided_pointer<const Quat>(&verts[0].tangent, sizeof(verts[0]));
++	command.pVertexTransformIndices = strided_pointer<const SoftwareVertexBlendIndex>(&verts[0].indices[0], sizeof(verts[0]));
++	command.pVertexTransformWeights = strided_pointer<const SoftwareVertexBlendWeight>(&verts[0].weights[0], sizeof(verts[0]));
++	command.vertexTransformCount = 4;
++
++	VertexCommandSkin::Execute(command, vertexData);
++
++	for (uint32 i = 0; i < vertexCount; ++i)
++	{
++		Vec4 tng, btg;
++		tangents[i].GetTB(tng, btg);
++		normals[i] = Vec3(tng.x, tng.y, tng.z).Cross(Vec3(btg.x, btg.y, btg.z)) * tng.w;
++	}
++
++	// positions are plain floats; normals come back through an 8 bit snorm tangent frame
++	const float posEps = 1e-4f;
++	const float normEps = 2e-2f;
++
++	int posMismatches = 0;
++	int normMismatches = 0;
++	float maxPosErr = 0.f;
++	float maxNormErr = 0.f;
++
++	for (uint32 q = 0; q < quadCount; q++)
++	{
++		for (uint32 c = 0; c < 4; c++)
++		{
++			const uint32 i = q * 4 + c;
++
++			const Vec3 wantPos = quadRot[q] * verts[i].position;
++			const Vec3 wantNorm = quadRot[q] * Vec3(0.f, 0.f, 1.f);
++
++			const float posErr = (positions[i] - wantPos).GetLength();
++			const float normErr = (normals[i] - wantNorm).GetLength();
++
++			maxPosErr = max(maxPosErr, posErr);
++			maxNormErr = max(maxNormErr, normErr);
++
++			if (posErr > posEps)
++				posMismatches++;
++			if (normErr > normEps)
++				normMismatches++;
++		}
++	}
++
++	const bool bPassed = (posMismatches == 0) && (normMismatches == 0);
++
++	CryLogAlways("RT self test: skinning - 2 bones, %u verts in %u quads (identity / 90 deg X / 50-50 blend); "
++	             "position mismatches = %d, normal mismatches = %d (must be 0); max err pos %.2e, norm %.2e - %s",
++	             vertexCount, quadCount, posMismatches, normMismatches, maxPosErr, maxNormErr,
++	             bPassed ? "PASSED" : "FAILED");
++}
++
++///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
++// CPU readable skinned geometry (ReC, rt stage 3B)
++//
++// CE 5.7.1 skins either in a compute shader (the CPU never sees a result) or, in the vertex animation
++// fallback, straight into a write only discard mapped vertex buffer. Neither leaves a CPU readable
++// skinned position anywhere, and the skin -> skeleton bone remap table never leaves CryAnimation.
++// The data is all there; only the interface was missing.
++//
++// This is deliberately NOT a second skinning implementation: it drives VertexCommandSkin - the exact
++// command the software skinning path compiles into its command buffer - with the master character's
++// current SSkinningData::pBoneQuatsS and this attachment's m_arrRemapTable, over the CSoftwareMesh
++// CModelMesh already keeps (or lazily builds) for the requested LOD. Same dual quaternions, same
++// blend, same tangent frame maths as a software skinned character.
++///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
++
++uint32 CAttachmentSKIN::GetSkinnedVertexCount(uint32 lod)
++{
++	if (!m_pModelSkin)
++		return 0;
++
++	const CModelMesh* pModelMesh = m_pModelSkin->GetModelMesh(lod);
++
++	if (!pModelMesh || !pModelMesh->m_pIRenderMesh)
++		return 0;
++
++	// CSoftwareMesh::Create() allocates exactly renderMesh.GetVerticesCount() vertices, so this is the
++	// count GetSkinnedVertices() will write without having to build the software mesh first.
++	const int count = pModelMesh->m_pIRenderMesh->GetVerticesCount();
++
++	return (count > 0) ? (uint32)count : 0;
++}
++
++uint32 CAttachmentSKIN::GetSkinnedVertices(uint32 lod, Vec3* pPositions, Vec3* pNormals, Vec4* pTangents, uint32 capacity)
++{
++	DEFINE_PROFILER_FUNCTION();
++
++	if (!pPositions || !m_pModelSkin || !m_pAttachmentManager)
++		return 0;
++
++	CCharInstance* pMaster = m_pAttachmentManager->m_pSkelInstance;
++
++	if (!pMaster)
++		return 0;
++
++	CModelMesh* pModelMesh = m_pModelSkin->GetModelMesh(lod);
++
++	if (!pModelMesh || !pModelMesh->m_pIRenderMesh)
++		return 0;
++
++	// lazily builds the CPU side copy of this LOD (positions, QTangents, blend indices and weights);
++	// a no-op once it exists, and the very same buffer the software skinning path reads
++	if (!pModelMesh->InitSWSkinBuffer())
++		return 0;
++
++	const CSoftwareMesh& geometry = pModelMesh->m_softwareMesh;
++	const uint32         vertexCount = geometry.GetVertexCount();
++
++	if (!vertexCount || vertexCount > capacity)
++		return 0;
++
++	// The newest skinning data the renderer still holds: this frame's if the character has already
++	// been submitted, otherwise one of the two previous frames'. This is the same three slot scan
++	// GetRandomPoints() uses. A character that has never been rendered has none at all, and the
++	// caller is told so (0) rather than being handed a bind pose.
++	SSkinningData* pSkinningData = nullptr;
++
++	const int nFrameID = gEnv->pRenderer ? gEnv->pRenderer->EF_GetSkinningPoolID() : 0;
++
++	for (int n = 0; n < 3; n++)
++	{
++		const int nList = (nFrameID - n) % 3;
++
++		if (pMaster->arrSkinningRendererData[nList].nFrameID == nFrameID - n)
++		{
++			pSkinningData = pMaster->arrSkinningRendererData[nList].pSkinningData;
++			break;
++		}
++	}
++
++	if (!pSkinningData || !pSkinningData->pBoneQuatsS)
++		return 0;
++
++	// the bone transforms are produced by an async job; the render path waits on the same handle
++	if (pSkinningData->pAsyncJobs)
++		gEnv->pJobManager->WaitForJob(*pSkinningData->pAsyncJobs);
++
++	if (m_arrRemapTable.empty())
++		return 0;
++
++	const uint32 transformationCount = std::min<uint32>((uint32)m_arrRemapTable.size(), pSkinningData->nNumBones);
++
++	if (!transformationCount || transformationCount > MAX_JOINT_AMOUNT)
++		return 0;
++
++	// VertexCommandSkin always writes a tangent frame, so it needs a destination even when the caller
++	// only asked for positions. This scratch buffer is a member and never crosses a module boundary.
++	if ((uint32)m_skinnedVertexTangents.size() < vertexCount)
++		m_skinnedVertexTangents.resize(vertexCount);
++
++	CVertexData vertexData;
++	vertexData.m_vertexCount = vertexCount;
++	vertexData.pPositions = strided_pointer<Vec3>(pPositions, sizeof(Vec3));
++	vertexData.pTangents = strided_pointer<SPipTangents>(&m_skinnedVertexTangents[0], sizeof(SPipTangents));
++	// velocities and previous positions stay null: VertexCommandSkin then runs its cheapest variant
++
++	VertexCommandSkin command;
++	command.pTransformations = pSkinningData->pBoneQuatsS;
++	command.pTransformationRemapTable = &m_arrRemapTable[0];
++	command.transformationCount = transformationCount;
++	command.pVertexPositions = geometry.GetPositions();
++	command.pVertexQTangents = geometry.GetTangents();
++	command.pVertexTransformIndices = geometry.GetBlendIndices();
++	command.pVertexTransformWeights = geometry.GetBlendWeights();
++	command.vertexTransformCount = geometry.GetBlendCount();
++
++	VertexCommandSkin::Execute(command, vertexData);
++
++	// Decode the tangent frame the command produced. The normal is the third basis vector, exactly as
++	// SPipTangents::GetN() forms it, which is also how the ray tracer reads a static mesh's normals -
++	// so a skinned vertex and a rigid one are quantised the same way.
++	if (pNormals || pTangents)
++	{
++		for (uint32 i = 0; i < vertexCount; ++i)
++		{
++			Vec4 tng, btg;
++			m_skinnedVertexTangents[i].GetTB(tng, btg);
++
++			if (pNormals)
++				pNormals[i] = Vec3(tng.x, tng.y, tng.z).Cross(Vec3(btg.x, btg.y, btg.z)) * tng.w;
++
++			if (pTangents)
++				pTangents[i] = tng;
++		}
++	}
++
++	return vertexCount;
++}
++
+ SMeshLodInfo CAttachmentSKIN::ComputeGeometricMean() const
+ {
+ 	SMeshLodInfo lodInfo;
+diff --git a/Code/CryEngine/CryAnimation/AttachmentSkin.h b/Code/CryEngine/CryAnimation/AttachmentSkin.h
+index 3dd8fbf8..a80b61bc 100644
+--- a/Code/CryEngine/CryAnimation/AttachmentSkin.h
++++ b/Code/CryEngine/CryAnimation/AttachmentSkin.h
+@@ -108,6 +108,10 @@ public:
+ 	virtual void              GetRandomPoints(Array<PosNorm> points, CRndGen& seed, EGeomForm eForm) const override;
+ 	virtual SMeshLodInfo      ComputeGeometricMean() const override;
+ 
++	// CPU readable skinned geometry (ReC, rt stage 3B) - see IAttachment.h for the contract.
++	virtual uint32            GetSkinnedVertexCount(uint32 lod) override;
++	virtual uint32            GetSkinnedVertices(uint32 lod, Vec3* pPositions, Vec3* pNormals, Vec4* pTangents, uint32 capacity) override;
++
+ 	int                       GetGuid() const;
+ 
+ 	//---------------------------------------------------------
+@@ -122,6 +126,11 @@ public:
+ 	// history for skinning data, needed for motion blur
+ 	struct { SSkinningData* pSkinningData; int nFrameID; } m_arrSkinningRendererData[3]; // triple buffered for motion blur
+ 
++	//! Scratch tangent frames for GetSkinnedVertices(). VertexCommandSkin always writes a tangent
++	//! frame, so one is needed even when the caller only asked for positions; keeping it here means
++	//! the per frame cost is a loop over the vertices and nothing else.
++	DynArray<SPipTangents>  m_skinnedVertexTangents;
++
+ private:
+ 	// function to keep in sync ref counts on skins and cleanup of remap tables
+ 	void ReleaseModelSkin();
+diff --git a/Code/CryEngine/CryAnimation/AttachmentVCloth.h b/Code/CryEngine/CryAnimation/AttachmentVCloth.h
+index 8390efc2..4e79404d 100644
+--- a/Code/CryEngine/CryAnimation/AttachmentVCloth.h
++++ b/Code/CryEngine/CryAnimation/AttachmentVCloth.h
+@@ -766,6 +766,13 @@ public:
+ 	virtual void              GetRandomPoints(Array<PosNorm> points, CRndGen& seed, EGeomForm eForm) const override;
+ 	virtual SMeshLodInfo      ComputeGeometricMean() const override;
+ 
++	// CPU readable skinned geometry (ReC, rt stage 3B). Cloth is simulated, not skinned: the
++	// simulation result lives in the renderer's compute skinning buffers and there is no CPU side
++	// deformed copy to hand out, so this attachment reports "nothing available" and its consumers
++	// (the ray tracer) keep tracing the bind pose cloth. See the 05d report.
++	virtual uint32            GetSkinnedVertexCount(uint32 lod) override                                                            { return 0; }
++	virtual uint32            GetSkinnedVertices(uint32 lod, Vec3* pPositions, Vec3* pNormals, Vec4* pTangents, uint32 capacity) override { return 0; }
++
+ 	int                       GetGuid() const;
+ 
+ 	DynArray<JointIdType>   m_arrRemapTable;    //!< maps skin's bone indices to skeleton's bone indices
+diff --git a/Code/CryEngine/CryAnimation/cvars.cpp b/Code/CryEngine/CryAnimation/cvars.cpp
+index 8528b26b..c6393a1a 100644
+--- a/Code/CryEngine/CryAnimation/cvars.cpp
++++ b/Code/CryEngine/CryAnimation/cvars.cpp
+@@ -4,6 +4,9 @@
+ #include "cvars.h"
+ #include <CrySerialization/Enum.h>
+ 
++//! Implemented in AttachmentSkin.cpp - the CPU skinning self test (ca_RTSkinSelfTest).
++void CryAnimation_RTSkinSelfTest(IConsoleCmdArgs*);
++
+ //need global var as the singleton approach is too expensive
+ Console g_Consoleself;
+ namespace
+@@ -151,6 +154,7 @@ void Console::Init()
+ 	DefineConstIntCVar(ca_DebugSWSkinning, 0, VF_CHEAT | VF_DUMPTODISK, "if this is 1, then we will see a green wireframe on top of software skinned meshes");
+ 	DefineConstIntCVar(ca_DebugAnimMemTracking, 0, VF_CHEAT | VF_DUMPTODISK, "if this is 1, then its shows the anim-key allocations");
+ 	REGISTER_COMMAND("ca_DebugText", (ConsoleCommandFunc)CADebugText, VF_CHEAT | VF_DUMPTODISK, "if this is 1, it will print some debug text on the screen\nif you give a file path or part of it instead, only the info for that character will appear");
++	REGISTER_COMMAND("ca_RTSkinSelfTest", (ConsoleCommandFunc)CryAnimation_RTSkinSelfTest, VF_CHEAT, "runs the CPU skinning self test of IAttachmentSkin::GetSkinnedVertices (synthetic two bone skin, analytic comparison) and logs the result");
+ 	ca_DebugTextLayer = 0xffffffff;
+ 	DefineConstIntCVar(ca_DebugCommandBuffer, 0, VF_CHEAT | VF_DUMPTODISK, "if this is 1, it will print the amount of commands for the blend-buffer");
+ 	DefineConstIntCVar(ca_DebugAnimationStreaming, 0, VF_CHEAT | VF_DUMPTODISK, "if this is 1, then it shows what animations are streamed in");
+diff --git a/Code/CryEngine/CryCommon/CryAnimation/IAttachment.h b/Code/CryEngine/CryCommon/CryAnimation/IAttachment.h
+index 338748a9..7529f6c6 100644
+--- a/Code/CryEngine/CryCommon/CryAnimation/IAttachment.h
++++ b/Code/CryEngine/CryCommon/CryAnimation/IAttachment.h
+@@ -547,6 +547,32 @@ struct IAttachmentSkin
+ 	virtual void TriggerMeshStreaming(uint32 nDesiredRenderLOD, const SRenderingPassInfo& passInfo) = 0;
+ 	virtual void DrawWireframeStatic(const Matrix34& m34, int nLOD, uint32 color) = 0;
+ #endif
++
++	// CPU readable skinned geometry (ReC, rt stage 3B).
++	//
++	// These two are deliberately declared at the VERY END of the interface, after the destructor and
++	// after the EDITOR_PCDEBUGCODE block, so that every slot an already compiled module resolved
++	// against the previous header keeps its index: the vtable only grows at the back. CryAnimation is
++	// the only module that implements IAttachmentSkin (CAttachmentSKIN and CAttachmentVCLOTH); every
++	// other module is a caller, and a caller that never calls the new methods is unaffected.
++
++	//! Number of vertices GetSkinnedVertices() writes for this LOD, 0 if the LOD has no usable mesh.
++	//! Cheap: it does not touch the skinning data and does not build any CPU side buffer.
++	virtual uint32 GetSkinnedVertexCount(uint32 lod) = 0;
++
++	//! CPU skins this attachment's LOD with the CURRENT frame's bone transforms, through the very same
++	//! dual quaternion path the engine's own software skinning uses, so the result matches what the GPU
++	//! computes for the same pose.
++	//!
++	//! Every buffer is owned and sized by the CALLER - no STL container ever crosses the module
++	//! boundary. pPositions is mandatory; pNormals and pTangents may be null when they are not needed
++	//! (pTangents is xyz = tangent, w = the +-1 bitangent sign). capacity is the number of VERTICES the
++	//! buffers hold and must be at least GetSkinnedVertexCount(lod).
++	//!
++	//! eturn the number of vertices written, or 0 when nothing could be produced - in particular when
++	//! the character has no skinning data yet this frame. The caller should then keep whatever it
++	//! computed on a previous frame rather than fall back to the bind pose mid animation.
++	virtual uint32 GetSkinnedVertices(uint32 lod, Vec3* pPositions, Vec3* pNormals, Vec4* pTangents, uint32 capacity) = 0;
+ };
+ 
+ //! Represents an instance of an attachment on a character, managing the updating of the contained object (for example an IStatObj).
+-- 
+2.47.1.windows.1
+

@@ -1,0 +1,187 @@
+From 0d10aeda925cc1a7f70b42edf5d777e8d4e66d33 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Mon, 14 Sep 2026 01:08:20 +0800
+Subject: [PATCH 193/213] fix: the ray traced hit gets the material's gloss
+ map, not just its scalar
+
+CE ships _ddna as BC5U, DXTDecompress sets sourceChannels = 2 for it and
+DXTDecompressRow writes a literal 255 into alpha, so the atlas normal slice's
+alpha was a constant 1.0 for every material in the level and the hit's
+smoothness collapsed to the material scalar - flat across every texel, while
+the same surface seen directly is modulated per texel (report 02d section 3).
+
+CE's gloss is a separate texture: Illum.cfx GetSurfaceAttributes computes
+    attribs.Smoothness = MatSpecColor.w * GetSmoothnessTex(smoothnessTex, tc)
+and GetSmoothnessTex returns the map's .r - a multiply, not a replace, and
+Terrain.cfx and Vegetation.cfx use the identical product. The consumer already
+forms matInfo1.z * saturate(vNor.w) with matInfo1.z = MatSpecColor.w, so only
+vNor.w was missing a real value.
+
+CheckStoreTextureInPool's EFTT_NORMALS branch now fetches the material's
+EFTT_SMOOTHNESS low-res copy through the same GetLowResSystemCopy path and size
+snapping as every other layer and writes its red channel into the slice's alpha,
+nearest-resampled by the new RT_ResampleIndex when the two copies snapped to
+different sizes. With no gloss map the alpha stays 255, so the result degrades
+to the scalar, i.e. to exactly the previous picture. No record change, no extra
+atlas slice, no shader change.
+
+e_svoTI_RT_SelfTest gains a gloss resample check (4 size pairs: in range,
+monotonic, and the last destination texel maps to the last source texel when the
+source is not finer than the destination) and the verdict now requires it.
+e_svoTI_RT_Debug's help string spells out mode 0, the magenta markers of modes 5
+and 10, and that mode 11 is no longer flat per material.
+
+Known: the atlas dedupe key is the normal texture, so two materials sharing one
+normal map but not one gloss map share the first one's gloss, and a material
+with a gloss map but no normal map still gets the scalar. Route 2 of report 02d
+(a fifth atlas layer) is the escape hatch if either shows up.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SCUvWGLCsqzm3VNMzp4uiS
+---
+ .../Cry3DEngine/SVO/SceneTreeCVars.inl        |  2 +-
+ .../Cry3DEngine/SVO/VoxelSegment.cpp          | 87 ++++++++++++++++++-
+ 2 files changed, 86 insertions(+), 3 deletions(-)
+
+diff --git a/Code/CryEngine/Cry3DEngine/SVO/SceneTreeCVars.inl b/Code/CryEngine/Cry3DEngine/SVO/SceneTreeCVars.inl
+index 2fb48c48..43f49ba6 100644
+--- a/Code/CryEngine/Cry3DEngine/SVO/SceneTreeCVars.inl
++++ b/Code/CryEngine/Cry3DEngine/SVO/SceneTreeCVars.inl
+@@ -256,7 +256,7 @@ REGISTER_CVAR_AUTO(float, e_svoTI_RT_SafetyBorder, 0.25f, VF_EXPERIMENTAL, "DEPR
+ 
+ // Static BVH mesh ray tracing (decisions 02-05)
+ REGISTER_CVAR_AUTO(int, e_svoTI_RT_StaticBVH, 1, VF_EXPERIMENTAL, "Build and trace one static BVH per SVO cell\n0 = voxel cone tracing only");
+-REGISTER_CVAR_AUTO(int, e_svoTI_RT_Debug, 0, VF_EXPERIMENTAL, "Mesh ray tracing debug views\n1 = hit test count heat map\n2 = hit normals\n3 = hit albedo\n4 = hit distance\n5 = incomplete/overflow mask\n6 = stage-1 provisional colour (no light data)\n7 = sun shadow at the hit (white = lit)\n8 = direct light at the hit, before probes\n9 = raw shade output, before fog and exposure\n10 = raw atlas normal at the hit (magenta = no normal slot)\n11 = hit smoothness\n12 = hit reflectance (F0, x8)");
++REGISTER_CVAR_AUTO(int, e_svoTI_RT_Debug, 0, VF_EXPERIMENTAL, "Mesh ray tracing debug views\n0 = off\n1 = hit test count heat map (blue = few, red = many)\n2 = hit normals\n3 = hit albedo\n4 = hit distance\n5 = incomplete/overflow mask (magenta = the traversal stack ran out)\n6 = stage-1 provisional colour (no light data)\n7 = sun shadow at the hit (white = lit)\n8 = direct light at the hit, before probes\n9 = raw shade output, before fog and exposure\n10 = raw atlas normal at the hit, tangent space (magenta = no normal slot, flat lilac = no normal map)\n11 = hit smoothness (black = rough, white = mirror; modulated by the material gloss map, no longer flat per material)\n12 = hit reflectance F0, x8 (black = the material record really carries no reflectance)");
+ REGISTER_CVAR_AUTO(float, e_svoTI_RT_NormalsFading, 0, VF_EXPERIMENTAL, "Fade ray traced reflections into flat normals, in metres; 0 = off (normal maps at any distance)\nApplies to both the reflecting surface (a normal mapped mirror otherwise prints its detail map into the reflection) and to the hit's own normal map");
+ REGISTER_CVAR_AUTO(int, e_svoTI_RT_TriPoolXY, 256, VF_EXPERIMENTAL, "XY size of the BVH node/triangle record pool texture (power of two, multiple of 4)");
+ REGISTER_CVAR_AUTO(int, e_svoTI_RT_TriPoolZ, 64, VF_EXPERIMENTAL, "Z size of the BVH node/triangle record pool texture");
+diff --git a/Code/CryEngine/Cry3DEngine/SVO/VoxelSegment.cpp b/Code/CryEngine/Cry3DEngine/SVO/VoxelSegment.cpp
+index 16345148..f15ea835 100644
+--- a/Code/CryEngine/Cry3DEngine/SVO/VoxelSegment.cpp
++++ b/Code/CryEngine/Cry3DEngine/SVO/VoxelSegment.cpp
+@@ -3245,6 +3245,16 @@ bool CVoxelSegment::BuildStaticBVHRecords(const PodArray<SRTBuildTri>& arrTris,
+ // Mesh ray tracing - material texture atlas (rt decision 04)
+ ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+ 
++//! Nearest neighbour index when a source map of another size is written into a dst of dstSize.
++//! Factored out (and self tested) because getting it wrong shifts a whole gloss map by half a texel.
++static ILINE int RT_ResampleIndex(int dst, int dstSize, int srcSize)
++{
++	if (srcSize == dstSize || dstSize <= 0)
++		return CLAMP(dst, 0, max(0, srcSize - 1));
++
++	return CLAMP((int)(((int64)dst * srcSize) / dstSize), 0, max(0, srcSize - 1));
++}
++
+ //! Copies one low resolution texture into a free atlas slice (or reuses the one it already owns)
+ //! and returns the 1 based slice id the material record stores; 0 means "no texture".
+ int CVoxelSegment::CheckStoreTextureInPool(SShaderItem* pShItem, EEfResTextures texSlot, uint16& nTexW, uint16& nTexH, PodArray<int>& arrTexSlicesOut)
+@@ -3310,6 +3320,41 @@ int CVoxelSegment::CheckStoreTextureInPool(SShaderItem* pShItem, EEfResTextures
+ 
+ 		ColorB* pDst = gSvoEnv->m_arrRTPoolTexs.GetElements() + (size_t)newSlice * maxTexSizeXY * maxTexSizeXY;
+ 
++		// Gloss at a ray traced hit (report 02d 3, route 1). CE ships _ddna as BC5U and
++		// DXTDecompressRow writes a LITERAL 255 into alpha for a <= 3 channel source
++		// (Renderer.cpp), so this slice's alpha carried no smoothness at all and the hit only ever
++		// saw the material's scalar. CE's real gloss is a separate texture: Illum.cfx
++		// GetSurfaceAttributes (:479) computes
++		//     attribs.Smoothness = MatSpecColor.w * GetSmoothnessTex(smoothnessTex, baseTC)
++		// and GetSmoothnessTex (Common.cfi:146) returns the map's .r - a MULTIPLY, not a replace.
++		// The consumer already forms matInfo1.z * saturate(vNor.w) with matInfo1.z = MatSpecColor.w,
++		// so writing the smoothness map's red channel into this alpha reproduces the primary
++		// surface exactly, and 255 (no map) degrades to the scalar, i.e. to today's behaviour.
++		// Terrain.cfx and Vegetation.cfx use the same product, so this holds for them too.
++		const ColorB* pSmoothSrc = nullptr;
++		uint16        smoothW = 0, smoothH = 0;
++
++		if (texSlot == EFTT_NORMALS && pShItem && pShItem->m_pShaderResources)
++		{
++			if (SEfResTexture* pSmoothResTex = pShItem->m_pShaderResources->GetTexture(EFTT_SMOOTHNESS))
++			{
++				if (ITexture* pSmoothITex = pSmoothResTex->m_Sampler.m_pITex)
++				{
++					{
++						AUTO_MODIFYLOCK(m_arrLockedTextures.m_Lock);
++						m_arrLockedTextures[pSmoothITex] = pSmoothITex;
++					}
++
++					int* pSmoothSlotId = nullptr;
++					pSmoothSrc = pSmoothITex->GetLowResSystemCopy(smoothW, smoothH, &pSmoothSlotId, maxTexSizeXY);
++
++					// no slice is allocated for it - it only donates one channel to this one
++					if (!smoothW || !smoothH)
++						pSmoothSrc = nullptr;
++				}
++			}
++		}
++
+ 		for (int lineId = 0; lineId < nTexH; lineId++)
+ 		{
+ 			const ColorB* pSrcLine = pTexRgbOr + lineId * nTexW;
+@@ -3328,7 +3373,12 @@ int CVoxelSegment::CheckStoreTextureInPool(SShaderItem* pShItem, EEfResTextures
+ 					pDstLine[x].r = pSrcLine[x].r;
+ 					pDstLine[x].g = pSrcLine[x].g;
+ 					pDstLine[x].b = SATURATEB((int)(nz * 127.5f + 127.5f));
+-					pDstLine[x].a = pSrcLine[x].a;   // smoothness; 255 when the source carries none
++
++					// the gloss map's red, resampled if the two low res copies snapped to
++					// different sizes; 255 (no map) leaves the consumer with the scalar alone
++					pDstLine[x].a = pSmoothSrc
++					                ? pSmoothSrc[(size_t)RT_ResampleIndex(lineId, nTexH, smoothH) * smoothW + RT_ResampleIndex(x, nTexW, smoothW)].r
++					                : (uint8)255;
+ 				}
+ 			}
+ 			else if (texSlot == EFTT_EMITTANCE)
+@@ -5208,6 +5258,39 @@ void CVoxelSegment::RunRTSelfTest()
+ 
+ 	PrintMessage("RT self test: material records - 6 cases, specular/emissive slot round trip mismatches = %d (must be 0)", matMismatches);
+ 
++	// ---- gloss resample (report 02d route 1: the gloss map donates the normal slice's alpha) -----
++	// Nothing here needs a texture: what can silently go wrong is the index math that writes a
++	// smoothness copy of one size into a normal copy of another, so that is what is checked.
++	int resampleMismatches = 0;
++	{
++		const int kCases[4][2] = { { 256, 256 }, { 256, 128 }, { 128, 256 }, { 64, 256 } };
++
++		for (int c = 0; c < 4; c++)
++		{
++			const int dstSize = kCases[c][0], srcSize = kCases[c][1];
++
++			int prev = -1;
++			for (int i = 0; i < dstSize; i++)
++			{
++				const int v = RT_ResampleIndex(i, dstSize, srcSize);
++
++				if (v < 0 || v >= srcSize || v < prev)   // in range and monotonic
++					resampleMismatches++;
++
++				prev = v;
++			}
++
++			if (RT_ResampleIndex(0, dstSize, srcSize) != 0)
++				resampleMismatches++;
++
++			// when the source is not finer than the destination the last texel must be the last one
++			if (srcSize <= dstSize && RT_ResampleIndex(dstSize - 1, dstSize, srcSize) != srcSize - 1)
++				resampleMismatches++;
++		}
++	}
++
++	PrintMessage("RT self test: gloss resample - 4 size pairs, out of range / non monotonic / wrong end texel = %d (must be 0)", resampleMismatches);
++
+ 	// ---- dynamic two level tree (stage 3A) ------------------------------------------------------
+ 	// Two cached objects with different transforms, flattened under a median split top level and
+ 	// traced through THE WRITTEN RECORDS; then a second frame with one object moved, its records
+@@ -5460,7 +5543,7 @@ void CVoxelSegment::RunRTSelfTest()
+ 
+ 
+ 
+-	if (mismatchVsDecoded == 0 && overflowCount == 0 && matMismatches == 0 && dynMismatches == 0 && dynOverflows == 0 && dynStaleTexels == 0)
++	if (mismatchVsDecoded == 0 && overflowCount == 0 && matMismatches == 0 && resampleMismatches == 0 && dynMismatches == 0 && dynOverflows == 0 && dynStaleTexels == 0)
+ 		PrintMessage("RT self test: PASSED");
+ 	else
+ 		PrintMessage("RT self test: FAILED");
+-- 
+2.47.1.windows.1
+

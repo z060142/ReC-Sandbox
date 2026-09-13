@@ -1,0 +1,264 @@
+From b3adf150664e0f88193e3e561bf3a36252897a58 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Mon, 14 Sep 2026 04:34:23 +0800
+Subject: [PATCH 208/213] feat: ShadePS shades a ray traced hit by its material
+ type - vegetation, skin, glass, water (decision 10)
+
+The hit shading had one branch: CE's standard opaque forward lobe, plus a grey 0.5 transmittance
+for anything whose ALD.w sign said "vegetation". The HITMAT lane now carries the real tag and the
+real per type parameters, so each type takes the path the shader it is named after takes.
+
+0 Illum and 5 Terrain: unchanged, the stock sum. Terrain deliberately gets no branch of its own -
+Terrain.cfx's lighting IS the Illum lobe, and the record carries no terrain normal map to apply.
+
+0.25 vegetation leaves and 2 human skin: CE's one forward answer to light coming through a
+surface, LIGHTINGMODEL_TRANSMITTANCE, which makes Callback_ShadingDirect call ThinTranslucencyBRDF
+(shadeLib.cfi:952-964) INSTEAD OF the diffuse BRDF - a substitution, not an addition, which is why
+a leaf is not brighter than the trunk of the same tree. What changes is the colour: the material's
+own, resolved per texel at the hit, instead of grey 0.5. Vegetation.cfx:503-512 gives
+saturate(BackDiffuseMultiplier * translucencyMap) * TransmittanceColor (default 1, 1, 0.6);
+HumanSkin.cfx:286-298 gives exp((1 - saturate(mask * TranslucencyMultiplier)) * (-8, -40, -64)),
+which is the red glow. CustomForwardShadingAttribs.Transmittance had to widen from a float to a
+float3 for that - it was broadcast to grey, which is the one thing a transmittance colour must not
+be. A leaf record that predates the extras still gets the old 0.5.
+
+Skin is the forward approximation and nothing more, as decision 10 says: CE's skin is this
+lighting model plus a SCREEN SPACE subsurface blur keyed on attribs.ScatteringIndex
+(HumanSkin.cfx:288-293). There is no screen at an off screen hit, so the blur cannot be
+reproduced; the transmittance term, which is the part that makes an ear glow, is.
+
+3 glass: Glass.cfx:575-586 shades a pane from its TINT, not its albedo, so the tint replaces the
+albedo and the composite is Glass's own,
+    cFinal = lerp(lerp(cBackbuffer * tint, tint * diffuseAcc, TintCloudiness), litDiffuse,
+                  backlightMask), then lerp(cDiffuse, cSpecular, fresnel)
+with two terms collapsed. cBackbuffer - what is behind the pane - is not a value this branch needs:
+the traversal's stipple acceptance already sends the ray straight through the pane in (1 - opacity)
+of the four stipple phases, so the background arrives AS those other phases and the stage 4B
+temporal filter does that lerp for us. backlightMask is a forward only screen term and is 0. What
+is left is the cloudy half - the tint lit as a diffuse - and the specular, combined by
+GetEnvmapFresnel, the same function Glass.cfx:579 uses.
+
+4 water: decision 09 section 9.4 and the record the stage 5C producer writes. The body colour
+(fog colour attenuated by exp2(-density * depth), Water.cfx:1116-1117, with what is under the
+water taken as fully absorbed because v1 sends no refraction ray) takes the albedo's place, so the
+sun and the SVO GI light it like any other diffuse surface. The reflection is Water.cfx:1160,
+    cFinal = lerp(refractColor, cSpecularAcc, fFresnel)
+with cSpecularAcc replaced by the SAME sky lookup the miss path already has, evaluated along the
+mirror of the incoming ray about the water normal and scaled by ReflectionScale - no secondary ray
+in v1. fFresnel is GetEnvmapFresnel on the record's F0, which the producer writes as water's
+0.02 (Water.cfx:1134). The sun highlight rides on top, as SunSpecular does (Water.cfx:971-992).
+When the sky answers, water passes bSkipSpecularProbes so the probe specular does not double the
+reflection it is an estimate of; a ray reflected downward off water gets nothing from a lat-long
+dome and keeps the ordinary probe specular instead. That flag is a new defaulted parameter on
+Fwd_StandardOpaqueShading_Raytracing, so every other call site is textually unchanged.
+
+Alpha blended Illum materials need no code at all - the traversal's stipple test already accepts
+them with probability equal to their opacity, which is the same stochastic rule glass uses.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SCUvWGLCsqzm3VNMzp4uiS
+---
+ .../HWScripts/CryFX/Total_Illumination.cfx    | 116 +++++++++++++++++-
+ .../CryFX/Total_Illumination_Shading.cfi      |  10 +-
+ 2 files changed, 117 insertions(+), 9 deletions(-)
+
+diff --git a/Engine/Shaders/HWScripts/CryFX/Total_Illumination.cfx b/Engine/Shaders/HWScripts/CryFX/Total_Illumination.cfx
+index 6cf2a4ce..447eb679 100644
+--- a/Engine/Shaders/HWScripts/CryFX/Total_Illumination.cfx
++++ b/Engine/Shaders/HWScripts/CryFX/Total_Illumination.cfx
+@@ -13,7 +13,12 @@
+ struct CustomForwardShadingAttribs
+ {
+ 	int    LightingModel;
+-	float  Transmittance;
++	// rt stage 5B: a float3, not a scalar. ThinTranslucencyBRDF takes a transmittance COLOUR
++	// (shadeLib.cfi:952) and both CE sources of one are coloured - Vegetation's
++	// TransmittanceColor defaults to (1, 1, 0.6) and HumanSkin's is exp(x * (-8, -40, -64)),
++	// which is the red skin glow. Until now this lane was one scalar broadcast to grey, which
++	// is the one thing a transmittance colour must not be.
++	float3 Transmittance;
+ 	float  Emittance;
+ 	float3 RayDirection;
+ 	float  SunShadowRT;
+@@ -2240,18 +2245,54 @@ pixoutShade ShadePS(vtxOutWPOS IN)
+ 
+ 		const float3 vEmmTint = RT_UnpackEmissiveHue(vGAL.w);
+ 
++		// rt stage 5B (decision 10): the hit's material TYPE and its per type parameters.
++		uint nMatCode; float fMatParam; bool bMatExtras;
++		RT_UnpackHitMatCode(refl_GMAT.SampleLevel(ssSvoPointClamp, IN.baseTC.xy, 0).x, nMatCode, fMatParam, bMatExtras);
++		const float3 vMatRgb = refl_GMAT.SampleLevel(ssSvoPointClamp, IN.baseTC.xy, 0).yzw;
++
++		// The sign of the packed emissive hue is stage 2D's veg-leaves marker and is kept as the
++		// fallback, so a record written before the tag existed still gets the two-sided model.
++		const bool bTagVegLeaves = (nMatCode == VOX_RT_MATCODE_VEG_LEAVES) || (vGAL.w < 0);
++		const bool bTagSkin      = (nMatCode == VOX_RT_MATCODE_HUMAN_SKIN);
++		const bool bTagGlass     = (nMatCode == VOX_RT_MATCODE_GLASS);
++		const bool bTagWater     = (nMatCode == VOX_RT_MATCODE_WATER);
++
+ 		MaterialAttribsCommon commonAttribs = (MaterialAttribsCommon)0;
+ 		commonAttribs.NormalWorld = normalize(vGAL.xyz);
+ 		commonAttribs.Albedo      = vGNO.xyz;
+ 		commonAttribs.Reflectance = vReflectance;
+ 		commonAttribs.Smoothness  = fSmoothness;
+ 
+-		if (vGAL.w < 0) // the lighting model rides in the sign of the packed emissive hue
++		// VEGETATION LEAVES (tag 0.25) and HUMAN SKIN (tag 2) share CE's one forward answer to
++		// "light comes through this surface": LIGHTINGMODEL_TRANSMITTANCE, which makes
++		// Callback_ShadingDirect call ThinTranslucencyBRDF (shadeLib.cfi:952-964) INSTEAD OF the
++		// diffuse BRDF - it is a substitution, not an addition, which is why the leaf is not
++		// twice as bright as the trunk. The colour is the material's own now:
++		//   Vegetation.cfx:503-512  saturate(BackDiffuseMultiplier * translucencyMap) * TransmittanceColor
++		//   HumanSkin.cfx:286-298   exp((1 - saturate(translucencyMap * TranslucencyMultiplier)) * (-8, -40, -64))
++		// Both are resolved per texel at the hit (RT_ProcessBestHit) and arrive in the HITMAT
++		// float3. A leaf material whose record predates the extras keeps the old grey 0.5.
++		//
++		// SKIN IS THE FORWARD APPROXIMATION AND NOTHING MORE. CE's skin is
++		// LIGHTINGMODEL_TRANSMITTANCE plus a SCREEN SPACE subsurface blur keyed on
++		// attribs.ScatteringIndex (HumanSkin.cfx:288-293, resolved by the SSS stage). There is
++		// no screen at a ray hit, so the blur cannot be reproduced; what is reproduced is the
++		// transmittance term, which is the part that makes an ear glow red from behind.
++		if (bTagVegLeaves || bTagSkin)
+ 		{
+ 			commonAttribs.LightingModel = LIGHTINGMODEL_TRANSMITTANCE;
+-			commonAttribs.Transmittance = (half3)0.5f;
++			commonAttribs.Transmittance = bMatExtras ? (half3)vMatRgb : (half3)0.5f;
+ 		}
+ 
++		// GLASS (tag 3): Glass.cfx:575-586 shades the pane from its TINT, not from its albedo -
++		// localTintColor is what the glass keeps of what is behind it, and the albedo only
++		// appears through the backlight mask, which the hit has no equivalent of.
++		// WATER (tag 4): the body colour computed at the hit (fog colour attenuated by
++		// density x depth, Water.cfx:1116-1117) takes the albedo's place, so the sun and the
++		// SVO GI light the water body the same way they light any other diffuse surface.
++		if (bTagGlass || bTagWater)
++			commonAttribs.Albedo = vMatRgb;
++
+ 		ForwardShadingAttribs fwdAttribs = (ForwardShadingAttribs)0;
+ 		fwdAttribs.screenUV        = IN.baseTC.xy;
+ 		fwdAttribs.worldPos        = vGPO.xyz; // camera-relative, as everywhere in the forward stack
+@@ -2262,7 +2303,8 @@ pixoutShade ShadePS(vtxOutWPOS IN)
+ 		fwdAttribs.smoothness      = commonAttribs.Smoothness;
+ 
+ 		fwdAttribs.custom.LightingModel = commonAttribs.LightingModel;
+-		fwdAttribs.custom.Transmittance = (commonAttribs.LightingModel == LIGHTINGMODEL_TRANSMITTANCE) ? 0.5f : 0.f;
++		fwdAttribs.custom.Transmittance = (commonAttribs.LightingModel == LIGHTINGMODEL_TRANSMITTANCE)
++		                                  ? (float3)commonAttribs.Transmittance : (float3)0.f;
+ 		// emittance rides in the LENGTH of the packed normal
+ 		fwdAttribs.custom.Emittance     = max(length(vGAL.xyz) - 1.f, 0.f);
+ 		fwdAttribs.custom.RayDirection  = bNoHit ? -vRayDirN : vRayDirN;
+@@ -2283,6 +2325,24 @@ pixoutShade ShadePS(vtxOutWPOS IN)
+ 		float3 vSkyRadiance = (float3)0.f;
+ 		const bool bMissSky = bNoHit && (vGLD.z > 0.f) && SVO_RT_SampleSky(vRayDirN, vSkyRadiance);
+ 
++		// rt stage 5B, WATER (decision 09 section 9.4, decision 10 item 4 Water). What a water
++		// surface shows is Water.cfx:1160
++		//     cFinal = lerp(refractColor, cSpecularAcc, fFresnel)
++		// with cSpecularAcc the reflection (Water.cfx:1053, a cubemap or the planar reflection,
++		// times ReflectionScale) and fFresnel = GetEnvmapFresnel(0.02, FresnelGloss, NdotE)
++		// (Water.cfx:1134-1135). v1 sends NO secondary ray: the reflection is the SAME sky
++		// lookup the miss path already has, evaluated along the mirror of the incoming ray about
++		// the water normal. A ray reflected DOWNWARD off water gets nothing from a lat-long
++		// dome, so it keeps the ordinary probe specular instead.
++		float3 vWaterRefl = (float3)0.f;
++		bool bWaterSky = false;
++
++		if (bTagWater && !bNoHit)
++		{
++			const float3 vWaterReflDir = reflect(vRayDirN, commonAttribs.NormalWorld);
++			bWaterSky = (vWaterReflDir.z > 0.f) && SVO_RT_SampleSky(vWaterReflDir, vWaterRefl);
++		}
++
+ 		float3 diffuseAcc = 0.0f;
+ 		float3 specularAcc = 0.0f;
+ 		SRTShadeProbe dbgShade = (SRTShadeProbe)0;
+@@ -2295,12 +2355,56 @@ pixoutShade ShadePS(vtxOutWPOS IN)
+ 		// Fwd_StandardOpaqueShading_Raytracing where ApplyGI would have done it.
+ 		const float4 vGGI = refl_GGI.SampleLevel(ssSvoPointClamp, IN.baseTC.xy, 0);
+ 
++		// Water skips the SPECULAR PROBE when the sky answered: the probe specular and the sky
++		// lookup below are two estimates of the same reflection and adding both doubles it.
+ 		if (!bMissSky)
+-			Fwd_StandardOpaqueShading_Raytracing(commonAttribs, fwdAttribs, diffuseAcc, specularAcc, dbgShade, true, !bNoHit, !bNoHit, vGGI);
++			Fwd_StandardOpaqueShading_Raytracing(commonAttribs, fwdAttribs, diffuseAcc, specularAcc, dbgShade, true, !bNoHit, !bNoHit, vGGI, bWaterSky);
++
++		// rt stage 5B: the per tag composite. Tags 0 (Illum) and 5 (Terrain) - and 0.25 and 2,
++		// whose whole difference is the lighting model the BRDF callback already switched on -
++		// take the stock sum. Terrain deliberately has no branch: Terrain.cfx's own lighting IS
++		// the Illum lobe, and the record carries no terrain normal map to apply.
++		float3 vShaded = diffuseAcc + specularAcc;
++
++		if (bTagGlass || bTagWater)
++		{
++			// GetEnvmapFresnel is what BOTH shaders use for this lerp: Glass.cfx:579 on the
++			// material's own reflectance, Water.cfx:1135 on a hard coded 0.02 with FresnelGloss.
++			// The hit's reflectance lane already IS that 0.02 for water (the CPU writes it) and
++			// the material's own F0 for glass, so one expression covers both.
++			const float3 vViewVec = normalize(-fwdAttribs.custom.RayDirection);
++			const float fFres = GetEnvmapFresnel(fwdAttribs.reflectance, fwdAttribs.smoothness,
++			                                     saturate(dot(commonAttribs.NormalWorld, vViewVec))).x;
++
++			if (bTagGlass)
++			{
++				// Glass.cfx:576-586:
++				//   tintBlend = lerp(cBackbuffer * tint, tint * diffuseAcc, TintCloudiness)
++				//   cDiffuse  = lerp(tintBlend, litDiffuse, backlightMask)
++				//   cFinal    = lerp(cDiffuse, cSpecular, fresnel)
++				// cBackbuffer - what is BEHIND the pane - is not a value this branch has, and it
++				// does not need one: the stochastic acceptance in the traversal already sends
++				// the ray straight through the pane in (1 - opacity) of the stipple phases, so
++				// the background half of tintBlend arrives as those other phases and the
++				// temporal filter of stage 4B does the lerp. What is left here is the cloudy
++				// half - the tint lit as a diffuse - and the specular, combined by CE's own
++				// Fresnel. backlightMask is a forward-only screen term and is taken as 0.
++				vShaded = lerp(diffuseAcc * fMatParam, specularAcc, fFres);
++			}
++			else if (bWaterSky)
++			{
++				// Water.cfx:1160, with refractColor collapsed to the lit body colour (v1 sends
++				// no refraction ray) and cSpecularAcc replaced by the sky along the reflected
++				// direction times ReflectionScale. specularAcc is the SUN highlight, which
++				// Water.cfx adds on top of the reflection in the same way (SunSpecular,
++				// Water.cfx:971-992).
++				vShaded = lerp(diffuseAcc, vWaterRefl * fMatParam, fFres) + specularAcc;
++			}
++		}
+ 
+ 		float3 acc = bMissSky
+ 		             ? (vSkyRadiance + .0001f)
+-		             : (diffuseAcc + specularAcc + SVO_ShadeParams0.x * fwdAttribs.albedo + .0001f);
++		             : (vShaded + SVO_ShadeParams0.x * fwdAttribs.albedo + .0001f);
+ 
+ 		// Emissive, exactly Illum.cfx IlluminationPS:
+ 		//     emittance = MatEmissiveColor.rgb * MatEmissiveColor.w * MAT_EMISSIVE_UNIT_SCALE
+diff --git a/Engine/Shaders/HWScripts/CryFX/Total_Illumination_Shading.cfi b/Engine/Shaders/HWScripts/CryFX/Total_Illumination_Shading.cfi
+index 770b28ee..70fb9165 100644
+--- a/Engine/Shaders/HWScripts/CryFX/Total_Illumination_Shading.cfi
++++ b/Engine/Shaders/HWScripts/CryFX/Total_Illumination_Shading.cfi
+@@ -417,7 +417,8 @@ void TiledForwardShading_Raytracing(in ForwardShadingAttribs attribs, inout floa
+ void Fwd_StandardOpaqueShading_Raytracing(in MaterialAttribsCommon commonAttribs, inout ForwardShadingAttribs fwdAttribs,
+                                           inout float3 diffuseAcc, inout float3 specularAcc, out SRTShadeProbe dbg,
+                                           bool bSunShadows = true, bool bDirectLights = true,
+-                                          bool bUseHitGI = false, float4 vHitGI = (float4)0.f)
++                                          bool bUseHitGI = false, float4 vHitGI = (float4)0.f,
++                                          bool bSkipSpecularProbes = false)
+ {
+ 	dbg = (SRTShadeProbe)0;
+ 	dbg.sunVisibility = 1;
+@@ -458,8 +459,11 @@ void Fwd_StandardOpaqueShading_Raytracing(in MaterialAttribsCommon commonAttribs
+ 		dbg.directSpec += sunSpec;
+ 	}
+ 
+-	// unconditional: %_RT_TILED_SHADING means "trace voxels" on this shader
+-	TiledForwardShading_Raytracing(fwdAttribs, diffuseAcc, specularAcc, ssFwdBilinearWrap, ssFwdComparison, true, bDirectLights, false, dbg, bUseHitGI, vHitGI);
++	// unconditional: %_RT_TILED_SHADING means "trace voxels" on this shader.
++	// rt stage 5B: bSkipSpecularProbes was always false here; WATER passes true when the sky
++	// answered along the reflected direction, because the probe specular and that sky lookup are
++	// two estimates of the same reflection (decision 09 section 9.4).
++	TiledForwardShading_Raytracing(fwdAttribs, diffuseAcc, specularAcc, ssFwdBilinearWrap, ssFwdComparison, true, bDirectLights, bSkipSpecularProbes, dbg, bUseHitGI, vHitGI);
+ 
+ 	// energy audit error 1 / E1. The indirect DIFFUSE at the hit, taking the place the probe
+ 	// diffuse just vacated: the SVO's own voxel irradiance, which is exactly what ApplyGI mode 2
+-- 
+2.47.1.windows.1
+

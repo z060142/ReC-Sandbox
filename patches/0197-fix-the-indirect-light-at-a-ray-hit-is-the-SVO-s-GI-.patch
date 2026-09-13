@@ -1,0 +1,347 @@
+From 0bb159602386c26ed204fb19eaa3678bdeedd45a Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Mon, 14 Sep 2026 03:41:04 +0800
+Subject: [PATCH 197/213] fix: the indirect light at a ray hit is the SVO's GI
+ with occlusion, not the full probe
+
+The two biggest terms in the energy ledger (audit errors 1 and 2, E1/E2/E3).
+
+A surface seen DIRECTLY does not get the env probe's ambient at all: ApplyGI
+mode 2 overwrites it with the SVO's GI (TiledShading.cfi:139-140), and then
+SSDO multiplies that by occlDiff squared and the specular by
+DeriveSpecularOcclusion. The same surface seen in a ray traced reflection was
+getting the full probe irradiance instead, with occlusion hard-wired to (1,1) -
+a different indirect model AND no occlusion at all. Unbounded in an interior lit
+by a global probe; x1.7 to x5 more in any corner. Together they are why a
+reflected wall reads brighter than the wall.
+
+The hit now gets what the primary surface gets. TracingPS writes a fifth MRT,
+HITGI (RGBA16F): .xyz = the SVO diffuse irradiance in the cell the hit came from
+(RT_SampleVoxelIrradiance, unexposed, the same units TexGiDiffuse hands the
+deferred consumer), .w = a voxel AO. It has to be produced there and not in
+ShadePS, which may never touch a brick pool (t0-t3 aliasing). ShadePS reads it
+at t37 and:
+
+  - adds HITGI.xyz * PS_HDR_RANGE_ADAPT_MAX * AO to diffuseAcc - ApplyGI's own
+    exposure multiply, happening where ApplyGI would have done it - before the
+    energy split, so it picks up albedo * (1 - luminance(F0)) exactly as the
+    deferred surfAlbedo does;
+  - skips the probe DIFFUSE entirely, the way mode 2 replaces it;
+  - multiplies the probe specular by a specular occlusion derived from HITGI.w
+    through CE's own DeriveSpecularOcclusion and its max(ao*ao, 0.3) floor;
+  - passes occlusion = (AO, specOcc) instead of (1, 1).
+
+The AO is honest about what it is: three taps of brickPool_Opac along the hit
+normal at 1.5, 3 and 4.5 voxels with 1/i falloff, projected onto the normal the
+same way ConeTraceBrick does at CommonSVO.cfi:836. One ray, not a cone, and it
+only sees the hit's own SVO cell because RT_VoxelBrickTC clamps at the cell
+border. A hit with no cell, and every miss, writes (0,0,0,1) and is unchanged.
+
+RT_SampleVoxelIrradiance's addressing is factored out into RT_VoxelBrickTC with
+no change of arithmetic, so debug view 6 is byte-identical.
+
+The target is allocated, bound as MRT 4 and read at t37 only under
+e_svoTI_RT_Active; with the feature off nothing is allocated and the shader
+parameters default to bUseHitGI = false, which is the old behaviour exactly.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SCUvWGLCsqzm3VNMzp4uiS
+---
+ .../RenderDll/XRenderD3D9/D3D_SVO.cpp         | 10 +++-
+ .../CryEngine/RenderDll/XRenderD3D9/D3D_SVO.h |  3 ++
+ .../Shaders/HWScripts/CryFX/CommonSVO_RT.cfi  | 40 +++++++++++++++-
+ .../HWScripts/CryFX/Total_Illumination.cfx    | 41 +++++++++++++++-
+ .../CryFX/Total_Illumination_Shading.cfi      | 47 +++++++++++++++----
+ 5 files changed, 127 insertions(+), 14 deletions(-)
+
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/D3D_SVO.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/D3D_SVO.cpp
+index 2a400ac9..ea694b2f 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/D3D_SVO.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/D3D_SVO.cpp
+@@ -570,15 +570,17 @@ void CSvoRenderer::ConeTracePass(SSvoTargetsSet* pTS)
+ 	// and the ray direction + distance. Only on the specular set, only with RT on - and the
+ 	// targets are explicitly unbound again otherwise, because the pass object is a member and
+ 	// would keep last frame's bindings while the shader has only two outputs.
+-	if (e_svoTI_RT_Active && pTS->pRT_HITPOS_0 && pTS->pRT_RAYDIR_0)
++	if (e_svoTI_RT_Active && pTS->pRT_HITPOS_0 && pTS->pRT_RAYDIR_0 && pTS->pRT_HITGI_0)
+ 	{
+ 		rp.SetRenderTarget(2, pTS->pRT_HITPOS_0);
+ 		rp.SetRenderTarget(3, pTS->pRT_RAYDIR_0);
++		rp.SetRenderTarget(4, pTS->pRT_HITGI_0);
+ 	}
+ 	else
+ 	{
+ 		rp.SetRenderTarget(2, nullptr);
+ 		rp.SetRenderTarget(3, nullptr);
++		rp.SetRenderTarget(4, nullptr);
+ 	}
+ 
+ 	rp.SetRequireWorldPos(true);
+@@ -923,7 +925,7 @@ void CSvoRenderer::ShadePass(SSvoTargetsSet* pTS)
+ {
+ 	CSvoFullscreenPass& rp = pTS->passShade;
+ 
+-	if (!pTS->pRT_ALD_SHD || !pTS->pRT_RGB_SHD || !pTS->pRT_HITPOS_0 || !pTS->pRT_RAYDIR_0)
++	if (!pTS->pRT_ALD_SHD || !pTS->pRT_RGB_SHD || !pTS->pRT_HITPOS_0 || !pTS->pRT_RAYDIR_0 || !pTS->pRT_HITGI_0)
+ 		return;
+ 
+ 	rp.SetTechnique(m_pShader, "ShadePass", GetRunTimeFlags(false, true));
+@@ -943,6 +945,7 @@ void CSvoRenderer::ShadePass(SSvoTargetsSet* pTS)
+ 	rp.SetTexture(1, pTS->pRT_RGB_0);
+ 	rp.SetTexture(2, pTS->pRT_HITPOS_0);
+ 	rp.SetTexture(3, pTS->pRT_RAYDIR_0);
++	rp.SetTexture(37, pTS->pRT_HITGI_0);                   // refl_GGI, rt stage 4A
+ 	rp.SetSampler(0, EDefaultSamplerStates::PointClamp);   // ssSvoPointClamp
+ 
+ 	SetupShadeForwardResources(rp);
+@@ -1516,6 +1519,8 @@ void CSvoRenderer::CheckAllocateRT(bool bSpecPass)
+ 		{
+ 			CheckCreateUpdateRT(tsSpec.pRT_HITPOS_0, specW, specH, eTF_R32G32B32A32F, eTT_2D, FT_STATE_CLAMP, "SVO_SPEC_RT_HITPOS");
+ 			CheckCreateUpdateRT(tsSpec.pRT_RAYDIR_0, specW, specH, eTF_R16G16B16A16F, eTT_2D, FT_STATE_CLAMP, "SVO_SPEC_RT_RAYDIR");
++			// rt stage 4A: SVO diffuse irradiance (unexposed, TexGiDiffuse's units) + voxel AO.
++			CheckCreateUpdateRT(tsSpec.pRT_HITGI_0, specW, specH, eTF_R16G16B16A16F, eTT_2D, FT_STATE_CLAMP, "SVO_SPEC_RT_HITGI");
+ 			CheckCreateUpdateRT(tsSpec.pRT_ALD_SHD, specW, specH, eTF_R16G16B16A16F, eTT_2D, FT_STATE_CLAMP, "SVO_SPEC_RT_SHD_ALD");
+ 			CheckCreateUpdateRT(tsSpec.pRT_RGB_SHD, specW, specH, eTF_R16G16B16A16F, eTT_2D, FT_STATE_CLAMP, "SVO_SPEC_RT_SHD_RGB");
+ 		}
+@@ -1523,6 +1528,7 @@ void CSvoRenderer::CheckAllocateRT(bool bSpecPass)
+ 		{
+ 			tsSpec.pRT_HITPOS_0 = nullptr;
+ 			tsSpec.pRT_RAYDIR_0 = nullptr;
++			tsSpec.pRT_HITGI_0 = nullptr;
+ 			tsSpec.pRT_ALD_SHD = nullptr;
+ 			tsSpec.pRT_RGB_SHD = nullptr;
+ 		}
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/D3D_SVO.h b/Code/CryEngine/RenderDll/XRenderD3D9/D3D_SVO.h
+index da64a048..2a6d2ee1 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/D3D_SVO.h
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/D3D_SVO.h
+@@ -43,6 +43,9 @@ struct SSvoTargetsSet
+ 	// ShadePass cannot write into pRT_ALD_0 / pRT_RGB_0 because it reads them as g-data, so it
+ 	// gets its own pair and DemosaicPass is pointed at that pair for the frame (bShaded).
+ 	_smart_ptr<CTexture> pRT_HITPOS_0, pRT_RAYDIR_0, pRT_ALD_SHD, pRT_RGB_SHD;
++	// rt stage 4A: the fifth g-data target, SVO diffuse irradiance + voxel AO at the hit, so the
++	// reflected surface gets the same indirect model ApplyGI mode 2 gives the primary one.
++	_smart_ptr<CTexture> pRT_HITGI_0;
+ 	bool                 bShaded = false;
+ 
+ 	// de-mosaic targets
+diff --git a/Engine/Shaders/HWScripts/CryFX/CommonSVO_RT.cfi b/Engine/Shaders/HWScripts/CryFX/CommonSVO_RT.cfi
+index e31a17b9..2f5d9379 100644
+--- a/Engine/Shaders/HWScripts/CryFX/CommonSVO_RT.cfi
++++ b/Engine/Shaders/HWScripts/CryFX/CommonSVO_RT.cfi
+@@ -848,14 +848,50 @@ void RT_ProcessBestHit(const Ray rOrig, inout SRTInfo rtInfo, const float fDista
+ // with CE's own trick (CommonSVO.cfi:999) - the voxel radiance at the hit divided by the
+ // voxel albedo is an irradiance estimate, and the triangle albedo replaces the voxel one.
+ // tcMin / voxAreaMin / voxAreaMax describe the SVO cell that produced the hit.
+-float3 RT_SampleVoxelIrradiance(const float3 tcMin, const float4 voxAreaMin, const float4 voxAreaMax, const float3 vPos)
++// The brick-atlas texture coordinate of a world position inside the SVO cell that produced the
++// hit. Factored out of RT_SampleVoxelIrradiance unchanged so the AO probe below can walk a few
++// voxels along the hit normal without duplicating the addressing. The clamp is the same one: a
++// sample that leaves the cell reads the cell's border voxel, never a neighbour's brick.
++float3 RT_VoxelBrickTC(const float3 tcMin, const float4 voxAreaMin, const float4 voxAreaMax, const float3 vPos)
+ {
+ 	const float ocNodeSize = voxAreaMin.w;
+ 	const float3 vBoxSize = voxAreaMax.xyz - voxAreaMin.xyz;
+ 	const float3 vHalfTexSizeWS = 0.5f / VOX_BRICK_TEXRES * ocNodeSize;
+ 	const float3 vMulTC = rcp(ocNodeSize) * vBoxSize / VOX_ATLAS_SIZE.xyz * VOX_SUBBLOCK_SIZE_RATIO;
+ 
+-	const float3 vCurTC = tcMin + ((clamp(vPos, voxAreaMin.xyz + vHalfTexSizeWS, voxAreaMax.xyz - vHalfTexSizeWS) - voxAreaMin.xyz) / vBoxSize) * vMulTC;
++	return tcMin + ((clamp(vPos, voxAreaMin.xyz + vHalfTexSizeWS, voxAreaMax.xyz - vHalfTexSizeWS) - voxAreaMin.xyz) / vBoxSize) * vMulTC;
++}
++
++// rt stage 4A (energy audit error 2 / E3). A voxel-derived ambient occlusion at the hit, for the
++// HITGI.w lane. There is no screen-space AO at an off-screen point and that is by design, so the
++// stand-in is the SVO's own directional opacity sampled a few voxels ALONG THE HIT NORMAL: solid
++// neighbours in front of the surface are what an AO term is measuring. Three taps at 1.5, 3 and
++// 4.5 voxels with 1/i falloff, the same shape CE's own cone trace uses over its first steps.
++//
++// Honest about the limits: it is a single ray, not a cone, it only sees the hit's OWN SVO cell
++// (RT_VoxelBrickTC clamps at the cell border), and brickPool_Opac.zyx is a per-axis opacity, so
++// the dot with abs(normal) is the same projection ConeTraceBrick uses at CommonSVO.cfi:836.
++// 1 = unoccluded.
++float RT_SampleVoxelAO(const float3 tcMin, const float4 voxAreaMin, const float4 voxAreaMax, const float3 vPos, const float3 vNorm)
++{
++	const float fVoxSize = voxAreaMin.w / VOX_BRICK_TEXRES;
++	const float3 vNormAbs = abs(vNorm);
++
++	float fOccl = 0.f;
++
++	for (int i = 1; i <= 3; i++)
++	{
++		const float3 vSample = vPos + vNorm * (fVoxSize * 1.5f * (float)i);
++		const float4 vOPAC = tex3DlodLC(brickPool_Opac, float4(RT_VoxelBrickTC(tcMin, voxAreaMin, voxAreaMax, vSample), 0));
++		fOccl += saturate(dot(vOPAC.zyx, vNormAbs)) / (float)i;
++	}
++
++	return saturate(1.f - fOccl / (1.f + 0.5f + 1.f / 3.f));
++}
++
++float3 RT_SampleVoxelIrradiance(const float3 tcMin, const float4 voxAreaMin, const float4 voxAreaMax, const float3 vPos)
++{
++	const float3 vCurTC = RT_VoxelBrickTC(tcMin, voxAreaMin, voxAreaMax, vPos);
+ 
+ 	const float4 vNORA = tex3DlodLC(brickPool_Norm, vCurTC).zyxw;
+ 
+diff --git a/Engine/Shaders/HWScripts/CryFX/Total_Illumination.cfx b/Engine/Shaders/HWScripts/CryFX/Total_Illumination.cfx
+index b8c28eee..61ba026e 100644
+--- a/Engine/Shaders/HWScripts/CryFX/Total_Illumination.cfx
++++ b/Engine/Shaders/HWScripts/CryFX/Total_Illumination.cfx
+@@ -136,6 +136,10 @@ Texture2D refl_GNO: register (t1); // = the RGB target
+ Texture2D refl_GPO: register (t2); // = HITPOS
+ Texture2D refl_GLD: register (t3); // = RAYDIR
+ 
++// rt stage 4A: the fifth g-data target, the SVO GI + AO at the hit. t37 is free on the ShadePass
++// technique (the forward set claims t17-t24, t26-t31, t33, t40; t34-t36 are the sky).
++Texture2D refl_GGI: register (t37);
++
+ /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+ // Structures
+ struct vtxOutWPOS
+@@ -175,6 +179,13 @@ struct pixoutMRTTrace
+ 	//          (the "no hit => fall back to probes" sentinel). .w == 0 means "not an RT pixel".
+ 	float4 HitPos: SV_Target2;
+ 	half4  RayDir: SV_Target3;
++	//  HitGi:  rt stage 4A (energy audit error 1 + 2). .xyz = the SVO's DIFFUSE IRRADIANCE at
++	//          the hit, in the same unexposed units as TexGiDiffuse (the deferred consumer's
++	//          ApplyGI mode 2 input), .w = a voxel-derived ambient occlusion, 1 = unoccluded.
++	//          It has to be produced HERE and not in ShadePS: the irradiance is a brick-pool
++	//          fetch inside the SVO cell that produced the hit, and ShadePS may never touch a
++	//          brick pool (t0-t3 aliasing). A miss writes (0,0,0,1).
++	half4  HitGi: SV_Target4;
+ #endif
+ };
+ 
+@@ -1940,6 +1951,27 @@ pixoutMRTTrace ConeTracePS(vtxOutWPOS IN)
+ 		OUT.HitPos = float4(g_rtInfo.hitpos.xyz - GetWorldViewPos(),
+ 		                    RT_PackHitMaterial(g_rtInfo.reflectance, abs(g_rtInfo.albedo_smoothness.w)));
+ 		OUT.RayDir = float4(g_rtInfo.raydir.xyz, g_rtInfo.raydir.w);
++
++		// rt stage 4A, energy audit error 1 + 2. The DIRECT view of a surface does not get the
++		// env probe's ambient at all: ApplyGI mode 2 replaces it with the SVO's GI
++		// (TiledShading.cfi:139-140). The hit used to get the full probe irradiance instead,
++		// with occlusion hard-wired to (1,1) - a different indirect model AND no occlusion, which
++		// between them are the dominant reason a reflected wall reads brighter than the wall.
++		// So the hit gets the same thing the primary surface gets: a voxel irradiance fetch in
++		// the cell the hit came from, plus a voxel AO, handed to ShadePS in a fifth target.
++		// Unexposed, like TexGiDiffuse; ShadePS multiplies by PS_HDR_RANGE_ADAPT_MAX exactly
++		// where ApplyGI would have.
++		if (g_rtInfo.best.vAlb.a > 0 && g_rtInfo.cellValid)
++		{
++			OUT.HitGi = float4(RT_SampleVoxelIrradiance(g_rtInfo.cellTC, g_rtInfo.cellMin, g_rtInfo.cellMax, g_rtInfo.hitpos.xyz),
++			                   RT_SampleVoxelAO(g_rtInfo.cellTC, g_rtInfo.cellMin, g_rtInfo.cellMax, g_rtInfo.hitpos.xyz, normalize(g_rtInfo.normal_emissive.xyz)));
++		}
++		else
++		{
++			// no cell (a miss, or a hit the traversal could not place): no GI, no occlusion.
++			// A miss is resolved by the sky and never reads this lane.
++			OUT.HitGi = float4(0, 0, 0, 1);
++		}
+ 	}
+ #endif
+ 
+@@ -2045,8 +2077,15 @@ pixoutShade ShadePS(vtxOutWPOS IN)
+ 		SRTShadeProbe dbgShade = (SRTShadeProbe)0;
+ 		dbgShade.sunVisibility = 1;
+ 
++		// rt stage 4A, energy audit errors 1 and 2: the indirect term at the hit is the SVO's own
++		// GI, exactly as ApplyGI mode 2 gives it to the primary surface, not the env probe's full
++		// irradiance with occlusion pinned to 1. Produced by TracingPS into the fifth g-data
++		// target because it needs the brick pools; unexposed there, exposed inside
++		// Fwd_StandardOpaqueShading_Raytracing where ApplyGI would have done it.
++		const float4 vGGI = refl_GGI.SampleLevel(ssSvoPointClamp, IN.baseTC.xy, 0);
++
+ 		if (!bMissSky)
+-			Fwd_StandardOpaqueShading_Raytracing(commonAttribs, fwdAttribs, diffuseAcc, specularAcc, dbgShade, true, !bNoHit);
++			Fwd_StandardOpaqueShading_Raytracing(commonAttribs, fwdAttribs, diffuseAcc, specularAcc, dbgShade, true, !bNoHit, !bNoHit, vGGI);
+ 
+ 		float3 acc = bMissSky
+ 		             ? (vSkyRadiance + .0001f)
+diff --git a/Engine/Shaders/HWScripts/CryFX/Total_Illumination_Shading.cfi b/Engine/Shaders/HWScripts/CryFX/Total_Illumination_Shading.cfi
+index 2a50180c..770b28ee 100644
+--- a/Engine/Shaders/HWScripts/CryFX/Total_Illumination_Shading.cfi
++++ b/Engine/Shaders/HWScripts/CryFX/Total_Illumination_Shading.cfi
+@@ -198,7 +198,7 @@ struct SRTShadeProbe
+ void TiledForwardShading_Raytracing(in ForwardShadingAttribs attribs, inout float3 diffuseAcc, inout float3 specularAcc,
+                                     SamplerState ssTrilinearClamp, SamplerComparisonState ssComparison,
+                                     const bool applyProbes, const bool applyNonProbes, const bool bSkipSpecularProbes,
+-                                    inout SRTShadeProbe dbg)
++                                    inout SRTShadeProbe dbg, const bool bUseHitGI, const float4 vHitGI)
+ {
+ 	const float3 worldPosAbs = attribs.worldPos + GetWorldViewPos();
+ 
+@@ -216,8 +216,16 @@ void TiledForwardShading_Raytracing(in ForwardShadingAttribs attribs, inout floa
+ 	float2 envBRDF = Fwd_EnvironmentBRDF.SampleLevel(ssTrilinearClamp, float2(NdotV, attribs.smoothness), 0).xy;
+ 	envFresnel = lerp(envBRDF.xxx, envBRDF.yyy, attribs.reflectance);
+ 
+-	// bOpaque is false at a hit, so there is no screen-space AO term to read
+-	const float2 occlusion = float2(1, 1);
++	// energy audit error 2 / E3. bOpaque is false at a hit, so there is no SCREEN-SPACE AO term
++	// to read - but "no screen-space AO" was implemented as "no occlusion at all", i.e. (1,1),
++	// while the same surface seen directly is multiplied by occlDiff squared and by
++	// DeriveSpecularOcclusion (TiledShading.cfi:841-852). That is a x1.7 to x5 gap in any corner.
++	// The voxel AO the tracer measured at the hit (HITGI.w) stands in for the screen-space one,
++	// through CE's own formula and CE's own max(ao*ao, 0.3) floor, so the reflected corner darkens
++	// the same way the corner does.
++	const float fHitAO = bUseHitGI ? saturate(vHitGI.w) : 1.f;
++	const float fHitSpecOcc = bUseHitGI ? DeriveSpecularOcclusion(NdotV, max(fHitAO * fHitAO, 0.3f), attribs.smoothness) : 1.f;
++	const float2 occlusion = float2(fHitAO, fHitSpecOcc);
+ 
+ 	int lightIndex = -1;
+ 	uint maskIndex = 0;
+@@ -261,10 +269,18 @@ void TiledForwardShading_Raytracing(in ForwardShadingAttribs attribs, inout floa
+ 					uint4 resIndexClamps = GetResourceIndexAndMipClamps(Fwd_TiledLightsShadeInfo[lightShadeInfoIdx].resIndex);
+ 					float probeWeight = (1 - probeWeightSum) * attenuation;
+ 
+-					// Diffuse
+-					float4 diffuseProbe = Fwd_DiffuseCubeArray.SampleLevel( ssTrilinearClamp, float4( attribs.normal, resIndexClamps.x ), resIndexClamps.y );
+-					diffuseProbe.rgb = DecodeHDRCubemap( diffuseProbe );
+-					diffuseAcc += diffuseProbe.rgb * (lightColor.rgb * probeWeight) * occlusion.x;
++					// Diffuse. energy audit error 1 / E1: SKIPPED when the hit carries SVO GI,
++					// because that is exactly what ApplyGI mode 2 does to the primary surface -
++					// GI replaces the probe diffuse, TiledShading.cfi:139. The probe diffuse used
++					// to be added here in full, which is a different, and usually much brighter
++					// and flatter, indirect model than the one the same wall gets when the camera
++					// looks at it directly.
++					if (!bUseHitGI)
++					{
++						float4 diffuseProbe = Fwd_DiffuseCubeArray.SampleLevel( ssTrilinearClamp, float4( attribs.normal, resIndexClamps.x ), resIndexClamps.y );
++						diffuseProbe.rgb = DecodeHDRCubemap( diffuseProbe );
++						diffuseAcc += diffuseProbe.rgb * (lightColor.rgb * probeWeight) * occlusion.x;
++					}
+ 
+ 					if (!bSkipSpecularProbes)
+ 					{
+@@ -400,7 +416,8 @@ void TiledForwardShading_Raytracing(in ForwardShadingAttribs attribs, inout floa
+ // surface that is not there.
+ void Fwd_StandardOpaqueShading_Raytracing(in MaterialAttribsCommon commonAttribs, inout ForwardShadingAttribs fwdAttribs,
+                                           inout float3 diffuseAcc, inout float3 specularAcc, out SRTShadeProbe dbg,
+-                                          bool bSunShadows = true, bool bDirectLights = true)
++                                          bool bSunShadows = true, bool bDirectLights = true,
++                                          bool bUseHitGI = false, float4 vHitGI = (float4)0.f)
+ {
+ 	dbg = (SRTShadeProbe)0;
+ 	dbg.sunVisibility = 1;
+@@ -442,7 +459,19 @@ void Fwd_StandardOpaqueShading_Raytracing(in MaterialAttribsCommon commonAttribs
+ 	}
+ 
+ 	// unconditional: %_RT_TILED_SHADING means "trace voxels" on this shader
+-	TiledForwardShading_Raytracing(fwdAttribs, diffuseAcc, specularAcc, ssFwdBilinearWrap, ssFwdComparison, true, bDirectLights, false, dbg);
++	TiledForwardShading_Raytracing(fwdAttribs, diffuseAcc, specularAcc, ssFwdBilinearWrap, ssFwdComparison, true, bDirectLights, false, dbg, bUseHitGI, vHitGI);
++
++	// energy audit error 1 / E1. The indirect DIFFUSE at the hit, taking the place the probe
++	// diffuse just vacated: the SVO's own voxel irradiance, which is exactly what ApplyGI mode 2
++	// hands the primary surface (TiledShading.cfi:139). It arrives UNEXPOSED, in TexGiDiffuse's
++	// units, so the multiply by PS_HDR_RANGE_ADAPT_MAX is ApplyGI's own multiply happening here
++	// instead - one exposure, in the same place, so a reflected wall and the wall cannot drift.
++	// The AO rides on the GI term only, which is where the deferred path applies its own
++	// (TiledShading.cfi:841-848 multiplies diffuseAcc while it still holds nothing but GI, and
++	// the direct lights are added afterwards). It goes in BEFORE the energy split below, so it
++	// is multiplied by albedo * (1 - luminance(F0)) exactly as the deferred surfAlbedo is.
++	if (bUseHitGI)
++		diffuseAcc += vHitGI.xyz * PS_HDR_RANGE_ADAPT_MAX * saturate(vHitGI.w);
+ 
+ 	// Apply albedo (using simple energy conservation between specular and diffuse).
+ 	// Byte-identical to ForwardShading.cfi:337 - the reflected wall must be graded by the
+-- 
+2.47.1.windows.1
+

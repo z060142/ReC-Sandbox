@@ -1,0 +1,2219 @@
+From 122bb99184e7ff3438e436c501d44ec727575869 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Mon, 14 Sep 2026 01:00:51 +0800
+Subject: [PATCH 192/213] feat: dynamic meshes in the software triangle ray
+ tracer (stage 3A)
+
+Movable brushes, entity meshes and characters near the camera now appear in
+ray traced reflections. One global BVH over them is rebuilt every frame into
+the DYN_MESH segment (records 0..30719) with its materials in DYN_MATS, root =
+record 0 - the shape Neo's captures show. The consumer needs nothing new: the
+shader already walks the dynamic root every ray.
+
+- Collection (CSvoEnv::Render, main thread, every frame - the tree walk below
+  it is time throttled): eERType_MovableBrush / _Brush / _Character within
+  e_svoTI_RT_MaxDistCam * e_svoTI_RT_DynObjDistRatio, filtered to exactly what
+  CheckCollectObjectsForVoxelization leaves out of the static soup: characters
+  always, brushes whose GI mode is not eGM_StaticVoxelization, and brushes
+  flagged ERF_MOVES_EVERY_FRAME (their soup copy is stale by construction).
+  eGM_HideIfGiIsActive and eGM_IntegrateIntoTerrain are honoured, proxies and
+  hidden nodes dropped, objects sorted by projected size under the budget.
+- Geometry: IRenderMesh CPU streams (LockForThreadAccess, GetPosPtr/GetUVPtr/
+  GetTangentPtr, index stream, per chunk sub material) at the LOD chosen by
+  e_svoTI_RT_LodRatio, plus compound CGF sub objects and character attachments.
+  Skinned meshes use their bind pose placed by the character's world matrix -
+  CE 5.7.1 skins on the GPU and the CPU fallback writes into a write only
+  vertex buffer, so no CPU skinned positions exist; bone mounted stat objects
+  do follow the animation.
+- Build: per object BVH built once with the static SAH builder in object local
+  space and cached by (render mesh, lod); a rigid move is a refit - node boxes
+  recomputed bottom up from the transformed triangles, triangles requantised
+  against the object's world bounds. A per frame median split top level over
+  the object bounds is flattened into the same tree; object depth + top level
+  depth stay within the consumer's 18 level stack, and objects past the top
+  level cap merge into one leaf instead of a deeper node.
+- Upload: the whole dynamic region is rewritten each frame, the tail that the
+  previous frame used is zeroed so a stale subtree can never be walked, and
+  CheckUpdateMeshPools() now runs before the trace of the same frame.
+- e_svoTI_RT_SelfTest gains a dynamic case: two cached objects under a top
+  level, a second frame with one moved, a third with one dropped (tail zeroing)
+  and a fourth with 70 objects that exercises the overflow leaf - 4 x 1000 rays
+  against brute force, 0 mismatches, 0 stack overflows, 0 stale texels.
+- New cvars (the renderer mirrors none of them): e_svoTI_RT_Dynamic,
+  e_svoTI_RT_DynObjDistRatio, e_svoTI_RT_DynMaxTris, e_svoTI_RT_LodRatio.
+  New HUD line "RT dyn: ...". Everything stays behind e_svoTI_RT_Active.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SCUvWGLCsqzm3VNMzp4uiS
+---
+ Code/CryEngine/Cry3DEngine/SVO/SceneTree.cpp  |   21 +
+ Code/CryEngine/Cry3DEngine/SVO/SceneTree.h    |    3 +
+ .../Cry3DEngine/SVO/SceneTreeCVars.inl        |    7 +
+ .../Cry3DEngine/SVO/SceneTreeManager.cpp      |    6 +
+ .../Cry3DEngine/SVO/VoxelSegment.cpp          | 1839 ++++++++++++++---
+ Code/CryEngine/Cry3DEngine/SVO/VoxelSegment.h |   27 +-
+ 6 files changed, 1619 insertions(+), 284 deletions(-)
+
+diff --git a/Code/CryEngine/Cry3DEngine/SVO/SceneTree.cpp b/Code/CryEngine/Cry3DEngine/SVO/SceneTree.cpp
+index 75d857fc..b62d0750 100644
+--- a/Code/CryEngine/Cry3DEngine/SVO/SceneTree.cpp
++++ b/Code/CryEngine/Cry3DEngine/SVO/SceneTree.cpp
+@@ -117,6 +117,15 @@ bool CSvoEnv::Render()
+ 
+ 	CollectAnalyticalOccluders();
+ 
++	// Dynamic meshes (rt decision 07, stage 3A). This has to run EVERY frame - the tree walk below
++	// is time throttled - and the pool upload has to happen before the renderer traces this frame,
++	// which is why CheckUpdateMeshPools() is called here and not only after the brick updates.
++	if (GetCVars()->e_svoTI_RT_Active)
++	{
++		CVoxelSegment::RTUpdateDynamic();
++		CheckUpdateMeshPools();
++	}
++
+ 	if (Get3DEngine()->m_pObjectsTree)
+ 	{
+ 		CRY_PROFILE_SECTION(PROFILE_3DENGINE, "CSvoEnv::Render_FindProbe");
+@@ -989,6 +998,9 @@ CSvoEnv::~CSvoEnv()
+ 	SAFE_DELETE(m_pStreamEngine);
+ 	assert(CVoxelSegment::m_streamingTasksInProgress == 0);
+ 
++	// the per object dynamic BVH cache holds render mesh references; drop them with the SVO
++	CVoxelSegment::RTClearDynamicCache();
++
+ 	SAFE_DELETE(m_pSvoRoot);
+ 
+ 	GetRenderer()->RemoveTexture(m_arrRTPoolTris.m_textureId);
+@@ -2192,6 +2204,7 @@ void CSvoEnv::RTCachePoolDims()
+ 	// SRTBuildStats is a plain struct inside CSvoEnv, so without this the status line printed
+ 	// whatever was on the heap until the first BVH was built
+ 	m_rtStats.Reset();
++	m_rtDynStats.Reset();
+ 
+ 	if (m_rtPoolXY)
+ 		return;
+@@ -2629,6 +2642,14 @@ void CSvoEnv::RTFormatBvhLine(char* szOut, size_t bufSize) const
+ 	            st.mats, st.uvClamped, m_rtUvScaleMismatch, st.trisSkipped, st.buildMs);
+ }
+ 
++void CSvoEnv::RTFormatDynLine(char* szOut, size_t bufSize) const
++{
++	const SRTDynStats& st = m_rtDynStats;
++
++	cry_sprintf(szOut, bufSize, "RT dyn: %d of %d objs, %d K tris, %d records, %d mats, ovf %d, cache %d, %.2f ms",
++	            st.objs, st.objsFound, st.tris / 1000, st.records, st.mats, st.overflowed, st.cached, st.ms);
++}
++
+ //! Belt and braces for the HUD: print the same two lines to the log once, when a voxelization pass
+ //! has finished. Reaching the numbers must not depend on r_DisplayInfo being visible.
+ void CSvoEnv::RTLogStatsWhenReady()
+diff --git a/Code/CryEngine/Cry3DEngine/SVO/SceneTree.h b/Code/CryEngine/Cry3DEngine/SVO/SceneTree.h
+index 4c4bab1c..b72fb132 100644
+--- a/Code/CryEngine/Cry3DEngine/SVO/SceneTree.h
++++ b/Code/CryEngine/Cry3DEngine/SVO/SceneTree.h
+@@ -183,6 +183,8 @@ public:
+ 	//! The two RT status lines, shared by the r_DisplayInfo HUD and the log (2B).
+ 	void RTFormatPoolLine(char* szOut, size_t bufSize) const;
+ 	void RTFormatBvhLine(char* szOut, size_t bufSize) const;
++	//! Per frame dynamic BVH line (stage 3A).
++	void RTFormatDynLine(char* szOut, size_t bufSize) const;
+ 	//! Prints both lines to the log once per completed voxelization pass.
+ 	void RTLogStatsWhenReady();
+ 
+@@ -257,6 +259,7 @@ public:
+ 	bool                     m_rtWasReady = true;
+ 	bool                     m_rtSelfTestDone = false;
+ 	SRTBuildStats            m_rtStats;
++	SRTDynStats              m_rtDynStats;   //!< per frame dynamic BVH (stage 3A)
+ };
+ 
+ #pragma pack(pop)
+diff --git a/Code/CryEngine/Cry3DEngine/SVO/SceneTreeCVars.inl b/Code/CryEngine/Cry3DEngine/SVO/SceneTreeCVars.inl
+index 22dc7ede..2fb48c48 100644
+--- a/Code/CryEngine/Cry3DEngine/SVO/SceneTreeCVars.inl
++++ b/Code/CryEngine/Cry3DEngine/SVO/SceneTreeCVars.inl
+@@ -266,6 +266,13 @@ REGISTER_CVAR_AUTO(int, e_svoTI_RT_LeafTris, 4, VF_EXPERIMENTAL, "Maximum number
+ REGISTER_CVAR_AUTO(int, e_svoTI_RT_MaxDepth, 18, VF_EXPERIMENTAL, "Maximum BVH depth; the consumer traversal stack is sized for this value plus two");
+ REGISTER_CVAR_AUTO(int, e_svoTI_RT_SelfTest, 0, VF_EXPERIMENTAL, "Run the BVH builder and record encoding self test once on level load and print the result into the log");
+ REGISTER_CVAR_AUTO(int, e_svoTI_RT_LightGridDim, 16, VF_EXPERIMENTAL, "Light-mask grid resolution per axis for RT hit shading, multiple of 8");
++
++// Dynamic meshes in the ray traced reflections (decision 07, stage 3A).
++// The renderer does not mirror any of these - the shader already walks the dynamic root every ray.
++REGISTER_CVAR_AUTO(int, e_svoTI_RT_Dynamic, 1, VF_EXPERIMENTAL, "Rebuild a global BVH over the moving objects near the camera every frame and trace it\n0 = only the static per-cell BVH is traced (characters and entities disappear from reflections)");
++REGISTER_CVAR_AUTO(float, e_svoTI_RT_DynObjDistRatio, 1.f, VF_EXPERIMENTAL, "Controls how far from the camera entities are collected for ray tracing, as a fraction of e_svoTI_RT_MaxDistCam");
++REGISTER_CVAR_AUTO(int, e_svoTI_RT_DynMaxTris, 200000, VF_EXPERIMENTAL, "Triangle budget of the per frame dynamic BVH; objects are added by projected size until it is reached\nThe DYN_MESH pool segment is the harder limit and caps this further");
++REGISTER_CVAR_AUTO(int, e_svoTI_RT_LodRatio, 1, VF_EXPERIMENTAL, "Controls LOD of movable meshes used for RT\n0 = full detail");
+ REGISTER_CVAR_AUTO(float, e_svoTI_Specular_Sev, 1, VF_NULL, "Controls severity of specular cones; this value limits the material glossiness");
+ REGISTER_CVAR_AUTO(float, e_svoVoxDistRatio, 14.f, VF_NULL, "Limits the distance where real-time GPU voxelization used");
+ REGISTER_CVAR_AUTO(int, e_svoVoxGenRes, 512, VF_NULL, "GPU voxelization dummy render target resolution");
+diff --git a/Code/CryEngine/Cry3DEngine/SVO/SceneTreeManager.cpp b/Code/CryEngine/Cry3DEngine/SVO/SceneTreeManager.cpp
+index a4da197a..68d10f1e 100644
+--- a/Code/CryEngine/Cry3DEngine/SVO/SceneTreeManager.cpp
++++ b/Code/CryEngine/Cry3DEngine/SVO/SceneTreeManager.cpp
+@@ -139,6 +139,12 @@ char* CSvoManager::GetStatusString(int lineId)
+ 		return szText;
+ 	}
+ 
++	if (Cry3DEngineBase::GetCVars()->e_svoTI_RT_Active && Cry3DEngineBase::GetCVars()->e_svoTI_RT_Dynamic && lineId == (slotId++))
++	{
++		gSvoEnv->RTFormatDynLine(szText, sizeof(szText));
++		return szText;
++	}
++
+ 	return nullptr;
+ }
+ 
+diff --git a/Code/CryEngine/Cry3DEngine/SVO/VoxelSegment.cpp b/Code/CryEngine/Cry3DEngine/SVO/VoxelSegment.cpp
+index c61bd046..16345148 100644
+--- a/Code/CryEngine/Cry3DEngine/SVO/VoxelSegment.cpp
++++ b/Code/CryEngine/Cry3DEngine/SVO/VoxelSegment.cpp
+@@ -22,6 +22,7 @@
+ 	#include <CryThreading/IJobManager_JobDelegator.h>
+ 	#include <algorithm>
+ 	#include <CryAnimation/ICryAnimation.h>
++	#include <CryAnimation/IAttachment.h>
+ 
+ 	#pragma warning(push)
+ 	#pragma warning(disable: 4244) //conversion' conversion from 'type1' to 'type2', possible loss of data
+@@ -2842,6 +2843,55 @@ static ILINE float RT_PackUint2(int high, int low)
+ 	return (float)(CLAMP(high, 0, 4095) * 4096 + CLAMP(low, 0, 4095));
+ }
+ 
++//! One 4 texel triangle record (rt decision 02, 2.5). Shared by the static per cell builder and the
++//! per frame dynamic builder, so both produce byte identical triangles for the same input.
++static void RT_WriteTriRecord(const SRTBuildTri& tr, const Vec4& qb, int matRecord, Vec4* pTri)
++{
++	// per triangle tangent frame from the UV gradient; the consumer rebuilds the
++	// geometric normal as normalize(cross(tangent, bitangent) * handedness)
++	const Vec3  e1 = tr.v[1] - tr.v[0];
++	const Vec3  e2 = tr.v[2] - tr.v[0];
++	const Vec2  d1 = tr.t[1] - tr.t[0];
++	const Vec2  d2 = tr.t[2] - tr.t[0];
++	const float det = d1.x * d2.y - d2.x * d1.y;
++
++	Vec3 vT, vB;
++	if (fabs(det) > 1e-12f)
++	{
++		const float r = 1.f / det;
++		vT = (e1 * d2.y - e2 * d1.y) * r;
++		vB = (e2 * d1.x - e1 * d2.x) * r;
++	}
++	else
++	{
++		vT = e1;
++		vB = e2;
++	}
++
++	for (int v = 0; v < 3; v++)
++	{
++		const Vec3 vN = tr.n[v].GetNormalizedSafe(tr.faceNorm.GetNormalizedSafe(Vec3(0, 0, 1)));
++
++		Vec3 vTan = vT - vN * vN.Dot(vT);
++		if (vTan.GetLengthSquared() < 1e-12f)
++			vTan = vN.GetOrthogonal();
++		vTan.Normalize();
++
++		const float handedness = (vN.Cross(vTan).Dot(vB) < 0.f) ? -1.f : 1.f;
++		const Vec3  vBit = vN.Cross(vTan) * handedness;
++
++		const uint32 qx = RT_QuantPos(tr.v[v].x, qb.x, qb.w);
++		const uint32 qy = RT_QuantPos(tr.v[v].y, qb.y, qb.w);
++
++		pTri[v] = Vec4(RT_PackU16x2(qx, qy), RT_PackDir(vTan, handedness), RT_PackDir(vBit, 1.f), tr.v[v].z);
++	}
++
++	pTri[3] = Vec4((float)matRecord,
++	               RT_PackTC16(tr.t[0].x, tr.t[0].y),
++	               RT_PackTC16(tr.t[1].x, tr.t[1].y),
++	               RT_PackTC16(tr.t[2].x, tr.t[2].y));
++}
++
+ ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+ // Mesh ray tracing - binned SAH BVH builder (rt decision 03)
+ ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+@@ -3174,49 +3224,7 @@ bool CVoxelSegment::BuildStaticBVHRecords(const PodArray<SRTBuildTri>& arrTris,
+ 			const int          triTexel = nodeTexel + (1 + t) * SVO_RT_RECORD_TEXELS;
+ 			Vec4*              pTri = arrOut.GetElements() + triTexel;
+ 
+-			// per triangle tangent frame from the UV gradient; the consumer rebuilds the
+-			// geometric normal as normalize(cross(tangent, bitangent) * handedness)
+-			const Vec3  e1 = tr.v[1] - tr.v[0];
+-			const Vec3  e2 = tr.v[2] - tr.v[0];
+-			const Vec2  d1 = tr.t[1] - tr.t[0];
+-			const Vec2  d2 = tr.t[2] - tr.t[0];
+-			const float det = d1.x * d2.y - d2.x * d1.y;
+-
+-			Vec3 vT, vB;
+-			if (fabs(det) > 1e-12f)
+-			{
+-				const float r = 1.f / det;
+-				vT = (e1 * d2.y - e2 * d1.y) * r;
+-				vB = (e2 * d1.x - e1 * d2.x) * r;
+-			}
+-			else
+-			{
+-				vT = e1;
+-				vB = e2;
+-			}
+-
+-			for (int v = 0; v < 3; v++)
+-			{
+-				const Vec3 vN = tr.n[v].GetNormalizedSafe(tr.faceNorm.GetNormalizedSafe(Vec3(0, 0, 1)));
+-
+-				Vec3 vTan = vT - vN * vN.Dot(vT);
+-				if (vTan.GetLengthSquared() < 1e-12f)
+-					vTan = vN.GetOrthogonal();
+-				vTan.Normalize();
+-
+-				const float handedness = (vN.Cross(vTan).Dot(vB) < 0.f) ? -1.f : 1.f;
+-				const Vec3  vBit = vN.Cross(vTan) * handedness;
+-
+-				const uint32 qx = RT_QuantPos(tr.v[v].x, qb.x, qb.w);
+-				const uint32 qy = RT_QuantPos(tr.v[v].y, qb.y, qb.w);
+-
+-				pTri[v] = Vec4(RT_PackU16x2(qx, qy), RT_PackDir(vTan, handedness), RT_PackDir(vBit, 1.f), tr.v[v].z);
+-			}
+-
+-			pTri[3] = Vec4((float)tr.matRecord,
+-			               RT_PackTC16(tr.t[0].x, tr.t[0].y),
+-			               RT_PackTC16(tr.t[1].x, tr.t[1].y),
+-			               RT_PackTC16(tr.t[2].x, tr.t[2].y));
++			RT_WriteTriRecord(tr, qb, tr.matRecord, pTri);
+ 
+ 			if (pRelocFloats)
+ 				pRelocFloats->Add(triTexel * 4 + 12);      // texel 3 .x = matRecord
+@@ -3239,7 +3247,7 @@ bool CVoxelSegment::BuildStaticBVHRecords(const PodArray<SRTBuildTri>& arrTris,
+ 
+ //! Copies one low resolution texture into a free atlas slice (or reuses the one it already owns)
+ //! and returns the 1 based slice id the material record stores; 0 means "no texture".
+-int CVoxelSegment::CheckStoreTextureInPool(SShaderItem* pShItem, EEfResTextures texSlot, uint16& nTexW, uint16& nTexH)
++int CVoxelSegment::CheckStoreTextureInPool(SShaderItem* pShItem, EEfResTextures texSlot, uint16& nTexW, uint16& nTexH, PodArray<int>& arrTexSlicesOut)
+ {
+ 	const int maxTexSizeXY = gSvoEnv->GetRTTexRes();
+ 
+@@ -3356,7 +3364,7 @@ int CVoxelSegment::CheckStoreTextureInPool(SShaderItem* pShItem, EEfResTextures
+ 	const int slice = (*pSysTexId) - 1;
+ 
+ 	gSvoEnv->RTAddTexSliceRef(slice);
+-	m_rtTexSlices.Add(slice);
++	arrTexSlicesOut.Add(slice);
+ 
+ 	return slice + 1;
+ }
+@@ -3365,12 +3373,19 @@ int CVoxelSegment::CheckStoreTextureInPool(SShaderItem* pShItem, EEfResTextures
+ //! Stage 2B fills all four atlas layers: albedo, normal (_ddna), specular and emissive.
+ void CVoxelSegment::FillRTMaterialRecord(const SRayHitTriangleIndexed& tr, Vec4* pOut)
+ {
+-	const int maxTexSizeXY = gSvoEnv->GetRTTexRes();
+-
+ 	SSvoMatInfo& rMI = m_pMatsInArea->GetAt(tr.materialID);
+ 
+-	const bool   bTerrain = (tr.hitObjectType == HIT_OBJ_TYPE_TERRAIN);
+-	SShaderItem* pShItem = (rMI.pMat && !bTerrain) ? &rMI.pMat->GetShaderItem() : nullptr;
++	RTFillMaterialRecord(rMI.pMat, tr.hitObjectType == HIT_OBJ_TYPE_TERRAIN, m_rtTexSlices, pOut);
++}
++
++//! The material record itself, independent of where the triangle came from: the static soup (above)
++//! and the per frame dynamic collection (stage 3A) fill identical records from the same leaf material.
++void CVoxelSegment::RTFillMaterialRecord(IMaterial* pInMat, bool bTerrain, PodArray<int>& arrTexSlicesOut, Vec4* pOut)
++{
++	const int maxTexSizeXY = gSvoEnv->GetRTTexRes();
++
++	IMaterial*   pMat = pInMat;
++	SShaderItem* pShItem = (pMat && !bTerrain) ? &pMat->GetShaderItem() : nullptr;
+ 
+ 	uint16 texW = 0, texH = 0, norW = 0, norH = 0, spcW = 0, spcH = 0, emiW = 0, emiH = 0;
+ 	int    albSlot = 0, norSlot = 0, spcSlot = 0, emiSlot = 0;
+@@ -3386,7 +3401,7 @@ void CVoxelSegment::FillRTMaterialRecord(const SRayHitTriangleIndexed& tr, Vec4*
+ 
+ 	if (bTerrain)
+ 	{
+-		albSlot = CheckStoreTextureInPool(nullptr, EFTT_DIFFUSE, texW, texH);
++		albSlot = CheckStoreTextureInPool(nullptr, EFTT_DIFFUSE, texW, texH, arrTexSlicesOut);
+ 
+ 		const float mul = GetTerrain() ? GetTerrain()->GetTerrainTextureMultiplier() : 1.f;
+ 		tint = ColorF(mul, mul, mul, 1.f);
+@@ -3395,10 +3410,10 @@ void CVoxelSegment::FillRTMaterialRecord(const SRayHitTriangleIndexed& tr, Vec4*
+ 	}
+ 	else if (pShItem)
+ 	{
+-		albSlot = CheckStoreTextureInPool(pShItem, EFTT_DIFFUSE, texW, texH);
+-		norSlot = CheckStoreTextureInPool(pShItem, EFTT_NORMALS, norW, norH);
+-		spcSlot = CheckStoreTextureInPool(pShItem, EFTT_SPECULAR, spcW, spcH);
+-		emiSlot = CheckStoreTextureInPool(pShItem, EFTT_EMITTANCE, emiW, emiH);
++		albSlot = CheckStoreTextureInPool(pShItem, EFTT_DIFFUSE, texW, texH, arrTexSlicesOut);
++		norSlot = CheckStoreTextureInPool(pShItem, EFTT_NORMALS, norW, norH, arrTexSlicesOut);
++		spcSlot = CheckStoreTextureInPool(pShItem, EFTT_SPECULAR, spcW, spcH, arrTexSlicesOut);
++		emiSlot = CheckStoreTextureInPool(pShItem, EFTT_EMITTANCE, emiW, emiH, arrTexSlicesOut);
+ 
+ 		if (IRenderShaderResources* pRes = pShItem->m_pShaderResources)
+ 		{
+@@ -3456,7 +3471,7 @@ void CVoxelSegment::FillRTMaterialRecord(const SRayHitTriangleIndexed& tr, Vec4*
+ 		  (emiSlot && (emiW != texW || emiH != texH));
+ 
+ 		if (bMismatch)
+-			gSvoEnv->RTCountUvScaleMismatch(rMI.pMat ? rMI.pMat->GetName() : "?");
++			gSvoEnv->RTCountUvScaleMismatch(pMat ? pMat->GetName() : "?");
+ 	}
+ 
+ 	const float scaleX = albSlot ? (float)texW / (float)maxTexSizeXY : 1.f;
+@@ -3711,218 +3726,1293 @@ void CVoxelSegment::BuildStaticBVH()
+ }
+ 
+ ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+-// Mesh ray tracing - self test (e_svoTI_RT_SelfTest)
++// Mesh ray tracing - dynamic meshes (rt decision 07, stage 3A)
+ //
+-// Builds a synthetic soup, writes real records with the real packers, then traces rays through
+-// THE WRITTEN RECORDS with a CPU traversal that mirrors rt decision 02 exactly, and compares the
+-// result with brute force. This is the only validation available without an engine window.
++// Shape (Neo, confirmed by the captures in research/04 7): ONE global BVH over the moving objects
++// near the camera, rebuilt every frame into DYN_MESH (records 0 .. 30719) with its materials in
++// DYN_MATS, root = record 0. The consumer walks that root after the static cell walk, sharing best.
++//
++// Two levels: a per object sub BVH that is built ONCE with the static SAH builder in OBJECT LOCAL
++// space and cached across frames, plus a per frame median split top level over the object bounds.
++// A rigid move is therefore a refit: the cached topology is kept, the triangles are transformed and
++// the node boxes are recomputed bottom up from them (exact, unlike transforming the cached boxes).
++// Both levels are flattened into ONE Neo shaped tree, so the consumer sees a single tree and needs
++// nothing new from the renderer.
+ ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+ 
+ namespace
+ {
+-//! Deterministic LCG, so a failing run can always be reproduced.
+-struct SRTTestRand
++//! Topology of one cached per object BVH. Boxes are deliberately NOT cached (see the refit note).
++struct SRTDynNode
+ {
+-	uint32 s;
+-	SRTTestRand(uint32 seed) : s(seed) {}
+-	float  Next()
+-	{
+-		s = s * 1664525u + 1013904223u;
+-		return (float)((s >> 8) & 0xffffff) / (float)0x1000000;
+-	}
+-	float NextRange(float a, float b) { return a + (b - a) * Next(); }
++	int first;      //!< first triangle in SRTDynMesh::tris (leaves only)
++	int count;      //!< triangle count, 0 on interior nodes
++	int child0;     //!< index into SRTDynMesh::nodes, -1 on leaves; holds the LOWER half along splitAxis
++	int child1;
++	int splitAxis;  //!< 0/1/2, -1 on leaves
+ };
+ 
+-//! Mirror of CommonSVO_RT.cfi ExtractUint2 (base 4096, high field first).
+-void RT_ExtractUint2(float f, int& high, int& low)
++//! One cached object BVH, in OBJECT LOCAL space, keyed by (render mesh, lod).
++struct SRTDynMesh
+ {
+-	uint32 n = (uint32)f;
+-	low = (int)(n & 4095); n /= 4096;
+-	high = (int)(n & 4095);
+-}
++	_smart_ptr<IRenderMesh> pRM;      //!< holds a reference, so the cache key pointer can never be recycled
++	PodArray<SRTBuildTri>   tris;     //!< local space, permuted into leaf order; matRecord = sub material id
++	PodArray<SRTDynNode>    nodes;    //!< nodes[0] is the root, a child always has a higher index than its parent
++	AABB                    localBox;
++	int                     depth = 0;
++	uint                    lastUsedFrame = 0;
++};
+ 
+-//! Mirror of CommonSVO_RT.cfi ExtractTC16 (asuint split, two 16 bit fields over [0, 16)).
+-void RT_ExtractTC16(float f, float& u, float& v)
++typedef std::map<std::pair<const void*, int>, SRTDynMesh*> TRTDynCache;
++
++//! One object instance collected for this frame.
++struct SRTDynInst
+ {
+-	const uint32 n = RT_AsUint(f);
+-	u = (float)(n & 0xffff) / 65535.f * 16.f;
+-	v = (float)(n >> 16) / 65535.f * 16.f;
+-}
++	SRTDynMesh* pMesh;
++	IMaterial*  pMat;        //!< the instance's material (sub materials are resolved per chunk id)
++	Matrix34    mat;         //!< object to world
++	AABB        worldBox;
++	Vec4        qb;          //!< quantisation bounds of this object subtree
++	float       importance;  //!< projected size; the budget keeps the biggest
++	int         triOfs;      //!< first world space triangle of this instance
++	int         boxOfs;      //!< first node box of this instance
++};
+ 
+-//! Moller-Trumbore with a relative determinant epsilon (rt decision 03, 3.6).
+-bool RT_TestTriangle(const Vec3& org, const Vec3& dir, const Vec3& v0, const Vec3& v1, const Vec3& v2, float& tOut)
++//! Everything the emitter needs; frame local, main thread only.
++struct SRTDynFrame
+ {
+-	const Vec3  e1 = v1 - v0;
+-	const Vec3  e2 = v2 - v0;
+-	const Vec3  pv = dir.Cross(e2);
+-	const float det = e1.Dot(pv);
++	PodArray<SRTDynInst>  insts;
++	PodArray<SRTBuildTri> worldTris;   //!< per instance blocks, already carrying the ABSOLUTE matRecord
++	PodArray<AABB>        nodeBoxes;   //!< per instance blocks, one per cached node
++	PodArray<Vec4>        records;     //!< DYN_MESH records, index 0 == record 0
++	PodArray<Vec4>        matRecords;  //!< DYN_MATS records
++	PodArray<int>         texSlices;   //!< atlas slices referenced this frame
++	int                   overflowed = 0;
++};
+ 
+-	if (fabs(det) < 1e-7f * e1.GetLength() * e2.GetLength())
+-		return false;
++TRTDynCache   g_rtDynCache;
++PodArray<int> g_rtDynPrevTexSlices;
++int           g_rtDynPrevRecords = 0;
++int           g_rtDynPrevMats = 0;
+ 
+-	const float invDet = 1.f / det;
+-	const Vec3  tv = org - v0;
+-	const float u = tv.Dot(pv) * invDet;
+-	if (u < 0.f || u > 1.f)
+-		return false;
++//! Quantisation bounds of one world box: XY centre plus the larger XY extent, as for a static cell.
++Vec4 RT_DynQuantBounds(const AABB& box)
++{
++	float size = max(box.max.x - box.min.x, box.max.y - box.min.y);
++	size = max(size, 0.05f) * (1.f + 1.f / 1024.f);
++	return Vec4((box.min.x + box.max.x) * 0.5f, (box.min.y + box.max.y) * 0.5f, 0.f, size);
++}
+ 
+-	const Vec3  qv = tv.Cross(e1);
+-	const float v = dir.Dot(qv) * invDet;
+-	if (v < 0.f || u + v > 1.f)
++//! Reads one render mesh through the CPU accessible streams and appends its triangles in LOCAL space.
++//! This is the same stream set CE's own SVO triangle collector uses (RenderMeshUtils.cpp
++//! ProcessBoxIntersection): GetPosPtr / GetUVPtr return float32 caches even for half float vertex
++//! formats, and the vertex normal comes out of the tangent frame stream.
++bool RT_ExtractMeshTris(IRenderMesh* pRM, IMaterial* pMat, PodArray<SRTBuildTri>& arrOut, int maxTris)
++{
++	if (!pRM || pRM->GetVerticesCount() <= 0 || pRM->GetIndicesCount() < 3)
+ 		return false;
+ 
+-	const float t = e2.Dot(qv) * invDet;
+-	if (t <= 0.f)
+-		return false;
++	pRM->LockForThreadAccess();
+ 
+-	tOut = t;
+-	return true;
+-}
++	int32 posStride = 0, uvStride = 0, tangStride = 0;
+ 
+-bool RT_TestAABB(const Vec3& org, const Vec3& invDir, const AABB& box, float tMax, float& tEnter)
+-{
+-	float t0 = 0.f, t1 = tMax;
++	const int nVerts = pRM->GetVerticesCount();
++	const int nInds = pRM->GetIndicesCount();
+ 
+-	for (int a = 0; a < 3; a++)
++	const uint8*   pPos = (const uint8*)pRM->GetPosPtr(posStride, FSL_READ);
++	const vtx_idx* pInds = pRM->GetIndexPtr(FSL_READ);
++	const uint8*   pUV = pPos ? (const uint8*)pRM->GetUVPtr(uvStride, FSL_READ) : nullptr;
++	const uint8*   pTangs = pPos ? (const uint8*)pRM->GetTangentPtr(tangStride, FSL_READ) : nullptr;
++
++	// GetTangentPtr falls back to the QTangent stream; the two structures have different sizes
++	const bool bQTangents = (pTangs != nullptr) && (tangStride < (int32)sizeof(SPipTangents));
++
++	const int startCount = arrOut.Count();
++
++	if (pPos && pInds)
+ 	{
+-		float n = (box.min[a] - org[a]) * invDir[a];
+-		float f = (box.max[a] - org[a]) * invDir[a];
+-		if (n > f)
+-			std::swap(n, f);
+-		t0 = max(t0, n);
+-		t1 = min(t1, f);
+-		if (t0 > t1)
+-			return false;
+-	}
++		TRenderChunkArray& chunks = pRM->GetChunks();
+ 
+-	tEnter = t0;
+-	return true;
+-}
+-}
++		for (int c = 0; c < (int)chunks.size() && arrOut.Count() < maxTris; c++)
++		{
++			const CRenderChunk& chunk = chunks[c];
+ 
+-void CVoxelSegment::RunRTSelfTest()
+-{
+-	const int kMaxStack = 20;
++			if ((chunk.m_nMatFlags & MTL_FLAG_NODRAW) || !chunk.pRE)
++				continue;
+ 
+-	PrintMessage("RT self test: building synthetic soup...");
++			const int matId = (int)chunk.m_nMatID;
+ 
+-	// ---- synthetic soup: two quads plus one thin wall -------------------------------------------
+-	PodArray<SRTBuildTri> arrSoup;
++			if (pMat)
++			{
++				// same visibility filter CE applies when it collects triangles for voxelization
++				const SShaderItem& si = pMat->GetShaderItem(matId);
++				IShader*           pSh = si.m_pShader;
+ 
+-	struct SAddQuad
+-	{
+-		static void Add(PodArray<SRTBuildTri>& out, const Vec3& o, const Vec3& du, const Vec3& dv, int subDiv)
+-		{
+-			const Vec3 n = du.Cross(dv).GetNormalizedSafe(Vec3(0, 0, 1));
+-			for (int i = 0; i < subDiv; i++)
++				if (!pSh || (pSh->GetFlags() & EF_NODRAW) || (pSh->GetFlags() & EF_DECAL) ||
++				    (pSh->GetShaderType() != eST_General && pSh->GetShaderType() != eST_Vegetation))
++					continue;
++			}
++
++			const uint iEnd = chunk.nFirstIndexId + chunk.nNumIndices;
++
++			for (uint ii = chunk.nFirstIndexId; ii + 2 < iEnd && arrOut.Count() < maxTris; ii += 3)
+ 			{
+-				for (int j = 0; j < subDiv; j++)
++				const int I[3] = { (int)pInds[ii + 0], (int)pInds[ii + 1], (int)pInds[ii + 2] };
++
++				if (I[0] >= nVerts || I[1] >= nVerts || I[2] >= nVerts || I[0] < 0 || I[1] < 0 || I[2] < 0)
++					continue;
++
++				SRTBuildTri bt;
++
++				for (int v = 0; v < 3; v++)
+ 				{
+-					const float u0 = (float)i / subDiv, u1 = (float)(i + 1) / subDiv;
+-					const float v0 = (float)j / subDiv, v1 = (float)(j + 1) / subDiv;
++					bt.v[v] = *(const Vec3*)(pPos + (size_t)posStride * I[v]);
++					bt.t[v] = pUV ? *(const Vec2*)(pUV + (size_t)uvStride * I[v]) : Vec2(0.f, 0.f);
+ 
+-					const Vec3 p00 = o + du * u0 + dv * v0;
+-					const Vec3 p10 = o + du * u1 + dv * v0;
+-					const Vec3 p11 = o + du * u1 + dv * v1;
+-					const Vec3 p01 = o + du * u0 + dv * v1;
++					if (pTangs)
++						bt.n[v] = bQTangents ? ((const SPipQTangents*)(pTangs + (size_t)tangStride * I[v]))->GetN()
++						                     : ((const SPipTangents*)(pTangs + (size_t)tangStride * I[v]))->GetN();
++					else
++						bt.n[v] = Vec3(0, 0, 0);
++				}
+ 
+-					SRTBuildTri a;
+-					a.v[0] = p00; a.v[1] = p10; a.v[2] = p11;
+-					a.t[0] = Vec2(u0, v0); a.t[1] = Vec2(u1, v0); a.t[2] = Vec2(u1, v1);
+-					a.n[0] = a.n[1] = a.n[2] = a.faceNorm = n;
+-					a.matRecord = 0;
+-					out.Add(a);
++				bt.faceNorm = (bt.v[1] - bt.v[0]).Cross(bt.v[2] - bt.v[0]);
+ 
+-					SRTBuildTri b;
+-					b.v[0] = p00; b.v[1] = p11; b.v[2] = p01;
+-					b.t[0] = Vec2(u0, v0); b.t[1] = Vec2(u1, v1); b.t[2] = Vec2(u0, v1);
+-					b.n[0] = b.n[1] = b.n[2] = b.faceNorm = n;
+-					b.matRecord = 0;
+-					out.Add(b);
++				// degenerates give the consumer a zero determinant
++				if (bt.faceNorm.GetLengthSquared() < 1e-16f)
++					continue;
++
++				bt.faceNorm.Normalize();
++
++				for (int v = 0; v < 3; v++)
++				{
++					bt.n[v] = bt.n[v].GetNormalizedSafe(bt.faceNorm);
++					if (bt.n[v].Dot(bt.faceNorm) < 0.f)
++						bt.n[v] = -bt.n[v];
++				}
++
++				// UVs are normalised per triangle into [0, 16), exactly as the static producer does
++				const Vec2 tcMin(min(bt.t[0].x, min(bt.t[1].x, bt.t[2].x)), min(bt.t[0].y, min(bt.t[1].y, bt.t[2].y)));
++				for (int v = 0; v < 3; v++)
++				{
++					bt.t[v].x = CLAMP(bt.t[v].x - floor(tcMin.x), 0.f, 16.f - 1.f / 4096.f);
++					bt.t[v].y = CLAMP(bt.t[v].y - floor(tcMin.y), 0.f, 16.f - 1.f / 4096.f);
+ 				}
++
++				bt.matRecord = matId;   // sub material id here; made an absolute record index per frame
++
++				arrOut.Add(bt);
+ 			}
+ 		}
+-	};
++	}
+ 
+-	// floor quad, 8x8 cells
+-	SAddQuad::Add(arrSoup, Vec3(0, 0, 0), Vec3(8, 0, 0), Vec3(0, 8, 0), 8);
+-	// ceiling quad, 4x4 cells, offset and smaller
+-	SAddQuad::Add(arrSoup, Vec3(1, 1, 5), Vec3(5, 0, 0), Vec3(0, 5, 0), 4);
+-	// thin wall: a closed box 2 cm thick, spanning the floor
++	pRM->UnlockStream(VSF_GENERAL);
++	pRM->UnlockStream(VSF_TANGENTS);
++	pRM->UnlockStream(VSF_QTANGENTS);
++	pRM->UnlockIndexStream();
++	pRM->UnLockForThreadAccess();
++
++	return arrOut.Count() > startCount;
++}
++
++//! Builds the cached topology of one object: the static SAH builder, then the triangles permuted
++//! into leaf order so a node's (first, count) indexes them directly. Local space, boxes discarded.
++void RT_BuildDynMeshTopology(PodArray<SRTBuildTri>& arrSrc, SRTDynMesh& out)
++{
++	// The top level over the objects and this subtree share the 18 levels the consumer's stack is
++	// sized for, so the object build is capped at maxDepth - SVO_RT_DYN_TOP_MAX_DEPTH.
++	SRTBuilder bld;
++	bld.leafTris = max(1, Cry3DEngineBase::GetCVars()->e_svoTI_RT_LeafTris);
++	bld.maxDepth = CLAMP(Cry3DEngineBase::GetCVars()->e_svoTI_RT_MaxDepth - SVO_RT_DYN_TOP_MAX_DEPTH, 1, 18 - SVO_RT_DYN_TOP_MAX_DEPTH);
++	bld.maxDepthSeen = 0;
++	bld.maxLeafTris = 0;
++	bld.leafCount = 0;
++
++	bld.refs.PreAllocate(arrSrc.Count(), 0);
++	for (int i = 0; i < arrSrc.Count(); i++)
+ 	{
+-		const float x0 = 3.5f, x1 = 3.52f, y0 = 0.f, y1 = 8.f, z0 = 0.f, z1 = 4.f;
+-		const Vec3  c[8] =
+-		{
+-			Vec3(x0, y0, z0), Vec3(x1, y0, z0), Vec3(x1, y1, z0), Vec3(x0, y1, z0),
+-			Vec3(x0, y0, z1), Vec3(x1, y0, z1), Vec3(x1, y1, z1), Vec3(x0, y1, z1)
+-		};
+-		const int quads[6][4] = { { 3, 2, 1, 0 }, { 4, 5, 6, 7 }, { 0, 1, 5, 4 }, { 1, 2, 6, 5 }, { 2, 3, 7, 6 }, { 3, 0, 4, 7 } };
++		SRTRef ref;
++		ref.box.Reset();
++		ref.box.Add(arrSrc[i].v[0]);
++		ref.box.Add(arrSrc[i].v[1]);
++		ref.box.Add(arrSrc[i].v[2]);
++		ref.centroid = (arrSrc[i].v[0] + arrSrc[i].v[1] + arrSrc[i].v[2]) / 3.f;
++		ref.triId = i;
++		bld.refs.Add(ref);
++	}
+ 
+-		for (int f = 0; f < 6; f++)
+-		{
+-			const Vec3 p0 = c[quads[f][0]], p1 = c[quads[f][1]], p2 = c[quads[f][2]], p3 = c[quads[f][3]];
+-			const Vec3 n = (p1 - p0).Cross(p2 - p0).GetNormalizedSafe(Vec3(0, 0, 1));
++	bld.nodes.PreAllocate(arrSrc.Count() * 2 + 8, 0);
++	bld.Split(bld.AddNode(0, bld.refs.Count(), 0));
+ 
+-			SRTBuildTri a;
+-			a.v[0] = p0; a.v[1] = p1; a.v[2] = p2;
+-			a.t[0] = Vec2(0, 0); a.t[1] = Vec2(1, 0); a.t[2] = Vec2(1, 1);
+-			a.n[0] = a.n[1] = a.n[2] = a.faceNorm = n;
+-			a.matRecord = 0;
+-			arrSoup.Add(a);
++	// permute the triangles into leaf order, so a node's (first, count) indexes tris directly
++	out.tris.PreAllocate(arrSrc.Count(), 0);
++	for (int i = 0; i < bld.refs.Count(); i++)
++		out.tris.Add(arrSrc[bld.refs[i].triId]);
+ 
+-			SRTBuildTri b;
+-			b.v[0] = p0; b.v[1] = p2; b.v[2] = p3;
+-			b.t[0] = Vec2(0, 0); b.t[1] = Vec2(1, 1); b.t[2] = Vec2(0, 1);
+-			b.n[0] = b.n[1] = b.n[2] = b.faceNorm = n;
+-			b.matRecord = 0;
+-			arrSoup.Add(b);
+-		}
++	out.nodes.PreAllocate(bld.nodes.Count(), 0);
++	for (int n = 0; n < bld.nodes.Count(); n++)
++	{
++		const SRTNode& src = bld.nodes[n];
++		SRTDynNode     dst;
++		dst.first = src.first;
++		dst.count = (src.child0 < 0) ? src.count : 0;
++		dst.child0 = src.child0;
++		dst.child1 = src.child1;
++		dst.splitAxis = src.splitAxis;
++		out.nodes.Add(dst);
+ 	}
+ 
+-	// ---- build real records ---------------------------------------------------------------------
+-	AABB soupBox;
+-	soupBox.Reset();
+-	for (int i = 0; i < arrSoup.Count(); i++)
++	out.localBox.Reset();
++	for (int i = 0; i < out.tris.Count(); i++)
+ 		for (int v = 0; v < 3; v++)
+-			soupBox.Add(arrSoup[i].v[v]);
++			out.localBox.Add(out.tris[i].v[v]);
+ 
+-	const float qSize = max(soupBox.max.x - soupBox.min.x, soupBox.max.y - soupBox.min.y) * (1.f + 1.f / 1024.f);
+-	const Vec4  qb((soupBox.min.x + soupBox.max.x) * 0.5f, (soupBox.min.y + soupBox.max.y) * 0.5f, 0.f, qSize);
++	out.depth = bld.maxDepthSeen;
++}
+ 
+-	const int      recordBase = SVO_RT_SEG_STATIC;
+-	PodArray<Vec4> arrRec;
+-	SRTBuildStats  stats;
+-	stats.Reset();
++//! Builds (or returns) the cached local space BVH of one render mesh.
++SRTDynMesh* RT_GetDynMesh(IRenderMesh* pRM, IMaterial* pMat, int lod)
++{
++	if (!pRM)
++		return nullptr;
+ 
+-	const float buildStart = GetCurAsyncTimeSec();
+-	if (!BuildStaticBVHRecords(arrSoup, qb, recordBase, arrRec, nullptr, stats))
++	const std::pair<const void*, int> key(pRM, lod);
++
++	TRTDynCache::const_iterator it = g_rtDynCache.find(key);
++	if (it != g_rtDynCache.end())
+ 	{
+-		PrintMessage("RT self test: FAILED - builder returned nothing");
+-		return;
++		it->second->lastUsedFrame = GetCurrPassMainFrameID();
++		return it->second;
+ 	}
+-	const float buildMs = (GetCurAsyncTimeSec() - buildStart) * 1000.f;
+ 
+-	// ---- decode the written records back, exactly as the consumer will ---------------------------
+-	PodArray<Vec3> arrDecodedV;   // 3 per triangle, indexed by leaf triangle record order
+-	PodArray<int>  arrDecodedRec; // record index of each decoded triangle
++	SRTDynMesh* pOut = new SRTDynMesh();
++	pOut->pRM = pRM;
++	pOut->lastUsedFrame = GetCurrPassMainFrameID();
+ 
+-	float maxPosError = 0.f;
++	PodArray<SRTBuildTri> arrSrc;
+ 
++	// one object may not eat the whole segment on its own
++	const int maxTris = SVO_RT_DYN_MESH_COUNT / 2;
++
++	if (!RT_ExtractMeshTris(pRM, pMat, arrSrc, maxTris))
+ 	{
+-		// Records are only meaningful through the tree - a triangle record read as a node would
+-		// decode its packed Z as a triangle count - so the decode walks the tree, like the consumer.
+-		PodArray<int> stack;
+-		stack.Add(recordBase);
++		// cache the failure too, so a mesh without CPU accessible streams is not retried every frame
++		pOut->localBox.Reset();
++		g_rtDynCache[key] = pOut;
++		return pOut;
++	}
+ 
+-		while (stack.Count())
+-		{
+-			const int rec = stack.Last();
+-			stack.DeleteLast();
++	RT_BuildDynMeshTopology(arrSrc, *pOut);
+ 
+-			const Vec4* pRec = arrRec.GetElements() + (rec - recordBase) * SVO_RT_RECORD_TEXELS;
+-			const int   child0 = (int)pRec[3].x;
++	g_rtDynCache[key] = pOut;
++	return pOut;
++}
+ 
+-			if (child0 > 0)
++//! Drops cache entries nothing referenced for a while (level change, object streamed out).
++void RT_EvictDynCache()
++{
++	const uint frameId = GetCurrPassMainFrameID();
++
++	for (TRTDynCache::iterator it = g_rtDynCache.begin(); it != g_rtDynCache.end(); )
++	{
++		if (frameId > it->second->lastUsedFrame + 600)
++		{
++			delete it->second;
++			it = g_rtDynCache.erase(it);
++		}
++		else
++		{
++			++it;
++		}
++	}
++}
++
++//! Refit: recompute the cached node boxes of one instance bottom up from its transformed triangles.
++//! A child always has a higher index than its parent (SRTBuilder appends children after the parent),
++//! so one reverse pass is enough. Recomputing is exact; transforming the cached boxes would not be.
++void RT_RefitDynInst(SRTDynFrame& f, const SRTDynInst& inst)
++{
++	const SRTDynMesh& mesh = *inst.pMesh;
++	const int         nodeCount = mesh.nodes.Count();
++	const int         boxOfs = inst.boxOfs;
++
++	f.nodeBoxes.PreAllocate(boxOfs + nodeCount, boxOfs + nodeCount);
++
++	for (int n = nodeCount - 1; n >= 0; n--)
++	{
++		const SRTDynNode& node = mesh.nodes[n];
++		AABB&             box = f.nodeBoxes[boxOfs + n];
++
++		box.Reset();
++
++		if (node.child0 < 0)
++		{
++			for (int t = 0; t < node.count; t++)
++				for (int v = 0; v < 3; v++)
++					box.Add(f.worldTris[inst.triOfs + node.first + t].v[v]);
++		}
++		else
++		{
++			box.Add(f.nodeBoxes[boxOfs + node.child0]);
++			box.Add(f.nodeBoxes[boxOfs + node.child1]);
++		}
++	}
++}
++
++//! Writes one node record (rt decision 02, 2.5).
++void RT_WriteNodeRecord(Vec4* pRec, const AABB& box, int triCount, int subtreeEnd, const Vec4& qb, int child0, int child1, int splitAxis)
++{
++	pRec[0] = Vec4(box.min, (float)triCount);
++	pRec[1] = Vec4(box.max, (float)subtreeEnd);
++	pRec[2] = qb;
++	pRec[3] = Vec4((float)child0, (float)child1, 0.f, (float)splitAxis);
++}
++
++//! Emits one cached object subtree at record rec, with the instance's transform already applied.
++//! Returns the first record after the subtree.
++int RT_EmitDynObj(SRTDynFrame& f, const SRTDynInst& inst, int nodeIdx, int rec)
++{
++	const SRTDynMesh& mesh = *inst.pMesh;
++	const SRTDynNode& node = mesh.nodes[nodeIdx];
++	const AABB&       box = f.nodeBoxes[inst.boxOfs + nodeIdx];
++
++	Vec4* pRec = f.records.GetElements() + (size_t)rec * SVO_RT_RECORD_TEXELS;
++
++	if (node.child0 < 0)
++	{
++		const int end = rec + 1 + node.count;
++
++		RT_WriteNodeRecord(pRec, box, node.count, end, inst.qb, 0, 0, -1);
++
++		for (int t = 0; t < node.count; t++)
++		{
++			const SRTBuildTri& tr = f.worldTris[inst.triOfs + node.first + t];
++			RT_WriteTriRecord(tr, inst.qb, tr.matRecord, pRec + (size_t)(1 + t) * SVO_RT_RECORD_TEXELS);
++		}
++
++		return end;
++	}
++
++	const int c0 = rec + 1;
++	const int c1 = RT_EmitDynObj(f, inst, node.child0, c0);
++	const int end = RT_EmitDynObj(f, inst, node.child1, c1);
++
++	RT_WriteNodeRecord(pRec, box, 0, end, inst.qb, c0, c1, node.splitAxis);
++
++	return end;
++}
++
++//! The top level hit its depth cap with more than one object left: everything below is merged into
++//! ONE leaf that owns all their triangles. That costs traversal speed for those rays and nothing
++//! else - it can never exceed the consumer's stack, which is the property we must not lose.
++int RT_EmitDynOverflowLeaf(SRTDynFrame& f, const int* pIds, int count, int rec)
++{
++	AABB box;
++	box.Reset();
++	for (int i = 0; i < count; i++)
++		box.Add(f.insts[pIds[i]].worldBox);
++
++	int triCount = 0;
++	for (int i = 0; i < count; i++)
++		triCount += f.insts[pIds[i]].pMesh->tris.Count();
++
++	const Vec4 qb = RT_DynQuantBounds(box);
++	const int  end = rec + 1 + triCount;
++
++	Vec4* pRec = f.records.GetElements() + (size_t)rec * SVO_RT_RECORD_TEXELS;
++	RT_WriteNodeRecord(pRec, box, triCount, end, qb, 0, 0, -1);
++
++	int written = 0;
++	for (int i = 0; i < count; i++)
++	{
++		const SRTDynInst& inst = f.insts[pIds[i]];
++		for (int t = 0; t < inst.pMesh->tris.Count(); t++, written++)
++		{
++			const SRTBuildTri& tr = f.worldTris[inst.triOfs + t];
++			RT_WriteTriRecord(tr, qb, tr.matRecord, pRec + (size_t)(1 + written) * SVO_RT_RECORD_TEXELS);
++		}
++	}
++
++	f.overflowed += count;
++
++	return end;
++}
++
++//! Per frame top level: median split over the object bounds (rt decision 03's "alternatives kept" -
++//! the loose splitter is the right one for a per frame rebuild).
++int RT_EmitDynTop(SRTDynFrame& f, int* pIds, int count, int depth, int rec, const Vec4& rootQb)
++{
++	if (count == 1)
++		return RT_EmitDynObj(f, f.insts[pIds[0]], 0, rec);
++
++	if (depth >= SVO_RT_DYN_TOP_MAX_DEPTH)
++		return RT_EmitDynOverflowLeaf(f, pIds, count, rec);
++
++	AABB centroidBox;
++	centroidBox.Reset();
++	for (int i = 0; i < count; i++)
++		centroidBox.Add(f.insts[pIds[i]].worldBox.GetCenter());
++
++	const Vec3 ext = centroidBox.max - centroidBox.min;
++
++	int axis = 0;
++	if (ext.y > ext[axis]) axis = 1;
++	if (ext.z > ext[axis]) axis = 2;
++
++	// child0 must hold the LOWER half along splitAxis (rt decision 02, 2.5)
++	SRTDynFrame* pF = &f;
++	std::stable_sort(pIds, pIds + count, [pF, axis](int a, int b)
++	{
++		const float ca = pF->insts[a].worldBox.GetCenter()[axis];
++		const float cb = pF->insts[b].worldBox.GetCenter()[axis];
++		return (ca != cb) ? (ca < cb) : (a < b);
++	});
++
++	const int mid = count / 2;
++
++	const int c0 = rec + 1;
++	const int c1 = RT_EmitDynTop(f, pIds, mid, depth + 1, c0, rootQb);
++	const int end = RT_EmitDynTop(f, pIds + mid, count - mid, depth + 1, c1, rootQb);
++
++	AABB box;
++	box.Reset();
++	for (int i = 0; i < count; i++)
++		box.Add(f.insts[pIds[i]].worldBox);
++
++	RT_WriteNodeRecord(f.records.GetElements() + (size_t)rec * SVO_RT_RECORD_TEXELS, box, 0, end, rootQb, c0, c1, axis);
++
++	return end;
++}
++
++//! Exactly which render nodes are NOT in the static triangle soup.
++//!
++//! CheckCollectObjectsForVoxelization (VoxelSegment.cpp) only ever queries eERType_Brush,
++//! eERType_MovableBrush and eERType_Vegetation, drops the proxy / pending-delete / hidden flags, and
++//! then requires GetGIMode() == eGM_StaticVoxelization. So:
++//!   - characters are never in the soup at all -> always dynamic;
++//!   - a brush with any other GI mode is dropped by that filter -> dynamic;
++//!   - a brush flagged ERF_MOVES_EVERY_FRAME has a soup copy, but it is at last voxelization's
++//!     position, i.e. stale by construction -> dynamic as well (the stale static copy stays, see
++//!     the report's known gaps);
++//!   - eGM_HideIfGiIsActive and eGM_IntegrateIntoTerrain are explicit author requests not to appear
++//!     as themselves, and are honoured here too;
++//!   - vegetation is not collected (decision 07: bending would need a per instance deformation the
++//!     cached, rigidly transformed subtree cannot express).
++bool RT_IsDynamicForRT(IRenderNode* pRN)
++{
++	if (!pRN)
++		return false;
++
++	const auto flags = pRN->GetRndFlags();
++
++	if (flags & (ERF_COLLISION_PROXY | ERF_RAYCAST_PROXY | ERF_PENDING_DELETE | ERF_HIDDEN))
++		return false;
++
++	if (pRN->IsHidden())
++		return false;
++
++	const IRenderNode::EGIMode giMode = pRN->GetGIMode();
++
++	if (giMode == IRenderNode::eGM_HideIfGiIsActive || giMode == IRenderNode::eGM_IntegrateIntoTerrain)
++		return false;
++
++	if (pRN->GetRenderNodeType() == eERType_Character)
++		return true;
++
++	if (giMode == IRenderNode::eGM_StaticVoxelization && !(flags & ERF_MOVES_EVERY_FRAME))
++		return false;
++
++	return true;
++}
++
++//! One (mesh, material, transform) triple to add to this frame.
++struct SRTDynSource
++{
++	IRenderMesh* pRM;
++	IMaterial*   pMat;
++	Matrix34     worldTM;    //!< object (or sub object, or bone) to world; the cache stays local space
++	int          lod;
++};
++
++//! Resolves one render node into the meshes it contributes.
++void RT_CollectNodeSources(IRenderNode* pRN, int lodWanted, PodArray<SRTDynSource>& arrOut)
++{
++	Matrix34A nodeTM;
++	nodeTM.SetIdentity();
++
++	if (ICharacterInstance* pChar = pRN->GetEntityCharacter(&nodeTM, false))
++	{
++		IMaterial* pNodeMat = pRN->GetMaterial();
++
++		// SKEL / CGA geometry that still lives on the skeleton
++		if (IRenderMesh* pRM = pChar->GetIDefaultSkeleton().GetIRenderMesh())
++		{
++			SRTDynSource src;
++			src.pRM = pRM;
++			src.pMat = pNodeMat ? pNodeMat : pChar->GetIMaterial();
++			src.worldTM = nodeTM;
++			src.lod = 0;
++			arrOut.Add(src);
++		}
++
++		if (IAttachmentManager* pAM = pChar->GetIAttachmentManager())
++		{
++			const int attCount = pAM->GetAttachmentCount();
++
++			for (int a = 0; a < attCount; a++)
++			{
++				IAttachment* pAtt = pAM->GetInterfaceByIndex(a);
++				if (!pAtt || pAtt->IsAttachmentHidden())
++					continue;
++
++				IAttachmentObject* pAttObj = pAtt->GetIAttachmentObject();
++				if (!pAttObj)
++					continue;
++
++				const IAttachmentObject::EType type = pAttObj->GetAttachmentType();
++
++				if (type == IAttachmentObject::eAttachment_SkinMesh)
++				{
++					IAttachmentSkin* pSkinAtt = pAttObj->GetIAttachmentSkin();
++					ISkin*           pSkin = pSkinAtt ? pSkinAtt->GetISkin() : nullptr;
++					if (!pSkin)
++						continue;
++
++					const int lod = CLAMP(lodWanted, 0, max(0, (int)pSkin->GetNumLODs() - 1));
++
++					IRenderMesh* pRM = pSkin->GetIRenderMesh(lod);
++					if (!pRM)
++						continue;
++
++					IMaterial* pMat = pAttObj->GetReplacementMaterial(lod);
++					if (!pMat)
++						pMat = pAttObj->GetBaseMaterial(lod);
++
++					SRTDynSource src;
++					src.pRM = pRM;
++					src.pMat = pMat;
++					// STAGE 3A LIMIT: this is the BIND POSE mesh, placed by the character's world
++					// matrix. CE 5.7.1 skins on the GPU (compute deformation) or, in the CPU
++					// fallback, straight into a write only dynamic vertex buffer - neither leaves a
++					// CPU readable skinned position anywhere, and the skin -> skeleton bone remap
++					// table is private to CryAnimation. See the report for the path to real skinning.
++					src.worldTM = nodeTM;
++					src.lod = lod;
++					arrOut.Add(src);
++				}
++				else if (type == IAttachmentObject::eAttachment_StatObj)
++				{
++					IStatObj* pStatObj = pAttObj->GetIStatObj();
++					if (!pStatObj)
++						continue;
++
++					IStatObj* pLod = (lodWanted > 0) ? pStatObj->GetLodObject(lodWanted, true) : pStatObj;
++					if (!pLod)
++						pLod = pStatObj;
++
++					IRenderMesh* pRM = pLod->GetRenderMesh();
++					if (!pRM)
++						continue;
++
++					IMaterial* pMat = pAttObj->GetReplacementMaterial(0);
++					if (!pMat)
++						pMat = pAttObj->GetBaseMaterial(0);
++					if (!pMat)
++						pMat = pLod->GetMaterial();
++
++					SRTDynSource src;
++					src.pRM = pRM;
++					src.pMat = pMat;
++					// bone attachments DO follow the animation - the joint transform is world space
++					src.worldTM = Matrix34(pAtt->GetAttWorldAbsolute());
++					src.lod = lodWanted;
++					arrOut.Add(src);
++				}
++			}
++		}
++
++		return;
++	}
++
++	IStatObj* pStatObj = pRN->GetEntityStatObj(0, &nodeTM, false);
++	if (!pStatObj)
++		return;
++
++	if (pStatObj->GetFlags() & STATIC_OBJECT_HIDDEN)
++		return;
++
++	IStatObj* pLod = (lodWanted > 0) ? pStatObj->GetLodObject(lodWanted, true) : pStatObj;
++	if (!pLod)
++		pLod = pStatObj;
++
++	IMaterial* pMat = pRN->GetMaterial();
++	if (!pMat)
++		pMat = pLod->GetMaterial();
++
++	if (IRenderMesh* pRM = pLod->GetRenderMesh())
++	{
++		SRTDynSource src;
++		src.pRM = pRM;
++		src.pMat = pMat;
++		src.worldTM = nodeTM;
++		src.lod = lodWanted;
++		arrOut.Add(src);
++		return;
++	}
++
++	// compound CGF: the geometry sits in the sub objects, each with its own local matrix
++	for (int s = 0; s < pLod->GetSubObjectCount(); s++)
++	{
++		IStatObj::SSubObject* pSub = pLod->GetSubObject(s);
++
++		if (!pSub || pSub->bHidden || pSub->nType != STATIC_SUB_OBJECT_MESH || !pSub->pStatObj)
++			continue;
++
++		IRenderMesh* pRM = pSub->pStatObj->GetRenderMesh();
++		if (!pRM)
++			continue;
++
++		SRTDynSource src;
++		src.pRM = pRM;
++		src.pMat = pMat ? pMat : pSub->pStatObj->GetMaterial();
++		// the sub object transform is folded into the INSTANCE matrix, never into the cached mesh,
++		// so two sub objects sharing one render mesh still share one cache entry
++		src.worldTM = pSub->bIdentityMatrix ? Matrix34(nodeTM) : (Matrix34(nodeTM) * pSub->localTM);
++		src.lod = lodWanted;
++		arrOut.Add(src);
++	}
++}
++}   // anonymous namespace
++
++void CVoxelSegment::RTClearDynamicCache()
++{
++	for (TRTDynCache::iterator it = g_rtDynCache.begin(); it != g_rtDynCache.end(); ++it)
++		delete it->second;
++
++	g_rtDynCache.clear();
++	g_rtDynPrevTexSlices.Reset();
++	g_rtDynPrevRecords = 0;
++	g_rtDynPrevMats = 0;
++}
++
++void CVoxelSegment::RTUpdateDynamic()
++{
++	if (!GetCVars()->e_svoTI_RT_Active || !gSvoEnv)
++		return;
++
++	const bool bEnabled = (GetCVars()->e_svoTI_RT_Dynamic != 0);
++
++	// switched off and nothing left over from a previous frame: touch nothing, allocate nothing
++	if (!bEnabled && !g_rtDynPrevRecords && !g_rtDynPrevMats)
++	{
++		gSvoEnv->m_rtDynStats.Reset();
++		return;
++	}
++
++	FUNCTION_PROFILER_3DENGINE;
++
++	const float startTime = GetCurAsyncTimeSec();
++
++	SRTDynFrame f;
++
++	if (bEnabled)
++	{
++		const Vec3  camPos = gEnv->pSystem->GetViewCamera().GetPosition();
++		const float distCam = max(1.f, GetCVars()->e_svoTI_RT_MaxDistCam * max(0.f, GetCVars()->e_svoTI_RT_DynObjDistRatio));
++		const float distRay = max(0.f, GetCVars()->e_svoTI_RT_MaxDistRay);
++		const int   lodWanted = max(0, GetCVars()->e_svoTI_RT_LodRatio);
++
++		AABB areaBox(camPos, camPos);
++		areaBox.Expand(Vec3(distCam));
++
++		// ---- collect --------------------------------------------------------------------------
++		PodArray<IRenderNode*> arrNodes;
++
++		const EERType arrTypes[3] = { eERType_MovableBrush, eERType_Brush, eERType_Character };
++
++		for (int t = 0; t < 3; t++)
++		{
++			const int objCount = (int)gEnv->p3DEngine->GetObjectsByTypeInBox(arrTypes[t], areaBox, (IRenderNode**)0);
++			if (objCount <= 0)
++				continue;
++
++			const int first = arrNodes.Count();
++			arrNodes.PreAllocate(first + objCount, first + objCount);
++			gEnv->p3DEngine->GetObjectsByTypeInBox(arrTypes[t], areaBox, arrNodes.GetElements() + first);
++		}
++
++		PodArray<SRTDynSource> arrSources;
++
++		for (int n = 0; n < arrNodes.Count(); n++)
++		{
++			IRenderNode* pRN = arrNodes[n];
++
++			if (!RT_IsDynamicForRT(pRN))
++				continue;
++
++			const AABB nodeBox = pRN->GetBBox();
++
++			if (nodeBox.IsReset() || !nodeBox.IsNonZero())
++				continue;
++
++			// a reflected object does not have to be on screen itself, but it does have to be
++			// within one ray length of something that is (same shape as CollectAnalyticalOccluders)
++			AABB visBox = nodeBox;
++			visBox.Expand(Vec3(distRay));
++			if (!gEnv->pSystem->GetViewCamera().IsAABBVisible_E(visBox))
++				continue;
++
++			// CE's "only important objects" rule, as used by the static collector
++			const float maxViewDist = nodeBox.GetRadius() * GetCVars()->e_ViewDistRatio;
++			const float minAllowedViewDist = GetCVars()->e_svoTI_ObjectsMaxViewDistance * GetCVars()->e_svoTI_ObjectsMaxViewDistanceScale;
++
++			if (minAllowedViewDist > 0.f && maxViewDist < minAllowedViewDist)
++				continue;
++
++			const float dist = max(0.5f, nodeBox.GetDistance(camPos));
++			if (dist > distCam)
++				continue;
++
++			const int firstSource = arrSources.Count();
++			RT_CollectNodeSources(pRN, lodWanted, arrSources);
++
++			// projected size: the budget keeps the objects that matter most in the picture
++			const float importance = nodeBox.GetRadius() / dist;
++
++			for (int s = firstSource; s < arrSources.Count(); s++)
++			{
++				SRTDynInst inst;
++				inst.pMesh = nullptr;
++				inst.pMat = arrSources[s].pMat;
++				inst.mat = arrSources[s].worldTM;
++				inst.importance = importance;
++				inst.triOfs = s;   // temporary: index into arrSources
++				inst.boxOfs = 0;
++				inst.worldBox = nodeBox;
++				inst.qb = Vec4(0, 0, 0, 1);
++				f.insts.Add(inst);
++			}
++		}
++
++		f.overflowed = 0;
++		gSvoEnv->m_rtDynStats.objsFound = f.insts.Count();
++
++		// ---- sort by importance, then build / fetch the cached subtrees under the budget -------
++		PodArray<int> arrOrder;
++		arrOrder.PreAllocate(f.insts.Count(), 0);
++		for (int i = 0; i < f.insts.Count(); i++)
++			arrOrder.Add(i);
++
++		SRTDynFrame* pF = &f;
++		std::stable_sort(arrOrder.GetElements(), arrOrder.GetElements() + arrOrder.Count(), [pF](int a, int b)
++		{
++			return pF->insts[a].importance > pF->insts[b].importance;
++		});
++
++		const int maxTrisCvar = max(0, GetCVars()->e_svoTI_RT_DynMaxTris);
++
++		// The DYN_MESH segment is the hard limit: an object costs (nodes + tris) records, plus two
++		// records per object for the top level. Leave room for the top level and one node of slack.
++		const int maxRecords = SVO_RT_DYN_MESH_COUNT - 64;
++
++		PodArray<SRTDynInst> arrKept;
++		int                  budgetRecords = 0;
++		int                  budgetTris = 0;
++
++		std::map<IMaterial*, int> matToRecord;
++
++		for (int o = 0; o < arrOrder.Count(); o++)
++		{
++			SRTDynInst inst = f.insts[arrOrder[o]];
++			const SRTDynSource& src = arrSources[inst.triOfs];
++
++			SRTDynMesh* pMesh = RT_GetDynMesh(src.pRM, src.pMat, src.lod);
++
++			if (!pMesh || !pMesh->tris.Count())
++				continue;
++
++			const int cost = pMesh->nodes.Count() + pMesh->tris.Count();
++
++			if (budgetTris + pMesh->tris.Count() > maxTrisCvar)
++				continue;
++			if (budgetRecords + cost + 2 * (arrKept.Count() + 1) > maxRecords)
++				continue;
++
++			budgetTris += pMesh->tris.Count();
++			budgetRecords += cost;
++
++			inst.pMesh = pMesh;
++			inst.triOfs = -1;
++
++			// object world bounds from the local box corners, for the top level and for qb
++			inst.worldBox.Reset();
++			for (int c = 0; c < 8; c++)
++			{
++				const Vec3 p((c & 1) ? pMesh->localBox.max.x : pMesh->localBox.min.x,
++				             (c & 2) ? pMesh->localBox.max.y : pMesh->localBox.min.y,
++				             (c & 4) ? pMesh->localBox.max.z : pMesh->localBox.min.z);
++				inst.worldBox.Add(src.worldTM.TransformPoint(p));
++			}
++
++			inst.qb = RT_DynQuantBounds(inst.worldBox);
++
++			arrKept.Add(inst);
++		}
++
++		f.insts.Clear();
++		f.insts.AddList(arrKept);
++
++		// ---- transform the triangles and resolve the materials ---------------------------------
++		f.worldTris.PreAllocate(budgetTris, 0);
++		f.nodeBoxes.PreAllocate(budgetRecords, 0);
++
++		for (int i = 0; i < f.insts.Count(); i++)
++		{
++			SRTDynInst&       inst = f.insts[i];
++			const SRTDynMesh& mesh = *inst.pMesh;
++
++			inst.triOfs = f.worldTris.Count();
++			inst.boxOfs = f.nodeBoxes.Count();
++
++			// sub material -> DYN_MATS record, deduplicated per frame by the leaf material pointer
++			for (int t = 0; t < mesh.tris.Count(); t++)
++			{
++				SRTBuildTri bt = mesh.tris[t];
++
++				IMaterial* pLeafMat = inst.pMat ? inst.pMat->GetSafeSubMtl(bt.matRecord) : nullptr;
++
++				int matRecord = 0;
++				std::map<IMaterial*, int>::const_iterator itM = matToRecord.find(pLeafMat);
++
++				if (itM != matToRecord.end())
++				{
++					matRecord = itM->second;
++				}
++				else if (f.matRecords.Count() / SVO_RT_RECORD_TEXELS < SVO_RT_DYN_MATS_COUNT)
++				{
++					matRecord = SVO_RT_SEG_DYN_MATS + f.matRecords.Count() / SVO_RT_RECORD_TEXELS;
++					matToRecord[pLeafMat] = matRecord;
++
++					Vec4 rec[SVO_RT_RECORD_TEXELS];
++					RTFillMaterialRecord(pLeafMat, false, f.texSlices, rec);
++
++					for (int k = 0; k < SVO_RT_RECORD_TEXELS; k++)
++						f.matRecords.Add(rec[k]);
++				}
++
++				for (int v = 0; v < 3; v++)
++				{
++					bt.v[v] = inst.mat.TransformPoint(bt.v[v]);
++					bt.n[v] = inst.mat.TransformVector(bt.n[v]);
++				}
++
++				bt.faceNorm = (bt.v[1] - bt.v[0]).Cross(bt.v[2] - bt.v[0]).GetNormalizedSafe(Vec3(0, 0, 1));
++
++				for (int v = 0; v < 3; v++)
++				{
++					bt.n[v] = bt.n[v].GetNormalizedSafe(bt.faceNorm);
++					if (bt.n[v].Dot(bt.faceNorm) < 0.f)
++						bt.n[v] = -bt.n[v];
++				}
++
++				bt.matRecord = matRecord;
++
++				f.worldTris.Add(bt);
++			}
++
++			RT_RefitDynInst(f, inst);
++		}
++	}
++
++	// ---- emit one flattened tree starting at record 0 ------------------------------------------
++	int usedRecords = 0;
++
++	if (f.insts.Count())
++	{
++		int upperBound = 2 * f.insts.Count() + 8;
++		for (int i = 0; i < f.insts.Count(); i++)
++			upperBound += f.insts[i].pMesh->nodes.Count() + f.insts[i].pMesh->tris.Count();
++
++		upperBound = min(upperBound, (int)SVO_RT_DYN_MESH_COUNT);
++
++		f.records.PreAllocate(upperBound * SVO_RT_RECORD_TEXELS, upperBound * SVO_RT_RECORD_TEXELS);
++
++		AABB rootBox;
++		rootBox.Reset();
++		for (int i = 0; i < f.insts.Count(); i++)
++			rootBox.Add(f.insts[i].worldBox);
++
++		PodArray<int> arrIds;
++		arrIds.PreAllocate(f.insts.Count(), 0);
++		for (int i = 0; i < f.insts.Count(); i++)
++			arrIds.Add(i);
++
++		usedRecords = RT_EmitDynTop(f, arrIds.GetElements(), arrIds.Count(), 0, SVO_RT_SEG_DYN_MESH, RT_DynQuantBounds(rootBox));
++	}
++
++	// ---- upload: whole region rewritten, stale tail zeroed --------------------------------------
++	const int matCount = f.matRecords.Count() / SVO_RT_RECORD_TEXELS;
++
++	{
++		AUTO_MODIFYLOCK(gSvoEnv->m_arrRTPoolTris.m_Lock);
++
++		gSvoEnv->RTCachePoolDims();
++
++		const int poolTexels = gSvoEnv->GetRTPoolXY() * gSvoEnv->GetRTPoolXY() * gSvoEnv->GetRTPoolZ();
++
++		if (poolTexels > 0 && gSvoEnv->GetRTPoolRecords() > SVO_RT_SEG_PARTICLES)
++		{
++			gSvoEnv->m_arrRTPoolTris.CheckAllocated(poolTexels);
++
++			if (gSvoEnv->m_arrRTDirtyTris.Count() != gSvoEnv->GetRTPoolZ())
++				gSvoEnv->m_arrRTDirtyTris.PreAllocate(gSvoEnv->GetRTPoolZ(), gSvoEnv->GetRTPoolZ());
++
++			Vec4* pPool = gSvoEnv->m_arrRTPoolTris.GetElements();
++
++			if (usedRecords)
++				memcpy(pPool + (size_t)SVO_RT_SEG_DYN_MESH * SVO_RT_RECORD_TEXELS, f.records.GetElements(),
++				       (size_t)usedRecords * SVO_RT_RECORD_TEXELS * sizeof(Vec4));
++
++			// A stale subtree must never be walkable: zero what last frame used and this one does not.
++			if (g_rtDynPrevRecords > usedRecords)
++				memset(pPool + (size_t)usedRecords * SVO_RT_RECORD_TEXELS, 0,
++				       (size_t)(g_rtDynPrevRecords - usedRecords) * SVO_RT_RECORD_TEXELS * sizeof(Vec4));
++
++			if (matCount)
++				memcpy(pPool + (size_t)SVO_RT_SEG_DYN_MATS * SVO_RT_RECORD_TEXELS, f.matRecords.GetElements(),
++				       (size_t)matCount * SVO_RT_RECORD_TEXELS * sizeof(Vec4));
++
++			if (g_rtDynPrevMats > matCount)
++				memset(pPool + (size_t)(SVO_RT_SEG_DYN_MATS + matCount) * SVO_RT_RECORD_TEXELS, 0,
++				       (size_t)(g_rtDynPrevMats - matCount) * SVO_RT_RECORD_TEXELS * sizeof(Vec4));
++
++			const int dirtyMesh = max(usedRecords, g_rtDynPrevRecords);
++			const int dirtyMats = max(matCount, g_rtDynPrevMats);
++
++			if (dirtyMesh)
++				gSvoEnv->RTMarkTrisDirty(SVO_RT_SEG_DYN_MESH, dirtyMesh);
++			if (dirtyMats)
++				gSvoEnv->RTMarkTrisDirty(SVO_RT_SEG_DYN_MATS, dirtyMats);
++
++			g_rtDynPrevRecords = usedRecords;
++			g_rtDynPrevMats = matCount;
++		}
++	}
++
++	// Atlas references: the new ones are taken before the old ones are queued for release, so a
++	// slice that is used in both frames never drops to refcount 0 and never moves.
++	for (int i = 0; i < g_rtDynPrevTexSlices.Count(); i++)
++		gSvoEnv->RTQueueFreeTexSlice(g_rtDynPrevTexSlices[i]);
++
++	g_rtDynPrevTexSlices.Clear();
++	g_rtDynPrevTexSlices.AddList(f.texSlices);
++
++	RT_EvictDynCache();
++
++	gSvoEnv->m_rtDynStats.objs = f.insts.Count();
++	gSvoEnv->m_rtDynStats.tris = f.worldTris.Count();
++	gSvoEnv->m_rtDynStats.records = usedRecords;
++	gSvoEnv->m_rtDynStats.mats = matCount;
++	gSvoEnv->m_rtDynStats.overflowed = f.overflowed;
++	gSvoEnv->m_rtDynStats.cached = (int)g_rtDynCache.size();
++	gSvoEnv->m_rtDynStats.ms = (GetCurAsyncTimeSec() - startTime) * 1000.f;
++}
++
++///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
++// Mesh ray tracing - self test (e_svoTI_RT_SelfTest)
++//
++// Builds a synthetic soup, writes real records with the real packers, then traces rays through
++// THE WRITTEN RECORDS with a CPU traversal that mirrors rt decision 02 exactly, and compares the
++// result with brute force. This is the only validation available without an engine window.
++///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
++
++namespace
++{
++//! Deterministic LCG, so a failing run can always be reproduced.
++struct SRTTestRand
++{
++	uint32 s;
++	SRTTestRand(uint32 seed) : s(seed) {}
++	float  Next()
++	{
++		s = s * 1664525u + 1013904223u;
++		return (float)((s >> 8) & 0xffffff) / (float)0x1000000;
++	}
++	float NextRange(float a, float b) { return a + (b - a) * Next(); }
++};
++
++//! Mirror of CommonSVO_RT.cfi ExtractUint2 (base 4096, high field first).
++void RT_ExtractUint2(float f, int& high, int& low)
++{
++	uint32 n = (uint32)f;
++	low = (int)(n & 4095); n /= 4096;
++	high = (int)(n & 4095);
++}
++
++//! Mirror of CommonSVO_RT.cfi ExtractTC16 (asuint split, two 16 bit fields over [0, 16)).
++void RT_ExtractTC16(float f, float& u, float& v)
++{
++	const uint32 n = RT_AsUint(f);
++	u = (float)(n & 0xffff) / 65535.f * 16.f;
++	v = (float)(n >> 16) / 65535.f * 16.f;
++}
++
++//! Moller-Trumbore with a relative determinant epsilon (rt decision 03, 3.6).
++bool RT_TestTriangle(const Vec3& org, const Vec3& dir, const Vec3& v0, const Vec3& v1, const Vec3& v2, float& tOut)
++{
++	const Vec3  e1 = v1 - v0;
++	const Vec3  e2 = v2 - v0;
++	const Vec3  pv = dir.Cross(e2);
++	const float det = e1.Dot(pv);
++
++	if (fabs(det) < 1e-7f * e1.GetLength() * e2.GetLength())
++		return false;
++
++	const float invDet = 1.f / det;
++	const Vec3  tv = org - v0;
++	const float u = tv.Dot(pv) * invDet;
++	if (u < 0.f || u > 1.f)
++		return false;
++
++	const Vec3  qv = tv.Cross(e1);
++	const float v = dir.Dot(qv) * invDet;
++	if (v < 0.f || u + v > 1.f)
++		return false;
++
++	const float t = e2.Dot(qv) * invDet;
++	if (t <= 0.f)
++		return false;
++
++	tOut = t;
++	return true;
++}
++
++bool RT_TestAABB(const Vec3& org, const Vec3& invDir, const AABB& box, float tMax, float& tEnter)
++{
++	float t0 = 0.f, t1 = tMax;
++
++	for (int a = 0; a < 3; a++)
++	{
++		float n = (box.min[a] - org[a]) * invDir[a];
++		float f = (box.max[a] - org[a]) * invDir[a];
++		if (n > f)
++			std::swap(n, f);
++		t0 = max(t0, n);
++		t1 = min(t1, f);
++		if (t0 > t1)
++			return false;
++	}
++
++	tEnter = t0;
++	return true;
++}
++//! Reference traversal of written records, mirroring rt decision 02 and the consumer exactly:
++//! 20 slot stack, near child first by splitAxis and ray sign, relative determinant Moller-Trumbore.
++//! pRecords[0] is record recordBase. Used by both the static and the dynamic self test.
++void RT_RefTrace(const Vec4* pRecords, int recordBase, int rootRecord, const Vec3& org, const Vec3& dir,
++                 float tMax, float& bestT, int& bestRec, bool& bIncomplete)
++{
++	const int kMaxStack = 20;
++
++	const Vec3 invDir(1.f / (fabs(dir.x) > 1e-12f ? dir.x : 1e-12f),
++	                  1.f / (fabs(dir.y) > 1e-12f ? dir.y : 1e-12f),
++	                  1.f / (fabs(dir.z) > 1e-12f ? dir.z : 1e-12f));
++
++	bestT = tMax;
++	bestRec = -1;
++	bIncomplete = false;
++
++	int stack[kMaxStack];
++	int stackPos = 0;
++	stack[stackPos++] = rootRecord;
++
++	while (stackPos > 0)
++	{
++		const int   rec = stack[--stackPos];
++		const Vec4* pRec = pRecords + (size_t)(rec - recordBase) * SVO_RT_RECORD_TEXELS;
++
++		AABB box(Vec3(pRec[0].x, pRec[0].y, pRec[0].z), Vec3(pRec[1].x, pRec[1].y, pRec[1].z));
++
++		float tEnter = 0.f;
++		if (!RT_TestAABB(org, invDir, box, bestT, tEnter))
++			continue;
++
++		const int child0 = (int)pRec[3].x;
++
++		if (child0 > 0)
++		{
++			const int child1 = (int)pRec[3].y;
++			const int axis = (int)pRec[3].w;
++
++			if (stackPos + 2 > kMaxStack)
++			{
++				bIncomplete = true;
++				continue;
++			}
++
++			// child0 holds the lower half along the split axis: push the far child first
++			if (dir[axis] >= 0.f)
++			{
++				stack[stackPos++] = child1;
++				stack[stackPos++] = child0;
++			}
++			else
++			{
++				stack[stackPos++] = child0;
++				stack[stackPos++] = child1;
++			}
++		}
++		else
++		{
++			const int  triCount = (int)pRec[0].w;
++			const Vec4 nodeQb = pRec[2];
++
++			for (int t = 0; t < triCount; t++)
++			{
++				const Vec4* pTri = pRec + (size_t)(1 + t) * SVO_RT_RECORD_TEXELS;
++
++				Vec3 p[3];
++				for (int v = 0; v < 3; v++)
++				{
++					const uint32 packed = RT_AsUint(pTri[v].x);
++					p[v] = Vec3(RT_UnquantPos(packed & 0xffff, nodeQb.x, nodeQb.w),
++					            RT_UnquantPos((packed >> 16) & 0xffff, nodeQb.y, nodeQb.w),
++					            pTri[v].w);
++				}
++
++				float tHit;
++				if (RT_TestTriangle(org, dir, p[0], p[1], p[2], tHit) && tHit < bestT)
++				{
++					bestT = tHit;
++					bestRec = rec + 1 + t;
++				}
++			}
++		}
++	}
++}
++}
++
++void CVoxelSegment::RunRTSelfTest()
++{
++	PrintMessage("RT self test: building synthetic soup...");
++
++	// ---- synthetic soup: two quads plus one thin wall -------------------------------------------
++	PodArray<SRTBuildTri> arrSoup;
++
++	struct SAddQuad
++	{
++		static void Add(PodArray<SRTBuildTri>& out, const Vec3& o, const Vec3& du, const Vec3& dv, int subDiv)
++		{
++			const Vec3 n = du.Cross(dv).GetNormalizedSafe(Vec3(0, 0, 1));
++			for (int i = 0; i < subDiv; i++)
++			{
++				for (int j = 0; j < subDiv; j++)
++				{
++					const float u0 = (float)i / subDiv, u1 = (float)(i + 1) / subDiv;
++					const float v0 = (float)j / subDiv, v1 = (float)(j + 1) / subDiv;
++
++					const Vec3 p00 = o + du * u0 + dv * v0;
++					const Vec3 p10 = o + du * u1 + dv * v0;
++					const Vec3 p11 = o + du * u1 + dv * v1;
++					const Vec3 p01 = o + du * u0 + dv * v1;
++
++					SRTBuildTri a;
++					a.v[0] = p00; a.v[1] = p10; a.v[2] = p11;
++					a.t[0] = Vec2(u0, v0); a.t[1] = Vec2(u1, v0); a.t[2] = Vec2(u1, v1);
++					a.n[0] = a.n[1] = a.n[2] = a.faceNorm = n;
++					a.matRecord = 0;
++					out.Add(a);
++
++					SRTBuildTri b;
++					b.v[0] = p00; b.v[1] = p11; b.v[2] = p01;
++					b.t[0] = Vec2(u0, v0); b.t[1] = Vec2(u1, v1); b.t[2] = Vec2(u0, v1);
++					b.n[0] = b.n[1] = b.n[2] = b.faceNorm = n;
++					b.matRecord = 0;
++					out.Add(b);
++				}
++			}
++		}
++	};
++
++	// floor quad, 8x8 cells
++	SAddQuad::Add(arrSoup, Vec3(0, 0, 0), Vec3(8, 0, 0), Vec3(0, 8, 0), 8);
++	// ceiling quad, 4x4 cells, offset and smaller
++	SAddQuad::Add(arrSoup, Vec3(1, 1, 5), Vec3(5, 0, 0), Vec3(0, 5, 0), 4);
++	// thin wall: a closed box 2 cm thick, spanning the floor
++	{
++		const float x0 = 3.5f, x1 = 3.52f, y0 = 0.f, y1 = 8.f, z0 = 0.f, z1 = 4.f;
++		const Vec3  c[8] =
++		{
++			Vec3(x0, y0, z0), Vec3(x1, y0, z0), Vec3(x1, y1, z0), Vec3(x0, y1, z0),
++			Vec3(x0, y0, z1), Vec3(x1, y0, z1), Vec3(x1, y1, z1), Vec3(x0, y1, z1)
++		};
++		const int quads[6][4] = { { 3, 2, 1, 0 }, { 4, 5, 6, 7 }, { 0, 1, 5, 4 }, { 1, 2, 6, 5 }, { 2, 3, 7, 6 }, { 3, 0, 4, 7 } };
++
++		for (int f = 0; f < 6; f++)
++		{
++			const Vec3 p0 = c[quads[f][0]], p1 = c[quads[f][1]], p2 = c[quads[f][2]], p3 = c[quads[f][3]];
++			const Vec3 n = (p1 - p0).Cross(p2 - p0).GetNormalizedSafe(Vec3(0, 0, 1));
++
++			SRTBuildTri a;
++			a.v[0] = p0; a.v[1] = p1; a.v[2] = p2;
++			a.t[0] = Vec2(0, 0); a.t[1] = Vec2(1, 0); a.t[2] = Vec2(1, 1);
++			a.n[0] = a.n[1] = a.n[2] = a.faceNorm = n;
++			a.matRecord = 0;
++			arrSoup.Add(a);
++
++			SRTBuildTri b;
++			b.v[0] = p0; b.v[1] = p2; b.v[2] = p3;
++			b.t[0] = Vec2(0, 0); b.t[1] = Vec2(1, 1); b.t[2] = Vec2(0, 1);
++			b.n[0] = b.n[1] = b.n[2] = b.faceNorm = n;
++			b.matRecord = 0;
++			arrSoup.Add(b);
++		}
++	}
++
++	// ---- build real records ---------------------------------------------------------------------
++	AABB soupBox;
++	soupBox.Reset();
++	for (int i = 0; i < arrSoup.Count(); i++)
++		for (int v = 0; v < 3; v++)
++			soupBox.Add(arrSoup[i].v[v]);
++
++	const float qSize = max(soupBox.max.x - soupBox.min.x, soupBox.max.y - soupBox.min.y) * (1.f + 1.f / 1024.f);
++	const Vec4  qb((soupBox.min.x + soupBox.max.x) * 0.5f, (soupBox.min.y + soupBox.max.y) * 0.5f, 0.f, qSize);
++
++	const int      recordBase = SVO_RT_SEG_STATIC;
++	PodArray<Vec4> arrRec;
++	SRTBuildStats  stats;
++	stats.Reset();
++
++	const float buildStart = GetCurAsyncTimeSec();
++	if (!BuildStaticBVHRecords(arrSoup, qb, recordBase, arrRec, nullptr, stats))
++	{
++		PrintMessage("RT self test: FAILED - builder returned nothing");
++		return;
++	}
++	const float buildMs = (GetCurAsyncTimeSec() - buildStart) * 1000.f;
++
++	// ---- decode the written records back, exactly as the consumer will ---------------------------
++	PodArray<Vec3> arrDecodedV;   // 3 per triangle, indexed by leaf triangle record order
++	PodArray<int>  arrDecodedRec; // record index of each decoded triangle
++
++	float maxPosError = 0.f;
++
++	{
++		// Records are only meaningful through the tree - a triangle record read as a node would
++		// decode its packed Z as a triangle count - so the decode walks the tree, like the consumer.
++		PodArray<int> stack;
++		stack.Add(recordBase);
++
++		while (stack.Count())
++		{
++			const int rec = stack.Last();
++			stack.DeleteLast();
++
++			const Vec4* pRec = arrRec.GetElements() + (rec - recordBase) * SVO_RT_RECORD_TEXELS;
++			const int   child0 = (int)pRec[3].x;
++
++			if (child0 > 0)
+ 			{
+ 				stack.Add(child0);
+ 				stack.Add((int)pRec[3].y);
+@@ -4005,82 +5095,13 @@ void CVoxelSegment::RunRTSelfTest()
+ 		dir.Normalize();
+ 
+ 		const float tMax = radius * 4.f;
+-		const Vec3  invDir(1.f / (fabs(dir.x) > 1e-12f ? dir.x : 1e-12f),
+-		                   1.f / (fabs(dir.y) > 1e-12f ? dir.y : 1e-12f),
+-		                   1.f / (fabs(dir.z) > 1e-12f ? dir.z : 1e-12f));
+ 
+ 		// (a) traversal of the written records
+ 		float bestT = tMax;
+ 		int   bestRec = -1;
+ 		bool  bIncomplete = false;
+ 
+-		int stack[kMaxStack];
+-		int stackPos = 0;
+-		stack[stackPos++] = recordBase;
+-
+-		while (stackPos > 0)
+-		{
+-			const int   rec = stack[--stackPos];
+-			const Vec4* pRec = arrRec.GetElements() + (rec - recordBase) * SVO_RT_RECORD_TEXELS;
+-
+-			AABB box(Vec3(pRec[0].x, pRec[0].y, pRec[0].z), Vec3(pRec[1].x, pRec[1].y, pRec[1].z));
+-
+-			float tEnter = 0.f;
+-			if (!RT_TestAABB(org, invDir, box, bestT, tEnter))
+-				continue;
+-
+-			const int child0 = (int)pRec[3].x;
+-
+-			if (child0 > 0)
+-			{
+-				const int child1 = (int)pRec[3].y;
+-				const int axis = (int)pRec[3].w;
+-
+-				if (stackPos + 2 > kMaxStack)
+-				{
+-					bIncomplete = true;
+-					continue;
+-				}
+-
+-				// child0 holds the lower half along the split axis: push the far child first
+-				if (dir[axis] >= 0.f)
+-				{
+-					stack[stackPos++] = child1;
+-					stack[stackPos++] = child0;
+-				}
+-				else
+-				{
+-					stack[stackPos++] = child0;
+-					stack[stackPos++] = child1;
+-				}
+-			}
+-			else
+-			{
+-				const int  triCount = (int)pRec[0].w;
+-				const Vec4 nodeQb = pRec[2];
+-
+-				for (int t = 0; t < triCount; t++)
+-				{
+-					const Vec4* pTri = pRec + (1 + t) * SVO_RT_RECORD_TEXELS;
+-
+-					Vec3 p[3];
+-					for (int v = 0; v < 3; v++)
+-					{
+-						const uint32 packed = RT_AsUint(pTri[v].x);
+-						p[v] = Vec3(RT_UnquantPos(packed & 0xffff, nodeQb.x, nodeQb.w),
+-						            RT_UnquantPos((packed >> 16) & 0xffff, nodeQb.y, nodeQb.w),
+-						            pTri[v].w);
+-					}
+-
+-					float tHit;
+-					if (RT_TestTriangle(org, dir, p[0], p[1], p[2], tHit) && tHit < bestT)
+-					{
+-						bestT = tHit;
+-						bestRec = rec + 1 + t;
+-					}
+-				}
+-			}
+-		}
++		RT_RefTrace(arrRec.GetElements(), recordBase, recordBase, org, dir, tMax, bestT, bestRec, bIncomplete);
+ 
+ 		if (bIncomplete)
+ 			overflowCount++;
+@@ -4187,7 +5208,259 @@ void CVoxelSegment::RunRTSelfTest()
+ 
+ 	PrintMessage("RT self test: material records - 6 cases, specular/emissive slot round trip mismatches = %d (must be 0)", matMismatches);
+ 
+-	if (mismatchVsDecoded == 0 && overflowCount == 0 && matMismatches == 0)
++	// ---- dynamic two level tree (stage 3A) ------------------------------------------------------
++	// Two cached objects with different transforms, flattened under a median split top level and
++	// traced through THE WRITTEN RECORDS; then a second frame with one object moved, its records
++	// rewritten over the first frame's in a simulated pool with the stale tail zeroed.
++	int dynMismatches = 0;
++	int dynOverflows = 0;
++	int dynStaleTexels = 0;
++	int dynRecordsUsed[4] = { 0, 0, 0, 0 };
++	int dynOverflowObjs = 0;
++	int dynTrisTotal = 0;
++	{
++		SRTDynMesh meshA, meshB;
++
++		{
++			PodArray<SRTBuildTri> arrA, arrB;
++			SAddQuad::Add(arrA, Vec3(-1, -1, 0), Vec3(2, 0, 0), Vec3(0, 2, 0), 5);   // 50 tris
++			SAddQuad::Add(arrB, Vec3(-2, -2, 0), Vec3(4, 0, 0), Vec3(0, 4, 0), 3);   // 18 tris
++			SAddQuad::Add(arrB, Vec3(-2, -2, 0), Vec3(4, 0, 0), Vec3(0, 0, 3), 3);   // + a wall
++			RT_BuildDynMeshTopology(arrA, meshA);
++			RT_BuildDynMeshTopology(arrB, meshB);
++		}
++
++		dynTrisTotal = meshA.tris.Count() + meshB.tris.Count();
++
++		PodArray<Vec4> pool;
++		pool.PreAllocate(SVO_RT_DYN_MESH_COUNT * SVO_RT_RECORD_TEXELS, SVO_RT_DYN_MESH_COUNT * SVO_RT_RECORD_TEXELS);
++		memset(pool.GetElements(), 0, pool.GetDataSize());
++
++		int prevUsed = 0;
++
++		for (int frame = 0; frame < 4 && !dynMismatches; frame++)
++		{
++			SRTDynFrame f;
++
++			Matrix34 matA = Matrix34::CreateRotationZ(DEG2RAD(15.f));
++			matA.SetTranslation(Vec3(0.f, 0.f, 0.f));
++
++			Matrix34 matB = Matrix34::CreateRotationX(DEG2RAD(40.f));
++			matB.SetTranslation(Vec3(6.f, 2.f, 1.f));
++
++			if (frame == 1)
++			{
++				// object A moves: the tree is rewritten, the records it used before must not survive
++				matA = Matrix34::CreateRotationY(DEG2RAD(25.f));
++				matA.SetTranslation(Vec3(-8.f, -4.f, 2.f));
++			}
++
++			SRTDynMesh* arrMesh[2] = { &meshA, &meshB };
++			Matrix34    arrMat[2] = { matA, matB };
++
++			// frame 2 drops object B: the region shrinks, so the tail it used must be zeroed.
++			// frame 3 puts 70 objects on a grid, which is more than the top level depth cap can
++			// separate - the overflow leaf policy has to keep the result correct.
++			const int instCount = (frame == 2) ? 1 : ((frame == 3) ? 70 : 2);
++
++			for (int i = 0; i < instCount; i++)
++			{
++				SRTDynMesh* pInstMesh = (frame == 3) ? &meshB : arrMesh[i];
++				Matrix34    instMat;
++
++				if (frame == 3)
++				{
++					instMat = Matrix34::CreateRotationZ(DEG2RAD(i * 7.f));
++					instMat.SetTranslation(Vec3((i % 10) * 9.f, (i / 10) * 9.f, (i % 3) * 2.f));
++				}
++				else
++				{
++					instMat = arrMat[i];
++				}
++
++				SRTDynInst inst;
++				inst.pMesh = pInstMesh;
++				inst.pMat = nullptr;
++				inst.mat = instMat;
++				inst.importance = 1.f;
++				inst.triOfs = 0;
++				inst.boxOfs = 0;
++				inst.worldBox.Reset();
++				for (int c = 0; c < 8; c++)
++				{
++					const Vec3 p((c & 1) ? pInstMesh->localBox.max.x : pInstMesh->localBox.min.x,
++					             (c & 2) ? pInstMesh->localBox.max.y : pInstMesh->localBox.min.y,
++					             (c & 4) ? pInstMesh->localBox.max.z : pInstMesh->localBox.min.z);
++					inst.worldBox.Add(instMat.TransformPoint(p));
++				}
++				inst.qb = RT_DynQuantBounds(inst.worldBox);
++				f.insts.Add(inst);
++			}
++
++			for (int i = 0; i < f.insts.Count(); i++)
++			{
++				SRTDynInst& inst = f.insts[i];
++
++				inst.triOfs = f.worldTris.Count();
++				inst.boxOfs = f.nodeBoxes.Count();
++
++				for (int t = 0; t < inst.pMesh->tris.Count(); t++)
++				{
++					SRTBuildTri bt = inst.pMesh->tris[t];
++					for (int v = 0; v < 3; v++)
++					{
++						bt.v[v] = inst.mat.TransformPoint(bt.v[v]);
++						bt.n[v] = inst.mat.TransformVector(bt.n[v]);
++					}
++					bt.faceNorm = (bt.v[1] - bt.v[0]).Cross(bt.v[2] - bt.v[0]).GetNormalizedSafe(Vec3(0, 0, 1));
++					bt.matRecord = SVO_RT_SEG_DYN_MATS;
++					f.worldTris.Add(bt);
++				}
++
++				RT_RefitDynInst(f, inst);
++			}
++
++			int upperBound = 2 * f.insts.Count() + 8;
++			for (int i = 0; i < f.insts.Count(); i++)
++				upperBound += f.insts[i].pMesh->nodes.Count() + f.insts[i].pMesh->tris.Count();
++
++			f.records.PreAllocate(upperBound * SVO_RT_RECORD_TEXELS, upperBound * SVO_RT_RECORD_TEXELS);
++
++			AABB rootBox;
++			rootBox.Reset();
++			for (int i = 0; i < f.insts.Count(); i++)
++				rootBox.Add(f.insts[i].worldBox);
++
++			PodArray<int> arrIds;
++			for (int i = 0; i < f.insts.Count(); i++)
++				arrIds.Add(i);
++
++			const int used = RT_EmitDynTop(f, arrIds.GetElements(), arrIds.Count(), 0, SVO_RT_SEG_DYN_MESH, RT_DynQuantBounds(rootBox));
++
++			dynRecordsUsed[frame] = used;
++			dynOverflowObjs = max(dynOverflowObjs, f.overflowed);
++
++			// the upload the engine does: whole region rewritten, stale tail zeroed
++			memcpy(pool.GetElements(), f.records.GetElements(), (size_t)used * SVO_RT_RECORD_TEXELS * sizeof(Vec4));
++			if (prevUsed > used)
++				memset(pool.GetElements() + (size_t)used * SVO_RT_RECORD_TEXELS, 0,
++				       (size_t)(prevUsed - used) * SVO_RT_RECORD_TEXELS * sizeof(Vec4));
++			prevUsed = used;
++
++			// nothing beyond the used region may be non zero any more
++			for (int i = used * SVO_RT_RECORD_TEXELS; i < min(used + 512, (int)SVO_RT_DYN_MESH_COUNT) * SVO_RT_RECORD_TEXELS; i++)
++				if (pool[i].x != 0.f || pool[i].y != 0.f || pool[i].z != 0.f || pool[i].w != 0.f)
++					dynStaleTexels++;
++
++			// decode the triangles back by walking the tree, exactly as the consumer reads them
++			PodArray<Vec3> arrDecV;
++			PodArray<int>  arrDecRec;
++			{
++				PodArray<int> stack;
++				stack.Add(SVO_RT_SEG_DYN_MESH);
++
++				while (stack.Count())
++				{
++					const int rec = stack.Last();
++					stack.DeleteLast();
++
++					const Vec4* pRec = pool.GetElements() + (size_t)rec * SVO_RT_RECORD_TEXELS;
++					const int   child0 = (int)pRec[3].x;
++
++					if (child0 > 0)
++					{
++						stack.Add(child0);
++						stack.Add((int)pRec[3].y);
++						continue;
++					}
++
++					const int  triCount = (int)pRec[0].w;
++					const Vec4 nodeQb = pRec[2];
++
++					for (int t = 0; t < triCount; t++)
++					{
++						const Vec4* pTri = pRec + (size_t)(1 + t) * SVO_RT_RECORD_TEXELS;
++						for (int v = 0; v < 3; v++)
++						{
++							const uint32 packed = RT_AsUint(pTri[v].x);
++							arrDecV.Add(Vec3(RT_UnquantPos(packed & 0xffff, nodeQb.x, nodeQb.w),
++							                 RT_UnquantPos((packed >> 16) & 0xffff, nodeQb.y, nodeQb.w),
++							                 pTri[v].w));
++						}
++						arrDecRec.Add(rec + 1 + t);
++					}
++				}
++			}
++
++			if (arrDecRec.Count() != f.worldTris.Count())
++			{
++				PrintMessage("RT self test: dynamic frame %d decoded %d triangles, expected %d", frame, arrDecRec.Count(), f.worldTris.Count());
++				dynMismatches++;
++				continue;
++			}
++
++			SRTTestRand dynRnd(0xd1a1u + frame);
++
++			AABB traceBox = rootBox;
++			const Vec3  tc = traceBox.GetCenter();
++			const float tr = traceBox.GetRadius() * 1.5f;
++
++			for (int rayId = 0; rayId < 1000; rayId++)
++			{
++				Vec3 org(tc.x + dynRnd.NextRange(-tr, tr), tc.y + dynRnd.NextRange(-tr, tr), tc.z + dynRnd.NextRange(-tr, tr));
++
++				Vec3 dir;
++				if (rayId & 1)
++					dir = Vec3(dynRnd.NextRange(traceBox.min.x, traceBox.max.x),
++					           dynRnd.NextRange(traceBox.min.y, traceBox.max.y),
++					           dynRnd.NextRange(traceBox.min.z, traceBox.max.z)) - org;
++				else
++					dir = Vec3(dynRnd.NextRange(-1.f, 1.f), dynRnd.NextRange(-1.f, 1.f), dynRnd.NextRange(-1.f, 1.f));
++
++				if (dir.GetLengthSquared() < 1e-6f)
++					dir = Vec3(0, 0, 1);
++				dir.Normalize();
++
++				const float tMaxDyn = tr * 4.f;
++
++				float bestT = tMaxDyn;
++				int   bestRec = -1;
++				bool  bInc = false;
++
++				RT_RefTrace(pool.GetElements(), SVO_RT_SEG_DYN_MESH, SVO_RT_SEG_DYN_MESH, org, dir, tMaxDyn, bestT, bestRec, bInc);
++
++				if (bInc)
++					dynOverflows++;
++
++				float refT = tMaxDyn;
++				int   refRec = -1;
++				for (int i = 0; i < arrDecRec.Count(); i++)
++				{
++					float tHit;
++					if (RT_TestTriangle(org, dir, arrDecV[i * 3 + 0], arrDecV[i * 3 + 1], arrDecV[i * 3 + 2], tHit) && tHit < refT)
++					{
++						refT = tHit;
++						refRec = arrDecRec[i];
++					}
++				}
++
++				if (bestRec != refRec || fabs(bestT - refT) > 1e-4f)
++					dynMismatches++;
++
++				if (bestRec >= 0 && bestRec >= dynRecordsUsed[frame])
++					dynMismatches++;   // a stale record was walked
++			}
++		}
++	}
++
++	PrintMessage("RT self test: dynamic - 2 objects, %d tris, records %d, %d (moved), %d (one dropped), %d (70 objects, %d merged into overflow leaves); 4 x 1000 rays, mismatches = %d (must be 0), stack overflows = %d, stale texels after zeroing = %d",
++	             dynTrisTotal, dynRecordsUsed[0], dynRecordsUsed[1], dynRecordsUsed[2], dynRecordsUsed[3], dynOverflowObjs,
++	             dynMismatches, dynOverflows, dynStaleTexels);
++
++
++
++
++	if (mismatchVsDecoded == 0 && overflowCount == 0 && matMismatches == 0 && dynMismatches == 0 && dynOverflows == 0 && dynStaleTexels == 0)
+ 		PrintMessage("RT self test: PASSED");
+ 	else
+ 		PrintMessage("RT self test: FAILED");
+diff --git a/Code/CryEngine/Cry3DEngine/SVO/VoxelSegment.h b/Code/CryEngine/Cry3DEngine/SVO/VoxelSegment.h
+index 863d3ece..2aa16090 100644
+--- a/Code/CryEngine/Cry3DEngine/SVO/VoxelSegment.h
++++ b/Code/CryEngine/Cry3DEngine/SVO/VoxelSegment.h
+@@ -29,6 +29,11 @@
+ 	#define SVO_RT_SEG_PARTICLES       32768  // sprite BVH (stage 4)
+ 	#define SVO_RT_SEG_STATIC          49152  // per SVO cell static blocks - record 0 is never a valid static root
+ 	#define SVO_RT_CHUNK_GRANULARITY   64     // chunk allocator granularity, in records
++	#define SVO_RT_DYN_MESH_COUNT      (SVO_RT_SEG_DYN_MATS - SVO_RT_SEG_DYN_MESH)       // 30720 records
++	#define SVO_RT_DYN_MATS_COUNT      (SVO_RT_SEG_PARTICLES - SVO_RT_SEG_DYN_MATS)      // 2048 records
++// Depth budget of the two level dynamic tree: the consumer stack is sized for e_svoTI_RT_MaxDepth + 2,
++// so the top level over objects and the cached per object subtrees have to share those 18 levels.
++	#define SVO_RT_DYN_TOP_MAX_DEPTH   6      // <= 64 objects before the overflow leaf policy kicks in
+ 
+ //! One triangle as handed to the static BVH builder (world space, already resolved from the soup).
+ struct SRTBuildTri
+@@ -57,6 +62,21 @@ struct SRTBuildStats
+ 	int   trisSkipped;  //!< triangles rejected (degenerate or out of the quantisation range)
+ 	float buildMs;      //!< accumulated build time
+ };
++
++//! Statistics of the per frame dynamic BVH (rt decision 07, stage 3A).
++struct SRTDynStats
++{
++	void Reset() { ZeroStruct(*this); }
++
++	int   objs;        //!< objects emitted into the dynamic tree
++	int   objsFound;   //!< objects that qualified before the budget was applied
++	int   tris;        //!< triangles emitted
++	int   records;     //!< records written into DYN_MESH
++	int   mats;        //!< material records written into DYN_MATS
++	int   overflowed;  //!< objects merged into an overflow leaf because the top level hit its depth cap
++	int   cached;      //!< per object BVHs held in the cache
++	float ms;          //!< CPU cost of the last frame
++};
+ 	
+ typedef uint16 ObjectLayerIdType;
+ const ObjectLayerIdType kInvalidObjectLayerId = 0;
+@@ -268,7 +288,7 @@ public:
+ 	static void  ErrorTerminate(const char* format, ...);
+ 	Vec3i        GetDxtDim();
+ 	void         AddTriangle(const SRayHitTriangleIndexed& ht, int trId, PodArray<int>*& rpNodeTrisXYZ, PodArrayRT<SRayHitVertex>* pVertInArea);
+-	int          CheckStoreTextureInPool(SShaderItem* pShItem, EEfResTextures texSlot, uint16& nTexW, uint16& nTexH);
++	static int   CheckStoreTextureInPool(SShaderItem* pShItem, EEfResTextures texSlot, uint16& nTexW, uint16& nTexH, PodArray<int>& arrTexSlicesOut);
+ 	ColorB*      ApplyHighPass(uint16& nTexW, uint16& nTexH, const ColorB* pTexRgbOr);
+ 	void         ComputeDistancesFast_MinDistToSurf(ColorB* pTex3dOptRGBA, ColorB* pTex3dOptNorm, ColorB* pTex3dOptOpac, int threadId);
+ 	void         CropVoxTexture(int threadId, bool bCompSurfDist);
+@@ -286,8 +306,13 @@ public:
+ 	void         BuildStaticBVH();
+ 	void         ReleaseRTChunk();
+ 	void         FillRTMaterialRecord(const SRayHitTriangleIndexed& tr, Vec4* pOut);
++	static void  RTFillMaterialRecord(IMaterial* pMat, bool bTerrain, PodArray<int>& arrTexSlicesOut, Vec4* pOut);
+ 	static bool  BuildStaticBVHRecords(const PodArray<SRTBuildTri>& arrTris, const Vec4& qb, int recordBase, PodArray<Vec4>& arrOut, PodArray<int>* pRelocFloats, SRTBuildStats& stats);
+ 	static void  RunRTSelfTest();
++
++	//! Dynamic mesh BVH (rt decision 07, stage 3A) - main thread, once per frame, from CSvoEnv::Render.
++	static void  RTUpdateDynamic();
++	static void  RTClearDynamicCache();
+ 	void         StreamAsyncOnComplete(IReadStream* pStream, unsigned nError) override;
+ 	void         StreamOnComplete(IReadStream* pStream, unsigned nError) override;
+ 	void         UnloadStreamableData();
+-- 
+2.47.1.windows.1
+

@@ -139,6 +139,13 @@ char* CSvoManager::GetStatusString(int lineId)
 		return szText;
 	}
 
+	if (Cry3DEngineBase::GetCVars()->e_svoTI_RT_Active &&
+	    (Cry3DEngineBase::GetCVars()->e_svoTI_RT_Dynamic || Cry3DEngineBase::GetCVars()->e_svoTI_RT_Water) && lineId == (slotId++))
+	{
+		gSvoEnv->RTFormatDynLine(szText, sizeof(szText));
+		return szText;
+	}
+
 	return nullptr;
 }
 

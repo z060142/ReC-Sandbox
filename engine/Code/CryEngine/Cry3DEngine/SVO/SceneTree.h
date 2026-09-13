@@ -183,6 +183,8 @@ public:
 	//! The two RT status lines, shared by the r_DisplayInfo HUD and the log (2B).
 	void RTFormatPoolLine(char* szOut, size_t bufSize) const;
 	void RTFormatBvhLine(char* szOut, size_t bufSize) const;
+	//! Per frame dynamic BVH line (stage 3A).
+	void RTFormatDynLine(char* szOut, size_t bufSize) const;
 	//! Prints both lines to the log once per completed voxelization pass.
 	void RTLogStatsWhenReady();
 
@@ -257,6 +259,7 @@ public:
 	bool                     m_rtWasReady = true;
 	bool                     m_rtSelfTestDone = false;
 	SRTBuildStats            m_rtStats;
+	SRTDynStats              m_rtDynStats;   //!< per frame dynamic BVH (stage 3A)
 };
 
 #pragma pack(pop)

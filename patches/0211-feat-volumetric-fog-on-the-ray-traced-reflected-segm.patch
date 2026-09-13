@@ -1,0 +1,513 @@
+From 3f33313a57a54a76f93eaa62e542743b9a184365 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Mon, 14 Sep 2026 04:50:47 +0800
+Subject: [PATCH 211/213] feat: volumetric fog on the ray traced reflected
+ segment (decision 09 section 9.3)
+
+A reflection now picks up the same froxel fog the direct view does, instead of only
+the analytic global fog.
+
+The source is CVolumetricFogStage's LOCAL froxel volume (the raymarch input, after
+temporal reprojection), read from the PREVIOUS frame. That is not a compromise: the
+stage runs at StandardGraphicsPipeline.cpp:536, after CSceneForwardStage::ExecuteOpaque
+at :523, so CE's own forward shading already samples a one-frame-old froxel volume.
+Reading it from the SVO block at :460 therefore needs no pipeline reordering at all
+and the stock frame order is untouched.
+
+Not the accumulated volume (s_ptexVolumetricFog / GetVolumetricFogTex): it holds
+in-scatter accumulated FROM THE CAMERA, so the endpoint difference fog(hit) - fog(surface)
+is only valid when both endpoints sit on one camera ray. A mirror on a back wall
+reflecting something in front of it puts the hit nearer the camera than the surface,
+the difference goes negative and the reflection gets no fog - the most common mirror
+shot there is. The local volume's two fields are per-unit-length in-scattered radiance
+and extinction, so they integrate along any direction.
+
+ShadePS marches the segment surface -> hit with 8 steps using CE's own integrator
+(VolumeLighting.cfi RaymarchVolumetricFogCS, unchanged), projecting each sample point
+with SVO_ViewProj to get the froxel texcoord. Steps that land off screen, behind the
+near plane or past farDistCenter have no froxel data; they are counted and the analytic
+global fog covers their share of the segment as T_analytic ^ (1 - covered). With no
+coverage that collapses to the exact lerp this pass has always done, so r_VolumetricFog 0
+falls back cleanly.
+
+Only the reflected segment is added. The camera -> surface segment is fogged downstream
+by CFogStage / CVolumetricFogStage on the composited image; adding it here would count
+it twice. A miss is still not fogged - the sky and the probes carry their own aerial
+perspective.
+
+Exposure: the froxel volume is injected from a scattering colour the CPU pre-multiplies
+by GetSceneReferredExposure() (VolumetricFog.cpp:2513) and from pre-exposed tiled lights,
+so its in-scatter is EXPOSED radiance, the same units GetVolumetricFogColorInternal's own
+PS_HDR_RANGE_ADAPT_MAX multiply produces. Both go in before ShadePS's single divide.
+The transmittances are unit free.
+
+Debug view 18 = the in-scatter added at the hit; 19 = the transmittance of the reflected
+segment, tinted green where the froxels covered it and red where the analytic fog did.
+
+Bindings: SVO_VolFogInscatter t41, SVO_VolFogDensity t50 (the density has its own R16F
+volume when r_HDRTexFormat 0 makes the in-scatter volume R11G11B10F, which has no alpha),
+SVO_VolFogParams, and SVO_ViewProj, which is no longer debug-only. VolumetricFog.h gains
+four const accessors and no behaviour.
+
+All shader hunks are inside %_RT_QUALITY; all C++ is behind e_svoTI_RT_Active. cryfx_lint
+0 findings, rtharness2 17 compiles 0 errors, CryRenderD3D11 Profile 0 errors 0 warnings.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SCUvWGLCsqzm3VNMzp4uiS
+---
+ .../RenderDll/XRenderD3D9/D3D_SVO.cpp         |  84 +++++++++++-
+ .../CryEngine/RenderDll/XRenderD3D9/D3D_SVO.h |  10 ++
+ .../GraphicsPipeline/VolumetricFog.h          |  12 ++
+ .../HWScripts/CryFX/Total_Illumination.cfx    | 113 +++++++++++++---
+ .../CryFX/Total_Illumination_Shading.cfi      | 127 ++++++++++++++++++
+ 5 files changed, 327 insertions(+), 19 deletions(-)
+
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/D3D_SVO.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/D3D_SVO.cpp
+index 3a28efa6..5b882f84 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/D3D_SVO.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/D3D_SVO.cpp
+@@ -960,6 +960,84 @@ void CSvoRenderer::SetupShadeSkyConstants(CSvoFullscreenPass& rp)
+ 	rp.SetConstantArray(nameBoxOpacity, &vBoxOpacity, 1);
+ }
+ 
++// rt stage 5E (decision 09 section 9.3): VOLUMETRIC FOG ON THE REFLECTED SEGMENT.
++//
++// The frame-order question the decision note left open, answered by reading
++// StandardGraphicsPipeline.cpp:
++//
++//   :460  SVOGI                              <- we are here
++//   :523  CSceneForwardStage::ExecuteOpaque  <- samples the froxel volume (Fwd_volFogTex)
++//   :536  CVolumetricFogStage::Execute       <- BUILDS the froxel volume
++//
++// The forward opaque pass already reads a froxel volume that was written one frame earlier. So
++// the previous frame's volume is not a compromise we are introducing, it is the data CE's own
++// forward shading has always used, and reading it from SVOGI needs NO pipeline reordering at
++// all - the stock frame order is byte for byte unchanged, which is the whole reason this option
++// was preferred over moving CVolumetricFogStage::Execute() ahead of the SVO block.
++//
++// WHICH volume: NOT GetVolumetricFogTex() (s_ptexVolumetricFog). That one is the raymarch
++// OUTPUT and holds in-scatter accumulated FROM THE CAMERA, which can only answer "how much fog
++// is between the camera and this point" - a question about the camera ray, not about a reflected
++// segment. We bind the raymarch INPUT instead (GetLocalInscatterVolume, plus the separate
++// density volume when the in-scatter format has no alpha), whose two fields are the LOCAL
++// per-unit-length in-scattered radiance and extinction of each froxel and are therefore
++// integrable along any direction. The shader runs CE's own integrator over them
++// (VolumeLighting.cfi RaymarchVolumetricFogCS) along the reflected segment.
++//
++// Both volumes are plain _smart_ptr<CTexture> members of the stage, allocated in
++// ResizeResource and released only on a resolution change, so they are alive at :460; the pair
++// is double buffered by m_tick, and m_tick is only advanced inside Execute(), so
++// GetLocalInscatterVolume() at :460 is exactly the texture last frame's temporal reprojection
++// wrote. Nothing here writes to them.
++//
++// t41 and t50 are free on the ShadePass technique: the highest register ForwardShading.cfi /
++// TiledShading.cfi / ShadeLib.cfi reach is t49 (LTCTex_2), t41 is the one gap in that range,
++// and MAX_TMU is 64 off Orbis.
++void CSvoRenderer::SetupShadeFogTextures(CSvoFullscreenPass& rp)
++{
++	m_bVolFogBound = false;
++	m_bVolFogSeparateDensity = false;
++
++	if (!e_svoTI_RT_Active)
++		return;
++
++	// the fallback path, deliberately: with r_VolumetricFog 0 the stage is inactive and
++	// ShadePS keeps the analytic global fog it has always applied to the segment.
++	if (!gRenDev->m_bVolumetricFogEnabled || !RenderView()->IsGlobalFogEnabled() || !CVolumetricFogStage::IsEnabledInFrame())
++		return;
++
++	auto* pVolFog = RenderView()->GetGraphicsPipeline()->GetStage<CVolumetricFogStage>();
++	if (!pVolFog || !pVolFog->AreLocalVolumesValid())
++		return;
++
++	CTexture* pInscatter = pVolFog->GetLocalInscatterVolume();
++	if (!CTexture::IsTextureExist(pInscatter))
++		return;
++
++	const bool bSeparate = pVolFog->HasSeparateDensityVolume();
++	CTexture* pDensity = pVolFog->GetLocalDensityVolume();
++	if (bSeparate && !CTexture::IsTextureExist(pDensity))
++		return;
++
++	rp.SetTexture(41, pInscatter);                              // SVO_VolFogInscatter
++	rp.SetTexture(50, bSeparate ? pDensity : pInscatter);       // SVO_VolFogDensity
++
++	m_bVolFogBound = true;
++	m_bVolFogSeparateDensity = bSeparate;
++}
++
++void CSvoRenderer::SetupShadeFogConstants(CSvoFullscreenPass& rp)
++{
++	// Eight steps. The segment is at most e_svoTI_RT_MaxDistRay (48 m) long and the froxel grid
++	// is far coarser than that, so more steps buy resolution the source does not have; fewer
++	// start to miss a thin fog volume the segment crosses.
++	const float fSteps = 8.f;
++
++	static CCryNameR paramName("SVO_VolFogParams");
++	Vec4 vData(m_bVolFogBound ? 1.f : 0.f, m_bVolFogSeparateDensity ? 1.f : 0.f, fSteps, 0.f);
++	rp.SetConstantArray(paramName, (Vec4*)&vData, 1);
++}
++
+ // Hit shading. Reads the four g-data targets, runs CE's own forward lighting at the hit world
+ // position, writes the ALD + RGB pair DemosaicPass consumes.
+ void CSvoRenderer::ShadePass(SSvoTargetsSet* pTS)
+@@ -992,6 +1070,7 @@ void CSvoRenderer::ShadePass(SSvoTargetsSet* pTS)
+ 
+ 	SetupShadeForwardResources(rp);
+ 	SetupShadeSkyTextures(rp);
++	SetupShadeFogTextures(rp);
+ 
+ 	// rt stage 4A, debug view 13 = validator C (energy audit section 5). The only two resources
+ 	// the pass needs beyond hit shading, and they are bound ONLY for that view: the depth buffer
+@@ -1015,6 +1094,7 @@ void CSvoRenderer::ShadePass(SSvoTargetsSet* pTS)
+ 
+ 	SetupRTLightGridConstants(rp);
+ 	SetupShadeSkyConstants(rp);
++	SetupShadeFogConstants(rp);
+ 
+ 	{
+ 		static CCryNameR paramName("SVO_ShadeParams0");
+@@ -1043,7 +1123,9 @@ void CSvoRenderer::ShadePass(SSvoTargetsSet* pTS)
+ 		rp.SetConstantArray(paramName, (Vec4*)&vData, 1);
+ 	}
+ 
+-	if (bValidatorC)
++	// rt stage 5E: the froxel march projects each sample point with this matrix, so it is no
++	// longer debug-only. Uploaded when either consumer needs it, never otherwise.
++	if (bValidatorC || m_bVolFogBound)
+ 	{
+ 		// SVO_ViewProj lives in SetupCommonConstants, which ShadePass deliberately does not call
+ 		// (it needs none of the rest of it). Same matrix, same transpose, D3D_SVO.cpp:1039.
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/D3D_SVO.h b/Code/CryEngine/RenderDll/XRenderD3D9/D3D_SVO.h
+index a4b06656..8e98121b 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/D3D_SVO.h
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/D3D_SVO.h
+@@ -156,6 +156,9 @@ protected:
+ 	// rt stage 4A (decision 09 section 9.1): the engine's own sky for a ray that misses.
+ 	void                   SetupShadeSkyTextures(CSvoFullscreenPass& rp);
+ 	void                   SetupShadeSkyConstants(CSvoFullscreenPass& rp);
++	// rt stage 5E (decision 09 section 9.3): volumetric fog on the reflected segment.
++	void                   SetupShadeFogTextures(CSvoFullscreenPass& rp);
++	void                   SetupShadeFogConstants(CSvoFullscreenPass& rp);
+ 	template<class T> void SetupRTLightGridConstants(T& rp);
+ 
+ 	template<class T> void SetupCommonSamplers(T& rp);
+@@ -262,6 +265,13 @@ protected:
+ 	bool               m_bSkyDomeBound = false;
+ 	bool               m_bSkyBoxBound = false;
+ 
++	// rt stage 5E: whether SetupShadeFogTextures found live froxel volumes this frame, and
++	// whether the extinction density lives in its own R16F volume (r_HDRTexFormat 0 makes the
++	// in-scatter volume R11G11B10F, which has no alpha to put it in). The shader branches on
++	// both through SVO_VolFogParams.xy; with .x = 0 it keeps the analytic global fog.
++	bool               m_bVolFogBound = false;
++	bool               m_bVolFogSeparateDensity = false;
++
+ 	// rt stage 4B (decision 08). These three are resolved DEFENSIVELY in InitCVarValues instead
+ 	// of through INIT_SVO_CVAR, because their REGISTER_CVAR_AUTO lines live in Cry3DEngine's
+ 	// SceneTreeCVars.inl and that file had another agent's uncommitted work in it when this
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/VolumetricFog.h b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/VolumetricFog.h
+index 6e19bca7..c247052e 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/VolumetricFog.h
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/VolumetricFog.h
+@@ -87,6 +87,18 @@ public:
+ 	CTexture*   GetGlobalEnvProbeTex1() const;
+ 	void        ResetFrame();
+ 
++	// rt stage 5E (decision 09 section 9.3). Accessors only, no behaviour: the SVOGI ray tracer
++	// integrates fog along a REFLECTED segment, which is not the camera ray, so GetVolumetricFogTex()
++	// - the raymarch output, accumulated from the camera - cannot answer for it. These expose the
++	// raymarch INPUT instead: the local per-froxel in-scattered radiance and extinction density,
++	// which are per-unit-length fields and can be integrated along any direction. SVOGI runs
++	// before this stage in the frame, so what it reads is the previous frame's volume - exactly
++	// the staleness CSceneForwardStage already lives with, since it too runs before Execute().
++	CTexture* GetLocalInscatterVolume() const     { return GetInscatterTex(); }
++	CTexture* GetLocalDensityVolume() const       { return m_seperateDensity ? GetDensityTex() : nullptr; }
++	bool      HasSeparateDensityVolume() const    { return m_seperateDensity; }
++	bool      AreLocalVolumesValid() const        { return IsTexturesValid(); }
++
+ private:
+ 	static const int32 MaxFrameNum = 4;
+ 
+diff --git a/Engine/Shaders/HWScripts/CryFX/Total_Illumination.cfx b/Engine/Shaders/HWScripts/CryFX/Total_Illumination.cfx
+index d874fe70..d277b9d1 100644
+--- a/Engine/Shaders/HWScripts/CryFX/Total_Illumination.cfx
++++ b/Engine/Shaders/HWScripts/CryFX/Total_Illumination.cfx
+@@ -2441,6 +2441,42 @@ pixoutShade ShadePS(vtxOutWPOS IN)
+ 		if (SVO_ShadeParams0.y) // debug: flat albedo
+ 			acc = fwdAttribs.albedo;
+ 
++		// rt stage 5E (decision 09 section 9.3): the fog terms of the REFLECTED SEGMENT are
++		// COMPUTED here, before the debug block, and APPLIED after it - so that debug views 7-9
++		// still show the shading term without a veil over it, and views 18/19 can show the fog
++		// terms themselves. Nothing here touches `acc`.
++		//
++		// The analytic global fog is computed unconditionally and is the fallback: with
++		// r_VolumetricFog 0 (or an interior with no global fog, or a frame where the fog stage
++		// has no live volumes) SVO_VolFogParams.x is 0, the march is skipped, fFogCovered is 0
++		// and what is applied below is byte for byte the lerp this pass has always done.
++		float3 vFogInscatter = (float3)0.f;
++		float  fFogTrans = 1.f;
++		float  fFogCovered = 0.f;
++		float4 vFogAnalytic = float4(0, 0, 0, 1);
++		if (!bNoHit)
++		{
++			// Neo's vector, and the right one: the REFLECTED SEGMENT, not camera-to-hit. The fog
++			// over the camera-to-mirror segment is applied to this pixel again downstream by the
++			// scene fog pass (CFogStage / CVolumetricFogStage on the composited image), so
++			// anything this pass adds for that segment would be counted twice. A MISS is not
++			// fogged at all: its "hit distance" is the e_svoTI_RT_MaxDistRay sentinel, and a sky
++			// or probe sample already carries its own aerial perspective.
++			const float  fSegLen = abs(vGLD.w);
++			const float3 cameraToWorldPos = vRayDirN * fSegLen;
++			const float3 worldPos = vGPO.xyz + GetWorldViewPos();
++
++			const SFogParams fogParams = GetFogParams();
++			vFogAnalytic = GetVolumetricFogColor(fogParams, worldPos, cameraToWorldPos);
++
++			if (SVO_VolFogParams.x > 0.f)
++			{
++				const float3 vSurfaceAbs = worldPos - cameraToWorldPos;
++				const SVolumetricFogParams vfp = GetVolumetricFogParams();
++				SVO_RT_MarchSegmentFog(vfp, vSurfaceAbs, vRayDirN, fSegLen, vFogInscatter, fFogTrans, fFogCovered);
++			}
++		}
++
+ 		// rt stage 2C: debug views 7-9, the three questions the picture cannot answer on its own.
+ 		// They sit HERE, before the fog and the writer clamp, so that what they show is the term
+ 		// itself and not the term plus a veil. The exposure divide below and ApplyGI's multiply
+@@ -2502,6 +2538,30 @@ pixoutShade ShadePS(vtxOutWPOS IN)
+ 				acc = (bNoHit || !bMatExtras) ? (float3)0.f : (float3)1.f;
+ 				bRawDebug = true;
+ 			}
++			else if (nDbg == 18)
++			{
++				// rt stage 5E. 18 = the fog IN-SCATTER added at the hit, i.e. the light the
++				// reflected segment picks up on its way back to the mirror, in exposed radiance -
++				// the same units view 0 is in, so a value that reads as mid grey here is a fog
++				// contribution as bright as a mid grey surface. Black = this pixel's reflected
++				// segment sits in clear air (or the froxel volume does not cover it and the
++				// analytic fog is doing the work, which this view deliberately does NOT show).
++				acc = vFogInscatter;
++				bRawDebug = true;
++			}
++			else if (nDbg == 19)
++			{
++				// rt stage 5E. 19 = the TRANSMITTANCE of the reflected segment, the factor the
++				// hit's own radiance is multiplied by. WHITE = clear air, the reflection arrives
++				// undimmed; BLACK = the segment is optically thick and the reflection is pure
++				// fog. GREEN tint = the froxel volume covered the segment; RED tint = it did not
++				// and the analytic global fog is covering that share (off screen, behind the near
++				// plane, or past the froxel range - see the gap list in
++				// Total_Illumination_Shading.cfi). A mirror that is all red here is telling you
++				// the froxel path never ran, not that there is no fog.
++				acc = float3(1.f - fFogCovered, fFogCovered, 0.f) * 0.35f + (float3)fFogTrans * 0.65f;
++				bRawDebug = true;
++			}
+ 			else if (nDbg == 13)
+ 			{
+ 				// 13 = VALIDATOR C (energy audit section 5 / research 06 section 8, option C).
+@@ -2554,27 +2614,44 @@ pixoutShade ShadePS(vtxOutWPOS IN)
+ 		}
+ #endif
+ 
+-		// Global fog, added BEFORE the exposure divide: GetVolumetricFogColorInternal already
+-		// multiplies the authored fog colour by PS_HDR_RANGE_ADAPT_MAX on this branch, and `acc`
+-		// is built from already-exposed lights, so both sides of the lerp are in the same units.
++		// Fog on the reflected segment, added BEFORE the exposure divide. Both sources are in
++		// EXPOSED radiance: GetVolumetricFogColorInternal multiplies the authored fog colour by
++		// PS_HDR_RANGE_ADAPT_MAX itself (VolumetricFog.cfi:154), and the froxel volume was
++		// injected from a scattering colour the CPU pre-multiplied by GetSceneReferredExposure()
++		// (VolumetricFog.cpp:2513). `acc` is built from already-exposed lights, so all three are
++		// in the same units. The transmittances are unit free.
+ 		//
+-		// rt stage 2C, finding (d): the vector passed to the fog is Neo's - the REFLECTED
+-		// SEGMENT, not the camera-to-hit vector - and that is the right choice, because the fog
+-		// over the camera-to-mirror segment is applied to this pixel again downstream by the
+-		// scene fog pass. Passing vGPO.xyz (camera to hit) instead would fog that segment twice.
+-		// What was wrong is that a MISS got fogged too: on a miss the "hit distance" is the
+-		// arbitrary e_svoTI_RT_MaxDistRay sentinel and the hit position is a point 24 m along a
+-		// ray that hit nothing, so the lerp pulled a sky/probe colour a fixed fraction of the way
+-		// towards the fog colour everywhere at once - a flat grey veil over every part of the
+-		// reflection that escaped, which is exactly the "hazy and washed out" report. A miss is
+-		// resolved by the probes, and a sky probe already carries its own aerial perspective.
++		// THE FORMULA. S = the reflecting surface, H = the hit. What this pass owns is the
++		// segment S->H and nothing else; the camera->S segment is fogged downstream by CFogStage /
++		// CVolumetricFogStage on the composited image, so adding it here would count it twice.
++		//
++		//   acc  <-  acc * T_froxel + I_froxel          (the part of S->H the froxels covered)
++		//   acc  <-  lerp(C_analytic, acc, T_analytic ^ (1 - covered))
++		//
++		// The second line is the leftover. The analytic fog's transmittance is exp2(-k * length),
++		// so raising it to (1 - covered) is the analytic fog of exactly the uncovered share of
++		// the segment - and when covered = 0 it collapses to T_analytic, i.e. to the lerp this
++		// pass has always done. There is no double counting between the two: the froxel volume
++		// already has the analytic global fog density injected into it
++		// (VolumeLighting.cfi:2000 GetExponentialHeightFogDensity), so the two terms are
++		// complementary shares of one segment, never the same share twice. The split is by
++		// FRACTION, not by position, so an uncovered step in the middle is charged as if it were
++		// at the far end; with fog this smooth that is below the noise of one GGX sample.
++		//
++		// A MISS is still not fogged: on a miss the "hit distance" is the e_svoTI_RT_MaxDistRay
++		// sentinel and the hit position is a point that far along a ray that hit nothing, so the
++		// lerp pulled a sky/probe colour a fixed fraction of the way towards the fog colour
++		// everywhere at once - a flat grey veil over every part of the reflection that escaped.
++		// A miss is resolved by the sky or the probes, and both carry their own aerial perspective.
+ 		if (!bRawDebug && !bNoHit)
+ 		{
+-			const float3 cameraToWorldPos = vRayDirN * abs(vGLD.w);
+-			const float3 worldPos = vGPO.xyz + GetWorldViewPos();
+-			const SFogParams fogParams = GetFogParams();
+-			const float4 localFogColor = GetVolumetricFogColor(fogParams, worldPos, cameraToWorldPos);
+-			acc = lerp(localFogColor.xyz, acc, saturate(localFogColor.w));
++			acc = acc * fFogTrans + vFogInscatter;
++			// the ternary is not cosmetic: with no froxel coverage this has to be the SAME
++			// expression as before, not pow(x, 1), which is exp2(log2(x)) and not bit exact.
++			const float fAnalyticTrans = (fFogCovered > 0.f)
++			                             ? pow(max(saturate(vFogAnalytic.w), 0.0001f), 1.f - fFogCovered)
++			                             : saturate(vFogAnalytic.w);
++			acc = lerp(vFogAnalytic.xyz, acc, saturate(fAnalyticTrans));
+ 		}
+ 
+ 		// Neo clamps to a hard 8 here, which is roughly the top of the RGBM range the voxel
+diff --git a/Engine/Shaders/HWScripts/CryFX/Total_Illumination_Shading.cfi b/Engine/Shaders/HWScripts/CryFX/Total_Illumination_Shading.cfi
+index 70fb9165..48203858 100644
+--- a/Engine/Shaders/HWScripts/CryFX/Total_Illumination_Shading.cfi
++++ b/Engine/Shaders/HWScripts/CryFX/Total_Illumination_Shading.cfi
+@@ -167,6 +167,133 @@ bool SVO_RT_SampleSky(const float3 vDir, out float3 vRadiance)
+ 	return true;
+ }
+ 
++///////////////////////////////////////////////////////////////////////////////////
++// rt stage 5E - VOLUMETRIC FOG ON THE REFLECTED SEGMENT (decision 09 section 9.3).
++//
++// WHICH VOLUME, AND WHY THE PREVIOUS FRAME IS NOT A COMPROMISE.
++// CVolumetricFogStage::Execute runs at StandardGraphicsPipeline.cpp:536, i.e. AFTER
++// CSceneForwardStage::ExecuteOpaque at :523. So the froxel volume CE's OWN forward shading
++// path samples is already one frame old - Fwd_ApplyFog reads a texture last frame wrote.
++// Sampling last frame's volume from SVOGI (:460) is therefore not a hack we invented, it is
++// exactly the staleness the engine already ships with, and it needs no pipeline reordering:
++// the stock frame order is untouched, so the native path cannot move.
++//
++// WHICH OF THE TWO VOLUMES. There are two:
++//   * CRendererResources::s_ptexVolumetricFog - the raymarch OUTPUT. At (x,y,k) it holds
++//     in-scatter ACCUMULATED FROM THE CAMERA to slice k, premultiplied by the camera
++//     transmittance, and .w = that transmittance. This is what Fwd_volFogTex / GetVolumetricFogValue
++//     read. It answers exactly one question: "how much fog is between the camera and this point".
++//   * CVolumetricFogStage::GetInscatterTex() - the raymarch INPUT, after temporal reprojection.
++//     At (x,y,k) it holds the LOCAL in-scattered radiance of that froxel (range-shifted) and the
++//     LOCAL extinction density. Both are per-unit-length fields: VolumeLighting.cfi:2107-2116
++//     multiplies them by a step size it computes itself.
++// A reflected segment is not a camera ray, so the accumulated volume cannot answer for it. The
++// endpoint difference fog(hit) - fog(surface) is only valid when the two endpoints lie on the
++// SAME camera ray, and it fails in the single most common mirror shot there is: a mirror on a
++// back wall reflecting something in FRONT of it puts the hit nearer the camera than the surface,
++// the difference goes negative, and the reflection gets no fog at all. A mirror reflecting
++// sideways gives two endpoints at nearly the same depth and, again, no fog - while the direct
++// view of the same object is fogged. So we take the LOCAL volume and run CE's own integrator
++// (VolumeLighting.cfi RaymarchVolumetricFogCS, the four lines below, unchanged) along OUR
++// segment instead of along the camera ray.
++//
++// WHAT THIS STILL CANNOT DO, stated rather than hidden:
++//   1. The froxel volume only exists inside the camera frustum and only out to farDistCenter.
++//      A sample point that projects off screen, behind the near plane, or past that range has no
++//      froxel data at all. Those steps are counted and the analytic global fog covers their share
++//      of the segment (see the pow() in ShadePS). A mirror reflecting something off screen is
++//      therefore fogged analytically, not by the froxels - that is a property of froxel fog, not
++//      a bug we can fix here.
++//   2. The phase function is baked into the volume for the CAMERA direction
++//      (CombineInscatteringSunAndRegularLights takes normalizedEyeRay). A reflected ray sees the
++//      wrong anisotropic lobe. Isotropic fog is exact; a strong sun lobe is not.
++//   3. One frame of lag, and it is the PREVIOUS frame's camera space (the temporal reprojection
++//      wrote it in frame N-1's grid) while we project with frame N's SVO_ViewProj. Fog is low
++//      frequency and this is the same lag the forward pass lives with.
++//
++// EXPOSURE. The volume is written by the injection pass from CVolumetricFogStage's own
++// cbVolFogInj, whose scattering colour FillForwardParams (VolumetricFog.cpp:2513) multiplies by
++// GetSceneReferredExposure() on the CPU, and whose local lights come from the tiled list, which
++// is pre-exposed too. So the in-scatter this returns is EXPOSED radiance, the same units `acc`
++// is in and the same units GetVolumetricFogColorInternal's own PS_HDR_RANGE_ADAPT_MAX multiply
++// produces for the analytic fog. It goes in before ShadePS's single divide. The transmittance is
++// unit free and carries no exposure either way.
++///////////////////////////////////////////////////////////////////////////////////
++
++// VolumeLighting.cfi:19 VOLUMETRIC_FOG_RANGE_SHIFT_INSCATTER. Repeated here because
++// VolumeLighting.cfi cannot be included - it declares u0 / t0 / t1 at file scope and would
++// collide with everything this technique binds.
++#define SVO_VOLFOG_INSCATTER_SHIFT (16.0f)
++
++Texture3D<float4> SVO_VolFogInscatter : register(t41);
++Texture3D<float4> SVO_VolFogDensity   : register(t50);
++
++// (bound, separate density volume, step count, 0). Set by CSvoRenderer::SetupShadeFogConstants
++// only when e_svoTI_RT_Active and the fog stage really has live volumes; .x = 0 means ShadePS
++// keeps the analytic global fog it has always used.
++float4 SVO_VolFogParams;
++
++// CE's own froxel integrator (VolumeLighting.cfi:2104-2118), walked along an arbitrary world
++// space segment instead of along the camera ray.
++//   vStartAbs  absolute world position of the REFLECTING surface
++//   vDirN      unit direction of the reflected ray
++//   fLen       length of the reflected segment (surface -> hit)
++// Returns the in-scatter added along the segment (exposed radiance, already attenuated by the
++// fog in front of it), the transmittance of the segment, and the fraction of the segment the
++// froxel volume actually covered.
++void SVO_RT_MarchSegmentFog(in SVolumetricFogParams vfp, in float3 vStartAbs, in float3 vDirN, in float fLen,
++                            out float3 vInscatter, out float fTransmittance, out float fCovered)
++{
++	vInscatter = (float3)0.f;
++	fTransmittance = 1.f;
++	fCovered = 0.f;
++
++	const float fSteps = max(SVO_VolFogParams.z, 1.f);
++	const int   nSteps = (int)fSteps;
++	const float fStep = fLen / fSteps;
++	const bool  bSepDensity = (SVO_VolFogParams.y > 0.f);
++
++	// the volume reaches farDistCenter at the centre of the screen and further towards the
++	// corners; farDistCenter is the conservative choice - a step past it is handed to the
++	// analytic fog rather than clamped onto the last slice, which would smear the edge slice
++	// across the whole remaining segment.
++	const float fMaxDepth = min(vfp.farDistCenter, vfp.nearDist + vfp.farMinusNearDist);
++
++	[loop] for (int i = 0; i < nSteps; ++i)
++	{
++		const float3 vP = vStartAbs + vDirN * (fStep * ((float)i + 0.5f));
++
++		// same matrix, same transpose as debug view 13: .w of a view-projection product is the
++		// linear view depth, which is exactly what GetVolumetricFogDepthTexcoord wants.
++		const float4 vProj = mul(SVO_ViewProj, float4(vP, 1));
++		if (vProj.w <= vfp.nearDist || vProj.w >= fMaxDepth)
++			continue;
++
++		float2 vUV = (vProj.xy / vProj.w) * 0.5f + 0.5f;
++		vUV.y = 1.f - vUV.y;
++		if (any(vUV != saturate(vUV)))
++			continue;
++
++		float3 tc;
++		tc.xy = vUV;
++		tc.z = saturate(GetVolumetricFogDepthTexcoord(vfp, vProj.w));
++
++		const float4 vRaw = SVO_VolFogInscatter.SampleLevel(SampStateTrilinearClamp, tc, 0.f);
++		const float fDensity = bSepDensity ? SVO_VolFogDensity.SampleLevel(SampStateTrilinearClamp, tc, 0.f).x : vRaw.w;
++
++		const float3 S = vfp.scatterCoefficient * (vRaw.xyz / SVO_VOLFOG_INSCATTER_SHIFT);
++		const float muE = max(0.000000001f, vfp.extinctionCoefficient * fDensity);
++		const float trns = exp(-muE * fStep);
++		const float3 Sint = ((-S * trns) + S) / muE;
++
++		vInscatter += fTransmittance * Sint;
++		fTransmittance *= trns;
++		fCovered += 1.f;
++	}
++
++	fCovered /= fSteps;
++}
++
+ ///////////////////////////////////////////////////////////////////////////////////
+ 
+ // Neo reads (worldPos - min) / cellSize with no clamp, so any hit outside the grid box
+-- 
+2.47.1.windows.1
+

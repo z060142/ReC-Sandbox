@@ -1,0 +1,409 @@
+From e3695d038c32e602e68b09b0445353c71fe1fbb7 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Mon, 14 Sep 2026 00:47:52 +0800
+Subject: [PATCH 191/213] fix: ray traced hits get a real specular response (F0
+ was quantised to zero)
+
+RT_ProcessBestHit packed the hit reflectance with PackRGB, which is 3 bits per
+channel (RT_RGB_RANGE 8). CE's dielectric F0 is MatSpecColor averaged - 0.0369
+for a plain material, a hard coded 0.02 for terrain - and round(0.0369 * 7) = 0,
+so every non-metal hit arrived at ShadePS with F0 exactly 0. shadeLib.cfi
+SpecularBRDF then derives f90 = saturate(dot(f0, 1/3) / 0.02) = 0 and returns
+fresnel * spec = 0: no sun highlight, no local light highlight, at every
+dielectric hit in every reflection. Only F0 >= 0.0714 survived the first step.
+
+New packing, exact integers in both directions:
+
+  HITPOS.w (RGBA32F, 24 bit mantissa)
+      ((hueCode * 256) + greyIdx) * 256 + smoothIdx,  max 14155775 < 2^24
+      smoothIdx  8 bit linear        smoothness = smoothIdx / 255
+      greyIdx    8 bit SQUARE law    F0max      = (greyIdx / 255)^2
+      hueCode    PackRGB base 6      F0         = F0max * hue (hue.max == 1)
+      The square law puts 49 of its 256 steps below F0 0.04, so a dielectric now
+      round trips to about 0.05 % (0.0369 -> 0.03692) instead of to zero, and a
+      coloured metal keeps its tint to ~2.6 bits per channel.
+
+  ALD.w (RGBA16F, integers exact to 2048)
+      +-(PackRGB(emissive hue) + 1). The emissive hue moved here to free the
+      whole HITPOS.w mantissa; the +1 keeps the lane non zero so the veg leaves
+      sign can never be lost - which is how the old encoding lost it, hanging
+      the sign on a reflectance code that was 0 for every dielectric.
+
+Sentinels unchanged: RAYDIR.w > 0 is still "this is an RT pixel", ALD.w's sign
+is still the transmittance lighting model, HITPOS.w's sign is still reserved for
+stage 4 refraction.
+
+SRTInfo: normal_reflectance -> normal_emissive (.w is the ALD.w lane now), new
+float3 reflectance holding the linear per channel F0, emissiveTintPacked folded
+into normal_emissive.w.
+
+Debug view 12 now packs and unpacks before displaying, so it shows what ShadePS
+will actually read; black finally means "the material record has no reflectance"
+rather than "the encoding ate it".
+
+Also documents, at the site, the smoothness ground truth: matInfo1.z is exactly
+MatSpecColor.w, and the atlas normal alpha is a constant 1 for every _ddna
+because CRenderer::DXTDecompress sets sourceChannels = 2 for BC5U and
+DXTDecompressRow writes 255 into the alpha byte. The hit gets the material's
+smoothness scalar and no smoothness map; that gap is CPU side and is left
+visible rather than papered over.
+
+Validated with scene-notes/rt/tools/rtharness2: ShadePS, ConeTracePS, DemosaicPS
+and UpScalePS in four flag sets plus BuildRayTracingLightListCS - 17 compiles,
+0 errors. Shader only: no C++ change, no new permutation bit, RunTime.ext
+untouched.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SCUvWGLCsqzm3VNMzp4uiS
+---
+ .../Shaders/HWScripts/CryFX/CommonSVO_RT.cfi  | 178 +++++++++++++++---
+ .../HWScripts/CryFX/Total_Illumination.cfx    |  49 ++---
+ 2 files changed, 183 insertions(+), 44 deletions(-)
+
+diff --git a/Engine/Shaders/HWScripts/CryFX/CommonSVO_RT.cfi b/Engine/Shaders/HWScripts/CryFX/CommonSVO_RT.cfi
+index fdebb221..1ccf3138 100644
+--- a/Engine/Shaders/HWScripts/CryFX/CommonSVO_RT.cfi
++++ b/Engine/Shaders/HWScripts/CryFX/CommonSVO_RT.cfi
+@@ -98,16 +98,22 @@ struct SBestHit
+ struct SRTInfo
+ {
+ 	float3   vFocus;              // ideal direction (normal for diffuse, reflect for specular)
+-	float4   normal_reflectance;  // .xyz world normal (length carries emittance), .w PackRGB(reflectance)
+-	float4   albedo_smoothness;
++
++	// rt stage 2D: .xyz is the world normal and its LENGTH carries (1 + emittance), as before.
++	// .w is the ALD.w g-data lane: +-(PackRGB(emissive hue) + 1), the sign carrying the
++	// veg-leaves lighting model. The +1 exists so the lane is never exactly zero and the sign
++	// therefore always survives - which is exactly what the old packing got wrong, because it
++	// hung the sign on a reflectance code that quantised to 0 for every dielectric.
++	float4   normal_emissive;
++	float4   albedo_smoothness;   // .xyz albedo * tint, .w smoothness in [0,1]
+ 	float4   hitpos;              // .xyz world, .w = 1 when this pixel carries G-data
+ 	float4   raydir;              // .xyz direction, .w hit distance
+ 	float    stippleAlphaRef;
+ 
+-	// rt stage 2: PackRGB of the emissive HUE, max-channel normalised to [0,1]^3. The emissive
+-	// MAGNITUDE rides in the length of normal_reflectance.xyz; the two are multiplied back
+-	// together in ShadePS. 511 (= white) whenever the material has no emissive map.
+-	float    emissiveTintPacked;
++	// rt stage 2D: the hit's LINEAR reflectance (F0), per channel, exactly
++	// matInfo1.y * specularMap.rgb. Packed into HITPOS.w by RT_PackHitMaterial; kept here
++	// unpacked as well so debug view 12 shows the value the material actually has.
++	float3   reflectance;
+ 
+ #if %_RT_PARTICLE_SHADOW
+ 	// rt stage 2C, debug only: the raw tangent-space _ddna sample of the hit, before the
+@@ -259,6 +265,98 @@ float PackRGB(const float3 col)
+ 	return (float)(colI.x + colI.y * RT_RGB_RANGE + colI.z * RT_RGB_RANGE * RT_RGB_RANGE);
+ }
+ 
++///////////////////////////////////////////////////////////////////////////////////
++// rt stage 2D - the hit's reflectance and smoothness lane (HITPOS.w)
++//
++// WHY THIS EXISTS. Until 2D the hit's F0 travelled through PackRGB, which is 3 bits per
++// channel (RT_RGB_RANGE 8, eight levels). CE's dielectric F0 is MatSpecColor averaged, which
++// is 0.0369 for a plain material and a hard-coded 0.02 for terrain, and
++//     round(0.0369 * 7) = 0
++// so EVERY dielectric hit arrived at ShadePS with F0 exactly 0. shadeLib.cfi SpecularBRDF
++// then computes f90 = saturate(dot(f0, 1/3) / 0.02) = 0 and returns fresnel * spec = 0: no
++// sun highlight, no local-light highlight, nothing, at every non-metal hit in every
++// reflection. The first surviving step of the old encoding was 1/7 = 0.143, i.e. only a
++// material with F0 >= 0.0714 kept any specular at all.
++//
++// THE BUDGET. The g-data has exactly two spare lanes and both are needed:
++//   ALD.w      RGBA16F  - integers are exact to 2048, so 11 bits, and the sign is free.
++//   HITPOS.w   RGBA32F  - a 24 bit mantissa, so integers are exact to 2^24 - 1.
++// RAYDIR.w is the hit distance and the "is this an RT pixel" sentinel, RGB.w is the
++// reflecting pixel's linear depth that DemosaicPS bilaterally weights on, ALD.xyz is the
++// normal times (1 + emittance) and RGB.xyz is the albedo. Nothing else is free.
++//
++// THE LAYOUT. The emissive hue moves out to ALD.w (it fits in 9 bits and fp16 holds it
++// exactly), which frees the whole 24 bit HITPOS.w mantissa for the three values that the
++// specular lobe actually reads:
++//
++//   HITPOS.w = ((hueCode * 256) + greyIdx) * 256 + smoothIdx        (max 14 155 775 < 2^24)
++//
++//     smoothIdx  8 bits, linear        smoothness = smoothIdx / 255
++//     greyIdx    8 bits, SQUARE law    F0max      = (greyIdx / 255)^2
++//     hueCode    PackRGB base 6 (216)  F0         = F0max * hue,  hue.max == 1 by construction
++//
++// The square law is the point of the fix: a linear 8 bit grey has a 0.0039 step, which is 11 %
++// of a 0.0369 dielectric; the square law puts 49 of its 256 steps below 0.04, so a dielectric
++// resolves to about 4 % RELATIVE - two orders of magnitude better than the old encoding, which
++// resolved it to zero. The hue is max-channel normalised before quantisation so the maximum
++// channel always lands on exactly 1.0 and the magnitude is carried entirely by greyIdx; a
++// coloured metal (gold, copper) keeps its tint to ~2.6 bits per channel, which is what is left
++// after the dielectric case has been given the precision it needs. Both are exact integers, so
++// the round trip is deterministic and testable.
++///////////////////////////////////////////////////////////////////////////////////
++
++#define RT_HUE_RANGE     6      // levels per channel in the reflectance hue code (6^3 = 216)
++#define RT_SMOOTH_STEPS  255    // smoothIdx in [0, 255]
++#define RT_GREY_STEPS    255    // greyIdx   in [0, 255]
++
++float RT_PackHitMaterial(const float3 vReflectance, const float fSmoothness)
++{
++	const float3 vRefl = max(vReflectance, 0.f);
++	const float  fMax  = min(max(vRefl.x, max(vRefl.y, vRefl.z)), 1.f);
++
++	// hue, max-channel normalised; a black F0 gets the white hue so that greyIdx alone decides
++	const float3 vHue = (fMax > 1e-5f) ? saturate(vRefl / fMax) : (float3)1.f;
++	const uint3  hueI = (uint3)clamp((int3)(vHue * (RT_HUE_RANGE - 1) + 0.5f), 0, RT_HUE_RANGE - 1);
++	const uint   hueCode = hueI.x + hueI.y * RT_HUE_RANGE + hueI.z * RT_HUE_RANGE * RT_HUE_RANGE;
++
++	const uint greyIdx   = (uint)clamp((int)(sqrt(fMax) * RT_GREY_STEPS + 0.5f), 0, RT_GREY_STEPS);
++	const uint smoothIdx = (uint)clamp((int)(saturate(fSmoothness) * RT_SMOOTH_STEPS + 0.5f), 0, RT_SMOOTH_STEPS);
++
++	return (float)(((hueCode * 256u) + greyIdx) * 256u + smoothIdx);
++}
++
++void RT_UnpackHitMaterial(const float fPacked, out float3 vReflectance, out float fSmoothness)
++{
++	uint code = (uint)(abs(fPacked) + 0.5f);
++
++	const uint smoothIdx = code & 255u; code /= 256u;
++	const uint greyIdx   = code & 255u; code /= 256u;
++	uint       hueCode   = code;
++
++	fSmoothness = (float)smoothIdx * (1.f / RT_SMOOTH_STEPS);
++
++	const float fGrey = (float)greyIdx * (1.f / RT_GREY_STEPS);
++
++	float3 vHue;
++	vHue.x = hueCode % RT_HUE_RANGE; hueCode /= RT_HUE_RANGE;
++	vHue.y = hueCode % RT_HUE_RANGE; hueCode /= RT_HUE_RANGE;
++	vHue.z = hueCode % RT_HUE_RANGE;
++
++	vReflectance = (fGrey * fGrey) * (vHue * (1.f / (RT_HUE_RANGE - 1)));
++}
++
++// ALD.w: the emissive hue code, offset by one so the lane is never zero, signed by the
++// lighting model. Decoded with RT_UnpackEmissiveHue in ShadePS.
++float RT_PackEmissiveHue(const float3 vHue, const bool bVegLeaves)
++{
++	return (bVegLeaves ? -1.f : 1.f) * (PackRGB(vHue) + 1.f);
++}
++
++float3 RT_UnpackEmissiveHue(const float fPacked)
++{
++	return UnpackRGB(max(abs(fPacked) - 1.f, 0.f));
++}
++
+ ///////////////////////////////////////////////////////////////////////////////////
+ // Ray length
+ ///////////////////////////////////////////////////////////////////////////////////
+@@ -284,12 +382,12 @@ void RT_ResetInfo(const float3 vFocus, const float fMaxDist, const float fCamDis
+                   const float fStippleAlphaRef, const bool bOnlyOcclusion)
+ {
+ 	g_rtInfo.vFocus = vFocus;
+-	g_rtInfo.normal_reflectance = 0;
++	g_rtInfo.normal_emissive = 0;
+ 	g_rtInfo.albedo_smoothness = 0;
+ 	g_rtInfo.hitpos = 0;
+ 	g_rtInfo.raydir = 0;
+ 	g_rtInfo.stippleAlphaRef = fStippleAlphaRef;
+-	g_rtInfo.emissiveTintPacked = 0;
++	g_rtInfo.reflectance = 0;
+ #if %_RT_PARTICLE_SHADOW
+ 	g_rtInfo.dbgAtlasNormal = float4(0.5f, 0.5f, 1.0f, 1.0f);
+ #endif
+@@ -652,11 +750,16 @@ void RT_ProcessBestHit(const Ray rOrig, inout SRTInfo rtInfo, const float fDista
+ 		// tangent normal: diffuse colour but no surface detail, and a mirror-flat specular lobe.
+ 		// Driven off our own cvar lane instead; 0 (the default) now means "no fade".
+ 		const float fBumpFade = RT_GetNormalsFade(best.camDistance + best.nearestHitDist);
+-		rtInfo.normal_reflectance.xyz = normalize(mul(lerp(float4(0.5, 0.5, 1.0, 1.0), vNor, matInfo1.x * fBumpFade).xyz * 2.f - 1.f, mTangentToWS));
++		rtInfo.normal_emissive.xyz = normalize(mul(lerp(float4(0.5, 0.5, 1.0, 1.0), vNor, matInfo1.x * fBumpFade).xyz * 2.f - 1.f, mTangentToWS));
+ 
+-		rtInfo.normal_reflectance.w = PackRGB(matInfo1.y * vSpc.xyz);
+-		if (matInfo3.z == VOX_RT_SHADING_VEG_LEAVES) // encode the transmittance lighting model
+-			rtInfo.normal_reflectance.w = -rtInfo.normal_reflectance.w;
++		// rt stage 2D: the reflectance is kept LINEAR and per channel here and is packed into
++		// HITPOS.w at the end of ConeTracePS (RT_PackHitMaterial). It used to be PackRGB'd into
++		// this lane at 3 bits per channel, which rounded CE's 0.0369 dielectric F0 to exactly 0
++		// and cost every non-metal hit its entire specular response - see the block above
++		// RT_PackHitMaterial. matInfo1.y is MatSpecColor averaged and vSpc is the atlas copy of
++		// the same specular map Illum.cfx multiplies it by, so this is Illum.cfx's own
++		// attribs.Reflectance with the material colour reduced to a scalar (2B gap).
++		rtInfo.reflectance = max(matInfo1.y * vSpc.xyz, 0.f);
+ 
+ 		// Emissive, matching Illum.cfx IlluminationPS:
+ 		//     emittance = MatEmissiveColor.rgb * MatEmissiveColor.w * MAT_EMISSIVE_UNIT_SCALE
+@@ -667,7 +770,8 @@ void RT_ProcessBestHit(const Ray rOrig, inout SRTInfo rtInfo, const float fDista
+ 		// the mask splits into a magnitude (vEmm.a) and a hue (vEmm.rgb), and we send them down
+ 		// two different channels because there is no free float3 in the g-data:
+ 		//   magnitude -> the length of the normal, as before
+-		//   hue       -> PackRGB into the integer part of hitpos.w, next to smoothness
++		//   hue       -> PackRGB into ALD.w (rt stage 2D; it was hitpos.w's integer part until
++		//                the reflectance needed the whole of that mantissa)
+ 		// The hue is max-channel normalised so it fits PackRGB's [0,1] range, and the luminance
+ 		// that normalisation removes is divided back into the magnitude, so that
+ 		// magnitude * hue == matInfo1.w * MAT_EMISSIVE_UNIT_SCALE * map.rgb * map.a exactly.
+@@ -676,12 +780,30 @@ void RT_ProcessBestHit(const Ray rOrig, inout SRTInfo rtInfo, const float fDista
+ 			const float3 vEmmHue = vEmm.rgb / max(max(vEmm.r, max(vEmm.g, vEmm.b)), 1e-4f);
+ 			const float  fEmmHueLum = max(RT_EmissiveMaskLuminance(vEmmHue), 1e-4f);
+ 
+-			rtInfo.normal_reflectance.xyz *= (1.f + matInfo1.w * MAT_EMISSIVE_UNIT_SCALE * vEmm.a / fEmmHueLum);
+-			rtInfo.emissiveTintPacked = PackRGB(vEmmHue);
++			rtInfo.normal_emissive.xyz *= (1.f + matInfo1.w * MAT_EMISSIVE_UNIT_SCALE * vEmm.a / fEmmHueLum);
++
++			// rt stage 2D: the emissive hue moved from HITPOS.w's integer part to this lane so
++			// that the whole 24 bit HITPOS.w mantissa is available to the reflectance. The
++			// veg-leaves lighting model rides on the sign, as it did on the old reflectance
++			// code, and the +1 inside RT_PackEmissiveHue keeps the lane non-zero so that sign
++			// cannot be lost.
++			rtInfo.normal_emissive.w = RT_PackEmissiveHue(vEmmHue, matInfo3.z == VOX_RT_SHADING_VEG_LEAVES);
+ 		}
+ 
+ 		rtInfo.albedo_smoothness.xyz = best.vAlb.xyz * matInfo2.xyz;
+-		rtInfo.albedo_smoothness.w = matInfo1.z * saturate(vNor.w); // _ddna alpha carries smoothness
++		// SMOOTHNESS, and what it is really made of (rt stage 2D, verified end to end):
++		//   matInfo1.z = GetStrengthValue(EFTT_SMOOTHNESS) = REG_PM_SPECULAR_COL.w = MatSpecColor.w,
++		//                i.e. exactly the scalar half of Illum.cfx's
++		//                "attribs.Smoothness = MatSpecColor.w * GetSmoothnessTex(smoothnessTex)".
++		//   vNor.w     = the atlas normal layer's alpha. CE ships _ddna as BC5U, and
++		//                CRenderer::DXTDecompress sets sourceChannels = 2 for BC5U, after which
++		//                DXTDecompressRow writes a literal 255 into the alpha byte
++		//                (Renderer.cpp:3156, 3288-3310). So for every _ddna this is a CONSTANT 1.
++		// The hit therefore gets the material's smoothness SCALAR and no smoothness MAP: gloss is
++		// uniform across each material in a reflection while the same surface seen directly is
++		// modulated by smoothnessTex. That is a CPU-side gap (the record has no smoothness-map
++		// slot); it is not a shader bug and is not papered over here. Debug view 11 shows it.
++		rtInfo.albedo_smoothness.w = matInfo1.z * saturate(vNor.w);
+ 
+ 		rtInfo.hitpos.xyz = rOrig.startpoint + rOrig.direction * (best.nearestHitDist - fDistanceIn);
+ 		rtInfo.hitpos.w = 1;
+@@ -692,11 +814,15 @@ void RT_ProcessBestHit(const Ray rOrig, inout SRTInfo rtInfo, const float fDista
+ 	else
+ 	{
+ 		// miss - G-data for the probe fallback
+-		rtInfo.normal_reflectance.xyz = rtInfo.vFocus;
+-		rtInfo.normal_reflectance.w = IsDiffuseMode() ? PackRGB(float3(0, 0, 0)) : PackRGB(float3(1, 1, 1));
+-
++		rtInfo.normal_emissive.xyz = rtInfo.vFocus;
++		// a miss emits nothing: the magnitude (the normal's length) is 1, i.e. emittance 0, and
++		// the hue lane is the "black" code. It still has to be the ENCODED black, not a raw 0,
++		// or ShadePS would decode white.
++		rtInfo.normal_emissive.w = RT_PackEmissiveHue(float3(0, 0, 0), false);
++
++		// reflectance 1 / albedo 1 so the probe term passes through the energy split unmodified
++		rtInfo.reflectance = IsDiffuseMode() ? (float3)0.f : (float3)1.f;
+ 		rtInfo.albedo_smoothness = 1;
+-		rtInfo.emissiveTintPacked = 0; // a miss emits nothing; the magnitude is 0 as well
+ 
+ 		rtInfo.hitpos.xyz = rOrig.startpoint + rOrig.direction * GetMaxRayDistance();
+ 		rtInfo.hitpos.w = 1;
+@@ -757,7 +883,7 @@ bool RT_GetDebugColor(out float3 vCol)
+ 	}
+ 	else if (nMode == 2)
+ 	{
+-		vCol = bHit ? (normalize(g_rtInfo.normal_reflectance.xyz) * 0.5f + 0.5f) : (float3)0;
++		vCol = bHit ? (normalize(g_rtInfo.normal_emissive.xyz) * 0.5f + 0.5f) : (float3)0;
+ 	}
+ 	else if (nMode == 3)
+ 	{
+@@ -789,8 +915,14 @@ bool RT_GetDebugColor(out float3 vCol)
+ 	}
+ 	else if (nMode == 12)
+ 	{
+-		// hit reflectance (F0) as it survives PackRGB, x8 so a dielectric 0.04 is visible
+-		vCol = bHit ? saturate(UnpackRGB(abs(g_rtInfo.normal_reflectance.w)) * 8.f) : (float3)0;
++		// rt stage 2D: the hit reflectance (F0) as it survives the HITPOS.w round trip - packed
++		// and unpacked here on purpose, so that what the view shows is what ShadePS will read and
++		// not what RT_ProcessBestHit wished it had sent. x8, so CE's 0.0369 dielectric reads as a
++		// mid grey (0.30) instead of near black; a metal reads as its tint at or near clipping.
++		// BLACK now means the material record really has no reflectance, not "the encoding ate it".
++		float3 vDbgRefl; float fDbgSmooth;
++		RT_UnpackHitMaterial(RT_PackHitMaterial(g_rtInfo.reflectance, g_rtInfo.albedo_smoothness.w), vDbgRefl, fDbgSmooth);
++		vCol = bHit ? saturate(vDbgRefl * 8.f) : (float3)0;
+ 	}
+ 	else
+ 	{
+diff --git a/Engine/Shaders/HWScripts/CryFX/Total_Illumination.cfx b/Engine/Shaders/HWScripts/CryFX/Total_Illumination.cfx
+index 6a6e7b35..2db21e6a 100644
+--- a/Engine/Shaders/HWScripts/CryFX/Total_Illumination.cfx
++++ b/Engine/Shaders/HWScripts/CryFX/Total_Illumination.cfx
+@@ -165,10 +165,12 @@ struct pixoutMRTTrace
+ 	// rt stage 2 (decision 06 section 6.6). Only allocated and only bound for the specular
+ 	// target set when e_svoTI_RT_Active; the diffuse permutation never sets %_RT_QUALITY.
+ 	//  HitPos: .xyz camera-relative hit position (RGBA32F - fp16 is 1.5 cm at 32 m, which is
+-	//          shadow-acne territory for hit shading), .w = PackRGB(emissive hue) in the integer
+-	//          part + hit smoothness in [0, 1) in the fraction. Kept positive; the sign is
+-	//          reserved for the interleaved-refraction flag, stage 4. RGBA32F has mantissa to
+-	//          spare for both: the tint code is at most 511 and smoothness needs ~8 bits.
++	//          shadow-acne territory for hit shading), .w = RT_PackHitMaterial(reflectance,
++	//          smoothness): a 24 bit integer holding the hit's F0 (8 bit square-law magnitude +
++	//          a 216 entry hue code) and its smoothness (8 bit). Kept positive; the sign is
++	//          reserved for the interleaved-refraction flag, stage 4. rt stage 2D moved the
++	//          emissive hue out of this lane and into ALD.w to make room - see the comment above
++	//          RT_PackHitMaterial in CommonSVO_RT.cfi for why the old packing killed specular.
+ 	//  RayDir: .xyz ray direction, .w = hit distance, or GetMaxRayDistance() + 1 on a miss
+ 	//          (the "no hit => fall back to probes" sentinel). .w == 0 means "not an RT pixel".
+ 	float4 HitPos: SV_Target2;
+@@ -1920,22 +1922,23 @@ pixoutMRTTrace ConeTracePS(vtxOutWPOS IN)
+ 	// rt stage 2 (decision 06 section 6.1 / 6.6): a triangle-ray pixel carries g-data instead of
+ 	// a colour, and the ShadePass overwrites ALD + RGB with the shaded result. The packing is
+ 	// Neo's, so the two existing targets carry four of the six values:
+-	//   ALD.xyz = world normal scaled by (1 + emittance)   ALD.w = PackRGB(reflectance), negated
+-	//                                                              for the veg-leaves model
++	//   ALD.xyz = world normal scaled by (1 + emittance)   ALD.w = PackRGB(emissive hue) + 1,
++	//                                                              negated for the veg-leaves model
+ 	//   RGB.xyz = hit albedo                               RGB.w = UNTOUCHED scene linear depth
+ 	// RGB.w stays the reflecting pixel's depth because that is what DemosaicPS reads out of this
+-	// channel (Total_Illumination.cfx:1066, 1073-1074) for its bilateral weights. Smoothness
+-	// therefore rides in HitPos.w, not here.
++	// channel (Total_Illumination.cfx:1066, 1073-1074) for its bilateral weights. Reflectance and
++	// smoothness therefore ride in HitPos.w, not here (rt stage 2D).
+ 	if (bRTWriteGData)
+ 	{
+-		vALD.xyz = g_rtInfo.normal_reflectance.xyz;
+-		vALD.w   = g_rtInfo.normal_reflectance.w;
++		vALD.xyz = g_rtInfo.normal_emissive.xyz;
++		vALD.w   = g_rtInfo.normal_emissive.w;
+ 		vRGB.xyz = g_rtInfo.albedo_smoothness.xyz;
+ 
+-		// smoothness is capped just below 1 so that the fractional part never carries into the
+-		// emissive tint code sitting in the integer part (a mirror at 0.9999 is a mirror)
++		// rt stage 2D: one 24 bit integer, no fractional field any more. Reflectance and
++		// smoothness are both exact integers on the way out and on the way back, so the round
++		// trip is deterministic and debug view 12 can show exactly what ShadePS will read.
+ 		OUT.HitPos = float4(g_rtInfo.hitpos.xyz - GetWorldViewPos(),
+-		                    min(abs(g_rtInfo.albedo_smoothness.w), 0.9999f) + g_rtInfo.emissiveTintPacked);
++		                    RT_PackHitMaterial(g_rtInfo.reflectance, abs(g_rtInfo.albedo_smoothness.w)));
+ 		OUT.RayDir = float4(g_rtInfo.raydir.xyz, g_rtInfo.raydir.w);
+ 	}
+ #endif
+@@ -1984,19 +1987,23 @@ pixoutShade ShadePS(vtxOutWPOS IN)
+ 		// unmodified. That is the whole fallback-to-probes policy.
+ 		const bool bNoHit = (vGLD.w >= GetMaxRayDistance() + 0.5f);
+ 
+-		// hitpos.w packs two things: PackRGB of the emissive hue in the integer part, the hit
+-		// smoothness in the fraction (see pixoutMRTTrace above)
+-		const float fHitPosW    = abs(vGPO.w);
+-		const float fEmmPacked  = floor(fHitPosW);
+-		const float3 vEmmTint   = UnpackRGB(fEmmPacked);
++		// rt stage 2D. HITPOS.w carries the hit's F0 and smoothness (RT_PackHitMaterial);
++		// ALD.w carries the emissive hue code + 1, signed by the lighting model. Before 2D the
++		// reflectance came through PackRGB at 3 bits per channel and CE's 0.0369 dielectric F0
++		// quantised to exactly 0, so SpecularBRDF returned 0 at every non-metal hit and the
++		// reflection had no specular response at all.
++		float3 vReflectance; float fSmoothness;
++		RT_UnpackHitMaterial(vGPO.w, vReflectance, fSmoothness);
++
++		const float3 vEmmTint = RT_UnpackEmissiveHue(vGAL.w);
+ 
+ 		MaterialAttribsCommon commonAttribs = (MaterialAttribsCommon)0;
+ 		commonAttribs.NormalWorld = normalize(vGAL.xyz);
+ 		commonAttribs.Albedo      = vGNO.xyz;
+-		commonAttribs.Reflectance = UnpackRGB(abs(vGAL.w));
+-		commonAttribs.Smoothness  = fHitPosW - fEmmPacked;
++		commonAttribs.Reflectance = vReflectance;
++		commonAttribs.Smoothness  = fSmoothness;
+ 
+-		if (vGAL.w < 0) // the lighting model rides in the sign of the packed reflectance
++		if (vGAL.w < 0) // the lighting model rides in the sign of the packed emissive hue
+ 		{
+ 			commonAttribs.LightingModel = LIGHTINGMODEL_TRANSMITTANCE;
+ 			commonAttribs.Transmittance = (half3)0.5f;
+-- 
+2.47.1.windows.1
+

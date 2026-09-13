@@ -1,0 +1,195 @@
+From ca1801a60705d72ef9d4b15559fb0f9a5e6fd297 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Mon, 14 Sep 2026 04:11:53 +0800
+Subject: [PATCH 204/213] feat: glossy triangle-RT reflections - renderer
+ bindings and constants (decision 08)
+
+D3D_SVO.cpp / D3D_SVO.h, every hunk inside an existing e_svoTI_RT_Active block:
+
+  - ConeTracePass lazily loads Engine/EngineAssets/Textures/rt_bluenoise_64.dds
+    (CTexture::ForName, FT_DONT_STREAM | FT_NOMIPS, the way PostAA loads
+    AreaTex.dds) and binds it at t32; a missing file leaves SVO_RTParams2.w at 0
+    and the shader uses its hash instead, so the asset is a quality upgrade, not a
+    requirement. IsRtBlueNoiseReady() is the single predicate.
+  - SetupCommonConstants uploads SVO_RTParams2 = (glossyMode, glossScale,
+    temporalFrames, noiseBound) so the tracer, the demosaic and the upscale all
+    agree; ShadePass uploads the same lane separately because it deliberately does
+    not call SetupCommonConstants.
+  - DemosaicPass and UpscalePass bind pRT_RAYDIR_0 read-only at t38: the hit
+    distance is the virtual-image reprojection depth and the bilateral's guide
+    signal, and it is the one g-data lane the shaded ALD + RGB pair does not
+    carry. Bound to black when RT is off.
+  - e_svoTI_RT_GlossyMode / GlossScale / TemporalFrames are resolved DEFENSIVELY
+    in InitCVarValues instead of through INIT_SVO_CVAR, because their
+    REGISTER_CVAR_AUTO lines belong in Cry3DEngine's SceneTreeCVars.inl and that
+    file has another agent's uncommitted work in it; INIT_SVO_CVAR dereferences
+    GetCVar() unchecked. The header defaults are the registered defaults, so the
+    feature behaves the same either way and only the console knobs wait.
+
+CryRenderD3D11 Profile, bundled CMake 3.22: 0 errors, 0 warnings.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SCUvWGLCsqzm3VNMzp4uiS
+---
+ .../RenderDll/XRenderD3D9/D3D_SVO.cpp         | 63 +++++++++++++++++++
+ .../CryEngine/RenderDll/XRenderD3D9/D3D_SVO.h | 18 ++++++
+ 2 files changed, 81 insertions(+)
+
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/D3D_SVO.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/D3D_SVO.cpp
+index 999bd8c4..a732e54b 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/D3D_SVO.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/D3D_SVO.cpp
+@@ -607,6 +607,20 @@ void CSvoRenderer::ConeTracePass(SSvoTargetsSet* pTS)
+ 
+ 		if (m_texInfo.pTexTexA)
+ 			rp.SetTexture(28, (CTexture*)m_texInfo.pTexTexA.get());
++
++		// rt stage 4B (decision 08 item 1): the blue noise mask the GGX-VNDF sampler draws its
++		// two uniform pairs from. Loaded the same way PostAA loads AreaTex.dds - a loose .dds
++		// under %ENGINE%/EngineAssets, FT_DONT_STREAM | FT_NOMIPS, read with Load() so no
++		// sampler is involved. Missing file => IsLoaded() is false, SVO_RTParams2.w stays 0 and
++		// the shader uses its integer hash instead.
++		if (!m_bTriedLoadRTBlueNoise)
++		{
++			m_bTriedLoadRTBlueNoise = true;
++			m_pTexRTBlueNoise.Assign_NoAddRef(CTexture::ForName(
++			  "%ENGINE%/EngineAssets/Textures/rt_bluenoise_64.dds", FT_DONT_STREAM | FT_NOMIPS, eTF_Unknown));
++		}
++
++		rp.SetTexture(32, IsRtBlueNoiseReady() ? m_pTexRTBlueNoise.get() : CRendererResources::s_ptexBlack);
+ 	}
+ 	#endif
+ 
+@@ -1016,6 +1030,15 @@ void CSvoRenderer::ShadePass(SSvoTargetsSet* pTS)
+ 		rp.SetConstantArray(paramName, (Vec4*)&vData, 1);
+ 	}
+ 
++	{
++		// rt stage 4B: ShadePS reads .x to decide whether RayDir.xyz carries the VNDF estimator
++		// weight in its length. Same lane, same order as SetupCommonConstants.
++		static CCryNameR paramName("SVO_RTParams2");
++		Vec4 vData((float)e_svoTI_RT_GlossyMode, e_svoTI_RT_GlossScale,
++		           (float)max(e_svoTI_RT_TemporalFrames, 1), IsRtBlueNoiseReady() ? 1.f : 0.f);
++		rp.SetConstantArray(paramName, (Vec4*)&vData, 1);
++	}
++
+ 	if (bValidatorC)
+ 	{
+ 		// SVO_ViewProj lives in SetupCommonConstants, which ShadePass deliberately does not call
+@@ -1227,9 +1250,26 @@ void CSvoRenderer::SetupCommonConstants(SSvoTargetsSet* pTS, T& rp, CTexture* pR
+ 			Vec4 vData(e_svoTI_RT_NormalsFading, 0.f, 0.f, 0.f);
+ 			rp.SetConstantArray(paramName, (Vec4*)&vData, 1);
+ 		}
++
++		{
++			// rt stage 4B (decision 08): (glossyMode, glossScale, temporalFrames, noiseBound).
++			// Read by ConeTracePS (the sampler), DemosaicPS (the history length) and UpScalePS
++			// (the filter radius and the cross-fade band), so it has to go on the common path.
++			static CCryNameR paramName("SVO_RTParams2");
++			Vec4 vData((float)e_svoTI_RT_GlossyMode, e_svoTI_RT_GlossScale,
++			           (float)max(e_svoTI_RT_TemporalFrames, 1), IsRtBlueNoiseReady() ? 1.f : 0.f);
++			rp.SetConstantArray(paramName, (Vec4*)&vData, 1);
++		}
+ 	}
+ }
+ 
++// rt stage 4B: true only when the loose blue noise .dds really came in. The shader's fallback
++// hash is a correct sampler, just a noisier one, so a missing asset degrades instead of failing.
++bool CSvoRenderer::IsRtBlueNoiseReady() const
++{
++	return m_pTexRTBlueNoise && m_pTexRTBlueNoise->IsLoaded() && m_pTexRTBlueNoise->GetDevTexture();
++}
++
+ template<class T>
+ void CSvoRenderer::SetupCommonSamplers(T& rp)
+ {
+@@ -1378,6 +1418,13 @@ void CSvoRenderer::DemosaicPass(SSvoTargetsSet* pTS)
+ 	rp.SetTexture(12, pTS->pRT_RGB_DEM_MAX_1);
+ 	rp.SetTexture(13, pTS->pRT_ALD_DEM_MAX_1);
+ 
++	// rt stage 4B (decision 08 item 2): the hit distance, for the virtual-image reprojection.
++	// It is the one g-data lane the shaded ALD + RGB pair does not carry.
++	if (e_svoTI_RT_Active && pTS->pRT_RAYDIR_0)
++		rp.SetTexture(38, pTS->pRT_RAYDIR_0);
++	else
++		rp.SetTexture(38, CRendererResources::s_ptexBlack);
++
+ 	rp.SetTexture(8, GetUtils().GetVelocityObjectRT(RenderView()));
+ 
+ 	rp.BeginConstantUpdate();
+@@ -2188,6 +2235,16 @@ void CSvoRenderer::InitCVarValues()
+ 	INIT_ALL_SVO_CVARS;
+ 	#undef INIT_SVO_CVAR
+ 
++	// rt stage 4B (decision 08): the three glossy-reflection knobs, resolved by hand so a
++	// Cry3DEngine.dll that does not carry their registrations yet keeps the header's defaults
++	// instead of dereferencing a null ICVar. See the comment on the members in D3D_SVO.h.
++	if (ICVar* pCVarGlossyMode = gEnv->pConsole->GetCVar("e_svoTI_RT_GlossyMode"))
++		e_svoTI_RT_GlossyMode = pCVarGlossyMode->GetIVal();
++	if (ICVar* pCVarGlossScale = gEnv->pConsole->GetCVar("e_svoTI_RT_GlossScale"))
++		e_svoTI_RT_GlossScale = pCVarGlossScale->GetFVal();
++	if (ICVar* pCVarTemporalFrames = gEnv->pConsole->GetCVar("e_svoTI_RT_TemporalFrames"))
++		e_svoTI_RT_TemporalFrames = pCVarTemporalFrames->GetIVal();
++
+ 	// S8, decisions/s8-svogi-fog-clouds.md item 1 A4. The screen-space depth trace is the ONE
+ 	// place SVOGI reads an already pre-exposed buffer ($HDRTargetPrev, bound at slot 12) back
+ 	// into voxel-space maths that is deliberately kept in unexposed stock units. Mixing the two
+@@ -2279,6 +2336,12 @@ void CSvoRenderer::UpscalePass(SSvoTargetsSet* pTS)
+ 
+ 	rp.SetTexture(9, pTS->pRT_FIN_OUT_1);
+ 
++	// rt stage 4B (decision 08 item 3): the hit distance, the guide signal of the bilateral.
++	if (e_svoTI_RT_Active && pTS->pRT_RAYDIR_0)
++		rp.SetTexture(38, pTS->pRT_RAYDIR_0);
++	else
++		rp.SetTexture(38, CRendererResources::s_ptexBlack);
++
+ 	if (pTS == &m_pPasses->m_tsSpec && m_pPasses->m_tsDiff.pRT_FIN_OUT_0)
+ 	{
+ 		rp.SetTexture(15, m_pPasses->m_tsDiff.pRT_FIN_OUT_0);
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/D3D_SVO.h b/Code/CryEngine/RenderDll/XRenderD3D9/D3D_SVO.h
+index 2a6d2ee1..bdb42f9a 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/D3D_SVO.h
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/D3D_SVO.h
+@@ -146,6 +146,7 @@ protected:
+ 
+ 	// rt stage 2 (decision 06): hit shading
+ 	bool                   IsRtHitShadingActive() const;
++	bool                   IsRtBlueNoiseReady() const;
+ 	void                   BuildRTLightGridPass();
+ 	void                   ShadePass(SSvoTargetsSet* pTS);
+ 	void                   SetupShadeForwardResources(CSvoFullscreenPass& rp);
+@@ -193,6 +194,11 @@ protected:
+ 	CShader*                    m_pShader;
+ 	_smart_ptr<CTexture>        m_pNoiseTex;
+ 	_smart_ptr<CTexture>        m_pCloudShadowTex;
++	// rt stage 4B (decision 08 item 1): 64 x 64 RGBA8 void-and-cluster blue noise, the random
++	// numbers of the GGX-VNDF sampler. Loaded lazily the first time e_svoTI_RT_Active is on and
++	// never released; if the file is missing the shader falls back to a hash.
++	_smart_ptr<CTexture>        m_pTexRTBlueNoise;
++	bool                        m_bTriedLoadRTBlueNoise = false;
+ 	static _smart_ptr<CTexture> s_pRsmColorMap;
+ 	static _smart_ptr<CTexture> s_pRsmNormlMap;
+ 	static _smart_ptr<CTexture> s_pRsmPoolCol;
+@@ -253,6 +259,18 @@ protected:
+ 	bool               m_bSkyDomeBound = false;
+ 	bool               m_bSkyBoxBound = false;
+ 
++	// rt stage 4B (decision 08). These three are resolved DEFENSIVELY in InitCVarValues instead
++	// of through INIT_SVO_CVAR, because their REGISTER_CVAR_AUTO lines live in Cry3DEngine's
++	// SceneTreeCVars.inl and that file had another agent's uncommitted work in it when this
++	// landed, so it is not committed with this stage (report 04b section 8 lists the three lines
++	// to add). INIT_SVO_CVAR dereferences gEnv->pConsole->GetCVar() unchecked, so a
++	// Cry3DEngine.dll built without the registrations would crash on the first frame. The values
++	// below are the registered defaults, so the feature behaves identically either way; only the
++	// console knobs are missing until the registrations land.
++	int   e_svoTI_RT_GlossyMode = 1;
++	float e_svoTI_RT_GlossScale = 1.f;
++	int   e_svoTI_RT_TemporalFrames = 8;
++
+ 	// cvar values
+ 	#define INIT_ALL_SVO_CVARS                                      \
+ 	  INIT_SVO_CVAR(int, e_svoDVR);                                 \
+-- 
+2.47.1.windows.1
+

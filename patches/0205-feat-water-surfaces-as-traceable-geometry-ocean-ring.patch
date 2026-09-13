@@ -1,0 +1,1155 @@
+From 06d90e63012507cb4d24417b351fb860c564bb5c Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Mon, 14 Sep 2026 04:18:04 +0800
+Subject: [PATCH 205/213] feat: water surfaces as traceable geometry - ocean
+ ring and water volumes in the dynamic RT segment (CPU, decision 09 9.4)
+
+Water was in no static soup at all: CheckCollectObjectsForVoxelization only queries
+Brush / MovableBrush / Vegetation, and the ocean is procedural (COcean is a fake render
+node that is never registered in the object tree). So a reflection ray could not see
+water at any setting. Both halves are now emitted into the per frame DYN_MESH segment as
+ordinary objects of the two level dynamic tree, inheriting its budget, its per object
+quantisation and its stale tail zeroing.
+
+Ocean: one camera centred quad grid at the water level, covering
++/- (e_svoTI_RT_MaxDistCam * e_svoTI_RT_DynObjDistRatio + e_svoTI_RT_MaxDistRay), split
+e_svoTI_RT_WaterGrid cells per axis (default 4 = 32 triangles). The local mesh is cached
+and rebuilt only when its radius or subdivision changes; a walking camera costs one
+Matrix34. Gated on an existing COcean with a material, a valid GetWaterLevel(),
+e_WaterOcean and OCR_NO_DRAW.
+
+Water volumes: CWaterVolumeRenderNode's own surface mesh - exactly the vertices and
+indices Render_JobEntry hands to CREWaterVolume - placed by the same matrix the render
+object gets (identity, or m_parentEntityWorldTM when attached to an entity). Skipped when
+hidden, pending delete, zero fog density (CE draws nothing either), out of the collection
+radius or more than one ray length outside the frustum. Read through new read only
+accessors on CWaterVolumeRenderNode; the cached BVH is re-validated every frame against a
+(triangle count, first vertex) signature so an edited, moved or recycled node can never
+keep a stale subtree. Every triangle is wound to face +Z, so water is single sided seen
+from above and a hit from below is a back face the consumer rejects.
+
+Material record: tag 4 (Water), matInfo1.y = 0.02 (water F0), matInfo1.z = 1.0
+smoothness, matInfo2.xyz and extras+2.xyz = the fog colour (E3DPARAM_OCEANFOG_COLOR for
+the ocean, m_fogColor x the time of day HDR multiplier for a volume), extras+2.w = the fog
+density, extras+3.x = MatSpecColor (the sun specular scalar Water.cfx multiplies
+CV_SunColor by), extras+3.y = ReflectionScale / ssrBGMultiplier, extras+3.z = the water
+depth hint (e_svoTI_RT_WaterDepth, or the volume's own depth). No atlas slices are taken:
+a water hit is shaded from the fog colour and the sky, not from an albedo map. Field table
+and the GPU consumer contract in scene-notes/rt/reports/05c-water-cpu.md.
+
+New cvars e_svoTI_RT_Water (1), e_svoTI_RT_WaterGrid (4), e_svoTI_RT_WaterDepth (5 m);
+water is collected even with e_svoTI_RT_Dynamic 0 and the HUD line shows either.
+"RT dyn:" gains "water N tris". e_svoTI_RT_SelfTest gains a water line: a synthetic ocean
+ring and a volume quad through the real producer, the tag 4 record decoded back with the
+consumer's own extractors, and 400 point pairs traced from above and from below - front
+face from above, back face from below, 0 mismatches.
+
+This commit also carries the four cvar registrations stage 4B (glossy reflections) could
+not commit because this file was checked out here: e_svoTI_RT_GlossyMode,
+e_svoTI_RT_GlossScale, e_svoTI_RT_TemporalFrames and the e_svoTI_RT_MinGloss 0.85 -> 0.5
+default change, verbatim from reports/04b-glossy.md section 8.
+
+Everything is behind e_svoTI_RT_Active; the native path is unchanged.
+Cry3DEngine builds 0 error / 0 warning (Profile, bundled CMake 3.22). The engine was not
+run and nothing was deployed.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SCUvWGLCsqzm3VNMzp4uiS
+---
+ Code/CryEngine/Cry3DEngine/SVO/SceneTree.cpp  |   4 +-
+ .../Cry3DEngine/SVO/SceneTreeCVars.inl        |  14 +-
+ .../Cry3DEngine/SVO/SceneTreeManager.cpp      |   3 +-
+ .../Cry3DEngine/SVO/VoxelSegment.cpp          | 840 +++++++++++++++++-
+ Code/CryEngine/Cry3DEngine/SVO/VoxelSegment.h |   5 +-
+ .../Cry3DEngine/WaterVolumeRenderNode.h       |  27 +
+ 6 files changed, 865 insertions(+), 28 deletions(-)
+
+diff --git a/Code/CryEngine/Cry3DEngine/SVO/SceneTree.cpp b/Code/CryEngine/Cry3DEngine/SVO/SceneTree.cpp
+index f38b9509..b188b88d 100644
+--- a/Code/CryEngine/Cry3DEngine/SVO/SceneTree.cpp
++++ b/Code/CryEngine/Cry3DEngine/SVO/SceneTree.cpp
+@@ -2646,8 +2646,8 @@ void CSvoEnv::RTFormatDynLine(char* szOut, size_t bufSize) const
+ {
+ 	const SRTDynStats& st = m_rtDynStats;
+ 
+-	cry_sprintf(szOut, bufSize, "RT dyn: %d of %d objs, %d K tris, %d records, %d mats, ovf %d, cache %d, %.2f ms",
+-	            st.objs, st.objsFound, st.tris / 1000, st.records, st.mats, st.overflowed, st.cached, st.ms);
++	cry_sprintf(szOut, bufSize, "RT dyn: %d of %d objs, %d K tris, %d records, %d mats, ovf %d, cache %d, water %d tris, %.2f ms",
++	            st.objs, st.objsFound, st.tris / 1000, st.records, st.mats, st.overflowed, st.cached, st.waterTris, st.ms);
+ }
+ 
+ //! Belt and braces for the HUD: print the same two lines to the log once, when a voxelization pass
+diff --git a/Code/CryEngine/Cry3DEngine/SVO/SceneTreeCVars.inl b/Code/CryEngine/Cry3DEngine/SVO/SceneTreeCVars.inl
+index 320925c5..4654a295 100644
+--- a/Code/CryEngine/Cry3DEngine/SVO/SceneTreeCVars.inl
++++ b/Code/CryEngine/Cry3DEngine/SVO/SceneTreeCVars.inl
+@@ -248,7 +248,7 @@ REGISTER_CVAR_AUTO(int, e_svoTI_Reflect_Vox_Max_Overhead, 50, VF_NULL, "Controls
+ REGISTER_CVAR_AUTO(int, e_svoTI_RT_Active, 0, VF_EXPERIMENTAL, "Activates mesh ray tracing for reflections\nIt is necessary to re-voxelize the scene after activation");
+ REGISTER_CVAR_AUTO(float, e_svoTI_RT_MaxDistRay, 48.f, VF_EXPERIMENTAL, "Maximum ray distance for mesh tracing. Past it the ray is a MISS and is resolved by the sky (above the horizon) or the env probe (below it), not by the surface that is actually there");
+ REGISTER_CVAR_AUTO(float, e_svoTI_RT_MaxDistCam, 100.f, VF_EXPERIMENTAL, "Maximum camera distance for mesh tracing");
+-REGISTER_CVAR_AUTO(float, e_svoTI_RT_MinGloss, 0.85f, VF_EXPERIMENTAL, "Minimum surface glossiness for mesh tracing");
++REGISTER_CVAR_AUTO(float, e_svoTI_RT_MinGloss, 0.5f, VF_EXPERIMENTAL, "Minimum surface glossiness for mesh tracing\nRougher surfaces keep voxel cone tracing; the two are cross faded over this value plus/minus 0.05 so there is no seam");
+ REGISTER_CVAR_AUTO(float, e_svoTI_RT_MinRefl, 0, VF_EXPERIMENTAL, "Minimum surface reflectance for mesh tracing");
+ REGISTER_CVAR_AUTO(int, e_svoTI_RT_MaxTrisPerVoxel, 100, VF_EXPERIMENTAL, "DEPRECATED - retired together with the per-voxel triangle list path\nKept registered only so that existing level files keep loading");
+ REGISTER_CVAR_AUTO(int, e_svoTI_RT_MaxTexRes, 256, VF_EXPERIMENTAL, "XY resolution of the material texture atlas used by mesh ray tracing");
+@@ -256,7 +256,10 @@ REGISTER_CVAR_AUTO(float, e_svoTI_RT_SafetyBorder, 0.25f, VF_EXPERIMENTAL, "DEPR
+ 
+ // Static BVH mesh ray tracing (decisions 02-05)
+ REGISTER_CVAR_AUTO(int, e_svoTI_RT_StaticBVH, 1, VF_EXPERIMENTAL, "Build and trace one static BVH per SVO cell\n0 = voxel cone tracing only");
+-REGISTER_CVAR_AUTO(int, e_svoTI_RT_Debug, 0, VF_EXPERIMENTAL, "Mesh ray tracing debug views\n0 = off\n1 = hit test count heat map (blue = few, red = many)\n2 = hit normals\n3 = hit albedo\n4 = hit distance\n5 = incomplete/overflow mask (magenta = the traversal stack ran out)\n6 = stage-1 provisional colour (no light data)\n7 = sun shadow at the hit (white = lit)\n8 = direct light at the hit, before probes\n9 = raw shade output, before fog and exposure\n10 = raw atlas normal at the hit, tangent space (magenta = no normal slot, flat lilac = no normal map)\n11 = hit smoothness (black = rough, white = mirror; modulated by the material gloss map, no longer flat per material)\n12 = hit reflectance F0, x8 (black = the material record really carries no reflectance)\n13 = validator C: for a hit that is also on screen, |reflected - direct| in STOPS (black = they agree, red = the reflection is that many stops too bright, green = too dark, blue = the hit is off screen or occluded so the test says nothing). Reads the PREVIOUS frame's pre-exposed HDR target, so judge it on a still camera");
++REGISTER_CVAR_AUTO(int, e_svoTI_RT_Debug, 0, VF_EXPERIMENTAL, "Mesh ray tracing debug views\n0 = off\n1 = hit test count heat map (blue = few, red = many)\n2 = hit normals\n3 = hit albedo\n4 = hit distance\n5 = incomplete/overflow mask (magenta = the traversal stack ran out)\n6 = stage-1 provisional colour (no light data)\n7 = sun shadow at the hit (white = lit)\n8 = direct light at the hit, before probes\n9 = raw shade output, before fog and exposure\n10 = raw atlas normal at the hit, tangent space (magenta = no normal slot, flat lilac = no normal map)\n11 = hit smoothness (black = rough, white = mirror; modulated by the material gloss map, no longer flat per material)\n12 = hit reflectance F0, x8 (black = the material record really carries no reflectance)\n13 = validator C: for a hit that is also on screen, |reflected - direct| in STOPS (black = they agree, red = the reflection is that many stops too bright, green = too dark, blue = the hit is off screen or occluded so the test says nothing). Reads the PREVIOUS frame's pre-exposed HDR target, so judge it on a still camera\n14 = the raw 1 sample per pixel glossy trace, temporal and spatial filters off - 14 against 0 is exactly what the denoiser removes\n15 = the temporal history weight for ray traced pixels (white = the pixel is all history, black = all new)");
++REGISTER_CVAR_AUTO(int, e_svoTI_RT_GlossyMode, 1, VF_EXPERIMENTAL, "Ray traced reflection lobe\n0 = mirror only (the exact reflect direction at every smoothness)\n1 = one GGX visible normal sample per pixel per frame, so reflections blur with roughness");
++REGISTER_CVAR_AUTO(float, e_svoTI_RT_GlossScale, 1.f, VF_EXPERIMENTAL, "Multiplier on the ray traced GGX lobe width; 1 = the same lobe the surface is shaded with, below 1 = sharper and less noisy, above 1 = blurrier");
++REGISTER_CVAR_AUTO(int, e_svoTI_RT_TemporalFrames, 8, VF_EXPERIMENTAL, "Frames of temporal history for ray traced reflections at the rough end of the range; a mirror always uses two\nMore frames = less noise and more ghosting");
+ REGISTER_CVAR_AUTO(float, e_svoTI_RT_NormalsFading, 0, VF_EXPERIMENTAL, "Fade ray traced reflections into flat normals, in metres; 0 = off (normal maps at any distance)\nApplies to both the reflecting surface (a normal mapped mirror otherwise prints its detail map into the reflection) and to the hit's own normal map");
+ REGISTER_CVAR_AUTO(int, e_svoTI_RT_TriPoolXY, 256, VF_EXPERIMENTAL, "XY size of the BVH node/triangle record pool texture (power of two, multiple of 4)");
+ REGISTER_CVAR_AUTO(int, e_svoTI_RT_TriPoolZ, 64, VF_EXPERIMENTAL, "Z size of the BVH node/triangle record pool texture");
+@@ -273,6 +276,13 @@ REGISTER_CVAR_AUTO(int, e_svoTI_RT_Dynamic, 1, VF_EXPERIMENTAL, "Rebuild a globa
+ REGISTER_CVAR_AUTO(float, e_svoTI_RT_DynObjDistRatio, 1.f, VF_EXPERIMENTAL, "Controls how far from the camera entities are collected for ray tracing, as a fraction of e_svoTI_RT_MaxDistCam");
+ REGISTER_CVAR_AUTO(int, e_svoTI_RT_DynMaxTris, 200000, VF_EXPERIMENTAL, "Triangle budget of the per frame dynamic BVH; objects are added by projected size until it is reached\nThe DYN_MESH pool segment is the harder limit and caps this further");
+ REGISTER_CVAR_AUTO(int, e_svoTI_RT_LodRatio, 1, VF_EXPERIMENTAL, "Controls LOD of movable meshes used for RT\n0 = full detail");
++
++// Water surfaces as traceable geometry (rt decision 09 9.4, stage 5C). The ocean plane and the
++// water volume surfaces are emitted into the per frame dynamic segment, tagged 4 (Water) in the
++// material record, so a reflection ray sees the water the direct view draws.
++REGISTER_CVAR_AUTO(int, e_svoTI_RT_Water, 1, VF_EXPERIMENTAL, "Emit the ocean plane and the water volume surfaces into the ray traced dynamic BVH\n0 = water stays invisible to reflection rays (behaviour before stage 5C)");
++REGISTER_CVAR_AUTO(int, e_svoTI_RT_WaterGrid, 4, VF_EXPERIMENTAL, "Cells per axis of the camera centred ocean quad ring; 2 = 8 triangles, 4 = 32 (clamped to 1..4)");
++REGISTER_CVAR_AUTO(float, e_svoTI_RT_WaterDepth, 5.f, VF_EXPERIMENTAL, "Water depth hint in metres, stored in the water material record so the hit shader can attenuate the fog colour with it\nUsed for the ocean; a water volume with an authored volume depth uses its own");
+ REGISTER_CVAR_AUTO(float, e_svoTI_Specular_Sev, 1, VF_NULL, "Controls severity of specular cones; this value limits the material glossiness");
+ REGISTER_CVAR_AUTO(float, e_svoVoxDistRatio, 14.f, VF_NULL, "Limits the distance where real-time GPU voxelization used");
+ REGISTER_CVAR_AUTO(int, e_svoVoxGenRes, 512, VF_NULL, "GPU voxelization dummy render target resolution");
+diff --git a/Code/CryEngine/Cry3DEngine/SVO/SceneTreeManager.cpp b/Code/CryEngine/Cry3DEngine/SVO/SceneTreeManager.cpp
+index 68d10f1e..db09c09f 100644
+--- a/Code/CryEngine/Cry3DEngine/SVO/SceneTreeManager.cpp
++++ b/Code/CryEngine/Cry3DEngine/SVO/SceneTreeManager.cpp
+@@ -139,7 +139,8 @@ char* CSvoManager::GetStatusString(int lineId)
+ 		return szText;
+ 	}
+ 
+-	if (Cry3DEngineBase::GetCVars()->e_svoTI_RT_Active && Cry3DEngineBase::GetCVars()->e_svoTI_RT_Dynamic && lineId == (slotId++))
++	if (Cry3DEngineBase::GetCVars()->e_svoTI_RT_Active &&
++	    (Cry3DEngineBase::GetCVars()->e_svoTI_RT_Dynamic || Cry3DEngineBase::GetCVars()->e_svoTI_RT_Water) && lineId == (slotId++))
+ 	{
+ 		gSvoEnv->RTFormatDynLine(szText, sizeof(szText));
+ 		return szText;
+diff --git a/Code/CryEngine/Cry3DEngine/SVO/VoxelSegment.cpp b/Code/CryEngine/Cry3DEngine/SVO/VoxelSegment.cpp
+index 46955f20..b88695d0 100644
+--- a/Code/CryEngine/Cry3DEngine/SVO/VoxelSegment.cpp
++++ b/Code/CryEngine/Cry3DEngine/SVO/VoxelSegment.cpp
+@@ -23,6 +23,10 @@
+ 	#include <algorithm>
+ 	#include <CryAnimation/ICryAnimation.h>
+ 	#include <CryAnimation/IAttachment.h>
++	#include "terrain.h"
++	#include "terrain_water.h"
++	#include "TimeOfDay.h"
++	#include "WaterVolumeRenderNode.h"
+ 
+ 	#pragma warning(push)
+ 	#pragma warning(disable: 4244) //conversion' conversion from 'type1' to 'type2', possible loss of data
+@@ -4196,6 +4200,7 @@ struct SRTDynInst
+ 	AABB        worldBox;
+ 	Vec4        qb;          //!< quantisation bounds of this object subtree
+ 	float       importance;  //!< projected size; the budget keeps the biggest
++	int         waterMat;    //!< -1 = a normal mesh; else the index of this water surface's ready made material record set (rt decision 09 9.4)
+ 	int         triOfs;      //!< first world space triangle of this instance
+ 	int         boxOfs;      //!< first node box of this instance
+ };
+@@ -4209,7 +4214,10 @@ struct SRTDynFrame
+ 	PodArray<Vec4>        records;     //!< DYN_MESH records, index 0 == record 0
+ 	PodArray<Vec4>        matRecords;  //!< DYN_MATS records
+ 	PodArray<int>         texSlices;   //!< atlas slices referenced this frame
++	PodArray<SRTMatRecordSet> waterMats;   //!< one ready made record set per emitted water surface
+ 	int                   overflowed = 0;
++	int                   waterObjs = 0;
++	int                   waterTris = 0;
+ };
+ 
+ TRTDynCache   g_rtDynCache;
+@@ -4804,6 +4812,427 @@ void RT_CollectNodeSources(IRenderNode* pRN, int lodWanted, PodArray<SRTDynSourc
+ 		arrOut.Add(src);
+ 	}
+ }
++
++///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
++// Water surfaces as traceable geometry (rt decision 09 9.4)
++//
++// Water is in NO static soup: CheckCollectObjectsForVoxelization only ever queries eERType_Brush,
++// eERType_MovableBrush and eERType_Vegetation, and the ocean is procedural (COcean is a fake render
++// node that is never registered in the object tree at all). So a reflection ray could not see water
++// before this stage, at any setting.
++//
++// Both halves are emitted into the per frame DYN_MESH segment as ordinary objects of the two level
++// dynamic tree, so they inherit its budget, its quantisation and its tail zeroing for free:
++//   * the ocean  -> ONE camera centred quad grid at the water level, rebuilt only when its size
++//                   changes; the per frame cost is the instance translation, nothing else;
++//   * a volume   -> the render node's own surface triangles (CWaterVolumeRenderNode's
++//                   m_waterSurfaceVertices / m_waterSurfaceIndices - exactly the mesh
++//                   Render_JobEntry hands to CREWaterVolume), in the node's space, placed by the
++//                   same matrix the render object gets.
++// Both carry a material record tagged SVO_RT_TAG_WATER (4) with the fog colour, the fog density and
++// a depth hint; see report 05c for the field table.
++///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
++
++//! One water surface ready to be added to this frame's instance list.
++struct SRTWaterSurface
++{
++	SRTDynMesh*     pMesh;
++	Matrix34        mat;
++	AABB            worldBox;
++	SRTMatRecordSet matSet;
++};
++
++//! Cached local space BVH of one water surface. Keyed by owner pointer, re-validated by a cheap
++//! signature every frame so a changed (or recycled) owner can never keep a stale subtree.
++struct SRTWaterCacheEntry
++{
++	SRTDynMesh mesh;
++	int64      sig = 0;
++	uint       lastUsedFrame = 0;
++};
++
++typedef std::map<const void*, SRTWaterCacheEntry*> TRTWaterCache;
++
++TRTWaterCache g_rtWaterCache;
++const int     g_rtOceanKey = 0;   //!< stable address used as the ocean's cache key
++
++void RT_ClearWaterCache()
++{
++	for (TRTWaterCache::iterator it = g_rtWaterCache.begin(); it != g_rtWaterCache.end(); ++it)
++		delete it->second;
++
++	g_rtWaterCache.clear();
++}
++
++void RT_EvictWaterCache()
++{
++	const uint frameId = GetCurrPassMainFrameID();
++
++	for (TRTWaterCache::iterator it = g_rtWaterCache.begin(); it != g_rtWaterCache.end(); )
++	{
++		if (frameId > it->second->lastUsedFrame + 600)
++		{
++			delete it->second;
++			it = g_rtWaterCache.erase(it);
++		}
++		else
++		{
++			++it;
++		}
++	}
++}
++
++//! Per triangle UV normalisation into [0, 16), byte for byte the rule the static builder applies
++//! before RT_WriteTriRecord packs the three PackTC16 pairs.
++void RT_NormalizeTriUV(SRTBuildTri& bt)
++{
++	const Vec2 tcMin(min(bt.t[0].x, min(bt.t[1].x, bt.t[2].x)), min(bt.t[0].y, min(bt.t[1].y, bt.t[2].y)));
++
++	for (int v = 0; v < 3; v++)
++	{
++		bt.t[v].x -= floor(tcMin.x);
++		bt.t[v].y -= floor(tcMin.y);
++		bt.t[v].x = CLAMP(bt.t[v].x, 0.f, RT_TC16_MAX);
++		bt.t[v].y = CLAMP(bt.t[v].y, 0.f, RT_TC16_MAX);
++	}
++}
++
++//! One flat, upward facing quad split into grid x grid cells (2 triangles each). The winding makes
++//! the face normal +Z, so the surface is single sided seen from above - a ray arriving from below
++//! hits its BACK face and the consumer must reject it (report 05c, back face policy).
++void RT_AddWaterQuad(PodArray<SRTBuildTri>& out, const Vec3& org, const Vec3& du, const Vec3& dv, int grid)
++{
++	const Vec3 n = du.Cross(dv).GetNormalizedSafe(Vec3(0, 0, 1));
++
++	for (int i = 0; i < grid; i++)
++	{
++		for (int j = 0; j < grid; j++)
++		{
++			const float u0 = (float)i / grid, u1 = (float)(i + 1) / grid;
++			const float v0 = (float)j / grid, v1 = (float)(j + 1) / grid;
++
++			const Vec3 p00 = org + du * u0 + dv * v0;
++			const Vec3 p10 = org + du * u1 + dv * v0;
++			const Vec3 p11 = org + du * u1 + dv * v1;
++			const Vec3 p01 = org + du * u0 + dv * v1;
++
++			SRTBuildTri a;
++			a.v[0] = p00; a.v[1] = p10; a.v[2] = p11;
++			a.t[0] = Vec2(u0, v0); a.t[1] = Vec2(u1, v0); a.t[2] = Vec2(u1, v1);
++			a.n[0] = a.n[1] = a.n[2] = a.faceNorm = n;
++			a.matRecord = 0;
++			out.Add(a);
++
++			SRTBuildTri b;
++			b.v[0] = p00; b.v[1] = p11; b.v[2] = p01;
++			b.t[0] = Vec2(u0, v0); b.t[1] = Vec2(u1, v1); b.t[2] = Vec2(u0, v1);
++			b.n[0] = b.n[1] = b.n[2] = b.faceNorm = n;
++			b.matRecord = 0;
++			out.Add(b);
++		}
++	}
++}
++
++//! The material record of a water surface (rt decision 09 9.4, layout in report 05c 3).
++//! The record carries no textures: a water hit is shaded from the fog colour and the sky, not from
++//! an albedo map, so nothing is pulled into the atlas for it.
++void RT_FillWaterMatRecord(IMaterial* pMat, const Vec3& fogColor, float fogDensity, float depthHint, SRTMatRecordSet& out)
++{
++	ZeroStruct(out);
++
++	float sunSpecMul = 1.f;
++	float reflAmount = 1.f;
++
++	if (pMat)
++	{
++		SShaderItem& shItem = pMat->GetShaderItem();
++
++		if (IRenderShaderResources* pRes = shItem.m_pShaderResources)
++		{
++			// Water.cfx:632   OUT.cSpecular.xyz = MatSpecColor * CV_SunColor.xyz * CV_SunColor.w
++			// i.e. the only CPU visible scalar in front of the sun specular lobe is MatSpecColor,
++			// which is exactly GetColorValue(EFTT_SPECULAR) (REG_PM_SPECULAR_COL).
++			const ColorF spec = pRes->GetColorValue(EFTT_SPECULAR);
++			sunSpecMul = max(0.f, (spec.r + spec.g + spec.b) / 3.f);
++
++			// Water.cfx:103        ReflectionScale  "Reflection scale"   REG_PM_PARAM_1.z, default 1
++			// WaterVolume.cfx:355  ssrBGMultiplier  "SSR sky reflection" REG_PM_PARAM_7.z, default 1
++			// CE only stores the parameters a .mtl actually overrides, so an absent name keeps the
++			// shader default of 1.
++			if (!RT_GetMatParam(pRes, "ReflectionScale", &reflAmount, 1))
++				RT_GetMatParam(pRes, "ssrBGMultiplier", &reflAmount, 1);
++
++			reflAmount = max(0.f, reflAmount);
++		}
++	}
++
++	out.bExtras = true;    // a water record ALWAYS has extras - that is where the fog lives
++	out.bBlend = false;
++
++	// base record: no atlas slices at all, extras reference 1 (the record at base + 1)
++	out.base[0] = Vec4(0.f, RT_PackUint2(0, 0), RT_PackUint2(0, 1), RT_PackTC16(1.f, 1.f));
++	out.base[1] = Vec4(1.f, 0.02f, 1.f, 0.f);   // normal strength, F0 = 0.02 (water), smoothness 1, no emissive
++	out.base[2] = Vec4(fogColor.x, fogColor.y, fogColor.z, 0.f);
++	out.base[3] = Vec4(0.f, 0.f, SVO_RT_TAG_WATER, RT_PackTC16(1.f, 0.f));   // opaque, no alpha test
++
++	out.extras[0] = Vec4(RT_PackUint2(0, 0), 1.f, 1.f, RT_PackTC16(0.f, 0.f));   // no detail map
++	out.extras[1] = Vec4(0.f, 0.f, 0.f, 0.f);                                    // no blend layer
++	out.extras[2] = Vec4(fogColor.x, fogColor.y, fogColor.z, max(0.f, fogDensity));
++	out.extras[3] = Vec4(sunSpecMul, reflAmount, max(0.f, depthHint), 0.f);
++}
++
++//! Cache lookup / (re)build of one water surface's local space BVH.
++SRTWaterCacheEntry* RT_GetWaterCacheEntry(const void* key, int64 sig)
++{
++	TRTWaterCache::const_iterator it = g_rtWaterCache.find(key);
++
++	if (it != g_rtWaterCache.end())
++	{
++		it->second->lastUsedFrame = GetCurrPassMainFrameID();
++
++		if (it->second->sig == sig)
++			return nullptr;   // cached and still valid: the caller must not rebuild it
++
++		it->second->sig = sig;
++		it->second->mesh.tris.Clear();
++		it->second->mesh.nodes.Clear();
++		return it->second;
++	}
++
++	SRTWaterCacheEntry* pNew = new SRTWaterCacheEntry();
++	pNew->sig = sig;
++	pNew->lastUsedFrame = GetCurrPassMainFrameID();
++	g_rtWaterCache[key] = pNew;
++
++	return pNew;
++}
++
++SRTDynMesh* RT_GetCachedWaterMesh(const void* key)
++{
++	TRTWaterCache::const_iterator it = g_rtWaterCache.find(key);
++
++	return (it != g_rtWaterCache.end()) ? &it->second->mesh : nullptr;
++}
++
++//! Collects the ocean plane and every visible water volume near the camera.
++void RT_CollectWaterSurfaces(const Vec3& camPos, float distCam, float distRay, PodArray<SRTWaterSurface>& arrOut)
++{
++	C3DEngine* p3DEngine = Cry3DEngineBase::Get3DEngine();
++
++	if (!p3DEngine)
++		return;
++
++	const int  gridDim = CLAMP(Cry3DEngineBase::GetCVars()->e_svoTI_RT_WaterGrid, 1, 4);
++	const bool bNoDraw = (p3DEngine->GetOceanRenderFlags() & OCR_NO_DRAW) != 0;
++
++	// ---- the ocean ---------------------------------------------------------------------------
++	{
++		CTerrain*  pTerrain = Cry3DEngineBase::GetTerrain();
++		COcean*    pOcean = pTerrain ? pTerrain->GetOcean() : nullptr;
++		IMaterial* pOceanMat = pOcean ? pOcean->GetMaterial() : nullptr;
++		const float waterLevel = p3DEngine->GetWaterLevel();
++
++		if (pOcean && pOceanMat && !bNoDraw && Cry3DEngineBase::GetCVars()->e_WaterOcean &&
++		    waterLevel > WATER_LEVEL_UNKNOWN && waterLevel < -WATER_LEVEL_UNKNOWN)
++		{
++			// the ring has to cover every point a ray can reach: the collection radius plus one ray
++			const float radius = max(1.f, distCam + distRay);
++
++			// the mesh is rebuilt only when its size or subdivision changes; the camera moves the
++			// INSTANCE, so a walking camera costs one Matrix34 and nothing else
++			const int64 sig = (int64)gridDim * 0x40000000ll + (int64)(radius * 16.f);
++
++			if (SRTWaterCacheEntry* pEntry = RT_GetWaterCacheEntry(&g_rtOceanKey, sig))
++			{
++				PodArray<SRTBuildTri> arrSrc;
++				RT_AddWaterQuad(arrSrc, Vec3(-radius, -radius, 0.f), Vec3(2.f * radius, 0.f, 0.f), Vec3(0.f, 2.f * radius, 0.f), gridDim);
++				for (int i = 0; i < arrSrc.Count(); i++)
++					RT_NormalizeTriUV(arrSrc[i]);
++				RT_BuildDynMeshTopology(arrSrc, pEntry->mesh);
++			}
++
++			if (SRTDynMesh* pMesh = RT_GetCachedWaterMesh(&g_rtOceanKey))
++			{
++				if (pMesh->tris.Count())
++				{
++					SRTWaterSurface ws;
++					ws.pMesh = pMesh;
++					ws.mat.SetIdentity();
++					ws.mat.SetTranslation(Vec3(camPos.x, camPos.y, waterLevel));
++					ws.worldBox = AABB(Vec3(camPos.x - radius, camPos.y - radius, waterLevel),
++					                   Vec3(camPos.x + radius, camPos.y + radius, waterLevel));
++
++					// ocean fog: E3DPARAM_OCEANFOG_COLOR / _DENSITY, the same two globals the time of day
++					// writes (TimeOfDay.cpp:1393) and COcean::Render reads as m_oceanFogColor /
++					// m_oceanFogDensity (terrain_water_quad.cpp:510)
++					Vec3 fogColor(0.f, 0.f, 0.f);
++					p3DEngine->GetGlobalParameter(E3DPARAM_OCEANFOG_COLOR, fogColor);
++					const float fogDensity = p3DEngine->GetGlobalParameter(E3DPARAM_OCEANFOG_DENSITY);
++
++					RT_FillWaterMatRecord(pOceanMat, fogColor, fogDensity,
++					                      max(0.f, Cry3DEngineBase::GetCVars()->e_svoTI_RT_WaterDepth), ws.matSet);
++
++					arrOut.Add(ws);
++				}
++			}
++		}
++	}
++
++	// ---- water volumes (rivers, lakes) -----------------------------------------------------
++	if (bNoDraw)
++		return;
++
++	AABB areaBox(camPos, camPos);
++	areaBox.Expand(Vec3(distCam));
++
++	const int objCount = (int)gEnv->p3DEngine->GetObjectsByTypeInBox(eERType_WaterVolume, areaBox, (IRenderNode**)0);
++
++	if (objCount <= 0)
++		return;
++
++	PodArray<IRenderNode*> arrNodes;
++	arrNodes.PreAllocate(objCount, objCount);
++	gEnv->p3DEngine->GetObjectsByTypeInBox(eERType_WaterVolume, areaBox, arrNodes.GetElements());
++
++	for (int n = 0; n < arrNodes.Count(); n++)
++	{
++		IRenderNode* pRN = arrNodes[n];
++
++		if (!pRN || pRN->GetRenderNodeType() != eERType_WaterVolume)
++			continue;
++
++		// COcean reports the same node type and is handled above; it calls itself "Ocean", every
++		// CWaterVolumeRenderNode calls itself "WaterVolume" (GetEntityClassName)
++		const char* szClass = pRN->GetEntityClassName();
++
++		if (!szClass || strcmp(szClass, "WaterVolume"))
++			continue;
++
++		if (pRN->GetRndFlags() & (ERF_PENDING_DELETE | ERF_HIDDEN))
++			continue;
++
++		if (pRN->IsHidden())
++			continue;
++
++		CWaterVolumeRenderNode* pWV = static_cast<CWaterVolumeRenderNode*>(pRN);
++
++		// CE itself draws nothing for a zero density volume (Render_JobEntry: "if (m_fogDensity == 0) return")
++		if (pWV->GetRTFogDensity() == 0.f)
++			continue;
++
++		const uint32 triCount = pWV->GetRTSurfaceTriCount();
++
++		if (!triCount)
++			continue;
++
++		const AABB nodeBox = pRN->GetBBox();
++
++		if (nodeBox.IsReset() || !nodeBox.IsNonZero())
++			continue;
++
++		if (nodeBox.GetDistance(camPos) > distCam)
++			continue;
++
++		// same visibility shape as the dynamic mesh collector: within one ray length of the frustum
++		AABB visBox = nodeBox;
++		visBox.Expand(Vec3(distRay));
++
++		if (!gEnv->pSystem->GetViewCamera().IsAABBVisible_E(visBox))
++			continue;
++
++		// one object may not eat the whole segment on its own
++		if ((int)triCount > SVO_RT_DYN_MESH_COUNT / 2)
++			continue;
++
++		Vec3 v0[3];
++		Vec2 t0[3];
++
++		if (!pWV->GetRTSurfaceTri(0, v0, t0))
++			continue;
++
++		// signature: triangle count plus the first vertex, so an edited or moved surface (and a
++		// recycled node pointer) rebuilds instead of keeping a stale subtree
++		int64 sig = (int64)triCount;
++		sig = sig * 1000003ll + (int64)(v0[0].x * 64.f);
++		sig = sig * 1000003ll + (int64)(v0[0].y * 64.f);
++		sig = sig * 1000003ll + (int64)(v0[0].z * 64.f);
++
++		if (SRTWaterCacheEntry* pEntry = RT_GetWaterCacheEntry(pRN, sig))
++		{
++			PodArray<SRTBuildTri> arrSrc;
++			arrSrc.PreAllocate(triCount, 0);
++
++			for (uint32 t = 0; t < triCount; t++)
++			{
++				Vec3 v[3];
++				Vec2 uv[3];
++
++				if (!pWV->GetRTSurfaceTri(t, v, uv))
++					continue;
++
++				SRTBuildTri bt;
++				bt.faceNorm = (v[1] - v[0]).Cross(v[2] - v[0]).GetNormalizedSafe(Vec3(0, 0, 1));
++
++				if (bt.faceNorm.z < 0.f)
++				{
++					// the triangulator does not guarantee a winding; water is single sided seen from
++					// above, so every triangle is flipped to face +Z
++					std::swap(v[1], v[2]);
++					std::swap(uv[1], uv[2]);
++					bt.faceNorm = -bt.faceNorm;
++				}
++
++				for (int k = 0; k < 3; k++)
++				{
++					bt.v[k] = v[k];
++					bt.t[k] = uv[k];
++					bt.n[k] = bt.faceNorm;
++				}
++
++				bt.matRecord = 0;
++				RT_NormalizeTriUV(bt);
++				arrSrc.Add(bt);
++			}
++
++			if (arrSrc.Count())
++				RT_BuildDynMeshTopology(arrSrc, pEntry->mesh);
++		}
++
++		SRTDynMesh* pMesh = RT_GetCachedWaterMesh(pRN);
++
++		if (!pMesh || !pMesh->tris.Count())
++			continue;
++
++		SRTWaterSurface ws;
++		ws.pMesh = pMesh;
++		ws.mat = pWV->GetRTWorldTM();
++		ws.worldBox.Reset();
++
++		for (int c = 0; c < 8; c++)
++		{
++			const Vec3 pt((c & 1) ? pMesh->localBox.max.x : pMesh->localBox.min.x,
++			              (c & 2) ? pMesh->localBox.max.y : pMesh->localBox.min.y,
++			              (c & 4) ? pMesh->localBox.max.z : pMesh->localBox.min.z);
++			ws.worldBox.Add(ws.mat.TransformPoint(pt));
++		}
++
++		// Render_JobEntry: m_fogColor is multiplied by the time of day HDR multiplier unless the
++		// volume is flagged "fog colour affected by sun"
++		const float hdrMul = pWV->GetRTFogColorAffectedBySun()
++		                     ? 1.f
++		                     : ((CTimeOfDay*)p3DEngine->GetTimeOfDay())->GetHDRMultiplier();
++
++		// the volume knows its own depth; fall back to the ocean hint when it is not authored
++		float depthHint = pWV->GetRTVolumeDepth();
++
++		if (depthHint <= 0.f)
++			depthHint = max(0.f, Cry3DEngineBase::GetCVars()->e_svoTI_RT_WaterDepth);
++
++		RT_FillWaterMatRecord(pRN->GetMaterial(), pWV->GetRTFogColor() * hdrMul, pWV->GetRTFogDensity(), depthHint, ws.matSet);
++
++		arrOut.Add(ws);
++	}
++}
+ }   // anonymous namespace
+ 
+ void CVoxelSegment::RTClearDynamicCache()
+@@ -4812,6 +5241,7 @@ void CVoxelSegment::RTClearDynamicCache()
+ 		delete it->second;
+ 
+ 	g_rtDynCache.clear();
++	RT_ClearWaterCache();
+ 	g_rtDynPrevTexSlices.Reset();
+ 	g_rtDynPrevRecords = 0;
+ 	g_rtDynPrevMats = 0;
+@@ -4822,7 +5252,9 @@ void CVoxelSegment::RTUpdateDynamic()
+ 	if (!GetCVars()->e_svoTI_RT_Active || !gSvoEnv)
+ 		return;
+ 
+-	const bool bEnabled = (GetCVars()->e_svoTI_RT_Dynamic != 0);
++	const bool bMeshes = (GetCVars()->e_svoTI_RT_Dynamic != 0);
++	const bool bWater = (GetCVars()->e_svoTI_RT_Water != 0);
++	const bool bEnabled = bMeshes || bWater;
+ 
+ 	// switched off and nothing left over from a previous frame: touch nothing, allocate nothing
+ 	if (!bEnabled && !g_rtDynPrevRecords && !g_rtDynPrevMats)
+@@ -4852,7 +5284,7 @@ void CVoxelSegment::RTUpdateDynamic()
+ 
+ 		const EERType arrTypes[3] = { eERType_MovableBrush, eERType_Brush, eERType_Character };
+ 
+-		for (int t = 0; t < 3; t++)
++		for (int t = 0; bMeshes && t < 3; t++)
+ 		{
+ 			const int objCount = (int)gEnv->p3DEngine->GetObjectsByTypeInBox(arrTypes[t], areaBox, (IRenderNode**)0);
+ 			if (objCount <= 0)
+@@ -4908,6 +5340,7 @@ void CVoxelSegment::RTUpdateDynamic()
+ 				inst.pMat = arrSources[s].pMat;
+ 				inst.mat = arrSources[s].worldTM;
+ 				inst.importance = importance;
++				inst.waterMat = -1;
+ 				inst.triOfs = s;   // temporary: index into arrSources
+ 				inst.boxOfs = 0;
+ 				inst.worldBox = nodeBox;
+@@ -4981,6 +5414,51 @@ void CVoxelSegment::RTUpdateDynamic()
+ 			arrKept.Add(inst);
+ 		}
+ 
++		// ---- water surfaces (rt decision 09 9.4) ------------------------------------------------
++		// The ocean ring and the water volumes are ordinary objects of the same two level tree, so
++		// they share its record budget, its per object quantisation and its tail zeroing. They are
++		// added AFTER the meshes: a water surface is cheap (the ocean is <= 32 triangles) but it is
++		// also the least interesting thing to keep when the segment is full.
++		if (bWater)
++		{
++			PodArray<SRTWaterSurface> arrWater;
++			RT_CollectWaterSurfaces(camPos, distCam, distRay, arrWater);
++
++			gSvoEnv->m_rtDynStats.objsFound += arrWater.Count();
++
++			for (int w = 0; w < arrWater.Count(); w++)
++			{
++				const SRTWaterSurface& ws = arrWater[w];
++				const int              triCount = ws.pMesh->tris.Count();
++				const int              cost = ws.pMesh->nodes.Count() + triCount;
++
++				if (budgetTris + triCount > maxTrisCvar)
++					continue;
++				if (budgetRecords + cost + 2 * (arrKept.Count() + 1) > maxRecords)
++					continue;
++
++				budgetTris += triCount;
++				budgetRecords += cost;
++
++				SRTDynInst inst;
++				inst.pMesh = ws.pMesh;
++				inst.pMat = nullptr;
++				inst.mat = ws.mat;
++				inst.importance = 0.f;
++				inst.waterMat = f.waterMats.Count();
++				inst.triOfs = -1;
++				inst.boxOfs = 0;
++				inst.worldBox = ws.worldBox;
++				inst.qb = RT_DynQuantBounds(ws.worldBox);
++
++				f.waterMats.Add(ws.matSet);
++				arrKept.Add(inst);
++
++				f.waterObjs++;
++				f.waterTris += triCount;
++			}
++		}
++
+ 		f.insts.Clear();
+ 		f.insts.AddList(arrKept);
+ 
+@@ -4996,36 +5474,57 @@ void CVoxelSegment::RTUpdateDynamic()
+ 			inst.triOfs = f.worldTris.Count();
+ 			inst.boxOfs = f.nodeBoxes.Count();
+ 
++			// A water surface brings its own ready made record set (rt decision 09 9.4), appended
++			// once per surface and never deduplicated: the ocean and every volume carry their own fog
++			// colour and density, so two of them are almost never the same record.
++			int waterRecord = 0;
++
++			if (inst.waterMat >= 0)
++			{
++				const SRTMatRecordSet& waterSet = f.waterMats[inst.waterMat];
++				const int              localRecord = f.matRecords.Count() / SVO_RT_RECORD_TEXELS;
++
++				if (localRecord + waterSet.RecordCount() <= SVO_RT_DYN_MATS_COUNT)
++				{
++					waterRecord = SVO_RT_SEG_DYN_MATS + localRecord;
++					RT_AppendMatRecordSet(waterSet, localRecord, SVO_RT_SEG_DYN_MATS, f.matRecords, nullptr);
++				}
++			}
++
+ 			// sub material -> DYN_MATS record, deduplicated per frame by the leaf material pointer
+ 			for (int t = 0; t < mesh.tris.Count(); t++)
+ 			{
+ 				SRTBuildTri bt = mesh.tris[t];
+ 
+-				IMaterial* pLeafMat = inst.pMat ? inst.pMat->GetSafeSubMtl(bt.matRecord) : nullptr;
+-
+-				int matRecord = 0;
+-				std::map<IMaterial*, int>::const_iterator itM = matToRecord.find(pLeafMat);
++				int matRecord = waterRecord;
+ 
+-				if (itM != matToRecord.end())
+-				{
+-					matRecord = itM->second;
+-				}
+-				else
++				if (inst.waterMat < 0)
+ 				{
+-					SRTMatRecordSet matSet;
+-					RTFillMaterialRecord(pLeafMat, false, f.texSlices, matSet);
++					IMaterial* pLeafMat = inst.pMat ? inst.pMat->GetSafeSubMtl(bt.matRecord) : nullptr;
+ 
+-					const int localRecord = f.matRecords.Count() / SVO_RT_RECORD_TEXELS;
++					std::map<IMaterial*, int>::const_iterator itM = matToRecord.find(pLeafMat);
+ 
+-					// the whole set (base + extras + blend) has to fit, or the material falls back to
+-					// record 0 - never a half written set the consumer would walk into
+-					if (localRecord + matSet.RecordCount() <= SVO_RT_DYN_MATS_COUNT)
++					if (itM != matToRecord.end())
+ 					{
+-						matRecord = SVO_RT_SEG_DYN_MATS + localRecord;
+-						matToRecord[pLeafMat] = matRecord;
++						matRecord = itM->second;
++					}
++					else
++					{
++						SRTMatRecordSet matSet;
++						RTFillMaterialRecord(pLeafMat, false, f.texSlices, matSet);
+ 
+-						// dynamic records are absolute from the start, so no relocation list
+-						RT_AppendMatRecordSet(matSet, localRecord, SVO_RT_SEG_DYN_MATS, f.matRecords, nullptr);
++						const int localRecord = f.matRecords.Count() / SVO_RT_RECORD_TEXELS;
++
++						// the whole set (base + extras + blend) has to fit, or the material falls back to
++						// record 0 - never a half written set the consumer would walk into
++						if (localRecord + matSet.RecordCount() <= SVO_RT_DYN_MATS_COUNT)
++						{
++							matRecord = SVO_RT_SEG_DYN_MATS + localRecord;
++							matToRecord[pLeafMat] = matRecord;
++
++							// dynamic records are absolute from the start, so no relocation list
++							RT_AppendMatRecordSet(matSet, localRecord, SVO_RT_SEG_DYN_MATS, f.matRecords, nullptr);
++						}
+ 					}
+ 				}
+ 
+@@ -5138,6 +5637,7 @@ void CVoxelSegment::RTUpdateDynamic()
+ 	g_rtDynPrevTexSlices.AddList(f.texSlices);
+ 
+ 	RT_EvictDynCache();
++	RT_EvictWaterCache();
+ 
+ 	gSvoEnv->m_rtDynStats.objs = f.insts.Count();
+ 	gSvoEnv->m_rtDynStats.tris = f.worldTris.Count();
+@@ -5145,6 +5645,8 @@ void CVoxelSegment::RTUpdateDynamic()
+ 	gSvoEnv->m_rtDynStats.mats = matCount;
+ 	gSvoEnv->m_rtDynStats.overflowed = f.overflowed;
+ 	gSvoEnv->m_rtDynStats.cached = (int)g_rtDynCache.size();
++	gSvoEnv->m_rtDynStats.waterObjs = f.waterObjs;
++	gSvoEnv->m_rtDynStats.waterTris = f.waterTris;
+ 	gSvoEnv->m_rtDynStats.ms = (GetCurAsyncTimeSec() - startTime) * 1000.f;
+ }
+ 
+@@ -5891,6 +6393,7 @@ void CVoxelSegment::RunRTSelfTest()
+ 				inst.pMat = nullptr;
+ 				inst.mat = instMat;
+ 				inst.importance = 1.f;
++				inst.waterMat = -1;
+ 				inst.triOfs = 0;
+ 				inst.boxOfs = 0;
+ 				inst.worldBox.Reset();
+@@ -6065,10 +6568,303 @@ void CVoxelSegment::RunRTSelfTest()
+ 	             dynTrisTotal, dynRecordsUsed[0], dynRecordsUsed[1], dynRecordsUsed[2], dynRecordsUsed[3], dynOverflowObjs,
+ 	             dynMismatches, dynOverflows, dynStaleTexels);
+ 
++	// ---------------------------------------------------------------------------------------------
++	// Water surfaces (rt decision 09 9.4): a synthetic ocean ring and one water volume quad go
++	// through the real producer - RT_AddWaterQuad, RT_BuildDynMeshTopology, RT_FillWaterMatRecord,
++	// RT_AppendMatRecordSet, RT_RefitDynInst, RT_EmitDynTop - and are then read back out of the
++	// WRITTEN records. Checked: the tag 4 record layout, that every water triangle faces +Z, that a
++	// ray from above hits its FRONT face while the same ray from below hits its BACK face (which is
++	// what lets the consumer reject it), and that each surface keeps its own material record.
++	// ---------------------------------------------------------------------------------------------
++	int waterMismatches = 0;
++	int waterBackFacing = 0;
++	int waterTrisTotal = 0;
++	int waterRecordsUsed = 0;
++	{
++		SRTDynMesh meshOcean, meshVol;
++
++		{
++			PodArray<SRTBuildTri> arrO, arrV;
++			RT_AddWaterQuad(arrO, Vec3(-40.f, -40.f, 0.f), Vec3(80.f, 0.f, 0.f), Vec3(0.f, 80.f, 0.f), 4);   // 32 tris
++			RT_AddWaterQuad(arrV, Vec3(-3.f, -3.f, 0.f), Vec3(6.f, 0.f, 0.f), Vec3(0.f, 6.f, 0.f), 2);       //  8 tris
++			for (int i = 0; i < arrO.Count(); i++)
++				RT_NormalizeTriUV(arrO[i]);
++			for (int i = 0; i < arrV.Count(); i++)
++				RT_NormalizeTriUV(arrV[i]);
++			RT_BuildDynMeshTopology(arrO, meshOcean);
++			RT_BuildDynMeshTopology(arrV, meshVol);
++		}
++
++		waterTrisTotal = meshOcean.tris.Count() + meshVol.tris.Count();
++
++		if (meshOcean.tris.Count() != 32 || meshVol.tris.Count() != 8)
++			waterMismatches++;   // the ocean ring has to stay inside its 32 triangle budget
++
++		// ---- the two material records ----------------------------------------------------------
++		const Vec3  oceanFog(0.05f, 0.14f, 0.19f);
++		const Vec3  volFog(0.10f, 0.30f, 0.22f);
++		const float oceanDensity = 0.32f, volDensity = 0.85f;
++		const float oceanDepth = 5.f, volDepth = 2.5f;
++
++		SRTMatRecordSet setOcean, setVol;
++		RT_FillWaterMatRecord(nullptr, oceanFog, oceanDensity, oceanDepth, setOcean);
++		RT_FillWaterMatRecord(nullptr, volFog, volDensity, volDepth, setVol);
++
++		if (setOcean.RecordCount() != 2 || setVol.RecordCount() != 2)
++			waterMismatches++;   // base + extras, never a blend record
++
++		PodArray<Vec4> mats;
++		RT_AppendMatRecordSet(setOcean, 0, SVO_RT_SEG_DYN_MATS, mats, nullptr);
++		RT_AppendMatRecordSet(setVol, setOcean.RecordCount(), SVO_RT_SEG_DYN_MATS, mats, nullptr);
++
++		const int oceanMatRec = SVO_RT_SEG_DYN_MATS + 0;
++		const int volMatRec = SVO_RT_SEG_DYN_MATS + setOcean.RecordCount();
++
++		{
++			const Vec4* pBase = mats.GetElements();
++			const Vec4* pExtra = mats.GetElements() + SVO_RT_RECORD_TEXELS;
++
++			int emissiveSlot = 0, extrasRef = 0;
++			RT_ExtractUint2(pBase[0].z, emissiveSlot, extrasRef);
++
++			float opacity = 0.f, alphaRef = 0.f;
++			RT_ExtractTC16(pBase[3].w, opacity, alphaRef);
++
++			if (extrasRef != 1 || emissiveSlot != 0)
++				waterMismatches++;
++			if (pBase[3].z != SVO_RT_TAG_WATER)
++				waterMismatches++;
++			if (fabs(pBase[1].y - 0.02f) > 1e-6f || fabs(pBase[1].z - 1.f) > 1e-6f)
++				waterMismatches++;
++			if (fabs(opacity - 1.f) > 1e-3f || fabs(alphaRef) > 1e-3f)
++				waterMismatches++;
++			if (fabs(pBase[2].x - oceanFog.x) > 1e-6f || fabs(pBase[2].y - oceanFog.y) > 1e-6f || fabs(pBase[2].z - oceanFog.z) > 1e-6f)
++				waterMismatches++;
++			if (fabs(pExtra[2].x - oceanFog.x) > 1e-6f || fabs(pExtra[2].y - oceanFog.y) > 1e-6f ||
++			    fabs(pExtra[2].z - oceanFog.z) > 1e-6f || fabs(pExtra[2].w - oceanDensity) > 1e-6f)
++				waterMismatches++;
++			if (fabs(pExtra[3].x - 1.f) > 1e-6f || fabs(pExtra[3].y - 1.f) > 1e-6f ||
++			    fabs(pExtra[3].z - oceanDepth) > 1e-6f || pExtra[3].w != 0.f)
++				waterMismatches++;
++
++			const Vec4* pVolBase = mats.GetElements() + (size_t)setOcean.RecordCount() * SVO_RT_RECORD_TEXELS;
++			const Vec4* pVolExtra = pVolBase + SVO_RT_RECORD_TEXELS;
++
++			if (pVolBase[3].z != SVO_RT_TAG_WATER || fabs(pVolExtra[2].w - volDensity) > 1e-6f ||
++			    fabs(pVolExtra[3].z - volDepth) > 1e-6f || fabs(pVolBase[2].y - volFog.y) > 1e-6f)
++				waterMismatches++;
++		}
++
++		// ---- emit both surfaces through the real dynamic path -----------------------------------
++		// the volume sits outside the ocean quad's XY footprint, so "from above" is unambiguous
++		const Vec3 oceanCentre(5.f, -3.f, 12.f);
++		const Vec3 volCentre(60.f, 40.f, 14.f);
++
++		SRTDynFrame f;
++
++		SRTDynMesh* arrMesh[2] = { &meshOcean, &meshVol };
++		Matrix34    arrMat[2];
++		arrMat[0].SetIdentity();
++		arrMat[0].SetTranslation(oceanCentre);
++		arrMat[1].SetIdentity();
++		arrMat[1].SetTranslation(volCentre);
++
++		const int arrMatRec[2] = { oceanMatRec, volMatRec };
++
++		for (int i = 0; i < 2; i++)
++		{
++			SRTDynInst inst;
++			inst.pMesh = arrMesh[i];
++			inst.pMat = nullptr;
++			inst.mat = arrMat[i];
++			inst.importance = 0.f;
++			inst.waterMat = i;
++			inst.triOfs = 0;
++			inst.boxOfs = 0;
++			inst.worldBox.Reset();
++			for (int c = 0; c < 8; c++)
++			{
++				const Vec3 pt((c & 1) ? arrMesh[i]->localBox.max.x : arrMesh[i]->localBox.min.x,
++				              (c & 2) ? arrMesh[i]->localBox.max.y : arrMesh[i]->localBox.min.y,
++				              (c & 4) ? arrMesh[i]->localBox.max.z : arrMesh[i]->localBox.min.z);
++				inst.worldBox.Add(arrMat[i].TransformPoint(pt));
++			}
++			inst.qb = RT_DynQuantBounds(inst.worldBox);
++			f.insts.Add(inst);
++		}
++
++		for (int i = 0; i < f.insts.Count(); i++)
++		{
++			SRTDynInst& inst = f.insts[i];
++
++			inst.triOfs = f.worldTris.Count();
++			inst.boxOfs = f.nodeBoxes.Count();
++
++			for (int t = 0; t < inst.pMesh->tris.Count(); t++)
++			{
++				SRTBuildTri bt = inst.pMesh->tris[t];
++				for (int v = 0; v < 3; v++)
++				{
++					bt.v[v] = inst.mat.TransformPoint(bt.v[v]);
++					bt.n[v] = inst.mat.TransformVector(bt.n[v]);
++				}
++				bt.faceNorm = (bt.v[1] - bt.v[0]).Cross(bt.v[2] - bt.v[0]).GetNormalizedSafe(Vec3(0, 0, 1));
++				bt.matRecord = arrMatRec[inst.waterMat];
++				f.worldTris.Add(bt);
++			}
++
++			RT_RefitDynInst(f, inst);
++		}
++
++		int upperBound = 2 * f.insts.Count() + 8;
++		for (int i = 0; i < f.insts.Count(); i++)
++			upperBound += f.insts[i].pMesh->nodes.Count() + f.insts[i].pMesh->tris.Count();
++
++		f.records.PreAllocate(upperBound * SVO_RT_RECORD_TEXELS, upperBound * SVO_RT_RECORD_TEXELS);
++
++		AABB rootBox;
++		rootBox.Reset();
++		for (int i = 0; i < f.insts.Count(); i++)
++			rootBox.Add(f.insts[i].worldBox);
++
++		PodArray<int> arrIds;
++		for (int i = 0; i < f.insts.Count(); i++)
++			arrIds.Add(i);
++
++		waterRecordsUsed = RT_EmitDynTop(f, arrIds.GetElements(), arrIds.Count(), 0, SVO_RT_SEG_DYN_MESH, RT_DynQuantBounds(rootBox));
++
++		PodArray<Vec4> pool;
++		pool.PreAllocate(waterRecordsUsed * SVO_RT_RECORD_TEXELS, waterRecordsUsed * SVO_RT_RECORD_TEXELS);
++		memcpy(pool.GetElements(), f.records.GetElements(), (size_t)waterRecordsUsed * SVO_RT_RECORD_TEXELS * sizeof(Vec4));
++
++		// ---- read the triangles back out of the written records --------------------------------
++		PodArray<Vec3> arrDecV;
++		PodArray<int>  arrDecRec;
++		PodArray<int>  arrDecMat;
++		{
++			PodArray<int> stack;
++			stack.Add(SVO_RT_SEG_DYN_MESH);
++
++			while (stack.Count())
++			{
++				const int rec = stack.Last();
++				stack.DeleteLast();
++
++				const Vec4* pRec = pool.GetElements() + (size_t)rec * SVO_RT_RECORD_TEXELS;
++				const int   child0 = (int)pRec[3].x;
++
++				if (child0 > 0)
++				{
++					stack.Add(child0);
++					stack.Add((int)pRec[3].y);
++					continue;
++				}
++
++				const int  triCount = (int)pRec[0].w;
++				const Vec4 nodeQb = pRec[2];
++
++				for (int t = 0; t < triCount; t++)
++				{
++					const Vec4* pTri = pRec + (size_t)(1 + t) * SVO_RT_RECORD_TEXELS;
++					for (int v = 0; v < 3; v++)
++					{
++						const uint32 packed = RT_AsUint(pTri[v].x);
++						arrDecV.Add(Vec3(RT_UnquantPos(packed & 0xffff, nodeQb.x, nodeQb.w),
++						                 RT_UnquantPos((packed >> 16) & 0xffff, nodeQb.y, nodeQb.w),
++						                 pTri[v].w));
++					}
++					arrDecRec.Add(rec + 1 + t);
++					arrDecMat.Add((int)pTri[3].x);
++				}
++			}
++		}
++
++		if (arrDecRec.Count() != waterTrisTotal)
++			waterMismatches++;
++
++		// every water triangle must face up: that is what makes "seen from above" well defined
++		for (int i = 0; i < arrDecRec.Count(); i++)
++		{
++			const Vec3 n = (arrDecV[i * 3 + 1] - arrDecV[i * 3 + 0]).Cross(arrDecV[i * 3 + 2] - arrDecV[i * 3 + 0]);
++
++			if (n.z <= 0.f)
++				waterMismatches++;
++			if (arrDecMat[i] != oceanMatRec && arrDecMat[i] != volMatRec)
++				waterMismatches++;
++		}
++
++		// ---- trace the same points from above and from below ------------------------------------
++		SRTTestRand waterRnd(0x7a7eu);
++
++		for (int rayId = 0; rayId < 400; rayId++)
++		{
++			const bool  bVolume = (rayId & 1) != 0;
++			const Vec3  centre = bVolume ? volCentre : oceanCentre;
++			const float halfSize = bVolume ? 2.5f : 35.f;
++			const int   wantMat = bVolume ? volMatRec : oceanMatRec;
++
++			const Vec3 target(centre.x + waterRnd.NextRange(-halfSize, halfSize),
++			                  centre.y + waterRnd.NextRange(-halfSize, halfSize),
++			                  centre.z);
++
++			for (int side = 0; side < 2; side++)
++			{
++				const Vec3 org = target + Vec3(0.f, 0.f, side ? -20.f : 20.f);
++				const Vec3 dir = (target - org).GetNormalizedSafe(Vec3(0, 0, -1));
++
++				float bestT = 100.f;
++				int   bestRec = -1;
++				bool  bInc = false;
++
++				RT_RefTrace(pool.GetElements(), SVO_RT_SEG_DYN_MESH, SVO_RT_SEG_DYN_MESH, org, dir, 100.f, bestT, bestRec, bInc);
++
++				if (bestRec < 0 || bInc)
++				{
++					// the geometry must be hit from both sides - it is the CONSUMER that rejects one
++					waterMismatches++;
++					continue;
++				}
++
++				int decoded = -1;
++				for (int i = 0; i < arrDecRec.Count(); i++)
++					if (arrDecRec[i] == bestRec)
++						decoded = i;
++
++				if (decoded < 0)
++				{
++					waterMismatches++;
++					continue;
++				}
++
++				if (arrDecMat[decoded] != wantMat)
++					waterMismatches++;   // each surface keeps its own water material record
++
++				// the geometric normal the consumer rebuilds from the winding, against the ray
++				const Vec3  nrm = (arrDecV[decoded * 3 + 1] - arrDecV[decoded * 3 + 0]).Cross(arrDecV[decoded * 3 + 2] - arrDecV[decoded * 3 + 0]);
++				const float facing = nrm.GetNormalizedSafe(Vec3(0, 0, 1)).Dot(dir);
++
++				if (side == 0 && facing >= 0.f)
++					waterMismatches++;   // from above the water is a FRONT face
++
++				if (side == 1)
++				{
++					if (facing <= 0.f)
++						waterMismatches++;   // from below it must be a BACK face
++					else
++						waterBackFacing++;
++				}
++			}
++		}
++	}
++
++	PrintMessage("RT self test: water - ocean ring %d tris + volume quad, records %d, tag 4 record round trip, 400 x 2 rays, from below back facing = %d (must be 400), mismatches = %d (must be 0)",
++	             waterTrisTotal, waterRecordsUsed, waterBackFacing, waterMismatches);
++
++
+ 
+ 
+ 
+-	if (mismatchVsDecoded == 0 && overflowCount == 0 && matMismatches == 0 && extrasMismatches == 0 && resampleMismatches == 0 && dynMismatches == 0 && dynOverflows == 0 && dynStaleTexels == 0)
++	if (mismatchVsDecoded == 0 && overflowCount == 0 && matMismatches == 0 && extrasMismatches == 0 && resampleMismatches == 0 && dynMismatches == 0 && dynOverflows == 0 && dynStaleTexels == 0 && waterMismatches == 0)
+ 		PrintMessage("RT self test: PASSED");
+ 	else
+ 		PrintMessage("RT self test: FAILED");
+diff --git a/Code/CryEngine/Cry3DEngine/SVO/VoxelSegment.h b/Code/CryEngine/Cry3DEngine/SVO/VoxelSegment.h
+index a3c9def5..dbcbb690 100644
+--- a/Code/CryEngine/Cry3DEngine/SVO/VoxelSegment.h
++++ b/Code/CryEngine/Cry3DEngine/SVO/VoxelSegment.h
+@@ -41,7 +41,7 @@
+ 	#define SVO_RT_TAG_VEG_LEAVES      0.25f
+ 	#define SVO_RT_TAG_HUMAN_SKIN      2.f
+ 	#define SVO_RT_TAG_GLASS           3.f
+-	#define SVO_RT_TAG_WATER           4.f    // reserved (decision 09) - never produced yet
++	#define SVO_RT_TAG_WATER           4.f    // ocean plane / water volume surface (decision 09 9.4)
+ 	#define SVO_RT_TAG_TERRAIN         5.f
+ 	#define SVO_RT_TAG_EMISSIVE_ONLY   6.f    // reserved - CE has no usable "emissive but unlit" flag
+ 
+@@ -107,6 +107,9 @@ struct SRTDynStats
+ 	int   mats;        //!< material records written into DYN_MATS (base + extras + blend layer)
+ 	int   overflowed;  //!< objects merged into an overflow leaf because the top level hit its depth cap
+ 	int   cached;      //!< per object BVHs held in the cache
++	int   waterObjs;   //!< water surfaces emitted (ocean ring + water volumes, rt decision 09 9.4)
++	int   waterTris;   //!< triangles of those water surfaces (a subset of tris)
++
+ 	float ms;          //!< CPU cost of the last frame
+ };
+ 	
+diff --git a/Code/CryEngine/Cry3DEngine/WaterVolumeRenderNode.h b/Code/CryEngine/Cry3DEngine/WaterVolumeRenderNode.h
+index abe264a8..93514d6f 100644
+--- a/Code/CryEngine/Cry3DEngine/WaterVolumeRenderNode.h
++++ b/Code/CryEngine/Cry3DEngine/WaterVolumeRenderNode.h
+@@ -145,6 +145,33 @@ public:
+ 	void                 Transform(const Vec3& localOrigin, const Matrix34& l2w);
+ 	virtual IRenderNode* Clone() const override;
+ 
++	// Read only access for the SVO software triangle ray tracer (rt decision 09 9.4). The surface
++	// mesh and the fog parameters are exactly what Render_JobEntry hands to CREWaterVolume; the
++	// vertices are in the node's own space and GetRTWorldTM() is the matrix it puts on the render
++	// object (identity unless the volume is attached to an entity).
++	uint32   GetRTSurfaceTriCount() const { return (uint32)(m_waterSurfaceIndices.size() / 3); }
++	bool     GetRTSurfaceTri(uint32 tri, Vec3* pPos, Vec2* pUv) const
++	{
++		const size_t base = (size_t)tri * 3;
++		if (base + 2 >= m_waterSurfaceIndices.size())
++			return false;
++		for (size_t k = 0; k < 3; k++)
++		{
++			const size_t id = (size_t)m_waterSurfaceIndices[base + k];
++			if (id >= m_waterSurfaceVertices.size())
++				return false;
++			pPos[k] = m_waterSurfaceVertices[id].xyz;
++			pUv[k] = m_waterSurfaceVertices[id].st;
++		}
++		return true;
++	}
++	Matrix34 GetRTWorldTM() const           { return IsAttachedToEntity() ? m_parentEntityWorldTM : Matrix34(IDENTITY); }
++	Vec3     GetRTFogColor() const          { return m_fogColor; }
++	bool     GetRTFogColorAffectedBySun() const { return m_fogColorAffectedBySun; }
++	float    GetRTFogDensity() const        { return m_fogDensity; }
++	float    GetRTVolumeDepth() const       { return m_volumeDepth; }
++
++
+ public:
+ 	CWaterVolumeRenderNode();
+ 	const SWaterVolumeSerialize* GetSerializationParams();
+-- 
+2.47.1.windows.1
+

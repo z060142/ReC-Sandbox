@@ -1,11 +1,34 @@
 # Sync manifest
 
 Baseline : main @ a34100a9 (pristine CRYENGINE 5.7.1)
-Dev      : experimental-rt @ c0857963
-Synced   : 2026-09-14 00:34
+Dev      : experimental-rt @ 56dd8dca
+Synced   : 2026-09-14 05:19
 
 ## Commits (newest first)
 
+- 56dd8dca feat: volumetric clouds in ray traced reflections (decision 09 section 9.2)
+- 0cf232d6 feat: factor the volumetric cloud shape and density functions into CloudsCommon.cfi
+- 3f33313a feat: volumetric fog on the ray traced reflected segment (decision 09 section 9.3)
+- aba6b745 feat: real skinning of characters in the software triangle ray tracer (decision 07, stage 3B)
+- c45d790d feat: ray tracing debug views 16 and 17 - the shading tag at the hit, and whether it has an extras record
+- b3adf150 feat: ShadePS shades a ray traced hit by its material type - vegetation, skin, glass, water (decision 10)
+- 7d884755 feat: reconstruct the full material at a ray traced hit - detail mapping, blend layer, per type parameters (decision 10)
+- 44714685 fix: raise the render pass colour attachment limit to the API's 8
+- 06d90e63 feat: water surfaces as traceable geometry - ocean ring and water volumes in the dynamic RT segment (CPU, decision 09 9.4)
+- ca1801a6 feat: glossy triangle-RT reflections - renderer bindings and constants (decision 08)
+- aec9a453 feat: glossy (rough) triangle-RT reflections - shaders (decision 08)
+- cc02a903 feat: material types at the ray traced hit - shading tags and the extras record (CPU, decision 10)
+- e39236f2 fix: warn once if the ShadePass sun cascade mask is empty while the sun has cascades
+- 650b7b0d feat: debug view 13 - validator C, the reflection against the direct view in stops
+- 955ca26d fix: e_svoTI_RT_MaxDistRay default 24 m -> 48 m
+- ba767d6f fix: e_svoTI_SpecularAmplifier now reaches ray traced pixels too
+- 0bb15960 fix: the indirect light at a ray hit is the SVO's GI with occlusion, not the full probe
+- bbf8f196 feat: a reflection ray that hits nothing shows the sky, not a second sun
+- 87d4888d fix: SVOGI disappeared because a comment line lost its // and ended the .cfx parse
+- c334c969 fix: startup crash - a // comment on a #define line is a null deref in CryFX
+- 0d10aeda fix: the ray traced hit gets the material's gloss map, not just its scalar
+- 122bb991 feat: dynamic meshes in the software triangle ray tracer (stage 3A)
+- e3695d03 fix: ray traced hits get a real specular response (F0 was quantised to zero)
 - c0857963 fix: never wrap a top-level CryFX function in a file-scope %-flag #if
 - c1d6f28f feat: e_svoTI_RT_NormalsFading, full res specular set under RT, debug lane on ShadePass
 - 9b51ff8d fix: sharp, unhazed ray traced reflections and a provable sun shadow at the hit
@@ -212,9 +235,15 @@ Synced   : 2026-09-14 00:34
 - M	Code/CryEngine/Cry3DEngine/SVO/VoxelSegment.h
 - M	Code/CryEngine/Cry3DEngine/SkyLightManager.cpp
 - M	Code/CryEngine/Cry3DEngine/TimeOfDay.cpp
+- M	Code/CryEngine/Cry3DEngine/WaterVolumeRenderNode.h
 - M	Code/CryEngine/Cry3DEngine/cvars.cpp
+- M	Code/CryEngine/CryAnimation/AttachmentSkin.cpp
+- M	Code/CryEngine/CryAnimation/AttachmentSkin.h
+- M	Code/CryEngine/CryAnimation/AttachmentVCloth.h
+- M	Code/CryEngine/CryAnimation/cvars.cpp
 - M	Code/CryEngine/CryCommon/CMakeLists.txt
 - M	Code/CryEngine/CryCommon/Cry3DEngine/I3DEngine.h
+- M	Code/CryEngine/CryCommon/CryAnimation/IAttachment.h
 - M	Code/CryEngine/CryCommon/CryRenderer/IRenderer.h
 - A	Code/CryEngine/CryCommon/CryRenderer/SceneReferredCurves.h
 - M	Code/CryEngine/RenderDll/Common/Include_HLSL_CPP_Shared.h
@@ -240,6 +269,7 @@ Synced   : 2026-09-14 00:34
 - M	Code/CryEngine/RenderDll/XRenderD3D9/D3D_SVO.cpp
 - M	Code/CryEngine/RenderDll/XRenderD3D9/D3D_SVO.h
 - M	Code/CryEngine/RenderDll/XRenderD3D9/DeviceManager/DeviceObjectHelpers.cpp
+- M	Code/CryEngine/RenderDll/XRenderD3D9/DeviceManager/DeviceRenderPass.h
 - M	Code/CryEngine/RenderDll/XRenderD3D9/DriverD3D.cpp
 - M	Code/CryEngine/RenderDll/XRenderD3D9/DriverD3D.h
 - M	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/AutoExposure.cpp
@@ -275,6 +305,7 @@ Synced   : 2026-09-14 00:34
 - M	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/VolumetricClouds.cpp
 - M	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/VolumetricClouds.h
 - M	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/VolumetricFog.cpp
+- M	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/VolumetricFog.h
 - M	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Water.cpp
 - M	Code/CryEngine/RenderDll/XRenderD3D9/PostProcessDOF.cpp
 - M	Code/CryEngine/RenderDll/XRenderD3D9/core_renderer.waf_files
@@ -388,6 +419,7 @@ Synced   : 2026-09-14 00:34
 - M	Code/Tools/CryCommonTools/FileUtil.cpp
 - M	Engine/Shaders/CMakeLists.txt
 - M	Engine/Shaders/HWScripts/CryFX/Clouds.cfx
+- A	Engine/Shaders/HWScripts/CryFX/CloudsCommon.cfi
 - M	Engine/Shaders/HWScripts/CryFX/CommonMath.cfi
 - M	Engine/Shaders/HWScripts/CryFX/CommonSVO.cfi
 - A	Engine/Shaders/HWScripts/CryFX/CommonSVO_RT.cfi

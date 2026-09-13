@@ -43,6 +43,12 @@ struct SSvoTargetsSet
 	// ShadePass cannot write into pRT_ALD_0 / pRT_RGB_0 because it reads them as g-data, so it
 	// gets its own pair and DemosaicPass is pointed at that pair for the frame (bShaded).
 	_smart_ptr<CTexture> pRT_HITPOS_0, pRT_RAYDIR_0, pRT_ALD_SHD, pRT_RGB_SHD;
+	// rt stage 4A: the fifth g-data target, SVO diffuse irradiance + voxel AO at the hit, so the
+	// reflected surface gets the same indirect model ApplyGI mode 2 gives the primary one.
+	_smart_ptr<CTexture> pRT_HITGI_0;
+	// rt stage 5B: the sixth g-data target, the hit's shading tag plus one per type float3
+	// (decision 10). Slot 5 of the ConeTracePass MRT set, read by ShadePS at t39.
+	_smart_ptr<CTexture> pRT_HITMAT_0;
 	bool                 bShaded = false;
 
 	// de-mosaic targets
@@ -143,9 +149,19 @@ protected:
 
 	// rt stage 2 (decision 06): hit shading
 	bool                   IsRtHitShadingActive() const;
+	bool                   IsRtBlueNoiseReady() const;
 	void                   BuildRTLightGridPass();
 	void                   ShadePass(SSvoTargetsSet* pTS);
 	void                   SetupShadeForwardResources(CSvoFullscreenPass& rp);
+	// rt stage 4A (decision 09 section 9.1): the engine's own sky for a ray that misses.
+	void                   SetupShadeSkyTextures(CSvoFullscreenPass& rp);
+	void                   SetupShadeSkyConstants(CSvoFullscreenPass& rp);
+	// rt stage 5E (decision 09 section 9.3): volumetric fog on the reflected segment.
+	void                   SetupShadeFogTextures(CSvoFullscreenPass& rp);
+	void                   SetupShadeFogConstants(CSvoFullscreenPass& rp);
+
+	void                   SetupShadeCloudTextures(CSvoFullscreenPass& rp);
+	void                   SetupShadeCloudConstants(CSvoFullscreenPass& rp);
 	template<class T> void SetupRTLightGridConstants(T& rp);
 
 	template<class T> void SetupCommonSamplers(T& rp);
@@ -187,6 +203,11 @@ protected:
 	CShader*                    m_pShader;
 	_smart_ptr<CTexture>        m_pNoiseTex;
 	_smart_ptr<CTexture>        m_pCloudShadowTex;
+	// rt stage 4B (decision 08 item 1): 64 x 64 RGBA8 void-and-cluster blue noise, the random
+	// numbers of the GGX-VNDF sampler. Loaded lazily the first time e_svoTI_RT_Active is on and
+	// never released; if the file is missing the shader falls back to a hash.
+	_smart_ptr<CTexture>        m_pTexRTBlueNoise;
+	bool                        m_bTriedLoadRTBlueNoise = false;
 	static _smart_ptr<CTexture> s_pRsmColorMap;
 	static _smart_ptr<CTexture> s_pRsmNormlMap;
 	static _smart_ptr<CTexture> s_pRsmPoolCol;
@@ -241,6 +262,41 @@ protected:
 	Vec4               m_rtLightGridMax = Vec4(ZERO);
 	Vec4               m_rtLightGridDims = Vec4(ZERO);
 	CConstantBufferPtr m_pShadeForwardCB;   // CBPerPassForward (b5) for ShadePass
+
+	// rt stage 4A: what SetupShadeSkyTextures actually managed to bind this frame. The shader
+	// branches on these through SVO_SkyParams.xy; with neither set a miss keeps the env probe.
+	bool               m_bSkyDomeBound = false;
+	bool               m_bSkyBoxBound = false;
+
+	// rt stage 5E: whether SetupShadeFogTextures found live froxel volumes this frame, and
+	// whether the extinction density lives in its own R16F volume (r_HDRTexFormat 0 makes the
+	// in-scatter volume R11G11B10F, which has no alpha to put it in). The shader branches on
+	// both through SVO_VolFogParams.xy; with .x = 0 it keeps the analytic global fog.
+	bool               m_bVolFogBound = false;
+	bool               m_bVolFogSeparateDensity = false;
+
+	// rt stage 5F: whether SetupShadeCloudTextures found a live volumetric cloud stage with a
+	// cloud shadow volume this frame. With false the shader's SVO_CloudParams0.x is 0 and the
+	// miss path is exactly the plain sky lookup of stage 4A.
+	bool               m_bCloudsBound = false;
+
+	// rt stage 4B (decision 08). These three are resolved DEFENSIVELY in InitCVarValues instead
+	// of through INIT_SVO_CVAR, because their REGISTER_CVAR_AUTO lines live in Cry3DEngine's
+	// SceneTreeCVars.inl and that file had another agent's uncommitted work in it when this
+	// landed, so it is not committed with this stage (report 04b section 8 lists the three lines
+	// to add). INIT_SVO_CVAR dereferences gEnv->pConsole->GetCVar() unchecked, so a
+	// Cry3DEngine.dll built without the registrations would crash on the first frame. The values
+	// below are the registered defaults, so the feature behaves identically either way; only the
+	// console knobs are missing until the registrations land.
+	int   e_svoTI_RT_GlossyMode = 1;
+	float e_svoTI_RT_GlossScale = 1.f;
+	int   e_svoTI_RT_TemporalFrames = 8;
+
+	// rt stage 5F (decision 09 section 9.2), resolved the same defensive way and for the same
+	// reason: a Cry3DEngine.dll without the registrations keeps these defaults instead of
+	// dereferencing a null ICVar.
+	int   e_svoTI_RT_Clouds = 1;
+	int   e_svoTI_RT_CloudSteps = 12;
 
 	// cvar values
 	#define INIT_ALL_SVO_CVARS                                      \

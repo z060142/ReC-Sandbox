@@ -13,7 +13,12 @@
 struct CustomForwardShadingAttribs
 {
 	int    LightingModel;
-	float  Transmittance;
+	// rt stage 5B: a float3, not a scalar. ThinTranslucencyBRDF takes a transmittance COLOUR
+	// (shadeLib.cfi:952) and both CE sources of one are coloured - Vegetation's
+	// TransmittanceColor defaults to (1, 1, 0.6) and HumanSkin's is exp(x * (-8, -40, -64)),
+	// which is the red skin glow. Until now this lane was one scalar broadcast to grey, which
+	// is the one thing a transmittance colour must not be.
+	float3 Transmittance;
 	float  Emittance;
 	float3 RayDirection;
 	float  SunShadowRT;
@@ -136,6 +141,26 @@ Texture2D refl_GNO: register (t1); // = the RGB target
 Texture2D refl_GPO: register (t2); // = HITPOS
 Texture2D refl_GLD: register (t3); // = RAYDIR
 
+// rt stage 4A: the fifth g-data target, the SVO GI + AO at the hit. t37 is free on the ShadePass
+// technique (the forward set claims t17-t24, t26-t31, t33, t40; t34-t36 are the sky).
+Texture2D refl_GGI: register (t37);
+
+// rt stage 5B (decision 10): the sixth g-data target, the hit's shading tag and its per type
+// parameters. t39 is free on the ShadePass technique - the forward set claims t17-t24, t26-t31,
+// t32, t33, t38 (Fwd_SunShadowMask), t40 and t42-t49, the sky t34-t36 and the SVO GI t37 - and
+// FXSamplerDefs.cfi's own t39 users (NOISE_3D_MAP / DISSOLVE_NOISE_MAP) are macros this shader
+// never instantiates.
+Texture2D refl_GMAT: register (t39);
+
+// rt stage 4B (decision 08 items 2 + 3): DemosaicPS and UpScalePS need the HIT DISTANCE - the
+// virtual-image reprojection depth and the bilateral hit-distance similarity weight are both
+// built on it - and it is the one g-data lane the shaded ALD + RGB pair does not carry. Same
+// target ConeTracePass wrote at MRT 3 (pRT_RAYDIR_0), bound read-only on those two passes and
+// only when e_svoTI_RT_Active. t38 is free on both techniques.
+//   .xyz = ray direction scaled by the VNDF estimator weight, .w = hit distance
+//          (GetMaxRayDistance() + 1 on a miss, 0 when the pixel is not an RT pixel).
+Texture2D refl_RAYDIR_REC: register (t38);
+
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 // Structures
 struct vtxOutWPOS
@@ -165,14 +190,29 @@ struct pixoutMRTTrace
 	// rt stage 2 (decision 06 section 6.6). Only allocated and only bound for the specular
 	// target set when e_svoTI_RT_Active; the diffuse permutation never sets %_RT_QUALITY.
 	//  HitPos: .xyz camera-relative hit position (RGBA32F - fp16 is 1.5 cm at 32 m, which is
-	//          shadow-acne territory for hit shading), .w = PackRGB(emissive hue) in the integer
-	//          part + hit smoothness in [0, 1) in the fraction. Kept positive; the sign is
-	//          reserved for the interleaved-refraction flag, stage 4. RGBA32F has mantissa to
-	//          spare for both: the tint code is at most 511 and smoothness needs ~8 bits.
+	//          shadow-acne territory for hit shading), .w = RT_PackHitMaterial(reflectance,
+	//          smoothness): a 24 bit integer holding the hit's F0 (8 bit square-law magnitude +
+	//          a 216 entry hue code) and its smoothness (8 bit). Kept positive; the sign is
+	//          reserved for the interleaved-refraction flag, stage 4. rt stage 2D moved the
+	//          emissive hue out of this lane and into ALD.w to make room - see the comment above
+	//          RT_PackHitMaterial in CommonSVO_RT.cfi for why the old packing killed specular.
 	//  RayDir: .xyz ray direction, .w = hit distance, or GetMaxRayDistance() + 1 on a miss
 	//          (the "no hit => fall back to probes" sentinel). .w == 0 means "not an RT pixel".
 	float4 HitPos: SV_Target2;
 	half4  RayDir: SV_Target3;
+	//  HitGi:  rt stage 4A (energy audit error 1 + 2). .xyz = the SVO's DIFFUSE IRRADIANCE at
+	//          the hit, in the same unexposed units as TexGiDiffuse (the deferred consumer's
+	//          ApplyGI mode 2 input), .w = a voxel-derived ambient occlusion, 1 = unoccluded.
+	//          It has to be produced HERE and not in ShadePS: the irradiance is a brick-pool
+	//          fetch inside the SVO cell that produced the hit, and ShadePS may never touch a
+	//          brick pool (t0-t3 aliasing). A miss writes (0,0,0,1).
+	half4  HitGi: SV_Target4;
+	//  HitMat: rt stage 5B (decision 10). .x = RT_PackHitMatCode - the shading tag as a compact
+	//          code, one per type 8 bit scalar, and the sign flagging "this material has an
+	//          extras record"; .yzw = the one per type float3 (vegetation / skin transmittance,
+	//          glass tint, water body colour). See the block above RT_TagToCode in
+	//          CommonSVO_RT.cfi for why no existing lane could carry it.
+	half4  HitMat: SV_Target5;
 #endif
 };
 
@@ -1043,8 +1083,11 @@ float GetBlendMin(float2 tc0, float2 tc1, float fAverSmoothness, float fDepth0, 
 ///////////////////////////////////////////////////////////////////////////////////
 bool RT_IsTriPixel(const float fAverSmoothness, const float3 vAverReflectance, const float fDistM)
 {
+	// rt stage 4B (decision 08): e_svoTI_RT_MinGloss is now 0.5 and the switch from voxel cone
+	// tracing to triangle rays is cross-faded over MinGloss +- VOX_RT_GLOSS_BAND, so the gate
+	// opens at the BOTTOM of the band and UpScalePS ramps the RT contribution in across it.
 	return !IsDiffuseMode()
-	       && fAverSmoothness > VOX_MAX_RT_MIN_GLOSS
+	       && fAverSmoothness > (VOX_MAX_RT_MIN_GLOSS - VOX_RT_GLOSS_BAND)
 	       && GetLuminance(vAverReflectance) > VOX_MAX_RT_MIN_REFL
 	       && fDistM < VOX_MAX_RT_DIST_CAM;
 }
@@ -1073,6 +1116,56 @@ float3 RT_GetFadedNormal(const float3 vPos0, const float3 vNor0, const float fDi
 	}
 
 	return normalize(lerp(vFlat, vNor0, RT_GetNormalsFade(fDistM)));
+}
+
+///////////////////////////////////////////////////////////////////////////////////
+// rt stage 4B (decision 08) - the three roughness ramps every RT pass agrees on.
+// Like RT_IsTriPixel these are file-scope and DELIBERATELY NOT flag-wrapped (see the warning
+// above it): a %-flag #if at file scope leaks a function into every stage. They are plain
+// named fragments, pulled in only by the pixel entry points that call them.
+///////////////////////////////////////////////////////////////////////////////////
+
+// 0 at the bottom of the cross-fade band, 1 at the top. Below the band the pixel is not an RT
+// pixel at all; above it the RT result is used neat.
+float RT_GetGlossBandT(const float fSmoothness)
+{
+	const float fLo = VOX_MAX_RT_MIN_GLOSS - VOX_RT_GLOSS_BAND;
+	return saturate((fSmoothness - fLo) / max(2.f * VOX_RT_GLOSS_BAND, 1e-4f));
+}
+
+// 0 at the bottom of the RT range (a wide lobe: long history, wide spatial filter, reproject at
+// the SURFACE), 1 at the mirror end (a pinhole lobe: short history, no spatial filter,
+// reproject through the VIRTUAL IMAGE). One curve, so the three filters cannot disagree.
+float RT_GetMirrorT(const float fSmoothness)
+{
+	const float fLo = VOX_MAX_RT_MIN_GLOSS - VOX_RT_GLOSS_BAND;
+	return saturate((fSmoothness - fLo) / max(VOX_RT_MIRROR_GLOSS - fLo, 1e-4f));
+}
+
+// The temporal blend weight for an RT pixel: 1 / (number of frames of history).
+// e_svoTI_RT_TemporalFrames (8) at the rough end, 2 frames at the mirror end - a mirror is
+// already stable and a long history only drags it. GetBlendMin's own rejection terms are
+// re-used verbatim on top: the depth ratio between this pixel and the history texel it
+// reprojected to, and the off-screen penalty. What is NOT re-used is GetBlendMin's
+// smoothness knee (it is the mirror-only rule this replaces) and its fDistTCRat anti-ghosting
+// term (it exists because the stock path reprojects a reflection at the wrong depth; the
+// virtual-image reprojection below is the actual fix for that, and paying the penalty as well
+// would throw the history away exactly when the camera moves, which is when it is needed).
+float RT_GetGlossyBlend(const float2 tcPrev, const float fSmoothness, const float fDepth0, const float fDepthPrev)
+{
+	const float fFrames = lerp(max(VOX_RT_TEMPORAL_FRAMES, 1.f), 2.f, RT_GetMirrorT(fSmoothness));
+
+	float fBlend = 1.f / fFrames;
+
+	// GetBlendMin:1015 - the history texel is a different surface, take less of it
+	fBlend += saturate(abs(fDepth0 / max(fDepthPrev, 1e-6f) - 1.f));
+
+	// GetBlendMin:1017, hardened: a camera cut or a reprojection that leaves the screen has no
+	// history at all, so reset instead of taking a quarter of a wrong pixel.
+	if (tcPrev.x < 0.f || tcPrev.x > 1.f || tcPrev.y < 0.f || tcPrev.y > 1.f)
+		fBlend = 1.f;
+
+	return saturate(fBlend);
 }
 
 #define SVO_MAX_PORTALS 8
@@ -1410,6 +1503,71 @@ pixoutMRTDemosaic DemosaicPS(vtxOutWPOS IN)
 	float fBlendMin = GetBlendMin(vReprojTC_Min.xy, IN.baseTC.xy, fAverSmoothness, fDepthMin, fDepthMinPrev);
 	float fBlendMax = GetBlendMin(vReprojTC_Max.xy, IN.baseTC.xy, fAverSmoothness, fDepthMax, fDepthMaxPrev);
 
+#if %_RT_QUALITY
+	// rt stage 4B (decision 08 item 3) - the temporal filter for triangle-ray pixels.
+	float3 vRTNbMin = 0, vRTNbMax = 0;
+	if (bRTPixel)
+	{
+		// --- reprojection through the VIRTUAL REFLECTED POSITION --------------------------
+		// What a mirror pixel shows is not the mirror, it is the virtual image of the hit, and
+		// that image lies along THIS pixel own view ray at (surface distance + hit distance).
+		// So the screen position the same content occupied last frame is the reprojection of
+		// this pixel at the VIRTUAL depth, not at the surface depth. Reprojecting at the
+		// surface depth - what the stock filter does - drags the reflection behind the camera;
+		// that is report 02C finding (b), and the reason UpScalePS second temporal filter had
+		// to be switched off for RT pixels. Neo calls the same quantity reflectedDepthScale
+		// (research/03 section 4.6). SVO_ReprojectionMatrix IS the previous view-projection
+		// composed with this frame inverse (D3D_SVO.cpp:1069 GetReprojectionMatrix), so handing
+		// Reproject a different depth along the same view ray is exactly "project the virtual
+		// point with the previous view-projection".
+		//
+		// As the lobe widens the virtual image stops being a point and the reflection starts
+		// moving with the SURFACE instead, so the reprojection depth lerps back. One ramp,
+		// RT_GetMirrorT, shared with the history length and with UpScalePS filter radius.
+		const float fHitDist = max(refl_RAYDIR_REC.SampleLevel(ssSvoPointClamp, IN.baseTC.xy, 0).w, 0.f);
+		const float fDepthVirt = saturate(fDepthC + fHitDist / max(PS_NearFarClipDist.y, 1e-3f));
+		const float fDepthReproj = lerp(fDepthC, fDepthVirt, RT_GetMirrorT(fAverSmoothness));
+
+		vReprojTC_Min = Reproject(IN.baseTC.xy, fDepthReproj, SVO_ReprojectionMatrix);
+		vReprojTC_Max = vReprojTC_Min;
+
+		// The rejection test still compares the REFLECTING surface own depth against the one
+		// the history texel stored, because .w is what that texel stored: if the virtual
+		// reprojection landed on a pixel whose surface was somewhere else, that history is
+		// somebody else reflection. RT_GetGlossyBlend re-uses GetBlendMin depth-ratio and
+		// off-screen tests over a roughness-dependent 1/frames base.
+		const float fPrevDepthRT = tex2DlodLC(sceneRgbMinPrev, float4(vReprojTC_Min.xy, 0, 0)).w;
+		fBlendMin = RT_GetGlossyBlend(vReprojTC_Min.xy, fAverSmoothness, fDepthC, fPrevDepthRT);
+		fBlendMax = fBlendMin;
+
+		// --- variance clamp ---------------------------------------------------------------
+		// This frame 3x3 neighbourhood bounds what the history is allowed to be. Standard TAA
+		// colour clipping, and the only thing between a one-sample-per-pixel GGX lobe and
+		// visible ghosting when the reflected content changes. The DEM min/max pair carries the
+		// clamped result downstream unchanged.
+		const float2 vRTTexel = 1.f / PS_ScreenSize.xy;
+		vRTNbMin = (float3)1e6f;
+		vRTNbMax = (float3)(-1e6f);
+		for (int nbx = -1; nbx <= 1; nbx++)
+			for (int nby = -1; nby <= 1; nby++)
+			{
+				const float3 vNb = tex2DlodLC(sceneRgb, float4(saturate(IN.baseTC.xy + vRTTexel * float2(nbx, nby)), 0, 0)).xyz;
+				vRTNbMin = min(vRTNbMin, vNb);
+				vRTNbMax = max(vRTNbMax, vNb);
+			}
+
+	#if %_RT_PARTICLE_SHADOW
+		// debug 14 = the raw 1 spp trace, temporal filter off (UpScalePS drops its spatial
+		// filter for the same view, so 14 against 0 is exactly "what the denoiser removed").
+		if ((int)VOX_RT_DEBUG_MODE == 14)
+		{
+			fBlendMin = 1.f;
+			fBlendMax = 1.f;
+		}
+	#endif
+	}
+#endif
+
 	// rt stage 2C: CE's +-8 is a ceiling on a UNIT-LENGTH chroma plus an ALD lobe, which never
 	// gets near it. An RT pixel carries a real radiance in this channel now, and a reflected
 	// window or practical clips at 8 and turns grey. Neo's clamp for the same data is 100
@@ -1420,11 +1578,38 @@ pixoutMRTDemosaic DemosaicPS(vtxOutWPOS IN)
 	const float fDemClamp = 8.f;
 #endif
 
-	OUT.Diffuse = clamp(lerp(tex2DlodLC(sceneRgbMinPrev, float4(vReprojTC_Min.xy, 0, 0)), OUT.Diffuse, fBlendMin), -fDemClamp, fDemClamp);
+	// rt stage 4B: the history colour is read out into a local so the variance clamp can be
+	// applied to it. Off %_RT_QUALITY this is the same fetch in the same place and the same
+	// lerp, so the stock path is unchanged.
+	float4 vHistRgbMin = tex2DlodLC(sceneRgbMinPrev, float4(vReprojTC_Min.xy, 0, 0));
+	float4 vHistRgbMax = tex2DlodLC(sceneRgbMaxPrev, float4(vReprojTC_Max.xy, 0, 0));
+
+#if %_RT_QUALITY
+	if (bRTPixel)
+	{
+		vHistRgbMin.xyz = clamp(vHistRgbMin.xyz, vRTNbMin, vRTNbMax);
+		vHistRgbMax.xyz = clamp(vHistRgbMax.xyz, vRTNbMin, vRTNbMax);
+	}
+#endif
+
+	OUT.Diffuse = clamp(lerp(vHistRgbMin, OUT.Diffuse, fBlendMin), -fDemClamp, fDemClamp);
 	OUT.Specular = clamp(lerp(tex2DlodLC(sceneAldMinPrev, float4(vReprojTC_Min.xy, 0, 0)), OUT.Specular, fBlendMin), -fDemClamp, fDemClamp);
 
-	OUT.Diffuse1 = clamp(lerp(tex2DlodLC(sceneRgbMaxPrev, float4(vReprojTC_Max.xy, 0, 0)), OUT.Diffuse1, fBlendMax), -fDemClamp, fDemClamp);
+	OUT.Diffuse1 = clamp(lerp(vHistRgbMax, OUT.Diffuse1, fBlendMax), -fDemClamp, fDemClamp);
 	OUT.Specular1 = clamp(lerp(tex2DlodLC(sceneAldMaxPrev, float4(vReprojTC_Max.xy, 0, 0)), OUT.Specular1, fBlendMax), -fDemClamp, fDemClamp);
+
+#if %_RT_QUALITY
+	#if %_RT_PARTICLE_SHADOW
+	// debug 15 = the temporal HISTORY weight, white = the pixel is all history, black = all
+	// new. It answers the one question 14 cannot: whether the denoiser is smooth because it is
+	// accumulating, or smooth because it is ghosting.
+	if (bRTPixel && (int)VOX_RT_DEBUG_MODE == 15)
+	{
+		OUT.Diffuse.xyz = (float3)saturate(1.f - fBlendMin);
+		OUT.Diffuse1.xyz = OUT.Diffuse.xyz;
+	}
+	#endif
+#endif
 
 	return OUT;
 }
@@ -1691,7 +1876,30 @@ pixoutMRTTrace ConeTracePS(vtxOutWPOS IN)
 	// finding (a): triangle rays follow the DISTANCE-FADED normal, so a normal-mapped mirror
 	// stops printing its detail map into the reflection as a grid. e_svoTI_RT_NormalsFading 0
 	// (the default) leaves vFocusRT == vFocus and the picture unchanged.
-	const float3 vFocusRT = reflect(normalize(IN.CamVec.xyz), RT_GetFadedNormal(vPos0, vNor0, fDistM));
+	const float3 vNorRT = RT_GetFadedNormal(vPos0, vNor0, fDistM);
+	float3 vFocusRT = reflect(normalize(IN.CamVec.xyz), vNorRT);
+
+	// rt stage 4B (decision 08 item 1). Below VOX_RT_MIRROR_GLOSS the ray is ONE GGX
+	// VISIBLE-NORMAL sample of the reflecting surface's own lobe instead of the mirror
+	// direction, so a smoothness 0.6 floor reflects a blurred picture rather than a sharp one,
+	// and the blur is the same GGX lobe shadeLib.cfi's SpecularBRDF uses for the direct view.
+	// The estimator weight G2/G1 leaves this pass in the LENGTH of RayDir.xyz - see the g-data
+	// write at the end of the function.
+	//
+	// The lobe is driven by fAverSmoothness, the same quantity RT_IsTriPixel, DemosaicPS and
+	// UpScalePS key on, and NOT by the raw G-buffer smoothness. They differ only where the 2x2
+	// quad's normals disagree, and there GetAverNormAndSmooth divides the smoothness by
+	// 1 + normalVar*25 - i.e. it charges sub-pixel normal variance as extra roughness, which is
+	// the Toksvig/LEAN answer and the right one for a ray that represents the whole pixel. It
+	// also keeps all three passes on one number, which is what makes the single-tap
+	// reconstruction legal at all (report 02C section 2).
+	float fRTSampleWeight = 1.f;
+	if (bUseRT && VOX_RT_GLOSSY_MODE > 0.f && fAverSmoothness < VOX_RT_MIRROR_GLOSS)
+	{
+		const int2 nRndXY = int2(IN.baseTC.xy * PS_ScreenSize.xy);
+		const float4 vRnd = RT_BlueNoise4(nRndXY, SVO_FrameIdByte.x);
+		vFocusRT = RT_GlossyReflectDir(vNorRT, -normalize(IN.CamVec.xyz), fAverSmoothness, vRnd, fRTSampleWeight);
+	}
 #endif
 
 	float fNewDepth = SampleLinearDepth(sceneDepth, IN.baseTC.xy);
@@ -1920,23 +2128,56 @@ pixoutMRTTrace ConeTracePS(vtxOutWPOS IN)
 	// rt stage 2 (decision 06 section 6.1 / 6.6): a triangle-ray pixel carries g-data instead of
 	// a colour, and the ShadePass overwrites ALD + RGB with the shaded result. The packing is
 	// Neo's, so the two existing targets carry four of the six values:
-	//   ALD.xyz = world normal scaled by (1 + emittance)   ALD.w = PackRGB(reflectance), negated
-	//                                                              for the veg-leaves model
+	//   ALD.xyz = world normal scaled by (1 + emittance)   ALD.w = PackRGB(emissive hue) + 1,
+	//                                                              negated for the veg-leaves model
 	//   RGB.xyz = hit albedo                               RGB.w = UNTOUCHED scene linear depth
 	// RGB.w stays the reflecting pixel's depth because that is what DemosaicPS reads out of this
-	// channel (Total_Illumination.cfx:1066, 1073-1074) for its bilateral weights. Smoothness
-	// therefore rides in HitPos.w, not here.
+	// channel (Total_Illumination.cfx:1066, 1073-1074) for its bilateral weights. Reflectance and
+	// smoothness therefore ride in HitPos.w, not here (rt stage 2D).
 	if (bRTWriteGData)
 	{
-		vALD.xyz = g_rtInfo.normal_reflectance.xyz;
-		vALD.w   = g_rtInfo.normal_reflectance.w;
+		vALD.xyz = g_rtInfo.normal_emissive.xyz;
+		vALD.w   = g_rtInfo.normal_emissive.w;
 		vRGB.xyz = g_rtInfo.albedo_smoothness.xyz;
 
-		// smoothness is capped just below 1 so that the fractional part never carries into the
-		// emissive tint code sitting in the integer part (a mirror at 0.9999 is a mirror)
+		// rt stage 2D: one 24 bit integer, no fractional field any more. Reflectance and
+		// smoothness are both exact integers on the way out and on the way back, so the round
+		// trip is deterministic and debug view 12 can show exactly what ShadePS will read.
 		OUT.HitPos = float4(g_rtInfo.hitpos.xyz - GetWorldViewPos(),
-		                    min(abs(g_rtInfo.albedo_smoothness.w), 0.9999f) + g_rtInfo.emissiveTintPacked);
-		OUT.RayDir = float4(g_rtInfo.raydir.xyz, g_rtInfo.raydir.w);
+		                    RT_PackHitMaterial(g_rtInfo.reflectance, abs(g_rtInfo.albedo_smoothness.w)));
+		// rt stage 4B: the VNDF estimator weight rides in the LENGTH of RayDir.xyz. The lane
+		// was free because the direction is unit by construction (RT_ProcessBestHit writes
+		// rOrig.direction, which is normalize(kern)), the target is RGBA16F so a [0,1] scale
+		// costs no precision the direction was not already losing, and ShadePS is the only
+		// reader. The alternatives were HITGI.w (packing two values into one half, which would
+		// have cost the voxel AO its precision) and a sixth MRT for one scalar.
+		// With e_svoTI_RT_GlossyMode 0 the weight is exactly 1 and this line is the old line.
+		OUT.RayDir = float4(g_rtInfo.raydir.xyz * fRTSampleWeight, g_rtInfo.raydir.w);
+
+		// rt stage 5B: the shading tag and the per type parameters RT_ProcessBestHit resolved at
+		// the hit. A miss writes zero, which decodes as "no material data".
+		OUT.HitMat = g_rtInfo.matData;
+
+		// rt stage 4A, energy audit error 1 + 2. The DIRECT view of a surface does not get the
+		// env probe's ambient at all: ApplyGI mode 2 replaces it with the SVO's GI
+		// (TiledShading.cfi:139-140). The hit used to get the full probe irradiance instead,
+		// with occlusion hard-wired to (1,1) - a different indirect model AND no occlusion, which
+		// between them are the dominant reason a reflected wall reads brighter than the wall.
+		// So the hit gets the same thing the primary surface gets: a voxel irradiance fetch in
+		// the cell the hit came from, plus a voxel AO, handed to ShadePS in a fifth target.
+		// Unexposed, like TexGiDiffuse; ShadePS multiplies by PS_HDR_RANGE_ADAPT_MAX exactly
+		// where ApplyGI would have.
+		if (g_rtInfo.best.vAlb.a > 0 && g_rtInfo.cellValid)
+		{
+			OUT.HitGi = float4(RT_SampleVoxelIrradiance(g_rtInfo.cellTC, g_rtInfo.cellMin, g_rtInfo.cellMax, g_rtInfo.hitpos.xyz),
+			                   RT_SampleVoxelAO(g_rtInfo.cellTC, g_rtInfo.cellMin, g_rtInfo.cellMax, g_rtInfo.hitpos.xyz, normalize(g_rtInfo.normal_emissive.xyz)));
+		}
+		else
+		{
+			// no cell (a miss, or a hit the traversal could not place): no GI, no occlusion.
+			// A miss is resolved by the sky and never reads this lane.
+			OUT.HitGi = float4(0, 0, 0, 1);
+		}
 	}
 #endif
 
@@ -1984,23 +2225,73 @@ pixoutShade ShadePS(vtxOutWPOS IN)
 		// unmodified. That is the whole fallback-to-probes policy.
 		const bool bNoHit = (vGLD.w >= GetMaxRayDistance() + 0.5f);
 
-		// hitpos.w packs two things: PackRGB of the emissive hue in the integer part, the hit
-		// smoothness in the fraction (see pixoutMRTTrace above)
-		const float fHitPosW    = abs(vGPO.w);
-		const float fEmmPacked  = floor(fHitPosW);
-		const float3 vEmmTint   = UnpackRGB(fEmmPacked);
+		// rt stage 4B (decision 08 item 1). The glossy VNDF estimator weight arrived in the
+		// LENGTH of RayDir.xyz, so the direction has to be re-normalised before it is used.
+		// FRESNEL IS NOT IN THE WEIGHT: TiledShading.cfi:951-953 multiplies TexGiSpecular by
+		// the reflecting surface's envFresnel downstream, so the weight carries the
+		// masking-shadowing ratio G2/G1 only and F0 is applied exactly once (report 02f / 04a
+		// ledger). With e_svoTI_RT_GlossyMode 0 the tracer writes a unit vector and both lines
+		// below are numerically the value they were before this stage.
+		const float3 vRayDirN = normalize(vGLD.xyz);
+		const float fSampleWeight = (VOX_RT_GLOSSY_MODE > 0.f) ? saturate(length(vGLD.xyz)) : 1.f;
+
+		// rt stage 2D. HITPOS.w carries the hit's F0 and smoothness (RT_PackHitMaterial);
+		// ALD.w carries the emissive hue code + 1, signed by the lighting model. Before 2D the
+		// reflectance came through PackRGB at 3 bits per channel and CE's 0.0369 dielectric F0
+		// quantised to exactly 0, so SpecularBRDF returned 0 at every non-metal hit and the
+		// reflection had no specular response at all.
+		float3 vReflectance; float fSmoothness;
+		RT_UnpackHitMaterial(vGPO.w, vReflectance, fSmoothness);
+
+		const float3 vEmmTint = RT_UnpackEmissiveHue(vGAL.w);
+
+		// rt stage 5B (decision 10): the hit's material TYPE and its per type parameters.
+		uint nMatCode; float fMatParam; bool bMatExtras;
+		RT_UnpackHitMatCode(refl_GMAT.SampleLevel(ssSvoPointClamp, IN.baseTC.xy, 0).x, nMatCode, fMatParam, bMatExtras);
+		const float3 vMatRgb = refl_GMAT.SampleLevel(ssSvoPointClamp, IN.baseTC.xy, 0).yzw;
+
+		// The sign of the packed emissive hue is stage 2D's veg-leaves marker and is kept as the
+		// fallback, so a record written before the tag existed still gets the two-sided model.
+		const bool bTagVegLeaves = (nMatCode == VOX_RT_MATCODE_VEG_LEAVES) || (vGAL.w < 0);
+		const bool bTagSkin      = (nMatCode == VOX_RT_MATCODE_HUMAN_SKIN);
+		const bool bTagGlass     = (nMatCode == VOX_RT_MATCODE_GLASS);
+		const bool bTagWater     = (nMatCode == VOX_RT_MATCODE_WATER);
 
 		MaterialAttribsCommon commonAttribs = (MaterialAttribsCommon)0;
 		commonAttribs.NormalWorld = normalize(vGAL.xyz);
 		commonAttribs.Albedo      = vGNO.xyz;
-		commonAttribs.Reflectance = UnpackRGB(abs(vGAL.w));
-		commonAttribs.Smoothness  = fHitPosW - fEmmPacked;
+		commonAttribs.Reflectance = vReflectance;
+		commonAttribs.Smoothness  = fSmoothness;
 
-		if (vGAL.w < 0) // the lighting model rides in the sign of the packed reflectance
+		// VEGETATION LEAVES (tag 0.25) and HUMAN SKIN (tag 2) share CE's one forward answer to
+		// "light comes through this surface": LIGHTINGMODEL_TRANSMITTANCE, which makes
+		// Callback_ShadingDirect call ThinTranslucencyBRDF (shadeLib.cfi:952-964) INSTEAD OF the
+		// diffuse BRDF - it is a substitution, not an addition, which is why the leaf is not
+		// twice as bright as the trunk. The colour is the material's own now:
+		//   Vegetation.cfx:503-512  saturate(BackDiffuseMultiplier * translucencyMap) * TransmittanceColor
+		//   HumanSkin.cfx:286-298   exp((1 - saturate(translucencyMap * TranslucencyMultiplier)) * (-8, -40, -64))
+		// Both are resolved per texel at the hit (RT_ProcessBestHit) and arrive in the HITMAT
+		// float3. A leaf material whose record predates the extras keeps the old grey 0.5.
+		//
+		// SKIN IS THE FORWARD APPROXIMATION AND NOTHING MORE. CE's skin is
+		// LIGHTINGMODEL_TRANSMITTANCE plus a SCREEN SPACE subsurface blur keyed on
+		// attribs.ScatteringIndex (HumanSkin.cfx:288-293, resolved by the SSS stage). There is
+		// no screen at a ray hit, so the blur cannot be reproduced; what is reproduced is the
+		// transmittance term, which is the part that makes an ear glow red from behind.
+		if (bTagVegLeaves || bTagSkin)
 		{
 			commonAttribs.LightingModel = LIGHTINGMODEL_TRANSMITTANCE;
-			commonAttribs.Transmittance = (half3)0.5f;
+			commonAttribs.Transmittance = bMatExtras ? (half3)vMatRgb : (half3)0.5f;
 		}
+
+		// GLASS (tag 3): Glass.cfx:575-586 shades the pane from its TINT, not from its albedo -
+		// localTintColor is what the glass keeps of what is behind it, and the albedo only
+		// appears through the backlight mask, which the hit has no equivalent of.
+		// WATER (tag 4): the body colour computed at the hit (fog colour attenuated by
+		// density x depth, Water.cfx:1116-1117) takes the albedo's place, so the sun and the
+		// SVO GI light the water body the same way they light any other diffuse surface.
+		if (bTagGlass || bTagWater)
+			commonAttribs.Albedo = vMatRgb;
 
 		ForwardShadingAttribs fwdAttribs = (ForwardShadingAttribs)0;
 		fwdAttribs.screenUV        = IN.baseTC.xy;
@@ -2012,19 +2303,146 @@ pixoutShade ShadePS(vtxOutWPOS IN)
 		fwdAttribs.smoothness      = commonAttribs.Smoothness;
 
 		fwdAttribs.custom.LightingModel = commonAttribs.LightingModel;
-		fwdAttribs.custom.Transmittance = (commonAttribs.LightingModel == LIGHTINGMODEL_TRANSMITTANCE) ? 0.5f : 0.f;
+		fwdAttribs.custom.Transmittance = (commonAttribs.LightingModel == LIGHTINGMODEL_TRANSMITTANCE)
+		                                  ? (float3)commonAttribs.Transmittance : (float3)0.f;
 		// emittance rides in the LENGTH of the packed normal
 		fwdAttribs.custom.Emittance     = max(length(vGAL.xyz) - 1.f, 0.f);
-		fwdAttribs.custom.RayDirection  = bNoHit ? -vGLD.xyz : vGLD.xyz;
+		fwdAttribs.custom.RayDirection  = bNoHit ? -vRayDirN : vRayDirN;
 		// traced sun shadow rays are stage 4; the cascades do the work today
 		fwdAttribs.custom.SunShadowRT   = 1.f;
 
+		// rt stage 4A (energy audit item 7, decision 09 section 9.1). A ray that hit nothing is
+		// looking at the sky, so it gets the ENGINE'S OWN sky along its direction - the same
+		// Nishita dome (or skybox) the deferred sky pass draws, including the Mie peak that IS
+		// the sun disc - and no sun / local-light loop at all. What it used to get was a fake
+		// surface with F0 = 1 and smoothness 1 run through the full direct lighting, which put a
+		// mirror-sharp second sun into every reflected sky.
+		//
+		// Below the horizon the sky texture says nothing useful (a lat-long dome is only defined
+		// above it, and what is actually down there is ground the ray failed to reach inside
+		// e_svoTI_RT_MaxDistRay), so a downward miss keeps the env-probe fallback with the
+		// roughness mip exactly as before.
+		float3 vSkyRadiance = (float3)0.f;
+		const bool bMissSky = bNoHit && (vGLD.z > 0.f) && SVO_RT_SampleSky(vRayDirN, vSkyRadiance);
+
+		// rt stage 5F (decision 09 section 9.2). VOLUMETRIC CLOUDS IN THE REFLECTION. The cloud
+		// pass renders into a screen space target one stage LATER in the frame, so there is no
+		// image of "the sky in this direction" to sample - only an image of the sky the camera
+		// saw. A reflection ray leaves the camera's pixel, so the clouds have to be marched
+		// again, in the reflected direction, out of the density field itself. That field is the
+		// SAME one Clouds.cfx uses (CloudsCommon.cfi), at the same wind offset, under the same
+		// cloud shadow map, so the cloud in the mirror is the cloud in the sky.
+		//
+		// The march starts at the REFLECTING SURFACE, not at the pseudo-hit the miss path puts
+		// e_svoTI_RT_MaxDistRay metres down the ray: the layer is kilometres up, so the 48 m
+		// difference is far below one step, but the surface is the physically right origin and
+		// it is also the origin the optional on-a-hit mode needs a name for.
+		//
+		// bCloudsOnHit is OFF by default (SVO_CloudParams2.w = 0). When a distance is set, a hit
+		// FURTHER away than that also gets the layer marched in front of it - the same veil a
+		// very distant object gets in the direct view. It is off by default because inside
+		// e_svoTI_RT_MaxDistRay (48 m) no hit is far enough for a cloud deck to sit in front of
+		// it, so the steps would be spent for nothing.
+		float3 vCloudInscatter = (float3)0.f;
+		float  fCloudTrans = 1.f;
+		bool   bCloudsOnHit = false;
+		{
+			const float3 vHitAbsCl = vGPO.xyz + GetWorldViewPos();
+			const float3 vSurfaceAbsCl = vHitAbsCl - vRayDirN * abs(vGLD.w);
+			bCloudsOnHit = (SVO_CloudParams2.w > 0.f) && !bNoHit && (abs(vGLD.w) >= SVO_CloudParams2.w);
+
+			if (bMissSky || bCloudsOnHit)
+				SVO_RT_MarchClouds(bCloudsOnHit ? vHitAbsCl : vSurfaceAbsCl, vRayDirN, vCloudInscatter, fCloudTrans);
+		}
+
+		// rt stage 5B, WATER (decision 09 section 9.4, decision 10 item 4 Water). What a water
+		// surface shows is Water.cfx:1160
+		//     cFinal = lerp(refractColor, cSpecularAcc, fFresnel)
+		// with cSpecularAcc the reflection (Water.cfx:1053, a cubemap or the planar reflection,
+		// times ReflectionScale) and fFresnel = GetEnvmapFresnel(0.02, FresnelGloss, NdotE)
+		// (Water.cfx:1134-1135). v1 sends NO secondary ray: the reflection is the SAME sky
+		// lookup the miss path already has, evaluated along the mirror of the incoming ray about
+		// the water normal. A ray reflected DOWNWARD off water gets nothing from a lat-long
+		// dome, so it keeps the ordinary probe specular instead.
+		float3 vWaterRefl = (float3)0.f;
+		bool bWaterSky = false;
+
+		if (bTagWater && !bNoHit)
+		{
+			const float3 vWaterReflDir = reflect(vRayDirN, commonAttribs.NormalWorld);
+			bWaterSky = (vWaterReflDir.z > 0.f) && SVO_RT_SampleSky(vWaterReflDir, vWaterRefl);
+		}
+
 		float3 diffuseAcc = 0.0f;
 		float3 specularAcc = 0.0f;
-		SRTShadeProbe dbgShade;
-		Fwd_StandardOpaqueShading_Raytracing(commonAttribs, fwdAttribs, diffuseAcc, specularAcc, dbgShade);
+		SRTShadeProbe dbgShade = (SRTShadeProbe)0;
+		dbgShade.sunVisibility = 1;
 
-		float3 acc = diffuseAcc + specularAcc + SVO_ShadeParams0.x * fwdAttribs.albedo + .0001f;
+		// rt stage 4A, energy audit errors 1 and 2: the indirect term at the hit is the SVO's own
+		// GI, exactly as ApplyGI mode 2 gives it to the primary surface, not the env probe's full
+		// irradiance with occlusion pinned to 1. Produced by TracingPS into the fifth g-data
+		// target because it needs the brick pools; unexposed there, exposed inside
+		// Fwd_StandardOpaqueShading_Raytracing where ApplyGI would have done it.
+		const float4 vGGI = refl_GGI.SampleLevel(ssSvoPointClamp, IN.baseTC.xy, 0);
+
+		// Water skips the SPECULAR PROBE when the sky answered: the probe specular and the sky
+		// lookup below are two estimates of the same reflection and adding both doubles it.
+		if (!bMissSky)
+			Fwd_StandardOpaqueShading_Raytracing(commonAttribs, fwdAttribs, diffuseAcc, specularAcc, dbgShade, true, !bNoHit, !bNoHit, vGGI, bWaterSky);
+
+		// rt stage 5B: the per tag composite. Tags 0 (Illum) and 5 (Terrain) - and 0.25 and 2,
+		// whose whole difference is the lighting model the BRDF callback already switched on -
+		// take the stock sum. Terrain deliberately has no branch: Terrain.cfx's own lighting IS
+		// the Illum lobe, and the record carries no terrain normal map to apply.
+		float3 vShaded = diffuseAcc + specularAcc;
+
+		if (bTagGlass || bTagWater)
+		{
+			// GetEnvmapFresnel is what BOTH shaders use for this lerp: Glass.cfx:579 on the
+			// material's own reflectance, Water.cfx:1135 on a hard coded 0.02 with FresnelGloss.
+			// The hit's reflectance lane already IS that 0.02 for water (the CPU writes it) and
+			// the material's own F0 for glass, so one expression covers both.
+			const float3 vViewVec = normalize(-fwdAttribs.custom.RayDirection);
+			const float fFres = GetEnvmapFresnel(fwdAttribs.reflectance, fwdAttribs.smoothness,
+			                                     saturate(dot(commonAttribs.NormalWorld, vViewVec))).x;
+
+			if (bTagGlass)
+			{
+				// Glass.cfx:576-586:
+				//   tintBlend = lerp(cBackbuffer * tint, tint * diffuseAcc, TintCloudiness)
+				//   cDiffuse  = lerp(tintBlend, litDiffuse, backlightMask)
+				//   cFinal    = lerp(cDiffuse, cSpecular, fresnel)
+				// cBackbuffer - what is BEHIND the pane - is not a value this branch has, and it
+				// does not need one: the stochastic acceptance in the traversal already sends
+				// the ray straight through the pane in (1 - opacity) of the stipple phases, so
+				// the background half of tintBlend arrives as those other phases and the
+				// temporal filter of stage 4B does the lerp. What is left here is the cloudy
+				// half - the tint lit as a diffuse - and the specular, combined by CE's own
+				// Fresnel. backlightMask is a forward-only screen term and is taken as 0.
+				vShaded = lerp(diffuseAcc * fMatParam, specularAcc, fFres);
+			}
+			else if (bWaterSky)
+			{
+				// Water.cfx:1160, with refractColor collapsed to the lit body colour (v1 sends
+				// no refraction ray) and cSpecularAcc replaced by the sky along the reflected
+				// direction times ReflectionScale. specularAcc is the SUN highlight, which
+				// Water.cfx adds on top of the reflection in the same way (SunSpecular,
+				// Water.cfx:971-992).
+				vShaded = lerp(diffuseAcc, vWaterRefl * fMatParam, fFres) + specularAcc;
+			}
+		}
+
+		// rt stage 5F: the cloud layer sits BETWEEN the reflecting surface and the sky dome, so
+		// it composites over the sky exactly the way CloudsBlendPS composites over the scene -
+		// sky * transmittance + in-scatter - and it does so on the EXPOSED side of the pass,
+		// before the single divide below, because both terms are already exposed (the cloud
+		// radiance constants take GetSceneReferredExposure() on the CPU in
+		// CVolumetricCloudsStage::GenerateCloudShaderParam, exactly as the sky constants do in
+		// CSkyStage). With clouds off fCloudTrans is 1 and vCloudInscatter is 0, and this line
+		// is the line it replaces.
+		float3 acc = bMissSky
+		             ? (vSkyRadiance * fCloudTrans + vCloudInscatter + .0001f)
+		             : (vShaded + SVO_ShadeParams0.x * fwdAttribs.albedo + .0001f);
 
 		// Emissive, exactly Illum.cfx IlluminationPS:
 		//     emittance = MatEmissiveColor.rgb * MatEmissiveColor.w * MAT_EMISSIVE_UNIT_SCALE
@@ -2037,8 +2455,65 @@ pixoutShade ShadePS(vtxOutWPOS IN)
 		// Neo's borrowed-hue trick for a scalar-only atlas, and we carry a real hue now.
 		acc += fwdAttribs.custom.Emittance * vEmmTint * PS_HDR_RANGE_ADAPT_MAX;
 
+		// rt stage 4A, energy audit error 3 / E4. Every VOXEL specular pixel is multiplied by
+		// e_svoTI_SpecularAmplifier inside the cone trace (CommonSVO.cfi:1323-1328,
+		// SvoParamsSpecular.w); an RT pixel never saw it, because the g-data write at the end of
+		// ConeTracePS overwrites the traced colour wholesale. So on a level tuned with the
+		// amplifier at, say, 0.3 - and it is a per-level Total Illumination setting, not a
+		// constant - the RT reflections sat a flat 1/0.3 brighter than the voxel reflections
+		// beside them, with a visible step at the e_svoTI_RT_MinGloss knee where the two meet.
+		// Applied here, on the same value and in the same units, so the two halves of the picture
+		// carry the same gain.
+		//
+		// It is a pure artistic gain on what is otherwise a radiance: A PHYSICALLY EXACT LEVEL
+		// SHOULD SET e_svoTI_SpecularAmplifier TO 1. This multiply exists to keep RT and voxel
+		// pixels consistent with each other, not because the gain is right.
+		acc *= SvoParamsSpecular.w;
+
+		// rt stage 4B: the Monte-Carlo estimator weight for the one GGX sample this pixel took.
+		// It multiplies the WHOLE reflected radiance - a hit's shading and a miss's sky alike -
+		// because it is the BRDF-over-pdf factor of the reflection integral, not a property of
+		// what was hit. Exactly 1 for a mirror and in mirror-only mode.
+		acc *= fSampleWeight;
+
 		if (SVO_ShadeParams0.y) // debug: flat albedo
 			acc = fwdAttribs.albedo;
+
+		// rt stage 5E (decision 09 section 9.3): the fog terms of the REFLECTED SEGMENT are
+		// COMPUTED here, before the debug block, and APPLIED after it - so that debug views 7-9
+		// still show the shading term without a veil over it, and views 18/19 can show the fog
+		// terms themselves. Nothing here touches `acc`.
+		//
+		// The analytic global fog is computed unconditionally and is the fallback: with
+		// r_VolumetricFog 0 (or an interior with no global fog, or a frame where the fog stage
+		// has no live volumes) SVO_VolFogParams.x is 0, the march is skipped, fFogCovered is 0
+		// and what is applied below is byte for byte the lerp this pass has always done.
+		float3 vFogInscatter = (float3)0.f;
+		float  fFogTrans = 1.f;
+		float  fFogCovered = 0.f;
+		float4 vFogAnalytic = float4(0, 0, 0, 1);
+		if (!bNoHit)
+		{
+			// Neo's vector, and the right one: the REFLECTED SEGMENT, not camera-to-hit. The fog
+			// over the camera-to-mirror segment is applied to this pixel again downstream by the
+			// scene fog pass (CFogStage / CVolumetricFogStage on the composited image), so
+			// anything this pass adds for that segment would be counted twice. A MISS is not
+			// fogged at all: its "hit distance" is the e_svoTI_RT_MaxDistRay sentinel, and a sky
+			// or probe sample already carries its own aerial perspective.
+			const float  fSegLen = abs(vGLD.w);
+			const float3 cameraToWorldPos = vRayDirN * fSegLen;
+			const float3 worldPos = vGPO.xyz + GetWorldViewPos();
+
+			const SFogParams fogParams = GetFogParams();
+			vFogAnalytic = GetVolumetricFogColor(fogParams, worldPos, cameraToWorldPos);
+
+			if (SVO_VolFogParams.x > 0.f)
+			{
+				const float3 vSurfaceAbs = worldPos - cameraToWorldPos;
+				const SVolumetricFogParams vfp = GetVolumetricFogParams();
+				SVO_RT_MarchSegmentFog(vfp, vSurfaceAbs, vRayDirN, fSegLen, vFogInscatter, fFogTrans, fFogCovered);
+			}
+		}
 
 		// rt stage 2C: debug views 7-9, the three questions the picture cannot answer on its own.
 		// They sit HERE, before the fog and the writer clamp, so that what they show is the term
@@ -2068,30 +2543,182 @@ pixoutShade ShadePS(vtxOutWPOS IN)
 				// lerp, before the writer clamp and before the exposure divide.
 				bRawDebug = true;
 			}
+			else if (nDbg == 16)
+			{
+				// rt stage 5B. 16 = the SHADING TAG at the hit, as a flat colour. This is the
+				// view that answers "is my glass actually tagged glass" before any argument
+				// about what glass should look like:
+				//   grey   0 Illum          green  0.25 vegetation leaves
+				//   pink   2 human skin     cyan   3 glass
+				//   blue   4 water          brown  5 terrain
+				//   yellow 6 emissive only (reserved, the CPU never produces it)
+				//   black    the pixel carries no material data at all (a miss)
+				float3 vTagCol = (float3)0.f;
+				if (nMatCode == VOX_RT_MATCODE_ILLUM)           vTagCol = float3(0.5f, 0.5f, 0.5f);
+				else if (nMatCode == VOX_RT_MATCODE_VEG_LEAVES) vTagCol = float3(0.f, 1.f, 0.f);
+				else if (nMatCode == VOX_RT_MATCODE_HUMAN_SKIN) vTagCol = float3(1.f, 0.5f, 0.6f);
+				else if (nMatCode == VOX_RT_MATCODE_GLASS)      vTagCol = float3(0.f, 0.8f, 1.f);
+				else if (nMatCode == VOX_RT_MATCODE_WATER)      vTagCol = float3(0.f, 0.15f, 1.f);
+				else if (nMatCode == VOX_RT_MATCODE_TERRAIN)    vTagCol = float3(0.6f, 0.4f, 0.15f);
+				else                                            vTagCol = float3(1.f, 1.f, 0.f);
+
+				acc = bNoHit ? (float3)0.f : vTagCol;
+				bRawDebug = true;
+			}
+			else if (nDbg == 17)
+			{
+				// rt stage 5B. 17 = does this hit's material have an EXTRAS record. White = yes
+				// (detail map, blend layer, transmittance, glass / skin / water parameters),
+				// black = a plain 4 texel record. A detail-mapped wall that reads black here is
+				// a CPU-side problem (the producer did not emit extras) and not a shader one;
+				// the "extras N" counter on the r_DisplayInfo 2 "RT BVH:" line is the other half
+				// of the same question.
+				acc = (bNoHit || !bMatExtras) ? (float3)0.f : (float3)1.f;
+				bRawDebug = true;
+			}
+			else if (nDbg == 18)
+			{
+				// rt stage 5E. 18 = the fog IN-SCATTER added at the hit, i.e. the light the
+				// reflected segment picks up on its way back to the mirror, in exposed radiance -
+				// the same units view 0 is in, so a value that reads as mid grey here is a fog
+				// contribution as bright as a mid grey surface. Black = this pixel's reflected
+				// segment sits in clear air (or the froxel volume does not cover it and the
+				// analytic fog is doing the work, which this view deliberately does NOT show).
+				acc = vFogInscatter;
+				bRawDebug = true;
+			}
+			else if (nDbg == 19)
+			{
+				// rt stage 5E. 19 = the TRANSMITTANCE of the reflected segment, the factor the
+				// hit's own radiance is multiplied by. WHITE = clear air, the reflection arrives
+				// undimmed; BLACK = the segment is optically thick and the reflection is pure
+				// fog. GREEN tint = the froxel volume covered the segment; RED tint = it did not
+				// and the analytic global fog is covering that share (off screen, behind the near
+				// plane, or past the froxel range - see the gap list in
+				// Total_Illumination_Shading.cfi). A mirror that is all red here is telling you
+				// the froxel path never ran, not that there is no fog.
+				acc = float3(1.f - fFogCovered, fFogCovered, 0.f) * 0.35f + (float3)fFogTrans * 0.65f;
+				bRawDebug = true;
+			}
+			else if (nDbg == 20)
+			{
+				// rt stage 5F. 20 = the cloud IN-SCATTER the reflected ray picked up in the
+				// cloud layer, in exposed radiance - the units view 0 is in. This is the cloud
+				// itself, without the sky behind it, so a sunlit cumulus reads bright and the
+				// clear sky between clouds reads black. If a mirror that clearly shows sky reads
+				// black everywhere here, the march never ran: either the ray points below the
+				// horizon, or the clouds stage bound nothing this frame (e_Clouds /
+				// r_VolumetricClouds), or e_svoTI_RT_Clouds is 0.
+				acc = vCloudInscatter;
+				bRawDebug = true;
+			}
+			else if (nDbg == 21)
+			{
+				// rt stage 5F. 21 = the cloud TRANSMITTANCE along the reflected ray. WHITE =
+				// clear sky, the dome behind the layer arrives undimmed; BLACK = an optically
+				// thick cloud, the reflection is pure cloud. This is the cloud's SHAPE, and it is
+				// the view to compare against the shape of the same cloud in the direct view:
+				// they must be the same cloud in the same place and they must drift together.
+				acc = (float3)fCloudTrans;
+				bRawDebug = true;
+			}
+			else if (nDbg == 13)
+			{
+				// 13 = VALIDATOR C (energy audit section 5 / research 06 section 8, option C).
+				// The one test the picture cannot argue with: for a hit that also happens to be
+				// ON SCREEN, the reflected shading of that point and the DIRECT shading of the
+				// same point must agree. Project the hit back through SVO_ViewProj, check the
+				// depth buffer says the camera really sees that surface and not something in
+				// front of it, and compare luminances in STOPS.
+				//   black = agreement          red   = the reflection is N stops too BRIGHT
+				//   blue  = not testable       green = the reflection is N stops too DARK
+				//
+				// Both sides are read in EXPOSED units and no exposure is applied to either:
+				// `acc` here is pre-divide, i.e. already exposed, and $HDRTargetPrev is the
+				// pre-exposed HDR target, so the ratio is exposure-free by construction.
+				//
+				// Two caveats, both real, both the reason this lives ONLY in a debug branch:
+				// $HDRTargetPrev is the PREVIOUS frame (the camera has moved, so judge it on a
+				// still frame), and reading a pre-exposed buffer back into SVO maths is exactly
+				// what e_svoTI_SSDepthTrace is forced off for on the scene-referred path. This
+				// value must never reach a non-debug path.
+				const float3 vHitAbs = vGPO.xyz + GetWorldViewPos();
+				float4 vProjTC = mul(SVO_ViewProj, float4(vHitAbs, 1));
+				const bool bInFront = (vProjTC.w > 0);
+				vProjTC /= vProjTC.w;
+				vProjTC.xy = vProjTC.xy * 0.5f + 0.5f;
+				vProjTC.y = 1.f - vProjTC.y;
+
+				bool bTestable = bInFront && !bNoHit && all(vProjTC.xy == saturate(vProjTC.xy));
+
+				if (bTestable)
+				{
+					const float fScrDepth = SampleLinearDepth(sceneDepth, vProjTC.xy) * PS_NearFarClipDist.y;
+					const float fHitDepth = GetLinearDepth(g_PS_ProjRatio.y / (vProjTC.z - g_PS_ProjRatio.x)) * PS_NearFarClipDist.y;
+					bTestable = abs(fScrDepth - fHitDepth) < max(0.05f, fHitDepth * 0.02f);
+				}
+
+				if (!bTestable)
+				{
+					acc = float3(0, 0, 0.25f);
+				}
+				else
+				{
+					const float3 vDirect = sceneTargetPrev.SampleLevel(ssSvoPointClamp, vProjTC.xy, 0).rgb;
+					const float fStops = log2(max(GetLuminance(acc), 1e-6f) / max(GetLuminance(vDirect), 1e-6f));
+					acc = (fStops > 0.f) ? float3(saturate(fStops), 0, 0) : float3(0, saturate(-fStops), 0);
+				}
+
+				bRawDebug = true;
+			}
 		}
 #endif
 
-		// Global fog, added BEFORE the exposure divide: GetVolumetricFogColorInternal already
-		// multiplies the authored fog colour by PS_HDR_RANGE_ADAPT_MAX on this branch, and `acc`
-		// is built from already-exposed lights, so both sides of the lerp are in the same units.
+		// Fog on the reflected segment, added BEFORE the exposure divide. Both sources are in
+		// EXPOSED radiance: GetVolumetricFogColorInternal multiplies the authored fog colour by
+		// PS_HDR_RANGE_ADAPT_MAX itself (VolumetricFog.cfi:154), and the froxel volume was
+		// injected from a scattering colour the CPU pre-multiplied by GetSceneReferredExposure()
+		// (VolumetricFog.cpp:2513). `acc` is built from already-exposed lights, so all three are
+		// in the same units. The transmittances are unit free.
 		//
-		// rt stage 2C, finding (d): the vector passed to the fog is Neo's - the REFLECTED
-		// SEGMENT, not the camera-to-hit vector - and that is the right choice, because the fog
-		// over the camera-to-mirror segment is applied to this pixel again downstream by the
-		// scene fog pass. Passing vGPO.xyz (camera to hit) instead would fog that segment twice.
-		// What was wrong is that a MISS got fogged too: on a miss the "hit distance" is the
-		// arbitrary e_svoTI_RT_MaxDistRay sentinel and the hit position is a point 24 m along a
-		// ray that hit nothing, so the lerp pulled a sky/probe colour a fixed fraction of the way
-		// towards the fog colour everywhere at once - a flat grey veil over every part of the
-		// reflection that escaped, which is exactly the "hazy and washed out" report. A miss is
-		// resolved by the probes, and a sky probe already carries its own aerial perspective.
+		// THE FORMULA. S = the reflecting surface, H = the hit. What this pass owns is the
+		// segment S->H and nothing else; the camera->S segment is fogged downstream by CFogStage /
+		// CVolumetricFogStage on the composited image, so adding it here would count it twice.
+		//
+		//   acc  <-  acc * T_froxel + I_froxel          (the part of S->H the froxels covered)
+		//   acc  <-  lerp(C_analytic, acc, T_analytic ^ (1 - covered))
+		//
+		// The second line is the leftover. The analytic fog's transmittance is exp2(-k * length),
+		// so raising it to (1 - covered) is the analytic fog of exactly the uncovered share of
+		// the segment - and when covered = 0 it collapses to T_analytic, i.e. to the lerp this
+		// pass has always done. There is no double counting between the two: the froxel volume
+		// already has the analytic global fog density injected into it
+		// (VolumeLighting.cfi:2000 GetExponentialHeightFogDensity), so the two terms are
+		// complementary shares of one segment, never the same share twice. The split is by
+		// FRACTION, not by position, so an uncovered step in the middle is charged as if it were
+		// at the far end; with fog this smooth that is below the noise of one GGX sample.
+		//
+		// A MISS is still not fogged: on a miss the "hit distance" is the e_svoTI_RT_MaxDistRay
+		// sentinel and the hit position is a point that far along a ray that hit nothing, so the
+		// lerp pulled a sky/probe colour a fixed fraction of the way towards the fog colour
+		// everywhere at once - a flat grey veil over every part of the reflection that escaped.
+		// A miss is resolved by the sky or the probes, and both carry their own aerial perspective.
+		// rt stage 5F, the optional on-a-hit mode (off unless SVO_CloudParams2.w is set): the
+		// cloud layer lies in front of a far enough hit, so it dims it and adds its own light,
+		// the same composite the miss path does over the sky. It goes BEFORE the fog so that the
+		// fog of the reflected segment still veils the whole thing.
+		if (!bRawDebug && bCloudsOnHit)
+			acc = acc * fCloudTrans + vCloudInscatter;
+
 		if (!bRawDebug && !bNoHit)
 		{
-			const float3 cameraToWorldPos = normalize(vGLD.xyz) * abs(vGLD.w);
-			const float3 worldPos = vGPO.xyz + GetWorldViewPos();
-			const SFogParams fogParams = GetFogParams();
-			const float4 localFogColor = GetVolumetricFogColor(fogParams, worldPos, cameraToWorldPos);
-			acc = lerp(localFogColor.xyz, acc, saturate(localFogColor.w));
+			acc = acc * fFogTrans + vFogInscatter;
+			// the ternary is not cosmetic: with no froxel coverage this has to be the SAME
+			// expression as before, not pow(x, 1), which is exp2(log2(x)) and not bit exact.
+			const float fAnalyticTrans = (fFogCovered > 0.f)
+			                             ? pow(max(saturate(vFogAnalytic.w), 0.0001f), 1.f - fFogCovered)
+			                             : saturate(vFogAnalytic.w);
+			acc = lerp(vFogAnalytic.xyz, acc, saturate(fAnalyticTrans));
 		}
 
 		// Neo clamps to a hard 8 here, which is roughly the top of the RGBM range the voxel
@@ -2112,7 +2739,7 @@ pixoutShade ShadePS(vtxOutWPOS IN)
 		// output ALD + RGB in the shape DemosaicPS expects
 		const float fBr = length(acc.xyz);
 
-		OUT.vALD.xyz = vGLD.xyz * fBr;
+		OUT.vALD.xyz = vRayDirN * fBr;
 		OUT.vALD.w   = fBr;
 
 		OUT.vRGB.xyz = acc.xyz;
@@ -3110,8 +3737,29 @@ pixoutMRTUpscale UpScalePS(vtxOutWPOS IN)
 	GetAverNormAndSmooth(IN.baseTC.xy, vUpNor0, fUpSmooth, fUpTransm, normalize(IN.CamVec.xyz), vUpRefl, fUpDepthMin, fUpDepthMax, vUpNorMin, vUpNorMax);
 	const float3 vUpPos0 = GetWorldPos(VOX_DEPTH_SCALE * fDepthC - VOX_DEPTH_BIAS, IN.CamVec);
 	const bool bRTPixel = RT_IsTriPixel(fUpSmooth, vUpRefl, length(vUpPos0 - PS_WorldViewPos.xyz));
+
+	// rt stage 4B (decision 08 item 4): the roughness-scaled spatial filter. A mirror is a
+	// single tap - it was already final at full resolution and any radius at all softens it -
+	// and the radius opens to 4 source texels at the bottom of the RT range, where one GGX
+	// sample per pixel is genuinely noisy. Same ramp as the temporal history length, so the two
+	// halves of the denoiser cannot disagree about how rough this pixel is.
+	float fRTRadius = bRTPixel ? lerp(4.f, 0.f, RT_GetMirrorT(fUpSmooth)) : 0.f;
+	float fRTBandT = bRTPixel ? RT_GetGlossBandT(fUpSmooth) : 1.f;
+	#if %_RT_PARTICLE_SHADOW
+	// debug 14 (raw 1 spp) and 15 (history weight) must reach the screen unfiltered and unmixed
+	if ((int)VOX_RT_DEBUG_MODE == 14 || (int)VOX_RT_DEBUG_MODE == 15)
+	{
+		fRTRadius = 0.f;
+		fRTBandT = 1.f;
+	}
+	#endif
+	// the centre tap hit distance, the guide signal of the bilateral below; 0 = not RT
+	const float fRTHitDistC = bRTPixel ? refl_RAYDIR_REC.SampleLevel(ssSvoPointClamp, IN.baseTC.xy, 0).w : 0.f;
 #else
 	const bool bRTPixel = false;
+	const float fRTRadius = 0.f;
+	const float fRTBandT = 1.f;
+	const float fRTHitDistC = 0.f;
 #endif
 
 	// define sampling kernel
@@ -3122,8 +3770,12 @@ pixoutMRTUpscale UpScalePS(vtxOutWPOS IN)
 	// to an already-final picture, and the quarter-texel bias smears it diagonally on top. Neo
 	// collapses the whole loop to one tap under %_RTGI_MESH_RAY_TRACING && !DIFFUSE
 	// (neo:2340-2346, neo:2348 samples at baseTC with tex2DlodPC). Same thing here, per pixel.
-	const float4 sampleTM = bRTPixel ? float4(0, 0, 0, 0) : float4(SVO_SrcPixSize.xy * 1.5f, SVO_SrcPixSize.xy * 0.25f);
-	const int samplesUsed = bRTPixel ? 1 : samplesNum;
+	// rt stage 4B: for an RT pixel the offsets become the roughness-scaled radius and the
+	// quarter-texel bias stays at zero (it exists to help a half-resolution upscale and only
+	// smears a full-resolution result). fRTRadius == 0 collapses back to stage 2C single tap.
+	const float4 sampleTM = bRTPixel ? float4(SVO_SrcPixSize.xy * fRTRadius, 0.f, 0.f)
+	                                 : float4(SVO_SrcPixSize.xy * 1.5f, SVO_SrcPixSize.xy * 0.25f);
+	const int samplesUsed = (bRTPixel && fRTRadius <= 0.f) ? 1 : samplesNum;
 	const float2 arrSamples[samplesNum] =
 	{
 		// TODO: try (-1,0), (0,1) ....
@@ -3170,6 +3822,21 @@ pixoutMRTUpscale UpScalePS(vtxOutWPOS IN)
 		float fDepTest = saturate((fDepthRange - abs(1.f - fDepthC / fDepth1)) * 4);
 
 		float fW = fDepTest * fDotTest;
+
+#if %_RT_QUALITY
+		if (bRTPixel && fRTRadius > 0.f)
+		{
+			// rt stage 4B: hit-distance similarity. Two neighbouring pixels whose rays ended
+			// metres apart are not looking at the same thing however alike their surfaces are,
+			// and depth + normal cannot tell - they are identical across a flat floor. This is
+			// the guide buffer an NRD-class denoiser keys on (decision 08 alternatives, R09);
+			// here it is one term of a 5 tap bilateral. A tap that is not an RT pixel at all
+			// (hit distance 0) is rejected outright.
+			const float fHitD = refl_RAYDIR_REC.SampleLevel(ssSvoPointClamp, tc, 0).w;
+			const float fRelD = abs(fHitD - fRTHitDistC) / max(fRTHitDistC, 0.25f);
+			fW *= (fHitD > 0.f) ? saturate(1.f - fRelD) : 0.f;
+		}
+#endif
 
 		if (s == 4)
 			fW = saturate(fW * 4); // midddle sample is most important
@@ -3237,6 +3904,23 @@ pixoutMRTUpscale UpScalePS(vtxOutWPOS IN)
 			// a perfect mirror. Both are cone-tracing reconstruction and both are wrong here.
 			// Neo: OUT.Diffuse.xyz = vRGB (neo:2412), no sceneDiffuseFin blend (neo:2419-2421).
 			OUT.Diffuse.xyz = vRGB.xyz;
+
+			// rt stage 4B (decision 08 consequences): the cross-fade band around
+			// e_svoTI_RT_MinGloss. Below the band a pixel is voxel cone traced and the stock
+			// line below anchors it to the DIFFUSE GI buffer with weight saturate(3s - 0.75);
+			// above the band an RT pixel is used neat. Inside the band the RT pixel is given
+			// the SAME anchor with the SAME weight and then ramped off it, so the
+			// reconstruction is continuous across the threshold and the only step left is the
+			// voxel-cone result against the ray-traced one - two estimates of the same
+			// reflection, which the stage 4A energy fixes put in the same units on purpose.
+			// A true cross-fade would need BOTH traces on the same pixel; see report 04b
+			// section 6.
+			if (fRTBandT < 1.f)
+			{
+				const float4 vFinalDiffuseRT = tex2DlodPC(sceneDiffuseFin, float4(IN.baseTC.xy, 0, 0)) / SvoParamsDiffuse.w * SvoParamsSpecular.w;
+				const float4 vAnchoredRT = lerp(vFinalDiffuseRT, OUT.Diffuse, saturate(gbuffer.Smoothness * 3.f - .75f));
+				OUT.Diffuse = lerp(vAnchoredRT, OUT.Diffuse, fRTBandT);
+			}
 		}
 		else
 		{

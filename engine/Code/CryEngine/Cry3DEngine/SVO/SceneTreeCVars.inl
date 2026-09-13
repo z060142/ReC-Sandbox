@@ -246,9 +246,9 @@ REGISTER_CVAR_AUTO(int, e_svoTI_Reflect_Vox_Max, 100, VF_NULL, "Controls amount 
 REGISTER_CVAR_AUTO(int, e_svoTI_Reflect_Vox_MaxEdit, 10000, VF_NULL, "Controls amount of voxels allowed to refresh every frame during lights editing");
 REGISTER_CVAR_AUTO(int, e_svoTI_Reflect_Vox_Max_Overhead, 50, VF_NULL, "Controls amount of voxels allowed to refresh every frame");
 REGISTER_CVAR_AUTO(int, e_svoTI_RT_Active, 0, VF_EXPERIMENTAL, "Activates mesh ray tracing for reflections\nIt is necessary to re-voxelize the scene after activation");
-REGISTER_CVAR_AUTO(float, e_svoTI_RT_MaxDistRay, 24.f, VF_EXPERIMENTAL, "Maximum ray distance for mesh tracing");
+REGISTER_CVAR_AUTO(float, e_svoTI_RT_MaxDistRay, 48.f, VF_EXPERIMENTAL, "Maximum ray distance for mesh tracing. Past it the ray is a MISS and is resolved by the sky (above the horizon) or the env probe (below it), not by the surface that is actually there");
 REGISTER_CVAR_AUTO(float, e_svoTI_RT_MaxDistCam, 100.f, VF_EXPERIMENTAL, "Maximum camera distance for mesh tracing");
-REGISTER_CVAR_AUTO(float, e_svoTI_RT_MinGloss, 0.85f, VF_EXPERIMENTAL, "Minimum surface glossiness for mesh tracing");
+REGISTER_CVAR_AUTO(float, e_svoTI_RT_MinGloss, 0.5f, VF_EXPERIMENTAL, "Minimum surface glossiness for mesh tracing\nRougher surfaces keep voxel cone tracing; the two are cross faded over this value plus/minus 0.05 so there is no seam");
 REGISTER_CVAR_AUTO(float, e_svoTI_RT_MinRefl, 0, VF_EXPERIMENTAL, "Minimum surface reflectance for mesh tracing");
 REGISTER_CVAR_AUTO(int, e_svoTI_RT_MaxTrisPerVoxel, 100, VF_EXPERIMENTAL, "DEPRECATED - retired together with the per-voxel triangle list path\nKept registered only so that existing level files keep loading");
 REGISTER_CVAR_AUTO(int, e_svoTI_RT_MaxTexRes, 256, VF_EXPERIMENTAL, "XY resolution of the material texture atlas used by mesh ray tracing");
@@ -256,7 +256,10 @@ REGISTER_CVAR_AUTO(float, e_svoTI_RT_SafetyBorder, 0.25f, VF_EXPERIMENTAL, "DEPR
 
 // Static BVH mesh ray tracing (decisions 02-05)
 REGISTER_CVAR_AUTO(int, e_svoTI_RT_StaticBVH, 1, VF_EXPERIMENTAL, "Build and trace one static BVH per SVO cell\n0 = voxel cone tracing only");
-REGISTER_CVAR_AUTO(int, e_svoTI_RT_Debug, 0, VF_EXPERIMENTAL, "Mesh ray tracing debug views\n1 = hit test count heat map\n2 = hit normals\n3 = hit albedo\n4 = hit distance\n5 = incomplete/overflow mask\n6 = stage-1 provisional colour (no light data)\n7 = sun shadow at the hit (white = lit)\n8 = direct light at the hit, before probes\n9 = raw shade output, before fog and exposure\n10 = raw atlas normal at the hit (magenta = no normal slot)\n11 = hit smoothness\n12 = hit reflectance (F0, x8)");
+REGISTER_CVAR_AUTO(int, e_svoTI_RT_Debug, 0, VF_EXPERIMENTAL, "Mesh ray tracing debug views\n0 = off\n1 = hit test count heat map (blue = few, red = many)\n2 = hit normals\n3 = hit albedo\n4 = hit distance\n5 = incomplete/overflow mask (magenta = the traversal stack ran out)\n6 = stage-1 provisional colour (no light data)\n7 = sun shadow at the hit (white = lit)\n8 = direct light at the hit, before probes\n9 = raw shade output, before fog and exposure\n10 = raw atlas normal at the hit, tangent space (magenta = no normal slot, flat lilac = no normal map)\n11 = hit smoothness (black = rough, white = mirror; modulated by the material gloss map, no longer flat per material)\n12 = hit reflectance F0, x8 (black = the material record really carries no reflectance)\n13 = validator C: for a hit that is also on screen, |reflected - direct| in STOPS (black = they agree, red = the reflection is that many stops too bright, green = too dark, blue = the hit is off screen or occluded so the test says nothing). Reads the PREVIOUS frame's pre-exposed HDR target, so judge it on a still camera\n14 = the raw 1 sample per pixel glossy trace, temporal and spatial filters off - 14 against 0 is exactly what the denoiser removes\n15 = the temporal history weight for ray traced pixels (white = the pixel is all history, black = all new)\n16 = the material shading TAG at the hit, as a flat colour (grey Illum, green vegetation leaves, pink skin, cyan glass, blue water, brown terrain, black no material data)\n17 = does the hit's material carry an EXTRAS record (white = detail map / blend layer / per type parameters, black = a plain record)\n18 = the volumetric fog IN-SCATTER added on the reflected segment, in exposed radiance (black = clear air, or the froxel volume did not cover the segment)\n19 = the TRANSMITTANCE of the reflected segment (white = clear, black = opaque fog); green tint = the froxel volume covered it, red tint = the analytic global fog is doing the work\n20 = the volumetric cloud IN-SCATTER a missed ray picked up in the cloud layer, in exposed radiance (black = clear sky along that ray, or the cloud march did not run)\n21 = the cloud TRANSMITTANCE along a missed ray (white = clear sky, black = thick cloud); this is the cloud's SHAPE, compare it with the same cloud in the direct view");
+REGISTER_CVAR_AUTO(int, e_svoTI_RT_GlossyMode, 1, VF_EXPERIMENTAL, "Ray traced reflection lobe\n0 = mirror only (the exact reflect direction at every smoothness)\n1 = one GGX visible normal sample per pixel per frame, so reflections blur with roughness");
+REGISTER_CVAR_AUTO(float, e_svoTI_RT_GlossScale, 1.f, VF_EXPERIMENTAL, "Multiplier on the ray traced GGX lobe width; 1 = the same lobe the surface is shaded with, below 1 = sharper and less noisy, above 1 = blurrier");
+REGISTER_CVAR_AUTO(int, e_svoTI_RT_TemporalFrames, 8, VF_EXPERIMENTAL, "Frames of temporal history for ray traced reflections at the rough end of the range; a mirror always uses two\nMore frames = less noise and more ghosting");
 REGISTER_CVAR_AUTO(float, e_svoTI_RT_NormalsFading, 0, VF_EXPERIMENTAL, "Fade ray traced reflections into flat normals, in metres; 0 = off (normal maps at any distance)\nApplies to both the reflecting surface (a normal mapped mirror otherwise prints its detail map into the reflection) and to the hit's own normal map");
 REGISTER_CVAR_AUTO(int, e_svoTI_RT_TriPoolXY, 256, VF_EXPERIMENTAL, "XY size of the BVH node/triangle record pool texture (power of two, multiple of 4)");
 REGISTER_CVAR_AUTO(int, e_svoTI_RT_TriPoolZ, 64, VF_EXPERIMENTAL, "Z size of the BVH node/triangle record pool texture");
@@ -266,6 +269,30 @@ REGISTER_CVAR_AUTO(int, e_svoTI_RT_LeafTris, 4, VF_EXPERIMENTAL, "Maximum number
 REGISTER_CVAR_AUTO(int, e_svoTI_RT_MaxDepth, 18, VF_EXPERIMENTAL, "Maximum BVH depth; the consumer traversal stack is sized for this value plus two");
 REGISTER_CVAR_AUTO(int, e_svoTI_RT_SelfTest, 0, VF_EXPERIMENTAL, "Run the BVH builder and record encoding self test once on level load and print the result into the log");
 REGISTER_CVAR_AUTO(int, e_svoTI_RT_LightGridDim, 16, VF_EXPERIMENTAL, "Light-mask grid resolution per axis for RT hit shading, multiple of 8");
+
+// Dynamic meshes in the ray traced reflections (decision 07, stage 3A).
+// The renderer does not mirror any of these - the shader already walks the dynamic root every ray.
+REGISTER_CVAR_AUTO(int, e_svoTI_RT_Dynamic, 1, VF_EXPERIMENTAL, "Rebuild a global BVH over the moving objects near the camera every frame and trace it\n0 = only the static per-cell BVH is traced (characters and entities disappear from reflections)");
+REGISTER_CVAR_AUTO(float, e_svoTI_RT_DynObjDistRatio, 1.f, VF_EXPERIMENTAL, "Controls how far from the camera entities are collected for ray tracing, as a fraction of e_svoTI_RT_MaxDistCam");
+REGISTER_CVAR_AUTO(int, e_svoTI_RT_DynMaxTris, 200000, VF_EXPERIMENTAL, "Triangle budget of the per frame dynamic BVH; objects are added by projected size until it is reached\nThe DYN_MESH pool segment is the harder limit and caps this further");
+REGISTER_CVAR_AUTO(int, e_svoTI_RT_LodRatio, 1, VF_EXPERIMENTAL, "Controls LOD of movable meshes used for RT\n0 = full detail");
+
+// Real skinning of characters in the ray traced reflections (decision 07, stage 3B). The skin mesh is
+// CPU skinned through IAttachmentSkin::GetSkinnedVertices with the current frame's bone transforms and
+// the cached per object BVH is refit onto the result, so a character animates in the reflection.
+REGISTER_CVAR_AUTO(int, e_svoTI_RT_SkinMaxTris, 30000, VF_EXPERIMENTAL, "Per frame CPU skinning budget for ray traced characters, in triangles over all characters\nThe nearest characters are skinned first; once the budget is spent the rest are traced in their bind pose\n0 = no skinning at all (bind pose, the behaviour before stage 3B)");
+
+// Water surfaces as traceable geometry (rt decision 09 9.4, stage 5C). The ocean plane and the
+// water volume surfaces are emitted into the per frame dynamic segment, tagged 4 (Water) in the
+// material record, so a reflection ray sees the water the direct view draws.
+REGISTER_CVAR_AUTO(int, e_svoTI_RT_Water, 1, VF_EXPERIMENTAL, "Emit the ocean plane and the water volume surfaces into the ray traced dynamic BVH\n0 = water stays invisible to reflection rays (behaviour before stage 5C)");
+REGISTER_CVAR_AUTO(int, e_svoTI_RT_WaterGrid, 4, VF_EXPERIMENTAL, "Cells per axis of the camera centred ocean quad ring; 2 = 8 triangles, 4 = 32 (clamped to 1..4)");
+REGISTER_CVAR_AUTO(float, e_svoTI_RT_WaterDepth, 5.f, VF_EXPERIMENTAL, "Water depth hint in metres, stored in the water material record so the hit shader can attenuate the fog colour with it\nUsed for the ocean; a water volume with an authored volume depth uses its own");
+// Volumetric clouds in ray traced reflections (rt decision 09 9.2, stage 5F). A ray that misses
+// above the horizon marches the SAME cloud density field Clouds.cfx uses, so the cloud in a
+// mirror is the cloud in the sky and drifts with it.
+REGISTER_CVAR_AUTO(int, e_svoTI_RT_Clouds, 1, VF_EXPERIMENTAL, "March the volumetric cloud layer along a reflection ray that misses above the horizon\n0 = the reflected sky is the bare sky dome, with no clouds in it");
+REGISTER_CVAR_AUTO(int, e_svoTI_RT_CloudSteps, 12, VF_EXPERIMENTAL, "Ray-march steps through the cloud layer for a reflection ray (clamped to 1..64)\nFewer = cheaper and banded, more = smoother cloud edges; the direct view uses r_VolumetricCloudsRaymarchStepNum, which is far higher because it has a full screen to fill and a temporal filter to hide the rest");
 REGISTER_CVAR_AUTO(float, e_svoTI_Specular_Sev, 1, VF_NULL, "Controls severity of specular cones; this value limits the material glossiness");
 REGISTER_CVAR_AUTO(float, e_svoVoxDistRatio, 14.f, VF_NULL, "Limits the distance where real-time GPU voxelization used");
 REGISTER_CVAR_AUTO(int, e_svoVoxGenRes, 512, VF_NULL, "GPU voxelization dummy render target resolution");

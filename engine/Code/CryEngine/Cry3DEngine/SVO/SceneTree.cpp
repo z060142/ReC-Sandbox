@@ -117,6 +117,15 @@ bool CSvoEnv::Render()
 
 	CollectAnalyticalOccluders();
 
+	// Dynamic meshes (rt decision 07, stage 3A). This has to run EVERY frame - the tree walk below
+	// is time throttled - and the pool upload has to happen before the renderer traces this frame,
+	// which is why CheckUpdateMeshPools() is called here and not only after the brick updates.
+	if (GetCVars()->e_svoTI_RT_Active)
+	{
+		CVoxelSegment::RTUpdateDynamic();
+		CheckUpdateMeshPools();
+	}
+
 	if (Get3DEngine()->m_pObjectsTree)
 	{
 		CRY_PROFILE_SECTION(PROFILE_3DENGINE, "CSvoEnv::Render_FindProbe");
@@ -988,6 +997,9 @@ CSvoEnv::~CSvoEnv()
 {
 	SAFE_DELETE(m_pStreamEngine);
 	assert(CVoxelSegment::m_streamingTasksInProgress == 0);
+
+	// the per object dynamic BVH cache holds render mesh references; drop them with the SVO
+	CVoxelSegment::RTClearDynamicCache();
 
 	SAFE_DELETE(m_pSvoRoot);
 
@@ -2192,6 +2204,7 @@ void CSvoEnv::RTCachePoolDims()
 	// SRTBuildStats is a plain struct inside CSvoEnv, so without this the status line printed
 	// whatever was on the heap until the first BVH was built
 	m_rtStats.Reset();
+	m_rtDynStats.Reset();
 
 	if (m_rtPoolXY)
 		return;
@@ -2624,9 +2637,19 @@ void CSvoEnv::RTFormatBvhLine(char* szOut, size_t bufSize) const
 {
 	const SRTBuildStats& st = m_rtStats;
 
-	cry_sprintf(szOut, bufSize, "RT BVH: %d cells, %d K tris, %d K nodes, %d leaves, depth %d, maxLeaf %d, %d mats, uvClamp %d, texScale %d, skip %d, %.0f ms",
+	cry_sprintf(szOut, bufSize, "RT BVH: %d cells, %d K tris, %d K nodes, %d leaves, depth %d, maxLeaf %d, %d mats, extras %d, blend %d, uvClamp %d, texScale %d, skip %d, %.0f ms",
 	            st.cells, st.tris / 1000, st.nodes / 1000, st.leaves, st.maxDepth, st.maxLeafTris,
-	            st.mats, st.uvClamped, m_rtUvScaleMismatch, st.trisSkipped, st.buildMs);
+	            st.mats, st.extras, st.blends, st.uvClamped, m_rtUvScaleMismatch, st.trisSkipped, st.buildMs);
+}
+
+void CSvoEnv::RTFormatDynLine(char* szOut, size_t bufSize) const
+{
+	const SRTDynStats& st = m_rtDynStats;
+
+	cry_sprintf(szOut, bufSize, "RT dyn: %d of %d objs, %d K tris, %d records, %d mats, ovf %d, cache %d, water %d tris, "
+	                            "skinned %d chars, %d K verts, %d stale, %.2f ms, %.2f ms",
+	            st.objs, st.objsFound, st.tris / 1000, st.records, st.mats, st.overflowed, st.cached, st.waterTris,
+	            st.skinnedChars, st.skinnedVerts / 1000, st.skinReused, st.skinMs, st.ms);
 }
 
 //! Belt and braces for the HUD: print the same two lines to the log once, when a voxelization pass

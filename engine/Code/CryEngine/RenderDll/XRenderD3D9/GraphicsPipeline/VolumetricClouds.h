@@ -49,6 +49,24 @@ public:
 	};
 	const SSceneReferredDebug& GetSceneReferredDebug() const { return m_srDebug; }
 
+	// rt stage 5F (decision 09 section 9.2): the four textures the SVO ray tracer's secondary
+	// cloud march needs, so a cloud is the same cloud in a reflection as in the direct view.
+	// Accessors only - nothing here changes what this stage does or when.
+	//
+	// GetVolCloudShadowTex() is the ONLY one of the four that is frame-fresh at the point the
+	// SVO block runs: ExecuteShadowGen() is called at StandardGraphicsPipeline.cpp:457-458,
+	// three lines before SVOGI, while Execute() (which is what fills m_pVolCloudNoiseTex /
+	// m_pVolCloudEdgeNoiseTex) runs at :544, after it. The two noise members are therefore last
+	// frame's POINTERS - but they are level textures resolved from
+	// GetVolumetricCloudTextureInfo(), not per-frame results, so the caller re-resolves them the
+	// same way ExecuteVolumetricCloudShadowGen does and falls back to GetDefaultNoiseTex(),
+	// which Init() always creates. That makes the first frame correct too.
+	CTexture* GetVolCloudShadowTex() const    { return m_pTexVolCloudShadow.get(); }
+	CTexture* GetVolCloudNoiseTex() const     { return m_pVolCloudNoiseTex.get(); }
+	CTexture* GetVolCloudEdgeNoiseTex() const { return m_pVolCloudEdgeNoiseTex.get(); }
+	CTexture* GetCloudMiePhaseTex() const     { return m_pCloudMiePhaseFuncTex.get(); }
+	CTexture* GetDefaultNoiseTex() const      { return m_pNoiseTex.get(); }
+
 private:
 	void  ExecuteVolumetricCloudShadowGen();
 	void  GenerateCloudShadowGenShaderParam(const Vec3& texSize);

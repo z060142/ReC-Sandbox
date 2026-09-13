@@ -54,10 +54,33 @@ float4 SVO_RTParams1;
 #define VOX_RT_PRIM_TYPE_DYNAMIC           1
 #define VOX_RT_PRIM_TYPE_PARTICLE          2
 
-// Material shading tags, material record texel +3 .z (decision 02 section 2.5).
+// Material shading tags, material record texel +3 .z (decision 02 section 2.5, decision 10).
+// The CPU producer writes these exact float values (VoxelSegment.h SVO_RT_TAG_*, report 05A
+// section 1); 0.25 keeps its stage 1/2 meaning so the vegetation path is bit for bit unchanged.
 #define VOX_RT_SHADING_DEFAULT             0.0
 #define VOX_RT_SHADING_VEG_LEAVES          0.25
 #define VOX_RT_SHADING_MULTI_BOUNCE        0.5
+#define VOX_RT_SHADING_HUMAN_SKIN          2.0
+#define VOX_RT_SHADING_GLASS               3.0
+#define VOX_RT_SHADING_WATER               4.0
+#define VOX_RT_SHADING_TERRAIN             5.0
+#define VOX_RT_SHADING_EMISSIVE_ONLY       6.0
+
+// rt stage 5B: the compact code the HITMAT g-data lane carries. A float tag would survive fp16
+// too, but a small dense integer is what the ShadePS branch chain and debug view 16 want, and
+// it leaves the low byte of the same lane free for one per type scalar.
+#define VOX_RT_MATCODE_ILLUM               0
+#define VOX_RT_MATCODE_VEG_LEAVES          1
+#define VOX_RT_MATCODE_HUMAN_SKIN          2
+#define VOX_RT_MATCODE_GLASS               3
+#define VOX_RT_MATCODE_WATER               4
+#define VOX_RT_MATCODE_TERRAIN             5
+#define VOX_RT_MATCODE_EMISSIVE            6
+
+// Illum.cfx:549 detailScales.z. The material's DetailGlossScale has no lane in the extras record
+// (report 05A gap 4), so the hit uses the shader's own default, which is what the overwhelming
+// majority of materials leave it at.
+#define VOX_RT_DETAIL_GLOSS_SCALE          0.5
 
 // Traversal stack depth: e_svoTI_RT_MaxDepth (18) + 2.
 #define VOX_RT_MAX_CALL_STACK              20
@@ -75,6 +98,174 @@ float RT_GetNormalsFade(const float fDistM)
 {
 	const float fFading = VOX_RT_NORMALS_FADING;
 	return (fFading > 0.f) ? saturate(fFading / max(fDistM, 0.01f)) : 1.f;
+}
+
+///////////////////////////////////////////////////////////////////////////////////
+// rt stage 4B - glossy (rough) triangle reflections (decision 08).
+//
+// (glossyMode, glossScale, temporalFrames, blueNoiseBound). Set by
+// CSvoRenderer::SetupCommonConstants and by ShadePass, both only under e_svoTI_RT_Active.
+//   .x e_svoTI_RT_GlossyMode    0 = mirror only (the stage 2C behaviour, bit for bit), 1 = GGX
+//   .y e_svoTI_RT_GlossScale    lobe width multiplier on the GGX alpha, 1 = physical
+//   .z e_svoTI_RT_TemporalFrames  the history length at smoothness 0.5
+//   .w 1 when rt_bluenoise_64.dds is bound at t32, 0 = fall back to the hash
+///////////////////////////////////////////////////////////////////////////////////
+float4 SVO_RTParams2;
+
+#define VOX_RT_GLOSSY_MODE                 (SVO_RTParams2.x)
+#define VOX_RT_GLOSS_SCALE_CVAR            (SVO_RTParams2.y)
+#define VOX_RT_TEMPORAL_FRAMES             (SVO_RTParams2.z)
+#define VOX_RT_NOISE_BOUND                 (SVO_RTParams2.w)
+
+// Smoothness at and above which a pixel keeps the EXACT mirror direction: the GGX alpha there
+// is (1 - 0.98)^2 = 4e-4, i.e. a lobe narrower than one specular texel, so sampling it only
+// adds noise. Also the upper end of every roughness ramp in the reconstruction.
+#define VOX_RT_MIRROR_GLOSS                0.98f
+
+// Half width of the cone-trace / ray-trace cross-fade band around e_svoTI_RT_MinGloss
+// (decision 08 consequences: "the transition band 0.45-0.55").
+#define VOX_RT_GLOSS_BAND                  0.05f
+
+// 64 x 64 RGBA8 void-and-cluster blue noise, scene-notes/rt/tools/gen_bluenoise.py.
+// Read with Load(), so no sampler and no filtering; t32 is free on every SVO technique.
+Texture2D SVO_BlueNoise: register (t32);
+
+// Fallback when the texture is missing: a cheap integer hash. White noise, not blue - the
+// temporal and spatial filters still work, they just have more to remove.
+float4 RT_HashNoise4(const int2 nXY, const float fFrameId)
+{
+	uint3 v = uint3((uint)abs(nXY.x), (uint)abs(nXY.y), (uint)abs(fFrameId));
+	uint h = v.x * 1973u + v.y * 9277u + v.z * 26699u + 1u;
+	uint4 r;
+	h ^= h >> 16; h *= 2246822519u; r.x = h;
+	h ^= h >> 13; h *= 3266489917u; r.y = h;
+	h ^= h >> 16; h *= 668265263u;  r.z = h;
+	h ^= h >> 15; h *= 2654435761u; r.w = h;
+	return float4(r >> 8) * (1.f / 16777216.f);
+}
+
+// Two independent uniform pairs in [0,1): .xy for the first GGX sample, .zw for the one
+// resample a below-the-horizon sample is allowed. Blue noise gives the spatial decorrelation
+// the 5 tap spatial filter needs; the per-frame R4 (generalised golden ratio) offset gives the
+// temporal decorrelation the history needs, and preserves the spectrum because an equal shift
+// of every texel is a shift, not a reshuffle (Wolfe/Heitz "blue noise + golden ratio").
+float4 RT_BlueNoise4(const int2 nXY, const float fFrameId)
+{
+	float4 vRnd = (VOX_RT_NOISE_BOUND > 0.f)
+	              ? SVO_BlueNoise.Load(int3(nXY.x & 63, nXY.y & 63, 0))
+	              : RT_HashNoise4(nXY, fFrameId);
+
+	// the plastic constant for d = 4: a_i = phi4^-i, phi4 = 1.1673039783
+	const float4 vR4 = float4(0.8566748839f, 0.7338918566f, 0.6287067210f, 0.5386328057f);
+	return frac(vRnd + fFrameId * vR4);
+}
+
+// CE's OWN smoothness -> GGX alpha mapping, so the traced lobe is the same lobe the deferred
+// pass shades with. shadeLib.cfi:368 SmoothnessToRoughness returns m = (1 - smoothness)^2, and
+// shadeLib.cfi:417 SpecularBRDF then writes the GGX NDF as m2 / (NdotH^2 (m2 - 1) + 1)^2 with
+// m2 = m * m - i.e. the D term's alpha IS m. Nothing here re-derives it.
+float RT_SmoothnessToAlpha(const float fSmoothness)
+{
+	const float m = (1.f - saturate(fSmoothness)) * (1.f - saturate(fSmoothness));
+	return clamp(m * max(VOX_RT_GLOSS_SCALE_CVAR, 0.f), 1e-3f, 1.f);
+}
+
+// Smith's Lambda for GGX, the same height-correlated form shadeLib.cfi:427-432 uses.
+float RT_SmithLambda(const float fNdotX, const float fAlpha)
+{
+	const float c2 = saturate(fNdotX * fNdotX);
+	const float t2 = (1.f - c2) / max(c2, 1e-7f);
+	return 0.5f * (-1.f + sqrt(1.f + fAlpha * fAlpha * t2));
+}
+
+// The VNDF estimator weight, WITHOUT the Fresnel term: sampling the distribution of visible
+// normals cancels D, the geometry and the cosines down to F * G2 / G1 (Heitz 2018 section 5).
+// F is deliberately left out here - TiledShading.cfi:951-953 multiplies TexGiSpecular by the
+// reflecting surface's envFresnel, so applying it again would count F0 twice (report 02f / 04a
+// energy ledger).
+float RT_GGXWeightG2overG1(const float fNdotV, const float fNdotL, const float fAlpha)
+{
+	const float Lv = RT_SmithLambda(fNdotV, fAlpha);
+	const float Ll = RT_SmithLambda(fNdotL, fAlpha);
+	return saturate((1.f + Lv) / max(1.f + Lv + Ll, 1e-6f));
+}
+
+// Heitz 2018, "Sampling the GGX Distribution of Visible Normals" (JCGT 7(4)), listing 1, the
+// isotropic case. Ve is the view direction in the tangent frame (+Z = shading normal, pointing
+// AWAY from the surface); the result is the sampled microfacet normal in the same frame.
+float3 RT_SampleGGXVNDF(const float3 Ve, const float fAlpha, const float u1, const float u2)
+{
+	// section 3.2: warp the view direction into the hemisphere configuration
+	const float3 Vh = normalize(float3(fAlpha * Ve.x, fAlpha * Ve.y, Ve.z));
+
+	// section 4.1: an orthonormal basis around Vh
+	const float fLenSq = Vh.x * Vh.x + Vh.y * Vh.y;
+	const float3 T1 = (fLenSq > 1e-7f) ? (float3(-Vh.y, Vh.x, 0.f) * rsqrt(fLenSq)) : float3(1, 0, 0);
+	const float3 T2 = cross(Vh, T1);
+
+	// section 4.2: a uniform point on the unit disk, squashed onto the visible half
+	const float r = sqrt(saturate(u1));
+	const float fPhi = 6.28318530718f * u2;
+	const float t1 = r * cos(fPhi);
+	float t2 = r * sin(fPhi);
+	const float s = 0.5f * (1.f + Vh.z);
+	t2 = lerp(sqrt(saturate(1.f - t1 * t1)), t2, s);
+
+	// section 4.3: lift back onto the hemisphere, then unwarp
+	const float3 Nh = t1 * T1 + t2 * T2 + sqrt(saturate(1.f - t1 * t1 - t2 * t2)) * Vh;
+	return normalize(float3(fAlpha * Nh.x, fAlpha * Nh.y, max(Nh.z, 1e-6f)));
+}
+
+// Branchless orthonormal basis, Duff et al. 2017 (JCGT 6(1)). No normalize, no singularity.
+void RT_BuildBasis(const float3 n, out float3 t, out float3 b)
+{
+	const float sgn = (n.z >= 0.f) ? 1.f : -1.f;
+	const float a = -1.f / (sgn + n.z);
+	const float c = n.x * n.y * a;
+	t = float3(1.f + sgn * n.x * n.x * a, sgn * c, -sgn * n.x);
+	b = float3(c, sgn + n.y * n.y * a, -n.y);
+}
+
+// The one entry point ConeTracePS calls. vNormal = the (distance-faded) shading normal,
+// vViewDir = surface -> eye, normalised. Returns the world space ray direction and writes the
+// VNDF estimator weight, which ShadePS multiplies the hit radiance by.
+//
+// A sampled microfacet can still reflect the view vector INTO the surface (the classic GGX
+// tail). Decision 08 says: resample once with the second noise pair, then fall back to the
+// exact mirror direction with weight 1 - biased, but bounded, cheap, and it never leaks a ray
+// through the floor. At one sample per pixel a rejection loop is not affordable.
+float3 RT_GlossyReflectDir(const float3 vNormal, const float3 vViewDir, const float fSmoothness,
+                           const float4 vRnd, out float fWeight)
+{
+	const float fAlpha = RT_SmoothnessToAlpha(fSmoothness);
+
+	float3 vT, vB;
+	RT_BuildBasis(vNormal, vT, vB);
+
+	const float3 Ve = float3(dot(vViewDir, vT), dot(vViewDir, vB), dot(vViewDir, vNormal));
+
+	float3 Nh = RT_SampleGGXVNDF(Ve, fAlpha, vRnd.x, vRnd.y);
+	float3 H = Nh.x * vT + Nh.y * vB + Nh.z * vNormal;
+	float3 L = reflect(-vViewDir, H);
+
+	if (dot(L, vNormal) <= 0.f)
+	{
+		Nh = RT_SampleGGXVNDF(Ve, fAlpha, vRnd.z, vRnd.w);
+		H = Nh.x * vT + Nh.y * vB + Nh.z * vNormal;
+		L = reflect(-vViewDir, H);
+	}
+
+	const float fNdotL = dot(L, vNormal);
+	if (fNdotL <= 0.f)
+	{
+		fWeight = 1.f;
+		return reflect(-vViewDir, vNormal);
+	}
+
+	// floored at 1/1024 so the direction stays recoverable from the LENGTH of the RGBA16F
+	// RayDir lane that carries this weight; the bias is under 0.1 % and only at grazing angles.
+	fWeight = max(RT_GGXWeightG2overG1(abs(Ve.z), fNdotL, fAlpha), 0.0009765625f);
+	return normalize(L);
 }
 
 ///////////////////////////////////////////////////////////////////////////////////
@@ -98,16 +289,27 @@ struct SBestHit
 struct SRTInfo
 {
 	float3   vFocus;              // ideal direction (normal for diffuse, reflect for specular)
-	float4   normal_reflectance;  // .xyz world normal (length carries emittance), .w PackRGB(reflectance)
-	float4   albedo_smoothness;
+
+	// rt stage 2D: .xyz is the world normal and its LENGTH carries (1 + emittance), as before.
+	// .w is the ALD.w g-data lane: +-(PackRGB(emissive hue) + 1), the sign carrying the
+	// veg-leaves lighting model. The +1 exists so the lane is never exactly zero and the sign
+	// therefore always survives - which is exactly what the old packing got wrong, because it
+	// hung the sign on a reflectance code that quantised to 0 for every dielectric.
+	float4   normal_emissive;
+	float4   albedo_smoothness;   // .xyz albedo * tint, .w smoothness in [0,1]
 	float4   hitpos;              // .xyz world, .w = 1 when this pixel carries G-data
 	float4   raydir;              // .xyz direction, .w hit distance
 	float    stippleAlphaRef;
 
-	// rt stage 2: PackRGB of the emissive HUE, max-channel normalised to [0,1]^3. The emissive
-	// MAGNITUDE rides in the length of normal_reflectance.xyz; the two are multiplied back
-	// together in ShadePS. 511 (= white) whenever the material has no emissive map.
-	float    emissiveTintPacked;
+	// rt stage 2D: the hit's LINEAR reflectance (F0), per channel, exactly
+	// matInfo1.y * specularMap.rgb. Packed into HITPOS.w by RT_PackHitMaterial; kept here
+	// unpacked as well so debug view 12 shows the value the material actually has.
+	float3   reflectance;
+
+	// rt stage 5B: the HITMAT g-data lane. .x = RT_PackHitMatCode(shading code, one per type
+	// 8 bit scalar, extras present), .yzw = the per type float3. See the block above
+	// RT_TagToCode for the layout and for why this needed a sixth render target.
+	float4   matData;
 
 #if %_RT_PARTICLE_SHADOW
 	// rt stage 2C, debug only: the raw tangent-space _ddna sample of the hit, before the
@@ -260,6 +462,184 @@ float PackRGB(const float3 col)
 }
 
 ///////////////////////////////////////////////////////////////////////////////////
+// rt stage 2D - the hit's reflectance and smoothness lane (HITPOS.w)
+//
+// WHY THIS EXISTS. Until 2D the hit's F0 travelled through PackRGB, which is 3 bits per
+// channel (RT_RGB_RANGE 8, eight levels). CE's dielectric F0 is MatSpecColor averaged, which
+// is 0.0369 for a plain material and a hard-coded 0.02 for terrain, and
+//     round(0.0369 * 7) = 0
+// so EVERY dielectric hit arrived at ShadePS with F0 exactly 0. shadeLib.cfi SpecularBRDF
+// then computes f90 = saturate(dot(f0, 1/3) / 0.02) = 0 and returns fresnel * spec = 0: no
+// sun highlight, no local-light highlight, nothing, at every non-metal hit in every
+// reflection. The first surviving step of the old encoding was 1/7 = 0.143, i.e. only a
+// material with F0 >= 0.0714 kept any specular at all.
+//
+// THE BUDGET. The g-data has exactly two spare lanes and both are needed:
+//   ALD.w      RGBA16F  - integers are exact to 2048, so 11 bits, and the sign is free.
+//   HITPOS.w   RGBA32F  - a 24 bit mantissa, so integers are exact to 2^24 - 1.
+// RAYDIR.w is the hit distance and the "is this an RT pixel" sentinel, RGB.w is the
+// reflecting pixel's linear depth that DemosaicPS bilaterally weights on, ALD.xyz is the
+// normal times (1 + emittance) and RGB.xyz is the albedo. Nothing else is free.
+//
+// THE LAYOUT. The emissive hue moves out to ALD.w (it fits in 9 bits and fp16 holds it
+// exactly), which frees the whole 24 bit HITPOS.w mantissa for the three values that the
+// specular lobe actually reads:
+//
+//   HITPOS.w = ((hueCode * 256) + greyIdx) * 256 + smoothIdx        (max 14 155 775 < 2^24)
+//
+//     smoothIdx  8 bits, linear        smoothness = smoothIdx / 255
+//     greyIdx    8 bits, SQUARE law    F0max      = (greyIdx / 255)^2
+//     hueCode    PackRGB base 6 (216)  F0         = F0max * hue,  hue.max == 1 by construction
+//
+// The square law is the point of the fix: a linear 8 bit grey has a 0.0039 step, which is 11 %
+// of a 0.0369 dielectric; the square law puts 49 of its 256 steps below 0.04, so a dielectric
+// resolves to about 4 % RELATIVE - two orders of magnitude better than the old encoding, which
+// resolved it to zero. The hue is max-channel normalised before quantisation so the maximum
+// channel always lands on exactly 1.0 and the magnitude is carried entirely by greyIdx; a
+// coloured metal (gold, copper) keeps its tint to ~2.6 bits per channel, which is what is left
+// after the dielectric case has been given the precision it needs. Both are exact integers, so
+// the round trip is deterministic and testable.
+///////////////////////////////////////////////////////////////////////////////////
+
+// CryFX pitfall (2026-09-14): never put a // comment on a #define line. SaveBinShader copies the
+// macro body up to but not including its newline, and SkipComments then searches that buffer for
+// a newline, finds none, and the caller dereferences the null result at startup. And every line
+// of a comment block needs its own // - a line without one is live file-scope text, and the very
+// first token of it that is not an FX command makes CParserBin::ParseObject return eTS_invalid,
+// which ends the ParseBinFX loop and silently drops every technique below it.
+// RT_HUE_RANGE: levels per channel in the reflectance hue code (6^3 = 216).
+// RT_SMOOTH_STEPS: smoothIdx in [0, 255]. RT_GREY_STEPS: greyIdx in [0, 255].
+#define RT_HUE_RANGE     6
+#define RT_SMOOTH_STEPS  255
+#define RT_GREY_STEPS    255
+
+float RT_PackHitMaterial(const float3 vReflectance, const float fSmoothness)
+{
+	const float3 vRefl = max(vReflectance, 0.f);
+	const float  fMax  = min(max(vRefl.x, max(vRefl.y, vRefl.z)), 1.f);
+
+	// hue, max-channel normalised; a black F0 gets the white hue so that greyIdx alone decides
+	const float3 vHue = (fMax > 1e-5f) ? saturate(vRefl / fMax) : (float3)1.f;
+	const uint3  hueI = (uint3)clamp((int3)(vHue * (RT_HUE_RANGE - 1) + 0.5f), 0, RT_HUE_RANGE - 1);
+	const uint   hueCode = hueI.x + hueI.y * RT_HUE_RANGE + hueI.z * RT_HUE_RANGE * RT_HUE_RANGE;
+
+	const uint greyIdx   = (uint)clamp((int)(sqrt(fMax) * RT_GREY_STEPS + 0.5f), 0, RT_GREY_STEPS);
+	const uint smoothIdx = (uint)clamp((int)(saturate(fSmoothness) * RT_SMOOTH_STEPS + 0.5f), 0, RT_SMOOTH_STEPS);
+
+	return (float)(((hueCode * 256u) + greyIdx) * 256u + smoothIdx);
+}
+
+void RT_UnpackHitMaterial(const float fPacked, out float3 vReflectance, out float fSmoothness)
+{
+	uint code = (uint)(abs(fPacked) + 0.5f);
+
+	const uint smoothIdx = code & 255u; code /= 256u;
+	const uint greyIdx   = code & 255u; code /= 256u;
+	uint       hueCode   = code;
+
+	fSmoothness = (float)smoothIdx * (1.f / RT_SMOOTH_STEPS);
+
+	const float fGrey = (float)greyIdx * (1.f / RT_GREY_STEPS);
+
+	float3 vHue;
+	vHue.x = hueCode % RT_HUE_RANGE; hueCode /= RT_HUE_RANGE;
+	vHue.y = hueCode % RT_HUE_RANGE; hueCode /= RT_HUE_RANGE;
+	vHue.z = hueCode % RT_HUE_RANGE;
+
+	vReflectance = (fGrey * fGrey) * (vHue * (1.f / (RT_HUE_RANGE - 1)));
+}
+
+// ALD.w: the emissive hue code, offset by one so the lane is never zero, signed by the
+// lighting model. Decoded with RT_UnpackEmissiveHue in ShadePS.
+float RT_PackEmissiveHue(const float3 vHue, const bool bVegLeaves)
+{
+	return (bVegLeaves ? -1.f : 1.f) * (PackRGB(vHue) + 1.f);
+}
+
+float3 RT_UnpackEmissiveHue(const float fPacked)
+{
+	return UnpackRGB(max(abs(fPacked) - 1.f, 0.f));
+}
+
+///////////////////////////////////////////////////////////////////////////////////
+// rt stage 5B - the HITMAT lane (decision 10, contract in report 05A).
+//
+// THE LANE. A SIXTH MRT, half4 HITMAT, written by ConeTracePS next to HITPOS / RAYDIR / HITGI
+// and read by ShadePS at t39:
+//
+//   .x    RT_PackHitMatCode: (matCode * 256 + param8 + 1), NEGATED when the material has an
+//         extras record. Max 6*256+255+1 = 1792, and fp16 holds every integer up to 2048
+//         exactly, so the round trip is exact. The +1 keeps the lane non-zero for code 0 with
+//         param 0, which is what makes the sign (= "extras present", debug view 17) survive and
+//         what lets a pixel that was never written read back as "no material data".
+//   .yzw  ONE per type float3, the value the branch actually needs:
+//           veg leaves   saturate(BackDiffuseMultiplier * translucencyMap) * TransmittanceColor
+//           human skin   exp((1 - saturate(mask * TranslucencyMultiplier)) * (-8, -40, -64))
+//           glass        TintColor.rgb
+//           water        the fog colour already attenuated by density x depth
+//         Illum / terrain leave it at 0.
+//
+// WHY A SIXTH TARGET AND NOT A SPARE LANE. There is no spare lane left. HITPOS.w is a full 24
+// bit integer (stage 2D), RAYDIR.xyz now carries the VNDF weight in its LENGTH (stage 4B),
+// RAYDIR.w is the hit distance and the "is this an RT pixel" sentinel, RGB.w is the reflecting
+// pixel's depth that DemosaicPS weights on, ALD.w is the emissive hue and ALD.xyz the normal
+// times (1 + emittance). HITGI.w is the voxel AO, and it MULTIPLIES the whole indirect diffuse:
+// stealing its upper bits would cost the term that darkens every reflected corner about 3 bits
+// to save one render target. A transmittance colour is a float3 in any case, and no existing
+// lane has a float3 free.
+///////////////////////////////////////////////////////////////////////////////////
+
+// The CPU writes the tag as a float valued small int; these are the exact values it writes, so
+// the comparisons are exact (the traversal already compares matInfo3.z == 0.25 the same way).
+uint RT_TagToCode(const float fTag)
+{
+	if (fTag == VOX_RT_SHADING_VEG_LEAVES)    return VOX_RT_MATCODE_VEG_LEAVES;
+	if (fTag == VOX_RT_SHADING_HUMAN_SKIN)    return VOX_RT_MATCODE_HUMAN_SKIN;
+	if (fTag == VOX_RT_SHADING_GLASS)         return VOX_RT_MATCODE_GLASS;
+	if (fTag == VOX_RT_SHADING_WATER)         return VOX_RT_MATCODE_WATER;
+	if (fTag == VOX_RT_SHADING_TERRAIN)       return VOX_RT_MATCODE_TERRAIN;
+	if (fTag == VOX_RT_SHADING_EMISSIVE_ONLY) return VOX_RT_MATCODE_EMISSIVE;
+	return VOX_RT_MATCODE_ILLUM;
+}
+
+float RT_PackHitMatCode(const uint nCode, const float fParam, const bool bExtras)
+{
+	const uint nParam = (uint)clamp((int)(saturate(fParam) * 255.f + 0.5f), 0, 255);
+	const float fVal = (float)(nCode * 256u + nParam + 1u);
+	return bExtras ? -fVal : fVal;
+}
+
+void RT_UnpackHitMatCode(const float fPacked, out uint nCode, out float fParam, out bool bExtras)
+{
+	const uint nRaw = (uint)(abs(fPacked) + 0.5f);
+
+	nCode = VOX_RT_MATCODE_ILLUM;
+	fParam = 0.f;
+	bExtras = false;
+
+	if (nRaw > 0u)
+	{
+		const uint nVal = nRaw - 1u;
+		nCode = min(nVal / 256u, (uint)VOX_RT_MATCODE_EMISSIVE);
+		fParam = (float)(nVal & 255u) * (1.f / 255.f);
+		bExtras = (fPacked < 0.f);
+	}
+}
+
+// Atlas texture coordinate of one extras layer. The traversal only kept the ALBEDO layer's
+// atlas coordinate, and every extras layer has its own tiling which CE applies to the RAW uv
+// BEFORE the wrap - so the raw uv has to be rebuilt at the hit and each layer wrapped itself.
+// vOffset and vScale are the material record's own (matInfo3.xy, ExtractTC16(matInfo0.w)),
+// exactly as the traversal uses them, so an extras layer lands on the same texel grid the
+// albedo does. Report 05A gap 3: a layer whose source texture had a different size samples with
+// the albedo's atlas scale and slides; the CPU counts that as texScale.
+float2 RT_ExtrasAtlasTC(const float2 vUvRaw, const float2 vTiling, const float2 vOffset,
+                        const float2 vScale, const float fInvAtlasRes)
+{
+	return frac(vUvRaw * vTiling + vOffset) * vScale - 0.5f * fInvAtlasRes;
+}
+
+///////////////////////////////////////////////////////////////////////////////////
 // Ray length
 ///////////////////////////////////////////////////////////////////////////////////
 
@@ -284,12 +664,13 @@ void RT_ResetInfo(const float3 vFocus, const float fMaxDist, const float fCamDis
                   const float fStippleAlphaRef, const bool bOnlyOcclusion)
 {
 	g_rtInfo.vFocus = vFocus;
-	g_rtInfo.normal_reflectance = 0;
+	g_rtInfo.normal_emissive = 0;
 	g_rtInfo.albedo_smoothness = 0;
 	g_rtInfo.hitpos = 0;
 	g_rtInfo.raydir = 0;
 	g_rtInfo.stippleAlphaRef = fStippleAlphaRef;
-	g_rtInfo.emissiveTintPacked = 0;
+	g_rtInfo.reflectance = 0;
+	g_rtInfo.matData = 0;
 #if %_RT_PARTICLE_SHADOW
 	g_rtInfo.dbgAtlasNormal = float4(0.5f, 0.5f, 1.0f, 1.0f);
 #endif
@@ -512,7 +893,12 @@ void RT_TraverseTris(const float fDistanceIn, const Ray r, inout SBestHit best,
 			hitDist += fDistanceIn;
 
 			// back faces block in occlusion mode beyond the self-shadow fix distance, and
-			// always pass for two-sided vegetation leaves
+			// always pass for two-sided vegetation leaves.
+			// rt stage 5B checked this against decision 10 and left it alone: tags 0 (Illum),
+			// 2 (skin), 3 (glass), 4 (water) and 5 (terrain) are all single sided - a water
+			// surface seen from below is the underside of a plane the v1 shading has no model
+			// for, and a glass pane's second face would double its Fresnel - and 0.25 (leaves)
+			// is the one two-sided case, which is what this line already says.
 			const float selfShadowFixDist = 0.25f;
 			if ((!best.onlyOcclusion || (hitDist < selfShadowFixDist)) && !bSprite && isBackSide
 			    && matInfo3.z != VOX_RT_SHADING_VEG_LEAVES)
@@ -560,6 +946,24 @@ void RT_TraverseTris(const float fDistanceIn, const Ray r, inout SBestHit best,
 
 			const float2 Opacity_AlphaRef = ExtractTC16(matInfo3.w);
 
+			// STOCHASTIC TRANSPARENCY (decision 10 item 4 v1, and item "alpha blend" on tag 0).
+			// The acceptance probability of a triangle is its material opacity times the albedo
+			// alpha, tested against the 2x2 screen stipple: a surface at opacity 0.5 is accepted
+			// in two of the four stipple phases and SEEN THROUGH in the other two, and the
+			// temporal filter of stage 4B resolves the four phases into one image. A GLASS pane
+			// and an %ALPHABLEND Illum material go through exactly this path and need no branch
+			// of their own: the CPU writes GetStrengthValue(EFTT_OPACITY) into matInfo3.w for
+			// every material (VoxelSegment.cpp:3633, :3829) and extras+3.z carries the SAME
+			// number for the alpha blended ones - the extras copy is deliberately NOT read here,
+			// because that would be one more texel fetch per triangle TESTED, in the hottest
+			// loop in the shader, for a value already in a texel the loop has.
+			// v2 (parked): a real continuation ray - a second RT_TraverseTris from the hit plus
+			// epsilon along the same direction, with throughput x tint x (1 - Fresnel) - which
+			// gives a see-through glass in EVERY phase instead of half of them, at the cost of a
+			// second traversal and a second material decode per glass surface crossed.
+			// GAP: Glass.cfx's opacity is vertColor.a (Glass.cfx:571), and the triangle record
+			// has no vertex colour lane, so a pane whose transparency is vertex painted rather
+			// than authored on the material reads as opaque.
 			if (!((Opacity_AlphaRef.x > 0.99f || vAlb.a * Opacity_AlphaRef.x > stippleAlphaRef)
 			      && (vAlb.a >= Opacity_AlphaRef.y - 0.01f)))
 			{
@@ -643,6 +1047,38 @@ void RT_ProcessBestHit(const Ray rOrig, inout SRTInfo rtInfo, const float fDista
 
 		const half3x3 mTangentToWS = half3x3(tang, btan, norm);
 
+		///////////////////////////////////////////////////////////////////////////////////
+		// rt stage 5B - the extras record (decision 10, contract in report 05A section 2).
+		//
+		// matInfo0.z's LOW ExtractUint2 field is a RELATIVE record offset + 1 (0 = no extras),
+		// so the extras record is at matRecord + offset. The absolute record index is not in
+		// SBestHit - it is v3.x of the winning triangle, which the traversal already read once
+		// and threw away - so v3 is re-read here. It is also where the raw (untiled) uv comes
+		// from: the traversal only kept the ATLAS coordinate of the albedo layer, and detail /
+		// blend mask / blend layer each wrap their own tiling BEFORE the atlas transform.
+		///////////////////////////////////////////////////////////////////////////////////
+		const float4 v3 = LoadTexel(geomPool_Tris, uint3(nTC.x + 3, nTC.y, nTC.z));
+
+		const float fInvAtlasRes = rcp(max(SVO_RTPoolInfo.z, 1.f));
+		const float2 vAtlasScale = ExtractTC16(matInfo0.w);
+		const float2 vUvRaw = ExtractTC16(v3.y) * best.vBTC[0]
+		                    + ExtractTC16(v3.z) * best.vBTC[1]
+		                    + ExtractTC16(v3.w) * best.vBTC[2];
+
+		const int  nExtrasOfs = (int)ExtractUint2(matInfo0.z).y;
+		const bool bExtras = (nExtrasOfs > 0);
+
+		float4 vEx0 = (float4)0.f, vEx1 = (float4)0.f, vEx2 = (float4)0.f, vEx3 = (float4)0.f;
+
+		if (bExtras)
+		{
+			const int3 nExTC = RT_RecordTC((int)v3.x + nExtrasOfs);
+			vEx0 = LoadTexel(geomPool_Tris, uint3(nExTC.x + 0, nExTC.y, nExTC.z));
+			vEx1 = LoadTexel(geomPool_Tris, uint3(nExTC.x + 1, nExTC.y, nExTC.z));
+			vEx2 = LoadTexel(geomPool_Tris, uint3(nExTC.x + 2, nExTC.y, nExTC.z));
+			vEx3 = LoadTexel(geomPool_Tris, uint3(nExTC.x + 3, nExTC.y, nExTC.z));
+		}
+
 		// rt stage 2C, finding (e). Neo writes this as
 		//     saturate(CV_TerrainInfo.y / (camDist + hitDist + 0.1))
 		// i.e. "fade the hit's normal map out past ti_RT_NormalsFading metres". In CE 5.7.1
@@ -652,11 +1088,192 @@ void RT_ProcessBestHit(const Ray rOrig, inout SRTInfo rtInfo, const float fDista
 		// tangent normal: diffuse colour but no surface detail, and a mirror-flat specular lobe.
 		// Driven off our own cvar lane instead; 0 (the default) now means "no fade".
 		const float fBumpFade = RT_GetNormalsFade(best.camDistance + best.nearestHitDist);
-		rtInfo.normal_reflectance.xyz = normalize(mul(lerp(float4(0.5, 0.5, 1.0, 1.0), vNor, matInfo1.x * fBumpFade).xyz * 2.f - 1.f, mTangentToWS));
 
-		rtInfo.normal_reflectance.w = PackRGB(matInfo1.y * vSpc.xyz);
-		if (matInfo3.z == VOX_RT_SHADING_VEG_LEAVES) // encode the transmittance lighting model
-			rtInfo.normal_reflectance.w = -rtInfo.normal_reflectance.w;
+		// The four values the rest of the g-data is built from, as the BASE record leaves them.
+		// Everything below modifies these in Illum.cfx's own order: blend layer first
+		// (Illum.cfx:507-533), detail mapping second (Illum.cfx:548-559).
+		float3 vNormalTS = lerp(float4(0.5, 0.5, 1.0, 1.0), vNor, matInfo1.x * fBumpFade).xyz * 2.f - 1.f;
+		float3 vHitAlbedo = best.vAlb.xyz * matInfo2.xyz;
+		float3 vHitReflectance = max(matInfo1.y * vSpc.xyz, 0.f);
+		float  fHitSmoothness = matInfo1.z * saturate(vNor.w);
+
+		///////////////////////////////////////////////////////////////////////////////////
+		// %BLENDLAYER (Illum.cfx:507-533, Vegetation.cfx:465, shadeLib.cfi:1039-1049).
+		//
+		// extras+1: .x = ABSOLUTE record index of the blend layer's own full base record,
+		// .y = the EFTT_OPACITY slice + 1 used as the mask, .z = BlendFactor, .w = BlendFalloff;
+		// the two tilings are packed in extras+3.w. The blend record is decoded with the same
+		// lanes as any base record, which is the whole point of making it a full record.
+		//
+		// GetLayerBlendingValue's vtxAlpha is substituted with 1: the triangle record has no
+		// vertex colour lane (report 05A section 3), so a vertex painted blend shows at its
+		// authored strength everywhere instead of only where it was painted.
+		///////////////////////////////////////////////////////////////////////////////////
+		if (bExtras && vEx1.x > 0.f)
+		{
+			const int nSlotMask = (int)vEx1.y - 1;
+			const float2 vBlendTiling = ExtractTC16(vEx3.w);
+
+			float fBlendFac = 0.f;
+
+			if (nSlotMask >= 0)
+			{
+				const float2 vMaskTC = RT_ExtrasAtlasTC(vUvRaw, (float2)vBlendTiling.x, matInfo3.xy, vAtlasScale, fInvAtlasRes);
+				const float fMask = RT_SampleAtlas(vMaskTC, nSlotMask).r;
+				fBlendFac = saturate(pow(max(fMask * (1.f + vEx1.z), 0.f), max(vEx1.w, 1e-3f)));
+			}
+
+			if (fBlendFac > 0.f)
+			{
+				const int3 nBlTC = RT_RecordTC((int)vEx1.x);
+				const float4 vBl0 = LoadTexel(geomPool_Tris, uint3(nBlTC.x + 0, nBlTC.y, nBlTC.z));
+				const float4 vBl1 = LoadTexel(geomPool_Tris, uint3(nBlTC.x + 1, nBlTC.y, nBlTC.z));
+				const float4 vBl2 = LoadTexel(geomPool_Tris, uint3(nBlTC.x + 2, nBlTC.y, nBlTC.z));
+
+				const int nSlotAlb2 = (int)vBl0.x - 1;
+				const int nSlotNor2 = (int)ExtractUint2(vBl0.y).x - 1;
+
+				const float2 vTC2 = RT_ExtrasAtlasTC(vUvRaw, (float2)vBlendTiling.y, matInfo3.xy, ExtractTC16(vBl0.w), fInvAtlasRes);
+
+				const float4 vAlb2 = (nSlotAlb2 >= 0) ? RT_SampleAtlas(vTC2, nSlotAlb2) : (float4)1.f;
+				const float4 vNor2 = (nSlotNor2 >= 0) ? RT_SampleAtlas(vTC2, nSlotNor2) : float4(0.5, 0.5, 1.0, 1.0);
+
+				// diffuseMap2 is used UNTINTED by CE, so vBl2.xyz is (1,1,1) and the multiply is
+				// the producer's contract, not a tint. The blend layer's smoothness rides in its
+				// normal slice's alpha exactly as the base layer's does (smoothness2Tex is
+				// written into that alpha by the producer), and BlendLayer2Specular is a SCALAR.
+				vHitAlbedo      = lerp(vHitAlbedo,      vAlb2.xyz * vBl2.xyz,      fBlendFac);
+				fHitSmoothness  = lerp(fHitSmoothness,  vBl1.z * saturate(vNor2.w), fBlendFac);
+				vHitReflectance = lerp(vHitReflectance, (float3)vBl1.y,             fBlendFac);
+				vNormalTS       = lerp(vNormalTS,
+				                       lerp(float4(0.5, 0.5, 1.0, 1.0), vNor2, vBl1.x * fBumpFade).xyz * 2.f - 1.f,
+				                       fBlendFac);
+			}
+		}
+
+		///////////////////////////////////////////////////////////////////////////////////
+		// %DETAIL_MAPPING (Illum.cfx:548-559, identical in Vegetation.cfx:482 and
+		// Terrain.cfx:456; HumanSkin.cfx:233-244 uses only the normal half).
+		//
+		// ONE texture, not two: Common.cfi:149 GetDetailTex samples .garb * 2 - 1, so
+		// (x, y) = the tangent space normal from (g, a), z = the albedo delta from r, and
+		// w = the gloss delta from b. The scales are Illum's detailScales.xxyz, i.e. the bump
+		// scale on both normal channels. extras+0: .x = detail slice + 1, .yz = the tiling from
+		// the texture modificator (what CM_DetailTilingAndAlphaRef.xy carries in the deferred
+		// pass), .w = PackTC16(DetailDiffuseScale, DetailBumpScale).
+		//
+		// The detail slice lives in the SAME atlas as the albedo, so it gets the same sRGB
+		// treatment - the producer stores it raw and applies no _ddna reconstruction, which is
+		// why the .garb * 2 - 1 is done HERE and not on the CPU.
+		//
+		// The bump half is multiplied by the same distance fade the base normal map gets, so a
+		// far away detail-mapped wall flattens as one surface instead of losing only half of
+		// its relief.
+		///////////////////////////////////////////////////////////////////////////////////
+		if (bExtras)
+		{
+			const int nSlotDetail = (int)ExtractUint2(vEx0.x).x - 1;
+
+			if (nSlotDetail >= 0)
+			{
+				const float2 vDetailTC = RT_ExtrasAtlasTC(vUvRaw, float2(vEx0.y, vEx0.z), matInfo3.xy, vAtlasScale, fInvAtlasRes);
+				const float2 vDetailScales = ExtractTC16(vEx0.w); // (DetailDiffuseScale, DetailBumpScale)
+				const float4 vDetail = RT_SampleAtlas(vDetailTC, nSlotDetail).garb * 2.f - 1.f;
+
+				vNormalTS.xy   += vDetail.xy * (vDetailScales.y * fBumpFade);
+				fHitSmoothness += fHitSmoothness * (vDetail.w * VOX_RT_DETAIL_GLOSS_SCALE);
+				vHitAlbedo     += vHitAlbedo * (vDetail.z * vDetailScales.x);
+			}
+		}
+
+		///////////////////////////////////////////////////////////////////////////////////
+		// Per type parameters (decision 10, report 05A section 2.1). One float3 plus one 8 bit
+		// scalar reach ShadePS in the HITMAT lane; everything that can be resolved at the hit
+		// is resolved here, so the branch in ShadePS stays a composite and not a decoder.
+		///////////////////////////////////////////////////////////////////////////////////
+		const uint nMatCode = RT_TagToCode(matInfo3.z);
+
+		float  fMatParam = 0.f;
+		float3 vMatRgb = (float3)0.f;
+
+		if (bExtras)
+		{
+			// extras+1.y is ONE CE texture with two meanings, exactly as in the shaders: the
+			// blend mask on Illum (BlendTex = TM_Opacity, Illum.cfx:58) and the translucency
+			// map on vegetation and skin (Vegetation.cfx:75, HumanSkin.cfx). Sampled with no
+			// tiling of its own, which is what those two shaders do (plain baseTC).
+			const int nSlotOpacity = (int)vEx1.y - 1;
+			const float fOpacityTex = (nSlotOpacity >= 0)
+			                          ? RT_SampleAtlas(RT_ExtrasAtlasTC(vUvRaw, (float2)1.f, matInfo3.xy, vAtlasScale, fInvAtlasRes), nSlotOpacity).r
+			                          : 1.f;
+
+			if (nMatCode == VOX_RT_MATCODE_VEG_LEAVES)
+			{
+				// Vegetation.cfx:504-512, verbatim:
+				//   translucency = BackDiffuseMultiplier * GetOpacityTex(opacityTex, baseTC)
+				//   attribs.Transmittance = saturate(translucency) * TransmittanceColor.rgb
+				vMatRgb = saturate(vEx2.w * fOpacityTex) * max(vEx2.xyz, 0.f);
+			}
+			else if (nMatCode == VOX_RT_MATCODE_HUMAN_SKIN)
+			{
+				// HumanSkin.cfx:295-298, redone per texel so the translucency map shows:
+				//   fTranslucency = GetOpacityTex(...) * TranslucencyMultiplier
+				//   attribs.Transmittance = exp((1 - saturate(fTranslucency)) * (-8, -40, -64))
+				vMatRgb = exp((1.f - saturate(fOpacityTex * vEx3.y)) * float3(-8.f, -40.f, -64.f));
+
+				// SSSIndex in [1, 2) - CE's screen space SSS profile selector. Carried so a
+				// future wrap-lighting approximation can pick a profile; nothing reads it in v1
+				// because the SSS blur is a screen space pass and there is no screen at a hit.
+				fMatParam = saturate(vEx3.x - 1.f);
+			}
+			else if (nMatCode == VOX_RT_MATCODE_GLASS)
+			{
+				// Glass.cfx:566-578. localTintColor.xyz is what the glass keeps of whatever is
+				// behind it; TintCloudiness is how much of it turns into a lit diffuse instead.
+				// TintColor.a (extras+3.x) is NOT used - Glass.cfx does not use it either.
+				vMatRgb = saturate(max(vEx2.xyz, 0.f));
+				fMatParam = saturate(vEx3.y);
+			}
+			else if (nMatCode == VOX_RT_MATCODE_WATER)
+			{
+				// Water.cfx:1116-1117:
+				//   waterVolumeFog = exp2(-fogDensity * volumeDepth / dot(vView, camFront))
+				//   refractColor   = lerp(fogColor, refractColor, saturate(waterVolumeFog))
+				// v1 has no refraction ray, so what is under the water is unknown and taken as
+				// fully absorbed - which is what a deep body of water looks like anyway. The
+				// depth is the record's own hint (the authored volume depth, or
+				// e_svoTI_RT_WaterDepth for the ocean), not a per pixel one: there is no scene
+				// depth at an off screen hit.
+				const float fFogT = exp2(-max(vEx2.w, 0.f) * max(vEx3.z, 0.f));
+				vMatRgb = max(vEx2.xyz, 0.f) * saturate(1.f - fFogT);
+
+				// ReflectionScale / ssrBGMultiplier - how much of the reflected sky the surface
+				// keeps (Water.cfx:1053).
+				fMatParam = saturate(vEx3.y);
+
+				// Water.cfx:632 folds MatSpecColor into the sun specular colour. The record has
+				// no separate sun-specular lane at the hit, and F0 is what SpecularBRDF scales
+				// the sun highlight by, so the multiplier rides on the reflectance. It also
+				// moves the Fresnel, which is why the CPU writes a plain 1 by default.
+				vHitReflectance *= max(vEx3.x, 0.f);
+			}
+		}
+
+		rtInfo.matData = float4(RT_PackHitMatCode(nMatCode, fMatParam, bExtras), vMatRgb);
+
+		rtInfo.normal_emissive.xyz = normalize(mul(vNormalTS, mTangentToWS));
+
+		// rt stage 2D: the reflectance is kept LINEAR and per channel here and is packed into
+		// HITPOS.w at the end of ConeTracePS (RT_PackHitMaterial). It used to be PackRGB'd into
+		// this lane at 3 bits per channel, which rounded CE's 0.0369 dielectric F0 to exactly 0
+		// and cost every non-metal hit its entire specular response - see the block above
+		// RT_PackHitMaterial. matInfo1.y is MatSpecColor averaged and vSpc is the atlas copy of
+		// the same specular map Illum.cfx multiplies it by, so this is Illum.cfx's own
+		// attribs.Reflectance with the material colour reduced to a scalar (2B gap).
+		// rt stage 5B: vHitReflectance is that value AFTER the blend layer's BlendLayer2Specular
+		// and after water's sun specular multiplier; with no extras record it is exactly the
+		// stage 2D expression and nothing moves.
+		rtInfo.reflectance = max(vHitReflectance, 0.f);
 
 		// Emissive, matching Illum.cfx IlluminationPS:
 		//     emittance = MatEmissiveColor.rgb * MatEmissiveColor.w * MAT_EMISSIVE_UNIT_SCALE
@@ -667,7 +1284,8 @@ void RT_ProcessBestHit(const Ray rOrig, inout SRTInfo rtInfo, const float fDista
 		// the mask splits into a magnitude (vEmm.a) and a hue (vEmm.rgb), and we send them down
 		// two different channels because there is no free float3 in the g-data:
 		//   magnitude -> the length of the normal, as before
-		//   hue       -> PackRGB into the integer part of hitpos.w, next to smoothness
+		//   hue       -> PackRGB into ALD.w (rt stage 2D; it was hitpos.w's integer part until
+		//                the reflectance needed the whole of that mantissa)
 		// The hue is max-channel normalised so it fits PackRGB's [0,1] range, and the luminance
 		// that normalisation removes is divided back into the magnitude, so that
 		// magnitude * hue == matInfo1.w * MAT_EMISSIVE_UNIT_SCALE * map.rgb * map.a exactly.
@@ -676,12 +1294,33 @@ void RT_ProcessBestHit(const Ray rOrig, inout SRTInfo rtInfo, const float fDista
 			const float3 vEmmHue = vEmm.rgb / max(max(vEmm.r, max(vEmm.g, vEmm.b)), 1e-4f);
 			const float  fEmmHueLum = max(RT_EmissiveMaskLuminance(vEmmHue), 1e-4f);
 
-			rtInfo.normal_reflectance.xyz *= (1.f + matInfo1.w * MAT_EMISSIVE_UNIT_SCALE * vEmm.a / fEmmHueLum);
-			rtInfo.emissiveTintPacked = PackRGB(vEmmHue);
+			rtInfo.normal_emissive.xyz *= (1.f + matInfo1.w * MAT_EMISSIVE_UNIT_SCALE * vEmm.a / fEmmHueLum);
+
+			// rt stage 2D: the emissive hue moved from HITPOS.w's integer part to this lane so
+			// that the whole 24 bit HITPOS.w mantissa is available to the reflectance. The
+			// veg-leaves lighting model rides on the sign, as it did on the old reflectance
+			// code, and the +1 inside RT_PackEmissiveHue keeps the lane non-zero so that sign
+			// cannot be lost.
+			rtInfo.normal_emissive.w = RT_PackEmissiveHue(vEmmHue, matInfo3.z == VOX_RT_SHADING_VEG_LEAVES);
 		}
 
-		rtInfo.albedo_smoothness.xyz = best.vAlb.xyz * matInfo2.xyz;
-		rtInfo.albedo_smoothness.w = matInfo1.z * saturate(vNor.w); // _ddna alpha carries smoothness
+		rtInfo.albedo_smoothness.xyz = max(vHitAlbedo, 0.f);
+		// SMOOTHNESS, and what it is really made of (rt stage 2D, verified end to end):
+		//   matInfo1.z = GetStrengthValue(EFTT_SMOOTHNESS) = REG_PM_SPECULAR_COL.w = MatSpecColor.w,
+		//                i.e. exactly the scalar half of Illum.cfx's
+		//                "attribs.Smoothness = MatSpecColor.w * GetSmoothnessTex(smoothnessTex)".
+		//   vNor.w     = the atlas normal layer's alpha. CE ships _ddna as BC5U, and
+		//                CRenderer::DXTDecompress sets sourceChannels = 2 for BC5U, after which
+		//                DXTDecompressRow writes a literal 255 into the alpha byte
+		//                (Renderer.cpp:3156, 3288-3310). So for every _ddna this is a CONSTANT 1.
+		// The hit therefore gets the material's smoothness SCALAR and no smoothness MAP: gloss is
+		// uniform across each material in a reflection while the same surface seen directly is
+		// modulated by smoothnessTex. That is a CPU-side gap (the record has no smoothness-map
+		// slot); it is not a shader bug and is not papered over here. Debug view 11 shows it.
+		// rt stage 5B: the detail map's gloss delta and the blend layer's own smoothness are in
+		// fHitSmoothness by now; the saturate is new and is there because Illum's detail term is
+		// additive (smoothness += smoothness * delta) and can leave the [0, 1] range.
+		rtInfo.albedo_smoothness.w = saturate(fHitSmoothness);
 
 		rtInfo.hitpos.xyz = rOrig.startpoint + rOrig.direction * (best.nearestHitDist - fDistanceIn);
 		rtInfo.hitpos.w = 1;
@@ -692,11 +1331,20 @@ void RT_ProcessBestHit(const Ray rOrig, inout SRTInfo rtInfo, const float fDista
 	else
 	{
 		// miss - G-data for the probe fallback
-		rtInfo.normal_reflectance.xyz = rtInfo.vFocus;
-		rtInfo.normal_reflectance.w = IsDiffuseMode() ? PackRGB(float3(0, 0, 0)) : PackRGB(float3(1, 1, 1));
+		rtInfo.normal_emissive.xyz = rtInfo.vFocus;
+		// a miss emits nothing: the magnitude (the normal's length) is 1, i.e. emittance 0, and
+		// the hue lane is the "black" code. It still has to be the ENCODED black, not a raw 0,
+		// or ShadePS would decode white.
+		rtInfo.normal_emissive.w = RT_PackEmissiveHue(float3(0, 0, 0), false);
 
+		// reflectance 1 / albedo 1 so the probe term passes through the energy split unmodified
+		rtInfo.reflectance = IsDiffuseMode() ? (float3)0.f : (float3)1.f;
 		rtInfo.albedo_smoothness = 1;
-		rtInfo.emissiveTintPacked = 0; // a miss emits nothing; the magnitude is 0 as well
+
+		// rt stage 5B: a miss has no material. The zero is the "never written" code that
+		// RT_UnpackHitMatCode maps back to Illum with no extras, so the sky path in ShadePS is
+		// reached through its own bMissSky test and never through a material branch.
+		rtInfo.matData = (float4)0.f;
 
 		rtInfo.hitpos.xyz = rOrig.startpoint + rOrig.direction * GetMaxRayDistance();
 		rtInfo.hitpos.w = 1;
@@ -714,14 +1362,50 @@ void RT_ProcessBestHit(const Ray rOrig, inout SRTInfo rtInfo, const float fDista
 // with CE's own trick (CommonSVO.cfi:999) - the voxel radiance at the hit divided by the
 // voxel albedo is an irradiance estimate, and the triangle albedo replaces the voxel one.
 // tcMin / voxAreaMin / voxAreaMax describe the SVO cell that produced the hit.
-float3 RT_SampleVoxelIrradiance(const float3 tcMin, const float4 voxAreaMin, const float4 voxAreaMax, const float3 vPos)
+// The brick-atlas texture coordinate of a world position inside the SVO cell that produced the
+// hit. Factored out of RT_SampleVoxelIrradiance unchanged so the AO probe below can walk a few
+// voxels along the hit normal without duplicating the addressing. The clamp is the same one: a
+// sample that leaves the cell reads the cell's border voxel, never a neighbour's brick.
+float3 RT_VoxelBrickTC(const float3 tcMin, const float4 voxAreaMin, const float4 voxAreaMax, const float3 vPos)
 {
 	const float ocNodeSize = voxAreaMin.w;
 	const float3 vBoxSize = voxAreaMax.xyz - voxAreaMin.xyz;
 	const float3 vHalfTexSizeWS = 0.5f / VOX_BRICK_TEXRES * ocNodeSize;
 	const float3 vMulTC = rcp(ocNodeSize) * vBoxSize / VOX_ATLAS_SIZE.xyz * VOX_SUBBLOCK_SIZE_RATIO;
 
-	const float3 vCurTC = tcMin + ((clamp(vPos, voxAreaMin.xyz + vHalfTexSizeWS, voxAreaMax.xyz - vHalfTexSizeWS) - voxAreaMin.xyz) / vBoxSize) * vMulTC;
+	return tcMin + ((clamp(vPos, voxAreaMin.xyz + vHalfTexSizeWS, voxAreaMax.xyz - vHalfTexSizeWS) - voxAreaMin.xyz) / vBoxSize) * vMulTC;
+}
+
+// rt stage 4A (energy audit error 2 / E3). A voxel-derived ambient occlusion at the hit, for the
+// HITGI.w lane. There is no screen-space AO at an off-screen point and that is by design, so the
+// stand-in is the SVO's own directional opacity sampled a few voxels ALONG THE HIT NORMAL: solid
+// neighbours in front of the surface are what an AO term is measuring. Three taps at 1.5, 3 and
+// 4.5 voxels with 1/i falloff, the same shape CE's own cone trace uses over its first steps.
+//
+// Honest about the limits: it is a single ray, not a cone, it only sees the hit's OWN SVO cell
+// (RT_VoxelBrickTC clamps at the cell border), and brickPool_Opac.zyx is a per-axis opacity, so
+// the dot with abs(normal) is the same projection ConeTraceBrick uses at CommonSVO.cfi:836.
+// 1 = unoccluded.
+float RT_SampleVoxelAO(const float3 tcMin, const float4 voxAreaMin, const float4 voxAreaMax, const float3 vPos, const float3 vNorm)
+{
+	const float fVoxSize = voxAreaMin.w / VOX_BRICK_TEXRES;
+	const float3 vNormAbs = abs(vNorm);
+
+	float fOccl = 0.f;
+
+	for (int i = 1; i <= 3; i++)
+	{
+		const float3 vSample = vPos + vNorm * (fVoxSize * 1.5f * (float)i);
+		const float4 vOPAC = tex3DlodLC(brickPool_Opac, float4(RT_VoxelBrickTC(tcMin, voxAreaMin, voxAreaMax, vSample), 0));
+		fOccl += saturate(dot(vOPAC.zyx, vNormAbs)) / (float)i;
+	}
+
+	return saturate(1.f - fOccl / (1.f + 0.5f + 1.f / 3.f));
+}
+
+float3 RT_SampleVoxelIrradiance(const float3 tcMin, const float4 voxAreaMin, const float4 voxAreaMax, const float3 vPos)
+{
+	const float3 vCurTC = RT_VoxelBrickTC(tcMin, voxAreaMin, voxAreaMax, vPos);
 
 	const float4 vNORA = tex3DlodLC(brickPool_Norm, vCurTC).zyxw;
 
@@ -740,7 +1424,11 @@ float3 RT_SampleVoxelIrradiance(const float3 tcMin, const float4 voxAreaMin, con
 // 1 hit test count, 2 hit normals, 3 hit albedo, 4 hit distance, 5 incomplete mask,
 // 6 stage-1 provisional colour (ConeTracePS), 7 sun shadow at the hit / 8 direct light before
 // probes / 9 raw ShadePass output (all three in ShadePS), 10 raw atlas normal, 11 hit
-// smoothness, 12 hit reflectance.
+// smoothness, 12 hit reflectance, 13 validator C - reflected minus direct in stops, for hits
+// that are also on screen (ShadePS; black = agreement, red = too bright, green = too dark,
+// blue = not testable), 14 the raw 1 spp trace with both filters off / 15 the temporal history
+// weight (both DemosaicPS / UpScalePS, rt stage 4B), 16 the shading tag as a colour / 17 extras
+// record present (both ShadePS, rt stage 5B).
 bool RT_GetDebugColor(out float3 vCol)
 {
 	vCol = 0;
@@ -757,7 +1445,7 @@ bool RT_GetDebugColor(out float3 vCol)
 	}
 	else if (nMode == 2)
 	{
-		vCol = bHit ? (normalize(g_rtInfo.normal_reflectance.xyz) * 0.5f + 0.5f) : (float3)0;
+		vCol = bHit ? (normalize(g_rtInfo.normal_emissive.xyz) * 0.5f + 0.5f) : (float3)0;
 	}
 	else if (nMode == 3)
 	{
@@ -789,8 +1477,14 @@ bool RT_GetDebugColor(out float3 vCol)
 	}
 	else if (nMode == 12)
 	{
-		// hit reflectance (F0) as it survives PackRGB, x8 so a dielectric 0.04 is visible
-		vCol = bHit ? saturate(UnpackRGB(abs(g_rtInfo.normal_reflectance.w)) * 8.f) : (float3)0;
+		// rt stage 2D: the hit reflectance (F0) as it survives the HITPOS.w round trip - packed
+		// and unpacked here on purpose, so that what the view shows is what ShadePS will read and
+		// not what RT_ProcessBestHit wished it had sent. x8, so CE's 0.0369 dielectric reads as a
+		// mid grey (0.30) instead of near black; a metal reads as its tint at or near clipping.
+		// BLACK now means the material record really has no reflectance, not "the encoding ate it".
+		float3 vDbgRefl; float fDbgSmooth;
+		RT_UnpackHitMaterial(RT_PackHitMaterial(g_rtInfo.reflectance, g_rtInfo.albedo_smoothness.w), vDbgRefl, fDbgSmooth);
+		vCol = bHit ? saturate(vDbgRefl * 8.f) : (float3)0;
 	}
 	else
 	{

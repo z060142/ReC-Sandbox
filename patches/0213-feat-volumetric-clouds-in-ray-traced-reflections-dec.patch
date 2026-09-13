@@ -1,0 +1,852 @@
+From 56dd8dca14aa8d416ea5bc85a4926c6d362c9530 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Mon, 14 Sep 2026 05:14:38 +0800
+Subject: [PATCH 213/213] feat: volumetric clouds in ray traced reflections
+ (decision 09 section 9.2)
+
+A reflection ray that misses above the horizon now marches the volumetric cloud
+layer before it reads the sky dome, so a mirror facing the sky shows the clouds
+the camera sees, in the right place, drifting with the same wind.
+
+WHY A SECOND MARCH. CVolumetricCloudsStage::Execute runs at
+StandardGraphicsPipeline.cpp:544, after the SVO block at :460, and it renders
+into a screen space target: the only cloud image that exists is the sky the
+CAMERA saw in that pixel, which is not what a reflected ray is looking at. So
+the density field is evaluated again along the reflected direction, out of the
+functions Clouds.cfx itself uses (CloudsCommon.cfi, factored out in 0cf232d6).
+
+WHAT IS FRESH AT :460. ExecuteShadowGen() is called at :457-458, three lines
+before SVOGI, so the tiled cloud shadow volume (x = optical thickness along the
+sun, y = to the top of the layer, z = to the bottom) is THIS frame's. That is
+exactly the sun transmittance source decision 09 section 9.2 asked for, and it
+costs one tap per march step. Outside its tiling region the shader falls back to
+a 3 step light march along the sun direction plus the analytic to-top /
+to-bottom thickness - the !inShadowTex branch of GetOpticalThicknessCombined.
+
+THE MARCH (Total_Illumination_Shading.cfi, SVO_RT_MarchClouds). N =
+e_svoTI_RT_CloudSteps steps (default 12, clamped 1..64) between the ray's entry
+into the spherical layer and its exit, distributed by vcGetLinearDepth exactly
+as the direct view distributes its own, no jitter (the RT path has its own
+temporal accumulation and a second dither would fight it). Per step one
+GetCloudDensity and one shadow tap, then the arithmetic of Clouds.cfx's
+AccumulateRadiance verbatim: Beer for the sun, the multi scatter preservation
+lerp for the sky and ground terms, the powder effect on the sum, the precise
+in-scattering integral. Early out below 0.01 transmittance; a zero density step
+costs only its density taps.
+
+COMPOSITE AND EXPOSURE. acc = sky * cloudTransmittance + cloudInscatter, on the
+exposed side of ShadePS, before its single divide - the same convention the sky
+lookup uses. Verified rather than assumed: GenerateCloudShaderParam multiplies
+shadeColorFromSun (VolumetricClouds.cpp:1486) and skylightRayleighInScatter
+(:1518) by GetSceneReferredExposure() and deliberately leaves the scattering and
+extinction COEFFICIENTS alone because they live inside exp();
+SetupShadeCloudConstants repeats exactly those two multiplies and scales nothing
+else.
+
+ANIMATION. The wind offset is PF.pVolCloudTilingOffset with the layer altitude
+folded into z, the same lane the direct view uses, so a cloud drifts identically
+in the mirror and in the sky.
+
+BINDINGS. t51 noise, t52 edge noise, t53 cloud shadow volume, t54 Mie phase LUT;
+s4 trilinear wrap, s5 trilinear border. All free on the ShadePass technique
+(the forward stack tops out at t49, stage 5E took t41 and t50) and confirmed in
+the compiled disassembly. Seventeen new SVO_Cloud* float4 constants, rebuilt
+from the same E3DPARAM_VOLCLOUD_* globals and render view constants the stage
+reads, because the stage's own values live in an inline b3 buffer filled after
+us at a slot ShadePass already uses.
+
+NOT CARRIED, deliberately: the atmospheric Rayleigh haze between the viewer and
+the deck (the sky lookup already carries the dome's aerial perspective; adding
+the cloud pass's copy would count it twice), the cirrus layer, the stereo
+reprojection, and the sky-ray edge fade of decisions/s9-cloud-edge.md (it hides
+a seam caused by camera-space march limits a reflection ray does not have).
+
+Also here, one line each in SceneTreeCVars.inl: the two new cvars, and the
+e_svoTI_RT_Debug help entries for views 16-21, which had been left out while
+that file was busy (report 05e gap 1).
+
+  e_svoTI_RT_Clouds      1   march the layer on a miss above the horizon
+  e_svoTI_RT_CloudSteps  12  steps through the layer
+  e_svoTI_RT_Debug 20        cloud in-scatter, exposed radiance
+  e_svoTI_RT_Debug 21        cloud transmittance - the cloud's shape
+
+Native path: every shader hunk is inside %_RT_QUALITY, every C++ hunk is behind
+e_svoTI_RT_Active, and the frame order is untouched. With clouds unbound
+SVO_CloudParams0.x is 0, the march returns immediately, transmittance is 1 and
+in-scatter is 0, so the miss path is the bare sky lookup it was at 3f33313a.
+The two cvar mirrors are resolved defensively (a null ICVar keeps the header
+default), as the glossy knobs are.
+
+Validation: cryfx_lint.py 0 findings on the five owned shader files;
+rtharness2/validate.sh 17 fxc compiles, 0 errors; ShadePS disassembled with
+%_RT_SAMPLE3 forced on to prove CloudBaseDensityTexture never reaches this
+technique; CryRenderD3D11 and Cry3DEngine Profile, 0 errors 0 warnings outside
+Code/SDKs. No engine run, no deploy.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SCUvWGLCsqzm3VNMzp4uiS
+---
+ .../Cry3DEngine/SVO/SceneTreeCVars.inl        |   7 +-
+ .../RenderDll/XRenderD3D9/D3D_SVO.cpp         | 224 ++++++++++++++
+ .../CryEngine/RenderDll/XRenderD3D9/D3D_SVO.h |  14 +
+ .../GraphicsPipeline/VolumetricClouds.h       |  18 ++
+ .../HWScripts/CryFX/Total_Illumination.cfx    |  69 ++++-
+ .../CryFX/Total_Illumination_Shading.cfi      | 284 ++++++++++++++++++
+ 6 files changed, 614 insertions(+), 2 deletions(-)
+
+diff --git a/Code/CryEngine/Cry3DEngine/SVO/SceneTreeCVars.inl b/Code/CryEngine/Cry3DEngine/SVO/SceneTreeCVars.inl
+index fbc6f23d..41caec20 100644
+--- a/Code/CryEngine/Cry3DEngine/SVO/SceneTreeCVars.inl
++++ b/Code/CryEngine/Cry3DEngine/SVO/SceneTreeCVars.inl
+@@ -256,7 +256,7 @@ REGISTER_CVAR_AUTO(float, e_svoTI_RT_SafetyBorder, 0.25f, VF_EXPERIMENTAL, "DEPR
+ 
+ // Static BVH mesh ray tracing (decisions 02-05)
+ REGISTER_CVAR_AUTO(int, e_svoTI_RT_StaticBVH, 1, VF_EXPERIMENTAL, "Build and trace one static BVH per SVO cell\n0 = voxel cone tracing only");
+-REGISTER_CVAR_AUTO(int, e_svoTI_RT_Debug, 0, VF_EXPERIMENTAL, "Mesh ray tracing debug views\n0 = off\n1 = hit test count heat map (blue = few, red = many)\n2 = hit normals\n3 = hit albedo\n4 = hit distance\n5 = incomplete/overflow mask (magenta = the traversal stack ran out)\n6 = stage-1 provisional colour (no light data)\n7 = sun shadow at the hit (white = lit)\n8 = direct light at the hit, before probes\n9 = raw shade output, before fog and exposure\n10 = raw atlas normal at the hit, tangent space (magenta = no normal slot, flat lilac = no normal map)\n11 = hit smoothness (black = rough, white = mirror; modulated by the material gloss map, no longer flat per material)\n12 = hit reflectance F0, x8 (black = the material record really carries no reflectance)\n13 = validator C: for a hit that is also on screen, |reflected - direct| in STOPS (black = they agree, red = the reflection is that many stops too bright, green = too dark, blue = the hit is off screen or occluded so the test says nothing). Reads the PREVIOUS frame's pre-exposed HDR target, so judge it on a still camera\n14 = the raw 1 sample per pixel glossy trace, temporal and spatial filters off - 14 against 0 is exactly what the denoiser removes\n15 = the temporal history weight for ray traced pixels (white = the pixel is all history, black = all new)");
++REGISTER_CVAR_AUTO(int, e_svoTI_RT_Debug, 0, VF_EXPERIMENTAL, "Mesh ray tracing debug views\n0 = off\n1 = hit test count heat map (blue = few, red = many)\n2 = hit normals\n3 = hit albedo\n4 = hit distance\n5 = incomplete/overflow mask (magenta = the traversal stack ran out)\n6 = stage-1 provisional colour (no light data)\n7 = sun shadow at the hit (white = lit)\n8 = direct light at the hit, before probes\n9 = raw shade output, before fog and exposure\n10 = raw atlas normal at the hit, tangent space (magenta = no normal slot, flat lilac = no normal map)\n11 = hit smoothness (black = rough, white = mirror; modulated by the material gloss map, no longer flat per material)\n12 = hit reflectance F0, x8 (black = the material record really carries no reflectance)\n13 = validator C: for a hit that is also on screen, |reflected - direct| in STOPS (black = they agree, red = the reflection is that many stops too bright, green = too dark, blue = the hit is off screen or occluded so the test says nothing). Reads the PREVIOUS frame's pre-exposed HDR target, so judge it on a still camera\n14 = the raw 1 sample per pixel glossy trace, temporal and spatial filters off - 14 against 0 is exactly what the denoiser removes\n15 = the temporal history weight for ray traced pixels (white = the pixel is all history, black = all new)\n16 = the material shading TAG at the hit, as a flat colour (grey Illum, green vegetation leaves, pink skin, cyan glass, blue water, brown terrain, black no material data)\n17 = does the hit's material carry an EXTRAS record (white = detail map / blend layer / per type parameters, black = a plain record)\n18 = the volumetric fog IN-SCATTER added on the reflected segment, in exposed radiance (black = clear air, or the froxel volume did not cover the segment)\n19 = the TRANSMITTANCE of the reflected segment (white = clear, black = opaque fog); green tint = the froxel volume covered it, red tint = the analytic global fog is doing the work\n20 = the volumetric cloud IN-SCATTER a missed ray picked up in the cloud layer, in exposed radiance (black = clear sky along that ray, or the cloud march did not run)\n21 = the cloud TRANSMITTANCE along a missed ray (white = clear sky, black = thick cloud); this is the cloud's SHAPE, compare it with the same cloud in the direct view");
+ REGISTER_CVAR_AUTO(int, e_svoTI_RT_GlossyMode, 1, VF_EXPERIMENTAL, "Ray traced reflection lobe\n0 = mirror only (the exact reflect direction at every smoothness)\n1 = one GGX visible normal sample per pixel per frame, so reflections blur with roughness");
+ REGISTER_CVAR_AUTO(float, e_svoTI_RT_GlossScale, 1.f, VF_EXPERIMENTAL, "Multiplier on the ray traced GGX lobe width; 1 = the same lobe the surface is shaded with, below 1 = sharper and less noisy, above 1 = blurrier");
+ REGISTER_CVAR_AUTO(int, e_svoTI_RT_TemporalFrames, 8, VF_EXPERIMENTAL, "Frames of temporal history for ray traced reflections at the rough end of the range; a mirror always uses two\nMore frames = less noise and more ghosting");
+@@ -288,6 +288,11 @@ REGISTER_CVAR_AUTO(int, e_svoTI_RT_SkinMaxTris, 30000, VF_EXPERIMENTAL, "Per fra
+ REGISTER_CVAR_AUTO(int, e_svoTI_RT_Water, 1, VF_EXPERIMENTAL, "Emit the ocean plane and the water volume surfaces into the ray traced dynamic BVH\n0 = water stays invisible to reflection rays (behaviour before stage 5C)");
+ REGISTER_CVAR_AUTO(int, e_svoTI_RT_WaterGrid, 4, VF_EXPERIMENTAL, "Cells per axis of the camera centred ocean quad ring; 2 = 8 triangles, 4 = 32 (clamped to 1..4)");
+ REGISTER_CVAR_AUTO(float, e_svoTI_RT_WaterDepth, 5.f, VF_EXPERIMENTAL, "Water depth hint in metres, stored in the water material record so the hit shader can attenuate the fog colour with it\nUsed for the ocean; a water volume with an authored volume depth uses its own");
++// Volumetric clouds in ray traced reflections (rt decision 09 9.2, stage 5F). A ray that misses
++// above the horizon marches the SAME cloud density field Clouds.cfx uses, so the cloud in a
++// mirror is the cloud in the sky and drifts with it.
++REGISTER_CVAR_AUTO(int, e_svoTI_RT_Clouds, 1, VF_EXPERIMENTAL, "March the volumetric cloud layer along a reflection ray that misses above the horizon\n0 = the reflected sky is the bare sky dome, with no clouds in it");
++REGISTER_CVAR_AUTO(int, e_svoTI_RT_CloudSteps, 12, VF_EXPERIMENTAL, "Ray-march steps through the cloud layer for a reflection ray (clamped to 1..64)\nFewer = cheaper and banded, more = smoother cloud edges; the direct view uses r_VolumetricCloudsRaymarchStepNum, which is far higher because it has a full screen to fill and a temporal filter to hide the rest");
+ REGISTER_CVAR_AUTO(float, e_svoTI_Specular_Sev, 1, VF_NULL, "Controls severity of specular cones; this value limits the material glossiness");
+ REGISTER_CVAR_AUTO(float, e_svoVoxDistRatio, 14.f, VF_NULL, "Limits the distance where real-time GPU voxelization used");
+ REGISTER_CVAR_AUTO(int, e_svoVoxGenRes, 512, VF_NULL, "GPU voxelization dummy render target resolution");
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/D3D_SVO.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/D3D_SVO.cpp
+index 5b882f84..01b51316 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/D3D_SVO.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/D3D_SVO.cpp
+@@ -27,6 +27,9 @@
+ 	// rt stage 4A (decision 09 section 9.1): a ray that misses is shaded with the engine's own
+ 	// sky, which means binding the sky stage's two Nishita dome textures.
+ 	#include "GraphicsPipeline/Sky.h"
++	// rt stage 5F (decision 09 section 9.2): the secondary cloud march needs the clouds stage's
++	// noise volumes, its Mie phase LUT and this frame's cloud shadow volume.
++	#include "GraphicsPipeline/VolumetricClouds.h"
+ 	#include "Common/ShadowUtils.h"
+ 
+ // Must match cbuffer CBPerPassForward (b5) in Engine/Shaders/HWScripts/CryFX/ForwardShading.cfi,
+@@ -1038,6 +1041,219 @@ void CSvoRenderer::SetupShadeFogConstants(CSvoFullscreenPass& rp)
+ 	rp.SetConstantArray(paramName, (Vec4*)&vData, 1);
+ }
+ 
++// rt stage 5F (decision 09 section 9.2): VOLUMETRIC CLOUDS ON A RAY THAT MISSES ABOVE THE HORIZON.
++//
++// THE FRAME ORDER, read in StandardGraphicsPipeline.cpp:
++//
++//   :457  CVolumetricCloudsStage::ExecuteShadowGen()   <- fills m_pTexVolCloudShadow
++//   :460  SVOGI                                        <- we are here
++//   :544  CVolumetricCloudsStage::Execute()            <- renders the cloud IMAGE
++//
++// The cloud shadow volume is therefore THIS frame's, three lines fresh, which is what makes
++// decision 09 section 9.2's "sun transmittance approximated by the cloud shadow map" the cheap
++// and correct choice rather than a stale one. The cloud image is not available and is not what a
++// reflection needs anyway: it is the sky the CAMERA saw in that pixel, not the sky along the
++// reflected ray. So the shader marches the density field again (CloudsCommon.cfi, shared with
++// Clouds.cfx) and this function gives it the field's parameters.
++//
++// WHY THE CONSTANTS ARE REBUILT HERE RATHER THAN BORROWED. The clouds stage keeps them in its
++// own inline constant buffer at b3, filled inside Execute() at :544 - after us, and at a slot
++// ShadePass already uses. Every value below is read from the SAME source the stage reads
++// (the E3DPARAM_VOLCLOUD_* time-of-day globals and this render view's shader constants), in the
++// same frame, so the two agree by construction rather than by copy.
++//
++// EXPOSURE, verified against CVolumetricCloudsStage::GenerateCloudShaderParam rather than
++// assumed. That function multiplies shadeColorFromSun (VolumetricClouds.cpp:1486) and
++// skylightRayleighInScatter (:1518) by GetSceneReferredExposure() and deliberately leaves the
++// scattering / extinction COEFFICIENTS alone, because a coefficient that lives inside exp() must
++// never take an exposure. The two multiplies are repeated below and nothing else is scaled, so
++// the shader's cloud in-scatter comes out in EXPOSED radiance - the same units
++// SVO_RT_SampleSky's result and the rest of ShadePS's `acc` are in, and it is composited before
++// the single divide. Off the scene-referred switch the factor is 1.0 and nothing moves.
++//
++// t51..t54 and s4/s5 are free on the ShadePass technique: the highest register the forward stack
++// reaches is t49 (LTCTex_2), stage 5E took t41 and t50, and the samplers in use are s0 (point
++// clamp), s3 (sky), s10/s11/s14/s15 (forward).
++void CSvoRenderer::SetupShadeCloudTextures(CSvoFullscreenPass& rp)
++{
++	m_bCloudsBound = false;
++
++	if (!e_svoTI_RT_Active || !e_svoTI_RT_Clouds)
++		return;
++
++	// The same two gates CVolumetricCloudsStage itself uses: e_Clouds / r_VolumetricClouds for
++	// "this level draws volumetric clouds at all", and m_bVolumetricCloudsEnabled for "the stage
++	// runs this frame" (which is literally what its IsStageActive returns).
++	if (!CVolumetricCloudsStage::IsRenderable() || !gcpRendD3D->m_bVolumetricCloudsEnabled)
++		return;
++
++	auto* pClouds = RenderView()->GetGraphicsPipeline()->GetStage<CVolumetricCloudsStage>();
++	if (!pClouds)
++		return;
++
++	CTexture* pShadow = pClouds->GetVolCloudShadowTex();
++	CTexture* pMie = pClouds->GetCloudMiePhaseTex();
++	if (!CTexture::IsTextureExist(pShadow) || !CTexture::IsTextureExist(pMie))
++		return;
++
++	// Resolve the two noise volumes exactly as ExecuteVolumetricCloudShadowGen does, so the march
++	// samples the same noise the shadow volume we are about to read was generated from. The
++	// stage's own cached pointers are last frame's and are null on the first frame; the level's
++	// texture ids plus the engine default are not.
++	SVolumetricCloudTexInfo texInfo;
++	gcpRendD3D->GetVolumetricCloudTextureInfo(texInfo);
++
++	CTexture* pNoise = pClouds->GetDefaultNoiseTex();
++	if (texInfo.cloudNoiseTexId > 0)
++	{
++		if (CTexture* pTex = CTexture::GetByID(texInfo.cloudNoiseTexId))
++			pNoise = pTex;
++	}
++
++	CTexture* pEdgeNoise = pClouds->GetDefaultNoiseTex();
++	if (texInfo.edgeNoiseTexId > 0)
++	{
++		if (CTexture* pTex = CTexture::GetByID(texInfo.edgeNoiseTexId))
++			pEdgeNoise = pTex;
++	}
++
++	if (!CTexture::IsTextureExist(pNoise) || !CTexture::IsTextureExist(pEdgeNoise))
++		return;
++
++	rp.SetTexture(51, pNoise);        // SVO_CloudNoiseTex
++	rp.SetTexture(52, pEdgeNoise);    // SVO_CloudEdgeNoiseTex
++	rp.SetTexture(53, pShadow);       // SVO_CloudShadowTex
++	rp.SetTexture(54, pMie);          // SVO_CloudMiePhaseTex
++
++	// The two states Clouds.cfx uses for exactly these two fetches: TrilinearWrap for the noise
++	// volumes (the density field tiles), and the border state for the cloud shadow volume, whose
++	// tiling region ends in "no shadow" rather than in a repeat.
++	rp.SetSampler(4, EDefaultSamplerStates::TrilinearWrap);
++	rp.SetSampler(5, EDefaultSamplerStates::TrilinearBorder_Black);
++
++	m_bCloudsBound = true;
++}
++
++void CSvoRenderer::SetupShadeCloudConstants(CSvoFullscreenPass& rp)
++{
++	// The clouds stage keeps these four in an anonymous namespace of VolumetricClouds.cpp, which
++	// belongs to the paused clouds branch and is not ours to touch. They are physical constants
++	// and a texture-space unit, not tunables - if that file ever changes them, this block has to
++	// follow, which is why they are named and sourced here rather than folded into a magic number.
++	//   VolumetricClouds.cpp:47-53
++	const float VCDropletDensity = 1e9f;
++	const float VCDropletRadius = 0.000015f;
++	const float VCScatterCoefficient = VCDropletDensity * (gf_PI * VCDropletRadius * VCDropletRadius);
++	const Vec3  VCBaseNoiseScale(0.00003125f, 0.00003125f, 0.00003125f);
++	const float VCEdgeNoiseScale = 19.876521f;
++	const float VCMinSphereRadius = 100000.0f;
++	const float VCMaxSphereRadius = 10000000.0f;
++
++	Vec4 vParams0(0, 0, 0, 0), vParams1(0, 0, 0, 0), vParams2(0, 0, 0, 0);
++	Vec4 vNoiseScale(0, 0, 0, 0), vBaseScale(0, 0, 0, 0), vBaseOffset(0, 0, 0, 0);
++	Vec4 vDensity(0, 0, 0, 0), vEdgeNoiseScale(0, 0, 0, 0), vEdgeTurbulence(0, 0, 0, 0);
++	Vec4 vInvTiling(0, 0, 0, 0), vShadowOffset(0, 0, 0, 0);
++	Vec4 vSunLight(0, 0, 0, 0), vSunDir(0, 0, 0, 0), vSkyLight(0, 0, 0, 0), vGroundLight(0, 0, 0, 0);
++	Vec4 vScatter(0, 0, 0, 0), vMultiScatter(0, 0, 0, 0);
++
++	if (m_bCloudsBound)
++	{
++		I3DEngine* const p3DEngine = gEnv->p3DEngine;
++		const SRenderViewShaderConstants& PF = RenderView()->GetShaderConstants();
++		const float sceneExposure = gcpRendD3D->GetSceneReferredExposure();
++
++		Vec3 genParams, scatteringLow, scatteringHigh, groundColor, scatteringMulti, turbulence;
++		Vec3 envParams, globalNoiseScale, renderParams, turbulenceNoiseScale, turbulenceNoiseParams;
++		Vec3 densityParams, miscParams, skylightRayleigh;
++		p3DEngine->GetGlobalParameter(E3DPARAM_VOLCLOUD_GEN_PARAMS, genParams);
++		p3DEngine->GetGlobalParameter(E3DPARAM_VOLCLOUD_SCATTERING_LOW, scatteringLow);
++		p3DEngine->GetGlobalParameter(E3DPARAM_VOLCLOUD_SCATTERING_HIGH, scatteringHigh);
++		p3DEngine->GetGlobalParameter(E3DPARAM_VOLCLOUD_GROUND_COLOR, groundColor);
++		p3DEngine->GetGlobalParameter(E3DPARAM_VOLCLOUD_SCATTERING_MULTI, scatteringMulti);
++		p3DEngine->GetGlobalParameter(E3DPARAM_VOLCLOUD_TURBULENCE, turbulence);
++		p3DEngine->GetGlobalParameter(E3DPARAM_VOLCLOUD_ENV_PARAMS, envParams);
++		p3DEngine->GetGlobalParameter(E3DPARAM_VOLCLOUD_GLOBAL_NOISE_SCALE, globalNoiseScale);
++		p3DEngine->GetGlobalParameter(E3DPARAM_VOLCLOUD_RENDER_PARAMS, renderParams);
++		p3DEngine->GetGlobalParameter(E3DPARAM_VOLCLOUD_TURBULENCE_NOISE_SCALE, turbulenceNoiseScale);
++		p3DEngine->GetGlobalParameter(E3DPARAM_VOLCLOUD_TURBULENCE_NOISE_PARAMS, turbulenceNoiseParams);
++		p3DEngine->GetGlobalParameter(E3DPARAM_VOLCLOUD_DENSITY_PARAMS, densityParams);
++		p3DEngine->GetGlobalParameter(E3DPARAM_VOLCLOUD_MISC_PARAM, miscParams);
++		p3DEngine->GetGlobalParameter(E3DPARAM_SKYLIGHT_RAYLEIGH_INSCATTER, skylightRayleigh);
++
++		const float altitude = genParams.y;
++		const float thickness = max(1e-3f, genParams.z);
++		const float absorptionFactor = turbulence.z;
++		const float extinction = VCScatterCoefficient + (VCScatterCoefficient * absorptionFactor);
++		const float shadowTilingSize = miscParams.z;
++		const float edgeNoiseErode = turbulenceNoiseParams.x;
++
++		vParams0 = Vec4(1.f, altitude, thickness, genParams.x);
++		vParams1 = Vec4(VCScatterCoefficient, extinction, scatteringMulti.z,
++		                clamp_tpl<float>(envParams.x, VCMinSphereRadius, VCMaxSphereRadius));
++		// .w = the clouds-on-a-hit distance, deliberately 0 (off): inside e_svoTI_RT_MaxDistRay
++		// no hit is far enough for a cloud deck to be in front of it.
++		vParams2 = Vec4((float)clamp_tpl<int>(e_svoTI_RT_CloudSteps, 1, 64),
++		                renderParams.x, renderParams.y, 0.f);
++
++		vNoiseScale = Vec4(VCBaseNoiseScale.CompMul(globalNoiseScale), 0.f);
++
++		const Vec3& baseTexTiling = PF.pVolCloudTilingSize;
++		vBaseScale = Vec4(1.0f / max(baseTexTiling.x, 1e-6f), 1.0f / max(baseTexTiling.y, 1e-6f),
++		                  1.0f / max(baseTexTiling.z, 1e-6f), 0.f);
++
++		// THE ANIMATION. pVolCloudTilingOffset is the wind-driven offset the time of day system
++		// advances every frame, and the -altitude on z is how Clouds.cfx folds the layer's base
++		// height into the same vector (VolumetricClouds.cpp:1587). Using the same lane is what
++		// makes a cloud drift identically in the reflection and in the direct view.
++		vBaseOffset = Vec4(PF.pVolCloudTilingOffset.x, PF.pVolCloudTilingOffset.y,
++		                   PF.pVolCloudTilingOffset.z - altitude, 0.f);
++
++		vDensity = Vec4(densityParams.x, densityParams.y, densityParams.z, miscParams.x);
++		vEdgeNoiseScale = Vec4(VCBaseNoiseScale.CompMul(turbulenceNoiseScale * VCEdgeNoiseScale), 0.f);
++		vEdgeTurbulence = Vec4((edgeNoiseErode > 0.0f) ? 2.0f * turbulence.x : 8.0f * turbulence.x,
++		                       turbulence.y + 1e-4f, edgeNoiseErode, turbulenceNoiseParams.y);
++
++		vInvTiling = Vec4(1.0f / max(shadowTilingSize, 1e-6f), 1.0f / max(shadowTilingSize, 1e-6f),
++		                  1.0f / thickness, 0.f);
++		vShadowOffset = Vec4(PF.pCloudShadowAnimParams.x, PF.pCloudShadowAnimParams.y, 0.f, 0.f);
++
++		vSunLight = Vec4(PF.pCloudShadingColorSun * sceneExposure, 0.f);
++		vSunDir = Vec4(PF.pSunDirection, 0.f);
++		vSkyLight = Vec4(skylightRayleigh * sceneExposure, scatteringHigh.y);
++		vGroundLight = Vec4(groundColor, scatteringHigh.z);
++		vScatter = Vec4(scatteringLow.x, scatteringLow.y, scatteringLow.z, scatteringHigh.x);
++		vMultiScatter = Vec4(scatteringMulti.x, scatteringMulti.y, 0.f, 0.f);
++	}
++
++	struct SNamedVec4 { const char* szName; const Vec4* pValue; };
++	const SNamedVec4 arrConsts[] =
++	{
++		{ "SVO_CloudParams0",        &vParams0        },
++		{ "SVO_CloudParams1",        &vParams1        },
++		{ "SVO_CloudParams2",        &vParams2        },
++		{ "SVO_CloudNoiseScale",     &vNoiseScale     },
++		{ "SVO_CloudBaseScale",      &vBaseScale      },
++		{ "SVO_CloudBaseOffset",     &vBaseOffset     },
++		{ "SVO_CloudDensityParams",  &vDensity        },
++		{ "SVO_CloudEdgeNoiseScale", &vEdgeNoiseScale },
++		{ "SVO_CloudEdgeTurbulence", &vEdgeTurbulence },
++		{ "SVO_CloudInvTiling",      &vInvTiling      },
++		{ "SVO_CloudShadowOffset",   &vShadowOffset   },
++		{ "SVO_CloudSunLight",       &vSunLight       },
++		{ "SVO_CloudSunDir",         &vSunDir         },
++		{ "SVO_CloudSkyLight",       &vSkyLight       },
++		{ "SVO_CloudGroundLight",    &vGroundLight    },
++		{ "SVO_CloudScatterParams",  &vScatter        },
++		{ "SVO_CloudMultiScatter",   &vMultiScatter   },
++	};
++
++	for (const SNamedVec4& c : arrConsts)
++	{
++		const CCryNameR name(c.szName);
++		rp.SetConstantArray(name, (Vec4*)c.pValue, 1);
++	}
++}
++
+ // Hit shading. Reads the four g-data targets, runs CE's own forward lighting at the hit world
+ // position, writes the ALD + RGB pair DemosaicPass consumes.
+ void CSvoRenderer::ShadePass(SSvoTargetsSet* pTS)
+@@ -1071,6 +1287,7 @@ void CSvoRenderer::ShadePass(SSvoTargetsSet* pTS)
+ 	SetupShadeForwardResources(rp);
+ 	SetupShadeSkyTextures(rp);
+ 	SetupShadeFogTextures(rp);
++	SetupShadeCloudTextures(rp);
+ 
+ 	// rt stage 4A, debug view 13 = validator C (energy audit section 5). The only two resources
+ 	// the pass needs beyond hit shading, and they are bound ONLY for that view: the depth buffer
+@@ -1095,6 +1312,7 @@ void CSvoRenderer::ShadePass(SSvoTargetsSet* pTS)
+ 	SetupRTLightGridConstants(rp);
+ 	SetupShadeSkyConstants(rp);
+ 	SetupShadeFogConstants(rp);
++	SetupShadeCloudConstants(rp);
+ 
+ 	{
+ 		static CCryNameR paramName("SVO_ShadeParams0");
+@@ -2338,6 +2556,12 @@ void CSvoRenderer::InitCVarValues()
+ 	if (ICVar* pCVarTemporalFrames = gEnv->pConsole->GetCVar("e_svoTI_RT_TemporalFrames"))
+ 		e_svoTI_RT_TemporalFrames = pCVarTemporalFrames->GetIVal();
+ 
++	// rt stage 5F (decision 09 section 9.2), same defensive resolution.
++	if (ICVar* pCVarClouds = gEnv->pConsole->GetCVar("e_svoTI_RT_Clouds"))
++		e_svoTI_RT_Clouds = pCVarClouds->GetIVal();
++	if (ICVar* pCVarCloudSteps = gEnv->pConsole->GetCVar("e_svoTI_RT_CloudSteps"))
++		e_svoTI_RT_CloudSteps = pCVarCloudSteps->GetIVal();
++
+ 	// S8, decisions/s8-svogi-fog-clouds.md item 1 A4. The screen-space depth trace is the ONE
+ 	// place SVOGI reads an already pre-exposed buffer ($HDRTargetPrev, bound at slot 12) back
+ 	// into voxel-space maths that is deliberately kept in unexposed stock units. Mixing the two
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/D3D_SVO.h b/Code/CryEngine/RenderDll/XRenderD3D9/D3D_SVO.h
+index 8e98121b..81acd511 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/D3D_SVO.h
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/D3D_SVO.h
+@@ -159,6 +159,9 @@ protected:
+ 	// rt stage 5E (decision 09 section 9.3): volumetric fog on the reflected segment.
+ 	void                   SetupShadeFogTextures(CSvoFullscreenPass& rp);
+ 	void                   SetupShadeFogConstants(CSvoFullscreenPass& rp);
++
++	void                   SetupShadeCloudTextures(CSvoFullscreenPass& rp);
++	void                   SetupShadeCloudConstants(CSvoFullscreenPass& rp);
+ 	template<class T> void SetupRTLightGridConstants(T& rp);
+ 
+ 	template<class T> void SetupCommonSamplers(T& rp);
+@@ -272,6 +275,11 @@ protected:
+ 	bool               m_bVolFogBound = false;
+ 	bool               m_bVolFogSeparateDensity = false;
+ 
++	// rt stage 5F: whether SetupShadeCloudTextures found a live volumetric cloud stage with a
++	// cloud shadow volume this frame. With false the shader's SVO_CloudParams0.x is 0 and the
++	// miss path is exactly the plain sky lookup of stage 4A.
++	bool               m_bCloudsBound = false;
++
+ 	// rt stage 4B (decision 08). These three are resolved DEFENSIVELY in InitCVarValues instead
+ 	// of through INIT_SVO_CVAR, because their REGISTER_CVAR_AUTO lines live in Cry3DEngine's
+ 	// SceneTreeCVars.inl and that file had another agent's uncommitted work in it when this
+@@ -284,6 +292,12 @@ protected:
+ 	float e_svoTI_RT_GlossScale = 1.f;
+ 	int   e_svoTI_RT_TemporalFrames = 8;
+ 
++	// rt stage 5F (decision 09 section 9.2), resolved the same defensive way and for the same
++	// reason: a Cry3DEngine.dll without the registrations keeps these defaults instead of
++	// dereferencing a null ICVar.
++	int   e_svoTI_RT_Clouds = 1;
++	int   e_svoTI_RT_CloudSteps = 12;
++
+ 	// cvar values
+ 	#define INIT_ALL_SVO_CVARS                                      \
+ 	  INIT_SVO_CVAR(int, e_svoDVR);                                 \
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/VolumetricClouds.h b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/VolumetricClouds.h
+index ce4b4ecf..d5612663 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/VolumetricClouds.h
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/VolumetricClouds.h
+@@ -49,6 +49,24 @@ public:
+ 	};
+ 	const SSceneReferredDebug& GetSceneReferredDebug() const { return m_srDebug; }
+ 
++	// rt stage 5F (decision 09 section 9.2): the four textures the SVO ray tracer's secondary
++	// cloud march needs, so a cloud is the same cloud in a reflection as in the direct view.
++	// Accessors only - nothing here changes what this stage does or when.
++	//
++	// GetVolCloudShadowTex() is the ONLY one of the four that is frame-fresh at the point the
++	// SVO block runs: ExecuteShadowGen() is called at StandardGraphicsPipeline.cpp:457-458,
++	// three lines before SVOGI, while Execute() (which is what fills m_pVolCloudNoiseTex /
++	// m_pVolCloudEdgeNoiseTex) runs at :544, after it. The two noise members are therefore last
++	// frame's POINTERS - but they are level textures resolved from
++	// GetVolumetricCloudTextureInfo(), not per-frame results, so the caller re-resolves them the
++	// same way ExecuteVolumetricCloudShadowGen does and falls back to GetDefaultNoiseTex(),
++	// which Init() always creates. That makes the first frame correct too.
++	CTexture* GetVolCloudShadowTex() const    { return m_pTexVolCloudShadow.get(); }
++	CTexture* GetVolCloudNoiseTex() const     { return m_pVolCloudNoiseTex.get(); }
++	CTexture* GetVolCloudEdgeNoiseTex() const { return m_pVolCloudEdgeNoiseTex.get(); }
++	CTexture* GetCloudMiePhaseTex() const     { return m_pCloudMiePhaseFuncTex.get(); }
++	CTexture* GetDefaultNoiseTex() const      { return m_pNoiseTex.get(); }
++
+ private:
+ 	void  ExecuteVolumetricCloudShadowGen();
+ 	void  GenerateCloudShadowGenShaderParam(const Vec3& texSize);
+diff --git a/Engine/Shaders/HWScripts/CryFX/Total_Illumination.cfx b/Engine/Shaders/HWScripts/CryFX/Total_Illumination.cfx
+index d277b9d1..30e5d1ba 100644
+--- a/Engine/Shaders/HWScripts/CryFX/Total_Illumination.cfx
++++ b/Engine/Shaders/HWScripts/CryFX/Total_Illumination.cfx
+@@ -2325,6 +2325,36 @@ pixoutShade ShadePS(vtxOutWPOS IN)
+ 		float3 vSkyRadiance = (float3)0.f;
+ 		const bool bMissSky = bNoHit && (vGLD.z > 0.f) && SVO_RT_SampleSky(vRayDirN, vSkyRadiance);
+ 
++		// rt stage 5F (decision 09 section 9.2). VOLUMETRIC CLOUDS IN THE REFLECTION. The cloud
++		// pass renders into a screen space target one stage LATER in the frame, so there is no
++		// image of "the sky in this direction" to sample - only an image of the sky the camera
++		// saw. A reflection ray leaves the camera's pixel, so the clouds have to be marched
++		// again, in the reflected direction, out of the density field itself. That field is the
++		// SAME one Clouds.cfx uses (CloudsCommon.cfi), at the same wind offset, under the same
++		// cloud shadow map, so the cloud in the mirror is the cloud in the sky.
++		//
++		// The march starts at the REFLECTING SURFACE, not at the pseudo-hit the miss path puts
++		// e_svoTI_RT_MaxDistRay metres down the ray: the layer is kilometres up, so the 48 m
++		// difference is far below one step, but the surface is the physically right origin and
++		// it is also the origin the optional on-a-hit mode needs a name for.
++		//
++		// bCloudsOnHit is OFF by default (SVO_CloudParams2.w = 0). When a distance is set, a hit
++		// FURTHER away than that also gets the layer marched in front of it - the same veil a
++		// very distant object gets in the direct view. It is off by default because inside
++		// e_svoTI_RT_MaxDistRay (48 m) no hit is far enough for a cloud deck to sit in front of
++		// it, so the steps would be spent for nothing.
++		float3 vCloudInscatter = (float3)0.f;
++		float  fCloudTrans = 1.f;
++		bool   bCloudsOnHit = false;
++		{
++			const float3 vHitAbsCl = vGPO.xyz + GetWorldViewPos();
++			const float3 vSurfaceAbsCl = vHitAbsCl - vRayDirN * abs(vGLD.w);
++			bCloudsOnHit = (SVO_CloudParams2.w > 0.f) && !bNoHit && (abs(vGLD.w) >= SVO_CloudParams2.w);
++
++			if (bMissSky || bCloudsOnHit)
++				SVO_RT_MarchClouds(bCloudsOnHit ? vHitAbsCl : vSurfaceAbsCl, vRayDirN, vCloudInscatter, fCloudTrans);
++		}
++
+ 		// rt stage 5B, WATER (decision 09 section 9.4, decision 10 item 4 Water). What a water
+ 		// surface shows is Water.cfx:1160
+ 		//     cFinal = lerp(refractColor, cSpecularAcc, fFresnel)
+@@ -2402,8 +2432,16 @@ pixoutShade ShadePS(vtxOutWPOS IN)
+ 			}
+ 		}
+ 
++		// rt stage 5F: the cloud layer sits BETWEEN the reflecting surface and the sky dome, so
++		// it composites over the sky exactly the way CloudsBlendPS composites over the scene -
++		// sky * transmittance + in-scatter - and it does so on the EXPOSED side of the pass,
++		// before the single divide below, because both terms are already exposed (the cloud
++		// radiance constants take GetSceneReferredExposure() on the CPU in
++		// CVolumetricCloudsStage::GenerateCloudShaderParam, exactly as the sky constants do in
++		// CSkyStage). With clouds off fCloudTrans is 1 and vCloudInscatter is 0, and this line
++		// is the line it replaces.
+ 		float3 acc = bMissSky
+-		             ? (vSkyRadiance + .0001f)
++		             ? (vSkyRadiance * fCloudTrans + vCloudInscatter + .0001f)
+ 		             : (vShaded + SVO_ShadeParams0.x * fwdAttribs.albedo + .0001f);
+ 
+ 		// Emissive, exactly Illum.cfx IlluminationPS:
+@@ -2562,6 +2600,28 @@ pixoutShade ShadePS(vtxOutWPOS IN)
+ 				acc = float3(1.f - fFogCovered, fFogCovered, 0.f) * 0.35f + (float3)fFogTrans * 0.65f;
+ 				bRawDebug = true;
+ 			}
++			else if (nDbg == 20)
++			{
++				// rt stage 5F. 20 = the cloud IN-SCATTER the reflected ray picked up in the
++				// cloud layer, in exposed radiance - the units view 0 is in. This is the cloud
++				// itself, without the sky behind it, so a sunlit cumulus reads bright and the
++				// clear sky between clouds reads black. If a mirror that clearly shows sky reads
++				// black everywhere here, the march never ran: either the ray points below the
++				// horizon, or the clouds stage bound nothing this frame (e_Clouds /
++				// r_VolumetricClouds), or e_svoTI_RT_Clouds is 0.
++				acc = vCloudInscatter;
++				bRawDebug = true;
++			}
++			else if (nDbg == 21)
++			{
++				// rt stage 5F. 21 = the cloud TRANSMITTANCE along the reflected ray. WHITE =
++				// clear sky, the dome behind the layer arrives undimmed; BLACK = an optically
++				// thick cloud, the reflection is pure cloud. This is the cloud's SHAPE, and it is
++				// the view to compare against the shape of the same cloud in the direct view:
++				// they must be the same cloud in the same place and they must drift together.
++				acc = (float3)fCloudTrans;
++				bRawDebug = true;
++			}
+ 			else if (nDbg == 13)
+ 			{
+ 				// 13 = VALIDATOR C (energy audit section 5 / research 06 section 8, option C).
+@@ -2643,6 +2703,13 @@ pixoutShade ShadePS(vtxOutWPOS IN)
+ 		// lerp pulled a sky/probe colour a fixed fraction of the way towards the fog colour
+ 		// everywhere at once - a flat grey veil over every part of the reflection that escaped.
+ 		// A miss is resolved by the sky or the probes, and both carry their own aerial perspective.
++		// rt stage 5F, the optional on-a-hit mode (off unless SVO_CloudParams2.w is set): the
++		// cloud layer lies in front of a far enough hit, so it dims it and adds its own light,
++		// the same composite the miss path does over the sky. It goes BEFORE the fog so that the
++		// fog of the reflected segment still veils the whole thing.
++		if (!bRawDebug && bCloudsOnHit)
++			acc = acc * fCloudTrans + vCloudInscatter;
++
+ 		if (!bRawDebug && !bNoHit)
+ 		{
+ 			acc = acc * fFogTrans + vFogInscatter;
+diff --git a/Engine/Shaders/HWScripts/CryFX/Total_Illumination_Shading.cfi b/Engine/Shaders/HWScripts/CryFX/Total_Illumination_Shading.cfi
+index 48203858..f10aa801 100644
+--- a/Engine/Shaders/HWScripts/CryFX/Total_Illumination_Shading.cfi
++++ b/Engine/Shaders/HWScripts/CryFX/Total_Illumination_Shading.cfi
+@@ -294,6 +294,290 @@ void SVO_RT_MarchSegmentFog(in SVolumetricFogParams vfp, in float3 vStartAbs, in
+ 	fCovered /= fSteps;
+ }
+ 
++///////////////////////////////////////////////////////////////////////////////////
++// rt stage 5F - VOLUMETRIC CLOUDS ON A RAY THAT MISSES ABOVE THE HORIZON
++// (decision 09 section 9.2).
++//
++// WHY A SECOND MARCH AND NOT THE CLOUD IMAGE. CVolumetricCloudsStage::Execute runs at
++// StandardGraphicsPipeline.cpp:544, i.e. AFTER the SVO block at :460, and it renders into a
++// screen space target anyway - there is no image of "the sky in that direction" to sample, only
++// an image of "the sky the camera saw in that pixel". A reflection ray leaves the camera's
++// pixel entirely, so the only correct source is the DENSITY FIELD itself. That field is now
++// shared: CloudsCommon.cfi holds exactly the functions Clouds.cfx uses, so a cloud in a mirror
++// is the same cloud, from the same noise, at the same wind offset.
++//
++// WHAT IS AVAILABLE AT :460 AND WHAT IS NOT.
++//   * ExecuteShadowGen() runs at :457-458, THREE LINES BEFORE the SVO block, so
++//     m_pTexVolCloudShadow (the tiled 3 channel optical thickness volume: x along the sun, y to
++//     the top of the layer, z to the bottom) is THIS frame's, not last frame's. That is the one
++//     piece of cloud data that is fresh here, and it is precisely the one decision 09 section
++//     9.2 asked for.
++//   * The per frame cloud constants are NOT available - they live in the stage's own b3 inline
++//     constant buffer, filled at :544. So CSvoRenderer::SetupShadeCloudConstants rebuilds the
++//     same values from the same E3DPARAM_VOLCLOUD_* globals and the same
++//     SRenderViewShaderConstants, with the same exposure multiplies. Same source, same frame,
++//     same numbers.
++//
++// THE MARCH. N = e_svoTI_RT_CloudSteps steps (default 12) between the ray's entry into the
++// layer and its exit, distributed by vcGetLinearDepth exactly as Clouds.cfx distributes its own
++// (quadratic, so the near part of the layer is sampled finer), no jitter - the RT path has its
++// own temporal accumulation and a second dither would fight it. Per step: one GetCloudDensity
++// (three 3D noise taps) and one cloud shadow tap, then AccumulateRadiance's arithmetic verbatim
++// - Beer for the sun, the multi scatter preservation lerp for the sky and ground terms, the
++// powder effect on the sum, and the precise in-scattering integral. Early out at transmittance
++// below 0.01, and a step whose density is zero costs only the density taps.
++//
++// SUN TRANSMITTANCE. Inside the cloud shadow map's tiling region: one tap, which is what
++// GetOpticalThicknessCombined's own lowDetail path does. Outside it: a 3 step light march along
++// the sun direction with GetCloudDensity (Clouds.cfx uses 6 at full detail, 3 coarse) plus the
++// analytic to-top / to-bottom thickness of the local density, which is the !inShadowTex branch
++// of GetOpticalThicknessCombined.
++//
++// EXPOSURE, verified rather than assumed. CVolumetricCloudsStage::GenerateCloudShaderParam
++// multiplies shadeColorFromSun (VolumetricClouds.cpp:1486), skylightRayleighInScatter (:1518)
++// and sunIntensityForAtmospheric (:1544) by GetSceneReferredExposure() on the CPU and leaves the
++// scattering/extinction COEFFICIENTS alone, because those live inside exp(). The constants below
++// are uploaded exactly the same way, so the in-scatter this returns is EXPOSED radiance - the
++// same units as SVO_RT_SampleSky's result and as everything else `acc` is built from, and it
++// goes in before ShadePS's single divide. The transmittance is unit free.
++//
++// NOT CARRIED, deliberately, each with its reason:
++//   * GetAtmosphericInscattering (the Rayleigh haze between the viewer and the cloud deck). The
++//     sky lookup this composites over already carries the dome's own aerial perspective; adding
++//     the cloud pass's copy of it would count that haze twice in a reflection.
++//   * The cirrus layer (ENABLE_CIRRUS_CLOUD_LAYER is off in Clouds.cfx anyway) and the stereo
++//     reprojection path.
++//   * The sky-ray edge fade of decisions/s9-cloud-edge.md. It fades the cloud contribution out
++//     over the last kilometres of a march that was cut short by the DEPTH BUFFER or the max
++//     viewable distance - both camera-space limits a reflection ray does not have. A reflection
++//     ray's march ends at the real layer exit, so there is no seam to fade.
++///////////////////////////////////////////////////////////////////////////////////
++
++#define VC_NO_BASE_DENSITY_TEX
++#define VC_NO_CLOUD_BLOCKERS
++#include "CloudsCommon.cfi"
++
++Texture3D SVO_CloudNoiseTex     : register(t51);
++Texture3D SVO_CloudEdgeNoiseTex : register(t52);
++Texture3D SVO_CloudShadowTex    : register(t53);
++Texture2D SVO_CloudMiePhaseTex  : register(t54);
++
++SamplerState ssSvoCloudWrap   : register(s4);
++SamplerState ssSvoCloudShadow : register(s5);
++
++// (bound, layer bottom altitude, layer thickness, cloudiness)
++float4 SVO_CloudParams0;
++// (scatter coefficient, extinction coefficient, powder factor, cloud sphere radius)
++float4 SVO_CloudParams1;
++// (march steps, max viewable distance, max ray-march distance, clouds-on-a-hit distance, 0 = off)
++float4 SVO_CloudParams2;
++// (noise scale xyz, 0)
++float4 SVO_CloudNoiseScale;
++// (base density texture tiling xyz, 0) - the base texture branch is compiled out here
++float4 SVO_CloudBaseScale;
++// (wind / tiling offset xyz, 0). THE ANIMATION: the same lane the direct view uses, so a cloud
++// drifts identically in the mirror and in the sky.
++float4 SVO_CloudBaseOffset;
++// (max global density, density remap min, density remap max, additional noise intensity)
++float4 SVO_CloudDensityParams;
++// (edge noise scale xyz, 0)
++float4 SVO_CloudEdgeNoiseScale;
++// (edge turbulence, edge threshold, enable erode, enable abs)
++float4 SVO_CloudEdgeTurbulence;
++// (1 / cloud shadow tiling size xyz, 0)
++float4 SVO_CloudInvTiling;
++// (cloud shadow world alignment offset xy, 0, 0)
++float4 SVO_CloudShadowOffset;
++// (sun shading colour xyz EXPOSED, 0)
++float4 SVO_CloudSunLight;
++// (sun direction xyz, pointing AT the sun, 0)
++float4 SVO_CloudSunDir;
++// (sky Rayleigh in-scatter xyz EXPOSED, sky lighting factor)
++float4 SVO_CloudSkyLight;
++// (ground albedo xyz, ground lighting factor)
++float4 SVO_CloudGroundLight;
++// (sun single scatter, sun low order scatter, low order anisotropy, sun high order scatter)
++float4 SVO_CloudScatterParams;
++// (multi-scatter attenuation, multi-scatter preservation, 0, 0)
++float4 SVO_CloudMultiScatter;
++
++CloudGenParam SVO_RT_GetCloudGenParam()
++{
++	// NOT "(CloudGenParam)0": the struct carries two Texture3D members and a SamplerState, and a
++	// resource object has no zero to cast from (fxc X3017). Every field the density chain reads
++	// is set below; cloudBlockerPos / cloudBlockerParam are the only ones left alone and they are
++	// unreachable here, because VC_NO_CLOUD_BLOCKERS compiles that branch out.
++	CloudGenParam param;
++
++	param.cloudiness               = SVO_CloudParams0.w;
++	param.altitude                 = SVO_CloudParams0.y;
++	param.thickness                = SVO_CloudParams0.z;
++	param.noiseSizeScale           = SVO_CloudNoiseScale.xyz;
++	param.baseSizeScale            = SVO_CloudBaseScale.xyz;
++	param.baseOffset               = SVO_CloudBaseOffset.xyz;
++	param.edgeNoiseSizeScale       = SVO_CloudEdgeNoiseScale.xyz;
++	param.baseTexRemap             = SVO_CloudDensityParams.yz;
++	param.edgeErode                = SVO_CloudEdgeTurbulence;
++	param.cloudDensityScale        = SVO_CloudDensityParams.x;
++	param.additionalNoiseIntensity = SVO_CloudDensityParams.w;
++	param.noiseTex                 = SVO_CloudNoiseTex;
++	param.edgeNoiseTex             = SVO_CloudEdgeNoiseTex;
++	param.linearWrapSampler        = ssSvoCloudWrap;
++
++	return param;
++}
++
++// Clouds.cfx GetOpticalThickness with the step count opened up, so the secondary march can use
++// the coarse count (3) the direct view uses for its own coarse shadow rays. The body is that
++// function's, unchanged.
++float SVO_RT_CloudSunThickness(in float3 vOriginAbs, in float3 vSunDir, in float fExtinction,
++                               CloudGenParam param, const float fMaxSteps)
++{
++	const float4 vPlaneBottom = float4(0.0f, 0.0f, 1.0f, param.altitude);
++	const float4 vPlaneTop    = float4(0.0f, 0.0f, 1.0f, param.altitude + param.thickness);
++	const float tb = vcGetIntersectionPlane(vOriginAbs, vSunDir, vPlaneBottom);
++	const float tt = vcGetIntersectionPlane(vOriginAbs, vSunDir, vPlaneTop);
++
++	const float fEnd = min(4000.0f, max(tb, tt));
++	const float fStart = max(min(tb, tt), 0.0f);
++	const float fSteps = (fStart >= fEnd) ? 0.0f : fMaxSteps;
++
++	float fThickness = 0.0f;
++	for (float i = 0.0f; i < fSteps; ++i)
++	{
++		const float d = vcGetLinearDepth(i, fSteps, fStart, fEnd);
++		const float dNext = vcGetLinearDepth(i + 1.0f, fSteps, fStart, fEnd);
++		const float3 vP = vSunDir * d + vOriginAbs;
++		fThickness += fExtinction * GetCloudDensity(vP, param) * (dNext - d);
++	}
++
++	return fThickness;
++}
++
++// The three optical thicknesses the radiance accumulation needs at one sample: x along the sun,
++// y to the top of the layer, z to the bottom. Inside the cloud shadow map's tiling region this
++// is one tap (GetOpticalThicknessCombined's lowDetail path); outside it, the coarse fallback of
++// that same function's !inShadowTex branch.
++float3 SVO_RT_CloudOpticalThickness(in float3 vPosAbs, in float fDensity, in float fExtinction,
++                                    CloudGenParam param)
++{
++	float3 vTC = (vPosAbs - float3(SVO_CloudShadowOffset.xy, param.altitude)) * SVO_CloudInvTiling.xyz;
++	vTC.xy += 0.5f;
++
++	if (all(vTC >= 0.0f) && all(vTC <= 1.0f))
++		return SVO_CloudShadowTex.SampleLevel(ssSvoCloudShadow, vTC, 0.0f).xyz;
++
++	float3 vThickness;
++	vThickness.x = SVO_RT_CloudSunThickness(vPosAbs, SVO_CloudSunDir.xyz, fExtinction, param, 3.0f);
++	vThickness.y = fExtinction * fDensity * min(4000.0f, max(0.0f, (param.altitude + param.thickness) - vPosAbs.z));
++	vThickness.z = fExtinction * fDensity * min(4000.0f, max(0.0f, vPosAbs.z - param.altitude));
++	return vThickness;
++}
++
++// Marches the cloud layer along vDirN starting at vStartAbs. Returns false when there is nothing
++// to do (clouds off, the ray points down, or the ray never meets the layer). vInscatter is
++// EXPOSED radiance; fTransmittance is what is left of whatever lies behind the layer.
++bool SVO_RT_MarchClouds(in float3 vStartAbs, in float3 vDirN, out float3 vInscatter, out float fTransmittance)
++{
++	vInscatter = (float3)0.f;
++	fTransmittance = 1.f;
++
++	if (SVO_CloudParams0.x <= 0.f || vDirN.z <= 0.f)
++		return false;
++
++	const float fAltitude   = SVO_CloudParams0.y;
++	const float fThickness  = SVO_CloudParams0.z;
++	const float fScatter    = SVO_CloudParams1.x;
++	const float fExtinction = SVO_CloudParams1.y;
++	const float fPowder     = SVO_CloudParams1.z;
++	const float fRadius     = SVO_CloudParams1.w;
++
++	// ENABLE_ORIGIN_MOVE_WITH_CAMERA, as Clouds.cfx builds it: the spherical layer's centre
++	// follows the camera, so the layer is a shell of constant altitude around the viewer.
++	float3 vCentre = GetWorldViewPos();
++	vCentre.z = -fRadius;
++
++	const float2 vHit = vcGetIntersectionWithCloudLayer(vStartAbs, vDirN, fAltitude, fThickness, fRadius, vCentre);
++	float fEnd = min(SVO_CloudParams2.y, max(vHit.x, vHit.y));
++	const float fStart = max(min(vHit.x, vHit.y), 0.f);
++	fEnd = ((fEnd - fStart) > SVO_CloudParams2.z) ? (fStart + SVO_CloudParams2.z) : fEnd;
++
++	if (fStart >= fEnd)
++		return false;
++
++	const float fSteps = max(SVO_CloudParams2.x, 1.f);
++	const int   nSteps = (int)fSteps;
++
++	CloudGenParam param = SVO_RT_GetCloudGenParam();
++
++	// Clouds.cfx's own sun / sky / ground terms for this direction, from the same constants.
++	const float3 vSunDir = SVO_CloudSunDir.xyz;
++	const float3 cSun = SVO_CloudSunLight.xyz;
++	const float  fDotLE = dot(vDirN, vSunDir);
++
++	const float fAngle = acos_fast(fDotLE) * ONE_OVER_PI;
++	const float fMieNorm = 1.0f / 12.71f;
++	const float3 vMiePhase = SVO_CloudMiePhaseTex.SampleLevel(SampStateTrilinearClamp, float2(fAngle, 0.f), 0.f).rgb
++	                         * SVO_CloudScatterParams.x * fMieNorm;
++
++	const float g = SVO_CloudScatterParams.z;
++	const float fMultiPhase = GetVolumetricFogInscatteringSchlickPhaseFunction(fDotLE, g, 1.f - g * g);
++	const float3 cSunLight = (cSun * vMiePhase) + (SVO_CloudScatterParams.y * fMultiPhase) * cSun;
++	const float3 cSunHigh = (SVO_CloudScatterParams.w * (0.25f * ONE_OVER_PI)) * cSun;
++
++	const float3 vSkyRayleigh = SVO_CloudSkyLight.xyz;
++	const float3 cGroundSrc = (saturate(vSunDir.z) * cSun) + vSkyRayleigh;
++	const float3 cGroundLight = SVO_CloudGroundLight.w * (0.25f * ONE_OVER_PI) * cGroundSrc * SVO_CloudGroundLight.xyz;
++	const float3 cSkyLight = SVO_CloudSkyLight.w * (0.25f * ONE_OVER_PI) * vSkyRayleigh;
++
++	const float fMsAttenuation = SVO_CloudMultiScatter.x;
++	const float fMsPreservation = SVO_CloudMultiScatter.y;
++
++	float fTotalThickness = 0.f;
++
++	[loop] for (int i = 0; i < nSteps; ++i)
++	{
++		if (fTransmittance < 0.01f)
++			break;
++
++		const float d = vcGetLinearDepth((float)i, fSteps, fStart, fEnd);
++		const float dNext = vcGetLinearDepth((float)i + 1.f, fSteps, fStart, fEnd);
++		const float fStepSize = dNext - d;
++
++		float3 vPosAbs = vStartAbs + vDirN * d;
++		// ENABLE_SPHERICAL_CLOUD_LAYER: the density field is evaluated in the flattened space of
++		// the shell, exactly as the direct view evaluates it.
++		vPosAbs = vcTranslateWorldPosToCloudPos(vPosAbs, vCentre, fRadius, fAltitude);
++
++		const float fDensity = GetCloudDensity(vPosAbs, param);
++		if (fDensity <= 0.f)
++			continue;
++
++		const float3 vOptThickness = SVO_RT_CloudOpticalThickness(vPosAbs, fDensity, fExtinction, param);
++
++		const float fShadow       = exp(-vOptThickness.x);
++		const float fSkyShadow    = lerp(fMsPreservation, 0.f, exp(-vOptThickness.y * fMsAttenuation));
++		const float fGroundShadow = lerp(fMsPreservation, 0.f, exp(-vOptThickness.z * fMsAttenuation));
++
++		fTotalThickness += fExtinction * fDensity * fStepSize;
++		const float fPowderEffect = 1.f - exp(-fTotalThickness * fPowder);
++
++		const float fSigmaS = fScatter * fDensity;
++		float3 S = fSigmaS * (fShadow * cSunLight + fSkyShadow * cSunHigh + fSkyShadow * cSkyLight + fGroundShadow * cGroundLight);
++		S *= fPowderEffect;
++
++		const float muE = max(0.000000001f, fExtinction * fDensity);
++		const float trns = exp(-muE * fStepSize);
++		const float3 Sint = ((-S * trns) + S) / muE;
++
++		vInscatter += fTransmittance * Sint;
++		fTransmittance *= trns;
++	}
++
++	return true;
++}
++
++
+ ///////////////////////////////////////////////////////////////////////////////////
+ 
+ // Neo reads (worldPos - min) / cellSize with no clamp, so any hit outside the grid box
+-- 
+2.47.1.windows.1
+
