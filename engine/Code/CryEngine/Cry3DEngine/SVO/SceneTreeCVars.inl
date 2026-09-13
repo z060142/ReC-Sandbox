@@ -256,7 +256,8 @@ REGISTER_CVAR_AUTO(float, e_svoTI_RT_SafetyBorder, 0.25f, VF_EXPERIMENTAL, "DEPR
 
 // Static BVH mesh ray tracing (decisions 02-05)
 REGISTER_CVAR_AUTO(int, e_svoTI_RT_StaticBVH, 1, VF_EXPERIMENTAL, "Build and trace one static BVH per SVO cell\n0 = voxel cone tracing only");
-REGISTER_CVAR_AUTO(int, e_svoTI_RT_Debug, 0, VF_EXPERIMENTAL, "Mesh ray tracing debug views\n1 = hit test count heat map\n2 = hit normals\n3 = hit albedo\n4 = hit distance\n5 = incomplete/overflow mask");
+REGISTER_CVAR_AUTO(int, e_svoTI_RT_Debug, 0, VF_EXPERIMENTAL, "Mesh ray tracing debug views\n1 = hit test count heat map\n2 = hit normals\n3 = hit albedo\n4 = hit distance\n5 = incomplete/overflow mask\n6 = stage-1 provisional colour (no light data)\n7 = sun shadow at the hit (white = lit)\n8 = direct light at the hit, before probes\n9 = raw shade output, before fog and exposure\n10 = raw atlas normal at the hit (magenta = no normal slot)\n11 = hit smoothness\n12 = hit reflectance (F0, x8)");
+REGISTER_CVAR_AUTO(float, e_svoTI_RT_NormalsFading, 0, VF_EXPERIMENTAL, "Fade ray traced reflections into flat normals, in metres; 0 = off (normal maps at any distance)\nApplies to both the reflecting surface (a normal mapped mirror otherwise prints its detail map into the reflection) and to the hit's own normal map");
 REGISTER_CVAR_AUTO(int, e_svoTI_RT_TriPoolXY, 256, VF_EXPERIMENTAL, "XY size of the BVH node/triangle record pool texture (power of two, multiple of 4)");
 REGISTER_CVAR_AUTO(int, e_svoTI_RT_TriPoolZ, 64, VF_EXPERIMENTAL, "Z size of the BVH node/triangle record pool texture");
 REGISTER_CVAR_AUTO(int, e_svoTI_RT_TexPoolZ, 256, VF_EXPERIMENTAL, "Number of slices (single textures) in the material texture atlas");
@@ -264,6 +265,7 @@ REGISTER_CVAR_AUTO(int, e_svoTI_RT_MaxBounces, 1, VF_EXPERIMENTAL, "Maximum numb
 REGISTER_CVAR_AUTO(int, e_svoTI_RT_LeafTris, 4, VF_EXPERIMENTAL, "Maximum number of triangles stored in one BVH leaf");
 REGISTER_CVAR_AUTO(int, e_svoTI_RT_MaxDepth, 18, VF_EXPERIMENTAL, "Maximum BVH depth; the consumer traversal stack is sized for this value plus two");
 REGISTER_CVAR_AUTO(int, e_svoTI_RT_SelfTest, 0, VF_EXPERIMENTAL, "Run the BVH builder and record encoding self test once on level load and print the result into the log");
+REGISTER_CVAR_AUTO(int, e_svoTI_RT_LightGridDim, 16, VF_EXPERIMENTAL, "Light-mask grid resolution per axis for RT hit shading, multiple of 8");
 REGISTER_CVAR_AUTO(float, e_svoTI_Specular_Sev, 1, VF_NULL, "Controls severity of specular cones; this value limits the material glossiness");
 REGISTER_CVAR_AUTO(float, e_svoVoxDistRatio, 14.f, VF_NULL, "Limits the distance where real-time GPU voxelization used");
 REGISTER_CVAR_AUTO(int, e_svoVoxGenRes, 512, VF_NULL, "GPU voxelization dummy render target resolution");

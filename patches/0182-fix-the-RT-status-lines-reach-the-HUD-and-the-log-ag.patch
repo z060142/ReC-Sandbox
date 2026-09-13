@@ -1,0 +1,274 @@
+From 12041ce250c738edfe6fc9c13b9e62ae8ea865a3 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Sun, 13 Sep 2026 22:21:20 +0800
+Subject: [PATCH 182/190] fix: the RT status lines reach the HUD and the log
+ again
+
+r_DisplayInfo 2 printed neither "RT pools:" nor "RT BVH:" even with a freshly
+voxelized level, because by the time the user looked at the HUD
+e_svoTI_RT_Active was already back to 0.
+
+C3DEngine::UpdateTISettings assigned all five e_svoTI_RT_* cvars from the
+level's TimeOfDay "TI advanced" params. Those five fields are never
+serialized - their SerializeSvoTi lines in TimeOfDayConstants.cpp are
+commented out ("Early version of RT is excluded from UI until we integrate
+proper version from Neon Noir branch") - so rtActive is always the
+constructor default false. Every ConstantsChanged() (level load, preset
+load, any edit in the Environment Editor) therefore silently switched
+triangle RT off. The write goes straight into the CVars struct member, not
+through ICVar::Set, so nothing is logged and no OnChange fires.
+
+The level params now apply only when the level actually asks for RT
+(tiAdv.rtActive), which preserves stock behaviour for the four legacy cvars
+whenever the switch is on and leaves the console in charge otherwise.
+
+Also in this change:
+
+- CSvoManager::OnDisplayInfo passed the status string as a printf FORMAT
+  string. The pool line contains a literal '%' ("= 3.2%"), which makes an
+  invalid conversion specifier and costs the whole line. It is passed as
+  "%s" data now.
+- Both RT lines test the cvar BEFORE slotId++, like the VoxSeg line, so a
+  suppressed line does not consume a slot and silence later lines.
+- CSvoEnv::m_rtStats was never initialised, so the BVH line printed heap
+  garbage until the first build. RTCachePoolDims resets it.
+- New CSvoEnv::RTFormatPoolLine / RTFormatBvhLine hold the two lines once;
+  RTLogStatsWhenReady prints them to the log as "SVO RT: ..." once per
+  completed voxelization pass, so the numbers are reachable even when the
+  HUD is not.
+- CSvoEnv::RTCountUvScaleMismatch: known gap 7.2 (one atlas UV scale per
+  material) now counts offending materials, warns once per level naming the
+  material, and reports the count as "texScale N" in the BVH line.
+- New cvar e_svoTI_RT_LightGridDim (16), mirrored by the renderer in 2A.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SCUvWGLCsqzm3VNMzp4uiS
+---
+ Code/CryEngine/Cry3DEngine/SVO/SceneTree.cpp  | 103 +++++++++++++++++-
+ Code/CryEngine/Cry3DEngine/SVO/SceneTree.h    |  13 +++
+ .../Cry3DEngine/SVO/SceneTreeCVars.inl        |   1 +
+ .../Cry3DEngine/SVO/SceneTreeManager.cpp      |  25 ++---
+ 4 files changed, 122 insertions(+), 20 deletions(-)
+
+diff --git a/Code/CryEngine/Cry3DEngine/SVO/SceneTree.cpp b/Code/CryEngine/Cry3DEngine/SVO/SceneTree.cpp
+index 9c90dc33..75d857fc 100644
+--- a/Code/CryEngine/Cry3DEngine/SVO/SceneTree.cpp
++++ b/Code/CryEngine/Cry3DEngine/SVO/SceneTree.cpp
+@@ -2189,6 +2189,10 @@ static int RTSnapPow2(int value, int lo, int hi)
+ 
+ void CSvoEnv::RTCachePoolDims()
+ {
++	// SRTBuildStats is a plain struct inside CSvoEnv, so without this the status line printed
++	// whatever was on the heap until the first BVH was built
++	m_rtStats.Reset();
++
+ 	if (m_rtPoolXY)
+ 		return;
+ 
+@@ -2579,6 +2583,79 @@ void CSvoEnv::CheckUpdateMeshPools()
+ 
+ 	RTUploadDirtySlices();
+ 	RTProcessPendingFrees();
++	RTLogStatsWhenReady();
++}
++
++//! Known gap 7.2 (report 01b): the material record carries one atlas UV scale, taken from the
++//! albedo copy, so a normal / specular / emissive copy of a different size samples with the wrong
++//! scale. Warn once, keep counting, and report the count in the status line.
++void CSvoEnv::RTCountUvScaleMismatch(const char* szMatName)
++{
++	AUTO_LOCK(m_rtPendingLock);   // called from the streaming workers
++
++	m_rtUvScaleMismatch++;
++
++	if (!m_rtUvScaleWarned)
++	{
++		m_rtUvScaleWarned = true;
++		CryWarning(VALIDATOR_MODULE_3DENGINE, VALIDATOR_WARNING,
++		           "SVO RT: material '%s' has a normal/specular/emissive texture of a different size than its diffuse; "
++		           "the ray traced hit samples those layers with the diffuse UV scale (one scale per material record). "
++		           "Make the maps the same size, or lower e_svoTI_RT_MaxTexRes so both snap to the same atlas size.",
++		           szMatName ? szMatName : "?");
++	}
++}
++
++void CSvoEnv::RTFormatPoolLine(char* szOut, size_t bufSize) const
++{
++	// PodArray::CheckAllocated sets Count() to the full capacity, so the old "Count / capacity"
++	// always printed 1.00 (research/01 finding 15). Report the allocator instead.
++	const int recordsTotal = max(1, GetRTPoolRecords() - SVO_RT_SEG_STATIC);
++
++	// note: the '%%' below only survives because BOTH consumers pass this string through a "%s"
++	cry_sprintf(szOut, bufSize, "RT pools: records %d of %d = %.1f%% (%d MB), atlas %d of %d (%d MB)",
++	            m_rtRecordsUsed, recordsTotal, 100.f * m_rtRecordsUsed / recordsTotal,
++	            int((int64)GetRTPoolXY() * GetRTPoolXY() * GetRTPoolZ() * sizeof(Vec4) / 1024 / 1024),
++	            m_rtTexSlicesUsed, GetRTTexPoolZ(),
++	            int((int64)GetRTTexRes() * GetRTTexRes() * GetRTTexPoolZ() * sizeof(ColorB) / 1024 / 1024));
++}
++
++void CSvoEnv::RTFormatBvhLine(char* szOut, size_t bufSize) const
++{
++	const SRTBuildStats& st = m_rtStats;
++
++	cry_sprintf(szOut, bufSize, "RT BVH: %d cells, %d K tris, %d K nodes, %d leaves, depth %d, maxLeaf %d, %d mats, uvClamp %d, texScale %d, skip %d, %.0f ms",
++	            st.cells, st.tris / 1000, st.nodes / 1000, st.leaves, st.maxDepth, st.maxLeafTris,
++	            st.mats, st.uvClamped, m_rtUvScaleMismatch, st.trisSkipped, st.buildMs);
++}
++
++//! Belt and braces for the HUD: print the same two lines to the log once, when a voxelization pass
++//! has finished. Reaching the numbers must not depend on r_DisplayInfo being visible.
++void CSvoEnv::RTLogStatsWhenReady()
++{
++	const bool bReady = Get3DEngine()->IsSvoReady(true);
++
++	if (!bReady)
++	{
++		m_rtWasReady = false;
++		m_rtStatsLogged = false;
++		return;
++	}
++
++	if (m_rtWasReady || m_rtStatsLogged || !m_rtStats.cells)
++	{
++		m_rtWasReady = true;
++		return;
++	}
++
++	m_rtWasReady = true;
++	m_rtStatsLogged = true;
++
++	char szLine[256];
++	RTFormatPoolLine(szLine, sizeof(szLine));
++	PrintMessage("SVO RT: %s", szLine);
++	RTFormatBvhLine(szLine, sizeof(szLine));
++	PrintMessage("SVO RT: %s", szLine);
+ }
+ 
+ bool C3DEngine::GetSvoStaticTextures(I3DEngine::SSvoStaticTexInfo& svoInfo, PodArray<I3DEngine::SLightTI>* pLightsTI_S, PodArray<I3DEngine::SLightTI>* pLightsTI_D)
+@@ -2683,11 +2760,27 @@ void C3DEngine::UpdateTISettings()
+ 	GetCVars()->e_svoTI_IntegrationMode = 0;
+ 	#endif
+ 
+-	GetCVars()->e_svoTI_RT_Active = tiAdv.rtActive;
+-	GetCVars()->e_svoTI_RT_MaxDistRay = tiAdv.rtMaxDistRay;
+-	GetCVars()->e_svoTI_RT_MaxDistCam = tiAdv.rtMaxDistCam;
+-	GetCVars()->e_svoTI_RT_MinGloss = tiAdv.rtMinGloss;
+-	GetCVars()->e_svoTI_RT_MinRefl = tiAdv.rtMinRefl;
++	// The five RT parameters of the level's "TI advanced" block are NOT serialized: their
++	// SerializeSvoTi lines are commented out (TimeOfDayConstants.cpp, "Early version of RT is
++	// excluded from UI until we integrate proper version from Neon Noir branch"), so tiAdv.rtActive
++	// is always its constructor default false and the other four are always the constructor
++	// defaults. Assigning them unconditionally therefore did not transport a level setting - it
++	// silently reset the console values to the struct defaults on every ConstantsChanged()
++	// (level load, preset load, and every edit in the Environment Editor). Because these are direct
++	// writes to the CVars struct member, not ICVar::Set, nothing is logged and no OnChange fires:
++	// triangle RT just stopped working mid session with no trace. Evidence in the 2B report.
++	//
++	// Stock behaviour is preserved for a level that really does ask for RT: when rtActive is set
++	// (which only a level authored with the fields re-enabled can do) all five are applied exactly
++	// as before. Otherwise the console stays in charge, which is the only way RT can be driven today.
++	if (tiAdv.rtActive)
++	{
++		GetCVars()->e_svoTI_RT_Active = 1;
++		GetCVars()->e_svoTI_RT_MaxDistRay = tiAdv.rtMaxDistRay;
++		GetCVars()->e_svoTI_RT_MaxDistCam = tiAdv.rtMaxDistCam;
++		GetCVars()->e_svoTI_RT_MinGloss = tiAdv.rtMinGloss;
++		GetCVars()->e_svoTI_RT_MinRefl = tiAdv.rtMinRefl;
++	}
+ 
+ 	if (Cry3DEngineBase::GetCVars()->e_svoStreamVoxels != 2)
+ 		GetCVars()->e_svoStreamVoxels = tiAdv.streamVoxels ? 1 : 0;
+diff --git a/Code/CryEngine/Cry3DEngine/SVO/SceneTree.h b/Code/CryEngine/Cry3DEngine/SVO/SceneTree.h
+index afdc9886..4c4bab1c 100644
+--- a/Code/CryEngine/Cry3DEngine/SVO/SceneTree.h
++++ b/Code/CryEngine/Cry3DEngine/SVO/SceneTree.h
+@@ -177,6 +177,15 @@ public:
+ 
+ 	void RTUploadDirtySlices();
+ 
++	//! Known gap 7.2 - one atlas UV scale per material. Counted and warned about once per level.
++	void RTCountUvScaleMismatch(const char* szMatName);
++
++	//! The two RT status lines, shared by the r_DisplayInfo HUD and the log (2B).
++	void RTFormatPoolLine(char* szOut, size_t bufSize) const;
++	void RTFormatBvhLine(char* szOut, size_t bufSize) const;
++	//! Prints both lines to the log once per completed voxelization pass.
++	void RTLogStatsWhenReady();
++
+ 	PodArray<I3DEngine::SLightTI>            m_lightsTI_S, m_lightsTI_D;
+ 	PodArray<I3DEngine::SAnalyticalOccluder> m_analyticalOccluders[2];
+ 	Vec4                      m_vSvoOriginAndSize;
+@@ -242,6 +251,10 @@ public:
+ 	int                      m_rtTexSlicesUsed = 0;
+ 	bool                     m_rtOverflowWarned = false;
+ 	bool                     m_rtTexOverflowWarned = false;
++	int                      m_rtUvScaleMismatch = 0;     //!< materials whose non albedo copy has another size
++	bool                     m_rtUvScaleWarned = false;
++	bool                     m_rtStatsLogged = false;     //!< log line already printed for this voxelization pass
++	bool                     m_rtWasReady = true;
+ 	bool                     m_rtSelfTestDone = false;
+ 	SRTBuildStats            m_rtStats;
+ };
+diff --git a/Code/CryEngine/Cry3DEngine/SVO/SceneTreeCVars.inl b/Code/CryEngine/Cry3DEngine/SVO/SceneTreeCVars.inl
+index 334dc2d6..bf6c4c86 100644
+--- a/Code/CryEngine/Cry3DEngine/SVO/SceneTreeCVars.inl
++++ b/Code/CryEngine/Cry3DEngine/SVO/SceneTreeCVars.inl
+@@ -264,6 +264,7 @@ REGISTER_CVAR_AUTO(int, e_svoTI_RT_MaxBounces, 1, VF_EXPERIMENTAL, "Maximum numb
+ REGISTER_CVAR_AUTO(int, e_svoTI_RT_LeafTris, 4, VF_EXPERIMENTAL, "Maximum number of triangles stored in one BVH leaf");
+ REGISTER_CVAR_AUTO(int, e_svoTI_RT_MaxDepth, 18, VF_EXPERIMENTAL, "Maximum BVH depth; the consumer traversal stack is sized for this value plus two");
+ REGISTER_CVAR_AUTO(int, e_svoTI_RT_SelfTest, 0, VF_EXPERIMENTAL, "Run the BVH builder and record encoding self test once on level load and print the result into the log");
++REGISTER_CVAR_AUTO(int, e_svoTI_RT_LightGridDim, 16, VF_EXPERIMENTAL, "Light-mask grid resolution per axis for RT hit shading, multiple of 8");
+ REGISTER_CVAR_AUTO(float, e_svoTI_Specular_Sev, 1, VF_NULL, "Controls severity of specular cones; this value limits the material glossiness");
+ REGISTER_CVAR_AUTO(float, e_svoVoxDistRatio, 14.f, VF_NULL, "Limits the distance where real-time GPU voxelization used");
+ REGISTER_CVAR_AUTO(int, e_svoVoxGenRes, 512, VF_NULL, "GPU voxelization dummy render target resolution");
+diff --git a/Code/CryEngine/Cry3DEngine/SVO/SceneTreeManager.cpp b/Code/CryEngine/Cry3DEngine/SVO/SceneTreeManager.cpp
+index da788a2d..a4da197a 100644
+--- a/Code/CryEngine/Cry3DEngine/SVO/SceneTreeManager.cpp
++++ b/Code/CryEngine/Cry3DEngine/SVO/SceneTreeManager.cpp
+@@ -125,25 +125,17 @@ char* CSvoManager::GetStatusString(int lineId)
+ 		return szText;
+ 	}
+ 
+-	// RT pool fill: PodArray::CheckAllocated sets Count() to the full capacity, so the old
+-	// "Count / capacity" always printed 1.00 (research/01 finding 15). Report the allocator instead.
+-	if (lineId == (slotId++) && Cry3DEngineBase::GetCVars()->e_svoTI_RT_Active)
++	// The cvar is tested BEFORE slotId++ (like the VoxSeg line above): a suppressed line must not
++	// consume a slot, or every line after it becomes unreachable and the caller's loop stops early.
++	if (Cry3DEngineBase::GetCVars()->e_svoTI_RT_Active && lineId == (slotId++))
+ 	{
+-		const int recordsTotal = max(1, gSvoEnv->GetRTPoolRecords() - SVO_RT_SEG_STATIC);
+-		cry_sprintf(szText, "RT pools: records %d of %d = %.1f%% (%d MB), atlas %d of %d (%d MB)",
+-		            gSvoEnv->m_rtRecordsUsed, recordsTotal, 100.f * gSvoEnv->m_rtRecordsUsed / recordsTotal,
+-		            int((int64)gSvoEnv->GetRTPoolXY() * gSvoEnv->GetRTPoolXY() * gSvoEnv->GetRTPoolZ() * sizeof(Vec4) / 1024 / 1024),
+-		            gSvoEnv->m_rtTexSlicesUsed, gSvoEnv->GetRTTexPoolZ(),
+-		            int((int64)gSvoEnv->GetRTTexRes() * gSvoEnv->GetRTTexRes() * gSvoEnv->GetRTTexPoolZ() * sizeof(ColorB) / 1024 / 1024));
++		gSvoEnv->RTFormatPoolLine(szText, sizeof(szText));
+ 		return szText;
+ 	}
+ 
+-	if (lineId == (slotId++) && Cry3DEngineBase::GetCVars()->e_svoTI_RT_Active)
++	if (Cry3DEngineBase::GetCVars()->e_svoTI_RT_Active && lineId == (slotId++))
+ 	{
+-		const SRTBuildStats& st = gSvoEnv->m_rtStats;
+-		cry_sprintf(szText, "RT BVH: %d cells, %d K tris, %d K nodes, %d leaves, depth %d, maxLeaf %d, %d mats, uvClamp %d, skip %d, %.0f ms",
+-		            st.cells, st.tris / 1000, st.nodes / 1000, st.leaves, st.maxDepth, st.maxLeafTris,
+-		            st.mats, st.uvClamped, st.trisSkipped, st.buildMs);
++		gSvoEnv->RTFormatBvhLine(szText, sizeof(szText));
+ 		return szText;
+ 	}
+ 
+@@ -267,7 +259,10 @@ void CSvoManager::OnDisplayInfo(float& textPosX, float& textPosY, float& textSte
+ 		int lineId = 0;
+ 		while (char* szStatus = CSvoManager::GetStatusString(lineId))
+ 		{
+-			Get3DEngine()->DrawTextRightAligned(textPosX, textPosY += textStepY, textScale, ColorF(0.5f, 1.0f, 1.0f), szStatus);
++			// szStatus is DATA, not a format string: the RT pool line contains a literal '%' and
++			// MSVC's vsnprintf rejects the whole format on the invalid specifier that makes,
++			// which silently dropped the line (2B).
++			Get3DEngine()->DrawTextRightAligned(textPosX, textPosY += textStepY, textScale, ColorF(0.5f, 1.0f, 1.0f), "%s", szStatus);
+ 			lineId++;
+ 		}
+ 	}
+-- 
+2.47.1.windows.1
+

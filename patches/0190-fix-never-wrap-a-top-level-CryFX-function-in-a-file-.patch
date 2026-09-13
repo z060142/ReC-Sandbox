@@ -1,0 +1,106 @@
+From c0857963153dbcd293939c381a530dab7a66e953 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Sun, 13 Sep 2026 23:49:28 +0800
+Subject: [PATCH 190/190] fix: never wrap a top-level CryFX function in a
+ file-scope %-flag #if
+
+RT_IsTriPixel and RT_GetFadedNormal sat between a file-scope `#if %_RT_QUALITY` and
+its `#endif`, and that made RenderLightingCommonVS and BuildRayTracingLightListCS
+fail to compile with "undeclared identifier 'IsDiffuseMode'".
+
+The rule, from the parser:
+
+  - CryFX strips unused code per entry point by REACHABILITY, but only for NAMED code
+    fragments: InitShaderDependenciesList (ShaderFXParseBin.cpp:2070-2094) walks the
+    entry function's token range, pulls in every eFT_Function / eFT_StorageClass whose
+    name token it finds, and recurses.
+  - ParserBin.cpp:2157-2171 turns every file-scope preprocessor directive into its own
+    SCodeFragment and NEVER assigns m_dwName.
+  - ParseBinFX_Technique_Pass_GenerateShaderData (ShaderFXParseBin.cpp:2961-2969)
+    emits a fragment unconditionally when m_dwName is 0 - the reachability list is
+    consulted only for named ones.
+
+So a %-flag conditional region at file scope reaches every stage's generated script,
+while the named helpers the code inside it calls are still stripped from the stages
+that do not reach them. Plain #define guards (ENABLE_TESSELLATION, FEATURE_SVO_GI,
+SVO_LMAPS, NV_VR_*) are safe because the real preprocessor resolves them before CryFX
+ever tokenizes the file - which is why every stock file-scope guard around a top-level
+function in this tree is one of those, and why this had never bitten before.
+
+Left unwrapped, both helpers are ordinary named fragments: the pixel entry points that
+call them pull them in, every other stage strips them, and RT_GetFadedNormal's ddx/ddy
+never reach a stage with no derivatives. Their bodies compile in every permutation
+(VOX_MAX_RT_* and SVO_RTParams1 are declared unconditionally), so no guard is needed.
+A #if INSIDE a struct body or a function body stays as it was - CE's own
+pixoutMRTUpscale and the %_PS blocks in CommonSVO.cfi are the precedent.
+
+Shader only, no C++ change. rtharness2 re-run: 16 ps_5_0 compiles across
+(QUALITY, SAMPLE6), (QUALITY, SAMPLE6, PARTICLE_SHADOW), (QUALITY) and (SAMPLE4),
+plus the cs_5_0 light grid. 0 errors.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SCUvWGLCsqzm3VNMzp4uiS
+---
+ .../Shaders/HWScripts/CryFX/CommonSVO_RT.cfi  |  3 +++
+ .../HWScripts/CryFX/Total_Illumination.cfx    | 24 +++++++++++++++++--
+ 2 files changed, 25 insertions(+), 2 deletions(-)
+
+diff --git a/Engine/Shaders/HWScripts/CryFX/CommonSVO_RT.cfi b/Engine/Shaders/HWScripts/CryFX/CommonSVO_RT.cfi
+index ce8570fc..fdebb221 100644
+--- a/Engine/Shaders/HWScripts/CryFX/CommonSVO_RT.cfi
++++ b/Engine/Shaders/HWScripts/CryFX/CommonSVO_RT.cfi
+@@ -113,6 +113,9 @@ struct SRTInfo
+ 	// rt stage 2C, debug only: the raw tangent-space _ddna sample of the hit, before the
+ 	// distance fade and before the tangent-to-world rotation. Debug view 10 renders it, so a
+ 	// "flat normals" finding can be pinned on the atlas layer instead of on the fade.
++	// A #if INSIDE a struct body is safe - CE's own pixoutMRTUpscale does it
++	// (Total_Illumination.cfx:194-197). A #if at FILE SCOPE around a top-level function is
++	// not; see the warning above RT_IsTriPixel in Total_Illumination.cfx.
+ 	float4   dbgAtlasNormal;
+ #endif
+ 
+diff --git a/Engine/Shaders/HWScripts/CryFX/Total_Illumination.cfx b/Engine/Shaders/HWScripts/CryFX/Total_Illumination.cfx
+index 2063607a..6a6e7b35 100644
+--- a/Engine/Shaders/HWScripts/CryFX/Total_Illumination.cfx
++++ b/Engine/Shaders/HWScripts/CryFX/Total_Illumination.cfx
+@@ -1009,7 +1009,28 @@ float GetBlendMin(float2 tc0, float2 tc1, float fAverSmoothness, float fDepth0,
+ 	return saturate(fMinBlend);
+ }
+ 
+-#if %_RT_QUALITY
++///////////////////////////////////////////////////////////////////////////////////
++// !!! DO NOT WRAP THESE TWO IN A FILE-SCOPE #if. !!!
++//
++// CryFX's dead-code stripping only reaches NAMED code fragments. ParserBin.cpp:2157-2171
++// turns every file-scope preprocessor directive into a code fragment whose m_dwName is never
++// assigned, and ShaderFXParseBin.cpp:2961-2969 copies every unnamed fragment into EVERY
++// stage's generated script without consulting the reachability list that
++// InitShaderDependenciesList (ShaderFXParseBin.cpp:2070-2094) built. A top-level function
++// sitting between a file-scope #if and its #endif therefore reaches the VS and the CS as
++// well, while the helpers it calls - which ARE named fragments - are correctly stripped from
++// them, and the stage fails with "undeclared identifier". That is exactly what
++// #if %_RT_QUALITY around RT_IsTriPixel did to RenderLightingCommonVS and
++// BuildRayTracingLightListCS: they got the body and not IsDiffuseMode (CommonSVO.cfi:226).
++//
++// Left unwrapped, both are ordinary named fragments: the pixel entry points that call them
++// pull them in, every other stage strips them, and RT_GetFadedNormal's ddx/ddy never reach a
++// stage that has no derivatives. This is how every function in CommonSVO_RT.cfi is written.
++// The only stock file-scope #if blocks around a top-level function in this tree are
++// `#ifdef SVO_LMAPS` (a plain define, never set) and Illum.cfx's `%SILHOUETTE_*` material
++// flag - no %_RT_ one, which is why nobody hit this before.
++///////////////////////////////////////////////////////////////////////////////////
++
+ ///////////////////////////////////////////////////////////////////////////////////
+ // rt stage 2C: the ONE predicate that decides "this pixel is traced with triangles".
+ //
+@@ -1053,7 +1074,6 @@ float3 RT_GetFadedNormal(const float3 vPos0, const float3 vNor0, const float fDi
+ 
+ 	return normalize(lerp(vFlat, vNor0, RT_GetNormalsFade(fDistM)));
+ }
+-#endif
+ 
+ #define SVO_MAX_PORTALS 8
+ 
+-- 
+2.47.1.windows.1
+

@@ -1,0 +1,671 @@
+From 9b51ff8d5bdec0db0ba377239a5bc3f9c6adb22f Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Sun, 13 Sep 2026 23:27:26 +0800
+Subject: [PATCH 188/190] fix: sharp, unhazed ray traced reflections and a
+ provable sun shadow at the hit
+
+Stage 2C, shader side. Five findings, all inside %_RT_QUALITY / %_RT_PARTICLE_SHADOW
+blocks or behind a per-pixel predicate that is a compile-time false off the flag.
+
+(a) A normal mapped mirror printed its detail map into the reflection as a regular
+    grid: the reflect direction was built from the per-pixel shading normal. Neo's
+    ti_RT_NormalsFading is transplanted as e_svoTI_RT_NormalsFading and applied to
+    the reflecting surface as well as to the hit; the flat normal comes from the
+    screen space derivatives of the reconstructed world position.
+
+(b) Blur. Three causes, all cone tracing reconstruction applied to a picture that is
+    already final and already full resolution: the stochastic gloss kernel
+    (kern += vFocus * power / 25, offset indexed by the screen dither tile, so it is
+    also a second source of (a)), portal ray bending (portal chosen by the same tile
+    index), the demosaic min/max spread, and UpScalePS's five tap +-1.5 texel kernel
+    with its quarter texel centre bias. Triangle rays now take the exact mirror
+    direction, and DemosaicPS / UpScalePS collapse to a single tap for RT pixels,
+    which is Neo's own answer (neo:1468-1472, neo:2340-2346).
+
+(c) Sun shadow: the cascade walk was structurally correct but unprovable. Debug view
+    7 renders the factor directly (white = the hit sees the sun), and the sun lobe is
+    now accumulated instead of assigned, which is what Callback_ShadingDirect's out
+    parameters actually promise. View 8 renders sun + local lights before probes.
+
+(d) Haze. A ray that hit nothing was still fogged over the full e_svoTI_RT_MaxDistRay
+    sentinel, dragging every escaped pixel towards the fog colour; and UpScalePS added
+    e_svoTI_DiffuseBias * sky top on top of a fully shaded hit. Both dropped for RT
+    pixels. The demosaic and upscale clamps go from 8 to Neo's 100, because that
+    channel now carries a real radiance instead of a unit length chroma. Debug view 9
+    renders the raw accumulator before fog, clamp and exposure.
+
+(e) Every hit came back with a flat normal and no gloss response:
+    RT_ProcessBestHit scaled the normal map by CV_TerrainInfo.y, which Neo uses as its
+    normals fading distance but which CE 5.7.1 fills as a hard zero
+    (GraphicsPipeline.cpp:1280). Driven off the new cvar lane instead. Debug views 10,
+    11 and 12 render the raw atlas normal, the hit smoothness and the hit reflectance
+    so the remaining half of the finding can be pinned on the atlas producer.
+
+Validated with scene-notes/rt/tools/rtharness2: ShadePS, ConeTracePS, DemosaicPS and
+UpScalePS compile clean in (QUALITY, SAMPLE6), (QUALITY, SAMPLE6, PARTICLE_SHADOW),
+(QUALITY) and (SAMPLE4), plus BuildRayTracingLightListCS as cs_5_0.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SCUvWGLCsqzm3VNMzp4uiS
+---
+ .../Shaders/HWScripts/CryFX/CommonSVO_RT.cfi  |  71 ++++-
+ .../HWScripts/CryFX/Total_Illumination.cfx    | 246 ++++++++++++++++--
+ .../CryFX/Total_Illumination_Shading.cfi      |  41 ++-
+ 3 files changed, 333 insertions(+), 25 deletions(-)
+
+diff --git a/Engine/Shaders/HWScripts/CryFX/CommonSVO_RT.cfi b/Engine/Shaders/HWScripts/CryFX/CommonSVO_RT.cfi
+index aa125c89..ce8570fc 100644
+--- a/Engine/Shaders/HWScripts/CryFX/CommonSVO_RT.cfi
++++ b/Engine/Shaders/HWScripts/CryFX/CommonSVO_RT.cfi
+@@ -33,6 +33,15 @@ float4 SVO_RTPoolInfo;
+ // stage-1A report.
+ float4 SVO_RTParams0;
+ 
++// rt stage 2C. (normalsFading, 0, 0, 0). .x = e_svoTI_RT_NormalsFading in METRES, the distance
++// past which a ray traced surface fades into its flat normal; <= 0 disables the fade entirely
++// (normal maps are used at any distance). Two consumers, both Neo's:
++//   - RT_ProcessBestHit below, for the HIT's normal map (this is what Neo drove off
++//     CV_TerrainInfo.y; in CE 5.7.1 that lane is hard zero, see the comment there);
++//   - ConeTracePS, for the REFLECTING surface's normal, which is what turns a normal-mapped
++//     mirror's reflection into a fine grid of slightly different ray directions.
++float4 SVO_RTParams1;
++
+ #define VOX_RT_TRI_DATA_SIZE               4
+ 
+ // Pool segmentation in record units (decision 02 section 2.3).
+@@ -57,6 +66,16 @@ float4 SVO_RTParams0;
+ #define VOX_RT_GLOSS_SCALE                 (SVO_RTParams0.y)
+ #define VOX_RT_MIX_WITH_PROBES             (SVO_RTParams0.z)
+ #define VOX_RT_DEBUG_MODE                  (SVO_RTParams0.w)
++#define VOX_RT_NORMALS_FADING              (SVO_RTParams1.x)
++
++// "How much of the normal map survives at this distance": 1 inside VOX_RT_NORMALS_FADING metres,
++// falling off as 1/d beyond it (Neo's own curve, RT_ProcessBestHit). A fading value of 0 or less
++// means "never fade" and returns 1, so the feature is off by default rather than flat by default.
++float RT_GetNormalsFade(const float fDistM)
++{
++	const float fFading = VOX_RT_NORMALS_FADING;
++	return (fFading > 0.f) ? saturate(fFading / max(fDistM, 0.01f)) : 1.f;
++}
+ 
+ ///////////////////////////////////////////////////////////////////////////////////
+ // Structures
+@@ -90,6 +109,13 @@ struct SRTInfo
+ 	// together in ShadePS. 511 (= white) whenever the material has no emissive map.
+ 	float    emissiveTintPacked;
+ 
++#if %_RT_PARTICLE_SHADOW
++	// rt stage 2C, debug only: the raw tangent-space _ddna sample of the hit, before the
++	// distance fade and before the tangent-to-world rotation. Debug view 10 renders it, so a
++	// "flat normals" finding can be pinned on the atlas layer instead of on the fade.
++	float4   dbgAtlasNormal;
++#endif
++
+ 	// Stage-1 provisional colour (decision 06 section 6.5): the SVO cell that produced the
+ 	// current best hit, so the voxel irradiance can be sampled at the hit point.
+ 	float3   cellTC;
+@@ -261,6 +287,9 @@ void RT_ResetInfo(const float3 vFocus, const float fMaxDist, const float fCamDis
+ 	g_rtInfo.raydir = 0;
+ 	g_rtInfo.stippleAlphaRef = fStippleAlphaRef;
+ 	g_rtInfo.emissiveTintPacked = 0;
++#if %_RT_PARTICLE_SHADOW
++	g_rtInfo.dbgAtlasNormal = float4(0.5f, 0.5f, 1.0f, 1.0f);
++#endif
+ 
+ 	g_rtInfo.cellTC = 0;
+ 	g_rtInfo.cellMin = 0;
+@@ -584,6 +613,10 @@ void RT_ProcessBestHit(const Ray rOrig, inout SRTInfo rtInfo, const float fDista
+ 		const float4 vSpc = (nTexSlotSpc >= 0) ? RT_SampleAtlas(best.vPosTC, nTexSlotSpc) : float4(1.0, 1.0, 1.0, 1.0);
+ 		const float4 vEmm = (nTexSlotEmm >= 0) ? RT_SampleAtlas(best.vPosTC, nTexSlotEmm) : float4(1.0, 1.0, 1.0, 1.0);
+ 
++#if %_RT_PARTICLE_SHADOW
++		rtInfo.dbgAtlasNormal = (nTexSlotNor >= 0) ? vNor : float4(0.5, 0.5, 1.0, -1.0); // .w < 0 = no slot
++#endif
++
+ 		// rebuild the tangent frame of the winning triangle
+ 		const int3 nTC = RT_RecordTC(best.nMatDataTC.w);
+ 		const float4 v0 = LoadTexel(geomPool_Tris, uint3(nTC.x + 0, nTC.y, nTC.z));
+@@ -607,7 +640,15 @@ void RT_ProcessBestHit(const Ray rOrig, inout SRTInfo rtInfo, const float fDista
+ 
+ 		const half3x3 mTangentToWS = half3x3(tang, btan, norm);
+ 
+-		const float fBumpFade = saturate(CV_TerrainInfo.y / (best.camDistance + best.nearestHitDist + 0.1f));
++		// rt stage 2C, finding (e). Neo writes this as
++		//     saturate(CV_TerrainInfo.y / (camDist + hitDist + 0.1))
++		// i.e. "fade the hit's normal map out past ti_RT_NormalsFading metres". In CE 5.7.1
++		// CV_TerrainInfo is filled as Vec4(GetTerrainTextureMultiplier(), 0, 0, 0)
++		// (GraphicsPipeline.cpp:1280) - .y is a HARD ZERO, so the transplanted line multiplied
++		// the normal-map strength by exactly 0 and every ray traced hit came back with a flat
++		// tangent normal: diffuse colour but no surface detail, and a mirror-flat specular lobe.
++		// Driven off our own cvar lane instead; 0 (the default) now means "no fade".
++		const float fBumpFade = RT_GetNormalsFade(best.camDistance + best.nearestHitDist);
+ 		rtInfo.normal_reflectance.xyz = normalize(mul(lerp(float4(0.5, 0.5, 1.0, 1.0), vNor, matInfo1.x * fBumpFade).xyz * 2.f - 1.f, mTangentToWS));
+ 
+ 		rtInfo.normal_reflectance.w = PackRGB(matInfo1.y * vSpc.xyz);
+@@ -693,7 +734,10 @@ float3 RT_SampleVoxelIrradiance(const float3 tcMin, const float4 voxAreaMin, con
+ }
+ 
+ // e_svoTI_RT_Debug, mirrored into SVO_RTParams0.w (decision 05 section 5.3):
+-// 1 hit test count, 2 hit normals, 3 hit albedo, 4 hit distance, 5 incomplete mask.
++// 1 hit test count, 2 hit normals, 3 hit albedo, 4 hit distance, 5 incomplete mask,
++// 6 stage-1 provisional colour (ConeTracePS), 7 sun shadow at the hit / 8 direct light before
++// probes / 9 raw ShadePass output (all three in ShadePS), 10 raw atlas normal, 11 hit
++// smoothness, 12 hit reflectance.
+ bool RT_GetDebugColor(out float3 vCol)
+ {
+ 	vCol = 0;
+@@ -725,10 +769,31 @@ bool RT_GetDebugColor(out float3 vCol)
+ 	{
+ 		vCol = g_rtInfo.best.incomplete ? float3(1, 0, 1) : (float3)0;
+ 	}
++	else if (nMode == 10)
++	{
++		// rt stage 2C (e): the RAW _ddna sample of the hit, tangent space, before the distance
++		// fade and before the rotation into world space. Flat lilac (0.5, 0.5, 1) everywhere
++		// means the atlas normal layer is flat or missing; a magenta tint (the .w < 0 marker)
++		// means the material record carries no normal slot at all.
++	#if %_RT_PARTICLE_SHADOW
++		vCol = bHit ? ((g_rtInfo.dbgAtlasNormal.w < 0.f) ? float3(1, 0, 1) : g_rtInfo.dbgAtlasNormal.xyz) : (float3)0;
++	#endif
++	}
++	else if (nMode == 11)
++	{
++		// hit smoothness, black = 0 (a perfectly rough hit, no gloss lobe), white = 1
++		vCol = bHit ? (float3)saturate(g_rtInfo.albedo_smoothness.w) : (float3)0;
++	}
++	else if (nMode == 12)
++	{
++		// hit reflectance (F0) as it survives PackRGB, x8 so a dielectric 0.04 is visible
++		vCol = bHit ? saturate(UnpackRGB(abs(g_rtInfo.normal_reflectance.w)) * 8.f) : (float3)0;
++	}
+ 	else
+ 	{
+ 		// mode 6 = the stage-1 provisional colour, produced in ConeTracePS itself (it needs the
+-		// SVO cell of the hit, which is not in SBestHit); anything above is unassigned.
++		// SVO cell of the hit, which is not in SBestHit); modes 7-9 are produced in ShadePS
++		// (they need the light data); anything else is unassigned.
+ 		return false;
+ 	}
+ 
+diff --git a/Engine/Shaders/HWScripts/CryFX/Total_Illumination.cfx b/Engine/Shaders/HWScripts/CryFX/Total_Illumination.cfx
+index baff6948..2063607a 100644
+--- a/Engine/Shaders/HWScripts/CryFX/Total_Illumination.cfx
++++ b/Engine/Shaders/HWScripts/CryFX/Total_Illumination.cfx
+@@ -1009,6 +1009,52 @@ float GetBlendMin(float2 tc0, float2 tc1, float fAverSmoothness, float fDepth0,
+ 	return saturate(fMinBlend);
+ }
+ 
++#if %_RT_QUALITY
++///////////////////////////////////////////////////////////////////////////////////
++// rt stage 2C: the ONE predicate that decides "this pixel is traced with triangles".
++//
++// ConeTracePS owns the decision, but DemosaicPS and UpScalePS have to reach the same answer
++// pixel for pixel, because an RT pixel is reconstructed with a single tap and a cone-traced
++// pixel is not. All three call GetAverNormAndSmooth at the same texel of the same G-buffer,
++// and with e_svoTI_RT_Active the specular set is forced to full resolution (D3D_SVO.cpp
++// CheckAllocateRT), so "the same texel" is literally the same pixel in all three passes and
++// the three answers are bit-identical.
++///////////////////////////////////////////////////////////////////////////////////
++bool RT_IsTriPixel(const float fAverSmoothness, const float3 vAverReflectance, const float fDistM)
++{
++	return !IsDiffuseMode()
++	       && fAverSmoothness > VOX_MAX_RT_MIN_GLOSS
++	       && GetLuminance(vAverReflectance) > VOX_MAX_RT_MIN_REFL
++	       && fDistM < VOX_MAX_RT_DIST_CAM;
++}
++
++// rt stage 2C, finding (a): the reflect direction of a normal-mapped mirror wobbles per pixel,
++// and because a normal/detail map tiles on a regular screen grid the reflection picks that grid
++// up directly. Neo's remedy is ti_RT_NormalsFading - fade the shading normal into the flat one
++// with distance - and this is the reflecting-surface half of it. The flat normal is taken from
++// the screen-space derivatives of the reconstructed world position, i.e. the geometric normal of
++// the triangle under the quad (Neo does the same thing in its refraction branch). It is rejected
++// where the quad straddles a depth discontinuity or a silhouette, in which case the shading
++// normal is kept. MUST be called from uniform control flow: it uses ddx/ddy.
++float3 RT_GetFadedNormal(const float3 vPos0, const float3 vNor0, const float fDistM)
++{
++	const float3 vGeo = cross(ddx(vPos0), ddy(vPos0));
++	const float  fGeoLen = length(vGeo);
++
++	float3 vFlat = vNor0;
++	if (fGeoLen > 1e-9f)
++	{
++		float3 vG = vGeo / fGeoLen;
++		if (dot(vG, vNor0) < 0)
++			vG = -vG;
++		if (dot(vG, vNor0) > 0.5f) // same surface, only the bump differs
++			vFlat = vG;
++	}
++
++	return normalize(lerp(vFlat, vNor0, RT_GetNormalsFade(fDistM)));
++}
++#endif
++
+ #define SVO_MAX_PORTALS 8
+ 
+ float4 SVO_PortalsPos[SVO_MAX_PORTALS];
+@@ -1100,6 +1146,18 @@ pixoutMRTDemosaic DemosaicPS(vtxOutWPOS IN)
+ 	// reduce range at distance
+ 	const float fDistM = length(vPos0 - PS_WorldViewPos.xyz);
+ 
++#if %_RT_QUALITY
++	// rt stage 2C, finding (b). A triangle-ray pixel already carries a FINAL shaded colour at
++	// full resolution (ShadePass wrote it); the min/max demosaic exists to reconstruct a
++	// half-resolution stochastic cone trace and has nothing left to do here except smear it.
++	// Neo reaches the same place from the other end - its specular filter radius collapses to
++	// 0.1 under mesh ray tracing (neo:1014) - and the same single tap is what makes its upscale
++	// (neo:2340) legal. So: one tap, at this pixel's own texel.
++	const bool bRTPixel = RT_IsTriPixel(fAverSmoothness, vAverReflectance, fDistM);
++	if (bRTPixel)
++		nRange = 1;
++#endif
++
+ 	//#if %_RT_SAMPLE0
+ 	//nRange = lerp(nRange, nRange / 2, saturate((fDistM - 8) / 8));
+ 	//#endif
+@@ -1169,15 +1227,33 @@ pixoutMRTDemosaic DemosaicPS(vtxOutWPOS IN)
+ 			fSumm1 += fWeigth1;
+ 		}
+ 
++	// rt stage 2C, finding (b) / (d). CE keeps only the CHROMA here and rebuilds the magnitude in
++	// UpScalePS out of the ALD lobe (vRGB * vALD.w, with an NdotH power of 2^12.5 for a mirror).
++	// That round trip is exact only for a single sample and an exactly-reconstructed half vector;
++	// for a triangle-ray pixel the colour is already final, so keep it as it is and let
++	// UpScalePS pass it through. Neo does exactly this (neo:1047 has no normalize, neo:2412
++	// assigns vRGB straight out).
++#if %_RT_QUALITY
++	const bool bKeepRTColour = bRTPixel;
++#else
++	const bool bKeepRTColour = false;
++#endif
++
+ 	if (fSumm0)
+ 	{
+ 		vALD0 /= fSumm0;
+-		vRGB0.xyz = normalize(vRGB0.xyz);
++		if (bKeepRTColour)
++			vRGB0.xyz /= fSumm0;
++		else
++			vRGB0.xyz = normalize(vRGB0.xyz);
+ 	}
+ 	if (fSumm1)
+ 	{
+ 		vALD1 /= fSumm1;
+-		vRGB1.xyz = normalize(vRGB1.xyz);
++		if (bKeepRTColour)
++			vRGB1.xyz /= fSumm1;
++		else
++			vRGB1.xyz = normalize(vRGB1.xyz);
+ 	}
+ 
+ 	OUT.Diffuse.xyz = vRGB0;
+@@ -1314,11 +1390,21 @@ pixoutMRTDemosaic DemosaicPS(vtxOutWPOS IN)
+ 	float fBlendMin = GetBlendMin(vReprojTC_Min.xy, IN.baseTC.xy, fAverSmoothness, fDepthMin, fDepthMinPrev);
+ 	float fBlendMax = GetBlendMin(vReprojTC_Max.xy, IN.baseTC.xy, fAverSmoothness, fDepthMax, fDepthMaxPrev);
+ 
+-	OUT.Diffuse = clamp(lerp(tex2DlodLC(sceneRgbMinPrev, float4(vReprojTC_Min.xy, 0, 0)), OUT.Diffuse, fBlendMin), -8, 8);
+-	OUT.Specular = clamp(lerp(tex2DlodLC(sceneAldMinPrev, float4(vReprojTC_Min.xy, 0, 0)), OUT.Specular, fBlendMin), -8, 8);
++	// rt stage 2C: CE's +-8 is a ceiling on a UNIT-LENGTH chroma plus an ALD lobe, which never
++	// gets near it. An RT pixel carries a real radiance in this channel now, and a reflected
++	// window or practical clips at 8 and turns grey. Neo's clamp for the same data is 100
++	// (neo:1114); use it for RT pixels only, so the stock path keeps its exact +-8.
++#if %_RT_QUALITY
++	const float fDemClamp = bRTPixel ? 100.f : 8.f;
++#else
++	const float fDemClamp = 8.f;
++#endif
++
++	OUT.Diffuse = clamp(lerp(tex2DlodLC(sceneRgbMinPrev, float4(vReprojTC_Min.xy, 0, 0)), OUT.Diffuse, fBlendMin), -fDemClamp, fDemClamp);
++	OUT.Specular = clamp(lerp(tex2DlodLC(sceneAldMinPrev, float4(vReprojTC_Min.xy, 0, 0)), OUT.Specular, fBlendMin), -fDemClamp, fDemClamp);
+ 
+-	OUT.Diffuse1 = clamp(lerp(tex2DlodLC(sceneRgbMaxPrev, float4(vReprojTC_Max.xy, 0, 0)), OUT.Diffuse1, fBlendMax), -8, 8);
+-	OUT.Specular1 = clamp(lerp(tex2DlodLC(sceneAldMaxPrev, float4(vReprojTC_Max.xy, 0, 0)), OUT.Specular1, fBlendMax), -8, 8);
++	OUT.Diffuse1 = clamp(lerp(tex2DlodLC(sceneRgbMaxPrev, float4(vReprojTC_Max.xy, 0, 0)), OUT.Diffuse1, fBlendMax), -fDemClamp, fDemClamp);
++	OUT.Specular1 = clamp(lerp(tex2DlodLC(sceneAldMaxPrev, float4(vReprojTC_Max.xy, 0, 0)), OUT.Specular1, fBlendMax), -fDemClamp, fDemClamp);
+ 
+ 	return OUT;
+ }
+@@ -1575,6 +1661,19 @@ pixoutMRTTrace ConeTracePS(vtxOutWPOS IN)
+ 
+ 	float3 vFocus = IsDiffuseMode() ? vNor0 : reflect(normalize(IN.CamVec.xyz), vNor0);
+ 
++#if %_RT_QUALITY
++	// rt stage 2C. The RT decision is hoisted out of the trace loop so that (i) the kernel can
++	// be replaced by the exact reflect direction before it is built, (ii) RT_GetFadedNormal can
++	// call ddx/ddy from uniform control flow, and (iii) DemosaicPS / UpScalePS can recompute the
++	// identical predicate from the identical inputs.
++	const bool bUseRT = RT_IsTriPixel(fAverSmoothness, vAverReflectance, fDistM);
++
++	// finding (a): triangle rays follow the DISTANCE-FADED normal, so a normal-mapped mirror
++	// stops printing its detail map into the reflection as a grid. e_svoTI_RT_NormalsFading 0
++	// (the default) leaves vFocusRT == vFocus and the picture unchanged.
++	const float3 vFocusRT = reflect(normalize(IN.CamVec.xyz), RT_GetFadedNormal(vPos0, vNor0, fDistM));
++#endif
++
+ 	float fNewDepth = SampleLinearDepth(sceneDepth, IN.baseTC.xy);
+ 
+ 	int2 nXY = int2(IN.baseTC.xy * PS_ScreenSize.xy);
+@@ -1653,6 +1752,18 @@ pixoutMRTTrace ConeTracePS(vtxOutWPOS IN)
+ 
+ 			power = exp2(10.h * fAverSmoothness + 1.h);
+ 
++#if %_RT_QUALITY
++			// rt stage 2C, finding (b). A triangle ray is a RAY, not a cone: it takes the exact
++			// mirror direction and no per-pixel kernel jitter. CE's "kern += vFocus*power/25"
++			// below is a stochastic gloss lobe whose offset comes from GetDiffuseKernel indexed
++			// by the screen-space dither tile, so on a surface that falls just under the .95
++			// knee it prints that tile into the reflection as a regular grid and blurs it. Neo
++			// is categorical about it: for a mirror "kern = vFocus" unless _RTGI_GLOSSY_REFLECTIONS
++			// is on (neo:1468-1472), and the glossy lobe is our stage 4.
++			if (bUseRT)
++				kern = vFocusRT;
++			else
++#endif
+ 			if (fAverSmoothness < .95)
+ 			kern += vFocus * power / 25;
+ 			else
+@@ -1669,7 +1780,15 @@ pixoutMRTTrace ConeTracePS(vtxOutWPOS IN)
+ 
+ 	#if !ORBIS
+ 		#if %_RT_SAMPLE5 && !%_RT_LIGHTVOLUME1 && %_RT_LIGHTVOLUME0
++		// rt stage 2C, finding (a)/(b): portal bending picks a portal with `i & 3`, i.e. with the
++		// screen-space dither tile, and bends the ray toward it - another per-pixel grid printed
++		// into the reflection, and geometrically wrong for a mirror in any case. It is a cone
++		// tracing importance-sampling trick; a triangle ray does not get one.
++		#if %_RT_QUALITY
++		if (SvoTreeSettings5.y && !bUseRT)
++		#else
+ 		if (SvoTreeSettings5.y)
++		#endif
+ 		{
+ 			float4 arrBestPortalPos[MAX_BEST_PORTALS];
+ 			float4 arrBestPortalDir[MAX_BEST_PORTALS];
+@@ -1704,11 +1823,6 @@ pixoutMRTTrace ConeTracePS(vtxOutWPOS IN)
+ 	#endif
+ 
+ #if %_RT_QUALITY
+-		const bool bUseRT = !IsDiffuseMode()
+-			&& fAverSmoothness > VOX_MAX_RT_MIN_GLOSS
+-			&& GetLuminance(vAverReflectance) > VOX_MAX_RT_MIN_REFL
+-			&& fDistM < VOX_MAX_RT_DIST_CAM;
+-
+ 		if (bUseRT)
+ 		{
+ 			// triangle rays get their own length budget, not the cone length
+@@ -1719,7 +1833,7 @@ pixoutMRTTrace ConeTracePS(vtxOutWPOS IN)
+ 			// scaled with distance, instead of relying on the 1 mm hit epsilon alone.
+ 			r.startpoint += normalize(vNor0) * max(0.002f, 0.0002f * fDistM);
+ 
+-			RT_ResetInfo(vFocus, VOX_MAX_RT_DIST_RAY, fDistM, RT_GetStippleAlphaRef(nXY), false);
++			RT_ResetInfo(vFocusRT, VOX_MAX_RT_DIST_RAY, fDistM, RT_GetStippleAlphaRef(nXY), false);
+ 		}
+ #else
+ 		const bool bUseRT = false;
+@@ -1887,7 +2001,8 @@ pixoutShade ShadePS(vtxOutWPOS IN)
+ 
+ 		float3 diffuseAcc = 0.0f;
+ 		float3 specularAcc = 0.0f;
+-		Fwd_StandardOpaqueShading_Raytracing(commonAttribs, fwdAttribs, diffuseAcc, specularAcc);
++		SRTShadeProbe dbgShade;
++		Fwd_StandardOpaqueShading_Raytracing(commonAttribs, fwdAttribs, diffuseAcc, specularAcc, dbgShade);
+ 
+ 		float3 acc = diffuseAcc + specularAcc + SVO_ShadeParams0.x * fwdAttribs.albedo + .0001f;
+ 
+@@ -1905,9 +2020,52 @@ pixoutShade ShadePS(vtxOutWPOS IN)
+ 		if (SVO_ShadeParams0.y) // debug: flat albedo
+ 			acc = fwdAttribs.albedo;
+ 
++		// rt stage 2C: debug views 7-9, the three questions the picture cannot answer on its own.
++		// They sit HERE, before the fog and the writer clamp, so that what they show is the term
++		// itself and not the term plus a veil. The exposure divide below and ApplyGI's multiply
++		// cancel exactly, so a value of 1 written here reaches the screen as 1.
++		bool bRawDebug = false;
++#if %_RT_PARTICLE_SHADOW
++		{
++			const int nDbg = (int)VOX_RT_DEBUG_MODE;
++			if (nDbg == 7)
++			{
++				// 7 = the sun shadow factor at the hit. WHITE = the hit sees the sun.
++				acc = (float3)dbgShade.sunVisibility;
++				bRawDebug = true;
++			}
++			else if (nDbg == 8)
++			{
++				// 8 = sun + local lights only, before any probe. What is left when this is
++				// subtracted from view 0 is the probe ambient, which is the term the directly
++				// seen surface does NOT get (ApplyGI mode 2 replaces it with the SVO result).
++				acc = dbgShade.directAcc;
++				bRawDebug = true;
++			}
++			else if (nDbg == 9)
++			{
++				// 9 = the raw accumulator: every light plus probes plus emissive, before the fog
++				// lerp, before the writer clamp and before the exposure divide.
++				bRawDebug = true;
++			}
++		}
++#endif
++
+ 		// Global fog, added BEFORE the exposure divide: GetVolumetricFogColorInternal already
+ 		// multiplies the authored fog colour by PS_HDR_RANGE_ADAPT_MAX on this branch, and `acc`
+ 		// is built from already-exposed lights, so both sides of the lerp are in the same units.
++		//
++		// rt stage 2C, finding (d): the vector passed to the fog is Neo's - the REFLECTED
++		// SEGMENT, not the camera-to-hit vector - and that is the right choice, because the fog
++		// over the camera-to-mirror segment is applied to this pixel again downstream by the
++		// scene fog pass. Passing vGPO.xyz (camera to hit) instead would fog that segment twice.
++		// What was wrong is that a MISS got fogged too: on a miss the "hit distance" is the
++		// arbitrary e_svoTI_RT_MaxDistRay sentinel and the hit position is a point 24 m along a
++		// ray that hit nothing, so the lerp pulled a sky/probe colour a fixed fraction of the way
++		// towards the fog colour everywhere at once - a flat grey veil over every part of the
++		// reflection that escaped, which is exactly the "hazy and washed out" report. A miss is
++		// resolved by the probes, and a sky probe already carries its own aerial perspective.
++		if (!bRawDebug && !bNoHit)
+ 		{
+ 			const float3 cameraToWorldPos = normalize(vGLD.xyz) * abs(vGLD.w);
+ 			const float3 worldPos = vGPO.xyz + GetWorldViewPos();
+@@ -1920,7 +2078,7 @@ pixoutShade ShadePS(vtxOutWPOS IN)
+ 		// codec expects - a ceiling in UNEXPOSED units applied to an EXPOSED value. On the
+ 		// scene-referred path the only meaningful ceiling is the fp16 writer clamp, applied
+ 		// while the value is still exposed, exactly as Illum.cfx does it.
+-		if (SCENE_WRITER_CLAMP > 0)
++		if (!bRawDebug && SCENE_WRITER_CLAMP > 0)
+ 			acc = min(acc, (float3)SCENE_WRITER_CLAMP);
+ 
+ 		// decision 06 section 6.4: ApplyGI (TiledShading.cfi:105-142) is THE single pre-exposure
+@@ -2920,9 +3078,32 @@ pixoutMRTUpscale UpScalePS(vtxOutWPOS IN)
+ 	float fShadowSvoFin = 0, fShadowSvoDepthMin = 1.f, fShadowSvoDepthMax = 0;
+ 	float fAverSmoothness = 0;
+ 
++#if %_RT_QUALITY
++	// rt stage 2C, finding (b). Recompute ConeTracePS's own predicate from the same inputs: the
++	// specular set is full resolution under e_svoTI_RT_Active, so this pass, DemosaicPS and
++	// ConeTracePS all evaluate it at the same texel and agree.
++	float3 vUpNor0 = 0;
++	float fUpSmooth = 0, fUpTransm = 0;
++	float3 vUpRefl = 0;
++	float fUpDepthMin = 0, fUpDepthMax = 0;
++	float3 vUpNorMin = 0, vUpNorMax = 0;
++	GetAverNormAndSmooth(IN.baseTC.xy, vUpNor0, fUpSmooth, fUpTransm, normalize(IN.CamVec.xyz), vUpRefl, fUpDepthMin, fUpDepthMax, vUpNorMin, vUpNorMax);
++	const float3 vUpPos0 = GetWorldPos(VOX_DEPTH_SCALE * fDepthC - VOX_DEPTH_BIAS, IN.CamVec);
++	const bool bRTPixel = RT_IsTriPixel(fUpSmooth, vUpRefl, length(vUpPos0 - PS_WorldViewPos.xyz));
++#else
++	const bool bRTPixel = false;
++#endif
++
+ 	// define sampling kernel
+ 	const int samplesNum = 5;
+-	const float4 sampleTM = float4(SVO_SrcPixSize.xy * 1.5f, SVO_SrcPixSize.xy * 0.25f);
++	// rt stage 2C: the stock kernel reads +-1.5 SOURCE texels away and shifts even its own
++	// centre tap by a quarter texel, through a LINEAR sampler. At half resolution that is the
++	// upscale; at the full resolution an RT reflection runs at it is a 4x4-ish box blur applied
++	// to an already-final picture, and the quarter-texel bias smears it diagonally on top. Neo
++	// collapses the whole loop to one tap under %_RTGI_MESH_RAY_TRACING && !DIFFUSE
++	// (neo:2340-2346, neo:2348 samples at baseTC with tex2DlodPC). Same thing here, per pixel.
++	const float4 sampleTM = bRTPixel ? float4(0, 0, 0, 0) : float4(SVO_SrcPixSize.xy * 1.5f, SVO_SrcPixSize.xy * 0.25f);
++	const int samplesUsed = bRTPixel ? 1 : samplesNum;
+ 	const float2 arrSamples[samplesNum] =
+ 	{
+ 		// TODO: try (-1,0), (0,1) ....
+@@ -2933,7 +3114,7 @@ pixoutMRTUpscale UpScalePS(vtxOutWPOS IN)
+ 		float2( 0, 0) * sampleTM.xy - sampleTM.zw,
+ 	};
+ 
+-	for (int s = 0; s < samplesNum; s++)
++	for (int s = 0; s < samplesUsed; s++)
+ 	{
+ 		const float2 tc = IN.baseTC.xy + arrSamples[s];
+ 
+@@ -3026,11 +3207,25 @@ pixoutMRTUpscale UpScalePS(vtxOutWPOS IN)
+ 
+ 		//OUT.Diffuse.xyz = vRGB * vALD.w;
+ 
++		if (bRTPixel)
++		{
++			// rt stage 2C, finding (b)/(d): DemosaicPS kept the real radiance for this pixel, so
++			// there is nothing to reconstruct. The stock line below rebuilds the magnitude from
++			// the ALD lobe through pow(saturate(NdotH), 2^12.5) - a knife-edge test that an RT
++			// ray direction fails the moment the shading normal and the traced direction differ
++			// by a thousandth - and then lerps in the DIFFUSE GI buffer for anything that is not
++			// a perfect mirror. Both are cone-tracing reconstruction and both are wrong here.
++			// Neo: OUT.Diffuse.xyz = vRGB (neo:2412), no sceneDiffuseFin blend (neo:2419-2421).
++			OUT.Diffuse.xyz = vRGB.xyz;
++		}
++		else
++		{
+ 		OUT.Diffuse.xyz = lerp(vRGB * fIntensity, vRGB * vALD.w, pow(gbuffer.Smoothness, 2));
+ 
+ 		float4 vFinalDiffuse = tex2DlodPC(sceneDiffuseFin, float4(IN.baseTC.xy, 0, 0)) / SvoParamsDiffuse.w * SvoParamsSpecular.w;
+ 
+ 		OUT.Diffuse = lerp(vFinalDiffuse, OUT.Diffuse, saturate(pow(gbuffer.Smoothness * 3 - .75, 1)));
++		}
+ 
+ 		// Fresnel amplify
+ 		//OUT.Diffuse.xyz *= 1 + pow(saturate(1 - so), 4) * pow(saturate(1 - dot(-normalize(IN.CamVec.xyz), vNor0)), 7) * 2;
+@@ -3039,10 +3234,18 @@ pixoutMRTUpscale UpScalePS(vtxOutWPOS IN)
+ 	}
+ 
+ #if !%_RT_SAMPLE5 && !%_RT_LIGHTVOLUME1
++	// rt stage 2C, finding (d): e_svoTI_DiffuseBias x the sky-top colour is a FLAT ADDITIVE
++	// lift, the cone tracer's "there is always a bit of ambient" fudge. Added on top of a fully
++	// shaded triangle hit it is exactly the hazy, washed-out veil the direct view does not have,
++	// and it is bright enough to bury a sun shadow edge. Neo drops it under mesh ray tracing
++	// (neo:2427). Off for RT pixels, byte-identical for everything else.
++	if (!bRTPixel)
++	{
+ 	if (SvoParamsCommon.z > 0)
+ 		OUT.Diffuse.xyz += SvoParamsCommon.z * vSkyColorTop.z;
+ 	else
+ 		OUT.Diffuse.xyz += -SvoParamsCommon.z * vSkyColorTop.z * 0.15f;
++	}
+ #endif
+ 
+ 	OUT.Diffuse.w = fDepthC;
+@@ -3058,7 +3261,16 @@ pixoutMRTUpscale UpScalePS(vtxOutWPOS IN)
+ 	if (fDiff > 0)
+ 		fBlend += (1.f - fBlend) * saturate(fDiff * 3);
+ 
+-	OUT.Diffuse = clamp(lerp(valPrev, OUT.Diffuse, fBlend), 0, 8);
++	// rt stage 2C, finding (b): this is the SECOND temporal filter on the same data, and unlike
++	// DemosaicPS's it reprojects a reflection at the REFLECTING surface's depth - which is the
++	// wrong depth for a virtual image and drags the reflection behind the camera. DemosaicPS
++	// already holds the flicker for us. Neo takes the same decision and hard-codes fBlend = 1
++	// for specular (neo:2455). Clamp follows the demosaic's (neo:2463).
++	const float fUpClamp = bRTPixel ? 100.f : 8.f;
++	if (bRTPixel)
++		fBlend = 1.f;
++
++	OUT.Diffuse = clamp(lerp(valPrev, OUT.Diffuse, fBlend), 0, fUpClamp);
+ 
+ #if %_RT_REVERSE_DEPTH
+ 	if (IsDiffuseMode())
+diff --git a/Engine/Shaders/HWScripts/CryFX/Total_Illumination_Shading.cfi b/Engine/Shaders/HWScripts/CryFX/Total_Illumination_Shading.cfi
+index d5cac857..54bbffb0 100644
+--- a/Engine/Shaders/HWScripts/CryFX/Total_Illumination_Shading.cfi
++++ b/Engine/Shaders/HWScripts/CryFX/Total_Illumination_Shading.cfi
+@@ -79,9 +79,21 @@ uint SVO_RT_GetLightGridBufferIdx(float3 worldPosAbs)
+ 	return 8u * (vIdx.z * nDims.y * nDims.x + vIdx.y * nDims.x + vIdx.x);
+ }
+ 
++// rt stage 2C: what the debug views 7/8 need out of the hit shading. Filled unconditionally
++// (three scalars, no texture work); the compiler drops it when %_RT_PARTICLE_SHADOW is off and
++// ShadePS never reads it.
++struct SRTShadeProbe
++{
++	float  sunVisibility;  // 1 = the hit sees the sun, 0 = fully in cascade shadow
++	float3 directDiff;     // sun + local lights diffuse lobe, BEFORE probes and before the energy split
++	float3 directSpec;     // sun + local lights specular lobe, BEFORE probes
++	float3 directAcc;      // the two above recombined by Fwd_StandardOpaqueShading_Raytracing
++};
++
+ void TiledForwardShading_Raytracing(in ForwardShadingAttribs attribs, inout float3 diffuseAcc, inout float3 specularAcc,
+                                     SamplerState ssTrilinearClamp, SamplerComparisonState ssComparison,
+-                                    const bool applyProbes, const bool applyNonProbes, const bool bSkipSpecularProbes = false)
++                                    const bool applyProbes, const bool applyNonProbes, const bool bSkipSpecularProbes,
++                                    inout SRTShadeProbe dbg)
+ {
+ 	const float3 worldPosAbs = attribs.worldPos + GetWorldViewPos();
+ 
+@@ -260,6 +272,8 @@ void TiledForwardShading_Raytracing(in ForwardShadingAttribs attribs, inout floa
+ 
+ 				diffuseAcc += diffuseTerm;
+ 				specularAcc += specularTerm;
++				dbg.directDiff += diffuseTerm;   // debug 8 only
++				dbg.directSpec += specularTerm;  // debug 8 only
+ 			}
+ 		}
+ 
+@@ -273,8 +287,12 @@ void TiledForwardShading_Raytracing(in ForwardShadingAttribs attribs, inout floa
+ }
+ 
+ void Fwd_StandardOpaqueShading_Raytracing(in MaterialAttribsCommon commonAttribs, inout ForwardShadingAttribs fwdAttribs,
+-                                          inout float3 diffuseAcc, inout float3 specularAcc, bool bSunShadows = true)
++                                          inout float3 diffuseAcc, inout float3 specularAcc, out SRTShadeProbe dbg,
++                                          bool bSunShadows = true)
+ {
++	dbg = (SRTShadeProbe)0;
++	dbg.sunVisibility = 1;
++
+ 	fwdAttribs.normal = commonAttribs.NormalWorld;
+ 	fwdAttribs.normalSpecProbe = fwdAttribs.normal;
+ 	fwdAttribs.reflectance = commonAttribs.Reflectance;
+@@ -292,20 +310,33 @@ void Fwd_StandardOpaqueShading_Raytracing(in MaterialAttribsCommon commonAttribs
+ 		if (bSunShadows)
+ 			shadowMask = Fwd_SampleSunShadowMaps(fwdAttribs.worldPos + GetWorldViewPos());
+ 
++		// debug view 7: white = the hit sees the sun. Note that this is also the factor that
++		// gates the sun's SPECULAR lobe, so a stuck shadowMask of 1 costs the reflection its
++		// entire sun highlight as well as its shadow pattern (finding (e)).
++		dbg.sunVisibility = 1 - shadowMask;
++
+ 		ForwardLightParams lightParams;
+ 		lightParams.type = LIGHT_TYPE_SUN;
+ 		lightParams.lightVec = CV_SunLightDir.xyz;
+ 		lightParams.illuminance = CV_SunColor.xyz * (1 - shadowMask);
+-		Callback_ShadingDirect(fwdAttribs, lightParams, diffuseAcc, specularAcc);
++
++		float3 sunDiff = 0, sunSpec = 0;
++		Callback_ShadingDirect(fwdAttribs, lightParams, sunDiff, sunSpec);
++		diffuseAcc += sunDiff;
++		specularAcc += sunSpec;
++		dbg.directDiff += sunDiff;
++		dbg.directSpec += sunSpec;
+ 	}
+ 
+ 	// unconditional: %_RT_TILED_SHADING means "trace voxels" on this shader
+-	TiledForwardShading_Raytracing(fwdAttribs, diffuseAcc, specularAcc, ssFwdBilinearWrap, ssFwdComparison, true, true, false);
++	TiledForwardShading_Raytracing(fwdAttribs, diffuseAcc, specularAcc, ssFwdBilinearWrap, ssFwdComparison, true, true, false, dbg);
+ 
+ 	// Apply albedo (using simple energy conservation between specular and diffuse).
+ 	// Byte-identical to ForwardShading.cfi:337 - the reflected wall must be graded by the
+ 	// same rule as the wall.
+-	diffuseAcc *= fwdAttribs.albedo * saturate(1 - GetLuminance(fwdAttribs.reflectance));
++	const float3 vEnergySplit = fwdAttribs.albedo * saturate(1 - GetLuminance(fwdAttribs.reflectance));
++	diffuseAcc *= vEnergySplit;
++	dbg.directAcc = dbg.directDiff * vEnergySplit + dbg.directSpec;
+ }
+ 
+ ///////////////////////////////////////////////////////////////////////////////////
+-- 
+2.47.1.windows.1
+

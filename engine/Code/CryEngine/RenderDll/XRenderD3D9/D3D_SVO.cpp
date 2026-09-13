@@ -17,6 +17,25 @@
 	#include "Common/RenderView.h"
 	#include "GraphicsPipeline/TiledLightVolumes.h"
 	#include "GraphicsPipeline/ShadowMap.h"
+	// rt stage 2 (decision 06 section 6.3): the hit-shading pass fills a forward-shaped
+	// CBPerPassForward itself instead of borrowing CSceneForwardStage's, because the order of
+	// the two stages inside a frame is not guaranteed (research/06 section 9.9).
+	#include "GraphicsPipeline/ClipVolumes.h"
+	#include "GraphicsPipeline/Fog.h"
+	#include "GraphicsPipeline/VolumetricFog.h"
+	#include "GraphicsPipeline/SceneForward.h"
+	#include "Common/ShadowUtils.h"
+
+// Must match cbuffer CBPerPassForward (b5) in Engine/Shaders/HWScripts/CryFX/ForwardShading.cfi,
+// field for field, and it is the same layout SceneForward.cpp:17 SPerPassConstantBuffer uses.
+struct SSvoShadeForwardConstantBuffer
+{
+	CFogStage::SForwardParams                 cbFog;
+	CVolumetricFogStage::SForwardParams       cbVoxelFog;
+	CShadowUtils::SShadowCascadesSamplingInfo cbShadowSampling;
+	CSceneForwardStage::SCloudShadingParams   cbClouds;
+	CSvoRenderer::SForwardParams              cbSVOGI;
+};
 
 _smart_ptr<CTexture> CSvoRenderer::s_pRsmColorMap;
 _smart_ptr<CTexture> CSvoRenderer::s_pRsmNormlMap;
@@ -35,6 +54,7 @@ SSvoPrimitivePasses::SSvoPrimitivePasses(CGraphicsPipeline* pGraphicsPipeline)
 	, m_passPropagateLighting_1to2(pGraphicsPipeline)
 	, m_passPropagateLighting_2to3(pGraphicsPipeline)
 	, m_passTroposphere(pGraphicsPipeline)
+	, m_passBuildRTLightList(pGraphicsPipeline)
 	, currentKey(pGraphicsPipeline->GetKey())
 {
 }
@@ -523,6 +543,10 @@ void CSvoRenderer::ConeTracePass(SSvoTargetsSet* pTS)
 {
 	CSvoFullscreenPass& rp = pTS->passConeTrace;
 
+	// rt stage 2: this frame's g-data is not shaded yet; DemosaicPass reads the tracing targets
+	// unless ShadePass says otherwise.
+	pTS->bShaded = false;
+
 	CheckAllocateRT(pTS == &m_pPasses->m_tsSpec);
 
 	if (!e_svoTI_Active || !e_svoTI_Apply || !e_svoRender || !m_pShader || m_texInfo.bSvoFreeze || !m_texInfo.pTexTree)
@@ -538,6 +562,22 @@ void CSvoRenderer::ConeTracePass(SSvoTargetsSet* pTS)
 
 	rp.SetRenderTarget(0, pTS->pRT_ALD_0);
 	rp.SetRenderTarget(1, pTS->pRT_RGB_0);
+
+	// rt stage 2 (decision 06 section 6.6): two more MRTs carry the hit position + smoothness
+	// and the ray direction + distance. Only on the specular set, only with RT on - and the
+	// targets are explicitly unbound again otherwise, because the pass object is a member and
+	// would keep last frame's bindings while the shader has only two outputs.
+	if (e_svoTI_RT_Active && pTS->pRT_HITPOS_0 && pTS->pRT_RAYDIR_0)
+	{
+		rp.SetRenderTarget(2, pTS->pRT_HITPOS_0);
+		rp.SetRenderTarget(3, pTS->pRT_RAYDIR_0);
+	}
+	else
+	{
+		rp.SetRenderTarget(2, nullptr);
+		rp.SetRenderTarget(3, nullptr);
+	}
+
 	rp.SetRequireWorldPos(true);
 	rp.SetRequirePerViewConstantBuffer(true);
 
@@ -609,6 +649,212 @@ void CSvoRenderer::ConeTracePass(SSvoTargetsSet* pTS)
 	}
 
 	rp.Execute();
+}
+
+///////////////////////////////////////////////////////////////////////////////////
+// rt stage 2 - hit shading (decision 06)
+///////////////////////////////////////////////////////////////////////////////////
+
+bool CSvoRenderer::IsRtHitShadingActive() const
+{
+	// Every condition the specular ConeTracePass itself needs, plus the RT master switch.
+	// With e_svoTI_RT_Active == 0 (the default, VF_EXPERIMENTAL) nothing below ever runs, no
+	// target is allocated, no constant is set, and DemosaicPass reads the stock pair.
+	return e_svoTI_RT_Active
+	       && e_svoTI_Active && e_svoTI_Apply && e_svoRender
+	       && GetIntegratioMode() == 2 && e_svoTI_SpecularAmplifier
+	       && m_pShader && !m_texInfo.bSvoFreeze && m_texInfo.pTexTree;
+}
+
+template<class T>
+void CSvoRenderer::SetupRTLightGridConstants(T& rp)
+{
+	static CCryNameR paramNameMin("SVO_RTLightGridMin");
+	static CCryNameR paramNameMax("SVO_RTLightGridMax");
+	static CCryNameR paramNameDims("SVO_RTLightGridDims");
+
+	rp.SetConstantArray(paramNameMin, (Vec4*)&m_rtLightGridMin, 1);
+	rp.SetConstantArray(paramNameMax, (Vec4*)&m_rtLightGridMax, 1);
+	rp.SetConstantArray(paramNameDims, (Vec4*)&m_rtLightGridDims, 1);
+}
+
+// Neo's BuildRayTracingLightListCS. One thread per grid cell, 8 x 8 x 8 groups, testing every
+// valid entry of the EXISTING tiled light list (Fwd_TiledLightsShadeInfo) against the cell's
+// AABB. No new CPU-side light collection at all: the point of the design is that the shade-time
+// index structure stays byte-identical to the screen tile mask and only the address function
+// changes (research/06 section 3.4).
+void CSvoRenderer::BuildRTLightGridPass()
+{
+	std::shared_ptr<CGraphicsPipeline> pActivePipeline = RenderView()->GetGraphicsPipeline();
+	auto* pTiledLights = pActivePipeline->GetStage<CTiledLightVolumesStage>();
+
+	if (!pTiledLights)
+		return;
+
+	// the compute shader is [numthreads(8,8,8)] with one thread per cell
+	const int nDim = clamp_tpl(((e_svoTI_RT_LightGridDim + 7) / 8) * 8, 8, 128);
+
+	if (m_rtLightGridDim != nDim)
+	{
+		m_rtLightGridBuf.Create(nDim * nDim * nDim * 8, sizeof(uint32), DXGI_FORMAT_R32_UINT,
+		                        CDeviceObjectFactory::BIND_SHADER_RESOURCE | CDeviceObjectFactory::BIND_UNORDERED_ACCESS, NULL);
+		m_rtLightGridDim = nDim;
+	}
+
+	// The box follows the camera and reaches as far as a triangle ray can: a hit is at most
+	// e_svoTI_RT_MaxDistCam (primary surface) + e_svoTI_RT_MaxDistRay (ray) away. Hits outside
+	// it are clamped to the nearest cell by the shader, not read out of bounds as in Neo.
+	const Vec3 vCamPos = gEnv->pSystem->GetViewCamera().GetPosition();
+	const float fReach = max(1.f, e_svoTI_RT_MaxDistCam + e_svoTI_RT_MaxDistRay);
+
+	m_rtLightGridMin = Vec4(vCamPos - Vec3(fReach, fReach, fReach), 0);
+	m_rtLightGridMax = Vec4(vCamPos + Vec3(fReach, fReach, fReach), 0);
+	m_rtLightGridDims = Vec4((float)nDim, (float)nDim, (float)nDim, (float)pTiledLights->GetValidLightCount());
+
+	CSvoComputePass& rp = m_pPasses->m_passBuildRTLightList;
+
+	rp.SetTechnique(m_pShader, "BuildRayTracingLightList", GetRunTimeFlags(false, true));
+
+	// u0 is written, never OR-ed: one thread owns one cell, so the store is also the clear.
+	// Neo accumulates with InterlockedOr and has no visible clear, so stale masks survive.
+	rp.SetOutputUAV(0, &m_rtLightGridBuf);
+	rp.SetBuffer(18, pTiledLights->GetLightShadeInfoBuffer());
+
+	rp.SetDispatchSize(nDim / 8, nDim / 8, nDim / 8);
+
+	rp.BeginConstantUpdate();
+
+	SetupRTLightGridConstants(rp);
+
+	rp.PrepareResourcesForUse(GetDeviceObjectFactory().GetCoreCommandList());
+
+	{
+		SScopedComputeCommandList computeCommandList(false);
+		rp.Execute(computeCommandList, EShaderStage_All);
+	}
+}
+
+// The forward per-pass resource set, filled from CSvoRenderer rather than borrowed from
+// CSceneForwardStage (decision 06 section 6.3). Only the slots ShadePS actually reaches are
+// bound; everything else the forward includes declare is unreferenced in this technique and is
+// stripped by the compiler.
+void CSvoRenderer::SetupShadeForwardResources(CSvoFullscreenPass& rp)
+{
+	std::shared_ptr<CGraphicsPipeline> pActivePipeline = RenderView()->GetGraphicsPipeline();
+
+	auto* pTiledLights = pActivePipeline->GetStage<CTiledLightVolumesStage>();
+	auto* pShadowMapStage = pActivePipeline->GetStage<CShadowMapStage>();
+
+	// samplers declared by ForwardShading.cfi / TiledShading.cfi
+	rp.SetSampler(10, EDefaultSamplerStates::BilinearWrap);    // ssFwdBilinearWrap
+	rp.SetSampler(11, EDefaultSamplerStates::LinearCompare);   // ssFwdComparison
+	rp.SetSampler(15, EDefaultSamplerStates::TrilinearClamp);  // SampStateTrilinearClamp
+
+	// the light list itself, and the atlases the probe / projector / shadow terms sample
+	rp.SetBuffer(18, pTiledLights->GetLightShadeInfoBuffer());          // Fwd_TiledLightsShadeInfo
+	rp.SetTexture(20, pTiledLights->GetSpecularProbeAtlas());           // Fwd_SpecCubeArray
+	rp.SetTexture(21, pTiledLights->GetDiffuseProbeAtlas());            // Fwd_DiffuseCubeArray
+	rp.SetTexture(22, pTiledLights->GetProjectedLightAtlas());          // Fwd_SpotTexArray
+	rp.SetTexture(23, pShadowMapStage->m_pTexRT_ShadowPool);            // Fwd_ShadowPool
+	rp.SetTexture(24, CRendererResources::s_ptexShadowJitterMap);       // Fwd_RandomRotations
+	rp.SetTexture(40, CRendererResources::s_ptexEnvironmentBRDF);       // Fwd_EnvironmentBRDF
+
+	// the world-space light mask grid built one pass earlier
+	rp.SetBuffer(33, &m_rtLightGridBuf);                                // Fwd_TileLightMaskRayTracing
+
+	// Sun cascades at a world position. This is the volumetric-fog precedent (VolumetricFog.cpp
+	// :932, :986) - three calls, no forward stage involved - and it is the only option that gives
+	// the hit the same cascade walk, the same bias and the same cloud shadows as the primary
+	// surface. rsmSunShadowMap (one cascade, unfiltered, injection resolution) is not a substitute.
+	CShadowUtils::SShadowCascades cascades;
+	CShadowUtils::SetupShadowsForFog(cascades, RenderView());
+	// the two helpers are explicitly instantiated for CFullscreenPass and CComputeRenderPass
+	// only (ShadowUtils.cpp:584-598), so pass the base reference as BindTiledLights does
+	CShadowUtils::SetShadowCascadesToRenderPass((CFullscreenPass&)rp, 26, 30, cascades);          // t26..t29 + cloud t30
+	CShadowUtils::SetShadowSamplingContextToRenderPass((CFullscreenPass&)rp, 11, 8, 9, 10, 31);   // s11/s8/s9/s10 + noise t31
+
+	// CBPerPassForward (b5)
+	if (!m_pShadeForwardCB)
+		m_pShadeForwardCB = gcpRendD3D->m_DevBufMan.CreateConstantBuffer(sizeof(SSvoShadeForwardConstantBuffer));
+
+	{
+		PREFAST_SUPPRESS_WARNING(6263)
+		CryStackAllocWithSizeCleared(SSvoShadeForwardConstantBuffer, cb, CDeviceBufferManager::AlignBufferSizeForStreaming);
+
+		CShadowUtils::GetShadowCascadesSamplingInfo(cb->cbShadowSampling, RenderView());
+
+		if (auto* pForwardStage = pActivePipeline->GetStage<CSceneForwardStage>())
+			pForwardStage->FillCloudShadingParams(cb->cbClouds, true);
+
+		if (auto* pFogStage = pActivePipeline->GetStage<CFogStage>())
+			pFogStage->FillForwardParams(cb->cbFog, true);
+
+		if (auto* pVolFogStage = pActivePipeline->GetStage<CVolumetricFogStage>())
+			pVolFogStage->FillForwardParams(cb->cbVoxelFog, true);
+
+		FillForwardParams(cb->cbSVOGI, true);
+
+		m_pShadeForwardCB->UpdateBuffer(cb, cbSize);
+	}
+
+	rp.SetInlineConstantBuffer(eConstantBufferShaderSlot_PerPass, m_pShadeForwardCB, EShaderStage_Pixel);
+}
+
+// Hit shading. Reads the four g-data targets, runs CE's own forward lighting at the hit world
+// position, writes the ALD + RGB pair DemosaicPass consumes.
+void CSvoRenderer::ShadePass(SSvoTargetsSet* pTS)
+{
+	CSvoFullscreenPass& rp = pTS->passShade;
+
+	if (!pTS->pRT_ALD_SHD || !pTS->pRT_RGB_SHD || !pTS->pRT_HITPOS_0 || !pTS->pRT_RAYDIR_0)
+		return;
+
+	rp.SetTechnique(m_pShader, "ShadePass", GetRunTimeFlags(false, true));
+	rp.SetPrimitiveFlags(CRenderPrimitive::eFlags_ReflectShaderConstants_PS);
+	rp.SetState(GS_NODEPTHTEST);
+
+	rp.SetRenderTarget(0, pTS->pRT_ALD_SHD);
+	rp.SetRenderTarget(1, pTS->pRT_RGB_SHD);
+	rp.SetRequireWorldPos(true);
+	rp.SetRequirePerViewConstantBuffer(true);
+
+	// The four g-data targets. t0..t3 alias the brick pools declared in CommonSVO.cfi; see the
+	// warning at the top of Total_Illumination_Shading.cfi. NOTE the two calls that are NOT here:
+	// SetupSvoTexturesForRead and SetupRsmSunTextures would fight the forward set for t17..t20
+	// and t26..t31, and ShadePS must not reach an SVO pool anyway.
+	rp.SetTexture(0, pTS->pRT_ALD_0);
+	rp.SetTexture(1, pTS->pRT_RGB_0);
+	rp.SetTexture(2, pTS->pRT_HITPOS_0);
+	rp.SetTexture(3, pTS->pRT_RAYDIR_0);
+	rp.SetSampler(0, EDefaultSamplerStates::PointClamp);   // ssSvoPointClamp
+
+	SetupShadeForwardResources(rp);
+
+	rp.BeginConstantUpdate();
+
+	SetupRTLightGridConstants(rp);
+
+	{
+		static CCryNameR paramName("SVO_ShadeParams0");
+		// .x flat albedo add (off), .y debug albedo (off), .z AO range - deliberately 0, which
+		// makes Neo's distance-AO multiply a no-op: it darkens by hit distance and double-counts
+		// against ApplyGI mode 0, which is also AO (R05, research/06 section 1.5 note 4).
+		// .w = 1 for the specular set.
+		Vec4 vData(0.f, 0.f, 0.f, 1.f);
+		rp.SetConstantArray(paramName, (Vec4*)&vData, 1);
+	}
+
+	{
+		// rt stage 2C: ShadePass does not call SetupCommonConstants (it needs none of it), so
+		// the debug lane has to be uploaded here or views 7/8/9 read an undefined register.
+		static CCryNameR paramName("SVO_RTParams0");
+		Vec4 vData((float)e_svoTI_RT_MaxBounces, 1.f, 0.f, (float)e_svoTI_RT_Debug);
+		rp.SetConstantArray(paramName, (Vec4*)&vData, 1);
+	}
+
+	rp.Execute();
+
+	pTS->bShaded = true;
 }
 
 template<class T>
@@ -797,6 +1043,16 @@ void CSvoRenderer::SetupCommonConstants(SSvoTargetsSet* pTS, T& rp, CTexture* pR
 			Vec4 vData((float)e_svoTI_RT_MaxBounces, 1.f, 0.f, (float)e_svoTI_RT_Debug);
 			rp.SetConstantArray(paramName, (Vec4*)&vData, 1);
 		}
+
+		{
+			// rt stage 2C: (normalsFading, reserved x3). Neo drove the same quantity off
+			// CV_TerrainInfo.y, which in CE 5.7.1 is a hard zero (GraphicsPipeline.cpp:1280
+			// fills CV_TerrainInfo as Vec4(GetTerrainTextureMultiplier(), 0, 0, 0)), so the
+			// transplanted line silently flattened every ray traced normal map.
+			static CCryNameR paramName("SVO_RTParams1");
+			Vec4 vData(e_svoTI_RT_NormalsFading, 0.f, 0.f, 0.f);
+			rp.SetConstantArray(paramName, (Vec4*)&vData, 1);
+		}
 	}
 }
 
@@ -856,6 +1112,23 @@ void CSvoRenderer::UpdateRender(CRenderView* pRenderView)
 		PROFILE_LABEL_SCOPE("TI_GEN_SPEC");
 
 		ConeTracePass(&m_pPasses->m_tsSpec);
+	}
+
+	// rt stage 2 (decision 06): light grid, then hit shading, between the specular cone trace
+	// and its de-mosaic. Nothing downstream of ShadePass changes.
+	if (IsRtHitShadingActive())
+	{
+		{
+			PROFILE_LABEL_SCOPE("TI_LIGHTGRID");
+
+			BuildRTLightGridPass();
+		}
+
+		{
+			PROFILE_LABEL_SCOPE("TI_SHADE_SPEC");
+
+			ShadePass(&m_pPasses->m_tsSpec);
+		}
 	}
 
 	{
@@ -921,8 +1194,10 @@ void CSvoRenderer::DemosaicPass(SSvoTargetsSet* pTS)
 
 	SetupGBufferTextures(rp);
 
-	rp.SetTexture(10, pTS->pRT_ALD_0);
-	rp.SetTexture(11, pTS->pRT_RGB_0);
+	// rt stage 2: when the hit-shading pass ran, the shaded pair is the ALD + RGB contract this
+	// pass consumes; the tracing pair still holds raw g-data for the RT pixels.
+	rp.SetTexture(10, pTS->bShaded ? pTS->pRT_ALD_SHD.get() : pTS->pRT_ALD_0.get());
+	rp.SetTexture(11, pTS->bShaded ? pTS->pRT_RGB_SHD.get() : pTS->pRT_RGB_0.get());
 
 	rp.SetTexture(6, pTS->pRT_RGB_DEM_MIN_1);
 	rp.SetTexture(9, pTS->pRT_ALD_DEM_MIN_1);
@@ -1075,6 +1350,17 @@ void CSvoRenderer::CheckAllocateRT(bool bSpecPass)
 	int nResScaleBase = max(e_svoTI_ResScaleBase + e_svoTI_LowSpecMode, 1);
 	int resScaleSpec = max(e_svoTI_ResScaleSpecular + e_svoTI_LowSpecMode, 1);
 
+	// rt stage 2C, finding (b): a triangle ray carries a final, fully shaded, per-pixel colour,
+	// and every reconstruction filter downstream of it is now a single tap. Run that set below
+	// the screen resolution and the reflection is a magnified point sample - visibly blockier
+	// than the cone traced one it replaces, because the cone trace at least had a real spatial
+	// filter to hide it. e_svoTI_ResScaleSpecular already defaults to 1; this pins it there so
+	// e_svoTI_LowSpecMode (which ADDS to every scale) cannot quietly halve it underneath the RT
+	// path. Cost at 1080p: the specular set is 10 fp16x4 targets, so 1 -> 2 is about 24 MB of
+	// target memory and 4x the trace, shade and demosaic pixels.
+	if (e_svoTI_RT_Active)
+		resScaleSpec = 1;
+
 	int nInW = (nWidth / nResScaleBase);
 	int nInH = (nHeight / nResScaleBase);
 #ifdef FEATURE_SVO_GI_ALLOW_HQ
@@ -1102,6 +1388,25 @@ void CSvoRenderer::CheckAllocateRT(bool bSpecPass)
 		CheckCreateUpdateRT(tsSpec.pRT_ALD_1, specW, specH, eTF_R16G16B16A16F, eTT_2D, FT_STATE_CLAMP, "SV1_SPEC_ALD");
 		CheckCreateUpdateRT(tsSpec.pRT_RGB_0, specW, specH, eTF_R16G16B16A16F, eTT_2D, FT_STATE_CLAMP, "SVO_SPEC_RGB");
 		CheckCreateUpdateRT(tsSpec.pRT_RGB_1, specW, specH, eTF_R16G16B16A16F, eTT_2D, FT_STATE_CLAMP, "SV1_SPEC_RGB");
+
+		// rt stage 2 (decision 06 section 6.6). HITPOS is RGBA32F on purpose: fp16 quantises to
+		// 1.5 cm at 16-32 m, which is shadow-acne territory once the position is fed to the
+		// cascade walk (R01). RAYDIR keeps fp16 as Neo. The SHD pair exists because ShadePass
+		// reads ALD_0 / RGB_0 as g-data and cannot write them at the same time.
+		if (e_svoTI_RT_Active)
+		{
+			CheckCreateUpdateRT(tsSpec.pRT_HITPOS_0, specW, specH, eTF_R32G32B32A32F, eTT_2D, FT_STATE_CLAMP, "SVO_SPEC_RT_HITPOS");
+			CheckCreateUpdateRT(tsSpec.pRT_RAYDIR_0, specW, specH, eTF_R16G16B16A16F, eTT_2D, FT_STATE_CLAMP, "SVO_SPEC_RT_RAYDIR");
+			CheckCreateUpdateRT(tsSpec.pRT_ALD_SHD, specW, specH, eTF_R16G16B16A16F, eTT_2D, FT_STATE_CLAMP, "SVO_SPEC_RT_SHD_ALD");
+			CheckCreateUpdateRT(tsSpec.pRT_RGB_SHD, specW, specH, eTF_R16G16B16A16F, eTT_2D, FT_STATE_CLAMP, "SVO_SPEC_RT_SHD_RGB");
+		}
+		else if (tsSpec.pRT_HITPOS_0)
+		{
+			tsSpec.pRT_HITPOS_0 = nullptr;
+			tsSpec.pRT_RAYDIR_0 = nullptr;
+			tsSpec.pRT_ALD_SHD = nullptr;
+			tsSpec.pRT_RGB_SHD = nullptr;
+		}
 	}
 
 	if (!bSpecPass)

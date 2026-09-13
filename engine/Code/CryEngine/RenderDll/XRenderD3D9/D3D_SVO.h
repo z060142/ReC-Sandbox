@@ -30,11 +30,20 @@ struct SSvoTargetsSet
 {
 	SSvoTargetsSet(CGraphicsPipeline* pGraphicsPipeline)
 		: passConeTrace(pGraphicsPipeline)
+		, passShade(pGraphicsPipeline)
 		, passDemosaic(pGraphicsPipeline)
 		, passUpscale(pGraphicsPipeline) {}
 
 	// tracing targets
 	_smart_ptr<CTexture> pRT_RGB_0, pRT_ALD_0, pRT_RGB_1, pRT_ALD_1;
+
+	// rt stage 2 (decision 06): the two extra g-data targets ConeTracePass writes and the pair
+	// ShadePass writes. Allocated only for the specular set and only while e_svoTI_RT_Active;
+	// null otherwise, which is what keeps the stock path untouched.
+	// ShadePass cannot write into pRT_ALD_0 / pRT_RGB_0 because it reads them as g-data, so it
+	// gets its own pair and DemosaicPass is pointed at that pair for the frame (bShaded).
+	_smart_ptr<CTexture> pRT_HITPOS_0, pRT_RAYDIR_0, pRT_ALD_SHD, pRT_RGB_SHD;
+	bool                 bShaded = false;
 
 	// de-mosaic targets
 	_smart_ptr<CTexture> pRT_RGB_DEM_MIN_0, pRT_ALD_DEM_MIN_0, pRT_RGB_DEM_MAX_0, pRT_ALD_DEM_MAX_0;
@@ -44,6 +53,7 @@ struct SSvoTargetsSet
 	_smart_ptr<CTexture> pRT_FIN_OUT_0, pRT_FIN_OUT_1;
 
 	CSvoFullscreenPass   passConeTrace;
+	CSvoFullscreenPass   passShade;
 	CSvoFullscreenPass   passDemosaic;
 	CSvoFullscreenPass   passUpscale;
 };
@@ -60,6 +70,7 @@ struct SSvoPrimitivePasses
 	CSvoComputePass      m_passPropagateLighting_1to2;
 	CSvoComputePass      m_passPropagateLighting_2to3;
 	CSvoFullscreenPass   m_passTroposphere;
+	CSvoComputePass      m_passBuildRTLightList;   // rt stage 2 (decision 06 section 6.2)
 
 	SGraphicsPipelineKey currentKey;
 
@@ -129,6 +140,13 @@ protected:
 	void                   UpscalePass(SSvoTargetsSet* pTS);
 	void                   DemosaicPass(SSvoTargetsSet* pTS);
 	void                   ConeTracePass(SSvoTargetsSet* pTS);
+
+	// rt stage 2 (decision 06): hit shading
+	bool                   IsRtHitShadingActive() const;
+	void                   BuildRTLightGridPass();
+	void                   ShadePass(SSvoTargetsSet* pTS);
+	void                   SetupShadeForwardResources(CSvoFullscreenPass& rp);
+	template<class T> void SetupRTLightGridConstants(T& rp);
 
 	template<class T> void SetupCommonSamplers(T& rp);
 	template<class T> void SetupCommonConstants(SSvoTargetsSet* pTS, T& rp, CTexture* pRT);
@@ -215,6 +233,15 @@ protected:
 
 	std::unique_ptr<SSvoPrimitivePasses> m_pPasses;
 
+	// rt stage 2 (decision 06 section 6.2): world-space light mask grid, gridDim^3 cells of
+	// 8 x uint, byte-compatible with the screen tile mask so the shade-time bit walk is CE's.
+	CGpuBuffer         m_rtLightGridBuf;
+	int                m_rtLightGridDim = 0;
+	Vec4               m_rtLightGridMin = Vec4(ZERO);
+	Vec4               m_rtLightGridMax = Vec4(ZERO);
+	Vec4               m_rtLightGridDims = Vec4(ZERO);
+	CConstantBufferPtr m_pShadeForwardCB;   // CBPerPassForward (b5) for ShadePass
+
 	// cvar values
 	#define INIT_ALL_SVO_CVARS                                      \
 	  INIT_SVO_CVAR(int, e_svoDVR);                                 \
@@ -278,6 +305,8 @@ protected:
 	  INIT_SVO_CVAR(int,   e_svoTI_RT_MaxTexRes);                   \
 	  INIT_SVO_CVAR(int,   e_svoTI_RT_TexPoolZ);                    \
 	  INIT_SVO_CVAR(int,   e_svoTI_RT_MaxBounces);                  \
+	  INIT_SVO_CVAR(int,   e_svoTI_RT_LightGridDim);                \
+	  INIT_SVO_CVAR(float, e_svoTI_RT_NormalsFading);               \
 	  INIT_SVO_CVAR(float, e_svoTI_ShadowsSoftness);                \
 	  INIT_SVO_CVAR(float, e_svoTI_Specular_Sev);                   \
 	  INIT_SVO_CVAR(float, e_svoTI_SSAOAmount);                     \

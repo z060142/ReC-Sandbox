@@ -1,0 +1,845 @@
+From f5c1c968aff12b3e8e01e6d7a070c710efca5678 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Sun, 13 Sep 2026 22:42:42 +0800
+Subject: [PATCH 184/190] feat: shade ray hits with CE's own forward lighting
+ (stage 2A, shaders)
+
+A triangle hit stops being a guess and becomes a lit surface. ConeTracePS now
+writes intermediate g-data instead of a provisional colour, and a new ShadePass
+technique turns that g-data back into the ALD + RGB contract DemosaicPass and
+UpScalePass already speak, so nothing downstream changes.
+
+- Total_Illumination_Shading.cfi (new): CE's TiledForwardShading and
+  Fwd_StandardOpaqueShading copied with the four substitutions of decision 06 -
+  a world-space light-mask grid instead of the screen tile mask, viewVec =
+  -RayDirection, Fwd_SampleSunShadowMaps(worldPos) instead of the reflecting
+  pixel's screen-space shadow mask, and g-data instead of the G-buffer. Two of
+  Neo's gaps fixed on the way in: the grid cell index is clamped to the grid
+  box, and the builder stores instead of InterlockedOr-ing so a stale mask
+  cannot survive a frame. bOpaque is always false at a hit: AO, the shadow mask
+  and ApplyGI would all be screen-space reads of the wrong pixel. Area lights
+  are skipped as Neo does.
+- BuildRayTracingLightListCS lives here too, not in TiledShading.cfi, because
+  that file's technique region is inside #if TILED_DEFERRED_SHADING_TECHNIQUE
+  and a technique outside it would be emitted into every material shader.
+- Total_Illumination.cfx: CustomForwardShadingAttribs and Callback_ShadingDirect
+  before the includes; ForwardShading.cfi pulled in ahead of CommonSVO.cfi so
+  CBPerPassForward (b5) is declared before ApplyGI reads cbSVOGI; pixoutMRTTrace
+  gains HITPOS (RGBA32F, camera-relative, .w = smoothness) and RAYDIR (.w = hit
+  distance, GetMaxRayDistance()+1 on a miss) under %_RT_QUALITY; ShadePS and the
+  two new techniques; refl_GAL/GNO/GPO/GLD on t0-t3 with the aliasing warning.
+- Exposure: the hit is lit by already-exposed lights, so ShadePS divides by
+  PS_HDR_RANGE_ADAPT_MAX before writing, leaving ApplyGI the single exposure
+  boundary. Neo's min(acc, 8) becomes SCENE_WRITER_CLAMP, applied while the
+  value is still exposed. Both are exactly 1.0 / no-ops on the stock path.
+- vRGB.w stays the reflecting pixel's scene linear depth, which is what
+  DemosaicPS reads out of that channel; smoothness rides in HITPOS.w instead.
+  Neo's reflected-depth term is deliberately not copied.
+- The stage-1 provisional colour survives as debug view 6; any debug view clears
+  the g-data flag so the debug picture is not overwritten by ShadePS.
+
+Validated with an fxc harness over the real include closure: ShadePS with and
+without the RT flags, BuildRayTracingLightListCS, ConeTracePS in four
+permutations, DemosaicPS and UpScalePS - 0 errors.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SCUvWGLCsqzm3VNMzp4uiS
+---
+ Engine/Shaders/HWScripts/CryFX/CommonSVO.cfi  |   5 +
+ .../Shaders/HWScripts/CryFX/CommonSVO_RT.cfi  |   8 +-
+ .../HWScripts/CryFX/Total_Illumination.cfx    | 297 +++++++++++++-
+ .../CryFX/Total_Illumination_Shading.cfi      | 370 ++++++++++++++++++
+ 4 files changed, 663 insertions(+), 17 deletions(-)
+ create mode 100644 Engine/Shaders/HWScripts/CryFX/Total_Illumination_Shading.cfi
+
+diff --git a/Engine/Shaders/HWScripts/CryFX/CommonSVO.cfi b/Engine/Shaders/HWScripts/CryFX/CommonSVO.cfi
+index 87f0a4c5..1764643d 100644
+--- a/Engine/Shaders/HWScripts/CryFX/CommonSVO.cfi
++++ b/Engine/Shaders/HWScripts/CryFX/CommonSVO.cfi
+@@ -189,7 +189,12 @@ RWTexture3D<uint> UAV_5: register (u5);
+ RWTexture3D<uint> UAV_6: register (u6);
+ RWTexture3D<uint> UAV_7: register (u7);
+ 
++// rt stage 2: Total_Illumination.cfx (the only consumer of this file) now includes
++// ForwardShading.cfi first, which already pulls TiledShading.cfi in - and TiledShading.cfi has
++// no include guard, so a second copy would redefine every symbol in it.
++#ifndef TILED_SHADING_ALREADY_INCLUDED
+ #include "TiledShading.cfi"
++#endif
+ 
+ StructuredBuffer<STiledLightShadeInfo> SVO_TiledLightsShadeInfo: register (t16);
+ Texture2DArray SVO_SpotTexArray: register (t19);
+diff --git a/Engine/Shaders/HWScripts/CryFX/CommonSVO_RT.cfi b/Engine/Shaders/HWScripts/CryFX/CommonSVO_RT.cfi
+index 177ab3c8..9bc1cfe2 100644
+--- a/Engine/Shaders/HWScripts/CryFX/CommonSVO_RT.cfi
++++ b/Engine/Shaders/HWScripts/CryFX/CommonSVO_RT.cfi
+@@ -687,10 +687,16 @@ bool RT_GetDebugColor(out float3 vCol)
+ 		const float f = bHit ? saturate(g_rtInfo.best.nearestHitDist / max(VOX_MAX_RT_DIST_RAY, 1.f)) : 0.f;
+ 		vCol = float3(f, f, f);
+ 	}
+-	else
++	else if (nMode == 5)
+ 	{
+ 		vCol = g_rtInfo.best.incomplete ? float3(1, 0, 1) : (float3)0;
+ 	}
++	else
++	{
++		// mode 6 = the stage-1 provisional colour, produced in ConeTracePS itself (it needs the
++		// SVO cell of the hit, which is not in SBestHit); anything above is unassigned.
++		return false;
++	}
+ 
+ 	return true;
+ }
+diff --git a/Engine/Shaders/HWScripts/CryFX/Total_Illumination.cfx b/Engine/Shaders/HWScripts/CryFX/Total_Illumination.cfx
+index e1781fea..8fb5bfe8 100644
+--- a/Engine/Shaders/HWScripts/CryFX/Total_Illumination.cfx
++++ b/Engine/Shaders/HWScripts/CryFX/Total_Illumination.cfx
+@@ -4,12 +4,58 @@
+ 
+ #if FEATURE_SVO_GI
+ 
++// rt stage 2 (decision 06 section 6.3): ShadeLib.cfi's ForwardShadingAttribs embeds a
++// CustomForwardShadingAttribs, so every shader that wants the forward stack has to declare
++// its own before including ShadeLib.cfi - see Illum.cfx:33, Terrain.cfx:21, Vegetation.cfx:323
++// and six more. Total_Illumination.cfx never did, because until now it never referenced
++// ForwardShadingAttribs. The five members are Neo's; they are what the hit carries that a
++// primary surface does not.
++struct CustomForwardShadingAttribs
++{
++	int    LightingModel;
++	float  Transmittance;
++	float  Emittance;
++	float3 RayDirection;
++	float  SunShadowRT;
++};
++
+ #include "Common.cfi"
+ #include "ShadeLib.cfi"
+ #include "vertexLib.cfi"
+-#include "CommonSVO.cfi"
+ #include "ShadowCommon.cfi"
+ 
++// rt stage 2: the direct-lighting lobe used by the hit-shading pass. It is CE's own callback
++// contract (TiledShading.cfi calls it), with one change: the view vector looks back along the
++// ray instead of back at the camera. DiffuseBRDF / SpecularBRDF / ThinTranslucencyBRDF already
++// carry SCENE_BRDF_NORM_FACTOR on this branch, so the 1/PI convention is inherited with no edit.
++void Callback_ShadingDirect(in ForwardShadingAttribs attribs, in ForwardLightParams light, out float3 diffuseAcc, out float3 specularAcc)
++{
++	const float3 viewVec = normalize(-attribs.custom.RayDirection);
++	const float NdotL = saturate(dot(attribs.normal, light.lightVec));
++
++	float3 diffuseTerm;
++	if (attribs.custom.LightingModel == LIGHTINGMODEL_TRANSMITTANCE)
++		diffuseTerm = ThinTranslucencyBRDF(attribs.normal, light.lightVec, (half3)attribs.custom.Transmittance);
++	else
++		diffuseTerm = (float3)DiffuseBRDF(attribs.normal, viewVec, light.lightVec, attribs.smoothness, NdotL);
++
++	specularAcc = SpecularBRDF(attribs.normal, viewVec, light.lightVec, attribs.smoothness, attribs.reflectance) * NdotL;
++
++	diffuseAcc = diffuseTerm * light.illuminance * attribs.custom.SunShadowRT;
++	specularAcc = specularAcc * light.illuminance * attribs.custom.SunShadowRT;
++}
++
++// rt stage 2: ForwardShading.cfi must come BEFORE CommonSVO.cfi. CommonSVO.cfi:192 includes
++// TiledShading.cfi itself, TiledShading.cfi has no include guard, and TiledShading.cfi's ApplyGI
++// reads cbSVOGI out of the CBPerPassForward (b5) block that ForwardShading.cfi declares just
++// above its own include of it. Pull it in from here, and tell CommonSVO.cfi to skip its copy.
++// (ShadowCommon.cfi moved up for the same reason: Fwd_SampleSunShadowMaps calls ShadowDepthTest.
++// CommonSVO.cfi references nothing from ShadowCommon.cfi.)
++#include "ForwardShading.cfi"
++#define TILED_SHADING_ALREADY_INCLUDED
++#include "CommonSVO.cfi"
++#include "Total_Illumination_Shading.cfi"
++
+ /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+ // Defines
+ #define VOX_AIR_ALBEDO_COLOR      0.01f
+@@ -76,6 +122,20 @@ Texture2D shadowFromSvoFinPrev: register (t16);
+ 
+ Texture2D levelHeightmap: register (t8);
+ 
++// rt stage 2: the four g-data targets the ShadePass reads.
++//
++// !!! THESE ALIAS t0-t3 WITH brickPool_Tree / Rgbs / Norm / Opac (CommonSVO.cfi:164-167). !!!
++// It compiles only because the CryFX parser emits per-technique HLSL containing just the
++// reachable declarations, and no single function ever reaches both sets: ConeTracePS walks the
++// brick pools and never the forward stack, ShadePS walks the forward stack and never a pool.
++// Adding a brick read to ShadePS - or a refl_G* read to anything the tracer calls - is a hard
++// register redefinition error from fxc with a message that will not mention this comment.
++// research/06 section 2.1, decision 06 section 6.1.
++Texture2D refl_GAL: register (t0); // = the ALD target of the previous ConeTracePass
++Texture2D refl_GNO: register (t1); // = the RGB target
++Texture2D refl_GPO: register (t2); // = HITPOS
++Texture2D refl_GLD: register (t3); // = RAYDIR
++
+ /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+ // Structures
+ struct vtxOutWPOS
+@@ -101,6 +161,25 @@ struct pixoutMRTTrace
+ {
+ 	half4 Diffuse: SV_Target0;
+ 	half4 Specular: SV_Target1;
++#if %_RT_QUALITY
++	// rt stage 2 (decision 06 section 6.6). Only allocated and only bound for the specular
++	// target set when e_svoTI_RT_Active; the diffuse permutation never sets %_RT_QUALITY.
++	//  HitPos: .xyz camera-relative hit position (RGBA32F - fp16 is 1.5 cm at 32 m, which is
++	//          shadow-acne territory for hit shading), .w = hit smoothness (kept positive;
++	//          the sign is reserved for the interleaved-refraction flag, stage 4).
++	//  RayDir: .xyz ray direction, .w = hit distance, or GetMaxRayDistance() + 1 on a miss
++	//          (the "no hit => fall back to probes" sentinel). .w == 0 means "not an RT pixel".
++	float4 HitPos: SV_Target2;
++	half4  RayDir: SV_Target3;
++#endif
++};
++
++// rt stage 2: the ShadePass output is exactly CE's two-target trace contract, which is why
++// DemosaicPS and UpScalePS need no change at all.
++struct pixoutShade
++{
++	half4 vALD: SV_Target0;
++	half4 vRGB: SV_Target1;
+ };
+ 
+ struct pixoutMRTDemosaic
+@@ -1513,6 +1592,12 @@ pixoutMRTTrace ConeTracePS(vtxOutWPOS IN)
+ 	const int nPassesNum = 1;
+ 	#endif
+ 
++#if %_RT_QUALITY
++	// rt stage 2: set when this pixel carries intermediate g-data for the ShadePass instead
++	// of a final colour. Cleared again by any debug view, so a debug picture survives ShadePS.
++	bool bRTWriteGData = false;
++#endif
++
+ 	for (int p = 0; p < nPassesNum; p++)
+ 	{
+ 		int s = (nFramesNum == 2) ? (int(SVO_FrameIdByte.x) & 1) : 0;
+@@ -1641,25 +1726,41 @@ pixoutMRTTrace ConeTracePS(vtxOutWPOS IN)
+ 		vC = ConeTraceTreeAndSky(fRayLen, r, SvoParamsDiffuse.x + power / 10000, SvoParamsInject.z, bUseRT ? 1 : 0, false, false, bUseRT ? float3(0, 0, 0) : normalize(vNor0));
+ 
+ #if %_RT_QUALITY
+-		if (bUseRT && g_rtInfo.hitpos.w > 0 && g_rtInfo.best.vAlb.a > 0 && !g_rtInfo.best.incomplete)
+-		{
+-			// Stage-1 provisional colour (decision 06 section 6.5): the triangle albedo replaces
+-			// the voxel albedo in CE's own irradiance trick. Replaced wholesale by the ShadePass
+-			// of stage 2. An `incomplete` traversal falls through to the voxel cone result.
+-			const float3 vIrradiance = g_rtInfo.cellValid
+-				? RT_SampleVoxelIrradiance(g_rtInfo.cellTC, g_rtInfo.cellMin, g_rtInfo.cellMax, g_rtInfo.hitpos.xyz)
+-				: (float3)1.f;
+-
+-			vC.xyz = g_rtInfo.albedo_smoothness.xyz * vIrradiance;
+-			vC.a = 1;
+-		}
++		// rt stage 2: a hit (or a deliberate miss) leaves this pixel carrying g-data, which the
++		// ShadePass turns into ALD + RGB. An `incomplete` traversal falls through to the voxel
++		// cone result and is therefore NOT g-data (decision 03 section 3.5).
++		bRTWriteGData = bUseRT && g_rtInfo.hitpos.w > 0 && !g_rtInfo.best.incomplete;
+ 
+ 	#if %_RT_PARTICLE_SHADOW
+ 		if (bUseRT)
+ 		{
+-			float3 vDebug;
+-			if (RT_GetDebugColor(vDebug))
+-				vC = float4(vDebug, 1);
++			if ((int)VOX_RT_DEBUG_MODE == 6)
++			{
++				// Debug view 6 = the stage-1 provisional colour (decision 06 section 6.5): the
++				// triangle albedo substituted into CE's own "voxel radiance / voxel albedo"
++				// irradiance trick. Kept as a view because it needs no light data at all, so it
++				// still shows a picture when the ShadePass resources are wrong.
++				if (bRTWriteGData && g_rtInfo.best.vAlb.a > 0)
++				{
++					const float3 vIrradiance = g_rtInfo.cellValid
++						? RT_SampleVoxelIrradiance(g_rtInfo.cellTC, g_rtInfo.cellMin, g_rtInfo.cellMax, g_rtInfo.hitpos.xyz)
++						: (float3)1.f;
++
++					vC.xyz = g_rtInfo.albedo_smoothness.xyz * vIrradiance;
++					vC.a = 1;
++				}
++
++				bRTWriteGData = false; // this pixel is final; ShadePS must leave it alone
++			}
++			else
++			{
++				float3 vDebug;
++				if (RT_GetDebugColor(vDebug))
++				{
++					vC = float4(vDebug, 1);
++					bRTWriteGData = false;
++				}
++			}
+ 		}
+ 	#endif
+ #endif
+@@ -1679,6 +1780,27 @@ pixoutMRTTrace ConeTracePS(vtxOutWPOS IN)
+ 	vRGB.xyz += 0.001f;
+ 	vRGB.w = fNewDepth;
+ 
++#if %_RT_QUALITY
++	// rt stage 2 (decision 06 section 6.1 / 6.6): a triangle-ray pixel carries g-data instead of
++	// a colour, and the ShadePass overwrites ALD + RGB with the shaded result. The packing is
++	// Neo's, so the two existing targets carry four of the six values:
++	//   ALD.xyz = world normal scaled by (1 + emittance)   ALD.w = PackRGB(reflectance), negated
++	//                                                              for the veg-leaves model
++	//   RGB.xyz = hit albedo                               RGB.w = UNTOUCHED scene linear depth
++	// RGB.w stays the reflecting pixel's depth because that is what DemosaicPS reads out of this
++	// channel (Total_Illumination.cfx:1066, 1073-1074) for its bilateral weights. Smoothness
++	// therefore rides in HitPos.w, not here.
++	if (bRTWriteGData)
++	{
++		vALD.xyz = g_rtInfo.normal_reflectance.xyz;
++		vALD.w   = g_rtInfo.normal_reflectance.w;
++		vRGB.xyz = g_rtInfo.albedo_smoothness.xyz;
++
++		OUT.HitPos = float4(g_rtInfo.hitpos.xyz - GetWorldViewPos(), abs(g_rtInfo.albedo_smoothness.w));
++		OUT.RayDir = float4(g_rtInfo.raydir.xyz, g_rtInfo.raydir.w);
++	}
++#endif
++
+ #endif
+ 
+ 	OUT.Diffuse = vALD;
+@@ -1688,6 +1810,126 @@ pixoutMRTTrace ConeTracePS(vtxOutWPOS IN)
+ 	return OUT;
+ }
+ 
++///////////////////////////////////////////////////////////////////////////////////
++// rt stage 2 - hit shading (decision 06). Sits between ConeTracePass and DemosaicPass on the
++// specular target set and converts the g-data written above back into the ALD + RGB contract
++// the rest of the stock SVO chain already speaks, so nothing downstream changes.
++//
++// !!! ShadePS aliases t0-t3 with the brick pools. It must never call an SVO tracing function.
++// See the header of Total_Illumination_Shading.cfi. !!!
++///////////////////////////////////////////////////////////////////////////////////
++
++pixoutShade ShadePS(vtxOutWPOS IN)
++{
++	pixoutShade OUT = (pixoutShade)0;
++
++	const float4 vGAL = refl_GAL.SampleLevel(ssSvoPointClamp, IN.baseTC.xy, 0);
++	const float4 vGNO = refl_GNO.SampleLevel(ssSvoPointClamp, IN.baseTC.xy, 0);
++
++	// pass-through for every pixel the tracer already shaded (voxel cone result, debug views,
++	// pixels below the gloss threshold); ALD + RGB simply survive the pass unmodified
++	OUT.vALD = vGAL;
++	OUT.vRGB = vGNO;
++
++#if %_RT_QUALITY
++	const float4 vGPO = refl_GPO.SampleLevel(ssSvoPointClamp, IN.baseTC.xy, 0);
++	const float4 vGLD = refl_GLD.SampleLevel(ssSvoPointClamp, IN.baseTC.xy, 0);
++
++	// The sentinel is the hit distance, not Neo's hitpos.w: a hit smoothness of exactly 0 is
++	// legal (a matte wall seen in a mirror) and would read as "not an RT pixel".
++	if (vGLD.w > 0)
++	{
++		// "no hit" is encoded as an over-long distance; the ray direction is then flipped so the
++		// probe lookup below reflects into the sky instead of into the surface, and albedo /
++		// reflectance were forced to 1 by RT_ProcessBestHit so the probe term passes through
++		// unmodified. That is the whole fallback-to-probes policy.
++		const bool bNoHit = (vGLD.w >= GetMaxRayDistance() + 0.5f);
++
++		MaterialAttribsCommon commonAttribs = (MaterialAttribsCommon)0;
++		commonAttribs.NormalWorld = normalize(vGAL.xyz);
++		commonAttribs.Albedo      = vGNO.xyz;
++		commonAttribs.Reflectance = UnpackRGB(abs(vGAL.w));
++		commonAttribs.Smoothness  = abs(vGPO.w);
++
++		if (vGAL.w < 0) // the lighting model rides in the sign of the packed reflectance
++		{
++			commonAttribs.LightingModel = LIGHTINGMODEL_TRANSMITTANCE;
++			commonAttribs.Transmittance = (half3)0.5f;
++		}
++
++		ForwardShadingAttribs fwdAttribs = (ForwardShadingAttribs)0;
++		fwdAttribs.screenUV        = IN.baseTC.xy;
++		fwdAttribs.worldPos        = vGPO.xyz; // camera-relative, as everywhere in the forward stack
++		fwdAttribs.normal          = commonAttribs.NormalWorld;
++		fwdAttribs.normalSpecProbe = commonAttribs.NormalWorld;
++		fwdAttribs.reflectance     = commonAttribs.Reflectance;
++		fwdAttribs.albedo          = commonAttribs.Albedo;
++		fwdAttribs.smoothness      = commonAttribs.Smoothness;
++
++		fwdAttribs.custom.LightingModel = commonAttribs.LightingModel;
++		fwdAttribs.custom.Transmittance = (commonAttribs.LightingModel == LIGHTINGMODEL_TRANSMITTANCE) ? 0.5f : 0.f;
++		// emittance rides in the LENGTH of the packed normal
++		fwdAttribs.custom.Emittance     = max(length(vGAL.xyz) - 1.f, 0.f);
++		fwdAttribs.custom.RayDirection  = bNoHit ? -vGLD.xyz : vGLD.xyz;
++		// traced sun shadow rays are stage 4; the cascades do the work today
++		fwdAttribs.custom.SunShadowRT   = 1.f;
++
++		float3 diffuseAcc = 0.0f;
++		float3 specularAcc = 0.0f;
++		Fwd_StandardOpaqueShading_Raytracing(commonAttribs, fwdAttribs, diffuseAcc, specularAcc);
++
++		float3 acc = diffuseAcc + specularAcc + SVO_ShadeParams0.x * fwdAttribs.albedo + .0001f;
++
++		// Emissive. MAT_EMISSIVE_UNIT_SCALE was already applied when the intensity was packed
++		// into the normal's length (CommonSVO_RT.cfi RT_ProcessBestHit), so this is the same
++		// kcd/m^2 convention Illum.cfx uses. NOTE: Neo multiplies emittance by albedo because
++		// the atlas stores a single emissive scalar and has to borrow the albedo for hue; CE's
++		// forward emissive does not. Kept as Neo's until the atlas carries a colour (2B).
++		acc += fwdAttribs.albedo * fwdAttribs.custom.Emittance;
++
++		if (SVO_ShadeParams0.y) // debug: flat albedo
++			acc = fwdAttribs.albedo;
++
++		// Global fog, added BEFORE the exposure divide: GetVolumetricFogColorInternal already
++		// multiplies the authored fog colour by PS_HDR_RANGE_ADAPT_MAX on this branch, and `acc`
++		// is built from already-exposed lights, so both sides of the lerp are in the same units.
++		{
++			const float3 cameraToWorldPos = normalize(vGLD.xyz) * abs(vGLD.w);
++			const float3 worldPos = vGPO.xyz + GetWorldViewPos();
++			const SFogParams fogParams = GetFogParams();
++			const float4 localFogColor = GetVolumetricFogColor(fogParams, worldPos, cameraToWorldPos);
++			acc = lerp(localFogColor.xyz, acc, saturate(localFogColor.w));
++		}
++
++		// Neo clamps to a hard 8 here, which is roughly the top of the RGBM range the voxel
++		// codec expects - a ceiling in UNEXPOSED units applied to an EXPOSED value. On the
++		// scene-referred path the only meaningful ceiling is the fp16 writer clamp, applied
++		// while the value is still exposed, exactly as Illum.cfx does it.
++		if (SCENE_WRITER_CLAMP > 0)
++			acc = min(acc, (float3)SCENE_WRITER_CLAMP);
++
++		// decision 06 section 6.4: ApplyGI (TiledShading.cfi:105-142) is THE single pre-exposure
++		// boundary for SVOGI, and everything downstream of this pass - DemosaicPS, UpScalePS,
++		// GetSpecularFinRT - is in stock, unexposed units. Fwd_StandardOpaqueShading_Raytracing
++		// returned EXPOSED radiance because CV_SunColor and the tiled light colours already carry
++		// the aperture. Divide it back out here, once, so ApplyGI exposes it exactly once.
++		// PS_HDR_RANGE_ADAPT_MAX is exactly 1.0 off the switch, so the stock path is unchanged.
++		acc /= PS_HDR_RANGE_ADAPT_MAX;
++
++		// output ALD + RGB in the shape DemosaicPS expects
++		const float fBr = length(acc.xyz);
++
++		OUT.vALD.xyz = vGLD.xyz * fBr;
++		OUT.vALD.w   = fBr;
++
++		OUT.vRGB.xyz = acc.xyz;
++		OUT.vRGB.w   = vGNO.w; // scene linear depth of the reflecting pixel, untouched
++	}
++#endif
++
++	return OUT;
++}
++
+ pixout_RenderAtmosphere RenderAtmospherePS(vtxOutWPOS IN)
+ {
+ 	pixout_RenderAtmosphere OUT = (pixout_RenderAtmosphere)0;
+@@ -2863,6 +3105,18 @@ technique ConeTracePass
+ 	}
+ }
+ 
++// rt stage 2 (decision 06): hit shading, between ConeTracePass and DemosaicPass on the
++// specular target set. Only dispatched when e_svoTI_RT_Active && IntegrationMode == 2.
++technique ShadePass
++{
++	pass p0
++	{
++		VertexShader = RenderLightingCommonVS();
++		PixelShader = ShadePS();
++		CullMode = None;
++	}
++}
++
+ #ifdef SVO_LMAPS
+ 
+ technique ConeTracePS_NID
+@@ -2924,6 +3178,17 @@ technique UpScalePass
+ /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+ // Compute techniques
+ 
++// rt stage 2: world-space light mask grid for the ShadePass (decision 06 section 6.2).
++// Body in Total_Illumination_Shading.cfi; see the note there for why it is not in
++// TiledShading.cfi.
++technique
++  BuildRayTracingLightList {
++	pass p0 {
++		ComputeShader =
++		  BuildRayTracingLightListCS();
++	}
++}
++
+ technique
+   ComputeClearBricks {
+ 	pass p0 {
+diff --git a/Engine/Shaders/HWScripts/CryFX/Total_Illumination_Shading.cfi b/Engine/Shaders/HWScripts/CryFX/Total_Illumination_Shading.cfi
+new file mode 100644
+index 00000000..d5cac857
+--- /dev/null
++++ b/Engine/Shaders/HWScripts/CryFX/Total_Illumination_Shading.cfi
+@@ -0,0 +1,370 @@
++// Copyright 2013-2021 Crytek GmbH / Crytek Group. All rights reserved.
++
++///////////////////////////////////////////////////////////////////////////////////
++//
++// Hit shading for software triangle ray tracing (rt stage 2, decision 06).
++//
++// This file is CE's own forward tiled shading (TiledShading.cfi TiledForwardShading +
++// ForwardShading.cfi Fwd_StandardOpaqueShading) with exactly four substitutions, the
++// same four Neo made (research/06 section 0):
++//
++//   1. the light index source is a WORLD-SPACE voxel grid mask
++//      (Fwd_TileLightMaskRayTracing) instead of the screen tile mask (Fwd_TileLightMask);
++//   2. the view vector is normalize(-attribs.custom.RayDirection), i.e. back along the
++//      ray, instead of -normalize(attribs.worldPos), i.e. back to the camera;
++//   3. the sun shadow is Fwd_SampleSunShadowMaps(worldPos), the world-space cascade
++//      walk, instead of a screen-space shadow-mask texel of the REFLECTING pixel;
++//   4. the material comes from the four ray-tracing g-data targets, not from the
++//      screen G-buffer.
++//
++// Everything else - DiffuseBRDF / SpecularBRDF / GetEnvmapFresnel / DecodeHDRCubemap /
++// CubemapBoxParallaxCorrection / GetPhysicalLightAttenuation / GetAreaLightFadeout /
++// the probe weight accumulation / the energy split - is CE 5.7.1 code, unchanged, so
++// that a reflected surface and the same surface seen directly cannot drift apart.
++//
++// !!! REGISTER ALIASING - READ BEFORE EDITING !!!
++// The ShadePS technique aliases t0-t3 (brickPool_Tree/Rgbs/Norm/Opac in CommonSVO.cfi)
++// with refl_GAL/GNO/GPO/GLD, t17 (brickPool_RTri, retired) with Fwd_TileLightMask, t18
++// (geomPool_TTex now lives at t28) with Fwd_TiledLightsShadeInfo and t28 (geomPool_TTex)
++// with Fwd_ShadowMap2. That is legal ONLY because the CryFX parser emits per-technique
++// HLSL containing just the reachable declarations, and ShadePS reaches the forward set
++// while ConeTracePS reaches the SVO pools - never both in one function.
++// => ShadePS and anything it calls must NEVER call an SVO tracing function
++//    (ConeTraceTree / ConeTraceBrick / RT_TraverseTris / RT_ProcessBestHit / ...)
++//    or touch any brick or geometry pool. Doing so produces an opaque fxc register
++//    redefinition error. research/06 section 2.1.
++//
++// The differences from Neo that are deliberate:
++//  - Fwd_TileLightMaskRayTracing sits at t33 (free), not at t17 on top of
++//    Fwd_TileLightMask (research/03 section 7.3).
++//  - the grid cell index is CLAMPED to the grid (Neo reads out of bounds outside the box).
++//  - the sun is not gated on %_RT_SAMPLE6 (that bit means "static BVH" here) and the
++//    tiled loop is not gated on %_RT_TILED_SHADING (that bit means "trace voxels" in
++//    the SVO shader - research/03 section 7.1); both run unconditionally.
++//  - bOpaque is always false: it would apply three screen-space reads of the REFLECTING
++//    pixel (AO, shadow mask, ApplyGI) to an off-screen point. research/06 section 3.5.
++//  - area lights are skipped at the hit (Neo does the same); when they are enabled they
++//    must take the same GetAreaLightFadeout branch as the primary surface.
++//
++///////////////////////////////////////////////////////////////////////////////////
++
++// World-space light mask grid, 8 x uint per cell, byte-compatible with the screen tile
++// mask so GetNextTileLightIndex and lightShadeInfoIdx = lightIndex + maskIndex * 32 are
++// reused verbatim. Produced by BuildRayTracingLightListCS below.
++Buffer<uint> Fwd_TileLightMaskRayTracing : register(t33);
++
++// (min.xyz, 0), (max.xyz, 0), (dimX, dimY, dimZ, validLightCount). Set by
++// CSvoRenderer::SetupShadeConstants only when e_svoTI_RT_Active.
++float4 SVO_RTLightGridMin;
++float4 SVO_RTLightGridMax;
++float4 SVO_RTLightGridDims;
++
++// (ambientAlbedoAdd, debugAlbedo, aoRange, isSpecularSet)
++float4 SVO_ShadeParams0;
++
++///////////////////////////////////////////////////////////////////////////////////
++
++// Neo reads (worldPos - min) / cellSize with no clamp, so any hit outside the grid box
++// wraps and reads another cell's mask (research/06 section 3.4, gap 3). We clamp: a hit
++// outside the box is shaded with the nearest cell's light set, which is the same answer
++// the conservative sphere cull would have given one cell further in.
++uint SVO_RT_GetLightGridBufferIdx(float3 worldPosAbs)
++{
++	const float3 vDims = max(SVO_RTLightGridDims.xyz, (float3)1.f);
++	const float3 vCell = max((SVO_RTLightGridMax.xyz - SVO_RTLightGridMin.xyz) / vDims, (float3)0.0001f);
++	const float3 vIdxF = clamp((worldPosAbs - SVO_RTLightGridMin.xyz) / vCell, (float3)0.f, vDims - 1.f);
++	const uint3  vIdx  = (uint3)vIdxF;
++	const uint3  nDims = (uint3)vDims;
++
++	return 8u * (vIdx.z * nDims.y * nDims.x + vIdx.y * nDims.x + vIdx.x);
++}
++
++void TiledForwardShading_Raytracing(in ForwardShadingAttribs attribs, inout float3 diffuseAcc, inout float3 specularAcc,
++                                    SamplerState ssTrilinearClamp, SamplerComparisonState ssComparison,
++                                    const bool applyProbes, const bool applyNonProbes, const bool bSkipSpecularProbes = false)
++{
++	const float3 worldPosAbs = attribs.worldPos + GetWorldViewPos();
++
++	// substitution 1: world-space grid instead of (tileIdx.y * numTiles.x + tileIdx.x) * 8
++	const uint bufferIdx = SVO_RT_GetLightGridBufferIdx(worldPosAbs);
++
++	float probeWeightSum = 0;
++
++	// substitution 2: look back along the ray, not back at the camera
++	const float3 viewVec = normalize(-attribs.custom.RayDirection);
++
++	float specCubeLod = TILED_SHADING_SPECPROBE_MAXMIP - attribs.smoothness * TILED_SHADING_SPECPROBE_MAXMIP;
++	float NdotV = saturate(dot(viewVec, attribs.normalSpecProbe));
++	float3 envFresnel = GetEnvmapFresnel(attribs.reflectance, attribs.smoothness, NdotV);
++	float2 envBRDF = Fwd_EnvironmentBRDF.SampleLevel(ssTrilinearClamp, float2(NdotV, attribs.smoothness), 0).xy;
++	envFresnel = lerp(envBRDF.xxx, envBRDF.yyy, attribs.reflectance);
++
++	// bOpaque is false at a hit, so there is no screen-space AO term to read
++	const float2 occlusion = float2(1, 1);
++
++	int lightIndex = -1;
++	uint maskIndex = 0;
++	uint curMask = Fwd_TileLightMaskRayTracing[bufferIdx];
++
++	[loop]
++	for (;;)
++	{
++		while (maskIndex < 8)
++		{
++			lightIndex = GetNextTileLightIndex(curMask, lightIndex);
++			if (lightIndex >= 0) break;
++			else curMask = Fwd_TileLightMaskRayTracing[++maskIndex + bufferIdx];
++		}
++
++		uint lightShadeInfoIdx = lightIndex + maskIndex * 32;
++		int lightType = Fwd_TiledLightsShadeInfo[lightShadeInfoIdx].lightType;
++
++		[branch]
++		if (lightIndex < 0 || lightType > LIGHT_TYPE_AMBIENT_AREA)
++			break;
++
++		if (applyProbes)
++		{
++			if (lightType == LIGHT_TYPE_PROBE && probeWeightSum < 1)
++			{
++				float3 lightVec = Fwd_TiledLightsShadeInfo[lightShadeInfoIdx].posRad.xyz - worldPosAbs;
++
++				// Compute attenuation for box
++				float3 tmpLightVec;
++				tmpLightVec.x = dot( Fwd_TiledLightsShadeInfo[lightShadeInfoIdx].projectorMatrix[0].xyz, lightVec );
++				tmpLightVec.y = dot( Fwd_TiledLightsShadeInfo[lightShadeInfoIdx].projectorMatrix[1].xyz, lightVec );
++				tmpLightVec.z = dot( Fwd_TiledLightsShadeInfo[lightShadeInfoIdx].projectorMatrix[2].xyz, lightVec );
++
++				[branch] if (abs(tmpLightVec.x) < 1 && abs(tmpLightVec.y) < 1 && abs(tmpLightVec.z) < 1)
++				{
++					tmpLightVec = MapCubeToSphere( tmpLightVec );
++					float4 lightColor = Fwd_TiledLightsShadeInfo[lightShadeInfoIdx].color;
++
++					float attenuation = GetAttenuation( tmpLightVec, 1, true, Fwd_TiledLightsShadeInfo[lightShadeInfoIdx].attenuationParams.y ) * Fwd_TiledLightsShadeInfo[lightShadeInfoIdx].attenuationParams.x;
++					uint4 resIndexClamps = GetResourceIndexAndMipClamps(Fwd_TiledLightsShadeInfo[lightShadeInfoIdx].resIndex);
++					float probeWeight = (1 - probeWeightSum) * attenuation;
++
++					// Diffuse
++					float4 diffuseProbe = Fwd_DiffuseCubeArray.SampleLevel( ssTrilinearClamp, float4( attribs.normal, resIndexClamps.x ), resIndexClamps.y );
++					diffuseProbe.rgb = DecodeHDRCubemap( diffuseProbe );
++					diffuseAcc += diffuseProbe.rgb * (lightColor.rgb * probeWeight) * occlusion.x;
++
++					if (!bSkipSpecularProbes)
++					{
++						// Specular. reflect(-viewVec, N) is the second-bounce direction: the
++						// mirror of the INCOMING ray about the HIT normal.
++						float tmpGloss = 0;
++						float3 tmpReflVec = reflect(-viewVec, attribs.normalSpecProbe);
++						CubemapBoxParallaxCorrection( tmpReflVec, lightVec, Fwd_TiledLightsShadeInfo[lightShadeInfoIdx].shadowMatrix[0].xyz, Fwd_TiledLightsShadeInfo[lightShadeInfoIdx].shadowMatrix[1].xyz, tmpGloss );
++						float4 specularProbe = Fwd_SpecCubeArray.SampleLevel( ssTrilinearClamp, float4( tmpReflVec, resIndexClamps.x ), max(resIndexClamps.z, specCubeLod) );
++						specularProbe.rgb = DecodeHDRCubemap( specularProbe ) * envFresnel;
++						specularAcc += specularProbe.rgb * (lightColor.rgb * probeWeight) * occlusion.y * lightColor.a;
++					}
++
++					probeWeightSum += probeWeight;
++				}
++			}
++		}
++	}
++
++	// NOTE: no ApplyGI here. CE calls it at this point with the SCREEN uv of the pixel being
++	// shaded; at a ray hit that uv belongs to the reflecting pixel, not to the hit, so the
++	// indirect term would be the mirror's GI pretending to be the reflected object's GI.
++	// decision 06 section 6.4 / R05: indirect at the hit is probe-only in stage 2, and
++	// SVO_RTParams0.z (mixWithProbes) is the lane reserved for revisiting it.
++
++	[loop]
++	for (;;)
++	{
++		[branch]
++		if (lightIndex < 0)
++			break;
++
++		uint lightShadeInfoIdx = lightIndex + maskIndex * 32;
++		int lightType = Fwd_TiledLightsShadeInfo[lightShadeInfoIdx].lightType;
++
++		const float3 position = attribs.worldPos;
++		const float4 posRad = Fwd_TiledLightsShadeInfo[lightShadeInfoIdx].posRad;
++		const float3 lightVec = posRad.xyz - worldPosAbs;
++
++		if (applyNonProbes && lightType > LIGHT_TYPE_AMBIENT_AREA && lightType < LIGHT_TYPE_SUN && length( lightVec ) < posRad.w)
++		{
++			bool skipShading = false;
++			bool shadowMap = false;
++
++			ForwardLightParams lightParams;
++			lightParams.type = lightType;
++			lightParams.lightVec = normalize(lightVec);
++			lightParams.illuminance = Fwd_TiledLightsShadeInfo[lightShadeInfoIdx].color.rgb;
++
++			// identical to the primary-surface branch in TiledForwardShading, so a reflected
++			// area light falls off the same way as the one seen directly
++			float attenuation = (lightType == LIGHT_TYPE_REGULAR_AREA && SCENE_REFERRED_LIGHT_UNITS)
++			                    ? GetAreaLightFadeout( length( lightVec ), rcp(posRad.w) )
++			                    : GetPhysicalLightAttenuation( length( lightVec ), rcp(posRad.w), Fwd_TiledLightsShadeInfo[lightShadeInfoIdx].attenuationParams.x );
++			lightParams.illuminance *= attenuation;
++
++			if (lightType == LIGHT_TYPE_REGULAR_PROJECTOR)
++			{
++				if (attenuation > 0)
++				{
++					float4 projTC = mul( Fwd_TiledLightsShadeInfo[lightShadeInfoIdx].projectorMatrix, float4( worldPosAbs, 1.0f ) );
++					projTC.xy /= projTC.w;
++
++					if (projTC.w < 0 || min( projTC.x, projTC.y ) < 0 || max( projTC.x, projTC.y ) > 1)  // Avoid back-projection
++						skipShading = true;
++					else
++					{
++						uint4 resIndexClamps = GetResourceIndexAndMipClamps(Fwd_TiledLightsShadeInfo[lightShadeInfoIdx].resIndex);
++						lightParams.illuminance *= Fwd_SpotTexArray.SampleLevel( ssTrilinearClamp, float3(projTC.xy, resIndexClamps.x), resIndexClamps.y ).xxx;
++					}
++
++					if (Fwd_TiledLightsShadeInfo[lightShadeInfoIdx].shadowParams.x > 0)
++						shadowMap = true;
++				}
++			}
++			else if (lightType == LIGHT_TYPE_REGULAR_POINTFACE)
++			{
++				uint cubeFace = selectCubeFace(lightVec);
++
++				skipShading = (Fwd_TiledLightsShadeInfo[lightShadeInfoIdx].resIndex != cubeFace);
++				shadowMap   = true;
++			}
++			else if (lightType == LIGHT_TYPE_REGULAR_AREA)
++			{
++				// research/06 section 7.3g: the LTC lobe needs the area basis and a view vector
++				// the hit does not have a tested convention for yet. Skipped, like Neo.
++				skipShading = true;
++			}
++
++			if (!skipShading)
++			{
++				float shadowOccl = 1;
++
++				if (shadowMap)
++				{
++					float4 P0 = mul( Fwd_TiledLightsShadeInfo[lightShadeInfoIdx].shadowMatrix, float4( worldPosAbs, 1 ) );
++					P0.xy /= P0.w;
++					P0.z -= Fwd_TiledLightsShadeInfo[lightShadeInfoIdx].shadowParams.y;
++
++					// bOpaque would read the screen-space shadow mask of the reflecting pixel here
++					shadowOccl = Fwd_ShadowPool.SampleCmpLevelZero( ssComparison, P0.xy, P0.z );
++				}
++
++				lightParams.illuminance *= shadowOccl;
++
++				float3 diffuseTerm = 0;
++				float3 specularTerm = 0;
++
++				Callback_ShadingDirect(attribs, lightParams, diffuseTerm, specularTerm);
++
++				diffuseAcc += diffuseTerm;
++				specularAcc += specularTerm;
++			}
++		}
++
++		while (maskIndex < 8)
++		{
++			lightIndex = GetNextTileLightIndex(curMask, lightIndex);
++			if (lightIndex >= 0) break;
++			else curMask = Fwd_TileLightMaskRayTracing[++maskIndex + bufferIdx];
++		}
++	}
++}
++
++void Fwd_StandardOpaqueShading_Raytracing(in MaterialAttribsCommon commonAttribs, inout ForwardShadingAttribs fwdAttribs,
++                                          inout float3 diffuseAcc, inout float3 specularAcc, bool bSunShadows = true)
++{
++	fwdAttribs.normal = commonAttribs.NormalWorld;
++	fwdAttribs.normalSpecProbe = fwdAttribs.normal;
++	fwdAttribs.reflectance = commonAttribs.Reflectance;
++	fwdAttribs.albedo = commonAttribs.Albedo;
++	fwdAttribs.smoothness = commonAttribs.Smoothness;
++	fwdAttribs.areaAttribs = (AreaLightShadingAttribs)0;
++
++	// Sun shading. substitution 3: the cascade walk at the HIT world position; the primary
++	// surface reads Fwd_SunShadowMask at its own screen texel, which is meaningless here.
++	// The sun colour is plain CV_SunColor - the SVO's own sun / PI (SceneTree.cpp:2500) exists
++	// only so the RGBM brick codec does not clip, and the hit never goes through RGBM
++	// (research/06 section 7.3e). The 1/PI arrives inside the BRDFs via SCENE_BRDF_NORM_FACTOR.
++	{
++		float shadowMask = 0;
++		if (bSunShadows)
++			shadowMask = Fwd_SampleSunShadowMaps(fwdAttribs.worldPos + GetWorldViewPos());
++
++		ForwardLightParams lightParams;
++		lightParams.type = LIGHT_TYPE_SUN;
++		lightParams.lightVec = CV_SunLightDir.xyz;
++		lightParams.illuminance = CV_SunColor.xyz * (1 - shadowMask);
++		Callback_ShadingDirect(fwdAttribs, lightParams, diffuseAcc, specularAcc);
++	}
++
++	// unconditional: %_RT_TILED_SHADING means "trace voxels" on this shader
++	TiledForwardShading_Raytracing(fwdAttribs, diffuseAcc, specularAcc, ssFwdBilinearWrap, ssFwdComparison, true, true, false);
++
++	// Apply albedo (using simple energy conservation between specular and diffuse).
++	// Byte-identical to ForwardShading.cfi:337 - the reflected wall must be graded by the
++	// same rule as the wall.
++	diffuseAcc *= fwdAttribs.albedo * saturate(1 - GetLuminance(fwdAttribs.reflectance));
++}
++
++///////////////////////////////////////////////////////////////////////////////////
++// World-space light mask grid builder (Neo's BuildRayTracingLightListCS, neo:TiledShading.cfi:1283).
++//
++// Placed here, not in TiledShading.cfi, on purpose: TiledShading.cfi's technique region
++// lives inside #if TILED_DEFERRED_SHADING_TECHNIQUE, i.e. it only compiles inside
++// DeferredShading.cfx, and a technique placed outside that block would be emitted into
++// EVERY material shader that includes TiledShading.cfi - a text change to the native path.
++// Total_Illumination.cfx is FEATURE_SVO_GI-only and is the shader CSvoRenderer already owns.
++///////////////////////////////////////////////////////////////////////////////////
++
++RWBuffer<uint> SVO_RTLightMaskGridOutput : register(u0);
++
++// "does the sphere's AABB overlap this cell" - conservative, over-includes by at most the
++// corner factor. Neo has the exact sphere/AABB test right next to it, commented out; the
++// over-inclusion only costs shade-time loop iterations and is safe.
++bool SVO_RT_VoxelInsideSphere(float3 vVoxelMin, float3 vVoxelMax, float3 vSphereCenter, float fRadius)
++{
++	const float3 vIntersectMin = max(vVoxelMin, vSphereCenter - fRadius);
++	const float3 vIntersectMax = min(vVoxelMax, vSphereCenter + fRadius);
++	return all(vIntersectMax >= vIntersectMin);
++}
++
++[numthreads(8, 8, 8)]
++void BuildRayTracingLightListCS(uint3 DispatchThreadID : SV_DispatchThreadID)
++{
++	const uint3 nGridDim = (uint3)max(SVO_RTLightGridDims.xyz, (float3)1.f);
++
++	// Neo has neither this guard nor a per-frame clear of the buffer, and accumulates with
++	// InterlockedOr, so a stale mask survives forever (research/06 section 3.4, gap 2).
++	// One thread owns one cell, so a plain store is both the clear and the write.
++	if (any(DispatchThreadID >= nGridDim))
++		return;
++
++	const float3 vVoxelDim = (SVO_RTLightGridMax.xyz - SVO_RTLightGridMin.xyz) / (float3)nGridDim;
++	const float3 vVoxelMin = (float3)DispatchThreadID * vVoxelDim + SVO_RTLightGridMin.xyz;
++	const float3 vVoxelMax = (float3)(DispatchThreadID + uint3(1, 1, 1)) * vVoxelDim + SVO_RTLightGridMin.xyz;
++
++	const uint nCellIdx = DispatchThreadID.z * nGridDim.x * nGridDim.y + DispatchThreadID.y * nGridDim.x + DispatchThreadID.x;
++
++	const uint nLightCount = min((uint)SVO_RTLightGridDims.w, (uint)TILED_SHADING_MAX_NUM_LIGHTS);
++
++	uint nResult[8];
++	{
++		for (uint i = 0; i < 8; ++i)
++			nResult[i] = 0;
++	}
++
++	for (uint nLightIdx = 0; nLightIdx < nLightCount; ++nLightIdx)
++	{
++		const float4 vPosRad = Fwd_TiledLightsShadeInfo[nLightIdx].posRad;
++
++		if (SVO_RT_VoxelInsideSphere(vVoxelMin, vVoxelMax, vPosRad.xyz, vPosRad.w))
++			nResult[nLightIdx >> 5] |= 1u << (nLightIdx & 0x1Fu);
++	}
++
++	{
++		for (uint i = 0; i < 8; ++i)
++			SVO_RTLightMaskGridOutput[nCellIdx * 8 + i] = nResult[i];
++	}
++}
+-- 
+2.47.1.windows.1
+

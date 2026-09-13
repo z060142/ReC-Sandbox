@@ -3323,6 +3323,26 @@ int CVoxelSegment::CheckStoreTextureInPool(SShaderItem* pShItem, EEfResTextures 
 					pDstLine[x].a = pSrcLine[x].a;   // smoothness; 255 when the source carries none
 				}
 			}
+			else if (texSlot == EFTT_EMITTANCE)
+			{
+				// Illum.cfx GetEmittanceMask uses "emittanceMap.rgb * emittanceMap.a" as the mask and
+				// the consumer only has one channel for it (vEmm.a), so the mask luminance is folded
+				// into the alpha here. rgb is kept untouched for a later coloured-emissive stage.
+				// EmittanceMapGamma is NOT applied - it is a per material shader constant the record
+				// has no room for, so a strongly gamma-shaped emissive mask reflects slightly flatter
+				// than it shades (documented gap, stage 4).
+				for (int x = 0; x < nTexW; x++)
+				{
+					const ColorB  s = pSrcLine[x];
+					const ColorF  f((float)s.r / 255.f, (float)s.g / 255.f, (float)s.b / 255.f, 1.f);
+					const float   mask = f.Luminance() * ((float)s.a / 255.f);
+
+					pDstLine[x].r = s.r;
+					pDstLine[x].g = s.g;
+					pDstLine[x].b = s.b;
+					pDstLine[x].a = SATURATEB((int)(mask * 255.f + 0.5f));
+				}
+			}
 			else
 			{
 				memcpy(pDstLine, pSrcLine, nTexW * sizeof(ColorB));
@@ -3341,7 +3361,8 @@ int CVoxelSegment::CheckStoreTextureInPool(SShaderItem* pShItem, EEfResTextures 
 	return slice + 1;
 }
 
-//! One 4 texel material record (rt decision 02, 2.5). Stage 1 fills albedo and normal only.
+//! One 4 texel material record (rt decision 02, 2.5).
+//! Stage 2B fills all four atlas layers: albedo, normal (_ddna), specular and emissive.
 void CVoxelSegment::FillRTMaterialRecord(const SRayHitTriangleIndexed& tr, Vec4* pOut)
 {
 	const int maxTexSizeXY = gSvoEnv->GetRTTexRes();
@@ -3351,8 +3372,8 @@ void CVoxelSegment::FillRTMaterialRecord(const SRayHitTriangleIndexed& tr, Vec4*
 	const bool   bTerrain = (tr.hitObjectType == HIT_OBJ_TYPE_TERRAIN);
 	SShaderItem* pShItem = (rMI.pMat && !bTerrain) ? &rMI.pMat->GetShaderItem() : nullptr;
 
-	uint16 texW = 0, texH = 0, norW = 0, norH = 0;
-	int    albSlot = 0, norSlot = 0;
+	uint16 texW = 0, texH = 0, norW = 0, norH = 0, spcW = 0, spcH = 0, emiW = 0, emiH = 0;
+	int    albSlot = 0, norSlot = 0, spcSlot = 0, emiSlot = 0;
 
 	ColorF tint = Col_White;
 	float  opacity = 1.f;
@@ -3376,6 +3397,8 @@ void CVoxelSegment::FillRTMaterialRecord(const SRayHitTriangleIndexed& tr, Vec4*
 	{
 		albSlot = CheckStoreTextureInPool(pShItem, EFTT_DIFFUSE, texW, texH);
 		norSlot = CheckStoreTextureInPool(pShItem, EFTT_NORMALS, norW, norH);
+		spcSlot = CheckStoreTextureInPool(pShItem, EFTT_SPECULAR, spcW, spcH);
+		emiSlot = CheckStoreTextureInPool(pShItem, EFTT_EMITTANCE, emiW, emiH);
 
 		if (IRenderShaderResources* pRes = pShItem->m_pShaderResources)
 		{
@@ -3387,23 +3410,59 @@ void CVoxelSegment::FillRTMaterialRecord(const SRayHitTriangleIndexed& tr, Vec4*
 			if (normalStrength <= 0.f)
 				normalStrength = 1.f;
 
+			// MatSpecColor.w - exactly what Illum.cfx uses for attribs.Smoothness
 			const float gloss = pRes->GetStrengthValue(EFTT_SMOOTHNESS);
 			smoothness = SATURATE(gloss > 1.f ? gloss / 255.f : gloss);
 
+			// Reflectance source. Illum.cfx (GetSurfaceAttributes) computes
+			//     attribs.Reflectance = MatSpecColor.rgb * GetSpecularTex(specularTex).rgb
+			// and CShaderResources::GetColorValue(EFTT_SPECULAR) returns exactly MatSpecColor.rgb
+			// (REG_PM_SPECULAR_COL - ShaderResources.cpp GetColorValue). The consumer forms
+			// matInfo1.y * vSpc.xyz, so matInfo1.y is the scalar stand-in for MatSpecColor.rgb and
+			// vSpc is the atlas copy of the same specular map the primary surface samples.
+			// The 4 texel record has no room for a coloured F0, so a coloured metal loses its tint
+			// here; the unweighted channel average is used (not a photometric luminance) because
+			// reflectance is an energy ratio per channel, not a perceived brightness.
 			const ColorF spec = pRes->GetColorValue(EFTT_SPECULAR);
 			specRefl = SATURATE((spec.r + spec.g + spec.b) / 3.f);
+
+			// Emissive source. Illum.cfx IlluminationPS computes
+			//     emittance = MatEmissiveColor.rgb * MatEmissiveColor.w * MAT_EMISSIVE_UNIT_SCALE * mask
+			// where MatEmissiveColor.w is the material's "Emissive Intensity (kcd/m2)" and
+			// MAT_EMISSIVE_UNIT_SCALE (FXConstantDefs.cfi) is the literal 1000/10000.
+			// SShaderResources::GetFinalEmittance() is rgb * w * (1000 / RENDERER_LIGHT_UNIT_SCALE),
+			// i.e. the same product with the unit scale already applied. The consumer
+			// (CommonSVO_RT.cfi RT_ProcessBestHit) applies MAT_EMISSIVE_UNIT_SCALE itself, so the
+			// record must store the RAW kcd/m2 value - divide the unit scale back out. Going through
+			// GetFinalEmittance keeps this tied to the one place CE defines the unit.
+			const float matEmissiveUnitScale = 1000.f / RENDERER_LIGHT_UNIT_SCALE;   // == MAT_EMISSIVE_UNIT_SCALE
+			emissive = max(0.f, pRes->GetFinalEmittance().Luminance() / matEmissiveUnitScale);
 		}
 
 		if (pShItem->IsVegetation() && alphaRef > 0.05f)
 			tag = 0.25f;   // two sided leaves
 	}
 
-	// the atlas UV scale comes from the albedo copy; a normal map of a different size would need
-	// its own scale, for which the 4 texel record has no room (open item, stage 2)
+	// Known gap 7.2: the record carries ONE atlas UV scale, taken from the albedo copy. A normal,
+	// specular or emissive copy of a different size then samples with the albedo's scale, which
+	// shifts that layer across the hit. Count it and warn once per level so the case is visible
+	// instead of silently wrong; the fix needs a second scale field (or the packed atlas of
+	// decision 04's alternatives) and is a stage 4 item.
+	if (albSlot && texW && texH)
+	{
+		const bool bMismatch =
+		  (norSlot && (norW != texW || norH != texH)) ||
+		  (spcSlot && (spcW != texW || spcH != texH)) ||
+		  (emiSlot && (emiW != texW || emiH != texH));
+
+		if (bMismatch)
+			gSvoEnv->RTCountUvScaleMismatch(rMI.pMat ? rMI.pMat->GetName() : "?");
+	}
+
 	const float scaleX = albSlot ? (float)texW / (float)maxTexSizeXY : 1.f;
 	const float scaleY = albSlot ? (float)texH / (float)maxTexSizeXY : 1.f;
 
-	pOut[0] = Vec4((float)albSlot, RT_PackUint2(norSlot, 0), RT_PackUint2(0, 0), RT_PackTC16(scaleX, scaleY));
+	pOut[0] = Vec4((float)albSlot, RT_PackUint2(norSlot, spcSlot), RT_PackUint2(emiSlot, 0), RT_PackTC16(scaleX, scaleY));
 	pOut[1] = Vec4(normalStrength, specRefl, smoothness, emissive);
 	pOut[2] = Vec4(tint.r, tint.g, tint.b, 0.f);
 	pOut[3] = Vec4(0.f, 0.f, tag, RT_PackTC16(opacity, alphaRef));
@@ -3673,6 +3732,22 @@ struct SRTTestRand
 	}
 	float NextRange(float a, float b) { return a + (b - a) * Next(); }
 };
+
+//! Mirror of CommonSVO_RT.cfi ExtractUint2 (base 4096, high field first).
+void RT_ExtractUint2(float f, int& high, int& low)
+{
+	uint32 n = (uint32)f;
+	low = (int)(n & 4095); n /= 4096;
+	high = (int)(n & 4095);
+}
+
+//! Mirror of CommonSVO_RT.cfi ExtractTC16 (asuint split, two 16 bit fields over [0, 16)).
+void RT_ExtractTC16(float f, float& u, float& v)
+{
+	const uint32 n = RT_AsUint(f);
+	u = (float)(n & 0xffff) / 65535.f * 16.f;
+	v = (float)(n >> 16) / 65535.f * 16.f;
+}
 
 //! Moller-Trumbore with a relative determinant epsilon (rt decision 03, 3.6).
 bool RT_TestTriangle(const Vec3& org, const Vec3& dir, const Vec3& v0, const Vec3& v1, const Vec3& v2, float& tOut)
@@ -4054,7 +4129,65 @@ void CVoxelSegment::RunRTSelfTest()
 	PrintMessage("RT self test: quantisation - max vertex error %.6f m (qb.w = %.2f m, budget %.6f m), max hit distance error %.6f m, hit/miss disagreements vs original soup = %d",
 	             maxPosError, qb.w, qb.w / 65536.f, maxDistError, mismatchVsSoup);
 
-	if (mismatchVsDecoded == 0 && overflowCount == 0)
+	// ---- material record round trip (stage 2B: specular and emissive slots) ---------------------
+	// FillRTMaterialRecord needs a live SShaderItem, so the four texels are assembled here with the
+	// same packers and decoded with the same helpers the consumer uses (RT_ProcessBestHit).
+	int matMismatches = 0;
+	{
+		const int kSlots[6][4] =
+		{
+			//  albedo, normal, specular, emissive   (0 = the material has no such map)
+			{ 0, 0, 0, 0 },
+			{ 1, 0, 0, 0 },
+			{ 1, 2, 3, 4 },
+			{ 7, 0, 9, 0 },
+			{ 5, 6, 0, 8 },
+			{ 256, 4095, 4095, 4095 },
+		};
+
+		for (int i = 0; i < 6; i++)
+		{
+			const int   alb = kSlots[i][0], nor = kSlots[i][1], spc = kSlots[i][2], emi = kSlots[i][3];
+			const float specRefl = 0.04f + 0.1f * i;
+			const float emissive = 12.5f * i;           // raw kcd/m2, as the record stores it
+			const float scaleX = (float)(i + 1) / 8.f;
+			const float scaleY = (float)(i + 2) / 8.f;
+
+			Vec4 rec[SVO_RT_RECORD_TEXELS];
+			rec[0] = Vec4((float)alb, RT_PackUint2(nor, spc), RT_PackUint2(emi, 0), RT_PackTC16(scaleX, scaleY));
+			rec[1] = Vec4(1.f, specRefl, 0.5f, emissive);
+			rec[2] = Vec4(0.2f, 0.4f, 0.6f, 0.f);
+			rec[3] = Vec4(0.f, 0.f, 0.f, RT_PackTC16(1.f, 0.33f));
+
+			int decNor = 0, decSpc = 0, decEmi = 0, decPad = 0;
+			RT_ExtractUint2(rec[0].y, decNor, decSpc);
+			RT_ExtractUint2(rec[0].z, decEmi, decPad);
+
+			float decScaleX = 0.f, decScaleY = 0.f;
+			RT_ExtractTC16(rec[0].w, decScaleX, decScaleY);
+
+			// the consumer subtracts one and treats a negative result as "no texture"
+			const int slotNor = decNor - 1, slotSpc = decSpc - 1, slotEmi = decEmi - 1;
+
+			const bool bOk =
+			  ((int)rec[0].x == alb) &&
+			  (slotNor == nor - 1) && (slotSpc == spc - 1) && (slotEmi == emi - 1) &&
+			  (decPad == 0) &&
+			  (fabs(decScaleX - scaleX) < 1e-3f) && (fabs(decScaleY - scaleY) < 1e-3f) &&
+			  (fabs(rec[1].y - specRefl) < 1e-6f) && (fabs(rec[1].w - emissive) < 1e-6f);
+
+			if (!bOk)
+			{
+				matMismatches++;
+				PrintMessage("RT self test: material record %d mismatch - alb %d, nor %d/%d, spc %d/%d, emi %d/%d, scale %.4f,%.4f vs %.4f,%.4f",
+				             i, (int)rec[0].x, slotNor + 1, nor, slotSpc + 1, spc, slotEmi + 1, emi, decScaleX, decScaleY, scaleX, scaleY);
+			}
+		}
+	}
+
+	PrintMessage("RT self test: material records - 6 cases, specular/emissive slot round trip mismatches = %d (must be 0)", matMismatches);
+
+	if (mismatchVsDecoded == 0 && overflowCount == 0 && matMismatches == 0)
 		PrintMessage("RT self test: PASSED");
 	else
 		PrintMessage("RT self test: FAILED");

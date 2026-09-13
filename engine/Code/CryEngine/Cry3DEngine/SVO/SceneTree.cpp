@@ -2189,6 +2189,10 @@ static int RTSnapPow2(int value, int lo, int hi)
 
 void CSvoEnv::RTCachePoolDims()
 {
+	// SRTBuildStats is a plain struct inside CSvoEnv, so without this the status line printed
+	// whatever was on the heap until the first BVH was built
+	m_rtStats.Reset();
+
 	if (m_rtPoolXY)
 		return;
 
@@ -2579,6 +2583,79 @@ void CSvoEnv::CheckUpdateMeshPools()
 
 	RTUploadDirtySlices();
 	RTProcessPendingFrees();
+	RTLogStatsWhenReady();
+}
+
+//! Known gap 7.2 (report 01b): the material record carries one atlas UV scale, taken from the
+//! albedo copy, so a normal / specular / emissive copy of a different size samples with the wrong
+//! scale. Warn once, keep counting, and report the count in the status line.
+void CSvoEnv::RTCountUvScaleMismatch(const char* szMatName)
+{
+	AUTO_LOCK(m_rtPendingLock);   // called from the streaming workers
+
+	m_rtUvScaleMismatch++;
+
+	if (!m_rtUvScaleWarned)
+	{
+		m_rtUvScaleWarned = true;
+		CryWarning(VALIDATOR_MODULE_3DENGINE, VALIDATOR_WARNING,
+		           "SVO RT: material '%s' has a normal/specular/emissive texture of a different size than its diffuse; "
+		           "the ray traced hit samples those layers with the diffuse UV scale (one scale per material record). "
+		           "Make the maps the same size, or lower e_svoTI_RT_MaxTexRes so both snap to the same atlas size.",
+		           szMatName ? szMatName : "?");
+	}
+}
+
+void CSvoEnv::RTFormatPoolLine(char* szOut, size_t bufSize) const
+{
+	// PodArray::CheckAllocated sets Count() to the full capacity, so the old "Count / capacity"
+	// always printed 1.00 (research/01 finding 15). Report the allocator instead.
+	const int recordsTotal = max(1, GetRTPoolRecords() - SVO_RT_SEG_STATIC);
+
+	// note: the '%%' below only survives because BOTH consumers pass this string through a "%s"
+	cry_sprintf(szOut, bufSize, "RT pools: records %d of %d = %.1f%% (%d MB), atlas %d of %d (%d MB)",
+	            m_rtRecordsUsed, recordsTotal, 100.f * m_rtRecordsUsed / recordsTotal,
+	            int((int64)GetRTPoolXY() * GetRTPoolXY() * GetRTPoolZ() * sizeof(Vec4) / 1024 / 1024),
+	            m_rtTexSlicesUsed, GetRTTexPoolZ(),
+	            int((int64)GetRTTexRes() * GetRTTexRes() * GetRTTexPoolZ() * sizeof(ColorB) / 1024 / 1024));
+}
+
+void CSvoEnv::RTFormatBvhLine(char* szOut, size_t bufSize) const
+{
+	const SRTBuildStats& st = m_rtStats;
+
+	cry_sprintf(szOut, bufSize, "RT BVH: %d cells, %d K tris, %d K nodes, %d leaves, depth %d, maxLeaf %d, %d mats, uvClamp %d, texScale %d, skip %d, %.0f ms",
+	            st.cells, st.tris / 1000, st.nodes / 1000, st.leaves, st.maxDepth, st.maxLeafTris,
+	            st.mats, st.uvClamped, m_rtUvScaleMismatch, st.trisSkipped, st.buildMs);
+}
+
+//! Belt and braces for the HUD: print the same two lines to the log once, when a voxelization pass
+//! has finished. Reaching the numbers must not depend on r_DisplayInfo being visible.
+void CSvoEnv::RTLogStatsWhenReady()
+{
+	const bool bReady = Get3DEngine()->IsSvoReady(true);
+
+	if (!bReady)
+	{
+		m_rtWasReady = false;
+		m_rtStatsLogged = false;
+		return;
+	}
+
+	if (m_rtWasReady || m_rtStatsLogged || !m_rtStats.cells)
+	{
+		m_rtWasReady = true;
+		return;
+	}
+
+	m_rtWasReady = true;
+	m_rtStatsLogged = true;
+
+	char szLine[256];
+	RTFormatPoolLine(szLine, sizeof(szLine));
+	PrintMessage("SVO RT: %s", szLine);
+	RTFormatBvhLine(szLine, sizeof(szLine));
+	PrintMessage("SVO RT: %s", szLine);
 }
 
 bool C3DEngine::GetSvoStaticTextures(I3DEngine::SSvoStaticTexInfo& svoInfo, PodArray<I3DEngine::SLightTI>* pLightsTI_S, PodArray<I3DEngine::SLightTI>* pLightsTI_D)
@@ -2683,11 +2760,27 @@ void C3DEngine::UpdateTISettings()
 	GetCVars()->e_svoTI_IntegrationMode = 0;
 	#endif
 
-	GetCVars()->e_svoTI_RT_Active = tiAdv.rtActive;
-	GetCVars()->e_svoTI_RT_MaxDistRay = tiAdv.rtMaxDistRay;
-	GetCVars()->e_svoTI_RT_MaxDistCam = tiAdv.rtMaxDistCam;
-	GetCVars()->e_svoTI_RT_MinGloss = tiAdv.rtMinGloss;
-	GetCVars()->e_svoTI_RT_MinRefl = tiAdv.rtMinRefl;
+	// The five RT parameters of the level's "TI advanced" block are NOT serialized: their
+	// SerializeSvoTi lines are commented out (TimeOfDayConstants.cpp, "Early version of RT is
+	// excluded from UI until we integrate proper version from Neon Noir branch"), so tiAdv.rtActive
+	// is always its constructor default false and the other four are always the constructor
+	// defaults. Assigning them unconditionally therefore did not transport a level setting - it
+	// silently reset the console values to the struct defaults on every ConstantsChanged()
+	// (level load, preset load, and every edit in the Environment Editor). Because these are direct
+	// writes to the CVars struct member, not ICVar::Set, nothing is logged and no OnChange fires:
+	// triangle RT just stopped working mid session with no trace. Evidence in the 2B report.
+	//
+	// Stock behaviour is preserved for a level that really does ask for RT: when rtActive is set
+	// (which only a level authored with the fields re-enabled can do) all five are applied exactly
+	// as before. Otherwise the console stays in charge, which is the only way RT can be driven today.
+	if (tiAdv.rtActive)
+	{
+		GetCVars()->e_svoTI_RT_Active = 1;
+		GetCVars()->e_svoTI_RT_MaxDistRay = tiAdv.rtMaxDistRay;
+		GetCVars()->e_svoTI_RT_MaxDistCam = tiAdv.rtMaxDistCam;
+		GetCVars()->e_svoTI_RT_MinGloss = tiAdv.rtMinGloss;
+		GetCVars()->e_svoTI_RT_MinRefl = tiAdv.rtMinRefl;
+	}
 
 	if (Cry3DEngineBase::GetCVars()->e_svoStreamVoxels != 2)
 		GetCVars()->e_svoStreamVoxels = tiAdv.streamVoxels ? 1 : 0;

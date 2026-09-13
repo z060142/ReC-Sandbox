@@ -125,25 +125,17 @@ char* CSvoManager::GetStatusString(int lineId)
 		return szText;
 	}
 
-	// RT pool fill: PodArray::CheckAllocated sets Count() to the full capacity, so the old
-	// "Count / capacity" always printed 1.00 (research/01 finding 15). Report the allocator instead.
-	if (lineId == (slotId++) && Cry3DEngineBase::GetCVars()->e_svoTI_RT_Active)
+	// The cvar is tested BEFORE slotId++ (like the VoxSeg line above): a suppressed line must not
+	// consume a slot, or every line after it becomes unreachable and the caller's loop stops early.
+	if (Cry3DEngineBase::GetCVars()->e_svoTI_RT_Active && lineId == (slotId++))
 	{
-		const int recordsTotal = max(1, gSvoEnv->GetRTPoolRecords() - SVO_RT_SEG_STATIC);
-		cry_sprintf(szText, "RT pools: records %d of %d = %.1f%% (%d MB), atlas %d of %d (%d MB)",
-		            gSvoEnv->m_rtRecordsUsed, recordsTotal, 100.f * gSvoEnv->m_rtRecordsUsed / recordsTotal,
-		            int((int64)gSvoEnv->GetRTPoolXY() * gSvoEnv->GetRTPoolXY() * gSvoEnv->GetRTPoolZ() * sizeof(Vec4) / 1024 / 1024),
-		            gSvoEnv->m_rtTexSlicesUsed, gSvoEnv->GetRTTexPoolZ(),
-		            int((int64)gSvoEnv->GetRTTexRes() * gSvoEnv->GetRTTexRes() * gSvoEnv->GetRTTexPoolZ() * sizeof(ColorB) / 1024 / 1024));
+		gSvoEnv->RTFormatPoolLine(szText, sizeof(szText));
 		return szText;
 	}
 
-	if (lineId == (slotId++) && Cry3DEngineBase::GetCVars()->e_svoTI_RT_Active)
+	if (Cry3DEngineBase::GetCVars()->e_svoTI_RT_Active && lineId == (slotId++))
 	{
-		const SRTBuildStats& st = gSvoEnv->m_rtStats;
-		cry_sprintf(szText, "RT BVH: %d cells, %d K tris, %d K nodes, %d leaves, depth %d, maxLeaf %d, %d mats, uvClamp %d, skip %d, %.0f ms",
-		            st.cells, st.tris / 1000, st.nodes / 1000, st.leaves, st.maxDepth, st.maxLeafTris,
-		            st.mats, st.uvClamped, st.trisSkipped, st.buildMs);
+		gSvoEnv->RTFormatBvhLine(szText, sizeof(szText));
 		return szText;
 	}
 
@@ -267,7 +259,10 @@ void CSvoManager::OnDisplayInfo(float& textPosX, float& textPosY, float& textSte
 		int lineId = 0;
 		while (char* szStatus = CSvoManager::GetStatusString(lineId))
 		{
-			Get3DEngine()->DrawTextRightAligned(textPosX, textPosY += textStepY, textScale, ColorF(0.5f, 1.0f, 1.0f), szStatus);
+			// szStatus is DATA, not a format string: the RT pool line contains a literal '%' and
+			// MSVC's vsnprintf rejects the whole format on the invalid specifier that makes,
+			// which silently dropped the line (2B).
+			Get3DEngine()->DrawTextRightAligned(textPosX, textPosY += textStepY, textScale, ColorF(0.5f, 1.0f, 1.0f), "%s", szStatus);
 			lineId++;
 		}
 	}

@@ -1,0 +1,202 @@
+From 7000d877451c94c84d12f6628d5253776800e0d8 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Sun, 13 Sep 2026 22:54:39 +0800
+Subject: [PATCH 187/190] fix: reflected emissive matches Illum.cfx in both
+ exposure and hue
+
+Two errors in the stage-2A emissive term, both visible on a practical seen in a
+mirror.
+
+1. Exposure. Illum.cfx writes MatEmissiveColor.rgb * .w * MAT_EMISSIVE_UNIT_SCALE
+   * PS_HDR_RANGE_ADAPT_MAX, i.e. exposed. ShadePS added the first three factors
+   and then divided the whole accumulator by PS_HDR_RANGE_ADAPT_MAX, which
+   ApplyGI multiplies back exactly once - so the reflected emissive came out one
+   exposure factor short of the same surface seen directly, at any non-unity
+   exposure. The term now enters on the exposed side of the divide, which is the
+   same thing as adding the raw value after it.
+
+2. Hue. The emissive was multiplied by the hit albedo - Neo's trick for an atlas
+   that stores a scalar only, so it has to borrow the albedo for colour. 2B's
+   atlas carries the emissive map's rgb, so the albedo multiply is gone and the
+   map's own hue is used, matching CE's forward path. A material with no
+   emissive map falls back to white x intensity as before.
+
+Carrying a colour needed a channel the g-data did not have. The mask splits into
+a magnitude, which keeps riding in the length of the packed normal, and a hue,
+max-channel normalised into [0,1]^3 and PackRGB'd into the integer part of
+hitpos.w next to the smoothness. hitpos.w is RGBA32F, the code is at most 511 and
+smoothness needs about eight bits, so both fit with room to spare; smoothness is
+capped at 0.9999 so it can never carry into the integer part.
+
+The luminance that the normalisation divides out is the one VoxelSegment.cpp
+folded into the atlas alpha, which is ColorF::Luminance() - Rec.601. The shader's
+own GetLuminance is Rec.709, and using it here would leave a pure red practical
+about 40% too bright. RT_EmissiveMaskLuminance exists to make that dependency
+explicit; if either side's weights move, both must move together.
+
+Validated with the rtharness2 fxc harness: ShadePS with and without the RT flags,
+ConeTracePS in four permutations, the light-grid CS, DemosaicPS and UpScalePS -
+0 errors. Shader-only, no C++ touched.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SCUvWGLCsqzm3VNMzp4uiS
+---
+ .../Shaders/HWScripts/CryFX/CommonSVO_RT.cfi  | 42 +++++++++++++++++--
+ .../HWScripts/CryFX/Total_Illumination.cfx    | 35 +++++++++++-----
+ 2 files changed, 63 insertions(+), 14 deletions(-)
+
+diff --git a/Engine/Shaders/HWScripts/CryFX/CommonSVO_RT.cfi b/Engine/Shaders/HWScripts/CryFX/CommonSVO_RT.cfi
+index 9bc1cfe2..aa125c89 100644
+--- a/Engine/Shaders/HWScripts/CryFX/CommonSVO_RT.cfi
++++ b/Engine/Shaders/HWScripts/CryFX/CommonSVO_RT.cfi
+@@ -85,6 +85,11 @@ struct SRTInfo
+ 	float4   raydir;              // .xyz direction, .w hit distance
+ 	float    stippleAlphaRef;
+ 
++	// rt stage 2: PackRGB of the emissive HUE, max-channel normalised to [0,1]^3. The emissive
++	// MAGNITUDE rides in the length of normal_reflectance.xyz; the two are multiplied back
++	// together in ShadePS. 511 (= white) whenever the material has no emissive map.
++	float    emissiveTintPacked;
++
+ 	// Stage-1 provisional colour (decision 06 section 6.5): the SVO cell that produced the
+ 	// current best hit, so the voxel irradiance can be sampled at the hit point.
+ 	float3   cellTC;
+@@ -209,6 +214,16 @@ float3 UnpackRGB(const float fVal)
+ 	return col * (1.f / (RT_RGB_RANGE - 1));
+ }
+ 
++// The luminance the CPU folded into the emissive atlas alpha, so that dividing it back out in
++// RT_ProcessBestHit cancels exactly. It is deliberately NOT CommonMath.cfi's GetLuminance:
++// VoxelSegment.cpp uses ColorF::Luminance(), which is Rec.601 (Cry_Color.h:52), while
++// GetLuminance is Rec.709. Using the wrong one makes a pure red practical about 40% too bright
++// in a reflection. If either side's weights ever move, both must move together.
++float RT_EmissiveMaskLuminance(const float3 col)
++{
++	return dot(col, float3(0.30f, 0.59f, 0.11f));
++}
++
+ float PackRGB(const float3 col)
+ {
+ 	int3 colI = clamp((int3)(col * (RT_RGB_RANGE - 1) + 0.5f), 0, RT_RGB_RANGE - 1);
+@@ -245,6 +260,7 @@ void RT_ResetInfo(const float3 vFocus, const float fMaxDist, const float fCamDis
+ 	g_rtInfo.hitpos = 0;
+ 	g_rtInfo.raydir = 0;
+ 	g_rtInfo.stippleAlphaRef = fStippleAlphaRef;
++	g_rtInfo.emissiveTintPacked = 0;
+ 
+ 	g_rtInfo.cellTC = 0;
+ 	g_rtInfo.cellMin = 0;
+@@ -598,10 +614,27 @@ void RT_ProcessBestHit(const Ray rOrig, inout SRTInfo rtInfo, const float fDista
+ 		if (matInfo3.z == VOX_RT_SHADING_VEG_LEAVES) // encode the transmittance lighting model
+ 			rtInfo.normal_reflectance.w = -rtInfo.normal_reflectance.w;
+ 
+-		// the normal's *length* carries emittance; use CE's named unit scale, not Neo's
+-		// literal 1000/10000, or a reflected emissive surface is a different brightness
+-		// from the surface itself (research/03 section 7.5)
+-		rtInfo.normal_reflectance.xyz *= (1.f + matInfo1.w * MAT_EMISSIVE_UNIT_SCALE * vEmm.a);
++		// Emissive, matching Illum.cfx IlluminationPS:
++		//     emittance = MatEmissiveColor.rgb * MatEmissiveColor.w * MAT_EMISSIVE_UNIT_SCALE
++		//                 * GetEmittanceMask(baseTC)          where the mask is map.rgb * map.a
++		// The record carries the LUMINANCE of MatEmissiveColor.rgb * .w in matInfo1.w (2B has no
++		// lane for a coloured material emissive), and 2B folded GetEmittanceMask's magnitude,
++		// luminance(map.rgb) * map.a, into the atlas alpha while leaving map.rgb untouched. So
++		// the mask splits into a magnitude (vEmm.a) and a hue (vEmm.rgb), and we send them down
++		// two different channels because there is no free float3 in the g-data:
++		//   magnitude -> the length of the normal, as before
++		//   hue       -> PackRGB into the integer part of hitpos.w, next to smoothness
++		// The hue is max-channel normalised so it fits PackRGB's [0,1] range, and the luminance
++		// that normalisation removes is divided back into the magnitude, so that
++		// magnitude * hue == matInfo1.w * MAT_EMISSIVE_UNIT_SCALE * map.rgb * map.a exactly.
++		// With no emissive map vEmm is (1,1,1,1): hue = white, magnitude = the raw intensity.
++		{
++			const float3 vEmmHue = vEmm.rgb / max(max(vEmm.r, max(vEmm.g, vEmm.b)), 1e-4f);
++			const float  fEmmHueLum = max(RT_EmissiveMaskLuminance(vEmmHue), 1e-4f);
++
++			rtInfo.normal_reflectance.xyz *= (1.f + matInfo1.w * MAT_EMISSIVE_UNIT_SCALE * vEmm.a / fEmmHueLum);
++			rtInfo.emissiveTintPacked = PackRGB(vEmmHue);
++		}
+ 
+ 		rtInfo.albedo_smoothness.xyz = best.vAlb.xyz * matInfo2.xyz;
+ 		rtInfo.albedo_smoothness.w = matInfo1.z * saturate(vNor.w); // _ddna alpha carries smoothness
+@@ -619,6 +652,7 @@ void RT_ProcessBestHit(const Ray rOrig, inout SRTInfo rtInfo, const float fDista
+ 		rtInfo.normal_reflectance.w = IsDiffuseMode() ? PackRGB(float3(0, 0, 0)) : PackRGB(float3(1, 1, 1));
+ 
+ 		rtInfo.albedo_smoothness = 1;
++		rtInfo.emissiveTintPacked = 0; // a miss emits nothing; the magnitude is 0 as well
+ 
+ 		rtInfo.hitpos.xyz = rOrig.startpoint + rOrig.direction * GetMaxRayDistance();
+ 		rtInfo.hitpos.w = 1;
+diff --git a/Engine/Shaders/HWScripts/CryFX/Total_Illumination.cfx b/Engine/Shaders/HWScripts/CryFX/Total_Illumination.cfx
+index 8fb5bfe8..baff6948 100644
+--- a/Engine/Shaders/HWScripts/CryFX/Total_Illumination.cfx
++++ b/Engine/Shaders/HWScripts/CryFX/Total_Illumination.cfx
+@@ -165,8 +165,10 @@ struct pixoutMRTTrace
+ 	// rt stage 2 (decision 06 section 6.6). Only allocated and only bound for the specular
+ 	// target set when e_svoTI_RT_Active; the diffuse permutation never sets %_RT_QUALITY.
+ 	//  HitPos: .xyz camera-relative hit position (RGBA32F - fp16 is 1.5 cm at 32 m, which is
+-	//          shadow-acne territory for hit shading), .w = hit smoothness (kept positive;
+-	//          the sign is reserved for the interleaved-refraction flag, stage 4).
++	//          shadow-acne territory for hit shading), .w = PackRGB(emissive hue) in the integer
++	//          part + hit smoothness in [0, 1) in the fraction. Kept positive; the sign is
++	//          reserved for the interleaved-refraction flag, stage 4. RGBA32F has mantissa to
++	//          spare for both: the tint code is at most 511 and smoothness needs ~8 bits.
+ 	//  RayDir: .xyz ray direction, .w = hit distance, or GetMaxRayDistance() + 1 on a miss
+ 	//          (the "no hit => fall back to probes" sentinel). .w == 0 means "not an RT pixel".
+ 	float4 HitPos: SV_Target2;
+@@ -1796,7 +1798,10 @@ pixoutMRTTrace ConeTracePS(vtxOutWPOS IN)
+ 		vALD.w   = g_rtInfo.normal_reflectance.w;
+ 		vRGB.xyz = g_rtInfo.albedo_smoothness.xyz;
+ 
+-		OUT.HitPos = float4(g_rtInfo.hitpos.xyz - GetWorldViewPos(), abs(g_rtInfo.albedo_smoothness.w));
++		// smoothness is capped just below 1 so that the fractional part never carries into the
++		// emissive tint code sitting in the integer part (a mirror at 0.9999 is a mirror)
++		OUT.HitPos = float4(g_rtInfo.hitpos.xyz - GetWorldViewPos(),
++		                    min(abs(g_rtInfo.albedo_smoothness.w), 0.9999f) + g_rtInfo.emissiveTintPacked);
+ 		OUT.RayDir = float4(g_rtInfo.raydir.xyz, g_rtInfo.raydir.w);
+ 	}
+ #endif
+@@ -1845,11 +1850,17 @@ pixoutShade ShadePS(vtxOutWPOS IN)
+ 		// unmodified. That is the whole fallback-to-probes policy.
+ 		const bool bNoHit = (vGLD.w >= GetMaxRayDistance() + 0.5f);
+ 
++		// hitpos.w packs two things: PackRGB of the emissive hue in the integer part, the hit
++		// smoothness in the fraction (see pixoutMRTTrace above)
++		const float fHitPosW    = abs(vGPO.w);
++		const float fEmmPacked  = floor(fHitPosW);
++		const float3 vEmmTint   = UnpackRGB(fEmmPacked);
++
+ 		MaterialAttribsCommon commonAttribs = (MaterialAttribsCommon)0;
+ 		commonAttribs.NormalWorld = normalize(vGAL.xyz);
+ 		commonAttribs.Albedo      = vGNO.xyz;
+ 		commonAttribs.Reflectance = UnpackRGB(abs(vGAL.w));
+-		commonAttribs.Smoothness  = abs(vGPO.w);
++		commonAttribs.Smoothness  = fHitPosW - fEmmPacked;
+ 
+ 		if (vGAL.w < 0) // the lighting model rides in the sign of the packed reflectance
+ 		{
+@@ -1880,12 +1891,16 @@ pixoutShade ShadePS(vtxOutWPOS IN)
+ 
+ 		float3 acc = diffuseAcc + specularAcc + SVO_ShadeParams0.x * fwdAttribs.albedo + .0001f;
+ 
+-		// Emissive. MAT_EMISSIVE_UNIT_SCALE was already applied when the intensity was packed
+-		// into the normal's length (CommonSVO_RT.cfi RT_ProcessBestHit), so this is the same
+-		// kcd/m^2 convention Illum.cfx uses. NOTE: Neo multiplies emittance by albedo because
+-		// the atlas stores a single emissive scalar and has to borrow the albedo for hue; CE's
+-		// forward emissive does not. Kept as Neo's until the atlas carries a colour (2B).
+-		acc += fwdAttribs.albedo * fwdAttribs.custom.Emittance;
++		// Emissive, exactly Illum.cfx IlluminationPS:
++		//     emittance = MatEmissiveColor.rgb * MatEmissiveColor.w * MAT_EMISSIVE_UNIT_SCALE
++		//                 * PS_HDR_RANGE_ADAPT_MAX * GetEmittanceMask(baseTC)
++		// Emittance (the normal's length) and vEmmTint (hitpos.w's integer part) multiply back
++		// to the first four factors times the mask; PS_HDR_RANGE_ADAPT_MAX is the one that was
++		// missing. It has to be here, on the exposed side of the divide below, because the
++		// divide + ApplyGI's multiply cancel and emissive would otherwise land one exposure
++		// factor short of the same surface seen directly. NOT multiplied by albedo: that is
++		// Neo's borrowed-hue trick for a scalar-only atlas, and we carry a real hue now.
++		acc += fwdAttribs.custom.Emittance * vEmmTint * PS_HDR_RANGE_ADAPT_MAX;
+ 
+ 		if (SVO_ShadeParams0.y) // debug: flat albedo
+ 			acc = fwdAttribs.albedo;
+-- 
+2.47.1.windows.1
+

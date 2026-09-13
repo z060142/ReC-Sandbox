@@ -33,6 +33,15 @@ float4 SVO_RTPoolInfo;
 // stage-1A report.
 float4 SVO_RTParams0;
 
+// rt stage 2C. (normalsFading, 0, 0, 0). .x = e_svoTI_RT_NormalsFading in METRES, the distance
+// past which a ray traced surface fades into its flat normal; <= 0 disables the fade entirely
+// (normal maps are used at any distance). Two consumers, both Neo's:
+//   - RT_ProcessBestHit below, for the HIT's normal map (this is what Neo drove off
+//     CV_TerrainInfo.y; in CE 5.7.1 that lane is hard zero, see the comment there);
+//   - ConeTracePS, for the REFLECTING surface's normal, which is what turns a normal-mapped
+//     mirror's reflection into a fine grid of slightly different ray directions.
+float4 SVO_RTParams1;
+
 #define VOX_RT_TRI_DATA_SIZE               4
 
 // Pool segmentation in record units (decision 02 section 2.3).
@@ -57,6 +66,16 @@ float4 SVO_RTParams0;
 #define VOX_RT_GLOSS_SCALE                 (SVO_RTParams0.y)
 #define VOX_RT_MIX_WITH_PROBES             (SVO_RTParams0.z)
 #define VOX_RT_DEBUG_MODE                  (SVO_RTParams0.w)
+#define VOX_RT_NORMALS_FADING              (SVO_RTParams1.x)
+
+// "How much of the normal map survives at this distance": 1 inside VOX_RT_NORMALS_FADING metres,
+// falling off as 1/d beyond it (Neo's own curve, RT_ProcessBestHit). A fading value of 0 or less
+// means "never fade" and returns 1, so the feature is off by default rather than flat by default.
+float RT_GetNormalsFade(const float fDistM)
+{
+	const float fFading = VOX_RT_NORMALS_FADING;
+	return (fFading > 0.f) ? saturate(fFading / max(fDistM, 0.01f)) : 1.f;
+}
 
 ///////////////////////////////////////////////////////////////////////////////////
 // Structures
@@ -84,6 +103,21 @@ struct SRTInfo
 	float4   hitpos;              // .xyz world, .w = 1 when this pixel carries G-data
 	float4   raydir;              // .xyz direction, .w hit distance
 	float    stippleAlphaRef;
+
+	// rt stage 2: PackRGB of the emissive HUE, max-channel normalised to [0,1]^3. The emissive
+	// MAGNITUDE rides in the length of normal_reflectance.xyz; the two are multiplied back
+	// together in ShadePS. 511 (= white) whenever the material has no emissive map.
+	float    emissiveTintPacked;
+
+#if %_RT_PARTICLE_SHADOW
+	// rt stage 2C, debug only: the raw tangent-space _ddna sample of the hit, before the
+	// distance fade and before the tangent-to-world rotation. Debug view 10 renders it, so a
+	// "flat normals" finding can be pinned on the atlas layer instead of on the fade.
+	// A #if INSIDE a struct body is safe - CE's own pixoutMRTUpscale does it
+	// (Total_Illumination.cfx:194-197). A #if at FILE SCOPE around a top-level function is
+	// not; see the warning above RT_IsTriPixel in Total_Illumination.cfx.
+	float4   dbgAtlasNormal;
+#endif
 
 	// Stage-1 provisional colour (decision 06 section 6.5): the SVO cell that produced the
 	// current best hit, so the voxel irradiance can be sampled at the hit point.
@@ -209,6 +243,16 @@ float3 UnpackRGB(const float fVal)
 	return col * (1.f / (RT_RGB_RANGE - 1));
 }
 
+// The luminance the CPU folded into the emissive atlas alpha, so that dividing it back out in
+// RT_ProcessBestHit cancels exactly. It is deliberately NOT CommonMath.cfi's GetLuminance:
+// VoxelSegment.cpp uses ColorF::Luminance(), which is Rec.601 (Cry_Color.h:52), while
+// GetLuminance is Rec.709. Using the wrong one makes a pure red practical about 40% too bright
+// in a reflection. If either side's weights ever move, both must move together.
+float RT_EmissiveMaskLuminance(const float3 col)
+{
+	return dot(col, float3(0.30f, 0.59f, 0.11f));
+}
+
 float PackRGB(const float3 col)
 {
 	int3 colI = clamp((int3)(col * (RT_RGB_RANGE - 1) + 0.5f), 0, RT_RGB_RANGE - 1);
@@ -245,6 +289,10 @@ void RT_ResetInfo(const float3 vFocus, const float fMaxDist, const float fCamDis
 	g_rtInfo.hitpos = 0;
 	g_rtInfo.raydir = 0;
 	g_rtInfo.stippleAlphaRef = fStippleAlphaRef;
+	g_rtInfo.emissiveTintPacked = 0;
+#if %_RT_PARTICLE_SHADOW
+	g_rtInfo.dbgAtlasNormal = float4(0.5f, 0.5f, 1.0f, 1.0f);
+#endif
 
 	g_rtInfo.cellTC = 0;
 	g_rtInfo.cellMin = 0;
@@ -568,6 +616,10 @@ void RT_ProcessBestHit(const Ray rOrig, inout SRTInfo rtInfo, const float fDista
 		const float4 vSpc = (nTexSlotSpc >= 0) ? RT_SampleAtlas(best.vPosTC, nTexSlotSpc) : float4(1.0, 1.0, 1.0, 1.0);
 		const float4 vEmm = (nTexSlotEmm >= 0) ? RT_SampleAtlas(best.vPosTC, nTexSlotEmm) : float4(1.0, 1.0, 1.0, 1.0);
 
+#if %_RT_PARTICLE_SHADOW
+		rtInfo.dbgAtlasNormal = (nTexSlotNor >= 0) ? vNor : float4(0.5, 0.5, 1.0, -1.0); // .w < 0 = no slot
+#endif
+
 		// rebuild the tangent frame of the winning triangle
 		const int3 nTC = RT_RecordTC(best.nMatDataTC.w);
 		const float4 v0 = LoadTexel(geomPool_Tris, uint3(nTC.x + 0, nTC.y, nTC.z));
@@ -591,17 +643,42 @@ void RT_ProcessBestHit(const Ray rOrig, inout SRTInfo rtInfo, const float fDista
 
 		const half3x3 mTangentToWS = half3x3(tang, btan, norm);
 
-		const float fBumpFade = saturate(CV_TerrainInfo.y / (best.camDistance + best.nearestHitDist + 0.1f));
+		// rt stage 2C, finding (e). Neo writes this as
+		//     saturate(CV_TerrainInfo.y / (camDist + hitDist + 0.1))
+		// i.e. "fade the hit's normal map out past ti_RT_NormalsFading metres". In CE 5.7.1
+		// CV_TerrainInfo is filled as Vec4(GetTerrainTextureMultiplier(), 0, 0, 0)
+		// (GraphicsPipeline.cpp:1280) - .y is a HARD ZERO, so the transplanted line multiplied
+		// the normal-map strength by exactly 0 and every ray traced hit came back with a flat
+		// tangent normal: diffuse colour but no surface detail, and a mirror-flat specular lobe.
+		// Driven off our own cvar lane instead; 0 (the default) now means "no fade".
+		const float fBumpFade = RT_GetNormalsFade(best.camDistance + best.nearestHitDist);
 		rtInfo.normal_reflectance.xyz = normalize(mul(lerp(float4(0.5, 0.5, 1.0, 1.0), vNor, matInfo1.x * fBumpFade).xyz * 2.f - 1.f, mTangentToWS));
 
 		rtInfo.normal_reflectance.w = PackRGB(matInfo1.y * vSpc.xyz);
 		if (matInfo3.z == VOX_RT_SHADING_VEG_LEAVES) // encode the transmittance lighting model
 			rtInfo.normal_reflectance.w = -rtInfo.normal_reflectance.w;
 
-		// the normal's *length* carries emittance; use CE's named unit scale, not Neo's
-		// literal 1000/10000, or a reflected emissive surface is a different brightness
-		// from the surface itself (research/03 section 7.5)
-		rtInfo.normal_reflectance.xyz *= (1.f + matInfo1.w * MAT_EMISSIVE_UNIT_SCALE * vEmm.a);
+		// Emissive, matching Illum.cfx IlluminationPS:
+		//     emittance = MatEmissiveColor.rgb * MatEmissiveColor.w * MAT_EMISSIVE_UNIT_SCALE
+		//                 * GetEmittanceMask(baseTC)          where the mask is map.rgb * map.a
+		// The record carries the LUMINANCE of MatEmissiveColor.rgb * .w in matInfo1.w (2B has no
+		// lane for a coloured material emissive), and 2B folded GetEmittanceMask's magnitude,
+		// luminance(map.rgb) * map.a, into the atlas alpha while leaving map.rgb untouched. So
+		// the mask splits into a magnitude (vEmm.a) and a hue (vEmm.rgb), and we send them down
+		// two different channels because there is no free float3 in the g-data:
+		//   magnitude -> the length of the normal, as before
+		//   hue       -> PackRGB into the integer part of hitpos.w, next to smoothness
+		// The hue is max-channel normalised so it fits PackRGB's [0,1] range, and the luminance
+		// that normalisation removes is divided back into the magnitude, so that
+		// magnitude * hue == matInfo1.w * MAT_EMISSIVE_UNIT_SCALE * map.rgb * map.a exactly.
+		// With no emissive map vEmm is (1,1,1,1): hue = white, magnitude = the raw intensity.
+		{
+			const float3 vEmmHue = vEmm.rgb / max(max(vEmm.r, max(vEmm.g, vEmm.b)), 1e-4f);
+			const float  fEmmHueLum = max(RT_EmissiveMaskLuminance(vEmmHue), 1e-4f);
+
+			rtInfo.normal_reflectance.xyz *= (1.f + matInfo1.w * MAT_EMISSIVE_UNIT_SCALE * vEmm.a / fEmmHueLum);
+			rtInfo.emissiveTintPacked = PackRGB(vEmmHue);
+		}
 
 		rtInfo.albedo_smoothness.xyz = best.vAlb.xyz * matInfo2.xyz;
 		rtInfo.albedo_smoothness.w = matInfo1.z * saturate(vNor.w); // _ddna alpha carries smoothness
@@ -619,6 +696,7 @@ void RT_ProcessBestHit(const Ray rOrig, inout SRTInfo rtInfo, const float fDista
 		rtInfo.normal_reflectance.w = IsDiffuseMode() ? PackRGB(float3(0, 0, 0)) : PackRGB(float3(1, 1, 1));
 
 		rtInfo.albedo_smoothness = 1;
+		rtInfo.emissiveTintPacked = 0; // a miss emits nothing; the magnitude is 0 as well
 
 		rtInfo.hitpos.xyz = rOrig.startpoint + rOrig.direction * GetMaxRayDistance();
 		rtInfo.hitpos.w = 1;
@@ -659,7 +737,10 @@ float3 RT_SampleVoxelIrradiance(const float3 tcMin, const float4 voxAreaMin, con
 }
 
 // e_svoTI_RT_Debug, mirrored into SVO_RTParams0.w (decision 05 section 5.3):
-// 1 hit test count, 2 hit normals, 3 hit albedo, 4 hit distance, 5 incomplete mask.
+// 1 hit test count, 2 hit normals, 3 hit albedo, 4 hit distance, 5 incomplete mask,
+// 6 stage-1 provisional colour (ConeTracePS), 7 sun shadow at the hit / 8 direct light before
+// probes / 9 raw ShadePass output (all three in ShadePS), 10 raw atlas normal, 11 hit
+// smoothness, 12 hit reflectance.
 bool RT_GetDebugColor(out float3 vCol)
 {
 	vCol = 0;
@@ -687,9 +768,36 @@ bool RT_GetDebugColor(out float3 vCol)
 		const float f = bHit ? saturate(g_rtInfo.best.nearestHitDist / max(VOX_MAX_RT_DIST_RAY, 1.f)) : 0.f;
 		vCol = float3(f, f, f);
 	}
-	else
+	else if (nMode == 5)
 	{
 		vCol = g_rtInfo.best.incomplete ? float3(1, 0, 1) : (float3)0;
+	}
+	else if (nMode == 10)
+	{
+		// rt stage 2C (e): the RAW _ddna sample of the hit, tangent space, before the distance
+		// fade and before the rotation into world space. Flat lilac (0.5, 0.5, 1) everywhere
+		// means the atlas normal layer is flat or missing; a magenta tint (the .w < 0 marker)
+		// means the material record carries no normal slot at all.
+	#if %_RT_PARTICLE_SHADOW
+		vCol = bHit ? ((g_rtInfo.dbgAtlasNormal.w < 0.f) ? float3(1, 0, 1) : g_rtInfo.dbgAtlasNormal.xyz) : (float3)0;
+	#endif
+	}
+	else if (nMode == 11)
+	{
+		// hit smoothness, black = 0 (a perfectly rough hit, no gloss lobe), white = 1
+		vCol = bHit ? (float3)saturate(g_rtInfo.albedo_smoothness.w) : (float3)0;
+	}
+	else if (nMode == 12)
+	{
+		// hit reflectance (F0) as it survives PackRGB, x8 so a dielectric 0.04 is visible
+		vCol = bHit ? saturate(UnpackRGB(abs(g_rtInfo.normal_reflectance.w)) * 8.f) : (float3)0;
+	}
+	else
+	{
+		// mode 6 = the stage-1 provisional colour, produced in ConeTracePS itself (it needs the
+		// SVO cell of the hit, which is not in SBestHit); modes 7-9 are produced in ShadePS
+		// (they need the light data); anything else is unassigned.
+		return false;
 	}
 
 	return true;

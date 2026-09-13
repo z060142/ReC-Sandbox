@@ -177,6 +177,15 @@ public:
 
 	void RTUploadDirtySlices();
 
+	//! Known gap 7.2 - one atlas UV scale per material. Counted and warned about once per level.
+	void RTCountUvScaleMismatch(const char* szMatName);
+
+	//! The two RT status lines, shared by the r_DisplayInfo HUD and the log (2B).
+	void RTFormatPoolLine(char* szOut, size_t bufSize) const;
+	void RTFormatBvhLine(char* szOut, size_t bufSize) const;
+	//! Prints both lines to the log once per completed voxelization pass.
+	void RTLogStatsWhenReady();
+
 	PodArray<I3DEngine::SLightTI>            m_lightsTI_S, m_lightsTI_D;
 	PodArray<I3DEngine::SAnalyticalOccluder> m_analyticalOccluders[2];
 	Vec4                      m_vSvoOriginAndSize;
@@ -242,6 +251,10 @@ public:
 	int                      m_rtTexSlicesUsed = 0;
 	bool                     m_rtOverflowWarned = false;
 	bool                     m_rtTexOverflowWarned = false;
+	int                      m_rtUvScaleMismatch = 0;     //!< materials whose non albedo copy has another size
+	bool                     m_rtUvScaleWarned = false;
+	bool                     m_rtStatsLogged = false;     //!< log line already printed for this voxelization pass
+	bool                     m_rtWasReady = true;
 	bool                     m_rtSelfTestDone = false;
 	SRTBuildStats            m_rtStats;
 };

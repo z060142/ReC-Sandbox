@@ -1,11 +1,20 @@
 # Sync manifest
 
 Baseline : main @ a34100a9 (pristine CRYENGINE 5.7.1)
-Dev      : experimental-rt @ 246f3a88
-Synced   : 2026-09-13 22:06
+Dev      : experimental-rt @ c0857963
+Synced   : 2026-09-14 00:34
 
 ## Commits (newest first)
 
+- c0857963 fix: never wrap a top-level CryFX function in a file-scope %-flag #if
+- c1d6f28f feat: e_svoTI_RT_NormalsFading, full res specular set under RT, debug lane on ShadePass
+- 9b51ff8d fix: sharp, unhazed ray traced reflections and a provable sun shadow at the hit
+- 7000d877 fix: reflected emissive matches Illum.cfx in both exposure and hue
+- 17e6237e fix: restore the line break in the cvar mirror macro
+- c459233a feat: ShadePass and the world-space light grid in CSvoRenderer (stage 2A, renderer)
+- f5c1c968 feat: shade ray hits with CE's own forward lighting (stage 2A, shaders)
+- 8aca880b feat: specular and emissive atlas layers in the RT material record
+- 12041ce2 fix: the RT status lines reach the HUD and the log again
 - 246f3a88 fix: triangle-RT rays start off the surface, not on it
 - 2bef67c2 fix: the SVO status line reports real RT pool usage and BVH build statistics
 - 3b57aa37 feat: static BVH per SVO cell for software triangle ray tracing (stage 1B)
@@ -403,6 +412,7 @@ Synced   : 2026-09-13 22:06
 - M	Engine/Shaders/HWScripts/CryFX/Sunshafts.cfx
 - M	Engine/Shaders/HWScripts/CryFX/TiledShading.cfi
 - M	Engine/Shaders/HWScripts/CryFX/Total_Illumination.cfx
+- A	Engine/Shaders/HWScripts/CryFX/Total_Illumination_Shading.cfi
 - M	Engine/Shaders/HWScripts/CryFX/VolumetricFog.cfi
 - M	Engine/Shaders/HWScripts/CryFX/Water.cfx
 - M	Engine/Shaders/HWScripts/CryFX/WaterReflectionsPass.cfi
