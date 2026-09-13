@@ -1,0 +1,2410 @@
+From 3b57aa37e9dd57266bab81b36af8fb3dedf92ef0 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Sun, 13 Sep 2026 18:27:33 +0800
+Subject: [PATCH 179/181] feat: static BVH per SVO cell for software triangle
+ ray tracing (stage 1B)
+
+Replaces the experimental per-voxel triangle list path with one static BVH per
+32 m SVO cell, written into a chunk-allocated record pool that the GPU consumer
+reads through SVO_RTPoolInfo. Everything is behind e_svoTI_RT_Active; with the
+flag off the produced data (bricks, tree texture including texel [1].w and the
+.crysvo files) is unchanged.
+
+Pool contract (scene-notes/rt/decisions/02):
+- geomPool_Tris is W x W x D R32G32B32A32F, W = e_svoTI_RT_TriPoolXY (256),
+  D = e_svoTI_RT_TriPoolZ (64) -> 64 MiB, 1048576 records of 4 texels.
+- geomPool_TTex is A x A x Zt RGBA8, A = e_svoTI_RT_MaxTexRes (now 256),
+  Zt = e_svoTI_RT_TexPoolZ (256) -> 64 MiB.
+- Dimensions have one source of truth in CSvoEnv and reach the renderer through
+  the new SSvoStaticTexInfo fields rtPoolXY / rtPoolZ / rtTexRes / rtTexPoolZ.
+- The STATIC segment starts at record 49152; record 0 is never a valid root.
+
+Allocator and lifetime:
+- First-fit free list over the STATIC segment with 64 record granularity,
+  guarded by the record pool's existing lock; materials live at the head of the
+  cell's chunk so one free reclaims everything.
+- A re-voxelized or deleted cell queues its old chunk and its atlas slice
+  references for release; they are applied on the main thread a few frames
+  later, so the GPU never sees a freed root.
+- Allocation failure gives the cell root 0 (voxel cone tracing fallback) plus a
+  once-per-level warning naming the cvar to raise - never silent aliasing.
+- The ring buffer write offsets are replaced by a dirty Z slice bitset; only
+  dirty slices are uploaded.
+
+Builder (decision 03): binned SAH, 3 axes x 16 bins on the centroid bounds,
+Ct = Ci = 1, exact child bounds, median fallback, leaf <= e_svoTI_RT_LeafTris,
+depth <= e_svoTI_RT_MaxDepth, deterministic, terrain included, visarea seal
+shells excluded. The build runs on the streaming worker into a local buffer and
+takes the pool lock only to reserve the chunk and memcpy the finished records,
+so e_svoTI_NumStreamingThreads is no longer forced to 1 and the decompression
+job is no longer disabled when RT is active.
+
+Records are byte exact per decision 02 section 2.5; the CPU packers are the
+exact inverses of the shader helpers (PackU16x2/ExtractPosXY, PackDir/ExtractDir,
+PackTC16/ExtractTC16, PackUint2/ExtractUint2). Per-cell quantisation bounds are
+written into every node so shared vertices quantise identically.
+
+Material atlas (decision 04): albedo (EFTT_DIFFUSE) and normal (_ddna,
+EFTT_NORMALS) layers via GetLowResSystemCopy, free list over Z slices with
+refcounts, terrain slot as before. BC5 normals arrive with only two valid
+channels from DXTDecompressRow, so the blue channel is reconstructed on copy.
+
+Retired with the per-voxel path: StoreAreaTrisIntoTriPool, StoreIndicesIntoPool,
+m_arrRTPoolInds, m_texTrisPoolId and the RTRIS brick sub-set writes.
+GetSubSetsNum() now stays 3 with RT on, so exported .crysvo files keep their
+meaning. e_svoTI_RT_SafetyBorder and e_svoTI_RT_MaxTrisPerVoxel stay registered
+but are marked deprecated so existing level files keep loading.
+
+e_svoTI_RT_SelfTest 1 builds a synthetic soup (two quads plus a thin wall),
+writes real records and then CPU-traces 1000 rays through those records with a
+reference traversal that mirrors decision 02, comparing against brute force.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SCUvWGLCsqzm3VNMzp4uiS
+---
+ Code/CryEngine/Cry3DEngine/SVO/SceneTree.cpp  |  440 +++++-
+ Code/CryEngine/Cry3DEngine/SVO/SceneTree.h    |   49 +-
+ .../Cry3DEngine/SVO/SceneTreeCVars.inl        |   23 +-
+ .../Cry3DEngine/SVO/VoxelSegment.cpp          | 1407 +++++++++++++++--
+ Code/CryEngine/Cry3DEngine/SVO/VoxelSegment.h |   52 +-
+ .../CryCommon/Cry3DEngine/I3DEngine.h         |    6 +
+ 6 files changed, 1754 insertions(+), 223 deletions(-)
+
+diff --git a/Code/CryEngine/Cry3DEngine/SVO/SceneTree.cpp b/Code/CryEngine/Cry3DEngine/SVO/SceneTree.cpp
+index 099f8618..9c90dc33 100644
+--- a/Code/CryEngine/Cry3DEngine/SVO/SceneTree.cpp
++++ b/Code/CryEngine/Cry3DEngine/SVO/SceneTree.cpp
+@@ -103,6 +103,12 @@ bool CSvoEnv::Render()
+ 
+ 	AUTO_LOCK(m_csLockTree);
+ 
++	if (!m_rtSelfTestDone && GetCVars()->e_svoTI_RT_SelfTest)
++	{
++		m_rtSelfTestDone = true;
++		CVoxelSegment::RunRTSelfTest();
++	}
++
+ 	CVoxelSegment::CheckAllocateTexturePool();
+ 
+ 	CVoxelSegment::UpdateObjectLayersInfo();
+@@ -938,7 +944,6 @@ CSvoEnv::CSvoEnv(const AABB& worldBox)
+ 	m_debugDrawVoxelsCounter = 0;
+ 	m_voxTexFormat = eTF_R8G8B8A8; // eTF_BC3
+ 
+-	m_texTrisPoolId = 0;
+ 	m_texRgb0PoolId = 0;
+ 	m_texRgb1PoolId = 0;
+ 	m_texDynlPoolId = 0;
+@@ -974,6 +979,8 @@ CSvoEnv::CSvoEnv(const AABB& worldBox)
+ 	m_bFirst_SvoFreezeTime = m_bFirst_StartStreaming = true;
+ 	m_bStreamingDonePrev = false;
+ 
++	RTCachePoolDims();
++
+ 	m_pStreamEngine = new CVoxStreamEngine();
+ }
+ 
+@@ -984,7 +991,8 @@ CSvoEnv::~CSvoEnv()
+ 
+ 	SAFE_DELETE(m_pSvoRoot);
+ 
+-	GetRenderer()->RemoveTexture(m_texTrisPoolId);
++	GetRenderer()->RemoveTexture(m_arrRTPoolTris.m_textureId);
++	GetRenderer()->RemoveTexture(m_arrRTPoolTexs.m_textureId);
+ 	GetRenderer()->RemoveTexture(m_texRgb0PoolId);
+ 	GetRenderer()->RemoveTexture(m_texRgb1PoolId);
+ 	GetRenderer()->RemoveTexture(m_texDynlPoolId);
+@@ -1622,7 +1630,7 @@ bool CSvoEnv::GetSvoStaticTextures(I3DEngine::SSvoStaticTexInfo& svoInfo, PodArr
+ 	svoInfo.pTexTree = GetRenderer()->EF_GetTextureByID(m_texNodePoolId);
+ 	svoInfo.pTexOpac = GetRenderer()->EF_GetTextureByID(m_texOpasPoolId);
+ 
+-	svoInfo.pTexTris = GetRenderer()->EF_GetTextureByID(m_texTrisPoolId);
++	svoInfo.pTexTris = nullptr;   // brickPool_RTri retired with the per-voxel triangle list path
+ 	svoInfo.pTexRgb0 = GetRenderer()->EF_GetTextureByID(m_texRgb0PoolId);
+ 	svoInfo.pTexRgb1 = GetRenderer()->EF_GetTextureByID(m_texRgb1PoolId);
+ 	svoInfo.pTexDynl = GetRenderer()->EF_GetTextureByID(m_texDynlPoolId);
+@@ -1633,7 +1641,7 @@ bool CSvoEnv::GetSvoStaticTextures(I3DEngine::SSvoStaticTexInfo& svoInfo, PodArr
+ 	svoInfo.pTexAldi = GetRenderer()->EF_GetTextureByID(m_texAldiPoolId);
+ 	svoInfo.pTexTriA = GetRenderer()->EF_GetTextureByID(gSvoEnv->m_arrRTPoolTris.m_textureId);
+ 	svoInfo.pTexTexA = GetRenderer()->EF_GetTextureByID(gSvoEnv->m_arrRTPoolTexs.m_textureId);
+-	svoInfo.pTexIndA = GetRenderer()->EF_GetTextureByID(gSvoEnv->m_arrRTPoolInds.m_textureId);
++	svoInfo.pTexIndA = nullptr;   // geomPool_TInd retired with the per-voxel triangle list path
+ 
+ 	GetGlobalEnvProbeProperties(svoInfo.pGlobalSpecCM, svoInfo.fGlobalSpecCM_Mult);
+ 
+@@ -1641,6 +1649,12 @@ bool CSvoEnv::GetSvoStaticTextures(I3DEngine::SSvoStaticTexInfo& svoInfo, PodArr
+ 	svoInfo.nTexDimZ = CVoxelSegment::m_voxTexPoolDimZ;
+ 	svoInfo.nBrickSize = SVO_VOX_BRICK_MAX_SIZE;
+ 
++	// SVO_RTPoolInfo = (W, D, A, Zt); no hard coded dimension exists on the consumer side
++	svoInfo.rtPoolXY = GetRTPoolXY();
++	svoInfo.rtPoolZ = GetRTPoolZ();
++	svoInfo.rtTexRes = GetRTTexRes();
++	svoInfo.rtTexPoolZ = GetRTTexPoolZ();
++
+ 	svoInfo.bSvoReady = (m_streamingStartTime < 0);
+ 	svoInfo.bSvoFreeze = (m_svoFreezeTime >= 0) || m_bRootTeleportSkipFrame;
+ 
+@@ -2159,98 +2173,414 @@ int CSvoEnv::GetWorstPointInSubSet(const int start, const int end)
+ 	return p0;
+ }
+ 
+-void CSvoEnv::CheckUpdateMeshPools()
++///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
++// Mesh ray tracing pools: dimensions, chunk allocator, atlas slices, incremental upload
++// (rt decision 02, 2.1 / 2.4 / 2.7). One source of truth for W, D, A and Zt lives here and is
++// handed to the renderer through SSvoStaticTexInfo, which fills SVO_RTPoolInfo.
++///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
++
++static int RTSnapPow2(int value, int lo, int hi)
++{
++	int p = lo;
++	while (p * 2 <= value && p * 2 <= hi)
++		p *= 2;
++	return p;
++}
++
++void CSvoEnv::RTCachePoolDims()
+ {
+-	if (!Get3DEngine()->IsSvoReady(false) && gSvoEnv->m_arrRTPoolInds.m_textureId)
++	if (m_rtPoolXY)
+ 		return;
+ 
+-	FUNCTION_PROFILER_3DENGINE;
++	// XY is a power of two and therefore a multiple of 4, so a 4 texel record never crosses a row
++	m_rtPoolXY = RTSnapPow2(GetCVars()->e_svoTI_RT_TriPoolXY, 64, 2048);
++	m_rtPoolZ = CLAMP(GetCVars()->e_svoTI_RT_TriPoolZ, 1, 2048);
++
++	// GetLowResSystemCopy snaps the requested size to the power of two of its slot, so must we
++	m_rtTexRes = RTSnapPow2(GetCVars()->e_svoTI_RT_MaxTexRes, 16, 2048);
++	m_rtTexPoolZ = CLAMP(GetCVars()->e_svoTI_RT_TexPoolZ, 1, 2048);
+ 
++	if (GetCVars()->e_svoTI_RT_Active)
+ 	{
+-		PodArrayRT<Vec4>& rAr = gSvoEnv->m_arrRTPoolTris;
++		PrintMessage("SVO RT pools: records %d x %d x %d = %d records, %d MB; atlas %d x %d x %d = %d MB",
++		             m_rtPoolXY, m_rtPoolXY, m_rtPoolZ, GetRTPoolRecords(),
++		             int((int64)m_rtPoolXY * m_rtPoolXY * m_rtPoolZ * sizeof(Vec4) / 1024 / 1024),
++		             m_rtTexRes, m_rtTexRes, m_rtTexPoolZ,
++		             int((int64)m_rtTexRes * m_rtTexRes * m_rtTexPoolZ * sizeof(ColorB) / 1024 / 1024));
++	}
++}
++
++//! First fit over the STATIC segment. The caller holds m_arrRTPoolTris.m_Lock in modify mode.
++//! On return records carries the granularity rounded size that was actually reserved.
++int CSvoEnv::RTAllocChunk(int& records)
++{
++	if (records <= 0)
++		return 0;
+ 
+-		AUTO_READLOCK(rAr.m_Lock);
++	RTCachePoolDims();
+ 
+-		if (rAr.m_writeOffsetReady != rAr.m_writeOffset)
++	const int totalRecords = GetRTPoolRecords();
++	if (totalRecords <= SVO_RT_SEG_STATIC)
++	{
++		if (!m_rtOverflowWarned)
+ 		{
+-			ProcessIncrementalTextureUpdate(rAr, eTF_R32G32B32A32F, "PoolTris");
+-
+-			rAr.m_writeOffsetReady = rAr.m_writeOffset;
++			m_rtOverflowWarned = true;
++			CryWarning(VALIDATOR_MODULE_3DENGINE, VALIDATOR_WARNING,
++			           "SVO RT: record pool holds only %d records, the static segment starts at %d - raise e_svoTI_RT_TriPoolZ",
++			           totalRecords, (int)SVO_RT_SEG_STATIC);
+ 		}
++		return 0;
+ 	}
+ 
+-  {
+-		PodArrayRT<ColorB>& rAr = gSvoEnv->m_arrRTPoolInds;
++	m_arrRTPoolTris.CheckAllocated(m_rtPoolXY * m_rtPoolXY * m_rtPoolZ);
+ 
+-		AUTO_READLOCK(rAr.m_Lock);
++	if (m_arrRTDirtyTris.Count() != m_rtPoolZ)
++		m_arrRTDirtyTris.PreAllocate(m_rtPoolZ, m_rtPoolZ);
+ 
+-		if (rAr.m_writeOffsetReady != rAr.m_writeOffset)
++	if (!m_arrRTFreeChunks.Count() && !m_rtRecordsUsed)
++	{
++		SRTChunk all;
++		all.start = SVO_RT_SEG_STATIC;
++		all.count = totalRecords - SVO_RT_SEG_STATIC;
++		m_arrRTFreeChunks.Add(all);
++	}
++
++	records = ((records + SVO_RT_CHUNK_GRANULARITY - 1) / SVO_RT_CHUNK_GRANULARITY) * SVO_RT_CHUNK_GRANULARITY;
++
++	for (int i = 0; i < m_arrRTFreeChunks.Count(); i++)
++	{
++		if (m_arrRTFreeChunks[i].count >= records)
+ 		{
+-			ProcessIncrementalTextureUpdate(rAr, m_voxTexFormat, "PoolInds");
++			const int start = m_arrRTFreeChunks[i].start;
+ 
+-			rAr.m_writeOffsetReady = rAr.m_writeOffset;
++			m_arrRTFreeChunks[i].start += records;
++			m_arrRTFreeChunks[i].count -= records;
++
++			if (!m_arrRTFreeChunks[i].count)
++				m_arrRTFreeChunks.Delete(i);
++
++			m_rtRecordsUsed += records;
++			return start;
+ 		}
+ 	}
+ 
++	if (!m_rtOverflowWarned)
++	{
++		m_rtOverflowWarned = true;
++		CryWarning(VALIDATOR_MODULE_3DENGINE, VALIDATOR_WARNING,
++		           "SVO RT: record pool is full (%d of %d records used), cells without a BVH fall back to voxel cone tracing - raise e_svoTI_RT_TriPoolZ",
++		           m_rtRecordsUsed, totalRecords - (int)SVO_RT_SEG_STATIC);
++	}
++
++	return 0;
++}
++
++//! Caller holds m_arrRTPoolTris.m_Lock in modify mode.
++void CSvoEnv::RTFreeChunkLocked(int start, int count)
++{
++	if (count <= 0)
++		return;
++
++	m_rtRecordsUsed -= count;
++
++	int i = 0;
++	for (; i < m_arrRTFreeChunks.Count(); i++)
++		if (m_arrRTFreeChunks[i].start > start)
++			break;
++
++	SRTChunk c;
++	c.start = start;
++	c.count = count;
++	m_arrRTFreeChunks.InsertBefore(c, i);
++
++	if (i + 1 < m_arrRTFreeChunks.Count() && m_arrRTFreeChunks[i].start + m_arrRTFreeChunks[i].count == m_arrRTFreeChunks[i + 1].start)
++	{
++		m_arrRTFreeChunks[i].count += m_arrRTFreeChunks[i + 1].count;
++		m_arrRTFreeChunks.Delete(i + 1);
++	}
++
++	if (i > 0 && m_arrRTFreeChunks[i - 1].start + m_arrRTFreeChunks[i - 1].count == m_arrRTFreeChunks[i].start)
++	{
++		m_arrRTFreeChunks[i - 1].count += m_arrRTFreeChunks[i].count;
++		m_arrRTFreeChunks.Delete(i);
++	}
++}
++
++//! A chunk is reclaimed only after the tree texel that pointed at it has been rewritten and
++//! uploaded, so releases go through this queue and are applied a few frames later on the main thread.
++void CSvoEnv::RTQueueFreeChunk(int start, int count)
++{
++	if (count <= 0)
++		return;
++
++	AUTO_LOCK(m_rtPendingLock);
++
++	SRTPendingFree f;
++	f.start = start;
++	f.count = count;
++	f.frameId = GetCurrPassMainFrameID();
++	m_arrRTPendingFree.Add(f);
++}
++
++//! count == 0 marks an atlas slice reference instead of a record chunk.
++void CSvoEnv::RTQueueFreeTexSlice(int slice)
++{
++	if (slice < 0)
++		return;
++
++	AUTO_LOCK(m_rtPendingLock);
++
++	SRTPendingFree f;
++	f.start = slice;
++	f.count = 0;
++	f.frameId = GetCurrPassMainFrameID();
++	m_arrRTPendingFree.Add(f);
++}
++
++void CSvoEnv::RTProcessPendingFrees()
++{
++	PodArray<SRTPendingFree> arrDue;
++
+ 	{
+-		PodArrayRT<ColorB>& rAr = gSvoEnv->m_arrRTPoolTexs;
++		AUTO_LOCK(m_rtPendingLock);
+ 
+-		AUTO_READLOCK(rAr.m_Lock);
++		const uint frameId = GetCurrPassMainFrameID();
+ 
+-		if (rAr.m_writeOffsetReady != rAr.m_writeOffset)
++		for (int i = 0; i < m_arrRTPendingFree.Count(); )
+ 		{
+-			ProcessIncrementalTextureUpdate(rAr, m_voxTexFormat, "PoolTexs");
++			if (frameId > m_arrRTPendingFree[i].frameId + 8)
++			{
++				arrDue.Add(m_arrRTPendingFree[i]);
++				m_arrRTPendingFree.Delete(i);
++			}
++			else
++			{
++				i++;
++			}
++		}
++	}
++
++	if (!arrDue.Count())
++		return;
++
++	{
++		AUTO_MODIFYLOCK(m_arrRTPoolTris.m_Lock);
++		for (int i = 0; i < arrDue.Count(); i++)
++			if (arrDue[i].count > 0)
++				RTFreeChunkLocked(arrDue[i].start, arrDue[i].count);
++	}
++
++	{
++		AUTO_MODIFYLOCK(m_arrRTPoolTexs.m_Lock);
++		for (int i = 0; i < arrDue.Count(); i++)
++			if (arrDue[i].count == 0)
++				RTReleaseTexSlice(arrDue[i].start);
++	}
++}
++
++//! Caller holds m_arrRTPoolTris.m_Lock in modify mode.
++void CSvoEnv::RTMarkTrisDirty(int firstRecord, int records)
++{
++	if (records <= 0 || !m_arrRTDirtyTris.Count())
++		return;
++
++	const int sliceTexels = m_rtPoolXY * m_rtPoolXY;
++	const int z0 = CLAMP(firstRecord * SVO_RT_RECORD_TEXELS / sliceTexels, 0, m_arrRTDirtyTris.Count() - 1);
++	const int z1 = CLAMP(((firstRecord + records) * SVO_RT_RECORD_TEXELS - 1) / sliceTexels, 0, m_arrRTDirtyTris.Count() - 1);
+ 
+-			rAr.m_writeOffsetReady = rAr.m_writeOffset;
++	for (int z = z0; z <= z1; z++)
++		m_arrRTDirtyTris[z] = 1;
++}
++
++//! Caller holds m_arrRTPoolTexs.m_Lock in modify mode.
++void CSvoEnv::RTMarkTexsDirty(int firstSlice, int slices)
++{
++	if (slices <= 0 || !m_arrRTDirtyTexs.Count())
++		return;
++
++	const int z0 = CLAMP(firstSlice, 0, m_arrRTDirtyTexs.Count() - 1);
++	const int z1 = CLAMP(firstSlice + slices - 1, 0, m_arrRTDirtyTexs.Count() - 1);
++
++	for (int z = z0; z <= z1; z++)
++		m_arrRTDirtyTexs[z] = 1;
++}
++
++//! Free list over Z slices (never a ring). Caller holds m_arrRTPoolTexs.m_Lock in modify mode.
++int CSvoEnv::RTAllocTexSlice(int* pOwner)
++{
++	RTCachePoolDims();
++
++	const int A = m_rtTexRes;
++	const int Zt = m_rtTexPoolZ;
++
++	m_arrRTPoolTexs.CheckAllocated(A * A * Zt);
++
++	if (m_arrRTTexSliceRef.Count() != Zt)
++	{
++		m_arrRTTexSliceRef.PreAllocate(Zt, Zt);
++		m_arrRTTexSliceOwner.PreAllocate(Zt, Zt);
++		m_arrRTDirtyTexs.PreAllocate(Zt, Zt);
++	}
++
++	for (int i = 0; i < Zt; i++)
++	{
++		if (!m_arrRTTexSliceOwner[i] && !m_arrRTTexSliceRef[i])
++		{
++			m_arrRTTexSliceOwner[i] = pOwner;
++			m_arrRTTexSliceRef[i] = 0;
++			m_rtTexSlicesUsed++;
++			return i;
+ 		}
+ 	}
++
++	if (!m_rtTexOverflowWarned)
++	{
++		m_rtTexOverflowWarned = true;
++		CryWarning(VALIDATOR_MODULE_3DENGINE, VALIDATOR_WARNING,
++		           "SVO RT: material atlas is full (%d slices), further materials fall back to their tint - raise e_svoTI_RT_TexPoolZ", Zt);
++	}
++
++	return -1;
+ }
+ 
+-template<class T>
+-void CSvoEnv::ProcessIncrementalTextureUpdate(PodArrayRT<T>& rAr, ETEX_Format texFormat, const char* szComment)
++void CSvoEnv::RTAddTexSliceRef(int slice)
+ {
+-	const int maxTexSizeXY = GetCVars()->e_svoTI_RT_MaxTexRes;
++	if (slice >= 0 && slice < m_arrRTTexSliceRef.Count())
++		m_arrRTTexSliceRef[slice]++;
++}
+ 
+-	if (!rAr.m_textureId)
++void CSvoEnv::RTReleaseTexSlice(int slice)
++{
++	if (slice < 0 || slice >= m_arrRTTexSliceRef.Count())
++		return;
++
++	if (--m_arrRTTexSliceRef[slice] <= 0)
+ 	{
+-		PrintMessage("%s: create new texture", szComment);
++		m_arrRTTexSliceRef[slice] = 0;
++
++		if (m_arrRTTexSliceOwner[slice])
++		{
++			// the texture object's atlas id is the dedupe key; clearing it re-inserts on next use
++			*m_arrRTTexSliceOwner[slice] = 0;
++			m_arrRTTexSliceOwner[slice] = nullptr;
++		}
+ 
+-		// create new texture
+-			rAr.m_textureId = gEnv->pRenderer->UploadToVideoMemory3D((byte*)rAr.GetElements(),
+-			maxTexSizeXY, maxTexSizeXY, CVoxelSegment::m_voxTexPoolDimZ,
+-			texFormat, texFormat, 1, false, FILTER_POINT, rAr.m_textureId, 0, FT_DONT_STREAM, eLittleEndian, nullptr, true);
++		m_rtTexSlicesUsed--;
+ 	}
+-	else if (rAr.m_writeOffsetReady >= rAr.m_writeOffset)
++}
++
++//! Dirty Z slice upload, replacing the old ring buffer write offset logic (rt decision 02, 2.4).
++void CSvoEnv::RTUploadDirtySlices()
++{
++	if (!GetCVars()->e_svoTI_RT_Active)
++		return;
++
+ 	{
+-		PrintMessage("%s: update entire texture", szComment);
++		AUTO_MODIFYLOCK(m_arrRTPoolTris.m_Lock);
++
++		if (m_arrRTPoolTris.Count())
++		{
++			const int W = m_rtPoolXY;
++			const int D = m_rtPoolZ;
++
++			if (!m_arrRTPoolTris.m_textureId)
++			{
++				m_arrRTPoolTris.m_textureId = gEnv->pRenderer->UploadToVideoMemory3D((byte*)m_arrRTPoolTris.GetElements(),
++				                                                                     W, W, D, eTF_R32G32B32A32F, eTF_R32G32B32A32F, 1, false, FILTER_POINT, 0, 0, FT_DONT_STREAM, eLittleEndian, nullptr, true);
++
++				for (int z = 0; z < m_arrRTDirtyTris.Count(); z++)
++					m_arrRTDirtyTris[z] = 0;
++
++				PrintMessage("SVO RT: record pool texture created (%d x %d x %d)", W, W, D);
++			}
++			else
++			{
++				int z = 0;
++				while (z < m_arrRTDirtyTris.Count())
++				{
++					if (!m_arrRTDirtyTris[z])
++					{
++						z++;
++						continue;
++					}
+ 
+-		// update entire texture
+-		gEnv->pRenderer->UpdateTextureInVideoMemory(
+-			rAr.m_textureId,
+-			(byte*)rAr.GetElements(),
+-			0, 0,
+-			maxTexSizeXY, maxTexSizeXY,
+-			texFormat,
+-			0,
+-			CVoxelSegment::m_voxTexPoolDimZ);
++					int z1 = z;
++					while (z1 < m_arrRTDirtyTris.Count() && m_arrRTDirtyTris[z1])
++					{
++						m_arrRTDirtyTris[z1] = 0;
++						z1++;
++					}
++
++					gEnv->pRenderer->UpdateTextureInVideoMemory(
++					  m_arrRTPoolTris.m_textureId,
++					  (byte*)(m_arrRTPoolTris.GetElements() + (size_t)z * W * W),
++					  0, 0, W, W, eTF_R32G32B32A32F, z, z1 - z);
++
++					z = z1;
++				}
++			}
++		}
+ 	}
+-	else
++
+ 	{
+-		int z0 = CLAMP(rAr.m_writeOffsetReady / (maxTexSizeXY * maxTexSizeXY), 0, CVoxelSegment::m_voxTexPoolDimZ - 1);
+-		int z1 = CLAMP(rAr.m_writeOffset / (maxTexSizeXY * maxTexSizeXY) + 1, 0, CVoxelSegment::m_voxTexPoolDimZ);
++		AUTO_MODIFYLOCK(m_arrRTPoolTexs.m_Lock);
++
++		if (m_arrRTPoolTexs.Count())
++		{
++			const int A = m_rtTexRes;
++			const int Zt = m_rtTexPoolZ;
+ 
+-		PrintMessage("%s: update few slices %d: z0 = %d, z1 = %d, delta = %d", szComment, (int)GetCurrPassMainFrameID(), z0, z1, z1 - z0);
++			if (!m_arrRTPoolTexs.m_textureId)
++			{
++				m_arrRTPoolTexs.m_textureId = gEnv->pRenderer->UploadToVideoMemory3D((byte*)m_arrRTPoolTexs.GetElements(),
++				                                                                     A, A, Zt, m_voxTexFormat, m_voxTexFormat, 1, false, FILTER_LINEAR, 0, 0, FT_DONT_STREAM, eLittleEndian, nullptr, true);
++
++				for (int z = 0; z < m_arrRTDirtyTexs.Count(); z++)
++					m_arrRTDirtyTexs[z] = 0;
+ 
+-		// update few slices of texture
+-		gEnv->pRenderer->UpdateTextureInVideoMemory(
+-			rAr.m_textureId,
+-			(byte*)(rAr.GetElements() + z0 * maxTexSizeXY * maxTexSizeXY),
+-			0, 0, maxTexSizeXY, maxTexSizeXY,
+-			texFormat,
+-			z0, z1 - z0);
++				PrintMessage("SVO RT: material atlas texture created (%d x %d x %d)", A, A, Zt);
++			}
++			else
++			{
++				int z = 0;
++				while (z < m_arrRTDirtyTexs.Count())
++				{
++					if (!m_arrRTDirtyTexs[z])
++					{
++						z++;
++						continue;
++					}
++
++					int z1 = z;
++					while (z1 < m_arrRTDirtyTexs.Count() && m_arrRTDirtyTexs[z1])
++					{
++						m_arrRTDirtyTexs[z1] = 0;
++						z1++;
++					}
++
++					gEnv->pRenderer->UpdateTextureInVideoMemory(
++					  m_arrRTPoolTexs.m_textureId,
++					  (byte*)(m_arrRTPoolTexs.GetElements() + (size_t)z * A * A),
++					  0, 0, A, A, m_voxTexFormat, z, z1 - z);
++
++					z = z1;
++				}
++			}
++		}
+ 	}
+ }
+ 
++void CSvoEnv::CheckUpdateMeshPools()
++{
++	if (!GetCVars()->e_svoTI_RT_Active)
++		return;
++
++	FUNCTION_PROFILER_3DENGINE;
++
++	RTUploadDirtySlices();
++	RTProcessPendingFrees();
++}
++
+ bool C3DEngine::GetSvoStaticTextures(I3DEngine::SSvoStaticTexInfo& svoInfo, PodArray<I3DEngine::SLightTI>* pLightsTI_S, PodArray<I3DEngine::SLightTI>* pLightsTI_D)
+ {
+ 	return CSvoManager::GetSvoStaticTextures(svoInfo, pLightsTI_S, pLightsTI_D);
+diff --git a/Code/CryEngine/Cry3DEngine/SVO/SceneTree.h b/Code/CryEngine/Cry3DEngine/SVO/SceneTree.h
+index 39b92fe1..afdc9886 100644
+--- a/Code/CryEngine/Cry3DEngine/SVO/SceneTree.h
++++ b/Code/CryEngine/Cry3DEngine/SVO/SceneTree.h
+@@ -139,7 +139,6 @@ public:
+ 	bool Render();
+ 	void ProcessSvoRootTeleport();
+ 	void CheckUpdateMeshPools();
+-	template<class T> void ProcessIncrementalTextureUpdate(PodArrayRT<T>& rAr, ETEX_Format texFormat, const char* szComment);
+ 	int  GetWorstPointInSubSet(const int start, const int end);
+ 	void StartupStreamingTimeTest(bool bDone);
+ 	void OnLevelGeometryChanged();
+@@ -154,6 +153,30 @@ public:
+ 	void AddAnalyticalOccluder(IRenderNode* pRN, Vec3 camPos);
+ 	void GetGlobalEnvProbeProperties(_smart_ptr<ITexture>& specEnvCM, float& mult);
+ 
++	// Mesh ray tracing pools (rt decision 02). All dimensions come from here - single source of truth.
++	void RTCachePoolDims();
++	int  GetRTPoolXY() const    { return m_rtPoolXY; }
++	int  GetRTPoolZ() const     { return m_rtPoolZ; }
++	int  GetRTTexRes() const    { return m_rtTexRes; }
++	int  GetRTTexPoolZ() const  { return m_rtTexPoolZ; }
++	int  GetRTPoolRecords() const { return m_rtPoolXY * m_rtPoolXY * m_rtPoolZ / SVO_RT_RECORD_TEXELS; }
++
++	//! Chunk allocator over the STATIC segment; call holds m_arrRTPoolTris.m_Lock in modify mode.
++	int  RTAllocChunk(int& records);
++	void RTFreeChunkLocked(int start, int count);
++	void RTQueueFreeChunk(int start, int count);
++	void RTQueueFreeTexSlice(int slice);
++	void RTProcessPendingFrees();
++	void RTMarkTrisDirty(int firstRecord, int records);
++
++	//! Material atlas slice allocator; caller holds m_arrRTPoolTexs.m_Lock in modify mode.
++	int  RTAllocTexSlice(int* pOwner);
++	void RTAddTexSliceRef(int slice);
++	void RTReleaseTexSlice(int slice);
++	void RTMarkTexsDirty(int firstSlice, int slices);
++
++	void RTUploadDirtySlices();
++
+ 	PodArray<I3DEngine::SLightTI>            m_lightsTI_S, m_lightsTI_D;
+ 	PodArray<I3DEngine::SAnalyticalOccluder> m_analyticalOccluders[2];
+ 	Vec4                      m_vSvoOriginAndSize;
+@@ -191,7 +214,6 @@ public:
+ 	int                       m_texRgb4PoolId;
+ 	int                       m_texDynlPoolId;
+ 	int                       m_texAldiPoolId;
+-	int                       m_texTrisPoolId;
+ 
+ 	ETEX_Format                                       m_voxTexFormat;
+ 	TDoublyLinkedList<CVoxelSegment>                  m_arrSegForUnload;
+@@ -200,7 +222,28 @@ public:
+ 
+ 	PodArrayRT<ColorB> m_arrRTPoolTexs;
+ 	PodArrayRT<Vec4>   m_arrRTPoolTris;
+-	PodArrayRT<ColorB> m_arrRTPoolInds;
++
++	// mesh ray tracing allocator state (rt decision 02 2.4 / 2.7)
++	struct SRTChunk       { int start; int count; };
++	struct SRTPendingFree { int start; int count; uint frameId; };
++
++	int                      m_rtPoolXY = 0;
++	int                      m_rtPoolZ = 0;
++	int                      m_rtTexRes = 0;
++	int                      m_rtTexPoolZ = 0;
++	PodArray<SRTChunk>       m_arrRTFreeChunks;
++	PodArray<SRTPendingFree> m_arrRTPendingFree;
++	PodArray<uint8>          m_arrRTDirtyTris;    //!< one flag per Z slice of the record pool
++	PodArray<uint8>          m_arrRTDirtyTexs;    //!< one flag per Z slice of the material atlas
++	PodArray<int>            m_arrRTTexSliceRef;  //!< refcount per atlas slice
++	PodArray<int*>           m_arrRTTexSliceOwner;//!< back pointer into the texture object's atlas id
++	CryCriticalSection       m_rtPendingLock;
++	int                      m_rtRecordsUsed = 0;
++	int                      m_rtTexSlicesUsed = 0;
++	bool                     m_rtOverflowWarned = false;
++	bool                     m_rtTexOverflowWarned = false;
++	bool                     m_rtSelfTestDone = false;
++	SRTBuildStats            m_rtStats;
+ };
+ 
+ #pragma pack(pop)
+diff --git a/Code/CryEngine/Cry3DEngine/SVO/SceneTreeCVars.inl b/Code/CryEngine/Cry3DEngine/SVO/SceneTreeCVars.inl
+index e36d8cfc..334dc2d6 100644
+--- a/Code/CryEngine/Cry3DEngine/SVO/SceneTreeCVars.inl
++++ b/Code/CryEngine/Cry3DEngine/SVO/SceneTreeCVars.inl
+@@ -246,13 +246,24 @@ REGISTER_CVAR_AUTO(int, e_svoTI_Reflect_Vox_Max, 100, VF_NULL, "Controls amount
+ REGISTER_CVAR_AUTO(int, e_svoTI_Reflect_Vox_MaxEdit, 10000, VF_NULL, "Controls amount of voxels allowed to refresh every frame during lights editing");
+ REGISTER_CVAR_AUTO(int, e_svoTI_Reflect_Vox_Max_Overhead, 50, VF_NULL, "Controls amount of voxels allowed to refresh every frame");
+ REGISTER_CVAR_AUTO(int, e_svoTI_RT_Active, 0, VF_EXPERIMENTAL, "Activates mesh ray tracing for reflections\nIt is necessary to re-voxelize the scene after activation");
+-REGISTER_CVAR_AUTO(float, e_svoTI_RT_MaxDistRay, 0, VF_EXPERIMENTAL, "Maximum ray distance for mesh tracing");
+-REGISTER_CVAR_AUTO(float, e_svoTI_RT_MaxDistCam, 0, VF_EXPERIMENTAL, "Maximum camera distance for mesh tracing");
+-REGISTER_CVAR_AUTO(float, e_svoTI_RT_MinGloss, 0, VF_EXPERIMENTAL, "Minimum surface glossiness for mesh tracing");
++REGISTER_CVAR_AUTO(float, e_svoTI_RT_MaxDistRay, 24.f, VF_EXPERIMENTAL, "Maximum ray distance for mesh tracing");
++REGISTER_CVAR_AUTO(float, e_svoTI_RT_MaxDistCam, 100.f, VF_EXPERIMENTAL, "Maximum camera distance for mesh tracing");
++REGISTER_CVAR_AUTO(float, e_svoTI_RT_MinGloss, 0.85f, VF_EXPERIMENTAL, "Minimum surface glossiness for mesh tracing");
+ REGISTER_CVAR_AUTO(float, e_svoTI_RT_MinRefl, 0, VF_EXPERIMENTAL, "Minimum surface reflectance for mesh tracing");
+-REGISTER_CVAR_AUTO(int, e_svoTI_RT_MaxTrisPerVoxel, 100, VF_EXPERIMENTAL, "Maximum number of triangles registered per voxel");
+-REGISTER_CVAR_AUTO(int, e_svoTI_RT_MaxTexRes, 512, VF_EXPERIMENTAL, "Maximum texture size for GPU tracing");
+-REGISTER_CVAR_AUTO(float, e_svoTI_RT_SafetyBorder, 0.25f, VF_EXPERIMENTAL, "Extend the area of voxel to triangle intersection. This makes sure the ray finds all necessary triangles");
++REGISTER_CVAR_AUTO(int, e_svoTI_RT_MaxTrisPerVoxel, 100, VF_EXPERIMENTAL, "DEPRECATED - retired together with the per-voxel triangle list path\nKept registered only so that existing level files keep loading");
++REGISTER_CVAR_AUTO(int, e_svoTI_RT_MaxTexRes, 256, VF_EXPERIMENTAL, "XY resolution of the material texture atlas used by mesh ray tracing");
++REGISTER_CVAR_AUTO(float, e_svoTI_RT_SafetyBorder, 0.25f, VF_EXPERIMENTAL, "DEPRECATED - retired together with the per-voxel triangle list path\nKept registered only so that existing level files keep loading");
++
++// Static BVH mesh ray tracing (decisions 02-05)
++REGISTER_CVAR_AUTO(int, e_svoTI_RT_StaticBVH, 1, VF_EXPERIMENTAL, "Build and trace one static BVH per SVO cell\n0 = voxel cone tracing only");
++REGISTER_CVAR_AUTO(int, e_svoTI_RT_Debug, 0, VF_EXPERIMENTAL, "Mesh ray tracing debug views\n1 = hit test count heat map\n2 = hit normals\n3 = hit albedo\n4 = hit distance\n5 = incomplete/overflow mask");
++REGISTER_CVAR_AUTO(int, e_svoTI_RT_TriPoolXY, 256, VF_EXPERIMENTAL, "XY size of the BVH node/triangle record pool texture (power of two, multiple of 4)");
++REGISTER_CVAR_AUTO(int, e_svoTI_RT_TriPoolZ, 64, VF_EXPERIMENTAL, "Z size of the BVH node/triangle record pool texture");
++REGISTER_CVAR_AUTO(int, e_svoTI_RT_TexPoolZ, 256, VF_EXPERIMENTAL, "Number of slices (single textures) in the material texture atlas");
++REGISTER_CVAR_AUTO(int, e_svoTI_RT_MaxBounces, 1, VF_EXPERIMENTAL, "Maximum number of ray traced bounces");
++REGISTER_CVAR_AUTO(int, e_svoTI_RT_LeafTris, 4, VF_EXPERIMENTAL, "Maximum number of triangles stored in one BVH leaf");
++REGISTER_CVAR_AUTO(int, e_svoTI_RT_MaxDepth, 18, VF_EXPERIMENTAL, "Maximum BVH depth; the consumer traversal stack is sized for this value plus two");
++REGISTER_CVAR_AUTO(int, e_svoTI_RT_SelfTest, 0, VF_EXPERIMENTAL, "Run the BVH builder and record encoding self test once on level load and print the result into the log");
+ REGISTER_CVAR_AUTO(float, e_svoTI_Specular_Sev, 1, VF_NULL, "Controls severity of specular cones; this value limits the material glossiness");
+ REGISTER_CVAR_AUTO(float, e_svoVoxDistRatio, 14.f, VF_NULL, "Limits the distance where real-time GPU voxelization used");
+ REGISTER_CVAR_AUTO(int, e_svoVoxGenRes, 512, VF_NULL, "GPU voxelization dummy render target resolution");
+diff --git a/Code/CryEngine/Cry3DEngine/SVO/VoxelSegment.cpp b/Code/CryEngine/Cry3DEngine/SVO/VoxelSegment.cpp
+index b04f001b..861521b9 100644
+--- a/Code/CryEngine/Cry3DEngine/SVO/VoxelSegment.cpp
++++ b/Code/CryEngine/Cry3DEngine/SVO/VoxelSegment.cpp
+@@ -20,6 +20,7 @@
+ 	#include "brush.h"
+ 	#include "SceneTree.h"
+ 	#include <CryThreading/IJobManager_JobDelegator.h>
++	#include <algorithm>
+ 	#include <CryAnimation/ICryAnimation.h>
+ 
+ 	#pragma warning(push)
+@@ -99,7 +100,7 @@ void CVoxStreamEngine::CVoxStreamEngineThread::ThreadEntry()
+ 		SVoxStreamItem pItem;
+ 		if (m_pStreamingEngine->m_arrForFileRead.dequeue(pItem))
+ 		{
+-			if (Cry3DEngineBase::GetCVars()->e_svoMaxStreamRequests > 4 && !Cry3DEngineBase::GetCVars()->e_svoTI_RT_Active)
++			if (Cry3DEngineBase::GetCVars()->e_svoMaxStreamRequests > 4)
+ 			{
+ 				TDecompressVoxStreamItemJob job(pItem);
+ 				job.SetClassInstance(m_pStreamingEngine);
+@@ -128,7 +129,9 @@ CVoxStreamEngine::CVoxStreamEngine() : m_arrForFileRead(512)
+ 	, m_arrForSyncCallBack(512)
+ 	, m_fileReadSemaphore(512)
+ {
+-	const int numThreads = Cry3DEngineBase::GetCVars()->e_svoTI_RT_Active ? 1 : gEnv->pConsole->GetCVar("e_svoTI_NumStreamingThreads")->GetIVal();
++	// The RT path no longer serialises voxelization: the static BVH build runs entirely in a local
++	// buffer and takes the pool lock only to reserve a chunk and memcpy the finished records.
++	const int numThreads = gEnv->pConsole->GetCVar("e_svoTI_NumStreamingThreads")->GetIVal();
+ 
+ 	for (int i = 0; i < numThreads; ++i)
+ 	{
+@@ -307,6 +310,10 @@ CVoxelSegment::~CVoxelSegment()
+ {
+ 	m_arrLoadedSegments.Delete(this);
+ 	m_segmentsCounter--;
++
++	if (gSvoEnv)
++		ReleaseRTChunk();
++
+ 	FreeAllBrickData();
+ 	FreeRenderData();
+ }
+@@ -1160,13 +1167,6 @@ void CVoxelSegment::CheckAllocateTexturePool()
+ 	#endif
+ 	}
+ 
+-	// mesh
+-	if (!gSvoEnv->m_texTrisPoolId && Cry3DEngineBase::GetCVars()->e_svoTI_RT_Active)
+-	{
+-		gSvoEnv->m_texTrisPoolId = gEnv->pRenderer->UploadToVideoMemory3D(NULL,
+-		                                                                  m_voxTexPoolDimXY, m_voxTexPoolDimXY, m_voxTexPoolDimZ, gSvoEnv->m_voxTexFormat, gSvoEnv->m_voxTexFormat, 1, false, FILTER_POINT, 0, 0, flagsReadOnly);
+-		m_svoDataPoolsCounter++;
+-	}
+ }
+ 
+ void CVoxelSegment::UpdateNodeRenderData()
+@@ -1184,7 +1184,16 @@ void CVoxelSegment::UpdateNodeRenderData()
+ 	voxNodeData[0] = voxNodeData[0] + Vec4(Vec3((float)m_vCropBoxMin.x / SVO_VOX_BRICK_MAX_SIZE, (float)m_vCropBoxMin.y / SVO_VOX_BRICK_MAX_SIZE, (float)m_vCropBoxMin.z / SVO_VOX_BRICK_MAX_SIZE) * GetBoxSize(), 0);
+ 	voxNodeData[1] = voxNodeData[0] + Vec4(Vec3((float)m_vCropTexSize.x / SVO_VOX_BRICK_MAX_SIZE, (float)m_vCropTexSize.y / SVO_VOX_BRICK_MAX_SIZE, (float)m_vCropTexSize.z / SVO_VOX_BRICK_MAX_SIZE) * GetBoxSize(), 0);
+ 	voxNodeData[0].w = GetBoxSize();
+-	voxNodeData[1].w = m_pParentCloud ? (0.1f + (float)m_pParentCloud->m_allocatedAtlasOffset) : -2.f;
++	if (GetCVars()->e_svoTI_RT_Active)
++	{
++		// the consumer reads this as the cell's static BVH root record (0 = no BVH); off flag the
++		// original (write only) parent atlas offset is written, so the texture stays byte identical
++		voxNodeData[1].w = (float)m_rtRootRecord;
++	}
++	else
++	{
++		voxNodeData[1].w = m_pParentCloud ? (0.1f + (float)m_pParentCloud->m_allocatedAtlasOffset) : -2.f;
++	}
+ 
+ 	for (int c = 0; c < 4; c++)
+ 	{
+@@ -1256,7 +1265,8 @@ void CVoxelSegment::UpdateVoxRenderData()
+ 		vSizeFin = GetDxtDim();
+ 	}
+ 
+-	int arrTexId[SVoxBrick::MAX_NUM] = { gSvoEnv->m_texOpasPoolId, gSvoEnv->m_texRgb0PoolId, gSvoEnv->m_texNormPoolId, gSvoEnv->m_texTrisPoolId };
++	// SVoxBrick::RTRIS is never allocated any more (rt decision 02: the per-voxel triangle list path is retired)
++	int arrTexId[SVoxBrick::MAX_NUM] = { gSvoEnv->m_texOpasPoolId, gSvoEnv->m_texRgb0PoolId, gSvoEnv->m_texNormPoolId, 0 };
+ 
+ 	for (int s = 0; s < SVoxBrick::MAX_NUM; s++)
+ 	{
+@@ -1616,23 +1626,6 @@ void CVoxelSegment::BuildVoxels(SBuildVoxelsParams params)
+ 							}
+ 						}
+ 
+-						if (GetCVars()->e_svoTI_RT_Active)
+-						{
+-							ColorB& triOutFin = voxData.pData[SVoxBrick::RTRIS][id];
+-
+-							int triIndexCount = 0;
+-							int firstTriIndexPos = StoreIndicesIntoPool(trisInt, triIndexCount);
+-
+-							triOutFin.r = firstTriIndexPos & 255;
+-							firstTriIndexPos /= 256;
+-							triOutFin.g = firstTriIndexPos & 255;
+-							firstTriIndexPos /= 256;
+-							triOutFin.b = firstTriIndexPos & 255;
+-							assert(firstTriIndexPos <= 255);
+-
+-							triOutFin.a = triIndexCount;
+-						}
+-
+ 						// OPA
+ 						{
+ 							{
+@@ -2504,8 +2497,8 @@ void CVoxelSegment::FindTrianglesForVoxelization(PodArray<int>*& rpNodeTrisXYZ)
+ 		//    if(m_nodeTrisAllMerged.Count())
+ 		//      PrintMessage("VoxelizeMeshes: %d tris found for node id %d (size=%d) in %.2f sec", m_nodeTrisAllMerged.Count(), m_nId, (int)GetBoxSize(), GetCurAsyncTimeSec() - fStartTimeAll);
+ 
+-		if (GetCVars()->e_svoTI_RT_Active && gSvoEnv->m_texTrisPoolId)
+-			StoreAreaTrisIntoTriPool();
++		// one static BVH per area parent, straight into the STATIC segment (rt decisions 02, 03)
++		BuildStaticBVH();
+ 
+ 		{
+ 			AUTO_READLOCK(m_superMeshLock);
+@@ -2773,148 +2766,1298 @@ ColorF CVoxelSegment::ProcessMaterial(const SRayHitTriangleIndexed& tr, const Ve
+ 	return colRes;
+ }
+ 
+-float CompressTC(Vec2 tc)
++///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
++// Mesh ray tracing - record packing (rt decision 02, 2.5)
++//
++// Every helper below is the exact inverse of the shader side helper named in its comment
++// (CommonSVO_RT.cfi). The record pool is R32G32B32A32F and is read with Load() only, so the
++// bit patterns produced by RT_PackU16x2 (which may be denormals or NaNs) survive untouched.
++///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
++
++static ILINE float RT_AsFloat(uint32 v)
+ {
+-	tc.x = (tc.x / 16.f) /* + .5f*/;
+-	tc.y = (tc.y / 16.f) /* + .5f*/;
++	float f;
++	memcpy(&f, &v, sizeof(f));
++	return f;
++}
+ 
+-	// todo: from -10 to +10, make size 4 !!!!!
++static ILINE uint32 RT_AsUint(float f)
++{
++	uint32 v;
++	memcpy(&v, &f, sizeof(v));
++	return v;
++}
+ 
+-	int x = CLAMP(int(tc.x * (256 * 256 - 1)), 0, (256 * 256 - 1));
++//! Inverse of ExtractPosXY's asuint split: low 16 bits = x, high 16 bits = y.
++static ILINE float RT_PackU16x2(uint32 a, uint32 b)
++{
++	return RT_AsFloat((a & 0xffff) | ((b & 0xffff) << 16));
++}
+ 
+-	int y = CLAMP(int(tc.y * (256 * 256 - 1)), 0, (256 * 256 - 1));
++//! Quantise one position component; the consumer computes pos.xy = (q / 65536 - 0.5) * qb.w + qb.xy
++static ILINE uint32 RT_QuantPos(float value, float center, float size)
++{
++	const float q = ((value - center) / size + 0.5f) * 65536.f;
++	return (uint32)CLAMP((int)floor(q + 0.5f), 0, 65535);
++}
+ 
+-	int val = x * 256 * 256 + y;
++static ILINE float RT_UnquantPos(uint32 q, float center, float size)
++{
++	return ((float)q / 65536.f - 0.5f) * size + center;
++}
+ 
+-	return 0.1f + (float)val;
++//! Inverse of ExtractDir: n = qx + qy*256 + qz*65536, q = round((v*0.5+0.5)*255); the sign carries handedness.
++static ILINE float RT_PackDir(const Vec3& vIn, float handedness)
++{
++	Vec3 v = vIn;
++	if (v.GetLengthSquared() < 1e-12f)
++		v = Vec3(0, 0, 1);
++	else
++		v.Normalize();
++
++	const int qx = CLAMP((int)floor((v.x * 0.5f + 0.5f) * 255.f + 0.5f), 0, 255);
++	const int qy = CLAMP((int)floor((v.y * 0.5f + 0.5f) * 255.f + 0.5f), 0, 255);
++	const int qz = CLAMP((int)floor((v.z * 0.5f + 0.5f) * 255.f + 0.5f), 0, 255);
++
++	int n = qx + qy * 256 + qz * 65536;
++
++	// the consumer recovers the sign as "f > 0 ? +1 : -1", so zero must never be emitted
++	if (n == 0)
++		n = 1;
++
++	return (handedness >= 0.f) ? (float)n : -((float)n);
+ }
+ 
+-void CVoxelSegment::StoreAreaTrisIntoTriPool()
++//! Inverse of ExtractTC16: two 16 bit fixed point fields over [0, 16), packed like positions.
++static ILINE float RT_PackTC16(float u, float v)
++{
++	const int qu = CLAMP((int)floor(u / 16.f * 65535.f + 0.5f), 0, 65535);
++	const int qv = CLAMP((int)floor(v / 16.f * 65535.f + 0.5f), 0, 65535);
++	return RT_PackU16x2((uint32)qu, (uint32)qv);
++}
++
++//! Inverse of ExtractUint2: base 4096, high field first.
++static ILINE float RT_PackUint2(int high, int low)
++{
++	return (float)(CLAMP(high, 0, 4095) * 4096 + CLAMP(low, 0, 4095));
++}
++
++///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
++// Mesh ray tracing - binned SAH BVH builder (rt decision 03)
++///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
++
++namespace
+ {
+-	if (m_pVertInArea && m_pVertInArea->Count())
++struct SRTRef
++{
++	AABB box;
++	Vec3 centroid;
++	int  triId;
++};
++
++struct SRTNode
++{
++	AABB box;
++	int  first;      //!< first reference of this node
++	int  count;      //!< number of references
++	int  child0;     //!< index into the node array, -1 on leaves
++	int  child1;
++	int  splitAxis;  //!< 0/1/2, -1 on leaves
++	int  depth;
++	int  record;     //!< absolute record index, filled by the layout pass
++	int  subtreeEnd; //!< first record after this subtree
++};
++
++const int kRTSahBins = 16;
++
++//! Top down binned SAH builder: 3 axes x 16 bins over the centroid bounds, Ct = Ci = 1,
++//! exact child bounds, median fallback. Deterministic - no randomness, stable partition.
++struct SRTBuilder
++{
++	PodArray<SRTRef>  refs;
++	PodArray<SRTNode> nodes;
++	int               leafTris;
++	int               maxDepth;
++	int               maxDepthSeen;
++	int               maxLeafTris;
++	int               leafCount;
++
++	static bool CompareRefX(const SRTRef& a, const SRTRef& b) { return (a.centroid.x != b.centroid.x) ? (a.centroid.x < b.centroid.x) : (a.triId < b.triId); }
++	static bool CompareRefY(const SRTRef& a, const SRTRef& b) { return (a.centroid.y != b.centroid.y) ? (a.centroid.y < b.centroid.y) : (a.triId < b.triId); }
++	static bool CompareRefZ(const SRTRef& a, const SRTRef& b) { return (a.centroid.z != b.centroid.z) ? (a.centroid.z < b.centroid.z) : (a.triId < b.triId); }
++
++	static float SurfaceArea(const AABB& box)
+ 	{
+-		PodArrayRT<Vec4>& rAr = gSvoEnv->m_arrRTPoolTris;
++		if (box.min.x > box.max.x)
++			return 0.f;
++		const Vec3 d = box.max - box.min;
++		return 2.f * (d.x * d.y + d.y * d.z + d.z * d.x);
++	}
+ 
+-		AUTO_MODIFYLOCK(rAr.m_Lock);
++	int AddNode(int first, int count, int depth)
++	{
++		SRTNode n;
++		n.box.Reset();
++		for (int i = first; i < first + count; i++)
++			n.box.Add(refs[i].box);
++		n.first = first;
++		n.count = count;
++		n.child0 = n.child1 = -1;
++		n.splitAxis = -1;
++		n.depth = depth;
++		n.record = 0;
++		n.subtreeEnd = 0;
++		nodes.Add(n);
++		return nodes.Count() - 1;
++	}
+ 
+-		for (int t = 0; t < m_pTrisInArea->Count(); t++)
++	void MakeLeaf(int nodeId)
++	{
++		SRTNode& n = nodes[nodeId];
++		n.child0 = n.child1 = -1;
++		n.splitAxis = -1;
++		leafCount++;
++		maxDepthSeen = max(maxDepthSeen, n.depth);
++		maxLeafTris = max(maxLeafTris, n.count);
++	}
++
++	void Split(int nodeId)
++	{
++		const int first = nodes[nodeId].first;
++		const int count = nodes[nodeId].count;
++		const int depth = nodes[nodeId].depth;
++
++		if (count <= leafTris || depth >= maxDepth || count < 2)
+ 		{
+-			SRayHitTriangleIndexed& tr = (*m_pTrisInArea)[t];
++			MakeLeaf(nodeId);
++			return;
++		}
+ 
+-			if (tr.hitObjectType == HIT_OBJ_TYPE_TERRAIN)
+-				continue;
++		AABB centroidBox;
++		centroidBox.Reset();
++		for (int i = first; i < first + count; i++)
++			centroidBox.Add(refs[i].centroid);
++
++		const Vec3  cExtent = centroidBox.max - centroidBox.min;
++		const float parentArea = SurfaceArea(nodes[nodeId].box);
++
++		int   bestAxis = -1;
++		int   bestBin = -1;
++		float bestCost = (float)count;   // leaf cost with Ct = Ci = 1
++
++		if (parentArea > 0.f)
++		{
++			for (int axis = 0; axis < 3; axis++)
++			{
++				const float lo = centroidBox.min[axis];
++				const float extent = cExtent[axis];
++				if (extent <= 0.f)
++					continue;
++
++				const float k = (float)kRTSahBins / extent;
++
++				AABB binBox[kRTSahBins];
++				int  binCount[kRTSahBins];
++				for (int b = 0; b < kRTSahBins; b++)
++				{
++					binBox[b].Reset();
++					binCount[b] = 0;
++				}
++
++				for (int i = first; i < first + count; i++)
++				{
++					const int b = CLAMP((int)((refs[i].centroid[axis] - lo) * k), 0, kRTSahBins - 1);
++					binBox[b].Add(refs[i].box);
++					binCount[b]++;
++				}
++
++				// accumulate the right side first
++				AABB rightBox[kRTSahBins];
++				int  rightCount[kRTSahBins];
++				AABB acc;
++				acc.Reset();
++				int accCount = 0;
++				for (int b = kRTSahBins - 1; b >= 1; b--)
++				{
++					if (binCount[b])
++						acc.Add(binBox[b]);
++					accCount += binCount[b];
++					rightBox[b] = acc;
++					rightCount[b] = accCount;
++				}
++
++				// sweep left to right and evaluate every plane
++				AABB leftAcc;
++				leftAcc.Reset();
++				int leftCount = 0;
++				for (int b = 0; b < kRTSahBins - 1; b++)
++				{
++					if (binCount[b])
++						leftAcc.Add(binBox[b]);
++					leftCount += binCount[b];
++
++					if (leftCount == 0 || rightCount[b + 1] == 0)
++						continue;
++
++					const float cost = 1.f + (SurfaceArea(leftAcc) * leftCount + SurfaceArea(rightBox[b + 1]) * rightCount[b + 1]) / parentArea;
++
++					if (cost < bestCost)
++					{
++						bestCost = cost;
++						bestAxis = axis;
++						bestBin = b;
++					}
++				}
++			}
++		}
++
++		int mid = -1;
++		int splitAxis = bestAxis;
++
++		if (bestAxis >= 0)
++		{
++			const float lo = centroidBox.min[bestAxis];
++			const float k = (float)kRTSahBins / cExtent[bestAxis];
++
++			// stable partition; child0 keeps the lower half along the split axis
++			PodArray<SRTRef> tmp;
++			tmp.PreAllocate(count, 0);
++			for (int i = first; i < first + count; i++)
++			{
++				const int b = CLAMP((int)((refs[i].centroid[bestAxis] - lo) * k), 0, kRTSahBins - 1);
++				if (b <= bestBin)
++					tmp.Add(refs[i]);
++			}
++			const int leftCount = tmp.Count();
++			for (int i = first; i < first + count; i++)
++			{
++				const int b = CLAMP((int)((refs[i].centroid[bestAxis] - lo) * k), 0, kRTSahBins - 1);
++				if (b > bestBin)
++					tmp.Add(refs[i]);
++			}
++			memcpy(refs.GetElements() + first, tmp.GetElements(), sizeof(SRTRef) * count);
++			mid = first + leftCount;
++		}
++		else
++		{
++			// median fallback: coincident centroids, or no plane was cheaper than the leaf
++			if (count <= leafTris)
++			{
++				MakeLeaf(nodeId);
++				return;
++			}
++
++			splitAxis = 0;
++			if (cExtent.y > cExtent[splitAxis])
++				splitAxis = 1;
++			if (cExtent.z > cExtent[splitAxis])
++				splitAxis = 2;
++
++			SRTRef* pBegin = refs.GetElements() + first;
++			if (splitAxis == 0)
++				std::stable_sort(pBegin, pBegin + count, CompareRefX);
++			else if (splitAxis == 1)
++				std::stable_sort(pBegin, pBegin + count, CompareRefY);
++			else
++				std::stable_sort(pBegin, pBegin + count, CompareRefZ);
++
++			mid = first + count / 2;
++		}
++
++		if (mid <= first || mid >= first + count)
++		{
++			MakeLeaf(nodeId);
++			return;
++		}
++
++		const int child0 = AddNode(first, mid - first, depth + 1);
++		const int child1 = AddNode(mid, first + count - mid, depth + 1);
++
++		nodes[nodeId].child0 = child0;
++		nodes[nodeId].child1 = child1;
++		nodes[nodeId].splitAxis = splitAxis;
++
++		Split(child0);
++		Split(child1);
++	}
++
++	//! Assigns record indices depth first; a leaf's triangle records follow its node record immediately.
++	int Layout(int nodeId, int rec)
++	{
++		nodes[nodeId].record = rec;
++		rec++;
++
++		if (nodes[nodeId].child0 < 0)
++		{
++			rec += nodes[nodeId].count;
++		}
++		else
++		{
++			rec = Layout(nodes[nodeId].child0, rec);
++			rec = Layout(nodes[nodeId].child1, rec);
++		}
++
++		nodes[nodeId].subtreeEnd = rec;
++		return rec;
++	}
++};
++}
++
++bool CVoxelSegment::BuildStaticBVHRecords(const PodArray<SRTBuildTri>& arrTris, const Vec4& qb, int recordBase, PodArray<Vec4>& arrOut, PodArray<int>* pRelocFloats, SRTBuildStats& stats)
++{
++	if (!arrTris.Count())
++		return false;
+ 
+-			Vec3 arrPos[3] = { (*m_pVertInArea)[tr.arrVertId[0]].v, (*m_pVertInArea)[tr.arrVertId[1]].v, (*m_pVertInArea)[tr.arrVertId[2]].v };
+-			Vec2 arrTC[3] = { (*m_pVertInArea)[tr.arrVertId[0]].t, (*m_pVertInArea)[tr.arrVertId[1]].t, (*m_pVertInArea)[tr.arrVertId[2]].t };
+-			Vec3 arrNor[3] = { (*m_pVertInArea)[tr.arrVertId[0]].n, (*m_pVertInArea)[tr.arrVertId[1]].n, (*m_pVertInArea)[tr.arrVertId[2]].n };
++	SRTBuilder bld;
++	bld.leafTris = max(1, Cry3DEngineBase::GetCVars()->e_svoTI_RT_LeafTris);
++	bld.maxDepth = CLAMP(Cry3DEngineBase::GetCVars()->e_svoTI_RT_MaxDepth, 1, 18);
++	bld.maxDepthSeen = 0;
++	bld.maxLeafTris = 0;
++	bld.leafCount = 0;
+ 
+-			// normalize TC
+-			Vec2 tcMin(0, 0);
+-			tcMin.x = min(arrTC[0].x, min(arrTC[1].x, arrTC[2].x));
+-			tcMin.y = min(arrTC[0].y, min(arrTC[1].y, arrTC[2].y));
++	bld.refs.PreAllocate(arrTris.Count(), 0);
++	for (int i = 0; i < arrTris.Count(); i++)
++	{
++		const SRTBuildTri& tr = arrTris[i];
++		SRTRef ref;
++		ref.box.Reset();
++		ref.box.Add(tr.v[0]);
++		ref.box.Add(tr.v[1]);
++		ref.box.Add(tr.v[2]);
++		ref.centroid = (tr.v[0] + tr.v[1] + tr.v[2]) / 3.f;
++		ref.triId = i;
++		bld.refs.Add(ref);
++	}
++
++	bld.nodes.PreAllocate(arrTris.Count() * 2 + 8, 0);
++	const int rootNode = bld.AddNode(0, bld.refs.Count(), 0);
++	bld.Split(rootNode);
++
++	const int recordsEnd = bld.Layout(rootNode, recordBase);
++	const int recordCount = recordsEnd - recordBase;
++
++	const int texelBase = arrOut.Count();
++	arrOut.PreAllocate(texelBase + recordCount * SVO_RT_RECORD_TEXELS, texelBase + recordCount * SVO_RT_RECORD_TEXELS);
++
++	for (int n = 0; n < bld.nodes.Count(); n++)
++	{
++		const SRTNode& node = bld.nodes[n];
++		const bool    isLeaf = (node.child0 < 0);
++		const int     nodeTexel = texelBase + (node.record - recordBase) * SVO_RT_RECORD_TEXELS;
++
++		Vec4* pRec = arrOut.GetElements() + nodeTexel;
++
++		pRec[0] = Vec4(node.box.min, isLeaf ? (float)node.count : 0.f);
++		pRec[1] = Vec4(node.box.max, (float)node.subtreeEnd);
++		pRec[2] = qb;
++		pRec[3] = Vec4(isLeaf ? 0.f : (float)bld.nodes[node.child0].record,
++		               isLeaf ? 0.f : (float)bld.nodes[node.child1].record,
++		               0.f,
++		               isLeaf ? -1.f : (float)node.splitAxis);
++
++		if (pRelocFloats)
++		{
++			pRelocFloats->Add(nodeTexel * 4 + 7);          // texel 1 .w = subtreeEnd
++			if (!isLeaf)
++			{
++				pRelocFloats->Add(nodeTexel * 4 + 12);     // texel 3 .x = child0
++				pRelocFloats->Add(nodeTexel * 4 + 13);     // texel 3 .y = child1
++			}
++		}
++
++		if (!isLeaf)
++			continue;
++
++		for (int t = 0; t < node.count; t++)
++		{
++			const SRTBuildTri& tr = arrTris[bld.refs[node.first + t].triId];
++			const int          triTexel = nodeTexel + (1 + t) * SVO_RT_RECORD_TEXELS;
++			Vec4*              pTri = arrOut.GetElements() + triTexel;
++
++			// per triangle tangent frame from the UV gradient; the consumer rebuilds the
++			// geometric normal as normalize(cross(tangent, bitangent) * handedness)
++			const Vec3  e1 = tr.v[1] - tr.v[0];
++			const Vec3  e2 = tr.v[2] - tr.v[0];
++			const Vec2  d1 = tr.t[1] - tr.t[0];
++			const Vec2  d2 = tr.t[2] - tr.t[0];
++			const float det = d1.x * d2.y - d2.x * d1.y;
++
++			Vec3 vT, vB;
++			if (fabs(det) > 1e-12f)
++			{
++				const float r = 1.f / det;
++				vT = (e1 * d2.y - e2 * d1.y) * r;
++				vB = (e2 * d1.x - e1 * d2.x) * r;
++			}
++			else
++			{
++				vT = e1;
++				vB = e2;
++			}
+ 
+ 			for (int v = 0; v < 3; v++)
+ 			{
+-				arrTC[v].x -= floor(tcMin.x);
+-				arrTC[v].y -= floor(tcMin.y);
++				const Vec3 vN = tr.n[v].GetNormalizedSafe(tr.faceNorm.GetNormalizedSafe(Vec3(0, 0, 1)));
++
++				Vec3 vTan = vT - vN * vN.Dot(vT);
++				if (vTan.GetLengthSquared() < 1e-12f)
++					vTan = vN.GetOrthogonal();
++				vTan.Normalize();
++
++				const float handedness = (vN.Cross(vTan).Dot(vB) < 0.f) ? -1.f : 1.f;
++				const Vec3  vBit = vN.Cross(vTan) * handedness;
++
++				const uint32 qx = RT_QuantPos(tr.v[v].x, qb.x, qb.w);
++				const uint32 qy = RT_QuantPos(tr.v[v].y, qb.y, qb.w);
++
++				pTri[v] = Vec4(RT_PackU16x2(qx, qy), RT_PackDir(vTan, handedness), RT_PackDir(vBit, 1.f), tr.v[v].z);
+ 			}
+ 
+-			uint16 nTexW = 0, nTexH = 0;
+-			int* pLowResSystemCopyAtlasId = 0;
++			pTri[3] = Vec4((float)tr.matRecord,
++			               RT_PackTC16(tr.t[0].x, tr.t[0].y),
++			               RT_PackTC16(tr.t[1].x, tr.t[1].y),
++			               RT_PackTC16(tr.t[2].x, tr.t[2].y));
++
++			if (pRelocFloats)
++				pRelocFloats->Add(triTexel * 4 + 12);      // texel 3 .x = matRecord
++		}
++	}
++
++	stats.tris += arrTris.Count();
++	stats.nodes += bld.nodes.Count();
++	stats.leaves += bld.leafCount;
++	stats.records += recordCount;
++	stats.maxDepth = max(stats.maxDepth, bld.maxDepthSeen);
++	stats.maxLeafTris = max(stats.maxLeafTris, bld.maxLeafTris);
+ 
+-			SSvoMatInfo& rMI = m_pMatsInArea->GetAt(tr.materialID);
+-			SShaderItem* pShItem = nullptr;
++	return true;
++}
++
++///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
++// Mesh ray tracing - material texture atlas (rt decision 04)
++///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
++
++//! Copies one low resolution texture into a free atlas slice (or reuses the one it already owns)
++//! and returns the 1 based slice id the material record stores; 0 means "no texture".
++int CVoxelSegment::CheckStoreTextureInPool(SShaderItem* pShItem, EEfResTextures texSlot, uint16& nTexW, uint16& nTexH)
++{
++	const int maxTexSizeXY = gSvoEnv->GetRTTexRes();
+ 
+-			if (rMI.pMat)
++	const ColorB* pTexRgbOr = nullptr;
++	int*          pSysTexId = nullptr;
++
++	nTexW = nTexH = 0;
++
++	if (pShItem)
++	{
++		if (pShItem->m_pShaderResources)
++		{
++			if (SEfResTexture* pResTexture = pShItem->m_pShaderResources->GetTexture(texSlot))
+ 			{
+-				pShItem = &rMI.pMat->GetShaderItem();
+-				CheckStoreTextureInPool(pShItem, nTexW, nTexH, &pLowResSystemCopyAtlasId);
++				if (ITexture* pITex = pResTexture->m_Sampler.m_pITex)
++				{
++					{
++						AUTO_MODIFYLOCK(m_arrLockedTextures.m_Lock);
++						m_arrLockedTextures[pITex] = pITex;
++					}
++
++					pTexRgbOr = pITex->GetLowResSystemCopy(nTexW, nTexH, &pSysTexId, maxTexSizeXY);
++				}
++			}
++		}
++	}
++	else if (texSlot == EFTT_DIFFUSE)
++	{
++		// terrain: the whole terrain diffuse is one square texture carrying its own atlas id slot
++		if (const PodArray<ColorB>* pTerrLowResTex = GetTerrain()->GetTerrainRgbLowResSystemCopy(&pSysTexId))
++		{
++			nTexW = nTexH = (uint16)(int)sqrt((float)pTerrLowResTex->Count());
++			pTexRgbOr = pTerrLowResTex->GetElements();
++		}
++	}
++
++	if (!pTexRgbOr || !pSysTexId || !nTexW || !nTexH)
++	{
++		nTexW = nTexH = 0;
++		return 0;
++	}
++
++	if (nTexW > maxTexSizeXY || nTexH > maxTexSizeXY)
++	{
++		// never overrun a slice; the material falls back to its tint
++		nTexW = nTexH = 0;
++		return 0;
++	}
++
++	AUTO_MODIFYLOCK(gSvoEnv->m_arrRTPoolTexs.m_Lock);
++
++	if (*pSysTexId == 0)
++	{
++		const int newSlice = gSvoEnv->RTAllocTexSlice(pSysTexId);
++		if (newSlice < 0)
++		{
++			nTexW = nTexH = 0;
++			return 0;
++		}
++
++		ColorB* pDst = gSvoEnv->m_arrRTPoolTexs.GetElements() + (size_t)newSlice * maxTexSizeXY * maxTexSizeXY;
++
++		for (int lineId = 0; lineId < nTexH; lineId++)
++		{
++			const ColorB* pSrcLine = pTexRgbOr + lineId * nTexW;
++			ColorB*       pDstLine = pDst + lineId * maxTexSizeXY;
++
++			if (texSlot == EFTT_NORMALS)
++			{
++				// CE _ddna normals are BC5; DXTDecompressRow only fills the channels the source has
++				// (Renderer.cpp, "sourceChannels"), so the blue channel is reconstructed here.
++				for (int x = 0; x < nTexW; x++)
++				{
++					const float nx = (float)pSrcLine[x].r / 255.f * 2.f - 1.f;
++					const float ny = (float)pSrcLine[x].g / 255.f * 2.f - 1.f;
++					const float nz = sqrt_tpl(max(0.f, 1.f - nx * nx - ny * ny));
++
++					pDstLine[x].r = pSrcLine[x].r;
++					pDstLine[x].g = pSrcLine[x].g;
++					pDstLine[x].b = SATURATEB((int)(nz * 127.5f + 127.5f));
++					pDstLine[x].a = pSrcLine[x].a;   // smoothness; 255 when the source carries none
++				}
+ 			}
+ 			else
+ 			{
+-				CheckStoreTextureInPool(nullptr, nTexW, nTexH, &pLowResSystemCopyAtlasId);
++				memcpy(pDstLine, pSrcLine, nTexW * sizeof(ColorB));
+ 			}
++		}
++
++		*pSysTexId = newSlice + 1;
++		gSvoEnv->RTMarkTexsDirty(newSlice, 1);
++	}
++
++	const int slice = (*pSysTexId) - 1;
++
++	gSvoEnv->RTAddTexSliceRef(slice);
++	m_rtTexSlices.Add(slice);
++
++	return slice + 1;
++}
++
++//! One 4 texel material record (rt decision 02, 2.5). Stage 1 fills albedo and normal only.
++void CVoxelSegment::FillRTMaterialRecord(const SRayHitTriangleIndexed& tr, Vec4* pOut)
++{
++	const int maxTexSizeXY = gSvoEnv->GetRTTexRes();
++
++	SSvoMatInfo& rMI = m_pMatsInArea->GetAt(tr.materialID);
++
++	const bool   bTerrain = (tr.hitObjectType == HIT_OBJ_TYPE_TERRAIN);
++	SShaderItem* pShItem = (rMI.pMat && !bTerrain) ? &rMI.pMat->GetShaderItem() : nullptr;
++
++	uint16 texW = 0, texH = 0, norW = 0, norH = 0;
++	int    albSlot = 0, norSlot = 0;
++
++	ColorF tint = Col_White;
++	float  opacity = 1.f;
++	float  alphaRef = 0.f;
++	float  smoothness = 1.f;
++	float  normalStrength = 1.f;
++	float  specRefl = 0.04f;
++	float  emissive = 0.f;
++	float  tag = 0.f;
++
++	if (bTerrain)
++	{
++		albSlot = CheckStoreTextureInPool(nullptr, EFTT_DIFFUSE, texW, texH);
++
++		const float mul = GetTerrain() ? GetTerrain()->GetTerrainTextureMultiplier() : 1.f;
++		tint = ColorF(mul, mul, mul, 1.f);
++		smoothness = 0.f;
++		specRefl = 0.02f;
++	}
++	else if (pShItem)
++	{
++		albSlot = CheckStoreTextureInPool(pShItem, EFTT_DIFFUSE, texW, texH);
++		norSlot = CheckStoreTextureInPool(pShItem, EFTT_NORMALS, norW, norH);
++
++		if (IRenderShaderResources* pRes = pShItem->m_pShaderResources)
++		{
++			tint = pRes->GetColorValue(EFTT_DIFFUSE);
++			opacity = SATURATE(pRes->GetStrengthValue(EFTT_OPACITY));
++			alphaRef = SATURATE(pRes->GetAlphaRef());
++
++			normalStrength = pRes->GetStrengthValue(EFTT_NORMALS);
++			if (normalStrength <= 0.f)
++				normalStrength = 1.f;
++
++			const float gloss = pRes->GetStrengthValue(EFTT_SMOOTHNESS);
++			smoothness = SATURATE(gloss > 1.f ? gloss / 255.f : gloss);
++
++			const ColorF spec = pRes->GetColorValue(EFTT_SPECULAR);
++			specRefl = SATURATE((spec.r + spec.g + spec.b) / 3.f);
++		}
+ 
+-			if (pLowResSystemCopyAtlasId)
++		if (pShItem->IsVegetation() && alphaRef > 0.05f)
++			tag = 0.25f;   // two sided leaves
++	}
++
++	// the atlas UV scale comes from the albedo copy; a normal map of a different size would need
++	// its own scale, for which the 4 texel record has no room (open item, stage 2)
++	const float scaleX = albSlot ? (float)texW / (float)maxTexSizeXY : 1.f;
++	const float scaleY = albSlot ? (float)texH / (float)maxTexSizeXY : 1.f;
++
++	pOut[0] = Vec4((float)albSlot, RT_PackUint2(norSlot, 0), RT_PackUint2(0, 0), RT_PackTC16(scaleX, scaleY));
++	pOut[1] = Vec4(normalStrength, specRefl, smoothness, emissive);
++	pOut[2] = Vec4(tint.r, tint.g, tint.b, 0.f);
++	pOut[3] = Vec4(0.f, 0.f, tag, RT_PackTC16(opacity, alphaRef));
++}
++
++///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
++// Mesh ray tracing - per cell static BVH build (rt decisions 02, 03, 04)
++///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
++
++static void RT_ReleaseTexSlices(PodArray<int>& arrSlices)
++{
++	if (!arrSlices.Count())
++		return;
++
++	for (int i = 0; i < arrSlices.Count(); i++)
++		gSvoEnv->RTQueueFreeTexSlice(arrSlices[i]);
++	arrSlices.Reset();
++}
++
++void CVoxelSegment::ReleaseRTChunk()
++{
++	if (m_rtChunkCount)
++	{
++		gSvoEnv->RTQueueFreeChunk(m_rtChunkStart, m_rtChunkCount);
++		m_rtChunkStart = m_rtChunkCount = m_rtRootRecord = 0;
++	}
++
++	RT_ReleaseTexSlices(m_rtTexSlices);
++}
++
++void CVoxelSegment::BuildStaticBVH()
++{
++	if (!GetCVars()->e_svoTI_RT_Active || !GetCVars()->e_svoTI_RT_StaticBVH)
++		return;
++
++	// only cells at exactly e_svoMaxNodeSize own a static BVH (consumer gate, rt decision 02, 2.3)
++	if (!m_isAreaParent)
++		return;
++
++	if (!m_pTrisInArea || !m_pTrisInArea->Count() || !m_pVertInArea || !m_pMatsInArea)
++		return;
++
++	const float startTime = GetCurAsyncTimeSec();
++
++	SRTBuildStats stats;
++	stats.Reset();
++
++	const int oldChunkStart = m_rtChunkStart;
++	const int oldChunkCount = m_rtChunkCount;
++
++	PodArray<int> arrOldTexSlices;
++	arrOldTexSlices.AddList(m_rtTexSlices);
++	m_rtTexSlices.Clear();
++
++	PodArray<SRTBuildTri> arrBuild;
++	PodArray<Vec4>        arrRecords;
++	PodArray<int>         arrReloc;
++	std::map<int, int>    matKeyToLocalId;
++	Vec4                  qb(0, 0, 0, 1);
++
++	{
++		AUTO_READLOCK(m_superMeshLock);
++
++		const AABB cellBox(m_boxOS.min + m_vSegOrigin, m_boxOS.max + m_vSegOrigin);
++
++		// Quantisation bounds: one per cell, so that a vertex shared between two leaves quantises
++		// identically (watertightness, rt decision 02, 2.5). The cell box is grown to the real soup
++		// bounds because a triangle that only overlaps the cell may legally have vertices outside it;
++		// clamping those would tear the geometry apart.
++		AABB qBox = cellBox;
++		for (int t = 0; t < m_pTrisInArea->Count(); t++)
++		{
++			const SRayHitTriangleIndexed& tr = (*m_pTrisInArea)[t];
++			if (tr.hitObjectType == HIT_OBJ_TYPE_VISAREA)
++				continue;
++			for (int v = 0; v < 3; v++)
++				qBox.Add((*m_pVertInArea)[tr.arrVertId[v]].v);
++		}
++
++		float qSize = max(qBox.max.x - qBox.min.x, qBox.max.y - qBox.min.y);
++		qSize = max(qSize, 1.f) * (1.f + 1.f / 1024.f);
++
++		qb = Vec4((qBox.min.x + qBox.max.x) * 0.5f, (qBox.min.y + qBox.max.y) * 0.5f, 0.f, qSize);
++
++		const int terrainSize = max(1, GetTerrain() ? GetTerrain()->GetTerrainSize() : 1);
++
++		arrBuild.PreAllocate(m_pTrisInArea->Count(), 0);
++
++		for (int t = 0; t < m_pTrisInArea->Count(); t++)
++		{
++			const SRayHitTriangleIndexed& tr = (*m_pTrisInArea)[t];
++
++			// Visarea shells are an opacity seal for voxel cone tracing, not real geometry; tracing
++			// them would put a black box into every reflection at an indoor/outdoor border.
++			if (tr.hitObjectType == HIT_OBJ_TYPE_VISAREA)
++				continue;
++
++			SRTBuildTri bt;
++			for (int v = 0; v < 3; v++)
++			{
++				const SRayHitVertex& vert = (*m_pVertInArea)[tr.arrVertId[v]];
++				bt.v[v] = vert.v;
++				bt.n[v] = vert.n;
++				bt.t[v] = vert.t;
++			}
++			bt.faceNorm = tr.vFaceNorm;
++
++			// reject degenerates: they give the consumer a zero determinant
++			if ((bt.v[1] - bt.v[0]).Cross(bt.v[2] - bt.v[0]).GetLengthSquared() < 1e-16f)
+ 			{
+-				const int maxTexSizeXY = GetCVars()->e_svoTI_RT_MaxTexRes;
++				stats.trisSkipped++;
++				continue;
++			}
+ 
+-				rAr.CheckAllocated(maxTexSizeXY * maxTexSizeXY * m_voxTexPoolDimZ);
++			// vertex normals are flipped into the face hemisphere so the frame the consumer rebuilds
++			// from (tangent, bitangent) stays consistent with the winding
++			for (int v = 0; v < 3; v++)
++				if (bt.n[v].Dot(bt.faceNorm) < 0.f)
++					bt.n[v] = -bt.n[v];
+ 
+-				const int triDataSize = 8; // number of Vec4 elements per triangle
++			if (tr.hitObjectType == HIT_OBJ_TYPE_TERRAIN)
++			{
++				// terrain carries no UVs in the soup: regenerate CE's terrain tex-gen (ProcessMaterial)
++				for (int v = 0; v < 3; v++)
++					bt.t[v] = Vec2(bt.v[v].y / (float)terrainSize, bt.v[v].x / (float)terrainSize);
++			}
+ 
+-				// get triangle offset and globalId
+-				if (rAr.m_writeOffset + triDataSize >= rAr.Count())
+-					rAr.m_writeOffset = 0;
++			// UVs are normalised per triangle into [0, 16), exactly as CE's old producer did
++			const Vec2 tcMin(min(bt.t[0].x, min(bt.t[1].x, bt.t[2].x)), min(bt.t[0].y, min(bt.t[1].y, bt.t[2].y)));
++			bool       bClamped = false;
++			for (int v = 0; v < 3; v++)
++			{
++				bt.t[v].x -= floor(tcMin.x);
++				bt.t[v].y -= floor(tcMin.y);
++
++				if (bt.t[v].x < 0.f || bt.t[v].x >= 16.f || bt.t[v].y < 0.f || bt.t[v].y >= 16.f)
++					bClamped = true;
+ 
+-				tr.globalId = rAr.m_writeOffset / triDataSize;
++				bt.t[v].x = CLAMP(bt.t[v].x, 0.f, 16.f - 1.f / 4096.f);
++				bt.t[v].y = CLAMP(bt.t[v].y, 0.f, 16.f - 1.f / 4096.f);
++			}
++			if (bClamped)
++				stats.uvClamped++;
+ 
+-				// store triangle into pool
+-				for (int i = 0; i < 3; i++)
+-					rAr[rAr.m_writeOffset++] = Vec4(arrPos[i], CompressTC(arrTC[i]));
++			// material records are deduplicated per cell by (material id, hit object type) and live
++			// at the head of the cell's chunk, so that one free() reclaims everything
++			const int                           matKey = (int)tr.materialID * 4 + (int)tr.hitObjectType;
++			std::map<int, int>::const_iterator  it = matKeyToLocalId.find(matKey);
++			int                                 localMatId;
+ 
+-				rAr[rAr.m_writeOffset++] = Vec4(0.1f + (float)(pLowResSystemCopyAtlasId ? *pLowResSystemCopyAtlasId : 0), (float)nTexW / (float)GetCVars()->e_svoTI_RT_MaxTexRes, SATURATE(1.f / 255.f * (float)tr.opacity), 0);
++			if (it != matKeyToLocalId.end())
++			{
++				localMatId = it->second;
++			}
++			else
++			{
++				localMatId = (int)matKeyToLocalId.size();
++				matKeyToLocalId[matKey] = localMatId;
+ 
+-				for (int i = 0; i < 3; i++)
+-					rAr[rAr.m_writeOffset++] = Vec4(arrNor[i], 0);
++				Vec4 matRec[SVO_RT_RECORD_TEXELS];
++				FillRTMaterialRecord(tr, matRec);
+ 
+-				ColorF colMat = (pShItem && pShItem->m_pShaderResources) ? pShItem->m_pShaderResources->GetColorValue(EFTT_DIFFUSE) : Col_White;
+-				rAr[rAr.m_writeOffset++] = colMat.toVec4();
++				for (int i = 0; i < SVO_RT_RECORD_TEXELS; i++)
++					arrRecords.Add(matRec[i]);
+ 			}
++
++			bt.matRecord = localMatId;   // made absolute once the chunk start is known
++
++			arrBuild.Add(bt);
++		}
++	}
++
++	const int matCount = (int)matKeyToLocalId.size();
++
++	if (!arrBuild.Count() || !BuildStaticBVHRecords(arrBuild, qb, matCount, arrRecords, &arrReloc, stats))
++	{
++		m_rtRootRecord = 0;
++		m_rtChunkStart = m_rtChunkCount = 0;
++		if (oldChunkCount)
++			gSvoEnv->RTQueueFreeChunk(oldChunkStart, oldChunkCount);
++		RT_ReleaseTexSlices(arrOldTexSlices);
++		return;
++	}
++
++	const int recordCount = arrRecords.Count() / SVO_RT_RECORD_TEXELS;
++
++	int chunkStart = 0;
++	int allocRecords = recordCount;
++	{
++		AUTO_MODIFYLOCK(gSvoEnv->m_arrRTPoolTris.m_Lock);
++
++		chunkStart = gSvoEnv->RTAllocChunk(allocRecords);
++
++		if (chunkStart)
++		{
++			// make every stored record index absolute
++			float* pFloats = (float*)arrRecords.GetElements();
++			for (int i = 0; i < arrReloc.Count(); i++)
++				pFloats[arrReloc[i]] += (float)chunkStart;
++
++			memcpy(gSvoEnv->m_arrRTPoolTris.GetElements() + (size_t)chunkStart * SVO_RT_RECORD_TEXELS,
++			       arrRecords.GetElements(),
++			       arrRecords.GetDataSize());
++
++			gSvoEnv->RTMarkTrisDirty(chunkStart, recordCount);
++
++			gSvoEnv->m_rtStats.cells++;
++			gSvoEnv->m_rtStats.tris += stats.tris;
++			gSvoEnv->m_rtStats.nodes += stats.nodes;
++			gSvoEnv->m_rtStats.leaves += stats.leaves;
++			gSvoEnv->m_rtStats.records += stats.records;
++			gSvoEnv->m_rtStats.mats += matCount;
++			gSvoEnv->m_rtStats.uvClamped += stats.uvClamped;
++			gSvoEnv->m_rtStats.trisSkipped += stats.trisSkipped;
++			gSvoEnv->m_rtStats.maxDepth = max(gSvoEnv->m_rtStats.maxDepth, stats.maxDepth);
++			gSvoEnv->m_rtStats.maxLeafTris = max(gSvoEnv->m_rtStats.maxLeafTris, stats.maxLeafTris);
++			gSvoEnv->m_rtStats.buildMs += (GetCurAsyncTimeSec() - startTime) * 1000.f;
+ 		}
+ 	}
++
++	// The old chunk is released only through the deferred queue, i.e. after the tree texel that
++	// pointed at it has been rewritten and uploaded (rt STRUCTURE, chain 3).
++	if (oldChunkCount)
++		gSvoEnv->RTQueueFreeChunk(oldChunkStart, oldChunkCount);
++	RT_ReleaseTexSlices(arrOldTexSlices);
++
++	if (!chunkStart)
++	{
++		// pool overflow: this cell falls back to voxel cone tracing, never to aliased records
++		m_rtRootRecord = 0;
++		m_rtChunkStart = m_rtChunkCount = 0;
++		RT_ReleaseTexSlices(m_rtTexSlices);
++		return;
++	}
++
++	m_rtChunkStart = chunkStart;
++	m_rtChunkCount = allocRecords;
++	m_rtRootRecord = chunkStart + matCount;
++
++	if (GetCVars()->e_svoDebug)
++	{
++		PrintMessage("RT BVH: cell (%.0f %.0f %.0f) size %.0f: %d tris, %d nodes, %d leaves, depth %d, maxLeaf %d, %d records, %d mats, root %d",
++		             m_vSegOrigin.x, m_vSegOrigin.y, m_vSegOrigin.z, GetBoxSize(),
++		             arrBuild.Count(), stats.nodes, stats.leaves, stats.maxDepth, stats.maxLeafTris, recordCount, matCount, m_rtRootRecord);
++	}
+ }
+ 
+-void CVoxelSegment::CheckStoreTextureInPool(SShaderItem* pShItem, uint16& nTexW, uint16& nTexH, int** ppSysTexId)
++///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
++// Mesh ray tracing - self test (e_svoTI_RT_SelfTest)
++//
++// Builds a synthetic soup, writes real records with the real packers, then traces rays through
++// THE WRITTEN RECORDS with a CPU traversal that mirrors rt decision 02 exactly, and compares the
++// result with brute force. This is the only validation available without an engine window.
++///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
++
++namespace
+ {
+-	const ColorB* pTexRgbOr = nullptr;
++//! Deterministic LCG, so a failing run can always be reproduced.
++struct SRTTestRand
++{
++	uint32 s;
++	SRTTestRand(uint32 seed) : s(seed) {}
++	float  Next()
++	{
++		s = s * 1664525u + 1013904223u;
++		return (float)((s >> 8) & 0xffffff) / (float)0x1000000;
++	}
++	float NextRange(float a, float b) { return a + (b - a) * Next(); }
++};
++
++//! Moller-Trumbore with a relative determinant epsilon (rt decision 03, 3.6).
++bool RT_TestTriangle(const Vec3& org, const Vec3& dir, const Vec3& v0, const Vec3& v1, const Vec3& v2, float& tOut)
++{
++	const Vec3  e1 = v1 - v0;
++	const Vec3  e2 = v2 - v0;
++	const Vec3  pv = dir.Cross(e2);
++	const float det = e1.Dot(pv);
+ 
+-	int maxTexSizeXY = GetCVars()->e_svoTI_RT_MaxTexRes;
++	if (fabs(det) < 1e-7f * e1.GetLength() * e2.GetLength())
++		return false;
+ 
+-	if (pShItem)
++	const float invDet = 1.f / det;
++	const Vec3  tv = org - v0;
++	const float u = tv.Dot(pv) * invDet;
++	if (u < 0.f || u > 1.f)
++		return false;
++
++	const Vec3  qv = tv.Cross(e1);
++	const float v = dir.Dot(qv) * invDet;
++	if (v < 0.f || u + v > 1.f)
++		return false;
++
++	const float t = e2.Dot(qv) * invDet;
++	if (t <= 0.f)
++		return false;
++
++	tOut = t;
++	return true;
++}
++
++bool RT_TestAABB(const Vec3& org, const Vec3& invDir, const AABB& box, float tMax, float& tEnter)
++{
++	float t0 = 0.f, t1 = tMax;
++
++	for (int a = 0; a < 3; a++)
++	{
++		float n = (box.min[a] - org[a]) * invDir[a];
++		float f = (box.max[a] - org[a]) * invDir[a];
++		if (n > f)
++			std::swap(n, f);
++		t0 = max(t0, n);
++		t1 = min(t1, f);
++		if (t0 > t1)
++			return false;
++	}
++
++	tEnter = t0;
++	return true;
++}
++}
++
++void CVoxelSegment::RunRTSelfTest()
++{
++	const int kMaxStack = 20;
++
++	PrintMessage("RT self test: building synthetic soup...");
++
++	// ---- synthetic soup: two quads plus one thin wall -------------------------------------------
++	PodArray<SRTBuildTri> arrSoup;
++
++	struct SAddQuad
+ 	{
+-		if (SEfResTexture* pResTexture = pShItem->m_pShaderResources->GetTexture(EFTT_DIFFUSE))
++		static void Add(PodArray<SRTBuildTri>& out, const Vec3& o, const Vec3& du, const Vec3& dv, int subDiv)
+ 		{
+-			if (ITexture* pITex = pResTexture->m_Sampler.m_pITex)
++			const Vec3 n = du.Cross(dv).GetNormalizedSafe(Vec3(0, 0, 1));
++			for (int i = 0; i < subDiv; i++)
+ 			{
+-				pTexRgbOr = pITex->GetLowResSystemCopy(nTexW, nTexH, ppSysTexId, maxTexSizeXY);
++				for (int j = 0; j < subDiv; j++)
++				{
++					const float u0 = (float)i / subDiv, u1 = (float)(i + 1) / subDiv;
++					const float v0 = (float)j / subDiv, v1 = (float)(j + 1) / subDiv;
++
++					const Vec3 p00 = o + du * u0 + dv * v0;
++					const Vec3 p10 = o + du * u1 + dv * v0;
++					const Vec3 p11 = o + du * u1 + dv * v1;
++					const Vec3 p01 = o + du * u0 + dv * v1;
++
++					SRTBuildTri a;
++					a.v[0] = p00; a.v[1] = p10; a.v[2] = p11;
++					a.t[0] = Vec2(u0, v0); a.t[1] = Vec2(u1, v0); a.t[2] = Vec2(u1, v1);
++					a.n[0] = a.n[1] = a.n[2] = a.faceNorm = n;
++					a.matRecord = 0;
++					out.Add(a);
++
++					SRTBuildTri b;
++					b.v[0] = p00; b.v[1] = p11; b.v[2] = p01;
++					b.t[0] = Vec2(u0, v0); b.t[1] = Vec2(u1, v1); b.t[2] = Vec2(u0, v1);
++					b.n[0] = b.n[1] = b.n[2] = b.faceNorm = n;
++					b.matRecord = 0;
++					out.Add(b);
++				}
+ 			}
+ 		}
++	};
++
++	// floor quad, 8x8 cells
++	SAddQuad::Add(arrSoup, Vec3(0, 0, 0), Vec3(8, 0, 0), Vec3(0, 8, 0), 8);
++	// ceiling quad, 4x4 cells, offset and smaller
++	SAddQuad::Add(arrSoup, Vec3(1, 1, 5), Vec3(5, 0, 0), Vec3(0, 5, 0), 4);
++	// thin wall: a closed box 2 cm thick, spanning the floor
++	{
++		const float x0 = 3.5f, x1 = 3.52f, y0 = 0.f, y1 = 8.f, z0 = 0.f, z1 = 4.f;
++		const Vec3  c[8] =
++		{
++			Vec3(x0, y0, z0), Vec3(x1, y0, z0), Vec3(x1, y1, z0), Vec3(x0, y1, z0),
++			Vec3(x0, y0, z1), Vec3(x1, y0, z1), Vec3(x1, y1, z1), Vec3(x0, y1, z1)
++		};
++		const int quads[6][4] = { { 3, 2, 1, 0 }, { 4, 5, 6, 7 }, { 0, 1, 5, 4 }, { 1, 2, 6, 5 }, { 2, 3, 7, 6 }, { 3, 0, 4, 7 } };
++
++		for (int f = 0; f < 6; f++)
++		{
++			const Vec3 p0 = c[quads[f][0]], p1 = c[quads[f][1]], p2 = c[quads[f][2]], p3 = c[quads[f][3]];
++			const Vec3 n = (p1 - p0).Cross(p2 - p0).GetNormalizedSafe(Vec3(0, 0, 1));
++
++			SRTBuildTri a;
++			a.v[0] = p0; a.v[1] = p1; a.v[2] = p2;
++			a.t[0] = Vec2(0, 0); a.t[1] = Vec2(1, 0); a.t[2] = Vec2(1, 1);
++			a.n[0] = a.n[1] = a.n[2] = a.faceNorm = n;
++			a.matRecord = 0;
++			arrSoup.Add(a);
++
++			SRTBuildTri b;
++			b.v[0] = p0; b.v[1] = p2; b.v[2] = p3;
++			b.t[0] = Vec2(0, 0); b.t[1] = Vec2(1, 1); b.t[2] = Vec2(0, 1);
++			b.n[0] = b.n[1] = b.n[2] = b.faceNorm = n;
++			b.matRecord = 0;
++			arrSoup.Add(b);
++		}
+ 	}
+-	else
++
++	// ---- build real records ---------------------------------------------------------------------
++	AABB soupBox;
++	soupBox.Reset();
++	for (int i = 0; i < arrSoup.Count(); i++)
++		for (int v = 0; v < 3; v++)
++			soupBox.Add(arrSoup[i].v[v]);
++
++	const float qSize = max(soupBox.max.x - soupBox.min.x, soupBox.max.y - soupBox.min.y) * (1.f + 1.f / 1024.f);
++	const Vec4  qb((soupBox.min.x + soupBox.max.x) * 0.5f, (soupBox.min.y + soupBox.max.y) * 0.5f, 0.f, qSize);
++
++	const int      recordBase = SVO_RT_SEG_STATIC;
++	PodArray<Vec4> arrRec;
++	SRTBuildStats  stats;
++	stats.Reset();
++
++	const float buildStart = GetCurAsyncTimeSec();
++	if (!BuildStaticBVHRecords(arrSoup, qb, recordBase, arrRec, nullptr, stats))
++	{
++		PrintMessage("RT self test: FAILED - builder returned nothing");
++		return;
++	}
++	const float buildMs = (GetCurAsyncTimeSec() - buildStart) * 1000.f;
++
++	// ---- decode the written records back, exactly as the consumer will ---------------------------
++	PodArray<Vec3> arrDecodedV;   // 3 per triangle, indexed by leaf triangle record order
++	PodArray<int>  arrDecodedRec; // record index of each decoded triangle
++
++	float maxPosError = 0.f;
++
++	{
++		// Records are only meaningful through the tree - a triangle record read as a node would
++		// decode its packed Z as a triangle count - so the decode walks the tree, like the consumer.
++		PodArray<int> stack;
++		stack.Add(recordBase);
++
++		while (stack.Count())
++		{
++			const int rec = stack.Last();
++			stack.DeleteLast();
++
++			const Vec4* pRec = arrRec.GetElements() + (rec - recordBase) * SVO_RT_RECORD_TEXELS;
++			const int   child0 = (int)pRec[3].x;
++
++			if (child0 > 0)
++			{
++				stack.Add(child0);
++				stack.Add((int)pRec[3].y);
++				continue;
++			}
++
++			const int  triCount = (int)pRec[0].w;
++			const Vec4 nodeQb = pRec[2];
++
++			for (int t = 0; t < triCount; t++)
++			{
++				const Vec4* pTri = pRec + (1 + t) * SVO_RT_RECORD_TEXELS;
++				for (int v = 0; v < 3; v++)
++				{
++					const uint32 packed = RT_AsUint(pTri[v].x);
++					const Vec3   p(RT_UnquantPos(packed & 0xffff, nodeQb.x, nodeQb.w),
++					               RT_UnquantPos((packed >> 16) & 0xffff, nodeQb.y, nodeQb.w),
++					               pTri[v].w);
++					arrDecodedV.Add(p);
++				}
++				arrDecodedRec.Add(rec + 1 + t);
++			}
++		}
++	}
++
++	const int decodedTris = arrDecodedRec.Count();
++
++	if (decodedTris != arrSoup.Count())
+ 	{
+-		if (const PodArray<ColorB>* pTerrLowResTex = GetTerrain()->GetTerrainRgbLowResSystemCopy(ppSysTexId))
++		PrintMessage("RT self test: FAILED - %d triangles written but %d decoded back", arrSoup.Count(), decodedTris);
++		return;
++	}
++
++	// quantisation error: match each decoded triangle against the soup by nearest vertex triple
++	for (int i = 0; i < decodedTris; i++)
++	{
++		float best = 1e30f;
++		for (int j = 0; j < arrSoup.Count(); j++)
+ 		{
+-			nTexW = nTexH = (int)sqrt((float)pTerrLowResTex->Count());
+-			pTexRgbOr = (ColorB*)pTerrLowResTex->GetElements();
++			float d = 0.f;
++			for (int v = 0; v < 3; v++)
++				d = max(d, (arrDecodedV[i * 3 + v] - arrSoup[j].v[v]).GetLength());
++			best = min(best, d);
+ 		}
++		maxPosError = max(maxPosError, best);
+ 	}
+ 
+-	assert(pTexRgbOr);
++	// ---- trace 1000 rays through the written records --------------------------------------------
++	SRTTestRand rnd(0x5eed1b);
++
++	int mismatchVsDecoded = 0;
++	int mismatchVsSoup = 0;
++	int overflowCount = 0;
++	int hitCount = 0;
++	float maxDistError = 0.f;
+ 
+-	if (pTexRgbOr)
++	const Vec3 c = soupBox.GetCenter();
++	const float radius = soupBox.GetRadius() * 1.5f;
++
++	for (int rayId = 0; rayId < 1000; rayId++)
+ 	{
+-		AUTO_MODIFYLOCK(gSvoEnv->m_arrRTPoolTexs.m_Lock);
++		Vec3 org(c.x + rnd.NextRange(-radius, radius), c.y + rnd.NextRange(-radius, radius), c.z + rnd.NextRange(-radius, radius));
+ 
+-		if ((**ppSysTexId) == 0)
++		Vec3 dir;
++		if (rayId & 1)
++		{
++			// half of the rays are aimed into the soup box so that most of them actually hit
++			const Vec3 target(rnd.NextRange(soupBox.min.x, soupBox.max.x),
++			                  rnd.NextRange(soupBox.min.y, soupBox.max.y),
++			                  rnd.NextRange(soupBox.min.z, soupBox.max.z));
++			dir = target - org;
++		}
++		else
+ 		{
+-			// add new texture into RT pool
++			dir = Vec3(rnd.NextRange(-1.f, 1.f), rnd.NextRange(-1.f, 1.f), rnd.NextRange(-1.f, 1.f));
++		}
++
++		if (dir.GetLengthSquared() < 1e-6f)
++			dir = Vec3(0, 0, 1);
++		dir.Normalize();
++
++		const float tMax = radius * 4.f;
++		const Vec3  invDir(1.f / (fabs(dir.x) > 1e-12f ? dir.x : 1e-12f),
++		                   1.f / (fabs(dir.y) > 1e-12f ? dir.y : 1e-12f),
++		                   1.f / (fabs(dir.z) > 1e-12f ? dir.z : 1e-12f));
++
++		// (a) traversal of the written records
++		float bestT = tMax;
++		int   bestRec = -1;
++		bool  bIncomplete = false;
++
++		int stack[kMaxStack];
++		int stackPos = 0;
++		stack[stackPos++] = recordBase;
++
++		while (stackPos > 0)
++		{
++			const int   rec = stack[--stackPos];
++			const Vec4* pRec = arrRec.GetElements() + (rec - recordBase) * SVO_RT_RECORD_TEXELS;
++
++			AABB box(Vec3(pRec[0].x, pRec[0].y, pRec[0].z), Vec3(pRec[1].x, pRec[1].y, pRec[1].z));
++
++			float tEnter = 0.f;
++			if (!RT_TestAABB(org, invDir, box, bestT, tEnter))
++				continue;
++
++			const int child0 = (int)pRec[3].x;
+ 
+-			assert(nTexW <= maxTexSizeXY && nTexH <= maxTexSizeXY);
++			if (child0 > 0)
++			{
++				const int child1 = (int)pRec[3].y;
++				const int axis = (int)pRec[3].w;
++
++				if (stackPos + 2 > kMaxStack)
++				{
++					bIncomplete = true;
++					continue;
++				}
++
++				// child0 holds the lower half along the split axis: push the far child first
++				if (dir[axis] >= 0.f)
++				{
++					stack[stackPos++] = child1;
++					stack[stackPos++] = child0;
++				}
++				else
++				{
++					stack[stackPos++] = child0;
++					stack[stackPos++] = child1;
++				}
++			}
++			else
++			{
++				const int  triCount = (int)pRec[0].w;
++				const Vec4 nodeQb = pRec[2];
++
++				for (int t = 0; t < triCount; t++)
++				{
++					const Vec4* pTri = pRec + (1 + t) * SVO_RT_RECORD_TEXELS;
++
++					Vec3 p[3];
++					for (int v = 0; v < 3; v++)
++					{
++						const uint32 packed = RT_AsUint(pTri[v].x);
++						p[v] = Vec3(RT_UnquantPos(packed & 0xffff, nodeQb.x, nodeQb.w),
++						            RT_UnquantPos((packed >> 16) & 0xffff, nodeQb.y, nodeQb.w),
++						            pTri[v].w);
++					}
+ 
+-			gSvoEnv->m_arrRTPoolTexs.CheckAllocated(maxTexSizeXY * maxTexSizeXY * m_voxTexPoolDimZ);
++					float tHit;
++					if (RT_TestTriangle(org, dir, p[0], p[1], p[2], tHit) && tHit < bestT)
++					{
++						bestT = tHit;
++						bestRec = rec + 1 + t;
++					}
++				}
++			}
++		}
++
++		if (bIncomplete)
++			overflowCount++;
++
++		// (b) brute force over the decoded triangles - must agree exactly
++		float refT = tMax;
++		int   refRec = -1;
++		for (int i = 0; i < decodedTris; i++)
++		{
++			float tHit;
++			if (RT_TestTriangle(org, dir, arrDecodedV[i * 3 + 0], arrDecodedV[i * 3 + 1], arrDecodedV[i * 3 + 2], tHit) && tHit < refT)
++			{
++				refT = tHit;
++				refRec = arrDecodedRec[i];
++			}
++		}
+ 
+-			for (int lineId = 0; lineId < nTexH; lineId++)
+-				memcpy(gSvoEnv->m_arrRTPoolTexs.GetElements() + gSvoEnv->m_arrRTPoolTexs.m_writeOffset + lineId * maxTexSizeXY, pTexRgbOr + lineId * nTexW, nTexW * sizeof(ColorB));
++		if (bestRec != refRec || fabs(bestT - refT) > 1e-4f)
++			mismatchVsDecoded++;
+ 
+-			const int texDataSize = maxTexSizeXY * maxTexSizeXY;
+-			(**ppSysTexId) = (gSvoEnv->m_arrRTPoolTexs.m_writeOffset / texDataSize) + 1;
++		if (refRec >= 0)
++			hitCount++;
+ 
+-			gSvoEnv->m_arrRTPoolTexs.m_writeOffset += texDataSize;
+-			if (gSvoEnv->m_arrRTPoolTexs.m_writeOffset >= texDataSize * m_voxTexPoolDimZ)
+-				gSvoEnv->m_arrRTPoolTexs.m_writeOffset = 0;
++		// (c) brute force over the original soup - difference is the quantisation budget
++		float soupT = tMax;
++		for (int i = 0; i < arrSoup.Count(); i++)
++		{
++			float tHit;
++			if (RT_TestTriangle(org, dir, arrSoup[i].v[0], arrSoup[i].v[1], arrSoup[i].v[2], tHit) && tHit < soupT)
++				soupT = tHit;
+ 		}
++
++		const bool bHitA = (bestT < tMax);
++		const bool bHitB = (soupT < tMax);
++
++		if (bHitA != bHitB)
++			mismatchVsSoup++;
++		else if (bHitA)
++			maxDistError = max(maxDistError, fabs(bestT - soupT));
+ 	}
++
++	PrintMessage("RT self test: soup %d tris, %d records (%d nodes, %d leaves), depth %d, maxLeaf %d, build %.2f ms",
++	             arrSoup.Count(), stats.records, stats.nodes, stats.leaves, stats.maxDepth, stats.maxLeafTris, buildMs);
++	PrintMessage("RT self test: 1000 rays, %d hits, traversal vs decoded soup mismatches = %d (must be 0), stack overflows = %d (must be 0)",
++	             hitCount, mismatchVsDecoded, overflowCount);
++	PrintMessage("RT self test: quantisation - max vertex error %.6f m (qb.w = %.2f m, budget %.6f m), max hit distance error %.6f m, hit/miss disagreements vs original soup = %d",
++	             maxPosError, qb.w, qb.w / 65536.f, maxDistError, mismatchVsSoup);
++
++	if (mismatchVsDecoded == 0 && overflowCount == 0)
++		PrintMessage("RT self test: PASSED");
++	else
++		PrintMessage("RT self test: FAILED");
+ }
+ 
+ ColorB* CVoxelSegment::ApplyHighPass(uint16& nTexW, uint16& nTexH, const ColorB* pTexRgbOr)
+@@ -2974,56 +4117,6 @@ ColorB* CVoxelSegment::ApplyHighPass(uint16& nTexW, uint16& nTexH, const ColorB*
+ 	return pTexRgbHP;
+ }
+ 
+-int CVoxelSegment::StoreIndicesIntoPool(const PodArray<int>& nodeTInd, int& countStored)
+-{
+-	if (nodeTInd.Count())
+-	{
+-		PodArrayRT<ColorB>& rAr = gSvoEnv->m_arrRTPoolInds;
+-
+-		AUTO_MODIFYLOCK(rAr.m_Lock);
+-
+-		const int maxTexSizeXY = GetCVars()->e_svoTI_RT_MaxTexRes;
+-
+-		rAr.CheckAllocated(maxTexSizeXY * maxTexSizeXY * m_voxTexPoolDimZ);
+-
+-		const int numTriIdsToStore = min(nodeTInd.Count(), Cry3DEngineBase::GetCVars()->e_svoTI_RT_MaxTrisPerVoxel);
+-		assert(numTriIdsToStore < 255);
+-
+-		if (rAr.m_writeOffset + numTriIdsToStore > rAr.Count())
+-			rAr.m_writeOffset = 0;
+-
+-		int startOffset = rAr.m_writeOffset;
+-
+-		for (int t = 0; t < numTriIdsToStore; t++)
+-		{
+-			SRayHitTriangleIndexed& tr = m_pTrisInArea->GetAt(nodeTInd[t]);
+-
+-			if (tr.hitObjectType == HIT_OBJ_TYPE_TERRAIN)
+-				continue;
+-
+-			int globId = tr.globalId;
+-
+-			ColorB valOut;
+-			valOut.r = globId & 255;
+-			globId /= 256;
+-			valOut.g = globId & 255;
+-			globId /= 256;
+-			valOut.b = globId & 255;
+-			globId /= 256;
+-			valOut.a = globId & 255;
+-			assert(globId <= 255);
+-
+-			rAr[rAr.m_writeOffset++] = valOut;
+-		}
+-
+-		countStored = rAr.m_writeOffset - startOffset;
+-		return startOffset;
+-	}
+-
+-	countStored = 0;
+-	return 0;
+-}
+-
+ void CVoxelSegment::DebugDrawVoxels()
+ {
+ 	if (Cry3DEngineBase::GetCVars()->e_svoDebug == 6 || Cry3DEngineBase::GetCVars()->e_svoDebug == 3)
+@@ -3541,7 +4634,7 @@ void CVoxelSegment::CheckAllocateSubSets(SVoxBrick& voxData, int elemsNum, bool
+ {
+ 	for (int s = 0; s < SVoxBrick::MAX_NUM; s++)
+ 	{
+-		if (s < GetSubSetsNum() || (s == SVoxBrick::RTRIS && Cry3DEngineBase::GetCVars()->e_svoTI_RT_Active))
++		if (s < GetSubSetsNum())
+ 		{
+ 			CheckAllocateBrick(voxData.pData[s], elemsNum, bClean);
+ 		}
+@@ -3550,7 +4643,9 @@ void CVoxelSegment::CheckAllocateSubSets(SVoxBrick& voxData, int elemsNum, bool
+ 
+ int CVoxelSegment::GetSubSetsNum()
+ {
+-	return GetCVars()->e_svoTI_IntegrationMode ? (Cry3DEngineBase::GetCVars()->e_svoTI_RT_Active ? SVoxBrick::MAX_NUM : SVoxBrick::RTRIS) : 1;
++	// Stays 3 with mesh ray tracing on: the sub set count is written into the .crysvo header and
++	// asserted on load, so allocating a fourth sub set would invalidate every exported SVO file.
++	return GetCVars()->e_svoTI_IntegrationMode ? SVoxBrick::RTRIS : 1;
+ }
+ 
+ #endif
+diff --git a/Code/CryEngine/Cry3DEngine/SVO/VoxelSegment.h b/Code/CryEngine/Cry3DEngine/SVO/VoxelSegment.h
+index f884387a..863d3ece 100644
+--- a/Code/CryEngine/Cry3DEngine/SVO/VoxelSegment.h
++++ b/Code/CryEngine/Cry3DEngine/SVO/VoxelSegment.h
+@@ -20,6 +20,43 @@
+ 	#define SVO_ATLAS_DIM_BRICKS_Z     (CVoxelSegment::m_voxTexPoolDimZ / SVO_VOX_BRICK_MAX_SIZE)
+ 	#define SVO_ROOTLESS_PARENT_SIZE   512.f
+ 	#define SVO_STREAM_QUEUE_MAX_SIZE  12
++
++// Mesh ray tracing record pool (rt decision 02 - the CPU/GPU contract).
++// One record is 4 texels of the R32G32B32A32F record pool; records never cross a texture row.
++	#define SVO_RT_RECORD_TEXELS       4
++	#define SVO_RT_SEG_DYN_MESH        0      // global dynamic mesh BVH (stage 3)
++	#define SVO_RT_SEG_DYN_MATS        30720  // dynamic material records (stage 3)
++	#define SVO_RT_SEG_PARTICLES       32768  // sprite BVH (stage 4)
++	#define SVO_RT_SEG_STATIC          49152  // per SVO cell static blocks - record 0 is never a valid static root
++	#define SVO_RT_CHUNK_GRANULARITY   64     // chunk allocator granularity, in records
++
++//! One triangle as handed to the static BVH builder (world space, already resolved from the soup).
++struct SRTBuildTri
++{
++	Vec3 v[3];         //!< world space positions
++	Vec3 n[3];         //!< per vertex normals, already flipped into the face normal hemisphere
++	Vec2 t[3];         //!< per vertex UVs, already normalised into [0, 16)
++	Vec3 faceNorm;     //!< plane normal
++	int  matRecord;    //!< absolute record index of the material record
++};
++
++//! Statistics of one static BVH build, accumulated over the level in CSvoEnv.
++struct SRTBuildStats
++{
++	void Reset() { ZeroStruct(*this); }
++
++	int   cells;        //!< number of cells with a BVH
++	int   tris;         //!< triangles stored
++	int   nodes;        //!< BVH nodes written
++	int   leaves;       //!< leaf nodes written
++	int   maxDepth;     //!< deepest leaf
++	int   maxLeafTris;  //!< biggest leaf
++	int   records;      //!< records written (nodes + triangles + materials)
++	int   mats;         //!< material records written
++	int   uvClamped;    //!< triangles whose UV span did not fit [0, 16)
++	int   trisSkipped;  //!< triangles rejected (degenerate or out of the quantisation range)
++	float buildMs;      //!< accumulated build time
++};
+ 	
+ typedef uint16 ObjectLayerIdType;
+ const ObjectLayerIdType kInvalidObjectLayerId = 0;
+@@ -217,7 +254,6 @@ public:
+ 	ColorF       ProcessMaterial(const SRayHitTriangleIndexed& tr, const Vec3& voxBox);
+ 	const AABB&  GetBoxOS()   { return m_boxOS; }
+ 	float        GetBoxSize() { return (m_boxOS.max.z - m_boxOS.min.z); }
+-	int          StoreIndicesIntoPool(const PodArray<int>& nodeTInd, int& countStored);
+ 	int32        GetID()      { return m_segmentID; }
+ 	static AABB  GetChildBBox(const AABB& parentBox, int childId);
+ 	static int   GetBrickPoolUsageLoadedMB();
+@@ -232,7 +268,7 @@ public:
+ 	static void  ErrorTerminate(const char* format, ...);
+ 	Vec3i        GetDxtDim();
+ 	void         AddTriangle(const SRayHitTriangleIndexed& ht, int trId, PodArray<int>*& rpNodeTrisXYZ, PodArrayRT<SRayHitVertex>* pVertInArea);
+-	void         CheckStoreTextureInPool(SShaderItem* pShItem, uint16& nTexW, uint16& nTexH, int** ppSysTexId);
++	int          CheckStoreTextureInPool(SShaderItem* pShItem, EEfResTextures texSlot, uint16& nTexW, uint16& nTexH);
+ 	ColorB*      ApplyHighPass(uint16& nTexW, uint16& nTexH, const ColorB* pTexRgbOr);
+ 	void         ComputeDistancesFast_MinDistToSurf(ColorB* pTex3dOptRGBA, ColorB* pTex3dOptNorm, ColorB* pTex3dOptOpac, int threadId);
+ 	void         CropVoxTexture(int threadId, bool bCompSurfDist);
+@@ -247,7 +283,11 @@ public:
+ 	void         RenderMesh(PodArray<SVF_P3F_C4B_T2F>& arrVertsOut);
+ 	void         SetBoxOS(const AABB& box) { m_boxOS = box; }
+ 	void         SetID(int32 nID)          { m_segmentID = nID; }
+-	void         StoreAreaTrisIntoTriPool();
++	void         BuildStaticBVH();
++	void         ReleaseRTChunk();
++	void         FillRTMaterialRecord(const SRayHitTriangleIndexed& tr, Vec4* pOut);
++	static bool  BuildStaticBVHRecords(const PodArray<SRTBuildTri>& arrTris, const Vec4& qb, int recordBase, PodArray<Vec4>& arrOut, PodArray<int>* pRelocFloats, SRTBuildStats& stats);
++	static void  RunRTSelfTest();
+ 	void         StreamAsyncOnComplete(IReadStream* pStream, unsigned nError) override;
+ 	void         StreamOnComplete(IReadStream* pStream, unsigned nError) override;
+ 	void         UnloadStreamableData();
+@@ -325,6 +365,12 @@ public:
+ 	std::unique_ptr<PodArray<SObjInfo>>                  m_areaObjects;
+ 	bool                                                 m_isAreaParent = false;
+ 	bool                                                 m_isLowLodNode = false;
++
++	// static BVH chunk owned by this cell (rt decision 02 2.4); record units, 0 = none
++	int                                                  m_rtChunkStart = 0;
++	int                                                  m_rtChunkCount = 0;
++	int                                                  m_rtRootRecord = 0;
++	PodArray<int>                                        m_rtTexSlices;  //!< 0 based atlas slices referenced by this cell
+ };
+ 
+ inline uint GetCurrPassMainFrameID() { return CVoxelSegment::m_currPassMainFrameID; }
+diff --git a/Code/CryEngine/CryCommon/Cry3DEngine/I3DEngine.h b/Code/CryEngine/CryCommon/Cry3DEngine/I3DEngine.h
+index ac86e6d4..0f787161 100644
+--- a/Code/CryEngine/CryCommon/Cry3DEngine/I3DEngine.h
++++ b/Code/CryEngine/CryCommon/Cry3DEngine/I3DEngine.h
+@@ -2295,6 +2295,12 @@ struct I3DEngine : public IProcess
+ 		int                  nTexDimXY;
+ 		int                  nTexDimZ;
+ 		int                  nBrickSize;
++
++		// mesh ray tracing pool dimensions (rt decision 02: SVO_RTPoolInfo = (W, D, A, Zt))
++		int                  rtPoolXY;   //!< XY size of pTexTriA (records pool)
++		int                  rtPoolZ;    //!< Z size of pTexTriA
++		int                  rtTexRes;   //!< XY size of pTexTexA (material atlas)
++		int                  rtTexPoolZ; //!< Z size of pTexTexA
+ 		bool                 bSvoReady;
+ 		bool                 bSvoFreeze;
+ 		Sphere               helperInfo;
+-- 
+2.47.1.windows.1
+

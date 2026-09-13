@@ -1,0 +1,1099 @@
+From 03cd8530099a172f17f2773845c866644fefebd4 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Sun, 13 Sep 2026 18:18:12 +0800
+Subject: [PATCH 176/181] feat: SVOTI traces real triangles again, through a
+ per-cell static BVH
+
+Stage 1A of the rt topic (GPU side). The per-voxel triangle-list path CE
+shipped (RayTraceMesh + geomPool_TInd + brickPool_RTri) is retired and
+replaced by a stack-based BVH walk rooted per 32 m SVO cell.
+
+New Engine/Shaders/HWScripts/CryFX/CommonSVO_RT.cfi:
+- SBestHit / SRTInfo and the file-scope `static SRTInfo g_rtInfo`, so no
+  existing CE tracing function changes its signature.
+- Record addressing driven entirely by SVO_RTPoolInfo (W, D, A, Zt): no
+  hard-coded 256 / 512 and no >>8 / >>16 shifts, which silently corrupt any
+  pool that is not exactly 256 wide.
+- Packing helpers: PackU16x2/UnpackU16x2, ExtractPosXY, ExtractDir,
+  ExtractTC16 (16-bit UV fields instead of Neo's 12-bit), PackTC16,
+  ExtractUint2, PackRGB/UnpackRGB.
+- RT_RayTriangleIntersect: Moeller-Trumbore with a determinant epsilon
+  relative to the edge lengths instead of a scale-dependent absolute one.
+- RT_TraverseTris: 20-slot stack; the near child is pushed last so it pops
+  first (child0 holds the lower half along the split axis); a stack overflow
+  sets best.incomplete and KEEPS the hit instead of deleting it.
+- RT_ProcessBestHit: material atlas at t28, atlas slice arithmetic from
+  SVO_RTPoolInfo, emittance scaled by the shared MAT_EMISSIVE_UNIT_SCALE so
+  a reflected emissive surface matches the surface itself.
+- RT_SampleVoxelIrradiance and RT_GetDebugColor for the stage-1 provisional
+  colour and the five debug views.
+- The sprite branch is kept but unreachable until particles in stage 4.
+
+CommonSVO.cfi:
+- geomPool_TTex moves from t18 to t28 (t18 becomes Fwd_TiledLightsShadeInfo
+  when the forward stack arrives in stage 2); geomPool_TInd and
+  brickPool_RTri declarations go with RayTraceMesh.
+- ConeTraceTree gains, under %_RT_SAMPLE6, a static-BVH branch that replaces
+  the ConeTraceBrick call for cells at VOX_MAX_NODE_SIZE holding a root, and
+  descends to that size regardless of LOD distance for triangle rays only.
+- Under %_RT_QUALITY: the cell walk no longer stops at the first hit, it
+  stops when the next cell can no longer beat the nearest hit; the dynamic
+  and particle roots are traversed afterwards sharing the same SBestHit.
+
+Total_Illumination.cfx ConeTracePS:
+- triangle rays get VOX_MAX_RT_DIST_RAY as their length budget;
+- a triangle hit is shaded provisionally as hitAlbedo * voxelRadiance /
+  voxelAlbedo until the ShadePass of stage 2 exists;
+- an incomplete traversal falls back to the voxel cone result;
+- %_RT_PARTICLE_SHADOW selects the debug views.
+
+Every changed hunk in the two existing shader files is inside
+%_RT_QUALITY / %_RT_SAMPLE6 / %_RT_PARTICLE_SHADOW, or is the retirement of
+RayTraceMesh and its now unreferenced resource declarations.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SCUvWGLCsqzm3VNMzp4uiS
+---
+ Engine/Shaders/HWScripts/CryFX/CommonSVO.cfi  | 204 +++--
+ .../Shaders/HWScripts/CryFX/CommonSVO_RT.cfi  | 696 ++++++++++++++++++
+ .../HWScripts/CryFX/Total_Illumination.cfx    |  38 +-
+ 3 files changed, 816 insertions(+), 122 deletions(-)
+ create mode 100644 Engine/Shaders/HWScripts/CryFX/CommonSVO_RT.cfi
+
+diff --git a/Engine/Shaders/HWScripts/CryFX/CommonSVO.cfi b/Engine/Shaders/HWScripts/CryFX/CommonSVO.cfi
+index 5f4717ef..87f0a4c5 100644
+--- a/Engine/Shaders/HWScripts/CryFX/CommonSVO.cfi
++++ b/Engine/Shaders/HWScripts/CryFX/CommonSVO.cfi
+@@ -157,15 +157,16 @@ float3 DecodeHDR(float4 Color)
+ 
+ Texture2D sceneDepth: register (t4);
+ 
+-Texture3D geomPool_TTex: register (t18);
++// t18 is Fwd_TiledLightsShadeInfo once ForwardShading.cfi reaches this shader (stage 2),
++// so the material texture atlas lives at t28 (decision 02 section 2.1). Declared
++// unconditionally: a resource declaration inside a %_RT_ #if silently kills the whole .cfx.
++Texture3D geomPool_TTex: register (t28);
+ Texture3D geomPool_Tris: register (t9);
+-Texture3D geomPool_TInd: register (t13);
+ 
+ Texture3D brickPool_Tree: register (t0);
+ Texture3D brickPool_Rgbs: register (t1);
+ Texture3D brickPool_Norm: register (t2);
+ Texture3D brickPool_Opac: register (t3);
+-Texture3D brickPool_RTri: register (t17);
+ Texture3D brickPool_Albe: register (t25);
+ 
+ TextureCube globalSpecCM: register (t6);
+@@ -480,95 +481,10 @@ float2 ExtractTC(float fVal)
+ 	return tc;
+ }
+ 
+-void RayTraceMesh(const float4 arrGoodTC, inout Ray rOrig, inout float4 vRgbOut, inout float3 vHitNorm, inout float fNearestHitDist)
+-{
+-	// find nearest hit triangle
+-
+-	// get first triangle id and tris count
+-	const float4 vValII = tex3DlodPC(brickPool_RTri, float4(Tris_SnapPoolTC(arrGoodTC.xyz), 0));
+-	const int nFirstTriII = int(vValII.r * 255) + int(vValII.g * 255) * 256 + int(vValII.b * 255) * 256 * 256;
+-	const int nTriCount = int(vValII.a * 255);
+-
+-	const int maxSizeXY = 512; // e_svoTI_RT_MaxTexRes
+-	const int dwMaskXY = maxSizeXY - 1;
+-	const int maxSizeZ = int(VOX_TEX_POOL_DIM.z);
+-	const int dwMaskZ = maxSizeZ - 1;
+-	const float4 vScaleTC = rcp(float4(maxSizeXY, maxSizeXY, maxSizeZ, 1));
+-
+-	int3 nTC_Best = 0;
+-	float3 vBarTC_Best = 0;
+-	float4 vCenterRGB_Best = 0;
+-
+-	for (int tii = 0; tii < nTriCount; tii++)
+-	{
+-		// get triangle index data location TC
+-		const int nTCII = nFirstTriII + tii;
+-		const int3 vTCII = int3(nTCII & dwMaskXY, (nTCII / maxSizeXY) & dwMaskXY, (nTCII / maxSizeXY / maxSizeXY) & dwMaskZ);
+-
+-		// get triangle id
+-		const float4 vVal = tex3DlodPC(geomPool_TInd, float4(vTCII.x, vTCII.y, vTCII.z, 0) * vScaleTC);
+-		const int triDataSize = 8; // number of Vec4 elements per triangle
+-		const int triDataOffset = (int(vVal.r * 255) + int(vVal.g * 255) * 256 + int(vVal.b * 255) * 256 * 256 + int(vVal.a * 255) * 256 * 256 * 256) * triDataSize;
+-
+-		// convert triangle id into data location TC
+-		const int3 nTC = int3(triDataOffset & dwMaskXY, (triDataOffset / maxSizeXY) & dwMaskXY, (triDataOffset / maxSizeXY / maxSizeXY) & dwMaskZ);
+-
+-		// load triangle vertices
+-		const float4 v0 = tex3DlodPC(geomPool_Tris, float4(nTC.x + 0, nTC.y, nTC.z, 0) * vScaleTC);
+-		const float4 v1 = tex3DlodPC(geomPool_Tris, float4(nTC.x + 1, nTC.y, nTC.z, 0) * vScaleTC);
+-		const float4 v2 = tex3DlodPC(geomPool_Tris, float4(nTC.x + 2, nTC.y, nTC.z, 0) * vScaleTC);
+-
+-		// intersect
+-		float3 vHitPoint = 0;
+-		if (Ray_Triangle(rOrig, v1, v0, v2, vHitPoint))
+-		{
+-			const float fHitDist = length(vHitPoint.xyz - rOrig.startpoint);
+-
+-			// find closest intersection
+-			if (fHitDist < fNearestHitDist)
+-			{
+-				// load vertices TC
+-				const float4 vInf = tex3DlodPC(geomPool_Tris, float4(nTC.x + 3, nTC.y, nTC.z, 0) * vScaleTC);
+-
+-				// calculate barycentric TC
+-				float3 vBarTC;
+-				GetBarycentricTC(v0, v1, v2, vBarTC[0], vBarTC[1], vBarTC[2], vHitPoint);
+-
+-				// get texture coordinates
+-				const float2 t0 = ExtractTC(v0.w);
+-				const float2 t1 = ExtractTC(v1.w);
+-				const float2 t2 = ExtractTC(v2.w);
+-				const float2 vPosTC = t0 * vBarTC[0] + t1 * vBarTC[1] + t2 * vBarTC[2];
+-
+-				// texture id
+-				const int textureId = (int)(vInf.x) - 1;
+-
+-				// read RGB texture
+-				const float4 vCenterRGB = tex3DlodLC(geomPool_TTex, float4(frac(vPosTC.xy) * vInf.y, float(textureId) / float(maxSizeZ) + .5f / float(maxSizeZ), 0));
+-
+-				if (vCenterRGB.a)
+-				{
+-					vCenterRGB_Best = vCenterRGB;
+-					nTC_Best = nTC;
+-					vBarTC_Best = vBarTC;
+-					fNearestHitDist = fHitDist;
+-				}
+-			}
+-		}
+-	}
+-
+-	if (vCenterRGB_Best.a)
+-	{
+-		const float4 n0 = tex3DlodPC(geomPool_Tris, float4(nTC_Best.x + 4, nTC_Best.y, nTC_Best.z, 0) * vScaleTC);
+-		const float4 n1 = tex3DlodPC(geomPool_Tris, float4(nTC_Best.x + 5, nTC_Best.y, nTC_Best.z, 0) * vScaleTC);
+-		const float4 n2 = tex3DlodPC(geomPool_Tris, float4(nTC_Best.x + 6, nTC_Best.y, nTC_Best.z, 0) * vScaleTC);
+-		vHitNorm = n0 * vBarTC_Best[0] + n1 * vBarTC_Best[1] + n2 * vBarTC_Best[2];
+-
+-		const float4 matColor = tex3DlodPC(geomPool_Tris, float4(nTC_Best.x + 7, nTC_Best.y, nTC_Best.z, 0) * vScaleTC);
+-		vRgbOut.xyz = vCenterRGB_Best * matColor;
+-		vRgbOut.a = 1;
+-	}
+-}
++// Software triangle ray tracing (stage 1: static per-cell BVH). Replaces the retired
++// per-voxel RayTraceMesh path: every function it declares is only called from code
++// inside #if %_RT_QUALITY / %_RT_SAMPLE6 / %_RT_PARTICLE_SHADOW.
++#include "CommonSVO_RT.cfi"
+ 
+ bool GetLightTI(int nLightId, out float4 vPosR, out float4 vDirF, out float4 vCol)
+ {
+@@ -974,34 +890,9 @@ bool ConeTraceBrick(const float3 vRayStartPos, inout Ray r, const float _fDistan
+ #endif
+ 
+ #if %_RT_QUALITY
+-				if (fMultTriRT > 0 && vRGBD.w)
+-				{
+-					float3 vHitNorm = 0;
+-					float4 vRgbOutRT = 0;
+-					RayTraceMesh(float4(vCurTC.xyz, vRGBD.w), rOrig, vRgbOutRT, vHitNorm, fNearestHitDist);
+-
+-					if (vRgbOutRT.a)
+-					{
+-						// read RGB (complete lit voxel color)
+-						float4 vRGBD = tex3DlodLC(brickPool_Rgbs, float4(vCurTC.xyz, 0));
+-						vRGBD /= max(0.1f, vNORA.a);
+-
+-						if (nDebugMode != 2)
+-							vRGBD.xyz = DecodeHDR(vRGBD);
+-						vRGBD.w = 0;
+-
+-						// read voxel Albedo
+-						float4 vAlbe = tex3DlodLC(brickPool_Albe, float4(vCurTC.xyz, 0));
+-						vAlbe = pow(vAlbe, .75);
+-						vAlbe /= max(0.1f, vNORA.a);
+-
+-						// replace voxel albedo by RT albedo
+-						vRgbOut.xyz = vRGBD.xyz / max(vAlbe, .01f) * vRgbOutRT.xyz;
+-						vRgbOut.w = 1;
+-						break;
+-					}
+-				}
+-
++				// The per-voxel triangle list path (RayTraceMesh + geomPool_TInd + brickPool_RTri)
++				// is retired by decision 01/02: triangle hits now come from the per-cell static BVH
++				// walked in ConeTraceTree, so a voxel sample no longer traces triangles.
+ #endif
+ 
+ #if %_RT_LIGHT_TEX_PROJ
+@@ -1128,6 +1019,13 @@ float4 ConeTraceTree(Ray rayForTree, const float fLodRatio, out float4 vPos0, ou
+ 
+ 	Ray rayForSS = rayForTree;
+ 
++#if %_RT_QUALITY
++	// The triangle traversal always uses the unadvanced ray: every hit distance in
++	// g_rtInfo is measured from here. (RT pixels pass vSurfNorm == 0, so the
++	// surface-normal offset below never moves this ray - see ConeTracePS.)
++	const Ray rOrigRT = rayForTree;
++#endif
++
+ 	// define root node
+ 	SNodeInfo rootNode;
+ 	rootNode.nId = 0;
+@@ -1270,6 +1168,14 @@ float4 ConeTraceTree(Ray rayForTree, const float fLodRatio, out float4 vPos0, ou
+ 				// process LOD
+ 				float fLodTransition = GetLodTransition(fDistanceIn, fDistance, (curNode.vMax.x - curNode.vMin.x), fLodRatio);
+ 
++#if %_RT_SAMPLE6
++				// Only cells at exactly VOX_MAX_NODE_SIZE own a static BVH, so a triangle-RT ray
++				// must descend to that size regardless of distance (Neo :1641). Pixels that are
++				// not tracing triangles keep CE's distance-driven LOD.
++				if (fMultTriRT > 0)
++					fLodTransition = 1000000.f;
++#endif
++
+ 				if ((fLodTransition >= 1 && (curNode.vMax.x - curNode.vMin.x) <= VOX_MAX_NODE_SIZE) || !bHasChilds)
+ 				{
+ 					// stop tree traversal and trace this node brick
+@@ -1310,6 +1216,39 @@ float4 ConeTraceTree(Ray rayForTree, const float fLodRatio, out float4 vPos0, ou
+ 			   bGoToNextNode = ConeTraceBrick_Terrain(vRayStartPos, rayForTree, _fDistanceIn, fDistance, fDistanceMax,
+ 			   vPos0, vNormal, curNode.vTC, vRgbOut, fMaxAlpha, fLodRatio, fAlphaRefMin, fAlphaRefMax, nPredictionMode, fMultTriRT, (nTraceMode == SVO_TRACE_MODE_AIR), bApplyGlobalDensity, bSpecular, fIsoValPrev);
+ 			   else*/
++#if %_RT_SAMPLE6
++			bool bStaticBvhCell = false;
++
++			if (fMultTriRT > 0)
++			{
++				// The cell's static BVH root lives in the tree texture's voxAreaMax.w
++				// (decision 02 section 2.6); 0 means "no BVH here, cone trace this cell".
++				float4 voxAreaMinRT, voxAreaMaxRT;
++				ReadNodeCropBox(curNode.vTC, voxAreaMinRT, voxAreaMaxRT);
++				const int nStaticRoot = (int)voxAreaMaxRT.w;
++
++				if (nStaticRoot >= VOX_RT_POOL_OFFSET_STATIC && (curNode.vMax.x - curNode.vMin.x) == VOX_MAX_NODE_SIZE)
++				{
++					const float fPrevHitDist = g_rtInfo.best.nearestHitDist;
++
++					RT_TraverseTris(0, rOrigRT, g_rtInfo.best, g_rtInfo.stippleAlphaRef, VOX_RT_PRIM_TYPE_STATIC, nStaticRoot);
++
++					// remember which cell owns the current best hit, so the stage-1 provisional
++					// colour can sample the voxel irradiance there (decision 06 section 6.5)
++					if (g_rtInfo.best.nearestHitDist < fPrevHitDist)
++					{
++						g_rtInfo.cellTC = curNode.vTC;
++						g_rtInfo.cellMin = voxAreaMinRT;
++						g_rtInfo.cellMax = voxAreaMaxRT;
++						g_rtInfo.cellValid = 1;
++					}
++
++					bStaticBvhCell = true;
++				}
++			}
++
++			if (!bStaticBvhCell)
++#endif
+ 			bGoToNextNode = ConeTraceBrick(vRayStartPos, rayForTree, _fDistanceIn, fDistance, fDistanceMax,
+ 			                               vPos0, vNormal, curNode.vTC, vRgbOut, fMaxAlpha, fLodRatio, fAlphaRefMin, fAlphaRefMax, nPredictionMode, fMultTriRT, (nTraceMode == SVO_TRACE_MODE_AIR), bApplyGlobalDensity, bSpecular, bUseLighting,
+ 			                               vBestHitPosOpa, nDebugMode, vSurfNormOffset, fStepSize, fNearestHitDist);
+@@ -1333,11 +1272,36 @@ float4 ConeTraceTree(Ray rayForTree, const float fLodRatio, out float4 vPos0, ou
+ 			}
+ 		}
+ 
++#if %_RT_QUALITY
++		// R02 / decision 03 section 3.5: do NOT break on the first triangle hit. A static hit is
++		// not clipped to the cell that found it, so the walk continues while the next cell can
++		// still produce a nearer one (fDistance is the ray parameter at that cell's entry).
++		if (fMultTriRT > 0 && g_rtInfo.best.vAlb.a && fDistance >= g_rtInfo.best.nearestHitDist)
++			break;
++#endif
++
+ 		// detect if ray left the volume - no more descents needed
+ 		if (fDistance >= fDistanceMax || rayForTree.startpoint.z < 0 /*|| rayForTree.startpoint.z>fRootMaxZ*/)
+ 			break;
+ 	}
+ 
++#if %_RT_QUALITY
++	if (fMultTriRT > 0)
++	{
++		// Dynamic meshes and particles share `best` with the static walk, so a nearer dynamic hit
++		// still wins. Both roots address empty records until stages 3/4 fill them: triCount 0 and
++		// a degenerate AABB cost one texel fetch and one slab test each.
++		RT_TraverseTris(0, rOrigRT, g_rtInfo.best, g_rtInfo.stippleAlphaRef, VOX_RT_PRIM_TYPE_DYNAMIC, VOX_RT_POOL_OFFSET_DYN_MESH);
++
++		if (!g_rtInfo.best.onlyOcclusion)
++		{
++			RT_TraverseTris(0, rOrigRT, g_rtInfo.best, g_rtInfo.stippleAlphaRef, VOX_RT_PRIM_TYPE_PARTICLE, VOX_RT_POOL_OFFSET_PARTICLES);
++
++			RT_ProcessBestHit(rOrigRT, g_rtInfo, 0);
++		}
++	}
++#endif
++
+ #if %_PS && %_RT_POINT_LIGHT
+ 	for (int p = 0; p < BEST_POINTS_NUM; p++)
+ 	{
+diff --git a/Engine/Shaders/HWScripts/CryFX/CommonSVO_RT.cfi b/Engine/Shaders/HWScripts/CryFX/CommonSVO_RT.cfi
+new file mode 100644
+index 00000000..177ab3c8
+--- /dev/null
++++ b/Engine/Shaders/HWScripts/CryFX/CommonSVO_RT.cfi
+@@ -0,0 +1,696 @@
++// Copyright 2013-2021 Crytek GmbH / Crytek Group. All rights reserved.
++// ReC Sandbox: software triangle ray tracing for SVOTI (stage 1 - static per-cell BVH).
++
++///////////////////////////////////////////////////////////////////////////////////
++//
++// This file is included unconditionally from CommonSVO.cfi, but nothing in it is
++// *called* outside a gated block: every use site lives inside
++//   %_RT_QUALITY          mesh ray tracing
++//   %_RT_SAMPLE6          static per-cell BVH
++//   %_RT_PARTICLE_SHADOW  RT debug views
++// so with those flags off the compiled shader is unchanged (unreferenced globals,
++// structs and functions are eliminated by the compiler).
++//
++// The record layout, the addressing and the pool segmentation implemented here are
++// the normative contract in scene-notes/rt/decisions/02-rt-pool-contract.md.
++// The CPU producer writes the exact inverses of the packing helpers below.
++//
++// Addressing rule (decision 02 section 2.2): a record is 4 texels,
++//   t = record * 4;  nTC = int3( t % W, (t / W) % W, (t / (W*W)) % D )
++// with W and D taken from SVO_RTPoolInfo. There are no hard-coded 256 / 512 values
++// and no shifts anywhere in this file (Neo's >>8 / >>16 silently corrupts any pool
++// that is not exactly 256 wide - research/03 section 7.5).
++//
++///////////////////////////////////////////////////////////////////////////////////
++
++// (W, D, A, Zt) = tri pool XY, tri pool Z, atlas XY, atlas Z. Set by
++// CSvoRenderer::SetupCommonConstants only when e_svoTI_RT_Active.
++float4 SVO_RTPoolInfo;
++
++// (maxBounces, glossScale, mixWithProbes, debugMode). NOTE: decision 02 section 2.1
++// reserved .w for refractionScale; PLAN stage 1A item 3 re-assigns it to
++// e_svoTI_RT_Debug because refraction is parked until stage 4. Recorded in the
++// stage-1A report.
++float4 SVO_RTParams0;
++
++#define VOX_RT_TRI_DATA_SIZE               4
++
++// Pool segmentation in record units (decision 02 section 2.3).
++#define VOX_RT_POOL_OFFSET_DYN_MESH        (0)
++#define VOX_RT_POOL_OFFSET_DYN_MATS        (30 * 1024)
++#define VOX_RT_POOL_OFFSET_PARTICLES       (32 * 1024)
++#define VOX_RT_POOL_OFFSET_STATIC          (48 * 1024)
++
++#define VOX_RT_PRIM_TYPE_STATIC            0
++#define VOX_RT_PRIM_TYPE_DYNAMIC           1
++#define VOX_RT_PRIM_TYPE_PARTICLE          2
++
++// Material shading tags, material record texel +3 .z (decision 02 section 2.5).
++#define VOX_RT_SHADING_DEFAULT             0.0
++#define VOX_RT_SHADING_VEG_LEAVES          0.25
++#define VOX_RT_SHADING_MULTI_BOUNCE        0.5
++
++// Traversal stack depth: e_svoTI_RT_MaxDepth (18) + 2.
++#define VOX_RT_MAX_CALL_STACK              20
++
++#define VOX_RT_MAX_BOUNCES                 (SVO_RTParams0.x)
++#define VOX_RT_GLOSS_SCALE                 (SVO_RTParams0.y)
++#define VOX_RT_MIX_WITH_PROBES             (SVO_RTParams0.z)
++#define VOX_RT_DEBUG_MODE                  (SVO_RTParams0.w)
++
++///////////////////////////////////////////////////////////////////////////////////
++// Structures
++///////////////////////////////////////////////////////////////////////////////////
++
++struct SBestHit
++{
++	int4   nMatDataTC;     // .xyz = material record texel coord, .w = winning triangle record index
++	float3 vBTC;           // barycentric (w, u, v) of the winning hit
++	float4 vAlb;           // .rgb = sampled albedo texel, .a = hit flag
++	float2 vPosTC;         // atlas UV of the hit, reused for the normal / spec / emissive fetches
++	float  nearestHitDist; // includes fDistanceIn
++	float  camDistance;    // camera to the *primary* surface, for the normal-map distance fade
++	float3 faceNorm;       // geometric face normal, only for VOX_RT_SHADING_MULTI_BOUNCE
++	bool   onlyOcclusion;
++	int    incomplete;     // R02: set on stack overflow; the hit is kept, the caller decides
++	int    testCounter;    // debug only, incremented under %_RT_PARTICLE_SHADOW
++};
++
++struct SRTInfo
++{
++	float3   vFocus;              // ideal direction (normal for diffuse, reflect for specular)
++	float4   normal_reflectance;  // .xyz world normal (length carries emittance), .w PackRGB(reflectance)
++	float4   albedo_smoothness;
++	float4   hitpos;              // .xyz world, .w = 1 when this pixel carries G-data
++	float4   raydir;              // .xyz direction, .w hit distance
++	float    stippleAlphaRef;
++
++	// Stage-1 provisional colour (decision 06 section 6.5): the SVO cell that produced the
++	// current best hit, so the voxel irradiance can be sampled at the hit point.
++	float3   cellTC;
++	float4   cellMin;
++	float4   cellMax;
++	int      cellValid;
++
++	SBestHit best;
++};
++
++// Decision 01: shared RT state is a file-scope static, never a new parameter on the six
++// existing CE tracing functions - zero signature changes means zero text change off-flag.
++static SRTInfo g_rtInfo;
++
++///////////////////////////////////////////////////////////////////////////////////
++// Addressing
++///////////////////////////////////////////////////////////////////////////////////
++
++bool RT_IsPoolValid()
++{
++	return SVO_RTPoolInfo.x >= 4.f && SVO_RTPoolInfo.y >= 1.f;
++}
++
++// record index -> texel coordinate of its first texel (decision 02 section 2.2)
++int3 RT_RecordTC(const int nRecord)
++{
++	const uint W = (uint)SVO_RTPoolInfo.x;
++	const uint D = (uint)SVO_RTPoolInfo.y;
++	const uint t = (uint)nRecord * VOX_RT_TRI_DATA_SIZE;
++
++	return int3(t % W, (t / W) % W, (t / (W * W)) % D);
++}
++
++// atlas slice centre for texture slot k (decision 02 section 2.7)
++float RT_AtlasSliceW(const int nSlot)
++{
++	const float fInvZt = rcp(max(SVO_RTPoolInfo.w, 1.f));
++	return (float(nSlot) + 0.5f) * fInvZt;
++}
++
++float4 RT_SampleAtlas(const float2 vTC, const int nSlot)
++{
++	return tex3DlodLC(geomPool_TTex, float3(vTC, RT_AtlasSliceW(nSlot)));
++}
++
++///////////////////////////////////////////////////////////////////////////////////
++// Packing helpers (decision 02 section 2.5). The CPU producer writes the exact
++// inverses of these; PackU16x2 / PackTC16 are here as the readable definition of
++// what the producer must emit.
++///////////////////////////////////////////////////////////////////////////////////
++
++float PackU16x2(const uint a, const uint b)
++{
++	return asfloat((a & 0xffff) | ((b & 0xffff) << 16));
++}
++
++uint2 UnpackU16x2(const float fVal)
++{
++	const uint n = asuint(fVal);
++	return uint2(n & 0xffff, (n >> 16) & 0xffff);
++}
++
++// vertex XY, quantised against the per-cell quantisation bounds qb = (cx, cy, 0, size)
++float2 ExtractPosXY(const float fVal, const float4 qb)
++{
++	const uint2 q = UnpackU16x2(fVal);
++	return ((float2(q) * (1.f / 65536.f) - 0.5f) * qb.w) + qb.xy;
++}
++
++// tangent / bitangent: 3 x 8 bit + sign in the float's sign
++float4 ExtractDir(const float fVal)
++{
++	uint n = (uint)abs(fVal);
++
++	float3 dir;
++	dir.x = n & 255; n /= 256;
++	dir.y = n & 255; n /= 256;
++	dir.z = n & 255;
++	dir = (dir * (1.f / 255.f) - 0.5f) * 2.f;
++
++	return float4(normalize(dir), (fVal > 0) ? 1.f : -1.f);
++}
++
++// 2 x 16 bit texture coordinate in [0, 16). Replaces Neo's 12-bit ExtractTC:
++// 16/65535 = 0.24 mtexel at 256 vs 2 texels for 12 bit (decision 02 section 2.5).
++// Note this is a bit reinterpret (PackU16x2), not a value cast like CE's ExtractTC.
++float2 ExtractTC16(const float fVal)
++{
++	const uint2 q = UnpackU16x2(fVal);
++	return float2(q) * (16.f / 65535.f);
++}
++
++float PackTC16(const float u, const float v)
++{
++	return PackU16x2((uint)(clamp(u, 0.f, 16.f) * (65535.f / 16.f) + 0.5f),
++	                 (uint)(clamp(v, 0.f, 16.f) * (65535.f / 16.f) + 0.5f));
++}
++
++// base-4096 pair, high field first - texture slot pairs in the material record
++uint2 ExtractUint2(const float fVal)
++{
++	uint n = (uint)fVal;
++
++	uint2 tc;
++	tc.y = n & 4095; n /= 4096;
++	tc.x = n & 4095;
++
++	return tc;
++}
++
++#define RT_RGB_RANGE 8
++
++float3 UnpackRGB(const float fVal)
++{
++	uint n = (uint)abs(fVal);
++
++	float3 col;
++	col.x = n % RT_RGB_RANGE; n /= RT_RGB_RANGE;
++	col.y = n % RT_RGB_RANGE; n /= RT_RGB_RANGE;
++	col.z = n % RT_RGB_RANGE;
++
++	return col * (1.f / (RT_RGB_RANGE - 1));
++}
++
++float PackRGB(const float3 col)
++{
++	int3 colI = clamp((int3)(col * (RT_RGB_RANGE - 1) + 0.5f), 0, RT_RGB_RANGE - 1);
++	return (float)(colI.x + colI.y * RT_RGB_RANGE + colI.z * RT_RGB_RANGE * RT_RGB_RANGE);
++}
++
++///////////////////////////////////////////////////////////////////////////////////
++// Ray length
++///////////////////////////////////////////////////////////////////////////////////
++
++// Off-flag this must return exactly CE's own cone length, or every ray in the native
++// path changes (research/03 section 7.2 calls this the highest-risk edit for bit identity).
++float GetMaxRayDistance()
++{
++#if %_RT_QUALITY
++	return IsDiffuseMode() ? VOX_CONE_MAX_LEN : VOX_MAX_RT_DIST_RAY;
++#else
++	return VOX_CONE_MAX_LEN;
++#endif
++}
++
++// 2x2 screen stipple used as a stochastic transparency threshold (Neo's, research/03 section 3.7)
++float RT_GetStippleAlphaRef(const int2 nXY)
++{
++	return ((nXY.x & 1) ? 0.5f : 0.f) + ((nXY.y & 1) ? 0.25f : 0.f) + 0.125f;
++}
++
++void RT_ResetInfo(const float3 vFocus, const float fMaxDist, const float fCamDist,
++                  const float fStippleAlphaRef, const bool bOnlyOcclusion)
++{
++	g_rtInfo.vFocus = vFocus;
++	g_rtInfo.normal_reflectance = 0;
++	g_rtInfo.albedo_smoothness = 0;
++	g_rtInfo.hitpos = 0;
++	g_rtInfo.raydir = 0;
++	g_rtInfo.stippleAlphaRef = fStippleAlphaRef;
++
++	g_rtInfo.cellTC = 0;
++	g_rtInfo.cellMin = 0;
++	g_rtInfo.cellMax = 0;
++	g_rtInfo.cellValid = 0;
++
++	g_rtInfo.best.nMatDataTC = 0;
++	g_rtInfo.best.vBTC = 0;
++	g_rtInfo.best.vAlb = 0;
++	g_rtInfo.best.vPosTC = 0;
++	g_rtInfo.best.nearestHitDist = fMaxDist;
++	g_rtInfo.best.camDistance = fCamDist;
++	g_rtInfo.best.faceNorm = 0;
++	g_rtInfo.best.onlyOcclusion = bOnlyOcclusion;
++	g_rtInfo.best.incomplete = 0;
++	g_rtInfo.best.testCounter = 0;
++}
++
++///////////////////////////////////////////////////////////////////////////////////
++// Intersection
++///////////////////////////////////////////////////////////////////////////////////
++
++// Moeller-Trumbore. Decision 03 section 3.6: the determinant test is *relative* to the
++// edge lengths - Neo's fixed abs(det) < 1e-5 rejects legitimate small triangles and
++// accepts degenerate large ones, both scale dependent.
++// (Stage 4 replaces this with the Woop/Benthin/Wald watertight test, R01.)
++bool RT_RayTriangleIntersect(const float3 orig, const float3 dir,
++                             const float3 v0, const float3 v1, const float3 v2,
++                             out float t, out float w, out float u, out float v, out bool isBackSide)
++{
++	t = 0; w = 0; u = 0; v = 0; isBackSide = false;
++
++	const float3 e1 = v1 - v0;
++	const float3 e2 = v2 - v0;
++	const float3 pvec = cross(dir, e2);
++	const float det = dot(e1, pvec);
++
++	if (abs(det) < 1e-7f * length(e1) * length(e2))
++		return false;
++
++	const float invDet = rcp(det);
++
++	const float3 tvec = orig - v0;
++	u = dot(tvec, pvec) * invDet;
++	if (u < 0.f || u > 1.f)
++		return false;
++
++	const float3 qvec = cross(tvec, e1);
++	v = dot(dir, qvec) * invDet;
++	if (v < 0.f || (u + v) > 1.f)
++		return false;
++
++	t = dot(e2, qvec) * invDet;
++	w = 1.f - u - v;
++	isBackSide = (det < 0.f);
++
++	return true;
++}
++
++///////////////////////////////////////////////////////////////////////////////////
++// BVH traversal
++///////////////////////////////////////////////////////////////////////////////////
++
++// Walks one BVH rooted at nRootRecord and keeps the nearest accepted hit in `best`.
++// IntersectRayAABB is CE's branch form on purpose: Neo's invRaydir slab test evaluates
++// 0 * inf on an axis-parallel ray (research/03 section 7.6, R01).
++void RT_TraverseTris(const float fDistanceIn, const Ray r, inout SBestHit best,
++                     const float stippleAlphaRef, const int objectType, const int nRootRecord)
++{
++	// record 0 is the dynamic-mesh root, so only a negative root is "no BVH"
++	if (!RT_IsPoolValid() || nRootRecord < 0)
++		return;
++
++	const bool  bSprite = (objectType == VOX_RT_PRIM_TYPE_PARTICLE);
++	const float maxDistSprite = best.nearestHitDist;
++
++	const float fInvAtlasRes = rcp(max(SVO_RTPoolInfo.z, 1.f));
++
++	int arrCallStack[VOX_RT_MAX_CALL_STACK];
++	int stackPos = -1;
++
++	arrCallStack[++stackPos] = nRootRecord;
++
++	while (stackPos >= 0)
++	{
++		const int nNodeRecord = arrCallStack[stackPos--];
++
++		const int3 nTC = RT_RecordTC(nNodeRecord);
++
++		const float4 n0 = LoadTexel(geomPool_Tris, uint3(nTC.x + 0, nTC.y, nTC.z));
++		const float4 n1 = LoadTexel(geomPool_Tris, uint3(nTC.x + 1, nTC.y, nTC.z));
++
++		const int nTriCount = (int)n0.w;
++
++		// intersect the node AABB; prune against the nearest hit so far
++		float tmin = 0, tmax = 0;
++		if (!IntersectRayAABB(r, n0.xyz, n1.xyz, tmin, tmax) ||
++		    (tmax + fDistanceIn) < 0.f ||
++		    (!bSprite && (tmin + fDistanceIn) > best.nearestHitDist) ||
++		    (bSprite && (tmin + fDistanceIn) > maxDistSprite))
++		{
++			continue;
++		}
++
++		const float4 n3 = LoadTexel(geomPool_Tris, uint3(nTC.x + 3, nTC.y, nTC.z));
++
++		const int nChild0 = (int)n3.x;
++		const int nChild1 = (int)n3.y;
++		const int nSplitAxis = (int)n3.w;
++
++		if (nChild0 > 0)
++		{
++			// interior node - push both children, near side last so it pops first.
++			// child0 holds the LOWER half along nSplitAxis (decision 02 section 2.5), so for a
++			// positive ray direction child0 is the near child. Neo has this inverted.
++			if (stackPos + 2 >= VOX_RT_MAX_CALL_STACK)
++			{
++				// R02: an over-deep subtree makes the answer incomplete, it does not make it a miss.
++				// The hit found so far is kept; the caller falls back to the voxel cone result.
++				best.incomplete = 1;
++				break;
++			}
++
++			if (r.direction[nSplitAxis] > 0.f)
++			{
++				arrCallStack[++stackPos] = nChild1;
++				arrCallStack[++stackPos] = nChild0;
++			}
++			else
++			{
++				arrCallStack[++stackPos] = nChild0;
++				arrCallStack[++stackPos] = nChild1;
++			}
++
++			continue;
++		}
++
++		// leaf - the triangles are the nTriCount records immediately following this one
++		const float4 qb = LoadTexel(geomPool_Tris, uint3(nTC.x + 2, nTC.y, nTC.z));
++
++		for (int tii = 0; tii < nTriCount; tii++)
++		{
++			const int nTriRecord = nNodeRecord + 1 + tii;
++			const int3 tTC = RT_RecordTC(nTriRecord);
++
++			const float4 v0 = LoadTexel(geomPool_Tris, uint3(tTC.x + 0, tTC.y, tTC.z));
++			const float4 v1 = LoadTexel(geomPool_Tris, uint3(tTC.x + 1, tTC.y, tTC.z));
++			const float4 v2 = LoadTexel(geomPool_Tris, uint3(tTC.x + 2, tTC.y, tTC.z));
++
++			float3 pos0 = float3(ExtractPosXY(v0.x, qb), v0.w);
++			float3 pos1 = float3(ExtractPosXY(v1.x, qb), v1.w);
++			float3 pos2 = float3(ExtractPosXY(v2.x, qb), v2.w);
++
++			float4 spriteSt = float4(1, 1, 1, 1);
++			float  hitDist = 0;
++			float3 vBTC = (float3)0;
++			bool   isBackSide = false;
++			bool   bHit = false;
++			bool   hitFirstTri = false;
++
++#if %_RT_PARTICLE_SHADOW
++			best.testCounter++;
++#endif
++
++			if (!bSprite)
++			{
++				bHit = RT_RayTriangleIntersect(r.startpoint, r.direction, pos0, pos1, pos2,
++				                               hitDist, vBTC[0], vBTC[1], vBTC[2], isBackSide)
++				       && (hitDist + fDistanceIn) < best.nearestHitDist
++				       && (hitDist + fDistanceIn) > 0.001f;
++			}
++			else
++			{
++				// Sprite path - kept so the particle BVH of stage 4 needs no new traversal code.
++				// Unreachable in stage 1: the particle root addresses empty records.
++				float3 vUp = float3(0, 0, 1);
++				float3 vRi = normalize(cross(r.direction, vUp));
++				vUp = normalize(cross(vRi, r.direction));
++
++				const float width = v2.x;
++				const float height = v2.y;
++				const float3 spriteCenter = pos0.xyz;
++
++				const uint ust = asuint(v1.y);
++				spriteSt = float4(((ust >> 16) & 0xff), ((ust >> 8) & 0xff), (ust & 0xff), ((ust >> 24) & 0xff)) * (1.f / 255.f);
++
++				pos0 = spriteCenter + vUp * height + vRi * width;
++				pos1 = spriteCenter - vUp * height - vRi * width;
++				pos2 = spriteCenter - vUp * height + vRi * width;
++
++				bHit = RT_RayTriangleIntersect(r.startpoint, r.direction, pos0, pos1, pos2,
++				                               hitDist, vBTC[0], vBTC[1], vBTC[2], isBackSide);
++				hitFirstTri = true;
++
++				if (!bHit)
++				{
++					pos0 = spriteCenter + vUp * height + vRi * width;
++					pos1 = spriteCenter + vUp * height - vRi * width;
++					pos2 = spriteCenter - vUp * height - vRi * width;
++
++					bHit = RT_RayTriangleIntersect(r.startpoint, r.direction, pos0, pos1, pos2,
++					                               hitDist, vBTC[0], vBTC[1], vBTC[2], isBackSide);
++					hitFirstTri = false;
++				}
++			}
++
++			if (!bHit)
++				continue;
++
++			const float4 v3 = LoadTexel(geomPool_Tris, uint3(tTC.x + 3, tTC.y, tTC.z));
++
++			const int  nMatRecord = bSprite ? (int)v2.z : (int)v3.x;
++			const int3 nMatTC = RT_RecordTC(nMatRecord);
++
++			const float4 matInfo3 = LoadTexel(geomPool_Tris, uint3(nMatTC.x + 3, nMatTC.y, nMatTC.z));
++
++			hitDist += fDistanceIn;
++
++			// back faces block in occlusion mode beyond the self-shadow fix distance, and
++			// always pass for two-sided vegetation leaves
++			const float selfShadowFixDist = 0.25f;
++			if ((!best.onlyOcclusion || (hitDist < selfShadowFixDist)) && !bSprite && isBackSide
++			    && matInfo3.z != VOX_RT_SHADING_VEG_LEAVES)
++			{
++				continue;
++			}
++
++			float2 t0, t1, t2;
++
++			if (bSprite)
++			{
++				const float2 tileSize = v1.zw;
++
++				if (hitFirstTri)
++				{
++					t0 = float2(1, 1) * tileSize;
++					t1 = float2(0, 0) * tileSize;
++					t2 = float2(1, 0) * tileSize;
++				}
++				else
++				{
++					t0 = float2(1, 1) * tileSize;
++					t1 = float2(0, 1) * tileSize;
++					t2 = float2(0, 0) * tileSize;
++				}
++
++				const float tileX = spriteSt.z * 255.f * tileSize.x;
++				const float2 offset = float2(frac(tileX), floor(tileX) * tileSize.y);
++				t0 += offset; t1 += offset; t2 += offset;
++			}
++			else
++			{
++				t0 = ExtractTC16(v3.y);
++				t1 = ExtractTC16(v3.z);
++				t2 = ExtractTC16(v3.w);
++			}
++
++			const float4 matInfo0 = LoadTexel(geomPool_Tris, uint3(nMatTC.x + 0, nMatTC.y, nMatTC.z));
++			const int nTexSlotAlb = (int)matInfo0.x - 1;
++
++			const float2 vPosTC = frac(t0 * vBTC[0] + t1 * vBTC[1] + t2 * vBTC[2] + matInfo3.xy)
++			                      * ExtractTC16(matInfo0.w) - 0.5f * fInvAtlasRes;
++
++			const float4 vAlb = (nTexSlotAlb >= 0) ? RT_SampleAtlas(vPosTC, nTexSlotAlb) : (float4)1.f;
++
++			const float2 Opacity_AlphaRef = ExtractTC16(matInfo3.w);
++
++			if (!((Opacity_AlphaRef.x > 0.99f || vAlb.a * Opacity_AlphaRef.x > stippleAlphaRef)
++			      && (vAlb.a >= Opacity_AlphaRef.y - 0.01f)))
++			{
++				continue;
++			}
++
++			if (!bSprite)
++				best.vAlb = float4(vAlb.xyz, 1);
++			else if (hitDist < maxDistSprite)
++				best.vAlb = float4((1 - vAlb.a) * best.vAlb.xyz + vAlb.a * vAlb.xyz, min(best.vAlb.a, vAlb.a));
++
++			if (!bSprite || (best.nearestHitDist > hitDist))
++			{
++				best.vPosTC = vPosTC;
++				best.vBTC = vBTC;
++				best.nearestHitDist = hitDist;
++
++				if (matInfo3.z == VOX_RT_SHADING_MULTI_BOUNCE)
++					best.faceNorm = normalize(cross(normalize(pos0 - pos1), normalize(pos2 - pos1)));
++				else
++					best.faceNorm = 0;
++
++				best.nMatDataTC = int4(nMatTC, nTriRecord);
++			}
++		}
++	}
++}
++
++///////////////////////////////////////////////////////////////////////////////////
++// Hit processing
++///////////////////////////////////////////////////////////////////////////////////
++
++void RT_ProcessBestHit(const Ray rOrig, inout SRTInfo rtInfo, const float fDistanceIn)
++{
++	const SBestHit best = rtInfo.best;
++
++	if (best.vAlb.a)
++	{
++		const int3 nMatTC = best.nMatDataTC.xyz;
++
++		const float4 matInfo0 = LoadTexel(geomPool_Tris, uint3(nMatTC.x + 0, nMatTC.y, nMatTC.z));
++		const float4 matInfo1 = LoadTexel(geomPool_Tris, uint3(nMatTC.x + 1, nMatTC.y, nMatTC.z));
++		const float4 matInfo2 = LoadTexel(geomPool_Tris, uint3(nMatTC.x + 2, nMatTC.y, nMatTC.z));
++		const float4 matInfo3 = LoadTexel(geomPool_Tris, uint3(nMatTC.x + 3, nMatTC.y, nMatTC.z));
++
++		uint2 texInf = ExtractUint2(matInfo0.y);
++		const int nTexSlotNor = (int)texInf.x - 1;
++		const int nTexSlotSpc = (int)texInf.y - 1;
++
++		texInf = ExtractUint2(matInfo0.z);
++		const int nTexSlotEmm = (int)texInf.x - 1;
++
++		const float4 vNor = (nTexSlotNor >= 0) ? RT_SampleAtlas(best.vPosTC, nTexSlotNor) : float4(0.5, 0.5, 1.0, 1.0);
++		const float4 vSpc = (nTexSlotSpc >= 0) ? RT_SampleAtlas(best.vPosTC, nTexSlotSpc) : float4(1.0, 1.0, 1.0, 1.0);
++		const float4 vEmm = (nTexSlotEmm >= 0) ? RT_SampleAtlas(best.vPosTC, nTexSlotEmm) : float4(1.0, 1.0, 1.0, 1.0);
++
++		// rebuild the tangent frame of the winning triangle
++		const int3 nTC = RT_RecordTC(best.nMatDataTC.w);
++		const float4 v0 = LoadTexel(geomPool_Tris, uint3(nTC.x + 0, nTC.y, nTC.z));
++		const float4 v1 = LoadTexel(geomPool_Tris, uint3(nTC.x + 1, nTC.y, nTC.z));
++		const float4 v2 = LoadTexel(geomPool_Tris, uint3(nTC.x + 2, nTC.y, nTC.z));
++
++		const float4 tang0 = ExtractDir(v0.y);
++		const float4 tang1 = ExtractDir(v1.y);
++		const float4 tang2 = ExtractDir(v2.y);
++		const float3 btan0 = ExtractDir(v0.z).xyz;
++		const float3 btan1 = ExtractDir(v1.z).xyz;
++		const float3 btan2 = ExtractDir(v2.z).xyz;
++
++		const float3 norm0 = normalize(cross(tang0.xyz, btan0) * tang0.w);
++		const float3 norm1 = normalize(cross(tang1.xyz, btan1) * tang1.w);
++		const float3 norm2 = normalize(cross(tang2.xyz, btan2) * tang2.w);
++
++		const float3 norm = norm0 * best.vBTC[0] + norm1 * best.vBTC[1] + norm2 * best.vBTC[2];
++		const float3 tang = tang0.xyz * best.vBTC[0] + tang1.xyz * best.vBTC[1] + tang2.xyz * best.vBTC[2];
++		const float3 btan = btan0 * best.vBTC[0] + btan1 * best.vBTC[1] + btan2 * best.vBTC[2];
++
++		const half3x3 mTangentToWS = half3x3(tang, btan, norm);
++
++		const float fBumpFade = saturate(CV_TerrainInfo.y / (best.camDistance + best.nearestHitDist + 0.1f));
++		rtInfo.normal_reflectance.xyz = normalize(mul(lerp(float4(0.5, 0.5, 1.0, 1.0), vNor, matInfo1.x * fBumpFade).xyz * 2.f - 1.f, mTangentToWS));
++
++		rtInfo.normal_reflectance.w = PackRGB(matInfo1.y * vSpc.xyz);
++		if (matInfo3.z == VOX_RT_SHADING_VEG_LEAVES) // encode the transmittance lighting model
++			rtInfo.normal_reflectance.w = -rtInfo.normal_reflectance.w;
++
++		// the normal's *length* carries emittance; use CE's named unit scale, not Neo's
++		// literal 1000/10000, or a reflected emissive surface is a different brightness
++		// from the surface itself (research/03 section 7.5)
++		rtInfo.normal_reflectance.xyz *= (1.f + matInfo1.w * MAT_EMISSIVE_UNIT_SCALE * vEmm.a);
++
++		rtInfo.albedo_smoothness.xyz = best.vAlb.xyz * matInfo2.xyz;
++		rtInfo.albedo_smoothness.w = matInfo1.z * saturate(vNor.w); // _ddna alpha carries smoothness
++
++		rtInfo.hitpos.xyz = rOrig.startpoint + rOrig.direction * (best.nearestHitDist - fDistanceIn);
++		rtInfo.hitpos.w = 1;
++
++		rtInfo.raydir.xyz = rOrig.direction;
++		rtInfo.raydir.w = min(best.nearestHitDist, GetMaxRayDistance());
++	}
++	else
++	{
++		// miss - G-data for the probe fallback
++		rtInfo.normal_reflectance.xyz = rtInfo.vFocus;
++		rtInfo.normal_reflectance.w = IsDiffuseMode() ? PackRGB(float3(0, 0, 0)) : PackRGB(float3(1, 1, 1));
++
++		rtInfo.albedo_smoothness = 1;
++
++		rtInfo.hitpos.xyz = rOrig.startpoint + rOrig.direction * GetMaxRayDistance();
++		rtInfo.hitpos.w = 1;
++
++		rtInfo.raydir.xyz = rOrig.direction;
++		rtInfo.raydir.w = GetMaxRayDistance() + 1; // miss sentinel
++	}
++}
++
++///////////////////////////////////////////////////////////////////////////////////
++// Stage-1 provisional colour and debug views
++///////////////////////////////////////////////////////////////////////////////////
++
++// Decision 06 section 6.5: until the ShadePass of stage 2 exists, a triangle hit is shaded
++// with CE's own trick (CommonSVO.cfi:999) - the voxel radiance at the hit divided by the
++// voxel albedo is an irradiance estimate, and the triangle albedo replaces the voxel one.
++// tcMin / voxAreaMin / voxAreaMax describe the SVO cell that produced the hit.
++float3 RT_SampleVoxelIrradiance(const float3 tcMin, const float4 voxAreaMin, const float4 voxAreaMax, const float3 vPos)
++{
++	const float ocNodeSize = voxAreaMin.w;
++	const float3 vBoxSize = voxAreaMax.xyz - voxAreaMin.xyz;
++	const float3 vHalfTexSizeWS = 0.5f / VOX_BRICK_TEXRES * ocNodeSize;
++	const float3 vMulTC = rcp(ocNodeSize) * vBoxSize / VOX_ATLAS_SIZE.xyz * VOX_SUBBLOCK_SIZE_RATIO;
++
++	const float3 vCurTC = tcMin + ((clamp(vPos, voxAreaMin.xyz + vHalfTexSizeWS, voxAreaMax.xyz - vHalfTexSizeWS) - voxAreaMin.xyz) / vBoxSize) * vMulTC;
++
++	const float4 vNORA = tex3DlodLC(brickPool_Norm, vCurTC).zyxw;
++
++	float4 vRGBD = tex3DlodLC(brickPool_Rgbs, vCurTC);
++	vRGBD /= max(0.1f, vNORA.a);
++	vRGBD.xyz = DecodeHDR(vRGBD);
++
++	float4 vAlbe = tex3DlodLC(brickPool_Albe, vCurTC);
++	vAlbe = pow(max(vAlbe, 0.f), .75f);
++	vAlbe /= max(0.1f, vNORA.a);
++
++	return vRGBD.xyz / max(vAlbe.xyz, .01f);
++}
++
++// e_svoTI_RT_Debug, mirrored into SVO_RTParams0.w (decision 05 section 5.3):
++// 1 hit test count, 2 hit normals, 3 hit albedo, 4 hit distance, 5 incomplete mask.
++bool RT_GetDebugColor(out float3 vCol)
++{
++	vCol = 0;
++
++	const int nMode = (int)VOX_RT_DEBUG_MODE;
++	if (nMode <= 0)
++		return false;
++
++	const bool bHit = (g_rtInfo.best.vAlb.a != 0);
++
++	if (nMode == 1)
++	{
++		vCol = lerp(float3(0, 0, 1), float3(1, 0, 0), saturate(float(g_rtInfo.best.testCounter) / 64.f));
++	}
++	else if (nMode == 2)
++	{
++		vCol = bHit ? (normalize(g_rtInfo.normal_reflectance.xyz) * 0.5f + 0.5f) : (float3)0;
++	}
++	else if (nMode == 3)
++	{
++		vCol = bHit ? g_rtInfo.albedo_smoothness.xyz : (float3)0;
++	}
++	else if (nMode == 4)
++	{
++		const float f = bHit ? saturate(g_rtInfo.best.nearestHitDist / max(VOX_MAX_RT_DIST_RAY, 1.f)) : 0.f;
++		vCol = float3(f, f, f);
++	}
++	else
++	{
++		vCol = g_rtInfo.best.incomplete ? float3(1, 0, 1) : (float3)0;
++	}
++
++	return true;
++}
+diff --git a/Engine/Shaders/HWScripts/CryFX/Total_Illumination.cfx b/Engine/Shaders/HWScripts/CryFX/Total_Illumination.cfx
+index 1881df89..883dc4f7 100644
+--- a/Engine/Shaders/HWScripts/CryFX/Total_Illumination.cfx
++++ b/Engine/Shaders/HWScripts/CryFX/Total_Illumination.cfx
+@@ -161,6 +161,8 @@ struct pixout_TraceSunShadows
+ // _RT_QUALITY1                 Include terrain heightmap (whole level) into ray-traced sun shadows
+ // _RT_NO_TESSELLATION          Use full sphere tracing for translucent geoemtry
+ // _RT_QUALITY                  Enable mesh tracing
++// _RT_SAMPLE6                  Mesh tracing uses the per-cell static BVH
++// _RT_PARTICLE_SHADOW          Mesh tracing debug views (e_svoTI_RT_Debug)
+ 
+ /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+ // Functions
+@@ -1615,16 +1617,48 @@ pixoutMRTTrace ConeTracePS(vtxOutWPOS IN)
+ 	#endif
+ 
+ #if %_RT_QUALITY
+-		const bool bUseRT = !IsDiffuseMode() 
+-			&& fAverSmoothness > VOX_MAX_RT_MIN_GLOSS 
++		const bool bUseRT = !IsDiffuseMode()
++			&& fAverSmoothness > VOX_MAX_RT_MIN_GLOSS
+ 			&& GetLuminance(vAverReflectance) > VOX_MAX_RT_MIN_REFL
+ 			&& fDistM < VOX_MAX_RT_DIST_CAM;
++
++		if (bUseRT)
++		{
++			// triangle rays get their own length budget, not the cone length
++			fRayLen = VOX_MAX_RT_DIST_RAY;
++
++			RT_ResetInfo(vFocus, VOX_MAX_RT_DIST_RAY, fDistM, RT_GetStippleAlphaRef(nXY), false);
++		}
+ #else
+ 		const bool bUseRT = false;
+ #endif
+ 
+ 		vC = ConeTraceTreeAndSky(fRayLen, r, SvoParamsDiffuse.x + power / 10000, SvoParamsInject.z, bUseRT ? 1 : 0, false, false, bUseRT ? float3(0, 0, 0) : normalize(vNor0));
+ 
++#if %_RT_QUALITY
++		if (bUseRT && g_rtInfo.hitpos.w > 0 && g_rtInfo.best.vAlb.a > 0 && !g_rtInfo.best.incomplete)
++		{
++			// Stage-1 provisional colour (decision 06 section 6.5): the triangle albedo replaces
++			// the voxel albedo in CE's own irradiance trick. Replaced wholesale by the ShadePass
++			// of stage 2. An `incomplete` traversal falls through to the voxel cone result.
++			const float3 vIrradiance = g_rtInfo.cellValid
++				? RT_SampleVoxelIrradiance(g_rtInfo.cellTC, g_rtInfo.cellMin, g_rtInfo.cellMax, g_rtInfo.hitpos.xyz)
++				: (float3)1.f;
++
++			vC.xyz = g_rtInfo.albedo_smoothness.xyz * vIrradiance;
++			vC.a = 1;
++		}
++
++	#if %_RT_PARTICLE_SHADOW
++		if (bUseRT)
++		{
++			float3 vDebug;
++			if (RT_GetDebugColor(vDebug))
++				vC = float4(vDebug, 1);
++		}
++	#endif
++#endif
++
+ #if %_RT_NO_TESSELLATION
+ 		vC *= lerp(1.f, SvoParamsInject.w, saturate(fAverTransmittanceY * 8));
+ #endif
+-- 
+2.47.1.windows.1
+

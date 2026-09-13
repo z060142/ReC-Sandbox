@@ -2295,6 +2295,12 @@ struct I3DEngine : public IProcess
 		int                  nTexDimXY;
 		int                  nTexDimZ;
 		int                  nBrickSize;
+
+		// mesh ray tracing pool dimensions (rt decision 02: SVO_RTPoolInfo = (W, D, A, Zt))
+		int                  rtPoolXY;   //!< XY size of pTexTriA (records pool)
+		int                  rtPoolZ;    //!< Z size of pTexTriA
+		int                  rtTexRes;   //!< XY size of pTexTexA (material atlas)
+		int                  rtTexPoolZ; //!< Z size of pTexTexA
 		bool                 bSvoReady;
 		bool                 bSvoFreeze;
 		Sphere               helperInfo;

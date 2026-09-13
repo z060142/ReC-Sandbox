@@ -103,6 +103,12 @@ bool CSvoEnv::Render()
 
 	AUTO_LOCK(m_csLockTree);
 
+	if (!m_rtSelfTestDone && GetCVars()->e_svoTI_RT_SelfTest)
+	{
+		m_rtSelfTestDone = true;
+		CVoxelSegment::RunRTSelfTest();
+	}
+
 	CVoxelSegment::CheckAllocateTexturePool();
 
 	CVoxelSegment::UpdateObjectLayersInfo();
@@ -938,7 +944,6 @@ CSvoEnv::CSvoEnv(const AABB& worldBox)
 	m_debugDrawVoxelsCounter = 0;
 	m_voxTexFormat = eTF_R8G8B8A8; // eTF_BC3
 
-	m_texTrisPoolId = 0;
 	m_texRgb0PoolId = 0;
 	m_texRgb1PoolId = 0;
 	m_texDynlPoolId = 0;
@@ -974,6 +979,8 @@ CSvoEnv::CSvoEnv(const AABB& worldBox)
 	m_bFirst_SvoFreezeTime = m_bFirst_StartStreaming = true;
 	m_bStreamingDonePrev = false;
 
+	RTCachePoolDims();
+
 	m_pStreamEngine = new CVoxStreamEngine();
 }
 
@@ -984,7 +991,8 @@ CSvoEnv::~CSvoEnv()
 
 	SAFE_DELETE(m_pSvoRoot);
 
-	GetRenderer()->RemoveTexture(m_texTrisPoolId);
+	GetRenderer()->RemoveTexture(m_arrRTPoolTris.m_textureId);
+	GetRenderer()->RemoveTexture(m_arrRTPoolTexs.m_textureId);
 	GetRenderer()->RemoveTexture(m_texRgb0PoolId);
 	GetRenderer()->RemoveTexture(m_texRgb1PoolId);
 	GetRenderer()->RemoveTexture(m_texDynlPoolId);
@@ -1622,7 +1630,7 @@ bool CSvoEnv::GetSvoStaticTextures(I3DEngine::SSvoStaticTexInfo& svoInfo, PodArr
 	svoInfo.pTexTree = GetRenderer()->EF_GetTextureByID(m_texNodePoolId);
 	svoInfo.pTexOpac = GetRenderer()->EF_GetTextureByID(m_texOpasPoolId);
 
-	svoInfo.pTexTris = GetRenderer()->EF_GetTextureByID(m_texTrisPoolId);
+	svoInfo.pTexTris = nullptr;   // brickPool_RTri retired with the per-voxel triangle list path
 	svoInfo.pTexRgb0 = GetRenderer()->EF_GetTextureByID(m_texRgb0PoolId);
 	svoInfo.pTexRgb1 = GetRenderer()->EF_GetTextureByID(m_texRgb1PoolId);
 	svoInfo.pTexDynl = GetRenderer()->EF_GetTextureByID(m_texDynlPoolId);
@@ -1633,13 +1641,19 @@ bool CSvoEnv::GetSvoStaticTextures(I3DEngine::SSvoStaticTexInfo& svoInfo, PodArr
 	svoInfo.pTexAldi = GetRenderer()->EF_GetTextureByID(m_texAldiPoolId);
 	svoInfo.pTexTriA = GetRenderer()->EF_GetTextureByID(gSvoEnv->m_arrRTPoolTris.m_textureId);
 	svoInfo.pTexTexA = GetRenderer()->EF_GetTextureByID(gSvoEnv->m_arrRTPoolTexs.m_textureId);
-	svoInfo.pTexIndA = GetRenderer()->EF_GetTextureByID(gSvoEnv->m_arrRTPoolInds.m_textureId);
+	svoInfo.pTexIndA = nullptr;   // geomPool_TInd retired with the per-voxel triangle list path
 
 	GetGlobalEnvProbeProperties(svoInfo.pGlobalSpecCM, svoInfo.fGlobalSpecCM_Mult);
 
 	svoInfo.nTexDimXY = CVoxelSegment::m_voxTexPoolDimXY;
 	svoInfo.nTexDimZ = CVoxelSegment::m_voxTexPoolDimZ;
 	svoInfo.nBrickSize = SVO_VOX_BRICK_MAX_SIZE;
+
+	// SVO_RTPoolInfo = (W, D, A, Zt); no hard coded dimension exists on the consumer side
+	svoInfo.rtPoolXY = GetRTPoolXY();
+	svoInfo.rtPoolZ = GetRTPoolZ();
+	svoInfo.rtTexRes = GetRTTexRes();
+	svoInfo.rtTexPoolZ = GetRTTexPoolZ();
 
 	svoInfo.bSvoReady = (m_streamingStartTime < 0);
 	svoInfo.bSvoFreeze = (m_svoFreezeTime >= 0) || m_bRootTeleportSkipFrame;
@@ -2159,96 +2173,412 @@ int CSvoEnv::GetWorstPointInSubSet(const int start, const int end)
 	return p0;
 }
 
-void CSvoEnv::CheckUpdateMeshPools()
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// Mesh ray tracing pools: dimensions, chunk allocator, atlas slices, incremental upload
+// (rt decision 02, 2.1 / 2.4 / 2.7). One source of truth for W, D, A and Zt lives here and is
+// handed to the renderer through SSvoStaticTexInfo, which fills SVO_RTPoolInfo.
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+static int RTSnapPow2(int value, int lo, int hi)
 {
-	if (!Get3DEngine()->IsSvoReady(false) && gSvoEnv->m_arrRTPoolInds.m_textureId)
+	int p = lo;
+	while (p * 2 <= value && p * 2 <= hi)
+		p *= 2;
+	return p;
+}
+
+void CSvoEnv::RTCachePoolDims()
+{
+	if (m_rtPoolXY)
 		return;
 
-	FUNCTION_PROFILER_3DENGINE;
+	// XY is a power of two and therefore a multiple of 4, so a 4 texel record never crosses a row
+	m_rtPoolXY = RTSnapPow2(GetCVars()->e_svoTI_RT_TriPoolXY, 64, 2048);
+	m_rtPoolZ = CLAMP(GetCVars()->e_svoTI_RT_TriPoolZ, 1, 2048);
 
+	// GetLowResSystemCopy snaps the requested size to the power of two of its slot, so must we
+	m_rtTexRes = RTSnapPow2(GetCVars()->e_svoTI_RT_MaxTexRes, 16, 2048);
+	m_rtTexPoolZ = CLAMP(GetCVars()->e_svoTI_RT_TexPoolZ, 1, 2048);
+
+	if (GetCVars()->e_svoTI_RT_Active)
 	{
-		PodArrayRT<Vec4>& rAr = gSvoEnv->m_arrRTPoolTris;
+		PrintMessage("SVO RT pools: records %d x %d x %d = %d records, %d MB; atlas %d x %d x %d = %d MB",
+		             m_rtPoolXY, m_rtPoolXY, m_rtPoolZ, GetRTPoolRecords(),
+		             int((int64)m_rtPoolXY * m_rtPoolXY * m_rtPoolZ * sizeof(Vec4) / 1024 / 1024),
+		             m_rtTexRes, m_rtTexRes, m_rtTexPoolZ,
+		             int((int64)m_rtTexRes * m_rtTexRes * m_rtTexPoolZ * sizeof(ColorB) / 1024 / 1024));
+	}
+}
 
-		AUTO_READLOCK(rAr.m_Lock);
+//! First fit over the STATIC segment. The caller holds m_arrRTPoolTris.m_Lock in modify mode.
+//! On return records carries the granularity rounded size that was actually reserved.
+int CSvoEnv::RTAllocChunk(int& records)
+{
+	if (records <= 0)
+		return 0;
 
-		if (rAr.m_writeOffsetReady != rAr.m_writeOffset)
+	RTCachePoolDims();
+
+	const int totalRecords = GetRTPoolRecords();
+	if (totalRecords <= SVO_RT_SEG_STATIC)
+	{
+		if (!m_rtOverflowWarned)
 		{
-			ProcessIncrementalTextureUpdate(rAr, eTF_R32G32B32A32F, "PoolTris");
+			m_rtOverflowWarned = true;
+			CryWarning(VALIDATOR_MODULE_3DENGINE, VALIDATOR_WARNING,
+			           "SVO RT: record pool holds only %d records, the static segment starts at %d - raise e_svoTI_RT_TriPoolZ",
+			           totalRecords, (int)SVO_RT_SEG_STATIC);
+		}
+		return 0;
+	}
 
-			rAr.m_writeOffsetReady = rAr.m_writeOffset;
+	m_arrRTPoolTris.CheckAllocated(m_rtPoolXY * m_rtPoolXY * m_rtPoolZ);
+
+	if (m_arrRTDirtyTris.Count() != m_rtPoolZ)
+		m_arrRTDirtyTris.PreAllocate(m_rtPoolZ, m_rtPoolZ);
+
+	if (!m_arrRTFreeChunks.Count() && !m_rtRecordsUsed)
+	{
+		SRTChunk all;
+		all.start = SVO_RT_SEG_STATIC;
+		all.count = totalRecords - SVO_RT_SEG_STATIC;
+		m_arrRTFreeChunks.Add(all);
+	}
+
+	records = ((records + SVO_RT_CHUNK_GRANULARITY - 1) / SVO_RT_CHUNK_GRANULARITY) * SVO_RT_CHUNK_GRANULARITY;
+
+	for (int i = 0; i < m_arrRTFreeChunks.Count(); i++)
+	{
+		if (m_arrRTFreeChunks[i].count >= records)
+		{
+			const int start = m_arrRTFreeChunks[i].start;
+
+			m_arrRTFreeChunks[i].start += records;
+			m_arrRTFreeChunks[i].count -= records;
+
+			if (!m_arrRTFreeChunks[i].count)
+				m_arrRTFreeChunks.Delete(i);
+
+			m_rtRecordsUsed += records;
+			return start;
 		}
 	}
 
-  {
-		PodArrayRT<ColorB>& rAr = gSvoEnv->m_arrRTPoolInds;
+	if (!m_rtOverflowWarned)
+	{
+		m_rtOverflowWarned = true;
+		CryWarning(VALIDATOR_MODULE_3DENGINE, VALIDATOR_WARNING,
+		           "SVO RT: record pool is full (%d of %d records used), cells without a BVH fall back to voxel cone tracing - raise e_svoTI_RT_TriPoolZ",
+		           m_rtRecordsUsed, totalRecords - (int)SVO_RT_SEG_STATIC);
+	}
 
-		AUTO_READLOCK(rAr.m_Lock);
+	return 0;
+}
 
-		if (rAr.m_writeOffsetReady != rAr.m_writeOffset)
+//! Caller holds m_arrRTPoolTris.m_Lock in modify mode.
+void CSvoEnv::RTFreeChunkLocked(int start, int count)
+{
+	if (count <= 0)
+		return;
+
+	m_rtRecordsUsed -= count;
+
+	int i = 0;
+	for (; i < m_arrRTFreeChunks.Count(); i++)
+		if (m_arrRTFreeChunks[i].start > start)
+			break;
+
+	SRTChunk c;
+	c.start = start;
+	c.count = count;
+	m_arrRTFreeChunks.InsertBefore(c, i);
+
+	if (i + 1 < m_arrRTFreeChunks.Count() && m_arrRTFreeChunks[i].start + m_arrRTFreeChunks[i].count == m_arrRTFreeChunks[i + 1].start)
+	{
+		m_arrRTFreeChunks[i].count += m_arrRTFreeChunks[i + 1].count;
+		m_arrRTFreeChunks.Delete(i + 1);
+	}
+
+	if (i > 0 && m_arrRTFreeChunks[i - 1].start + m_arrRTFreeChunks[i - 1].count == m_arrRTFreeChunks[i].start)
+	{
+		m_arrRTFreeChunks[i - 1].count += m_arrRTFreeChunks[i].count;
+		m_arrRTFreeChunks.Delete(i);
+	}
+}
+
+//! A chunk is reclaimed only after the tree texel that pointed at it has been rewritten and
+//! uploaded, so releases go through this queue and are applied a few frames later on the main thread.
+void CSvoEnv::RTQueueFreeChunk(int start, int count)
+{
+	if (count <= 0)
+		return;
+
+	AUTO_LOCK(m_rtPendingLock);
+
+	SRTPendingFree f;
+	f.start = start;
+	f.count = count;
+	f.frameId = GetCurrPassMainFrameID();
+	m_arrRTPendingFree.Add(f);
+}
+
+//! count == 0 marks an atlas slice reference instead of a record chunk.
+void CSvoEnv::RTQueueFreeTexSlice(int slice)
+{
+	if (slice < 0)
+		return;
+
+	AUTO_LOCK(m_rtPendingLock);
+
+	SRTPendingFree f;
+	f.start = slice;
+	f.count = 0;
+	f.frameId = GetCurrPassMainFrameID();
+	m_arrRTPendingFree.Add(f);
+}
+
+void CSvoEnv::RTProcessPendingFrees()
+{
+	PodArray<SRTPendingFree> arrDue;
+
+	{
+		AUTO_LOCK(m_rtPendingLock);
+
+		const uint frameId = GetCurrPassMainFrameID();
+
+		for (int i = 0; i < m_arrRTPendingFree.Count(); )
 		{
-			ProcessIncrementalTextureUpdate(rAr, m_voxTexFormat, "PoolInds");
+			if (frameId > m_arrRTPendingFree[i].frameId + 8)
+			{
+				arrDue.Add(m_arrRTPendingFree[i]);
+				m_arrRTPendingFree.Delete(i);
+			}
+			else
+			{
+				i++;
+			}
+		}
+	}
 
-			rAr.m_writeOffsetReady = rAr.m_writeOffset;
+	if (!arrDue.Count())
+		return;
+
+	{
+		AUTO_MODIFYLOCK(m_arrRTPoolTris.m_Lock);
+		for (int i = 0; i < arrDue.Count(); i++)
+			if (arrDue[i].count > 0)
+				RTFreeChunkLocked(arrDue[i].start, arrDue[i].count);
+	}
+
+	{
+		AUTO_MODIFYLOCK(m_arrRTPoolTexs.m_Lock);
+		for (int i = 0; i < arrDue.Count(); i++)
+			if (arrDue[i].count == 0)
+				RTReleaseTexSlice(arrDue[i].start);
+	}
+}
+
+//! Caller holds m_arrRTPoolTris.m_Lock in modify mode.
+void CSvoEnv::RTMarkTrisDirty(int firstRecord, int records)
+{
+	if (records <= 0 || !m_arrRTDirtyTris.Count())
+		return;
+
+	const int sliceTexels = m_rtPoolXY * m_rtPoolXY;
+	const int z0 = CLAMP(firstRecord * SVO_RT_RECORD_TEXELS / sliceTexels, 0, m_arrRTDirtyTris.Count() - 1);
+	const int z1 = CLAMP(((firstRecord + records) * SVO_RT_RECORD_TEXELS - 1) / sliceTexels, 0, m_arrRTDirtyTris.Count() - 1);
+
+	for (int z = z0; z <= z1; z++)
+		m_arrRTDirtyTris[z] = 1;
+}
+
+//! Caller holds m_arrRTPoolTexs.m_Lock in modify mode.
+void CSvoEnv::RTMarkTexsDirty(int firstSlice, int slices)
+{
+	if (slices <= 0 || !m_arrRTDirtyTexs.Count())
+		return;
+
+	const int z0 = CLAMP(firstSlice, 0, m_arrRTDirtyTexs.Count() - 1);
+	const int z1 = CLAMP(firstSlice + slices - 1, 0, m_arrRTDirtyTexs.Count() - 1);
+
+	for (int z = z0; z <= z1; z++)
+		m_arrRTDirtyTexs[z] = 1;
+}
+
+//! Free list over Z slices (never a ring). Caller holds m_arrRTPoolTexs.m_Lock in modify mode.
+int CSvoEnv::RTAllocTexSlice(int* pOwner)
+{
+	RTCachePoolDims();
+
+	const int A = m_rtTexRes;
+	const int Zt = m_rtTexPoolZ;
+
+	m_arrRTPoolTexs.CheckAllocated(A * A * Zt);
+
+	if (m_arrRTTexSliceRef.Count() != Zt)
+	{
+		m_arrRTTexSliceRef.PreAllocate(Zt, Zt);
+		m_arrRTTexSliceOwner.PreAllocate(Zt, Zt);
+		m_arrRTDirtyTexs.PreAllocate(Zt, Zt);
+	}
+
+	for (int i = 0; i < Zt; i++)
+	{
+		if (!m_arrRTTexSliceOwner[i] && !m_arrRTTexSliceRef[i])
+		{
+			m_arrRTTexSliceOwner[i] = pOwner;
+			m_arrRTTexSliceRef[i] = 0;
+			m_rtTexSlicesUsed++;
+			return i;
+		}
+	}
+
+	if (!m_rtTexOverflowWarned)
+	{
+		m_rtTexOverflowWarned = true;
+		CryWarning(VALIDATOR_MODULE_3DENGINE, VALIDATOR_WARNING,
+		           "SVO RT: material atlas is full (%d slices), further materials fall back to their tint - raise e_svoTI_RT_TexPoolZ", Zt);
+	}
+
+	return -1;
+}
+
+void CSvoEnv::RTAddTexSliceRef(int slice)
+{
+	if (slice >= 0 && slice < m_arrRTTexSliceRef.Count())
+		m_arrRTTexSliceRef[slice]++;
+}
+
+void CSvoEnv::RTReleaseTexSlice(int slice)
+{
+	if (slice < 0 || slice >= m_arrRTTexSliceRef.Count())
+		return;
+
+	if (--m_arrRTTexSliceRef[slice] <= 0)
+	{
+		m_arrRTTexSliceRef[slice] = 0;
+
+		if (m_arrRTTexSliceOwner[slice])
+		{
+			// the texture object's atlas id is the dedupe key; clearing it re-inserts on next use
+			*m_arrRTTexSliceOwner[slice] = 0;
+			m_arrRTTexSliceOwner[slice] = nullptr;
+		}
+
+		m_rtTexSlicesUsed--;
+	}
+}
+
+//! Dirty Z slice upload, replacing the old ring buffer write offset logic (rt decision 02, 2.4).
+void CSvoEnv::RTUploadDirtySlices()
+{
+	if (!GetCVars()->e_svoTI_RT_Active)
+		return;
+
+	{
+		AUTO_MODIFYLOCK(m_arrRTPoolTris.m_Lock);
+
+		if (m_arrRTPoolTris.Count())
+		{
+			const int W = m_rtPoolXY;
+			const int D = m_rtPoolZ;
+
+			if (!m_arrRTPoolTris.m_textureId)
+			{
+				m_arrRTPoolTris.m_textureId = gEnv->pRenderer->UploadToVideoMemory3D((byte*)m_arrRTPoolTris.GetElements(),
+				                                                                     W, W, D, eTF_R32G32B32A32F, eTF_R32G32B32A32F, 1, false, FILTER_POINT, 0, 0, FT_DONT_STREAM, eLittleEndian, nullptr, true);
+
+				for (int z = 0; z < m_arrRTDirtyTris.Count(); z++)
+					m_arrRTDirtyTris[z] = 0;
+
+				PrintMessage("SVO RT: record pool texture created (%d x %d x %d)", W, W, D);
+			}
+			else
+			{
+				int z = 0;
+				while (z < m_arrRTDirtyTris.Count())
+				{
+					if (!m_arrRTDirtyTris[z])
+					{
+						z++;
+						continue;
+					}
+
+					int z1 = z;
+					while (z1 < m_arrRTDirtyTris.Count() && m_arrRTDirtyTris[z1])
+					{
+						m_arrRTDirtyTris[z1] = 0;
+						z1++;
+					}
+
+					gEnv->pRenderer->UpdateTextureInVideoMemory(
+					  m_arrRTPoolTris.m_textureId,
+					  (byte*)(m_arrRTPoolTris.GetElements() + (size_t)z * W * W),
+					  0, 0, W, W, eTF_R32G32B32A32F, z, z1 - z);
+
+					z = z1;
+				}
+			}
 		}
 	}
 
 	{
-		PodArrayRT<ColorB>& rAr = gSvoEnv->m_arrRTPoolTexs;
+		AUTO_MODIFYLOCK(m_arrRTPoolTexs.m_Lock);
 
-		AUTO_READLOCK(rAr.m_Lock);
-
-		if (rAr.m_writeOffsetReady != rAr.m_writeOffset)
+		if (m_arrRTPoolTexs.Count())
 		{
-			ProcessIncrementalTextureUpdate(rAr, m_voxTexFormat, "PoolTexs");
+			const int A = m_rtTexRes;
+			const int Zt = m_rtTexPoolZ;
 
-			rAr.m_writeOffsetReady = rAr.m_writeOffset;
+			if (!m_arrRTPoolTexs.m_textureId)
+			{
+				m_arrRTPoolTexs.m_textureId = gEnv->pRenderer->UploadToVideoMemory3D((byte*)m_arrRTPoolTexs.GetElements(),
+				                                                                     A, A, Zt, m_voxTexFormat, m_voxTexFormat, 1, false, FILTER_LINEAR, 0, 0, FT_DONT_STREAM, eLittleEndian, nullptr, true);
+
+				for (int z = 0; z < m_arrRTDirtyTexs.Count(); z++)
+					m_arrRTDirtyTexs[z] = 0;
+
+				PrintMessage("SVO RT: material atlas texture created (%d x %d x %d)", A, A, Zt);
+			}
+			else
+			{
+				int z = 0;
+				while (z < m_arrRTDirtyTexs.Count())
+				{
+					if (!m_arrRTDirtyTexs[z])
+					{
+						z++;
+						continue;
+					}
+
+					int z1 = z;
+					while (z1 < m_arrRTDirtyTexs.Count() && m_arrRTDirtyTexs[z1])
+					{
+						m_arrRTDirtyTexs[z1] = 0;
+						z1++;
+					}
+
+					gEnv->pRenderer->UpdateTextureInVideoMemory(
+					  m_arrRTPoolTexs.m_textureId,
+					  (byte*)(m_arrRTPoolTexs.GetElements() + (size_t)z * A * A),
+					  0, 0, A, A, m_voxTexFormat, z, z1 - z);
+
+					z = z1;
+				}
+			}
 		}
 	}
 }
 
-template<class T>
-void CSvoEnv::ProcessIncrementalTextureUpdate(PodArrayRT<T>& rAr, ETEX_Format texFormat, const char* szComment)
+void CSvoEnv::CheckUpdateMeshPools()
 {
-	const int maxTexSizeXY = GetCVars()->e_svoTI_RT_MaxTexRes;
+	if (!GetCVars()->e_svoTI_RT_Active)
+		return;
 
-	if (!rAr.m_textureId)
-	{
-		PrintMessage("%s: create new texture", szComment);
+	FUNCTION_PROFILER_3DENGINE;
 
-		// create new texture
-			rAr.m_textureId = gEnv->pRenderer->UploadToVideoMemory3D((byte*)rAr.GetElements(),
-			maxTexSizeXY, maxTexSizeXY, CVoxelSegment::m_voxTexPoolDimZ,
-			texFormat, texFormat, 1, false, FILTER_POINT, rAr.m_textureId, 0, FT_DONT_STREAM, eLittleEndian, nullptr, true);
-	}
-	else if (rAr.m_writeOffsetReady >= rAr.m_writeOffset)
-	{
-		PrintMessage("%s: update entire texture", szComment);
-
-		// update entire texture
-		gEnv->pRenderer->UpdateTextureInVideoMemory(
-			rAr.m_textureId,
-			(byte*)rAr.GetElements(),
-			0, 0,
-			maxTexSizeXY, maxTexSizeXY,
-			texFormat,
-			0,
-			CVoxelSegment::m_voxTexPoolDimZ);
-	}
-	else
-	{
-		int z0 = CLAMP(rAr.m_writeOffsetReady / (maxTexSizeXY * maxTexSizeXY), 0, CVoxelSegment::m_voxTexPoolDimZ - 1);
-		int z1 = CLAMP(rAr.m_writeOffset / (maxTexSizeXY * maxTexSizeXY) + 1, 0, CVoxelSegment::m_voxTexPoolDimZ);
-
-		PrintMessage("%s: update few slices %d: z0 = %d, z1 = %d, delta = %d", szComment, (int)GetCurrPassMainFrameID(), z0, z1, z1 - z0);
-
-		// update few slices of texture
-		gEnv->pRenderer->UpdateTextureInVideoMemory(
-			rAr.m_textureId,
-			(byte*)(rAr.GetElements() + z0 * maxTexSizeXY * maxTexSizeXY),
-			0, 0, maxTexSizeXY, maxTexSizeXY,
-			texFormat,
-			z0, z1 - z0);
-	}
+	RTUploadDirtySlices();
+	RTProcessPendingFrees();
 }
 
 bool C3DEngine::GetSvoStaticTextures(I3DEngine::SSvoStaticTexInfo& svoInfo, PodArray<I3DEngine::SLightTI>* pLightsTI_S, PodArray<I3DEngine::SLightTI>* pLightsTI_D)

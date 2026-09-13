@@ -1,11 +1,17 @@
-﻿# Sync manifest
+# Sync manifest
 
 Baseline : main @ a34100a9 (pristine CRYENGINE 5.7.1)
-Dev      : dev @ 6003e211
-Synced   : 2026-09-11 10:42
+Dev      : experimental-rt @ 246f3a88
+Synced   : 2026-09-13 22:06
 
 ## Commits (newest first)
 
+- 246f3a88 fix: triangle-RT rays start off the surface, not on it
+- 2bef67c2 fix: the SVO status line reports real RT pool usage and BVH build statistics
+- 3b57aa37 feat: static BVH per SVO cell for software triangle ray tracing (stage 1B)
+- 8bbcf835 feat: the SVO shader type is precached for the three triangle RT bits
+- a5077aa9 feat: the renderer drives the triangle RT permutations, pools and constants
+- 03cd8530 feat: SVOTI traces real triangles again, through a per-cell static BVH
 - 6003e211 docs: the film grain ships as G0 + G1; plates and EXR metadata are parked, and the docs say so
 - 65c9ba67 fix: a moving camera dragged the picture over a static speckle layer - DSNU is a residual
 - ab5dd01c fix: structured sensor noise was orders of magnitude too loud, and the integration exponent goes to 0
@@ -190,6 +196,11 @@ Synced   : 2026-09-11 10:42
 - M	Code/CryEngine/Cry3DEngine/3dEngine.h
 - M	Code/CryEngine/Cry3DEngine/LightEntity.cpp
 - M	Code/CryEngine/Cry3DEngine/SVO/SceneTree.cpp
+- M	Code/CryEngine/Cry3DEngine/SVO/SceneTree.h
+- M	Code/CryEngine/Cry3DEngine/SVO/SceneTreeCVars.inl
+- M	Code/CryEngine/Cry3DEngine/SVO/SceneTreeManager.cpp
+- M	Code/CryEngine/Cry3DEngine/SVO/VoxelSegment.cpp
+- M	Code/CryEngine/Cry3DEngine/SVO/VoxelSegment.h
 - M	Code/CryEngine/Cry3DEngine/SkyLightManager.cpp
 - M	Code/CryEngine/Cry3DEngine/TimeOfDay.cpp
 - M	Code/CryEngine/Cry3DEngine/cvars.cpp
@@ -218,6 +229,7 @@ Synced   : 2026-09-11 10:42
 - M	Code/CryEngine/RenderDll/XRenderD3D9/D3DRendPipeline.cpp
 - M	Code/CryEngine/RenderDll/XRenderD3D9/D3DSystem.cpp
 - M	Code/CryEngine/RenderDll/XRenderD3D9/D3D_SVO.cpp
+- M	Code/CryEngine/RenderDll/XRenderD3D9/D3D_SVO.h
 - M	Code/CryEngine/RenderDll/XRenderD3D9/DeviceManager/DeviceObjectHelpers.cpp
 - M	Code/CryEngine/RenderDll/XRenderD3D9/DriverD3D.cpp
 - M	Code/CryEngine/RenderDll/XRenderD3D9/DriverD3D.h
@@ -368,6 +380,8 @@ Synced   : 2026-09-11 10:42
 - M	Engine/Shaders/CMakeLists.txt
 - M	Engine/Shaders/HWScripts/CryFX/Clouds.cfx
 - M	Engine/Shaders/HWScripts/CryFX/CommonMath.cfi
+- M	Engine/Shaders/HWScripts/CryFX/CommonSVO.cfi
+- A	Engine/Shaders/HWScripts/CryFX/CommonSVO_RT.cfi
 - M	Engine/Shaders/HWScripts/CryFX/DepthOfField.cfx
 - M	Engine/Shaders/HWScripts/CryFX/Eye.cfx
 - M	Engine/Shaders/HWScripts/CryFX/FXConstantDefs.cfi
@@ -388,6 +402,7 @@ Synced   : 2026-09-11 10:42
 - M	Engine/Shaders/HWScripts/CryFX/Stars.cfx
 - M	Engine/Shaders/HWScripts/CryFX/Sunshafts.cfx
 - M	Engine/Shaders/HWScripts/CryFX/TiledShading.cfi
+- M	Engine/Shaders/HWScripts/CryFX/Total_Illumination.cfx
 - M	Engine/Shaders/HWScripts/CryFX/VolumetricFog.cfi
 - M	Engine/Shaders/HWScripts/CryFX/Water.cfx
 - M	Engine/Shaders/HWScripts/CryFX/WaterReflectionsPass.cfi

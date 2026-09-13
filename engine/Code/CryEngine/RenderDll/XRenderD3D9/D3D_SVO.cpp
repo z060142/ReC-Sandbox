@@ -551,11 +551,17 @@ void CSvoRenderer::ConeTracePass(SSvoTargetsSet* pTS)
 	SetupGBufferTextures(rp);
 
 	#ifdef FEATURE_SVO_GI_ALLOW_HQ
-	if (m_texInfo.pTexIndA)
+	// Mesh ray tracing pools (rt decision 02 section 2.1): BVH node/triangle/material records at
+	// t9, material texture atlas at t28 (t18 is Fwd_TiledLightsShadeInfo from stage 2 on).
+	// The old per-voxel index pool (t13) and per-voxel triangle list (t17) are retired together
+	// with RayTraceMesh, so nothing binds them any more.
+	if (e_svoTI_RT_Active)
 	{
-		rp.SetTexture(18, (CTexture*)m_texInfo.pTexTexA.get());
-		rp.SetTexture(9, (CTexture*)m_texInfo.pTexTriA.get());
-		rp.SetTexture(13, (CTexture*)m_texInfo.pTexIndA.get());
+		if (m_texInfo.pTexTriA)
+			rp.SetTexture(9, (CTexture*)m_texInfo.pTexTriA.get());
+
+		if (m_texInfo.pTexTexA)
+			rp.SetTexture(28, (CTexture*)m_texInfo.pTexTexA.get());
 	}
 	#endif
 
@@ -767,6 +773,30 @@ void CSvoRenderer::SetupCommonConstants(SSvoTargetsSet* pTS, T& rp, CTexture* pR
 		static CCryNameR paramName("SVO_DepthTargetRes");
 		Vec4 vData((float)screenResolution.x, (float)screenResolution.y, 0, 0);
 		rp.SetConstantArray(paramName, (Vec4*)&vData, 1);
+	}
+
+	if (e_svoTI_RT_Active)
+	{
+		// Mesh ray tracing pool dimensions, the single source of truth for every address the
+		// shader computes (rt decision 02 section 2.1). The 3DEngine reports what it actually
+		// allocated; the cvars are only the fallback before the first allocation.
+		{
+			static CCryNameR paramName("SVO_RTPoolInfo");
+			Vec4 vData(
+			  (float)(m_texInfo.rtPoolXY   ? m_texInfo.rtPoolXY   : e_svoTI_RT_TriPoolXY),
+			  (float)(m_texInfo.rtPoolZ    ? m_texInfo.rtPoolZ    : e_svoTI_RT_TriPoolZ),
+			  (float)(m_texInfo.rtTexRes   ? m_texInfo.rtTexRes   : e_svoTI_RT_MaxTexRes),
+			  (float)(m_texInfo.rtTexPoolZ ? m_texInfo.rtTexPoolZ : e_svoTI_RT_TexPoolZ));
+			rp.SetConstantArray(paramName, (Vec4*)&vData, 1);
+		}
+
+		{
+			// (maxBounces, glossScale, mixWithProbes, debugMode). glossScale and mixWithProbes
+			// get their own cvars in stage 4; .w carries e_svoTI_RT_Debug (PLAN stage 1A item 3).
+			static CCryNameR paramName("SVO_RTParams0");
+			Vec4 vData((float)e_svoTI_RT_MaxBounces, 1.f, 0.f, (float)e_svoTI_RT_Debug);
+			rp.SetConstantArray(paramName, (Vec4*)&vData, 1);
+		}
 	}
 }
 
@@ -1023,11 +1053,8 @@ void CSvoRenderer::SetupSvoTexturesForRead(I3DEngine::SSvoStaticTexInfo& texInfo
 	else if (nStageOpa == 1)
 		rp.SetTexture(3, vp_RGB4.nTexId == 0 ? CRendererResources::s_ptexWhite3D : CTexture::GetByID(vp_RGB4.nTexId));
 
-	// set tris pool, each voxel contain start triangle id and tris num
-	if (texInfo.pTexTris)
-	{
-		rp.SetTexture(17, static_cast<CTexture*>(texInfo.pTexTris.get()));
-	}
+	// The per-voxel "first triangle id + tris count" pool (brickPool_RTri, t17) died with
+	// RayTraceMesh; nothing in the shader reads t17 any more.
 
 	if (texInfo.pGlobalSpecCM)
 		rp.SetTexture(6, static_cast<CTexture*>(texInfo.pGlobalSpecCM.get()));
@@ -1635,8 +1662,19 @@ uint64 CSvoRenderer::GetRunTimeFlags(bool bDiffuseMode, bool bPixelShader)
 	if (e_svoTI_TranslucentBrightness && bPixelShader)
 		rtFlags |= g_HWSR_MaskBit[HWSR_NO_TESSELLATION];
 
-// 	if (e_svoTI_RT_Active && bPixelShader && !bDiffuseMode)
-// 		rtFlags |= g_HWSR_MaskBit[HWSR_QUALITY];
+	// Software triangle ray tracing (rt decision 05 section 5.1). Every bit below is gated on
+	// e_svoTI_RT_Active, so with the feature off GetRunTimeFlags returns exactly what it
+	// returned before and no stock permutation changes.
+	if (e_svoTI_RT_Active && bPixelShader && !bDiffuseMode)
+	{
+		rtFlags |= g_HWSR_MaskBit[HWSR_QUALITY];       // mesh ray tracing
+
+		if (e_svoTI_RT_StaticBVH)
+			rtFlags |= g_HWSR_MaskBit[HWSR_SAMPLE6];     // per-cell static BVH
+
+		if (e_svoTI_RT_Debug)
+			rtFlags |= g_HWSR_MaskBit[HWSR_PARTICLE_SHADOW]; // RT debug views
+	}
 
 	return rtFlags;
 }

@@ -81,6 +81,23 @@ untouched and the stock path is byte-identical. Deploy note: the repository's
 or the grain technique's runtime flag stays masked off and the grain block never compiles. Full spec:
 `engine/Code/CryPlugins/CinematicCamera/FilmGrainSpec.md`.
 
+### Software triangle ray tracing for SVOTI (this branch, experimental)
+
+The `experimental-rt` branch extends the engine's voxel global illumination (SVOTI) with a
+software triangle ray tracer written in HLSL, in the spirit of the hybrid that shipped in the
+Neon Noir demo: the sparse voxel octree keeps doing space partitioning and low-frequency lighting,
+and glossy reflections above a smoothness threshold trace real triangles through a per-cell
+bounding-volume hierarchy instead of reading blocky voxels. Stage 1 (this snapshot) builds a
+binned-SAH BVH for every 32 m voxel cell on the streaming thread, writes it into a 64 MiB record
+pool next to a 64 MiB material atlas (albedo and normal maps), and returns sharp hit geometry with
+a provisional colour; hit-point lighting, dynamic objects and the quality work follow in later
+stages. Everything sits behind `e_svoTI_RT_Active` (`VF_EXPERIMENTAL`, default 0); with it off the
+engine is byte-identical to `main`. To try it: `e_svoTI_Active 1`, `e_svoTI_IntegrationMode 2`,
+`e_svoTI_RT_Active 1`, then re-voxelize with `e_svoTI_UpdateGeometry 1`; `e_svoTI_RT_Debug 1..5`
+shows hit-test counts, hit normals, hit albedo, hit distance and traversal overflow. Streamed
+voxel levels (`e_svoStreamVoxels 1`) do not get a BVH yet. The self test `e_svoTI_RT_SelfTest 1`
+checks the record format against a brute-force intersector in the log.
+
 ## Status
 
 - Verified on a physically lit interior and on the sample airfield in daylight.
