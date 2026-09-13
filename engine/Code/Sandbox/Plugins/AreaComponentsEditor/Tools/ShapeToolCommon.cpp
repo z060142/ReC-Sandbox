@@ -4,7 +4,10 @@
 
 #include <IEditor.h>
 #include <IObjectManager.h>
+#include <Viewport.h>
+#include <LevelEditor/LevelEditorSharedState.h>
 #include <Objects/BaseObject.h>
+#include <Objects/DisplayContext.h>
 
 #include <CryEntitySystem/IEntity.h>
 #include <CryEntitySystem/IEntityComponent.h>
@@ -16,6 +19,15 @@
 #include <IShapeComponent.h>
 
 using Cry::AreaComponents::IShapeComponent;
+using Cry::AreaComponents::IShapeComponentEdit;
+
+namespace
+{
+//! Two clicks closer together than this make one point, not two.
+const float kDrawMinPointSpacing = 0.01f;
+//! Largest number of points drawn in one frame while a shape is being drawn.
+const int kDrawContourPoints = 1024;
+}
 
 namespace AreaShapeTools
 {
@@ -104,6 +116,82 @@ void SyncEditedComponent(CBaseObject* pObject, IEntityComponent* pComponent)
 		pObject->InvalidateTM(0);
 
 		pObject->UpdatePrefab();
+	}
+}
+
+// ---------------------------------------------------------------------------
+// The draw gesture
+// ---------------------------------------------------------------------------
+
+bool PickDrawPoint(CViewport* pView, CPoint& point, Vec3& worldPosOut)
+{
+	if (pView == nullptr)
+		return false;
+
+	// The pick CShapeObject makes while it is being drawn: cast to terrain and geometry, with no
+	// axis constraint, so every point lands on what the user is pointing at (ShapeObject.cpp:1174).
+	worldPosOut = pView->MapViewToCP(point, CLevelEditorSharedState::Axis::None, true, 0.0f);
+	worldPosOut = pView->SnapToGrid(worldPosOut);
+	return worldPosOut.IsValid();
+}
+
+bool AppendDrawPoint(IShapeComponent* pShape, const Vec3& worldPos)
+{
+	IShapeComponentEdit* pEdit = pShape != nullptr ? pShape->GetEditInterface() : nullptr;
+	if (pEdit == nullptr)
+		return false;
+
+	// The points are the shape's own, so the world position has to come back into its space - the
+	// component's world transform, which is the entity's while the component has no transform.
+	const Matrix34 shapeTM = pShape->GetWorldTransformMatrix();
+
+	const int count = pEdit->GetPointCount();
+	if (count > 0)
+	{
+		const Vec3 lastWorld = shapeTM.TransformPoint(pEdit->GetPoint(count - 1));
+		if (lastWorld.GetDistance(worldPos) < kDrawMinPointSpacing)
+			return false;
+	}
+
+	Matrix34 invShapeTM = shapeTM;
+	invShapeTM.Invert();
+
+	pEdit->InsertPoint(-1, invShapeTM.TransformPoint(worldPos));
+
+	return pEdit->GetPointCount() > count;
+}
+
+void DisplayDrawInProgress(SDisplayContext& dc, IShapeComponent* pShape, bool bCursorValid, const Vec3& cursorWorldPos)
+{
+	if (pShape == nullptr)
+		return;
+
+	// The buffer is on our stack, never a container handed to the other DLL (heap rule,
+	// IShapeComponent.h).
+	Vec3      points[kDrawContourPoints];
+	const int count = min(pShape->GetContour(points, kDrawContourPoints, true), kDrawContourPoints);
+	if (count <= 0)
+		return;
+
+	// Yellow is what legacy draws the edge being placed in (ShapeObject.cpp:1322-1330).
+	dc.SetColor(ColorB(255, 255, 0, 255));
+
+	for (int i = 0; i + 1 < count; ++i)
+	{
+		dc.DrawLine(points[i], points[i + 1]);
+	}
+
+	if (bCursorValid)
+	{
+		// The rubber band: the edge the next click would commit, and the edge that would close
+		// the contour once it has one.
+		dc.DrawLine(points[count - 1], cursorWorldPos);
+
+		if (count >= 2)
+		{
+			dc.SetColor(ColorB(255, 255, 0, 128));
+			dc.DrawLine(cursorWorldPos, points[0]);
+		}
 	}
 }
 

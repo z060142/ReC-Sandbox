@@ -1,11 +1,23 @@
 # Sync manifest
 
 Baseline : main @ a34100a9 (pristine CRYENGINE 5.7.1)
-Dev      : area @ 3b182ffb
-Synced   : 2026-09-12 15:08
+Dev      : area @ 65ef6b23
+Synced   : 2026-09-13 13:08
 
 ## Commits (newest first)
 
+- 65ef6b23 fix(area): road component builds the stock road sectors
+- 86898a57 fix(area): water rebuilds from current points after a pivot recenter
+- 29fa8846 feat(area): several distributors per entity, each with its own offset
+- 105147f3 refactor(area): drop the road's unused ForceRebuild
+- 103f4532 docs(area): README - water volume, road, and the two new Create presets
+- 9000f696 fix(area): water volume says so when the polygon has too few points
+- c6fc8ab4 feat(area): Create -> Area -> Water / Road presets
+- 0500c187 feat(area): align terrain to road editor action
+- aa5531dc feat(area): road function component
+- c0b210a7 feat(area): water volume function component (area + river)
+- 7b44a557 feat(area): Edit Shape on an empty shape starts the draw flow
+- 746aab61 feat(3dengine): water volume and road render nodes can be entity-owned
 - 3b182ffb docs(area): AreaComponents README
 - eeb0a41e feat(area): distributor chord alignment, stretch-to-fit, forward axis
 - 61324df1 fix(area): spline evaluation with fewer than three points
@@ -223,9 +235,11 @@ Synced   : 2026-09-12 15:08
 - M	Code/CryEngine/Cry3DEngine/3dEngine.cpp
 - M	Code/CryEngine/Cry3DEngine/3dEngine.h
 - M	Code/CryEngine/Cry3DEngine/LightEntity.cpp
+- M	Code/CryEngine/Cry3DEngine/RoadRenderNode.h
 - M	Code/CryEngine/Cry3DEngine/SVO/SceneTree.cpp
 - M	Code/CryEngine/Cry3DEngine/SkyLightManager.cpp
 - M	Code/CryEngine/Cry3DEngine/TimeOfDay.cpp
+- M	Code/CryEngine/Cry3DEngine/WaterVolumeRenderNode.h
 - M	Code/CryEngine/Cry3DEngine/cvars.cpp
 - M	Code/CryEngine/CryCommon/CMakeLists.txt
 - M	Code/CryEngine/CryCommon/Cry3DEngine/I3DEngine.h
@@ -299,6 +313,7 @@ Synced   : 2026-09-12 15:08
 - M	Code/CryEngine/RenderDll/XRenderD3D9/PostProcessDOF.cpp
 - M	Code/CryEngine/RenderDll/XRenderD3D9/core_renderer.waf_files
 - A	Code/CryPlugins/AreaComponents/Interface/IDistributorBake.h
+- A	Code/CryPlugins/AreaComponents/Interface/IRoadAlign.h
 - A	Code/CryPlugins/AreaComponents/Interface/IShapeComponent.h
 - A	Code/CryPlugins/AreaComponents/Module/CMakeLists.txt
 - A	Code/CryPlugins/AreaComponents/Module/Functions/AreaFunctionComponent.cpp
@@ -307,8 +322,13 @@ Synced   : 2026-09-12 15:08
 - A	Code/CryPlugins/AreaComponents/Module/Functions/DistributorComponent.h
 - A	Code/CryPlugins/AreaComponents/Module/Functions/GravityVolumeComponent.cpp
 - A	Code/CryPlugins/AreaComponents/Module/Functions/GravityVolumeComponent.h
+- A	Code/CryPlugins/AreaComponents/Module/Functions/RoadComponent.cpp
+- A	Code/CryPlugins/AreaComponents/Module/Functions/RoadComponent.h
+- A	Code/CryPlugins/AreaComponents/Module/Functions/SplineSectors.h
 - A	Code/CryPlugins/AreaComponents/Module/Functions/TriggerBoundsComponent.cpp
 - A	Code/CryPlugins/AreaComponents/Module/Functions/TriggerBoundsComponent.h
+- A	Code/CryPlugins/AreaComponents/Module/Functions/WaterVolumeComponent.cpp
+- A	Code/CryPlugins/AreaComponents/Module/Functions/WaterVolumeComponent.h
 - A	Code/CryPlugins/AreaComponents/Module/PluginDll.cpp
 - A	Code/CryPlugins/AreaComponents/Module/PluginDll.h
 - A	Code/CryPlugins/AreaComponents/Module/Shapes/BoxShapeComponent.cpp
@@ -429,8 +449,11 @@ Synced   : 2026-09-12 15:08
 - A	Code/Sandbox/Plugins/AreaComponentsEditor/Plugin.h
 - A	Code/Sandbox/Plugins/AreaComponentsEditor/StdAfx.cpp
 - A	Code/Sandbox/Plugins/AreaComponentsEditor/StdAfx.h
+- A	Code/Sandbox/Plugins/AreaComponentsEditor/Tools/AreaFunctionCreateTools.cpp
 - A	Code/Sandbox/Plugins/AreaComponentsEditor/Tools/DistributorBakeTool.cpp
 - A	Code/Sandbox/Plugins/AreaComponentsEditor/Tools/DistributorBakeTool.h
+- A	Code/Sandbox/Plugins/AreaComponentsEditor/Tools/RoadAlignTerrainTool.cpp
+- A	Code/Sandbox/Plugins/AreaComponentsEditor/Tools/RoadAlignTerrainTool.h
 - A	Code/Sandbox/Plugins/AreaComponentsEditor/Tools/ShapeCreateTool.cpp
 - A	Code/Sandbox/Plugins/AreaComponentsEditor/Tools/ShapeCreateTool.h
 - A	Code/Sandbox/Plugins/AreaComponentsEditor/Tools/ShapeDragCreateTool.cpp

@@ -152,3 +152,56 @@ public:
 };
 
 REGISTER_CLASS_DESC(CAreaShapeSplineClassDesc);
+
+//! "Create Object -> Area -> Water": the polygon shape drawn click-click-double-click, with the
+//! Water Volume function component added beside it - the component form of the legacy
+//! Create Object -> Area -> Water Volume entry (CWaterShapeObjectClassDesc, WaterShapeObject.h:100).
+//! The shape component is still what the creation file string names; the function is added by the
+//! tool (CAreaWaterCreateTool, Tools/AreaFunctionCreateTools.cpp).
+class CAreaWaterClassDesc : public CObjectClassDesc
+{
+public:
+	virtual ObjectType     GetObjectType() override            { return OBJTYPE_VOLUME; }
+	virtual const char*    ClassName() override                { return "AreaWater"; }
+	virtual const char*    UIName() override                   { return "Water"; }
+	virtual const char*    Category() override                 { return "Area"; }
+	virtual CRuntimeClass* GetRuntimeClass() override          { return Private_AreaShapeObjectClassDescs::GetEntityWithComponentRuntimeClass(); }
+	virtual const char*    GetFileSpec() override              { return Private_AreaShapeObjectClassDescs::szPolygonShapeComponentGuid; }
+	virtual const char*    GetDataFilesFilterString() override { return ""; }
+	virtual const char*    GetToolClassName() override         { return "EditTool.AreaWaterCreate"; }
+
+	virtual bool IsCreatedByListEnumeration() override { return false; }
+
+	virtual void EnumerateObjects(IObjectEnumerator* pEnumerator) override
+	{
+		pEnumerator->AddEntry("Water", Private_AreaShapeObjectClassDescs::szPolygonShapeComponentGuid);
+	}
+};
+
+REGISTER_CLASS_DESC(CAreaWaterClassDesc);
+
+//! "Create Object -> Area -> Road": the spline shape drawn click-click-double-click, with the Road
+//! function component added beside it - the component form of the legacy Create Object -> Misc ->
+//! Road entry (CRoadObjectClassDesc, RoadObject.cpp:816-823). It lives under Area, not Misc,
+//! because that is where every component of this family lives.
+class CAreaRoadClassDesc : public CObjectClassDesc
+{
+public:
+	virtual ObjectType     GetObjectType() override            { return OBJTYPE_ROAD; }
+	virtual const char*    ClassName() override                { return "AreaRoad"; }
+	virtual const char*    UIName() override                   { return "Road"; }
+	virtual const char*    Category() override                 { return "Area"; }
+	virtual CRuntimeClass* GetRuntimeClass() override          { return Private_AreaShapeObjectClassDescs::GetEntityWithComponentRuntimeClass(); }
+	virtual const char*    GetFileSpec() override              { return Private_AreaShapeObjectClassDescs::szSplineShapeComponentGuid; }
+	virtual const char*    GetDataFilesFilterString() override { return ""; }
+	virtual const char*    GetToolClassName() override         { return "EditTool.AreaRoadCreate"; }
+
+	virtual bool IsCreatedByListEnumeration() override { return false; }
+
+	virtual void EnumerateObjects(IObjectEnumerator* pEnumerator) override
+	{
+		pEnumerator->AddEntry("Road", Private_AreaShapeObjectClassDescs::szSplineShapeComponentGuid);
+	}
+};
+
+REGISTER_CLASS_DESC(CAreaRoadClassDesc);

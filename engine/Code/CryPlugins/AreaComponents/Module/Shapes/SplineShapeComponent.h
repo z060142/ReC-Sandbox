@@ -203,6 +203,9 @@ public:
 	virtual float GetLocalWidth(float t, float defaultWidth) const override;
 	virtual Vec3  GetLocalBezierNormal(float t) const override;
 	virtual void  ParamToSegment(float t, int& indexOut, float& segmentTOut) const override;
+	virtual int   GetSegmentCount() const override;
+	virtual float GetSegmentLength(int index, float segmentT) const override;
+	virtual float SegmentToParam(int index, float segmentT) const override;
 	// ~ISplineShape
 
 	// IShapeComponentEdit - the real thing for this kind: the control points the tool edits.
@@ -215,6 +218,7 @@ public:
 	virtual void EndEdit() override;
 	virtual bool IsContourClosed() const override { return m_closed; }
 	virtual int  GetEdgePoints(int index, Vec3* pOut, int maxPoints) const override;
+	virtual int  GetMinPointCount() const override;
 	// ~IShapeComponentEdit
 
 	//! Per-segment sound obstruction, for the Area function component. Not part of
@@ -277,7 +281,6 @@ private:
 
 	void           InvalidateCache() const { m_cache.bValid = false; }
 	const SCache&  GetCache() const;
-	int            GetSegmentCount() const;
 
 	//! Evaluation on the cached arrays. `world` picks which of the two copies is used.
 	Vec3           SegmentPos(int segment, float t, bool world) const;

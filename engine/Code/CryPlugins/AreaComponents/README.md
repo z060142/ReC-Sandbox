@@ -25,6 +25,7 @@ Three binaries, plus one line in the project file.
 | --- | --- |
 | `AreaComponents.dll` | the engine's `bin/win_x64/` **and** the project's `bin/win_x64/` |
 | `AreaComponentsEditor.dll` | the engine's `bin/win_x64/EditorPlugins/` |
+| `Cry3DEngine.dll` | the engine's `bin/win_x64/` |
 | `Sandbox.exe`, `EditorCommon.dll`, `MFCToolsPlugin.dll`, `CryQt.dll` | the engine's `bin/win_x64/` |
 
 `AreaComponents.dll` goes to **both** bins on purpose: the editor loads the engine copy, the
@@ -44,9 +45,19 @@ plugins:
 { "guid": "", "type": "EType::Native", "path": "bin/win_x64/AreaComponents.dll" }
 ```
 
+`Cry3DEngine.dll` carries two lines each on the water-volume and road render nodes so that they can
+record the entity that owns them — which is what stops the level's object export baking a second,
+frozen copy of water or road an entity already owns. Nothing else in either class reads the owner,
+so every legacy Water Volume, River and Road object behaves exactly as before.
+
 `CryEntitySystem.dll` and `CryDefaultEntities.dll` are also part of this build (the area runtime
 gained an authored fade distance, a geometry-move entry point, and a fix that stopped an area
 entity moving itself). Deploy those two alongside if you are installing from source.
+
+`AreaComponentsEditor.dll` now links `Sandbox.exe`, for one class: the editor's own heightmap, which
+is what **Align Terrain To Road** rewrites and what the level saves. It uses only stock, unchanged
+exports, so an already-installed Sandbox of this build serves — but from here on the two are a pair,
+and a rebuilt editor plugin wants the Sandbox it was built against.
 
 ---
 
@@ -75,6 +86,8 @@ is there. They never ask which kind it is; they ask the shape.
 | **Trigger Bounds** | feeds the shape's bounds to the entity's proximity trigger | any shape |
 | **Gravity Volume** | a tube of physics gravity around the curve | spline |
 | **Distributor** | places meshes along the curve | spline |
+| **Water Volume** | fills the shape with water — a water volume on a polygon, a river on a spline | polygon or spline |
+| **Road** | drapes a road over the terrain along the curve | spline |
 
 Add a function component *before* its shape and it binds on the next entity move or property edit
 rather than instantly — there is no "a component was added" event to hang it on. The Create presets
@@ -88,7 +101,7 @@ volume, an audio **Environment** component beside an **Area**, and so on.
 
 ## Creating
 
-**Create Object → Area** has four entries:
+**Create Object → Area** has six entries:
 
 | Entry | Gesture | What you get |
 | --- | --- | --- |
@@ -96,6 +109,8 @@ volume, an audio **Environment** component beside an **Area**, and so on.
 | **Sphere** | press at the centre, drag out the radius, release | Shape: Sphere + **Area** |
 | **Polygon** | click each point, **double-click** or **Enter** to finish | Shape: Polygon + **Area** |
 | **Spline** | click each point, **double-click** or **Enter** to finish | Shape: Spline (no function — pick one) |
+| **Water** | click each point, **double-click** or **Enter** to finish | Shape: Polygon + **Water Volume** (at least four points) |
+| **Road** | click each point, **double-click** or **Enter** to finish | Shape: Spline + **Road** |
 
 A click with no drag leaves the kind's default size. **Esc** during the gesture discards the whole
 thing; so does finishing a polygon with fewer than three points, or a spline with fewer than two.
@@ -280,6 +295,13 @@ Places meshes along the spline. The legacy object had one mesh, one step, follow
 angle; this has a weighted list, four spacing modes, five alignments, jitter, ramps, trims and a
 stored seed.
 
+**An entity may carry as many distributors as you like** — unlike the shape components, which are
+one per entity. Each is an independent generator with its own meshes, seed, spacing, offset and
+render nodes, all reading the same spline, so a fence on the line, lamp posts two metres to the side
+and bollards a metre further out are three components on one entity rather than three entities to
+keep in step. Give each a **Label** and its inspector panel is titled with it. **Bake To Brushes**
+bakes the distributor whose button you pressed, and no other.
+
 **Meshes** is the list distributed **along** the curve — one row per entry, each with a **Weight**
 (how often it is picked relative to the others) and a **Mesh** (`.cgf`). **End Cap Mesh** is a
 separate, optional mesh placed **once at each end** of an open curve and nowhere in between, so a
@@ -287,6 +309,7 @@ distributor whose only mesh sits there produces exactly two objects — and says
 
 | Property | Default | Meaning |
 | --- | --- | --- |
+| **Label** | *(empty)* | A name for this distributor, used as the title of its inspector panel. Worth setting as soon as an entity carries more than one. |
 | **Enabled** | true | Whether any instances are placed at all. |
 | **Seed** | 1 | Seed of everything random here. The same seed always gives the same placement. |
 | **Spacing Mode** | Fixed Step | **Fixed Step** (every *Step* metres), **Fixed Count** (*Count* instances over the curve), **Density** (instances per metre), **Mesh Length** (as many sections as the mesh's own length tiles into the curve, rounded, the residual spread over the spacing). |
@@ -300,20 +323,22 @@ distributor whose only mesh sits there produces exactly two objects — and says
 | **Forward Axis** | +X | Which axis of the mesh points along the curve. +X is what the legacy spline distributor assumes, so the same `.cgf` lines up untouched; a mesh modelled sideways needs the dropdown, not a re-export. |
 | **Stretch To Fit** | false | In Point To Next, scale each instance along its forward axis until it reaches the next one, so sections meet with no gap. The stretch is applied in mesh space, so "longer" means longer along the fence, not taller. |
 | **Pivot At Start** | true | Put the **start face** of the mesh's bounding box on the sample point instead of the mesh's own pivot, so a section exported around its centre does not begin half a section early. |
-| **Z Angle** | 0 | A constant turn about the instance's own up axis, in degrees. |
+| **Rotation Offset** | 0 | A constant turn of every instance about its own up axis, in degrees, before the jitter. |
 | **Rotation Jitter** | (0, 0, 0) | Random rotation about each axis, in degrees, plus or minus. |
 | **Scale Min** / **Scale Max** | 1 / 1 | Instance scale range. |
 | **Scale Ramp Start** / **Scale Ramp End** | 1 / 1 | Extra scale multiplier at each end of the curve, linear in between. |
 | **Width Scales** | false | Multiply the instance scale by the spline's own per-point width at that point. |
 | **Default Width** | 1 | The width a point flagged "default width" contributes. |
-| **Offset Min** / **Offset Max** | (0,0,0) / (0,0,0) | Random offset range from the curve, in the instance's own frame. |
+| **Offset** | (0, 0, 0) | Moves **every** instance off the curve, in the curve's own frame: X along the tangent, Y sideways along the normal, Z up. This is what puts the second distributor's lamp posts beside the first one's fence, and it holds that distance round a bend. |
+| **Along Shift** | 0 | Slides the whole sample pattern along the curve, in metres, so two distributors with the same spacing interleave instead of landing on top of each other. An open curve drops instances that slide past its ends; a closed one wraps them round. |
+| **Offset Min** / **Offset Max** | (0,0,0) / (0,0,0) | Random offset range **on top of** Offset, in the instance's own frame. |
 | **Snap To Terrain** | false | Drop every instance onto the terrain height under it. |
 | **Outdoor Only**, **Cast Shadows**, **Rain Occluder**, **Register By BBox**, **Hideable**, **Exclude From Triangulation**, **No Decals**, **Receive Wind**, **Good Occluder**, **View Distance Ratio**, **LOD Ratio** | — | The brush render-flag block, as on any brush. Cast Shadows defaults on; the two ratios default to 100. |
 
 Placement is **deterministic**: one random stream seeded from **Seed** mixed with the instance
 index and drawn in a fixed order, so turning one feature off does not reshuffle everything after it.
 
-Every real rebuild prints **one console line** with the curve length, the spacing mode and its
+Every real rebuild prints **one console line**, naming the distributor's Label, with the curve length, the spacing mode and its
 numbers, trim, skip, alignment, forward axis, how many meshes were listed and how many actually
 loaded, whether the end cap loaded, how many instances were asked for, how many were placed and how
 many nodes are alive. When something produces nothing, that line says which of those it was. An open
@@ -328,13 +353,87 @@ over), and they are created flat with a shared name prefix rather than inside a 
 
 ---
 
+### Water Volume
+
+Fills the shape with water. On a **polygon** it is a water volume, the component form of the engine's
+own Water Volume object; on a **spline** it is a **river**, the component form of the River object.
+A box or a sphere gets a line in the console and no water.
+
+Two things are better than in the object it replaces. **Moving a water volume is a matrix update** —
+the surface is a render node in the entity's own slot, so the entity carries it, where the legacy
+object rebuilt and re-tessellated the whole surface on every mouse-move sample of a drag. And the
+long-standing load bug that read *Caustic Tiling* into *Caustic Intensity* is not reproduced, so both
+values survive a save and reload.
+
+Water needs at least **four** points. Three will draw, but the physics area needs four, so a
+three-point volume would render and float nothing; the component says so rather than staying silent.
+
+| Property | Default | Meaning |
+| --- | --- | --- |
+| **Enabled** | true | Whether the water exists at all. |
+| **Material** | (empty) | The water material. It must use a shader of type **Water** — anything else is reported once in the console, which is the usual cause of "my water is invisible". Empty falls back to the entity's own material. |
+| **Depth** | 10 | How deep the water goes below its surface, in metres. It is also what the physics volume is extruded down by. |
+| **Stream Speed** | 0 | Speed of the surface flow. On a river it also becomes the physics flow along the contour, so things float downstream. |
+| **Fog Density** | 0.5 | Density of the underwater fog. **Zero draws nothing at all** — not even the surface. |
+| **Fog Color** | (0.005, 0.01, 0.02) | Colour of the underwater fog, before the multiplier. |
+| **Fog Color Multiplier** | 0.5 | Multiplier applied to Fog Color. |
+| **Fog Color Affected By Sun** | true | Whether the sun colour tints the fog. |
+| **Fog Shadowing** | 0.5 | How much shadows darken the fog. |
+| **Cap Fog At Volume Depth** | false | Stop the fog at Depth instead of letting it continue below. |
+| **U Scale** / **V Scale** | 1 / 1 | Surface texture scale. |
+| **View Distance Ratio** | 100 | View distance ratio of the water render nodes. |
+| **Caustics** | true | Whether the volume casts water caustics. |
+| **Caustic Intensity** | 1 | Strength of the caustics. |
+| **Caustic Tiling** | 1 | Tiling of the caustic pattern. |
+| **Caustic Height** | 0.5 | How far above the surface the caustics still reach, in metres. The bounding box grows by it. |
+| **Water Density** | 1000 | Buoyancy density — what decides whether a thing floats. |
+| **Water Resistance** | 1000 | Buoyancy resistance — how much the water drags on a thing moving through it. |
+| **Fixed Volume**, **Volume Accuracy**, **Extrude Border**, **Convex Border**, **Object Size Limit**, **Wave Sim Cell**, **Wave Speed**, **Wave Damping**, **Wave Timestep**, **Min Wave Velocity**, **Depth Cells**, **Height Limit**, **Wave Resistance**, **Sim Area Growth** | — | The physics wave-simulation block, exactly the "Advanced" group of the legacy object. **Wave Sim Cell** of 0 leaves the simulation off, which is the default. |
+| **River Width** | 4 | River only: width of the water at a point flagged "default width". A spline point that carries its own **Width** overrides it, so a river can widen and narrow. |
+| **River Step Size** | 4 | River only: distance between sectors along the curve. Shorter follows the curve better and costs more render nodes. |
+| **River Tile Length** | 4 | River only: how many metres of river one texture tile covers. |
+
+A river is one render node per sector and **one** physics area for the whole river, which is how the
+legacy River object is built too. Its nodes hold world positions, so moving a river entity rebuilds
+it — only area water gets the cheap move.
+
+### Road
+
+Drapes a road over the terrain along the spline. The render nodes are the engine's own road nodes, in
+chunks of 16 sectors, including the 7.5 cm overlap at each chunk boundary that hides the seam the
+mesh format would otherwise leave. Per-point **Width** on the spline widens and narrows the road; a
+point flagged "default width" uses **Width** below.
+
+| Property | Default | Meaning |
+| --- | --- | --- |
+| **Enabled** | true | Whether the road exists at all. |
+| **Material** | (empty) | Road material. Empty falls back to the entity's own material. |
+| **Width** | 4 | Width of the road at a point flagged "default width", in metres. |
+| **Border Width** | 6 | Width of the band outside the road over which **Align Terrain To Road** blends the terrain back to what it was. |
+| **Step Size** | 4 | Distance between sectors along the curve, 0.25 to 10 m. Shorter follows the curve better and costs more triangles. |
+| **Tile Length** | 4 | How many metres of road one texture tile covers. |
+| **Sort Priority** | 0 | Which road wins where two overlap. Higher draws on top. |
+| **View Distance Ratio** | 100 | View distance ratio of the road render nodes. |
+| **Ignore Terrain Holes** | false | Keep the road surface across a terrain hole instead of letting the hole cut it. |
+| **Physicalize** | false | Give the road its own collision surface, so its material's surface type is what things drive on. |
+
+**Align Terrain To Road** is a button on the component. It pushes the heightmap up (or down) to meet
+the road: the road's own height inside its width, then a cosine blend back to the terrain over
+**Border Width**, and nothing beyond that. One **Ctrl+Z** puts the terrain back. The road re-drapes
+itself over the new heights in the same step, because the engine tells every road node inside a
+changed patch of terrain to re-project.
+
+Unlike the legacy Road object there is no **Erase Vegetation** button yet.
+
 ## Behaviour worth knowing
 
-**Instances and areas are owned by the entity and are not written into the level.** A distributor's
-meshes are render nodes the component owns; the level file stores the parameters and the seed, and
-the instances are rebuilt from them. The level's object export skips them entirely — adding twenty
-instances does not grow the exported octree data. You still see them on export and in GameLauncher,
-because the entity recreates them there from the same parameters.
+**Instances, water and roads are owned by the entity and are not written into the level.** A
+distributor's meshes, a water volume's surface and a road's sectors are render nodes the component
+owns; the level file stores the parameters and the shape, and the geometry is rebuilt from them. The
+level's object export skips them entirely — adding twenty instances, or a lake, does not grow the
+exported octree data. You still see them on export and in GameLauncher, because the entity recreates
+them there from the same parameters. A legacy Water Volume or Road, by contrast, is baked into that
+exported data and can only be changed by re-exporting the level.
 
 **The Area component's hidden area proxy leaves no trace in the level.** It is flagged not to save,
 so an entity carrying Shape + Area writes no `<Area>` node: the geometry exists once, in the shape
@@ -379,7 +478,13 @@ whichever artefact is out of shot.
   saved. Build new areas on new entities.
 - **No per-vertex height** on the polygon (the roof is flat at *lowest Z + Height*), no filled
   display, and no merge / split / reverse tools for polygon or spline.
-- **No road and no river** function components yet.
+- **No Erase Vegetation** on the road (the legacy object has it beside Align Height Map).
+- **Moving a river or a road rebuilds it**; only area water gets the cheap matrix move. A river's
+  and a road's vertices are world positions, and a road is draped over the terrain it crosses.
+- **A river's fog plane is one plane for the whole river**, as in the legacy object, so a river that
+  drops a long way down a hill fogs correctly only near its own level.
+- **An entity's scale is not applied to a road's or a river's width.** Author the width with the
+  property, or with the spline's per-point widths.
 - A polygon's roof ring is drawn and picked along **world** up, so a rotated entity extrudes visually
   along world Z. Legacy does exactly the same; this is parity, not a regression.
 - Objects created through **Create Object → Area** persist their class name in the level, so a level

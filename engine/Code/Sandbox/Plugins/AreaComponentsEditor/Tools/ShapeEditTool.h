@@ -105,6 +105,30 @@ private:
 	//! does, because it deletes this tool.
 	void     AbandonLostTarget();
 
+	//! --- The draw flow (backlog B1)
+	//!
+	//! A shape component added by hand - Add Component -> Area -> Shape: Polygon / Shape: Spline -
+	//! arrives with no points at all, so there is nothing for the point tool to edit. Pressing
+	//! Edit Shape on such a shape runs the SAME draw gesture the Create panel runs, on the entity
+	//! the user already has: the entity's own position is point 1, every click adds the next
+	//! point, a double-click or Enter finishes, Esc leaves the shape empty. When it finishes the
+	//! tool stays up and simply becomes the point tool again, and the whole draw is one undo step.
+	//!
+	//! The three steps of the gesture itself - pick, append, draw - are the create tool's, shared
+	//! through AreaShapeTools; what is here is only when to start it and when it is done.
+
+	//! Starts the draw on a shape with fewer than two points. Deliberately NOT called from
+	//! SetUserData(): that runs while the level editor is still installing the tool, and opening
+	//! an undo transaction in there is the trap CShapeRecenterTool already fell into (report 05).
+	void     StartDraw();
+	//! Ends the draw and returns to point editing. Too few points for the kind
+	//! (IShapeComponentEdit::GetMinPointCount) is a cancelled draw, with a warning.
+	void     FinishDraw();
+	//! Rolls the whole draw back to the empty shape the user pressed Edit Shape on and leaves the
+	//! tool. DELETES this tool - callers must return immediately.
+	void     CancelDraw();
+	bool     DrawMouseCallback(CViewport* pView, EMouseEvent event, CPoint& point, int flags);
+
 	void     BeginGesture(const char* szName);
 	void     EndGesture(bool bChanged);
 	void     SyncEditedComponent();
@@ -114,6 +138,12 @@ private:
 
 	int    m_selectedPoint = -1;
 	bool   m_gestureOpen = false;
+	//! The target had fewer than two points when the tool was given it: draw first, edit after.
+	bool   m_bDrawPending = false;
+	bool   m_bDrawing = false;
+	//! Cursor position of the last mouse move, drawn as the rubber-band edge while drawing.
+	bool   m_bCursorValid = false;
+	Vec3   m_cursorWorldPos = ZERO;
 	bool   m_modifying = false;
 	CPoint m_mouseDownPos = CPoint(0, 0);
 	Vec3   m_pointWorldPosAtDragStart = ZERO;

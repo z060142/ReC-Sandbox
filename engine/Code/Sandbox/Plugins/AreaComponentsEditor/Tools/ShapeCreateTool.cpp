@@ -22,14 +22,6 @@
 using Cry::AreaComponents::IShapeComponent;
 using Cry::AreaComponents::IShapeComponentEdit;
 
-namespace
-{
-//! Two clicks closer together than this make one point, not two.
-const float kMinPointSpacing = 0.01f;
-//! Largest number of points drawn in one frame while the shape is being created.
-const int kMaxDrawPoints = 1024;
-}
-
 //! CAreaFunctionComponent::ReflectType, CryPlugins/AreaComponents/Module/Functions/AreaFunctionComponent.h.
 const char* const szAreaFunctionComponentGuid = "B4E27C09-8A16-4D53-9C70-1F5D3E8A4620";
 
@@ -117,14 +109,7 @@ IShapeComponentEdit* CShapeCreateTool::ResolveShapeEdit() const
 
 bool CShapeCreateTool::PickWorldPoint(CViewport* pView, CPoint& point, Vec3& worldPos) const
 {
-	if (pView == nullptr)
-		return false;
-
-	// The pick CShapeObject makes while it is being drawn: cast to terrain and geometry, with no
-	// axis constraint, so every point lands on what the user is pointing at (ShapeObject.cpp:1174).
-	worldPos = pView->MapViewToCP(point, CLevelEditorSharedState::Axis::None, true, 0.0f);
-	worldPos = pView->SnapToGrid(worldPos);
-	return worldPos.IsValid();
+	return AreaShapeTools::PickDrawPoint(pView, point, worldPos);
 }
 
 bool CShapeCreateTool::StartCreation(const Vec3& worldPos)
@@ -216,32 +201,7 @@ void CShapeCreateTool::SeedShape()
 
 void CShapeCreateTool::AppendPoint(const Vec3& worldPos)
 {
-	CBaseObject*         pObject = ResolveObject();
-	IShapeComponentEdit* pEdit = ResolveShapeEdit();
-	if (pObject == nullptr || pEdit == nullptr)
-		return;
-
-	// The points are the shape's own, so the world position has to come back into its space - the
-	// component's world transform, which is the entity's while the component has no transform.
-	IShapeComponent* pShape = AreaShapeTools::AsShape(ResolveComponent());
-	Matrix34         shapeTM = pShape != nullptr ? pShape->GetWorldTransformMatrix() : pObject->GetWorldTM();
-
-	// The click that opens a double click lands on the pixel the double click lands on, so it
-	// would append the point the double click is about to finish with. Dropping a point that sits
-	// on the previous one is what legacy achieves by popping its trailing temporary point
-	// (ShapeObject.cpp:1198-1199) - here it keeps the log free of "too close to another point".
-	const int count = pEdit->GetPointCount();
-	if (count > 0)
-	{
-		const Vec3 lastWorld = shapeTM.TransformPoint(pEdit->GetPoint(count - 1));
-		if (lastWorld.GetDistance(worldPos) < kMinPointSpacing)
-			return;
-	}
-
-	Matrix34 invShapeTM = shapeTM;
-	invShapeTM.Invert();
-
-	pEdit->InsertPoint(-1, invShapeTM.TransformPoint(worldPos));
+	AreaShapeTools::AppendDrawPoint(AreaShapeTools::AsShape(ResolveComponent()), worldPos);
 }
 
 void CShapeCreateTool::FinishCreation()
@@ -377,35 +337,6 @@ void CShapeCreateTool::Display(SDisplayContext& dc)
 	if (!m_bCreating)
 		return;
 
-	IShapeComponent* pShape = AreaShapeTools::AsShape(ResolveComponent());
-	if (pShape == nullptr)
-		return;
-
-	// The buffer is on our stack, never a container handed to the other DLL (heap rule,
-	// IShapeComponent.h).
-	Vec3      points[kMaxDrawPoints];
-	const int count = min(pShape->GetContour(points, kMaxDrawPoints, true), kMaxDrawPoints);
-	if (count <= 0)
-		return;
-
-	// Yellow is what legacy draws the edge being placed in (ShapeObject.cpp:1322-1330).
-	dc.SetColor(ColorB(255, 255, 0, 255));
-
-	for (int i = 0; i + 1 < count; ++i)
-	{
-		dc.DrawLine(points[i], points[i + 1]);
-	}
-
-	if (m_bCursorValid)
-	{
-		// The rubber band: the edge the next click would commit, and the edge that would close
-		// the polygon once it has one.
-		dc.DrawLine(points[count - 1], m_cursorWorldPos);
-
-		if (count >= 2)
-		{
-			dc.SetColor(ColorB(255, 255, 0, 128));
-			dc.DrawLine(m_cursorWorldPos, points[0]);
-		}
-	}
+	AreaShapeTools::DisplayDrawInProgress(dc, AreaShapeTools::AsShape(ResolveComponent()),
+	                                      m_bCursorValid, m_cursorWorldPos);
 }

@@ -470,9 +470,26 @@ void CDistributorComponent::BuildInstances(ISplineShape& spline, std::vector<SIn
 		if (meshIndex < 0)
 			continue;
 
-		float distance = trimStart + static_cast<float>(i) * spacing;
+		float distance = trimStart + static_cast<float>(i) * spacing + m_alongShift;
 		if (m_spacingJitter > 0.0f)
 			distance += spacingDraw * m_spacingJitter * spacing * 0.5f;
+
+		if (m_alongShift != 0.0f && usable > 0.0001f)
+		{
+			if (spline.IsClosed())
+			{
+				// A ring has no ends to fall off: the pattern rotates round it.
+				const float local = fmod_tpl(fmod_tpl(distance - trimStart, usable) + usable, usable);
+				distance = trimStart + local;
+			}
+			else if (distance < trimStart || distance > trimStart + usable)
+			{
+				// Slid past an end. Dropping it is the honest answer - clamping would pile every
+				// shifted-out instance on top of the last one.
+				continue;
+			}
+		}
+
 		distance = clamp_tpl(distance, trimStart, trimStart + usable);
 
 		const float t = (totalLength > 0.0f) ? clamp_tpl(distance / totalLength, 0.0f, 1.0f) : 0.0f;
@@ -532,9 +549,12 @@ void CDistributorComponent::BuildInstances(ISplineShape& spline, std::vector<SIn
 		if (scale <= 0.0f)
 			continue;
 
-		const Vec3 offset(m_offsetMin.x + (m_offsetMax.x - m_offsetMin.x) * offsetDraw.x,
-		                  m_offsetMin.y + (m_offsetMax.y - m_offsetMin.y) * offsetDraw.y,
-		                  m_offsetMin.z + (m_offsetMax.z - m_offsetMin.z) * offsetDraw.z);
+		// The base offset first, the per-instance jitter on top - both in the curve's frame, so a
+		// distributor pushed sideways stays the same distance from the line all the way round a bend.
+		const Vec3 offset = m_baseOffset +
+		                    Vec3(m_offsetMin.x + (m_offsetMax.x - m_offsetMin.x) * offsetDraw.x,
+		                         m_offsetMin.y + (m_offsetMax.y - m_offsetMin.y) * offsetDraw.y,
+		                         m_offsetMin.z + (m_offsetMax.z - m_offsetMin.z) * offsetDraw.z);
 
 		// Stretch To Fit makes the section exactly as long as the gap it has to bridge, which is
 		// what closes a fence instead of merely aiming it.
@@ -577,7 +597,7 @@ void CDistributorComponent::BuildInstances(ISplineShape& spline, std::vector<SIn
 
 			SInstance instance;
 			instance.meshIndex = endCapIndex;
-			instance.tm = BuildInstanceTransform(frame, endCapIndex, 1.0f, 1.0f, position, Vec3(ZERO));
+			instance.tm = BuildInstanceTransform(frame, endCapIndex, 1.0f, 1.0f, position, m_baseOffset);
 
 			out.push_back(instance);
 		}
@@ -788,6 +808,10 @@ uint64 CDistributorComponent::ComputeBuildSignature(ISplineShape& spline) const
 	mixFloat(m_scaleRampEnd);
 	mix(m_bWidthScales ? 1 : 0);
 	mixFloat(m_defaultWidth);
+	mixFloat(m_baseOffset.x);
+	mixFloat(m_baseOffset.y);
+	mixFloat(m_baseOffset.z);
+	mixFloat(m_alongShift);
 	mixFloat(m_offsetMin.x);
 	mixFloat(m_offsetMin.y);
 	mixFloat(m_offsetMin.z);
@@ -814,6 +838,7 @@ uint64 CDistributorComponent::ComputeBuildSignature(ISplineShape& spline) const
 		mixString(entry.mesh.value);
 	}
 	mixString(m_endCapMesh.value);
+	mix(static_cast<uint64>(m_label.length()));
 
 	mixFloat(spline.TotalLength());
 	mix(spline.IsClosed() ? 1 : 0);
@@ -841,9 +866,10 @@ void CDistributorComponent::LogRebuild(float curveLength, int requestedCount, in
 	const int  endCapIndex = GetEndCapMeshIndex();
 	const bool bEndCapLoaded = endCapIndex < static_cast<int>(m_statObjs.size()) && m_statObjs[endCapIndex] != nullptr;
 
-	CryLog("Distributor on entity \"%s\": curve %.2f m, %s (step %.2f, count %d, density %.3f), trim %.2f/%.2f, "
+	CryLog("Distributor \"%s\" on entity \"%s\": curve %.2f m, %s (step %.2f, count %d, density %.3f), trim %.2f/%.2f, "
 	       "skip %.2f, align %s (forward %s%s%s), meshes %d listed / %d loaded, end cap %s - %d asked for, "
 	       "%d placed, %d nodes.",
+	       (GetName() != nullptr && GetName()[0] != '\0') ? GetName() : "Distributor",
 	       (m_pEntity != nullptr) ? m_pEntity->GetName() : "<none>",
 	       curveLength, szSpacingNames[spacingIndex], m_step, m_count, m_density,
 	       m_trimStart, m_trimEnd, m_skipProbability, szAlignNames[alignIndex],
@@ -982,8 +1008,18 @@ void CDistributorComponent::RebuildTransformsOnly()
 // Events
 // ---------------------------------------------------------------------------
 
+void CDistributorComponent::ApplyLabel()
+{
+	// CreateComponentWidgets titles a panel with IEntityComponent::GetName() when it is set and
+	// falls back to the class label otherwise (EntityObject.cpp:1078-1085). So an entity carrying
+	// three distributors can have three readable panels instead of three called "Distributor" -
+	// which is the difference between finding the lamp posts and counting panels.
+	SetName(m_label.c_str());
+}
+
 void CDistributorComponent::Initialize()
 {
+	ApplyLabel();
 	Rebuild();
 }
 
@@ -1071,6 +1107,7 @@ void CDistributorComponent::ProcessEvent(const SEntityEvent& event)
 	switch (event.event)
 	{
 	case ENTITY_EVENT_COMPONENT_PROPERTY_CHANGED:
+		ApplyLabel();
 		Rebuild();
 		break;
 	case ENTITY_EVENT_HIDE:

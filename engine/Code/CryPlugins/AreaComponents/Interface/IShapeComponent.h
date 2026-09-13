@@ -278,6 +278,37 @@ struct ISplineShape
 	//! the local parameter within it. Segment i runs from point i to point i+1, and a closed spline
 	//! has one more segment than an open one (the wrap from the last point back to the first).
 	virtual void  ParamToSegment(float t, int& indexOut, float& segmentTOut) const = 0;
+
+	// --- appended 2026-09-13 with the road function component (stage 4, second round). Append-only.
+	//
+	// Why these three exist. CRoadObject walks the curve SEGMENT BY SEGMENT
+	// (CRoadObject::SetRoadSectors, RoadObject.cpp:158-231): it asks each Bezier segment for its
+	// length, divides that by the step size to get the number of sectors in THAT segment, and then
+	// evaluates position, normal and width at the same segment-local parameter. Everything about a
+	// road's shape - where its sectors fall, how its texture tiles, which way its edges point -
+	// comes out of that loop. Reproducing it needs the segment list, which ParamToSegment could only
+	// be asked about backwards.
+	//
+	// The first version of the road component walked by arc length instead and evaluated position
+	// with PosByDistance() while taking normal and width at t = distance / totalLength. Those are
+	// NOT the same place on a Bezier curve: the ribbon's edges were built from a frame belonging to
+	// a different point than its centre, which shears the road wherever the control points are
+	// unevenly spaced. Hence a road that followed the spline but was not the road CRoadObject makes.
+
+	//! How many curve segments the spline has, indexed exactly as ParamToSegment indexes them. A
+	//! closed spline has one more than an open one (the wrap from the last point back to the first).
+	//! 0 means the kind cannot answer, and the caller must fall back to a whole-curve walk.
+	virtual int   GetSegmentCount() const { return 0; }
+
+	//! Arc length in WORLD metres of segment `index`, from its start up to the segment-local
+	//! parameter `segmentT`. `segmentT` of 1 is the whole segment. This is
+	//! CSplineObject::GetBezierSegmentLength (SplineObject.cpp:773-787), which is what legacy's
+	//! sector counts and texture coordinates are built from.
+	virtual float GetSegmentLength(int index, float segmentT) const { return 0.0f; }
+
+	//! The inverse of ParamToSegment: the normalised parameter over the WHOLE curve at which
+	//! segment `index` reaches its local parameter `segmentT`.
+	virtual float SegmentToParam(int index, float segmentT) const { return 0.0f; }
 };
 
 //! The authoring half of the contract, used by the editor plugin's point tools and by nothing
@@ -329,6 +360,18 @@ struct IShapeComponentEdit
 	//! The buffer belongs to the caller (heap rule at the top of this header); at most `maxPoints`
 	//! samples are written and the return value is how many were written.
 	virtual int GetEdgePoints(int index, Vec3* pOut, int maxPoints) const { return 0; }
+
+	// --- appended 2026-09-12 with backlog B1 (Edit Shape on an empty shape).
+
+	//! The fewest points this kind needs before its contour means anything: three for a closed
+	//! polygon, two for an open one and for a spline. A kind whose point set is FIXED has no
+	//! minimum to enforce - its points are always there - and keeps the default 0.
+	//!
+	//! It is what lets one draw gesture serve every point-list kind without the tool asking which
+	//! kind it is editing: below this count a finished draw is a cancelled draw and the shape is
+	//! left empty. RemovePoint() enforces the same number, which is why it lives here and not in
+	//! the tool.
+	virtual int GetMinPointCount() const { return 0; }
 };
 
 } // namespace AreaComponents

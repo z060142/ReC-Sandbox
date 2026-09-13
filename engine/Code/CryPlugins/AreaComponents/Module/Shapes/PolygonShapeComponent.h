@@ -162,6 +162,7 @@ public:
 	virtual void BeginEdit() override;
 	virtual void EndEdit() override;
 	virtual bool IsContourClosed() const override { return m_closed; }
+	virtual int  GetMinPointCount() const override;
 	// ~IShapeComponentEdit
 
 	//! Per-face obstruction, used by the Area function component and by the drawing below. Not

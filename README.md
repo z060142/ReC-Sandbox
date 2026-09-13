@@ -81,7 +81,11 @@ untouched and the stock path is byte-identical. Deploy note: the repository's
 or the grain technique's runtime flag stays masked off and the grain block never compiles. Full spec:
 `engine/Code/CryPlugins/CinematicCamera/FilmGrainSpec.md`.
 
-### Area components (branch `area-components`)
+### Area components (branch `experimental-area-components`, archived)
+
+**Experimental and archived (2026-09-13).** This branch is kept as a record of the approach; it is not
+merged into `main` and is not maintained. A better solution built on a similar idea exists elsewhere, so
+development here stopped. Everything below still describes what the branch contains.
 
 Shapes and functions as entity components, next to the untouched legacy "Area" objects. One
 shape per entity (Box, Sphere, Polygon, Spline) drawn and edited in the viewport from an

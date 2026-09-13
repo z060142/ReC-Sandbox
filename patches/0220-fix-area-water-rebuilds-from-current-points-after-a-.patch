@@ -1,0 +1,218 @@
+From 86898a57cee7ff3ce60b945b76e91f01b952ba91 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Sun, 13 Sep 2026 00:34:06 +0800
+Subject: [PATCH 220/221] fix(area): water rebuilds from current points after a
+ pivot recenter
+
+Recenter Pivot on a polygon carrying Water Volume left the outline where it was
+and translated the water by the pivot delta, keeping its shape.
+
+Area water's node geometry is LOCAL, relative to contour point 0, and the entity
+slot's local transform carries that point (m_localOrigin) so that the fog plane
+lands where the legacy object puts it. Recenter Pivot moves the entity AND
+rewrites every local point to compensate, so the WORLD contour never changes -
+only the entity-space one does. The component treated a transform notification as
+"move the physics area, nothing else", never re-read the points, and kept an
+origin belonging to the old pivot: node matrix = new entity transform x old
+origin, which is the observed translation exactly.
+
+Three changes, any one of which would have been enough, kept together because the
+notification order here is not something to rely on:
+
+- every OnShapeChanged reason now goes through the rebuild digest, transforms
+  included. Area water's digest is taken in entity space, so dragging the entity
+  still costs nothing and the matrix-only move decision 05 promised is intact;
+- before the digest, a rebuild is forced when the contour's first point in entity
+  space has drifted from m_localOrigin. That is the recenter case named directly,
+  and it survives any order the notifications arrive in;
+- the component now also listens to ENTITY_EVENT_XFORM itself, as insurance for
+  the case where it was not yet bound to the shape when the entity moved.
+
+RebuildIfNeeded returns whether it rebuilt, so the transform path still moves the
+physics area by hand when it did not.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SCUvWGLCsqzm3VNMzp4uiS
+---
+ .../Module/Functions/WaterVolumeComponent.cpp | 74 ++++++++++++++-----
+ .../Module/Functions/WaterVolumeComponent.h   | 13 +++-
+ 2 files changed, 66 insertions(+), 21 deletions(-)
+
+diff --git a/Code/CryPlugins/AreaComponents/Module/Functions/WaterVolumeComponent.cpp b/Code/CryPlugins/AreaComponents/Module/Functions/WaterVolumeComponent.cpp
+index 19bfbe29..bc197982 100644
+--- a/Code/CryPlugins/AreaComponents/Module/Functions/WaterVolumeComponent.cpp
++++ b/Code/CryPlugins/AreaComponents/Module/Functions/WaterVolumeComponent.cpp
+@@ -202,6 +202,20 @@ void CWaterVolumeComponent::FillAuxPhysParams(pe_params_area& out) const
+ 	out.growthReserve = m_simAreaGrowth;
+ }
+ 
++bool CWaterVolumeComponent::GetContourOriginInEntitySpace(IShapeComponent& shape, Vec3& out) const
++{
++	if (m_pEntity == nullptr)
++		return false;
++
++	Vec3      firstPoint(ZERO);
++	const int totalPoints = shape.GetContour(&firstPoint, 1, true);
++	if (totalPoints < 1)
++		return false;
++
++	out = m_pEntity->GetWorldTM().GetInverted().TransformPoint(firstPoint);
++	return true;
++}
++
+ Matrix34 CWaterVolumeComponent::GetNodeWorldTM() const
+ {
+ 	if (m_pEntity == nullptr)
+@@ -613,10 +627,10 @@ uint64 CWaterVolumeComponent::ComputeSignature(IShapeComponent& shape, EMode mod
+ 	return signature.hash != 0 ? signature.hash : 1;
+ }
+ 
+-void CWaterVolumeComponent::RebuildIfNeeded(bool bForce)
++bool CWaterVolumeComponent::RebuildIfNeeded(bool bForce)
+ {
+ 	if (m_pEntity == nullptr || gEnv->p3DEngine == nullptr)
+-		return;
++		return false;
+ 
+ 	IShapeComponent* pShape = EnsureBound();
+ 	if (pShape == nullptr)
+@@ -624,7 +638,7 @@ void CWaterVolumeComponent::RebuildIfNeeded(bool bForce)
+ 		DestroyNodes();
+ 		m_mode = EMode::None;
+ 		m_lastBuildSignature = 0;
+-		return;
++		return false;
+ 	}
+ 
+ 	EMode mode = EMode::None;
+@@ -654,14 +668,26 @@ void CWaterVolumeComponent::RebuildIfNeeded(bool bForce)
+ 		DestroyNodes();
+ 		m_mode = EMode::None;
+ 		m_lastBuildSignature = 0;
+-		return;
++		return false;
+ 	}
+ 
+ 	m_bWarnedWrongKind = false;
+ 
++	// The origin guard. Area water's node geometry is LOCAL and its slot transform carries contour
++	// point 0 in entity space, so a change to that point has to rebuild even when the digest below
++	// would say no. "Recenter Pivot" is exactly that case: it moves the entity and rewrites every
++	// local point to compensate, so the world contour never changes - and a cached origin would keep
++	// the water translated by the pivot delta for ever. Cheap: one point out of the shape.
++	if (!bForce && mode == EMode::Area && mode == m_mode && !m_nodes.empty())
++	{
++		Vec3 currentOrigin(ZERO);
++		if (GetContourOriginInEntitySpace(*pShape, currentOrigin) && !currentOrigin.IsEquivalent(m_localOrigin, 0.0001f))
++			bForce = true;
++	}
++
+ 	const uint64 signature = ComputeSignature(*pShape, mode);
+ 	if (!bForce && signature == m_lastBuildSignature && mode == m_mode)
+-		return;
++		return false;
+ 
+ 	// A mode change throws everything away first: the two modes own their nodes differently (slot
+ 	// versus direct) and nothing survives the switch.
+@@ -672,6 +698,7 @@ void CWaterVolumeComponent::RebuildIfNeeded(bool bForce)
+ 	m_lastBuildSignature = signature;
+ 
+ 	Rebuild();
++	return true;
+ }
+ 
+ void CWaterVolumeComponent::Rebuild()
+@@ -749,22 +776,20 @@ void CWaterVolumeComponent::Initialize()
+ 
+ void CWaterVolumeComponent::OnShapeChanged(IShapeComponent& shape, EShapeChangeReason reason)
+ {
+-	if (reason == EShapeChangeReason::Transform)
++	// EVERY reason goes through the digest now, transforms included, and the digest decides.
++	//
++	// Area water's digest is taken in ENTITY space, so simply dragging the entity leaves it
++	// unchanged and the move stays what decision 05 promised: the slot's matrix plus one
++	// pe_params_pos on the physics area, no re-tessellation. What the old "Transform means physics
++	// only" shortcut could not see is an edit that moves the entity AND rewrites the points to
++	// compensate - "Recenter Pivot" - where the world contour is unchanged but the entity-space one
++	// is not. That rebuilt nothing and left the water translated by the pivot delta.
++	const bool bRebuilt = RebuildIfNeeded(reason != EShapeChangeReason::Transform);
++
++	if (!bRebuilt && reason == EShapeChangeReason::Transform && m_mode == EMode::Area)
+ 	{
+-		// The point of decision 05's option C: moving an area water entity is a matrix update the
+-		// slot has already done, plus moving the physics area. No re-tessellation, where the legacy
+-		// object rebuilds everything on every transform invalidation (ShapeObject.cpp:1044-1053).
+-		if (m_mode == EMode::Area)
+-		{
+-			UpdateAreaPhysicsPlacement();
+-			return;
+-		}
+-
+-		RebuildIfNeeded(false);
+-		return;
++		UpdateAreaPhysicsPlacement();
+ 	}
+-
+-	RebuildIfNeeded(true);
+ }
+ 
+ void CWaterVolumeComponent::ProcessEvent(const SEntityEvent& event)
+@@ -776,6 +801,15 @@ void CWaterVolumeComponent::ProcessEvent(const SEntityEvent& event)
+ 		// here would re-tessellate the volume many times a second while its panel is open.
+ 		RebuildIfNeeded(false);
+ 		break;
++	case ENTITY_EVENT_XFORM:
++		{
++			// Insurance, not the main path: the shape tells its listeners about transforms too. This
++			// covers the case where the component was not bound when the entity moved - EnsureBound()
++			// runs inside RebuildIfNeeded - and it costs nothing, because the digest decides.
++			if (!RebuildIfNeeded(false) && m_mode == EMode::Area)
++				UpdateAreaPhysicsPlacement();
++		}
++		break;
+ 	case ENTITY_EVENT_HIDE:
+ 	case ENTITY_EVENT_UNHIDE:
+ 		{
+@@ -798,7 +832,7 @@ void CWaterVolumeComponent::ProcessEvent(const SEntityEvent& event)
+ 
+ Cry::Entity::EventFlags CWaterVolumeComponent::GetEventMask() const
+ {
+-	return ENTITY_EVENT_COMPONENT_PROPERTY_CHANGED | ENTITY_EVENT_HIDE | ENTITY_EVENT_UNHIDE;
++	return ENTITY_EVENT_COMPONENT_PROPERTY_CHANGED | ENTITY_EVENT_XFORM | ENTITY_EVENT_HIDE | ENTITY_EVENT_UNHIDE;
+ }
+ 
+ void CWaterVolumeComponent::OnShutDown()
+diff --git a/Code/CryPlugins/AreaComponents/Module/Functions/WaterVolumeComponent.h b/Code/CryPlugins/AreaComponents/Module/Functions/WaterVolumeComponent.h
+index 6ed17027..b9398835 100644
+--- a/Code/CryPlugins/AreaComponents/Module/Functions/WaterVolumeComponent.h
++++ b/Code/CryPlugins/AreaComponents/Module/Functions/WaterVolumeComponent.h
+@@ -159,7 +159,9 @@ private:
+ 	//! Rebuilds only when something a rebuild reads has changed, the way the distributor does it -
+ 	//! ENTITY_EVENT_COMPONENT_PROPERTY_CHANGED arrives on every inspector serialization pass, and a
+ 	//! rebuild here is a 256x tessellation plus a physics area (report 05 section 5d).
+-	void  RebuildIfNeeded(bool bForce);
++	//! Returns whether it actually rebuilt, so that the transform path knows whether it still has
++	//! to move the physics area by hand.
++	bool  RebuildIfNeeded(bool bForce);
+ 	void  Rebuild();
+ 	bool  BuildArea(IShapeComponent& shape);
+ 	bool  BuildRiver(IShapeComponent& shape, ISplineShape& spline);
+@@ -191,6 +193,15 @@ private:
+ 
+ 	uint64 ComputeSignature(IShapeComponent& shape, EMode mode) const;
+ 
++	//! The contour's first point in ENTITY space, which is what m_localOrigin caches and what the
++	//! slot's local transform carries. False when the shape has no usable contour.
++	//!
++	//! It exists because of the pivot-recenter bug: "Recenter Pivot" moves the entity AND rewrites
++	//! every local point so that nothing moves in the world, which leaves the world contour
++	//! identical and m_localOrigin - a point in ENTITY space - stale. A stale origin translates the
++	//! water by exactly the pivot delta while keeping its shape, which is what the user saw.
++	bool GetContourOriginInEntitySpace(IShapeComponent& shape, Vec3& out) const;
++
+ 	//! Largest contour any one rebuild copies onto the stack. A water contour is triangulated and
+ 	//! then tessellated 256x, so a contour anywhere near this is already a mistake.
+ 	static constexpr int kMaxStackPoints = 1024;
+-- 
+2.47.1.windows.1
+

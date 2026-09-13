@@ -1,0 +1,590 @@
+From 65ef6b232457deed474feed0e2084d00980335ff Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Sun, 13 Sep 2026 00:34:30 +0800
+Subject: [PATCH 221/221] fix(area): road component builds the stock road
+ sectors
+
+The road followed the spline but was not the road CRoadObject makes. The cause
+was the walk, not the render node.
+
+CRoadObject walks the curve SEGMENT BY SEGMENT (SetRoadSectors,
+RoadObject.cpp:158-231): each Bezier segment is asked for its length, that length
+divided by the step gives int((length + 0.5) / step) sectors for THAT segment -
+never fewer than one - and position, normal and width are then all evaluated at
+the same segment-local parameter. The component walked by arc length instead and,
+worse, took the position from PosByDistance() while taking normal and width at
+t = distance / totalLength. On a Bezier curve those are two different points, so
+every station's edges were built from a frame belonging to somewhere else: the
+ribbon sheared wherever the control points were unevenly spaced, and the sector
+boundaries fell in places legacy would never put them.
+
+SplineSectors.h now holds that walk once, against the shape contract, and both the
+road and the river use it - which is exactly right, because CRiverObject IS a
+CRoadObject and inherits the sector generation verbatim (RiverObject.cpp:195-230).
+ISplineShape gained the three append-only queries it needs - GetSegmentCount,
+GetSegmentLength(index, segmentT) and SegmentToParam - with defaults that make a
+kind which cannot answer fall back to a parameter-uniform walk rather than to the
+mismatched one. GetSegmentLength is CSplineObject::GetBezierSegmentLength's
+32-chord approximation, deliberately the same coarseness, so sector counts and
+texture coordinates come out where legacy puts them.
+
+Also aligned with CRoadObject::UpdateSectors (:283-326):
+
+- texture coordinates per chunk are now the stations' own arc lengths divided by
+  Tile Length (CRoadSector::t0, :195), not a uniform step, and the global range is
+  the first and last station's, which is what the end fade reads;
+- node setup order is flags, view distance ratio, min spec, material layers,
+  editor id, and only then SetVertices - which is what schedules the rebuild that
+  turns them into a mesh. Min spec and material layers were not pushed at all.
+
+Unchanged because they already matched: vertex order (left = +normal first, which
+is what GetClipPlanes assumes when it builds a trapezoid's clip planes,
+RoadRenderNode.cpp:647-650), 16 sectors per node, the 7.5 cm end overlap, the
+defaults, material handling (CMaterial::AssignToEntity is SetMaterial and nothing
+else, Material.cpp:1331-1335), and registration (Compile ends with RegisterEntity,
+RoadRenderNode.cpp:462).
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SCUvWGLCsqzm3VNMzp4uiS
+---
+ .../Interface/IShapeComponent.h               |  31 ++++
+ .../AreaComponents/Module/CMakeLists.txt      |   1 +
+ .../Module/Functions/RoadComponent.cpp        |  71 +++++----
+ .../Module/Functions/RoadComponent.h          |   9 +-
+ .../Module/Functions/SplineSectors.h          | 135 ++++++++++++++++++
+ .../Module/Functions/WaterVolumeComponent.cpp |  50 +++----
+ .../Module/Shapes/SplineShapeComponent.cpp    |  49 +++++++
+ .../Module/Shapes/SplineShapeComponent.h      |   4 +-
+ 8 files changed, 278 insertions(+), 72 deletions(-)
+ create mode 100644 Code/CryPlugins/AreaComponents/Module/Functions/SplineSectors.h
+
+diff --git a/Code/CryPlugins/AreaComponents/Interface/IShapeComponent.h b/Code/CryPlugins/AreaComponents/Interface/IShapeComponent.h
+index c8cf5776..03bd99af 100644
+--- a/Code/CryPlugins/AreaComponents/Interface/IShapeComponent.h
++++ b/Code/CryPlugins/AreaComponents/Interface/IShapeComponent.h
+@@ -278,6 +278,37 @@ struct ISplineShape
+ 	//! the local parameter within it. Segment i runs from point i to point i+1, and a closed spline
+ 	//! has one more segment than an open one (the wrap from the last point back to the first).
+ 	virtual void  ParamToSegment(float t, int& indexOut, float& segmentTOut) const = 0;
++
++	// --- appended 2026-09-13 with the road function component (stage 4, second round). Append-only.
++	//
++	// Why these three exist. CRoadObject walks the curve SEGMENT BY SEGMENT
++	// (CRoadObject::SetRoadSectors, RoadObject.cpp:158-231): it asks each Bezier segment for its
++	// length, divides that by the step size to get the number of sectors in THAT segment, and then
++	// evaluates position, normal and width at the same segment-local parameter. Everything about a
++	// road's shape - where its sectors fall, how its texture tiles, which way its edges point -
++	// comes out of that loop. Reproducing it needs the segment list, which ParamToSegment could only
++	// be asked about backwards.
++	//
++	// The first version of the road component walked by arc length instead and evaluated position
++	// with PosByDistance() while taking normal and width at t = distance / totalLength. Those are
++	// NOT the same place on a Bezier curve: the ribbon's edges were built from a frame belonging to
++	// a different point than its centre, which shears the road wherever the control points are
++	// unevenly spaced. Hence a road that followed the spline but was not the road CRoadObject makes.
++
++	//! How many curve segments the spline has, indexed exactly as ParamToSegment indexes them. A
++	//! closed spline has one more than an open one (the wrap from the last point back to the first).
++	//! 0 means the kind cannot answer, and the caller must fall back to a whole-curve walk.
++	virtual int   GetSegmentCount() const { return 0; }
++
++	//! Arc length in WORLD metres of segment `index`, from its start up to the segment-local
++	//! parameter `segmentT`. `segmentT` of 1 is the whole segment. This is
++	//! CSplineObject::GetBezierSegmentLength (SplineObject.cpp:773-787), which is what legacy's
++	//! sector counts and texture coordinates are built from.
++	virtual float GetSegmentLength(int index, float segmentT) const { return 0.0f; }
++
++	//! The inverse of ParamToSegment: the normalised parameter over the WHOLE curve at which
++	//! segment `index` reaches its local parameter `segmentT`.
++	virtual float SegmentToParam(int index, float segmentT) const { return 0.0f; }
+ };
+ 
+ //! The authoring half of the contract, used by the editor plugin's point tools and by nothing
+diff --git a/Code/CryPlugins/AreaComponents/Module/CMakeLists.txt b/Code/CryPlugins/AreaComponents/Module/CMakeLists.txt
+index f0df79e8..5af72d3e 100644
+--- a/Code/CryPlugins/AreaComponents/Module/CMakeLists.txt
++++ b/Code/CryPlugins/AreaComponents/Module/CMakeLists.txt
+@@ -35,6 +35,7 @@ add_sources("AreaComponents_uber_0.cpp"
+ 		"Functions/GravityVolumeComponent.cpp"
+ 		"Functions/DistributorComponent.h"
+ 		"Functions/DistributorComponent.cpp"
++		"Functions/SplineSectors.h"
+ 		"Functions/WaterVolumeComponent.h"
+ 		"Functions/WaterVolumeComponent.cpp"
+ 		"Functions/RoadComponent.h"
+diff --git a/Code/CryPlugins/AreaComponents/Module/Functions/RoadComponent.cpp b/Code/CryPlugins/AreaComponents/Module/Functions/RoadComponent.cpp
+index 0697afcf..879e8402 100644
+--- a/Code/CryPlugins/AreaComponents/Module/Functions/RoadComponent.cpp
++++ b/Code/CryPlugins/AreaComponents/Module/Functions/RoadComponent.cpp
+@@ -1,6 +1,7 @@
+ // Copyright 2026 ReC Sandbox. Distributed under the terms in LICENSE.md at the repository root.
+ #include "StdAfx.h"
+ #include "RoadComponent.h"
++#include "SplineSectors.h"
+ 
+ #include <Cry3DEngine/I3DEngine.h>
+ #include <Cry3DEngine/IRenderNode.h>
+@@ -131,42 +132,26 @@ IMaterial* CRoadComponent::ResolveMaterial() const
+ bool CRoadComponent::BuildSamples(ISplineShape& spline)
+ {
+ 	m_samples.clear();
++	m_sampleTex.clear();
+ 
+-	const float totalLength = spline.TotalLength();
+-	if (totalLength <= 0.01f)
++	// CRoadObject::SetRoadSectors' own walk, in SplineSectors.h - per Bezier segment, sector count
++	// from that segment's length, position and frame taken at one and the same parameter.
++	std::vector<SSplineStation> stations;
++	const int stationCount = SplineSectors::BuildStations(spline, m_step, m_width, kMaxStations, stations);
++	if (stationCount < 2)
+ 		return false;
+ 
+-	const float step = clamp_tpl(m_step, 0.25f, 10.0f);
+-	const int   sectorCount = clamp_tpl(static_cast<int>(totalLength / step + 0.5f), 1, kMaxSectors);
+-	const int   stationCount = sectorCount + 1;
++	const float tileLength = max(0.001f, m_tileLength);
+ 
+-	// Walked by ARC LENGTH, where CRoadObject walks each Bezier segment with its own step count
+-	// (GetRoadSectorCount, RoadObject.cpp:233-239). The strip is the same shape; evenly spaced
+-	// sectors are a small improvement, because legacy's step count is rounded per segment and a
+-	// short segment therefore gets a coarser road than a long one.
+ 	m_samples.resize(static_cast<size_t>(stationCount));
+-	m_sampledLength = totalLength;
++	m_sampleTex.resize(static_cast<size_t>(stationCount));
+ 
+-	for (int k = 0; k < stationCount; ++k)
++	for (int i = 0; i < stationCount; ++i)
+ 	{
+-		const float distance = (static_cast<float>(k) / static_cast<float>(sectorCount)) * totalLength;
+-		const float t = clamp_tpl(distance / totalLength, 0.0f, 1.0f);
+-
+-		SRoadSample& sample = m_samples[static_cast<size_t>(k)];
+-		sample.worldPos = spline.PosByDistance(distance);
+-
+-		Vec3 normal = spline.EvalNormal(t);
+-		if (normal.IsZero())
+-		{
+-			Vec3 tangent = spline.EvalTangent(t);
+-			normal = tangent.IsZero() ? Vec3(0.0f, 1.0f, 0.0f) : tangent.GetOrthogonal().GetNormalized();
+-		}
+-		sample.worldNormal = normal.GetNormalized();
+-
+-		// The spline's own per-point width, blended along the segment exactly as
+-		// CRoadObject::GetLocalWidth does (RoadObject.cpp:125-151); a point flagged "default width"
+-		// contributes this component's Width.
+-		sample.width = max(0.01f, spline.GetLocalWidth(t, m_width));
++		m_samples[static_cast<size_t>(i)].worldPos = stations[static_cast<size_t>(i)].worldPos;
++		m_samples[static_cast<size_t>(i)].worldNormal = stations[static_cast<size_t>(i)].worldNormal;
++		m_samples[static_cast<size_t>(i)].width = stations[static_cast<size_t>(i)].width;
++		m_sampleTex[static_cast<size_t>(i)] = stations[static_cast<size_t>(i)].distance / tileLength;
+ 	}
+ 
+ 	return true;
+@@ -186,13 +171,13 @@ void CRoadComponent::BuildNodes()
+ 	IMaterial* pMaterial = ResolveMaterial();
+ 	const bool bHidden = m_pEntity->IsHidden();
+ 
+-	const float tileLength = max(0.001f, m_tileLength);
+-
+-	// Texture coordinates are the distance along the road divided by the tile length. The stations
+-	// are evenly spaced by arc length, so the whole table is one multiply.
+-	const float texPerStation = (m_sampledLength / static_cast<float>(sectorCount)) / tileLength;
+-	const float texGlobalBegin = 0.0f;
+-	const float texGlobalEnd = texPerStation * static_cast<float>(sectorCount);
++	// The whole road's texture range, which every chunk is told about so that the shader can fade
++	// the two ends: CRoadObject passes fabs(sectorFirstGlobal.t0) and fabs(sectorLastGlobal.t1)
++	// (RoadObject.cpp:317-318). Ours are already positive - the legacy object negates the final t1
++	// as an end-of-road marker and then takes its absolute value again at every use, so the sign
++	// carries no information here.
++	const float texGlobalBegin = m_sampleTex[0];
++	const float texGlobalEnd = m_sampleTex[static_cast<size_t>(stationCount - 1)];
+ 
+ 	m_nodes.reserve(static_cast<size_t>(chunkCount));
+ 
+@@ -210,8 +195,14 @@ void CRoadComponent::BuildNodes()
+ 		// Owned by the entity, so COctreeNode::SaveObjects skips it (ObjectsTree_Serialize.cpp:295)
+ 		// - the engine change this stage added.
+ 		pNode->SetOwnerEntity(m_pEntity);
++
++		// CRoadObject::UpdateSectors' order, RoadObject.cpp:283-287: flags, view distance, min spec,
++		// material layers, editor id - all before the vertices, because SetVertices schedules the
++		// rebuild that turns them into a mesh.
+ 		pNode->SetRndFlags(bHidden ? ERF_HIDDEN : 0);
+ 		pNode->SetViewDistRatio(m_viewDistRatio);
++		pNode->SetMinSpec(0);
++		pNode->SetMaterialLayers(0);
+ 		pNode->SetEditorObjectId(m_pEntity->GetEditorObjectID());
+ 
+ 		// The quad strip: one left/right pair per station of the chunk. The render node knows
+@@ -248,8 +239,8 @@ void CRoadComponent::BuildNodes()
+ 			vertices.push_back(rightEnd + rightOffset);
+ 		}
+ 
+-		const float texBegin = texPerStation * static_cast<float>(firstSector);
+-		const float texEnd = texPerStation * static_cast<float>(firstSector + sectorsInChunk);
++		const float texBegin = m_sampleTex[static_cast<size_t>(firstSector)];
++		const float texEnd = m_sampleTex[static_cast<size_t>(firstSector + sectorsInChunk)];
+ 
+ 		pNode->SetVertices(&vertices[0], static_cast<int>(vertices.size()), texBegin, texEnd, texGlobalBegin, texGlobalEnd);
+ 		pNode->SetSortPriority(static_cast<uint8>(clamp_tpl(m_sortPriority, 0, 255)));
+@@ -344,6 +335,7 @@ void CRoadComponent::RebuildIfNeeded(bool bForce)
+ 	{
+ 		DestroyNodes();
+ 		m_samples.clear();
++		m_sampleTex.clear();
+ 		m_lastBuildSignature = 0;
+ 		return;
+ 	}
+@@ -358,6 +350,7 @@ void CRoadComponent::RebuildIfNeeded(bool bForce)
+ 	{
+ 		DestroyNodes();
+ 		m_samples.clear();
++		m_sampleTex.clear();
+ 		return;
+ 	}
+ 
+@@ -366,6 +359,7 @@ void CRoadComponent::RebuildIfNeeded(bool bForce)
+ 	{
+ 		DestroyNodes();
+ 		m_samples.clear();
++		m_sampleTex.clear();
+ 		return;
+ 	}
+ 
+@@ -424,6 +418,7 @@ void CRoadComponent::OnShutDown()
+ 	Unbind();
+ 	DestroyNodes();
+ 	m_samples.clear();
++	m_sampleTex.clear();
+ }
+ 
+ } // namespace AreaComponents
+diff --git a/Code/CryPlugins/AreaComponents/Module/Functions/RoadComponent.h b/Code/CryPlugins/AreaComponents/Module/Functions/RoadComponent.h
+index f77d0ee8..d4134a14 100644
+--- a/Code/CryPlugins/AreaComponents/Module/Functions/RoadComponent.h
++++ b/Code/CryPlugins/AreaComponents/Module/Functions/RoadComponent.h
+@@ -116,8 +116,8 @@ private:
+ 
+ 	//! CRoadObject's chunk size (RoadObject.cpp:258). One render node per 16 trapezoids.
+ 	static constexpr int   kSectorsPerChunk = 16;
+-	//! Most sectors one road builds. Each 16 of them is a render node.
+-	static constexpr int   kMaxSectors = 4096;
++	//! Most stations one road builds. Each 16 sectors is a render node.
++	static constexpr int   kMaxStations = 4096;
+ 	//! How far the last boundary of a chunk is pushed along the road, to hide the gaps f16 meshes
+ 	//! leave between two chunks (RoadObject.cpp:299-312).
+ 	static constexpr float kChunkOverlap = 0.075f;
+@@ -138,8 +138,9 @@ private:
+ 	//! Runtime only, never reflected (MEMORY.md).
+ 	IShapeComponent*             m_pBoundShape = nullptr;
+ 	std::vector<SRoadSample>     m_samples;
+-	//! Arc length the samples were taken over, in metres - what the texture coordinates divide.
+-	float                        m_sampledLength = 0.0f;
++	//! Texture coordinate of each station: its arc length divided by Tile Length, which is exactly
++	//! what CRoadSector::t0 holds in the legacy object (RoadObject.cpp:195).
++	std::vector<float>           m_sampleTex;
+ 	std::vector<IRoadRenderNode*> m_nodes;
+ 
+ 	bool   m_bWarnedNoSpline = false;
+diff --git a/Code/CryPlugins/AreaComponents/Module/Functions/SplineSectors.h b/Code/CryPlugins/AreaComponents/Module/Functions/SplineSectors.h
+new file mode 100644
+index 00000000..2f71ebcb
+--- /dev/null
++++ b/Code/CryPlugins/AreaComponents/Module/Functions/SplineSectors.h
+@@ -0,0 +1,135 @@
++// Copyright 2026 ReC Sandbox. Distributed under the terms in LICENSE.md at the repository root.
++#pragma once
++
++#include "../../Interface/IShapeComponent.h"
++
++#include <vector>
++
++namespace Cry
++{
++namespace AreaComponents
++{
++
++//! One station of a ribbon laid along a spline: the point on the curve, the sideways direction
++//! there, the width there, and how far along the curve it is. A sector is the quad between two
++//! consecutive stations.
++//!
++//! `left` is `worldPos + 0.5 * width * worldNormal` and `right` is `worldPos - 0.5 * width *
++//! worldNormal`, the same way round as CRoadObject::SetRoadSectors (RoadObject.cpp:180-181), which
++//! is also the order CRoadRenderNode::GetClipPlanes assumes when it builds a trapezoid's four clip
++//! planes out of (l0, r0, l1, r1) (RoadRenderNode.cpp:647-650).
++struct SSplineStation
++{
++	Vec3  worldPos = ZERO;
++	Vec3  worldNormal = ZERO;
++	float width = 0.0f;
++	//! Arc length from the start of the curve, in world metres. The texture coordinate is this
++	//! divided by the consumer's tile length.
++	float distance = 0.0f;
++};
++
++namespace SplineSectors
++{
++
++//! CRoadObject::SetRoadSectors' walk (RoadObject.cpp:158-231), line for line, against the shape
++//! contract instead of against CSplineObject.
++//!
++//! It matters that this is per SEGMENT and not per metre. Legacy asks each Bezier segment for its
++//! length, turns that into `int((length + 0.5) / step)` sectors - never fewer than one - and then
++//! evaluates position, normal and width at the SAME segment-local parameter. Position and frame
++//! therefore always belong to the same place on the curve. Walking by arc length instead and
++//! evaluating the frame at `t = distance / totalLength` samples two different points on a Bezier
++//! curve, which shears the ribbon wherever the control points are unevenly spaced - the defect that
++//! made the first road component look unlike a real road.
++//!
++//! Only the LAST segment emits its closing station; every other stops one short, so two segments
++//! meet at exactly one station and there are no duplicates (RoadObject.cpp:172-174).
++//!
++//! Returns the number of stations written, which is one more than the number of sectors. Fewer than
++//! two means there is no ribbon.
++inline int BuildStations(const ISplineShape& spline, float step, float defaultWidth, int maxStations,
++                         std::vector<SSplineStation>& out)
++{
++	out.clear();
++
++	if (maxStations < 2)
++		return 0;
++
++	const float clampedStep = clamp_tpl(step, 0.25f, 10.0f);
++	const int   segmentCount = spline.GetSegmentCount();
++
++	float travelled = 0.0f;
++
++	const auto addStation = [&](float t, float distance)
++	{
++		SSplineStation station;
++		station.worldPos = spline.EvalPos(t);
++
++		Vec3 normal = spline.EvalNormal(t);
++		if (normal.IsZero())
++		{
++			// A degenerate frame - a vertical tangent under the legacy up rule, or a zero-length
++			// segment. Any perpendicular beats a zero-width ribbon.
++			Vec3 tangent = spline.EvalTangent(t);
++			normal = tangent.IsZero() ? Vec3(0.0f, 1.0f, 0.0f) : tangent.GetOrthogonal();
++		}
++
++		station.worldNormal = normal.GetNormalizedSafe(Vec3(0.0f, 1.0f, 0.0f));
++		station.width = max(0.01f, spline.GetLocalWidth(t, defaultWidth));
++		station.distance = distance;
++
++		out.push_back(station);
++	};
++
++	if (segmentCount > 0)
++	{
++		for (int segment = 0; segment < segmentCount; ++segment)
++		{
++			const float segmentLength = spline.GetSegmentLength(segment, 1.0f);
++
++			// CRoadObject::GetRoadSectorCount, RoadObject.cpp:233-239, including the +0.5 bias and
++			// the "a segment is never fewer than one sector" floor.
++			int sectorsInSegment = static_cast<int>((segmentLength + 0.5f) / clampedStep);
++			if (sectorsInSegment <= 0)
++				sectorsInSegment = 1;
++
++			for (int k = 0; k <= sectorsInSegment; ++k)
++			{
++				if (segment != segmentCount - 1 && k == sectorsInSegment)
++					break;
++
++				if (static_cast<int>(out.size()) >= maxStations)
++					return static_cast<int>(out.size());
++
++				const float segmentT = static_cast<float>(k) / static_cast<float>(sectorsInSegment);
++				addStation(spline.SegmentToParam(segment, segmentT),
++				           travelled + spline.GetSegmentLength(segment, segmentT));
++			}
++
++			travelled += segmentLength;
++		}
++	}
++	else
++	{
++		// A spline kind that does not answer the segment queries (the append-only defaults in
++		// ISplineShape). Walk the whole curve uniformly in PARAMETER - not in arc length - so that
++		// position, normal and width still come from one and the same point.
++		const float totalLength = spline.TotalLength();
++		if (totalLength <= 0.01f)
++			return 0;
++
++		const int sectors = clamp_tpl(static_cast<int>(totalLength / clampedStep + 0.5f), 1, maxStations - 1);
++
++		for (int k = 0; k <= sectors; ++k)
++		{
++			const float t = static_cast<float>(k) / static_cast<float>(sectors);
++			addStation(t, t * totalLength);
++		}
++	}
++
++	return static_cast<int>(out.size());
++}
++
++} // namespace SplineSectors
++} // namespace AreaComponents
++} // namespace Cry
+diff --git a/Code/CryPlugins/AreaComponents/Module/Functions/WaterVolumeComponent.cpp b/Code/CryPlugins/AreaComponents/Module/Functions/WaterVolumeComponent.cpp
+index bc197982..f484501e 100644
+--- a/Code/CryPlugins/AreaComponents/Module/Functions/WaterVolumeComponent.cpp
++++ b/Code/CryPlugins/AreaComponents/Module/Functions/WaterVolumeComponent.cpp
+@@ -1,6 +1,7 @@
+ // Copyright 2026 ReC Sandbox. Distributed under the terms in LICENSE.md at the repository root.
+ #include "StdAfx.h"
+ #include "WaterVolumeComponent.h"
++#include "SplineSectors.h"
+ 
+ #include <Cry3DEngine/I3DEngine.h>
+ #include <Cry3DEngine/IRenderNode.h>
+@@ -413,43 +414,34 @@ void CWaterVolumeComponent::DestroyAreaPhysics()
+ 
+ bool CWaterVolumeComponent::BuildRiver(IShapeComponent& shape, ISplineShape& spline)
+ {
+-	const float totalLength = spline.TotalLength();
+-	if (totalLength <= 0.01f)
++	// The same walk the road uses, which is CRoadObject::SetRoadSectors' - and that is exactly
++	// right, because CRiverObject IS a CRoadObject: it inherits the sector generation verbatim and
++	// replaces only what each sector is turned into (RiverObject.cpp:195-230). Per Bezier segment,
++	// sector count from that segment's own length, position and frame at one and the same
++	// parameter - never a position by arc length paired with a frame by parameter, which samples
++	// two different points on the curve and shears the ribbon.
++	std::vector<SSplineStation> stations;
++	const int stationCount = SplineSectors::BuildStations(spline, m_riverStep, m_riverWidth,
++	                                                      kMaxRiverSectors + 1, stations);
++	if (stationCount < 2)
+ 		return false;
+ 
+-	const float step = max(0.25f, m_riverStep);
+-	const int   sectorCount = clamp_tpl(static_cast<int>(totalLength / step + 0.5f), 1, kMaxRiverSectors);
+-	const int   stationCount = sectorCount + 1;
++	const int   sectorCount = stationCount - 1;
++	const float tileLength = max(0.001f, m_riverTileLength);
+ 
+-	// One station per sector boundary, walked by ARC LENGTH rather than by the legacy object's
+-	// per-segment parameter steps (CRoadObject::SetRoadSectors, RoadObject.cpp:158-231). The result
+-	// is the same quad strip with evenly spaced sectors; the texture coordinate becomes exact
+-	// instead of accumulated, because the distance is known at every station.
+-	std::vector<Vec3>  left(stationCount);
+-	std::vector<Vec3>  right(stationCount);
+-	std::vector<float> texCoord(stationCount);
++	std::vector<Vec3>  left(static_cast<size_t>(stationCount));
++	std::vector<Vec3>  right(static_cast<size_t>(stationCount));
++	std::vector<float> texCoord(static_cast<size_t>(stationCount));
+ 
+ 	for (int k = 0; k < stationCount; ++k)
+ 	{
+-		const float distance = (static_cast<float>(k) / static_cast<float>(sectorCount)) * totalLength;
+-		const float t = clamp_tpl(distance / totalLength, 0.0f, 1.0f);
+-
+-		const Vec3 position = spline.PosByDistance(distance);
+-
+-		Vec3 normal = spline.EvalNormal(t);
+-		if (normal.IsZero())
+-		{
+-			Vec3 tangent = spline.EvalTangent(t);
+-			normal = tangent.IsZero() ? Vec3(0.0f, 1.0f, 0.0f) : tangent.GetOrthogonal().GetNormalized();
+-		}
+-		normal.Normalize();
+-
+-		const float width = max(0.01f, spline.GetLocalWidth(t, m_riverWidth));
++		const SSplineStation& station = stations[static_cast<size_t>(k)];
++		const Vec3            halfWidth = 0.5f * station.width * station.worldNormal;
+ 
+ 		// CRoadObject's own ordering: left is +normal, right is -normal (RoadObject.cpp:180-181).
+-		left[k] = position + 0.5f * width * normal;
+-		right[k] = position - 0.5f * width * normal;
+-		texCoord[k] = distance / max(0.001f, m_riverTileLength);
++		left[static_cast<size_t>(k)] = station.worldPos + halfWidth;
++		right[static_cast<size_t>(k)] = station.worldPos - halfWidth;
++		texCoord[static_cast<size_t>(k)] = station.distance / tileLength;
+ 	}
+ 
+ 	// One fog plane for the whole river, as CRiverObject builds it: the world Z column through the
+diff --git a/Code/CryPlugins/AreaComponents/Module/Shapes/SplineShapeComponent.cpp b/Code/CryPlugins/AreaComponents/Module/Shapes/SplineShapeComponent.cpp
+index 95b48b9d..0301195f 100644
+--- a/Code/CryPlugins/AreaComponents/Module/Shapes/SplineShapeComponent.cpp
++++ b/Code/CryPlugins/AreaComponents/Module/Shapes/SplineShapeComponent.cpp
+@@ -205,6 +205,55 @@ Matrix34 CSplineShapeComponent::GetShapeWorldTM() const
+ 	return GetWorldTransformMatrix() * Matrix34::CreateTranslationMat(m_offset);
+ }
+ 
++float CSplineShapeComponent::SegmentToParam(int index, float segmentT) const
++{
++	const int segmentCount = GetSegmentCount();
++	if (segmentCount <= 0)
++		return 0.0f;
++
++	const int   segment = clamp_tpl(index, 0, segmentCount - 1);
++	const float t = clamp_tpl(segmentT, 0.0f, 1.0f);
++
++	// The exact inverse of ParamToSegment's `t * segmentCount` split above.
++	return clamp_tpl((static_cast<float>(segment) + t) / static_cast<float>(segmentCount), 0.0f, 1.0f);
++}
++
++float CSplineShapeComponent::GetSegmentLength(int index, float segmentT) const
++{
++	const int segmentCount = GetSegmentCount();
++	if (index < 0 || index >= segmentCount)
++		return 0.0f;
++
++	const float t = clamp_tpl(segmentT, 0.0f, 1.0f);
++	if (t <= 0.0f)
++		return 0.0f;
++
++	const SCache& cache = GetCache();
++
++	if (t >= 1.0f)
++	{
++		// The whole segment is already in the arc-length table the cache builds.
++		return (index < static_cast<int>(cache.segmentLength.size())) ? cache.segmentLength[index] : 0.0f;
++	}
++
++	// CSplineObject::GetBezierSegmentLength's 32-chord approximation over [0, t]
++	// (SplineObject.cpp:773-787), deliberately the same coarseness so that sector counts and
++	// texture coordinates come out where legacy puts them.
++	const int kChords = 32;
++
++	float length = 0.0f;
++	Vec3  previous = SegmentPos(index, 0.0f, true);
++
++	for (int i = 1; i <= kChords; ++i)
++	{
++		const Vec3 current = SegmentPos(index, t * static_cast<float>(i) / static_cast<float>(kChords), true);
++		length += current.GetDistance(previous);
++		previous = current;
++	}
++
++	return length;
++}
++
+ int CSplineShapeComponent::GetSegmentCount() const
+ {
+ 	// Counted on the EVALUATION polygon, which is the authored points when smoothing is off and
+diff --git a/Code/CryPlugins/AreaComponents/Module/Shapes/SplineShapeComponent.h b/Code/CryPlugins/AreaComponents/Module/Shapes/SplineShapeComponent.h
+index a32a71c7..753403d5 100644
+--- a/Code/CryPlugins/AreaComponents/Module/Shapes/SplineShapeComponent.h
++++ b/Code/CryPlugins/AreaComponents/Module/Shapes/SplineShapeComponent.h
+@@ -203,6 +203,9 @@ public:
+ 	virtual float GetLocalWidth(float t, float defaultWidth) const override;
+ 	virtual Vec3  GetLocalBezierNormal(float t) const override;
+ 	virtual void  ParamToSegment(float t, int& indexOut, float& segmentTOut) const override;
++	virtual int   GetSegmentCount() const override;
++	virtual float GetSegmentLength(int index, float segmentT) const override;
++	virtual float SegmentToParam(int index, float segmentT) const override;
+ 	// ~ISplineShape
+ 
+ 	// IShapeComponentEdit - the real thing for this kind: the control points the tool edits.
+@@ -278,7 +281,6 @@ private:
+ 
+ 	void           InvalidateCache() const { m_cache.bValid = false; }
+ 	const SCache&  GetCache() const;
+-	int            GetSegmentCount() const;
+ 
+ 	//! Evaluation on the cached arrays. `world` picks which of the two copies is used.
+ 	Vec3           SegmentPos(int segment, float t, bool world) const;
+-- 
+2.47.1.windows.1
+

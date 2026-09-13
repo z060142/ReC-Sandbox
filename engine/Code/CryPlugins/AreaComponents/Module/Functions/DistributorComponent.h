@@ -6,6 +6,7 @@
 
 #include <CrySchematyc/MathTypes.h>
 #include <CrySchematyc/ResourceTypes.h>
+#include <CrySchematyc/Utils/SharedString.h>
 #include <CrySchematyc/Reflection/TypeDesc.h>
 #include <CrySchematyc/Env/IEnvRegistrar.h>
 #include <CrySerialization/IArchive.h>
@@ -207,7 +208,14 @@ public:
 		desc.SetEditorCategory("Area");
 		desc.SetLabel("Distributor");
 		desc.SetDescription("Places meshes along the spline shape on this entity.");
-		desc.SetComponentFlags({ IEntityComponent::EFlags::Singleton });
+
+		// Deliberately NOT Singleton, unlike every shape kind. One spline routinely carries several
+		// distributors - a fence on the line, lamp posts two metres to the side, bollards a metre
+		// further out - and each is an independent generator with its own meshes, seed, spacing,
+		// offset and render nodes. The inspector already separates them: CreateComponentWidgets
+		// keys each panel by (component type, instance index) (EntityObject.cpp:1117-1120) and the
+		// edit-tool payload carries the component's INSTANCE guid, so "Bake To Brushes" bakes the
+		// distributor whose button was pressed and no other.
 
 		// The reflected interface bases: IBakeableComponent is how the editor's bake tool finds this
 		// component across the DLL boundary, and IEditorActionComponent is what puts its button in
@@ -215,6 +223,7 @@ public:
 		desc.AddBase<IBakeableComponent>();
 		desc.AddBase<IEditorActionComponent>();
 
+		desc.AddMember(&CDistributorComponent::m_label, 'labl', "Label", "Label", "A name for this distributor, shown as the title of its inspector panel. Useful once an entity carries several.", Schematyc::CSharedString());
 		desc.AddMember(&CDistributorComponent::m_bEnabled, 'enbl', "Enabled", "Enabled", "Whether any instances are placed at all", true);
 		desc.AddMember(&CDistributorComponent::m_seed, 'seed', "Seed", "Seed", "Seed of everything random here. The same seed always gives the same placement.", 1u);
 
@@ -232,7 +241,7 @@ public:
 		desc.AddMember(&CDistributorComponent::m_forwardAxis, 'fwax', "ForwardAxis", "Forward Axis", "Which axis of the mesh points along the curve. +X is what the legacy spline distributor assumes.", EDistributorForwardAxis::PlusX);
 		desc.AddMember(&CDistributorComponent::m_bStretchToFit, 'strf', "StretchToFit", "Stretch To Fit", "In Point To Next alignment, stretch each instance along its forward axis until it reaches the next one, so sections meet with no gap.", false);
 		desc.AddMember(&CDistributorComponent::m_bPivotAtStart, 'pvst', "PivotAtStart", "Pivot At Start", "Place the START face of the mesh's bounding box on the sample point instead of the mesh's own pivot. On, this is what makes a chain of sections start where it should.", true);
-		desc.AddMember(&CDistributorComponent::m_zAngle, 'zang', "ZAngle", "Z Angle", "A constant turn about the instance's own up axis, in degrees", 0.0f);
+		desc.AddMember(&CDistributorComponent::m_zAngle, 'zang', "ZAngle", "Rotation Offset", "A constant turn of every instance about its own up axis, in degrees. Applied before the jitter.", 0.0f);
 		desc.AddMember(&CDistributorComponent::m_rotationJitter, 'rjit', "RotationJitter", "Rotation Jitter", "Random rotation about each axis, in degrees, plus or minus", Vec3(0.0f, 0.0f, 0.0f));
 
 		desc.AddMember(&CDistributorComponent::m_scaleMin, 'scmn', "ScaleMin", "Scale Min", "Smallest instance scale", 1.0f);
@@ -242,6 +251,8 @@ public:
 		desc.AddMember(&CDistributorComponent::m_bWidthScales, 'wscl', "WidthScales", "Width Scales", "Multiply the instance scale by the spline's own width at that point", false);
 		desc.AddMember(&CDistributorComponent::m_defaultWidth, 'wdef', "DefaultWidth", "Default Width", "The width a point flagged \"default width\" contributes", 1.0f);
 
+		desc.AddMember(&CDistributorComponent::m_baseOffset, 'boff', "Offset", "Offset", "Moves every instance off the curve, in the CURVE's frame: X along the tangent, Y sideways along the normal, Z up. This is what puts a second distributor's lamp posts two metres beside the first one's fence.", Vec3(0.0f, 0.0f, 0.0f));
+		desc.AddMember(&CDistributorComponent::m_alongShift, 'alsh', "AlongShift", "Along Shift", "Slides the whole sample pattern along the curve, in metres, so two distributors with the same spacing interleave instead of overlapping. An open curve drops instances that slide past its ends; a closed one wraps them round.", 0.0f);
 		desc.AddMember(&CDistributorComponent::m_offsetMin, 'ofmn', "OffsetMin", "Offset Min", "Smallest offset from the curve, in the instance's own frame", Vec3(0.0f, 0.0f, 0.0f));
 		desc.AddMember(&CDistributorComponent::m_offsetMax, 'ofmx', "OffsetMax", "Offset Max", "Largest offset from the curve, in the instance's own frame", Vec3(0.0f, 0.0f, 0.0f));
 		desc.AddMember(&CDistributorComponent::m_bSnapToTerrain, 'snap', "SnapToTerrain", "Snap To Terrain", "Drop every instance onto the terrain height under it", false);
@@ -333,6 +344,10 @@ private:
 	//! without a debugger: curve length, mode, spacing, the count asked for and the count placed.
 	void          LogRebuild(float curveLength, int requestedCount, int placedCount) const;
 
+	//! Pushes the reflected Label onto the component's name, which is what titles its inspector
+	//! panel. Called whenever the properties change, because that is when the label can change.
+	void          ApplyLabel();
+
 	//! Says so, once, when the Meshes list places nothing - including the case where the only mesh
 	//! sits in End Cap Mesh, which places one instance at each end and nothing in between.
 	void          WarnIfNothingToDistribute();
@@ -388,6 +403,11 @@ private:
 	float               m_zAngle = 0.0f;
 	Vec3                m_rotationJitter = ZERO;
 
+	//! The base placement offset every instance gets before any jitter, in the curve's own frame.
+	Vec3                m_baseOffset = ZERO;
+	//! Metres to slide the whole sample pattern along the curve.
+	float               m_alongShift = 0.0f;
+
 	float               m_scaleMin = 1.0f;
 	float               m_scaleMax = 1.0f;
 	float               m_scaleRampStart = 1.0f;
@@ -410,6 +430,8 @@ private:
 	bool                 m_bGoodOccluder = false;
 	int                  m_viewDistRatio = 100;
 	int                  m_lodRatio = 100;
+
+	Schematyc::CSharedString m_label;
 
 	SDistributorMeshes      m_meshes;
 	Schematyc::GeomFileName m_endCapMesh;

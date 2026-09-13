@@ -124,10 +124,14 @@ void CShapeEditTool::SetUserData(const char* key, void* userData)
 	m_objectGuid = pTarget->objectGuid;
 	m_componentGuid = pTarget->componentGuid;
 	m_selectedPoint = -1;
+	m_bDrawPending = false;
+	m_bDrawing = false;
+	m_bCursorValid = false;
 
 	// Refuse a payload that does not resolve instead of discovering it one virtual call later: a
 	// tool that cannot find its component has nothing to draw and nothing to edit.
-	if (ResolveShapeEdit() == nullptr)
+	IShapeComponentEdit* pEdit = ResolveShapeEdit();
+	if (pEdit == nullptr)
 	{
 		CryWarning(VALIDATOR_MODULE_EDITOR, VALIDATOR_WARNING,
 		           "Edit Shape: no editable shape component found for object %s, component %s - the tool will do nothing.",
@@ -137,6 +141,15 @@ void CShapeEditTool::SetUserData(const char* key, void* userData)
 		m_componentGuid = CryGUID::Null();
 		return;
 	}
+
+	// Backlog B1: a shape added by hand has an empty point list, and a point tool over nothing is
+	// nothing. Draw it first - the gesture the Create panel runs, on the entity the user already
+	// made. Only noted here; the draw itself starts on the first Display(), because this call runs
+	// while the level editor is still installing the tool.
+	//
+	// Two points are the fewest any point-list kind can be edited with, and every kind with a
+	// FIXED point set (Box, Sphere: two corners, always there) is therefore never in draw mode.
+	m_bDrawPending = pEdit->GetPointCount() < 2;
 
 	if (m_pManipulator != nullptr)
 	{
@@ -376,10 +389,26 @@ void CShapeEditTool::Display(SDisplayContext& dc)
 		return; // `this` is gone
 	}
 
+	// The draw flow starts here, on the first frame after SetUserData, not in SetUserData itself:
+	// the tool is fully installed by now, so the undo transaction the draw opens is safe.
+	if (m_bDrawPending)
+	{
+		StartDraw();
+	}
+
 	IShapeComponent*     pShape = ResolveShape();
 	IShapeComponentEdit* pEdit = pShape != nullptr ? pShape->GetEditInterface() : nullptr;
 	if (pEdit == nullptr || dc.view == nullptr)
 		return;
+
+	if (m_bDrawing)
+	{
+		// Exactly what the create tool draws, from the same helper: the committed edges, the
+		// rubber band to the cursor and the edge that would close the contour. No handles - there
+		// is nothing to grab until the draw is finished.
+		AreaShapeTools::DisplayDrawInProgress(dc, pShape, m_bCursorValid, m_cursorWorldPos);
+		return;
+	}
 
 	// The hull outline. The component previewer draws it too, but it stops at the entity's
 	// selection state, and while the tool is up the outline has to be there whatever happens to
@@ -444,6 +473,11 @@ bool CShapeEditTool::MouseCallback(CViewport* pView, EMouseEvent event, CPoint& 
 	IShapeComponentEdit* pEdit = ResolveShapeEdit();
 	if (pEdit == nullptr || pView == nullptr)
 		return false;
+
+	if (m_bDrawing)
+	{
+		return DrawMouseCallback(pView, event, point, flags);
+	}
 
 	// Ctrl+Shift+click drops the selected point onto whatever the cursor is over.
 	if (event == eMouseLDown && (flags & MK_CONTROL) && (flags & MK_SHIFT))
@@ -576,6 +610,24 @@ bool CShapeEditTool::MouseCallback(CViewport* pView, EMouseEvent event, CPoint& 
 
 bool CShapeEditTool::OnKeyDown(CViewport* pView, uint32 nChar, uint32 nRepCnt, uint32 nFlags)
 {
+	if (m_bDrawing)
+	{
+		// The keys of the draw gesture, the same two the create tool answers.
+		if (nChar == Qt::Key_Escape)
+		{
+			CancelDraw();
+			return true; // `this` is gone
+		}
+
+		if (nChar == Qt::Key_Return || nChar == Qt::Key_Enter)
+		{
+			FinishDraw();
+			return true; // FinishDraw may have cancelled, which deletes `this`
+		}
+
+		return false;
+	}
+
 	if (nChar == Qt::Key_Escape)
 	{
 		GetIEditor()->GetLevelEditorSharedState()->SetEditTool(nullptr);
@@ -592,6 +644,123 @@ bool CShapeEditTool::OnKeyDown(CViewport* pView, uint32 nChar, uint32 nRepCnt, u
 	}
 
 	return false;
+}
+
+// ---------------------------------------------------------------------------
+// The draw flow - one undo step for the whole draw (backlog B1)
+// ---------------------------------------------------------------------------
+
+void CShapeEditTool::StartDraw()
+{
+	m_bDrawPending = false;
+
+	IShapeComponentEdit* pEdit = ResolveShapeEdit();
+	if (pEdit == nullptr || pEdit->GetPointCount() >= 2)
+		return;
+
+	// One undo step for the whole draw, the way the creation tool brackets its own: the snapshot
+	// taken here is the empty shape, so Esc (Cancel) restores exactly that, and Ctrl+Z after a
+	// finished draw takes the shape back to empty in one step.
+	BeginGesture("Draw Shape");
+	if (!m_gestureOpen)
+		return;
+
+	if (pEdit->GetPointCount() == 0)
+	{
+		// Point 1 is the entity's own position, i.e. the local origin, so the entity stays where
+		// the user put it - the same seed CShapeCreateTool plants and the same one legacy plants
+		// with InsertPoint(-1, Vec3(0,0,0)) (ShapeObject.cpp:1185-1188).
+		pEdit->InsertPoint(-1, ZERO);
+	}
+
+	m_bDrawing = true;
+	m_bCursorValid = false;
+	m_selectedPoint = -1;
+
+	if (m_pManipulator != nullptr)
+	{
+		m_pManipulator->Invalidate();
+	}
+
+	CryLog("Edit Shape: this shape has no points yet - draw it. The entity's position is the first point; "
+	       "click to add more, double-click or Enter to finish, Esc to leave the shape empty.");
+}
+
+void CShapeEditTool::FinishDraw()
+{
+	IShapeComponentEdit* pEdit = ResolveShapeEdit();
+	if (pEdit == nullptr)
+	{
+		CancelDraw();
+		return; // `this` is gone
+	}
+
+	// The kind's own minimum: three for a closed polygon, two for a spline or an open polyline.
+	// Two is the floor whatever the kind answers - a one-point contour is not a shape.
+	const int minPoints = max(2, pEdit->GetMinPointCount());
+	if (pEdit->GetPointCount() < minPoints)
+	{
+		CryWarning(VALIDATOR_MODULE_EDITOR, VALIDATOR_WARNING,
+		           "Edit Shape: this shape needs at least %d points, %d were drawn - the shape was left empty.",
+		           minPoints, pEdit->GetPointCount());
+
+		CancelDraw();
+		return; // `this` is gone
+	}
+
+	m_bDrawing = false;
+	m_bCursorValid = false;
+
+	// Accepts the transaction and runs the 1a sync, so the drawn points reach the save snapshot
+	// and the prefab. The tool stays up and is the ordinary point tool from here on.
+	EndGesture(true);
+}
+
+void CShapeEditTool::CancelDraw()
+{
+	m_bDrawing = false;
+	m_bDrawPending = false;
+	m_bCursorValid = false;
+	m_selectedPoint = -1;
+
+	// Cancel rolls the transaction back to the snapshot StartDraw took, i.e. to the empty shape
+	// the user pressed Edit Shape on.
+	EndGesture(false);
+
+	// An empty shape has nothing to edit, and staying in the tool would start the draw again on
+	// the very next frame. Deletes this tool (CEditTool::Release -> DeleteThis); nothing may touch
+	// a member after it.
+	GetIEditor()->GetLevelEditorSharedState()->SetEditTool(nullptr);
+}
+
+bool CShapeEditTool::DrawMouseCallback(CViewport* pView, EMouseEvent event, CPoint& point, int flags)
+{
+	if (event != eMouseMove && event != eMouseLDown && event != eMouseLDblClick)
+		return false;
+
+	Vec3 worldPos;
+	if (!AreaShapeTools::PickDrawPoint(pView, point, worldPos))
+		return false;
+
+	m_cursorWorldPos = worldPos;
+	m_bCursorValid = true;
+
+	if (event == eMouseMove)
+	{
+		return true;
+	}
+
+	if (event == eMouseLDblClick)
+	{
+		// Click-click-double-click: the click that opens the double click has already appended
+		// its point (or been dropped as a duplicate of it), so nothing is added here.
+		FinishDraw();
+		return true; // `this` may be gone
+	}
+
+	// eMouseLDown
+	AreaShapeTools::AppendDrawPoint(ResolveShape(), worldPos);
+	return true;
 }
 
 // ---------------------------------------------------------------------------

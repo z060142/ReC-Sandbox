@@ -11,6 +11,8 @@
 #include "Functions/TriggerBoundsComponent.h"
 #include "Functions/GravityVolumeComponent.h"
 #include "Functions/DistributorComponent.h"
+#include "Functions/WaterVolumeComponent.h"
+#include "Functions/RoadComponent.h"
 
 #include <CrySchematyc/Env/IEnvRegistry.h>
 #include <CrySchematyc/Env/EnvPackage.h>
@@ -105,6 +107,14 @@ void CAreaComponentsPlugin::RegisterComponents(Schematyc::IEnvRegistrar& registr
 	{
 		Schematyc::CEnvRegistrationScope componentScope = scope.Register(SCHEMATYC_MAKE_ENV_COMPONENT(CDistributorComponent));
 		CDistributorComponent::Register(componentScope);
+	}
+	{
+		Schematyc::CEnvRegistrationScope componentScope = scope.Register(SCHEMATYC_MAKE_ENV_COMPONENT(CWaterVolumeComponent));
+		CWaterVolumeComponent::Register(componentScope);
+	}
+	{
+		Schematyc::CEnvRegistrationScope componentScope = scope.Register(SCHEMATYC_MAKE_ENV_COMPONENT(CRoadComponent));
+		CRoadComponent::Register(componentScope);
 	}
 }
 

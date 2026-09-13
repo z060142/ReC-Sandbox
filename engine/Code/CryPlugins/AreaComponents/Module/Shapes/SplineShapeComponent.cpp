@@ -205,6 +205,55 @@ Matrix34 CSplineShapeComponent::GetShapeWorldTM() const
 	return GetWorldTransformMatrix() * Matrix34::CreateTranslationMat(m_offset);
 }
 
+float CSplineShapeComponent::SegmentToParam(int index, float segmentT) const
+{
+	const int segmentCount = GetSegmentCount();
+	if (segmentCount <= 0)
+		return 0.0f;
+
+	const int   segment = clamp_tpl(index, 0, segmentCount - 1);
+	const float t = clamp_tpl(segmentT, 0.0f, 1.0f);
+
+	// The exact inverse of ParamToSegment's `t * segmentCount` split above.
+	return clamp_tpl((static_cast<float>(segment) + t) / static_cast<float>(segmentCount), 0.0f, 1.0f);
+}
+
+float CSplineShapeComponent::GetSegmentLength(int index, float segmentT) const
+{
+	const int segmentCount = GetSegmentCount();
+	if (index < 0 || index >= segmentCount)
+		return 0.0f;
+
+	const float t = clamp_tpl(segmentT, 0.0f, 1.0f);
+	if (t <= 0.0f)
+		return 0.0f;
+
+	const SCache& cache = GetCache();
+
+	if (t >= 1.0f)
+	{
+		// The whole segment is already in the arc-length table the cache builds.
+		return (index < static_cast<int>(cache.segmentLength.size())) ? cache.segmentLength[index] : 0.0f;
+	}
+
+	// CSplineObject::GetBezierSegmentLength's 32-chord approximation over [0, t]
+	// (SplineObject.cpp:773-787), deliberately the same coarseness so that sector counts and
+	// texture coordinates come out where legacy puts them.
+	const int kChords = 32;
+
+	float length = 0.0f;
+	Vec3  previous = SegmentPos(index, 0.0f, true);
+
+	for (int i = 1; i <= kChords; ++i)
+	{
+		const Vec3 current = SegmentPos(index, t * static_cast<float>(i) / static_cast<float>(kChords), true);
+		length += current.GetDistance(previous);
+		previous = current;
+	}
+
+	return length;
+}
+
 int CSplineShapeComponent::GetSegmentCount() const
 {
 	// Counted on the EVALUATION polygon, which is the authored points when smoothing is off and
@@ -1027,6 +1076,13 @@ void CSplineShapeComponent::RemovePoint(int index)
 
 	m_points.points.erase(m_points.points.begin() + index);
 	RecordChange(EShapeChangeReason::Topology);
+}
+
+int CSplineShapeComponent::GetMinPointCount() const
+{
+	// The same number RemovePoint() refuses to go below: two points are a curve, one is not
+	// (CSplineObject::GetMinPoints(), SplineObject.h:83).
+	return kMinPoints;
 }
 
 int CSplineShapeComponent::GetEdgePoints(int index, Vec3* pOut, int maxPoints) const

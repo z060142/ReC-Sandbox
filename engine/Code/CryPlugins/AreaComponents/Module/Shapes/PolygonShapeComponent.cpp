@@ -488,6 +488,13 @@ void CPolygonShapeComponent::RemovePoint(int index)
 	RecordChange(EShapeChangeReason::Topology);
 }
 
+int CPolygonShapeComponent::GetMinPointCount() const
+{
+	// The same number RemovePoint() refuses to go below, so the tool that draws a shape and the
+	// tool that edits one agree about what an unusable polygon is.
+	return m_closed ? kMinClosedPoints : kMinOpenPoints;
+}
+
 void CPolygonShapeComponent::BeginEdit()
 {
 	m_bInEdit = true;
