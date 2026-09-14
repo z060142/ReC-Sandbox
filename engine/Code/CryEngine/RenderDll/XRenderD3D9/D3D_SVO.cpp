@@ -573,13 +573,13 @@ void CSvoRenderer::ConeTracePass(SSvoTargetsSet* pTS)
 	// and the ray direction + distance. Only on the specular set, only with RT on - and the
 	// targets are explicitly unbound again otherwise, because the pass object is a member and
 	// would keep last frame's bindings while the shader has only two outputs.
-	if (e_svoTI_RT_Active && pTS->pRT_HITPOS_0 && pTS->pRT_RAYDIR_0 && pTS->pRT_HITGI_0 && pTS->pRT_HITMAT_0)
+	if (e_svoTI_RT_Active && pTS->pRT_HITPOS_0 && pTS->pRT_RAYDIR_0 && pTS->pRT_HITGI_0 && pTS->pRT_HITID_0)
 	{
 		rp.SetRenderTarget(2, pTS->pRT_HITPOS_0);
 		rp.SetRenderTarget(3, pTS->pRT_RAYDIR_0);
 		rp.SetRenderTarget(4, pTS->pRT_HITGI_0);
-		// rt stage 5B: the shading tag and the per type parameters (decision 10).
-		rp.SetRenderTarget(5, pTS->pRT_HITMAT_0);
+		// decision 11: the hit identity - which triangle, which material record, where on it.
+		rp.SetRenderTarget(5, pTS->pRT_HITID_0);
 	}
 	else
 	{
@@ -603,7 +603,10 @@ void CSvoRenderer::ConeTracePass(SSvoTargetsSet* pTS)
 
 	#ifdef FEATURE_SVO_GI_ALLOW_HQ
 	// Mesh ray tracing pools (rt decision 02 section 2.1): BVH node/triangle/material records at
-	// t9, material texture atlas at t28 (t18 is Fwd_TiledLightsShadeInfo from stage 2 on).
+	// t9, material texture atlas at t55. The atlas moved from t18 to t28 in stage 2 (t18 became
+	// Fwd_TiledLightsShadeInfo) and from t28 to t55 in decision 11, because ShadePass now reads
+	// the same two pools and t28 is ForwardShading.cfi's Fwd_ShadowMap2 there - see
+	// CommonSVO.cfi. Both slots must stay in step with the HLSL registers.
 	// The old per-voxel index pool (t13) and per-voxel triangle list (t17) are retired together
 	// with RayTraceMesh, so nothing binds them any more.
 	if (e_svoTI_RT_Active)
@@ -612,7 +615,7 @@ void CSvoRenderer::ConeTracePass(SSvoTargetsSet* pTS)
 			rp.SetTexture(9, (CTexture*)m_texInfo.pTexTriA.get());
 
 		if (m_texInfo.pTexTexA)
-			rp.SetTexture(28, (CTexture*)m_texInfo.pTexTexA.get());
+			rp.SetTexture(55, (CTexture*)m_texInfo.pTexTexA.get());
 
 		// rt stage 4B (decision 08 item 1): the blue noise mask the GGX-VNDF sampler draws its
 		// two uniform pairs from. Loaded the same way PostAA loads AreaTex.dds - a loose .dds
@@ -1260,7 +1263,7 @@ void CSvoRenderer::ShadePass(SSvoTargetsSet* pTS)
 {
 	CSvoFullscreenPass& rp = pTS->passShade;
 
-	if (!pTS->pRT_ALD_SHD || !pTS->pRT_RGB_SHD || !pTS->pRT_HITPOS_0 || !pTS->pRT_RAYDIR_0 || !pTS->pRT_HITGI_0 || !pTS->pRT_HITMAT_0)
+	if (!pTS->pRT_ALD_SHD || !pTS->pRT_RGB_SHD || !pTS->pRT_HITPOS_0 || !pTS->pRT_RAYDIR_0 || !pTS->pRT_HITGI_0 || !pTS->pRT_HITID_0)
 		return;
 
 	rp.SetTechnique(m_pShader, "ShadePass", GetRunTimeFlags(false, true));
@@ -1272,17 +1275,35 @@ void CSvoRenderer::ShadePass(SSvoTargetsSet* pTS)
 	rp.SetRequireWorldPos(true);
 	rp.SetRequirePerViewConstantBuffer(true);
 
-	// The four g-data targets. t0..t3 alias the brick pools declared in CommonSVO.cfi; see the
+	// The six g-data targets. t0..t3 alias the BRICK pools declared in CommonSVO.cfi; see the
 	// warning at the top of Total_Illumination_Shading.cfi. NOTE the two calls that are NOT here:
 	// SetupSvoTexturesForRead and SetupRsmSunTextures would fight the forward set for t17..t20
-	// and t26..t31, and ShadePS must not reach an SVO pool anyway.
+	// and t26..t31, and ShadePS must not reach a BRICK pool. The two RAY TRACING pools it now
+	// does reach are bound by hand below, at slots chosen to be free on this technique.
 	rp.SetTexture(0, pTS->pRT_ALD_0);
 	rp.SetTexture(1, pTS->pRT_RGB_0);
 	rp.SetTexture(2, pTS->pRT_HITPOS_0);
 	rp.SetTexture(3, pTS->pRT_RAYDIR_0);
 	rp.SetTexture(37, pTS->pRT_HITGI_0);                   // refl_GGI, rt stage 4A
-	rp.SetTexture(39, pTS->pRT_HITMAT_0);                  // refl_GMAT, rt stage 5B
+	rp.SetTexture(39, pTS->pRT_HITID_0);                   // refl_GID, decision 11
 	rp.SetSampler(0, EDefaultSamplerStates::PointClamp);   // ssSvoPointClamp
+
+	// decision 11: THE RAY TRACING POOLS ON THE SHADE PASS. RT_ReconstructHit reads the BVH /
+	// triangle / material records out of geomPool_Tris (t9) and every atlas layer out of
+	// geomPool_TTex (t55), because the hit material is rebuilt here now and not in the tracer.
+	// Neither slot collides with the forward set (t17-t24, t25-t32, t33, t34-t36, t37, t38,
+	// t39, t40, t41, t42-t49, t50-t54); t55 exists for exactly this reason, see CommonSVO.cfi.
+	// Still NOT bound and still forbidden here: the brick pools, which alias t0-t3 with the
+	// g-data targets above.
+	if (m_texInfo.pTexTriA)
+		rp.SetTexture(9, (CTexture*)m_texInfo.pTexTriA.get());
+
+	if (m_texInfo.pTexTexA)
+		rp.SetTexture(55, (CTexture*)m_texInfo.pTexTexA.get());
+
+	// The atlas layers are sampled with ssSvoLinearClamp (tex3DlodLC), which the trace pass gets
+	// from SetupSvoTexturesForRead. This pass does not call it, so s1 is bound here.
+	rp.SetSampler(1, EDefaultSamplerStates::LinearClamp);  // ssSvoLinearClamp
 
 	SetupShadeForwardResources(rp);
 	SetupShadeSkyTextures(rp);
@@ -1321,6 +1342,28 @@ void CSvoRenderer::ShadePass(SSvoTargetsSet* pTS)
 		// against ApplyGI mode 0, which is also AO (R05, research/06 section 1.5 note 4).
 		// .w = 1 for the specular set.
 		Vec4 vData(0.f, 0.f, 0.f, 1.f);
+		rp.SetConstantArray(paramName, (Vec4*)&vData, 1);
+	}
+
+	{
+		// decision 11: RT_ReconstructHit addresses the record pools with these dimensions, so
+		// the lane that was tracer-only until now has to be on this pass as well. Same values,
+		// same order, same fallbacks as SetupCommonConstants - if the two ever disagree, the
+		// shade pass decodes a different record from the one the tracer hit.
+		static CCryNameR paramName("SVO_RTPoolInfo");
+		Vec4 vData(
+		  (float)(m_texInfo.rtPoolXY   ? m_texInfo.rtPoolXY   : e_svoTI_RT_TriPoolXY),
+		  (float)(m_texInfo.rtPoolZ    ? m_texInfo.rtPoolZ    : e_svoTI_RT_TriPoolZ),
+		  (float)(m_texInfo.rtTexRes   ? m_texInfo.rtTexRes   : e_svoTI_RT_MaxTexRes),
+		  (float)(m_texInfo.rtTexPoolZ ? m_texInfo.rtTexPoolZ : e_svoTI_RT_TexPoolZ));
+		rp.SetConstantArray(paramName, (Vec4*)&vData, 1);
+	}
+
+	{
+		// decision 11: the hit's normal-map distance fade moved here with the reconstruction.
+		// (normalsFading, reserved x3), as in SetupCommonConstants.
+		static CCryNameR paramName("SVO_RTParams1");
+		Vec4 vData(e_svoTI_RT_NormalsFading, 0.f, 0.f, 0.f);
 		rp.SetConstantArray(paramName, (Vec4*)&vData, 1);
 	}
 
@@ -1924,12 +1967,14 @@ void CSvoRenderer::CheckAllocateRT(bool bSpecPass)
 			CheckCreateUpdateRT(tsSpec.pRT_RAYDIR_0, specW, specH, eTF_R16G16B16A16F, eTT_2D, FT_STATE_CLAMP, "SVO_SPEC_RT_RAYDIR");
 			// rt stage 4A: SVO diffuse irradiance (unexposed, TexGiDiffuse's units) + voxel AO.
 			CheckCreateUpdateRT(tsSpec.pRT_HITGI_0, specW, specH, eTF_R16G16B16A16F, eTT_2D, FT_STATE_CLAMP, "SVO_SPEC_RT_HITGI");
-			// rt stage 5B: the shading tag + one per type float3 (decision 10). fp16 because
-			// .x is an integer code up to 1792 - fp16 holds every integer to 2048 exactly - and
-			// .yzw are colours; an RGBA8 target could not carry the code and the scalar in one
-			// channel. Same resolution as the other g-data targets, so 8 bytes per specular
-			// pixel more, and only while e_svoTI_RT_Active.
-			CheckCreateUpdateRT(tsSpec.pRT_HITMAT_0, specW, specH, eTF_R16G16B16A16F, eTT_2D, FT_STATE_CLAMP, "SVO_SPEC_RT_HITMAT");
+			// decision 11: the hit identity - (triangle record + 1, material record + 1,
+			// u * 65535, v * 65535 * 16 + flags), four exact float integers. RGBA32F, not the
+			// fp16 the HITMAT lane it replaces used: a record index is a pool address of up to
+			// a few million and fp16 is exact only to 2048. ETEX_Format has no integer render
+			// target (ITexture.h), so the channels hold VALUES rather than asuint bit patterns -
+			// asfloat(5) is a denormal and the output merger may flush it to zero. 16 bytes per
+			// specular pixel, and only while e_svoTI_RT_Active.
+			CheckCreateUpdateRT(tsSpec.pRT_HITID_0, specW, specH, eTF_R32G32B32A32F, eTT_2D, FT_STATE_CLAMP, "SVO_SPEC_RT_HITID");
 			CheckCreateUpdateRT(tsSpec.pRT_ALD_SHD, specW, specH, eTF_R16G16B16A16F, eTT_2D, FT_STATE_CLAMP, "SVO_SPEC_RT_SHD_ALD");
 			CheckCreateUpdateRT(tsSpec.pRT_RGB_SHD, specW, specH, eTF_R16G16B16A16F, eTT_2D, FT_STATE_CLAMP, "SVO_SPEC_RT_SHD_RGB");
 		}
@@ -1938,7 +1983,7 @@ void CSvoRenderer::CheckAllocateRT(bool bSpecPass)
 			tsSpec.pRT_HITPOS_0 = nullptr;
 			tsSpec.pRT_RAYDIR_0 = nullptr;
 			tsSpec.pRT_HITGI_0 = nullptr;
-			tsSpec.pRT_HITMAT_0 = nullptr;
+			tsSpec.pRT_HITID_0 = nullptr;
 			tsSpec.pRT_ALD_SHD = nullptr;
 			tsSpec.pRT_RGB_SHD = nullptr;
 		}

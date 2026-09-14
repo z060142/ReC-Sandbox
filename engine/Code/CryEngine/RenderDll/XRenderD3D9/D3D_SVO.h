@@ -46,9 +46,12 @@ struct SSvoTargetsSet
 	// rt stage 4A: the fifth g-data target, SVO diffuse irradiance + voxel AO at the hit, so the
 	// reflected surface gets the same indirect model ApplyGI mode 2 gives the primary one.
 	_smart_ptr<CTexture> pRT_HITGI_0;
-	// rt stage 5B: the sixth g-data target, the hit's shading tag plus one per type float3
-	// (decision 10). Slot 5 of the ConeTracePass MRT set, read by ShadePS at t39.
-	_smart_ptr<CTexture> pRT_HITMAT_0;
+	// decision 11: the sixth g-data target, the hit's IDENTITY - triangle record, material
+	// record, barycentrics and flags (RT_PackHitId). Slot 5 of the ConeTracePass MRT set, read
+	// by ShadePS at t39, which turns it back into a material with RT_ReconstructHit. It
+	// replaces stage 5B's HITMAT, and it is RGBA32F rather than fp16 because the two record
+	// indices are exact integers the shader indexes a pool with.
+	_smart_ptr<CTexture> pRT_HITID_0;
 	bool                 bShaded = false;
 
 	// de-mosaic targets

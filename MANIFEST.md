@@ -1,11 +1,13 @@
 # Sync manifest
 
 Baseline : main @ a34100a9 (pristine CRYENGINE 5.7.1)
-Dev      : experimental-rt @ d8f5dad4
-Synced   : 2026-09-14 21:57
+Dev      : experimental-rt @ 0f2b0817
+Synced   : 2026-09-14 22:56
 
 ## Commits (newest first)
 
+- 0f2b0817 docs: record why d8f5dad4's blend-layer gate never gated anything in the engine
+- 51009ff4 feat: rebuild the hit material in ShadePS, not in the tracer (decision 11)
 - d8f5dad4 fix: gate the blend layer at a ray hit so ConeTracePS fits fxc again
 - fe294c9d fix: take the BVH walk out of ConeTracePS' pass loop and make fMultTriRT fold
 - ff66520f fix: the peeled pass loop opened a brace in each #if branch and CryFX dropped the whole .cfx

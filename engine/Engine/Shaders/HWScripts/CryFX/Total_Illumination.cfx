@@ -145,12 +145,14 @@ Texture2D refl_GLD: register (t3); // = RAYDIR
 // technique (the forward set claims t17-t24, t26-t31, t33, t40; t34-t36 are the sky).
 Texture2D refl_GGI: register (t37);
 
-// rt stage 5B (decision 10): the sixth g-data target, the hit's shading tag and its per type
-// parameters. t39 is free on the ShadePass technique - the forward set claims t17-t24, t26-t31,
-// t32, t33, t38 (Fwd_SunShadowMask), t40 and t42-t49, the sky t34-t36 and the SVO GI t37 - and
-// FXSamplerDefs.cfi's own t39 users (NOISE_3D_MAP / DISSOLVE_NOISE_MAP) are macros this shader
-// never instantiates.
-Texture2D refl_GMAT: register (t39);
+// decision 11: the sixth g-data target, the hit's IDENTITY - triangle record, material record,
+// barycentrics and flags (RT_PackHitId in CommonSVO_RT.cfi). It replaces stage 5B's HITMAT, and
+// ShadePS turns it back into a material with RT_ReconstructHit. t39 is free on the ShadePass
+// technique - the forward set claims t17-t24, t26-t31, t32, t33, t38 (Fwd_SunShadowMask), t40
+// and t42-t49, the sky t34-t36, the SVO GI t37, the fog/clouds t50-t54 and the RT pools t9/t55 -
+// and FXSamplerDefs.cfi's own t39 users (NOISE_3D_MAP / DISSOLVE_NOISE_MAP) are macros this
+// shader never instantiates.
+Texture2D refl_GID: register (t39);
 
 // rt stage 4B (decision 08 items 2 + 3): DemosaicPS and UpScalePS need the HIT DISTANCE - the
 // virtual-image reprojection depth and the bilateral hit-distance similarity weight are both
@@ -190,12 +192,10 @@ struct pixoutMRTTrace
 	// rt stage 2 (decision 06 section 6.6). Only allocated and only bound for the specular
 	// target set when e_svoTI_RT_Active; the diffuse permutation never sets %_RT_QUALITY.
 	//  HitPos: .xyz camera-relative hit position (RGBA32F - fp16 is 1.5 cm at 32 m, which is
-	//          shadow-acne territory for hit shading), .w = RT_PackHitMaterial(reflectance,
-	//          smoothness): a 24 bit integer holding the hit's F0 (8 bit square-law magnitude +
-	//          a 216 entry hue code) and its smoothness (8 bit). Kept positive; the sign is
-	//          reserved for the interleaved-refraction flag, stage 4. rt stage 2D moved the
-	//          emissive hue out of this lane and into ALD.w to make room - see the comment above
-	//          RT_PackHitMaterial in CommonSVO_RT.cfi for why the old packing killed specular.
+	//          shadow-acne territory for hit shading). .w is FREE since decision 11: it carried
+	//          RT_PackHitMaterial(reflectance, smoothness) while the tracer reconstructed the
+	//          material, and ShadePS now computes both itself. Written as 0; the next lane that
+	//          needs 24 exact bits at a hit should take it.
 	//  RayDir: .xyz ray direction, .w = hit distance, or GetMaxRayDistance() + 1 on a miss
 	//          (the "no hit => fall back to probes" sentinel). .w == 0 means "not an RT pixel".
 	float4 HitPos: SV_Target2;
@@ -207,12 +207,13 @@ struct pixoutMRTTrace
 	//          fetch inside the SVO cell that produced the hit, and ShadePS may never touch a
 	//          brick pool (t0-t3 aliasing). A miss writes (0,0,0,1).
 	half4  HitGi: SV_Target4;
-	//  HitMat: rt stage 5B (decision 10). .x = RT_PackHitMatCode - the shading tag as a compact
-	//          code, one per type 8 bit scalar, and the sign flagging "this material has an
-	//          extras record"; .yzw = the one per type float3 (vegetation / skin transmittance,
-	//          glass tint, water body colour). See the block above RT_TagToCode in
-	//          CommonSVO_RT.cfi for why no existing lane could carry it.
-	half4  HitMat: SV_Target5;
+	//  HitId:  decision 11. The hit's IDENTITY, not its material: (triangle record + 1,
+	//          material record + 1, u * 65535, v * 65535 * 16 + flags), four exact float
+	//          integers in an RGBA32F target. ShadePS reads the two records out of
+	//          geomPool_Tris itself and rebuilds normal / albedo / F0 / smoothness / emissive /
+	//          detail / blend layer / per type parameters from them (RT_ReconstructHit). This
+	//          pass is a SEARCH, and its answer is which triangle was found.
+	float4 HitId: SV_Target5;
 #endif
 };
 
@@ -2103,7 +2104,7 @@ pixoutMRTTrace ConeTracePS(vtxOutWPOS IN)
 		// RT_IsTriPixel is false in diffuse mode, so this is always the specular cone severity.
 		const half powerRT = exp2(10.h * fAverSmoothness + 1.h);
 
-		RT_ResetInfo(vFocusRT, VOX_MAX_RT_DIST_RAY, fDistM, RT_GetStippleAlphaRef(nXY), false);
+		RT_ResetInfo(VOX_MAX_RT_DIST_RAY, RT_GetStippleAlphaRef(nXY), false);
 
 		// triangle rays get their own length budget, not the cone length. vSurfNorm is 0 so the
 		// traversal ray is the unadvanced one (see ConeTraceTree).
@@ -2127,7 +2128,13 @@ pixoutMRTTrace ConeTracePS(vtxOutWPOS IN)
 					? RT_SampleVoxelIrradiance(g_rtInfo.cellTC, g_rtInfo.cellMin, g_rtInfo.cellMax, g_rtInfo.hitpos.xyz)
 					: (float3)1.f;
 
-				vCRT.xyz = g_rtInfo.albedo_smoothness.xyz * vIrradiance;
+				// decision 11: the RAW albedo texel the alpha test sampled, NOT the shaded
+				// albedo - this pass no longer has one. What is missing against the old view is
+				// the material's diffuse tint (matInfo2.xyz) and the detail / blend layer
+				// deltas, all of which are ShadePS' now. So view 6 is the atlas colour of the
+				// triangle that was hit, which is exactly the question it is asked: "did the
+				// search land on the surface I think it did".
+				vCRT.xyz = g_rtInfo.best.vAlb.xyz * vIrradiance;
 				vCRT.a = 1;
 			}
 
@@ -2163,26 +2170,21 @@ pixoutMRTTrace ConeTracePS(vtxOutWPOS IN)
 	vRGB.w = fNewDepth;
 
 #if %_RT_QUALITY
-	// rt stage 2 (decision 06 section 6.1 / 6.6): a triangle-ray pixel carries g-data instead of
-	// a colour, and the ShadePass overwrites ALD + RGB with the shaded result. The packing is
-	// Neo's, so the two existing targets carry four of the six values:
-	//   ALD.xyz = world normal scaled by (1 + emittance)   ALD.w = PackRGB(emissive hue) + 1,
-	//                                                              negated for the veg-leaves model
-	//   RGB.xyz = hit albedo                               RGB.w = UNTOUCHED scene linear depth
-	// RGB.w stays the reflecting pixel's depth because that is what DemosaicPS reads out of this
-	// channel (Total_Illumination.cfx:1066, 1073-1074) for its bilateral weights. Reflectance and
-	// smoothness therefore ride in HitPos.w, not here (rt stage 2D).
+	// decision 11: a triangle-ray pixel carries HIT IDENTITY, and the ShadePass overwrites
+	// ALD + RGB with the shaded result.
+	//
+	// ALD AND RGB ARE NOT TOUCHED HERE ANY MORE. They used to carry the reconstructed normal,
+	// emissive hue and albedo; this pass reconstructs none of those now. What is left in them is
+	// the voxel cone colour the post-loop trace produced, which makes them the RIGHT fallback:
+	// if the ShadePass does not run for any reason, an RT pixel reads as the cone result instead
+	// of as black. RGB.w is still the reflecting pixel's own linear depth, written below and
+	// untouched, because that is what DemosaicPS bilaterally weights on
+	// (Total_Illumination.cfx:1066, 1073-1074).
 	if (bRTWriteGData)
 	{
-		vALD.xyz = g_rtInfo.normal_emissive.xyz;
-		vALD.w   = g_rtInfo.normal_emissive.w;
-		vRGB.xyz = g_rtInfo.albedo_smoothness.xyz;
-
-		// rt stage 2D: one 24 bit integer, no fractional field any more. Reflectance and
-		// smoothness are both exact integers on the way out and on the way back, so the round
-		// trip is deterministic and debug view 12 can show exactly what ShadePS will read.
-		OUT.HitPos = float4(g_rtInfo.hitpos.xyz - GetWorldViewPos(),
-		                    RT_PackHitMaterial(g_rtInfo.reflectance, abs(g_rtInfo.albedo_smoothness.w)));
+		// HitPos.w: free since decision 11 (it held RT_PackHitMaterial). Zero, not garbage, so a
+		// future reader can tell "nothing wrote this" from "this is the value".
+		OUT.HitPos = float4(g_rtInfo.hitpos.xyz - GetWorldViewPos(), 0.f);
 		// rt stage 4B: the VNDF estimator weight rides in the LENGTH of RayDir.xyz. The lane
 		// was free because the direction is unit by construction (RT_ProcessBestHit writes
 		// rOrig.direction, which is normalize(kern)), the target is RGBA16F so a [0,1] scale
@@ -2192,9 +2194,8 @@ pixoutMRTTrace ConeTracePS(vtxOutWPOS IN)
 		// With e_svoTI_RT_GlossyMode 0 the weight is exactly 1 and this line is the old line.
 		OUT.RayDir = float4(g_rtInfo.raydir.xyz * fRTSampleWeight, g_rtInfo.raydir.w);
 
-		// rt stage 5B: the shading tag and the per type parameters RT_ProcessBestHit resolved at
-		// the hit. A miss writes zero, which decodes as "no material data".
-		OUT.HitMat = g_rtInfo.matData;
+		// decision 11: the hit identity. A miss writes zero, which RT_UnpackHitId rejects.
+		OUT.HitId = g_rtInfo.hitId;
 
 		// rt stage 4A, energy audit error 1 + 2. The DIRECT view of a surface does not get the
 		// env probe's ambient at all: ApplyGI mode 2 replaces it with the SVO's GI
@@ -2207,8 +2208,13 @@ pixoutMRTTrace ConeTracePS(vtxOutWPOS IN)
 		// where ApplyGI would have.
 		if (g_rtInfo.best.vAlb.a > 0 && g_rtInfo.cellValid)
 		{
+			// decision 11: the AO probe walks along the GEOMETRIC face normal of the winning
+			// triangle (SBestHit.faceNorm, oriented against the ray). The shading normal does
+			// not exist in this pass any more - and a normal-mapped one was never the right
+			// input for this probe, which asks "how much solid SVO sits in front of the
+			// surface"; the surface is the triangle, not its bump map.
 			OUT.HitGi = float4(RT_SampleVoxelIrradiance(g_rtInfo.cellTC, g_rtInfo.cellMin, g_rtInfo.cellMax, g_rtInfo.hitpos.xyz),
-			                   RT_SampleVoxelAO(g_rtInfo.cellTC, g_rtInfo.cellMin, g_rtInfo.cellMax, g_rtInfo.hitpos.xyz, normalize(g_rtInfo.normal_emissive.xyz)));
+			                   RT_SampleVoxelAO(g_rtInfo.cellTC, g_rtInfo.cellMin, g_rtInfo.cellMax, g_rtInfo.hitpos.xyz, g_rtInfo.best.faceNorm));
 		}
 		else
 		{
@@ -2233,8 +2239,12 @@ pixoutMRTTrace ConeTracePS(vtxOutWPOS IN)
 // specular target set and converts the g-data written above back into the ALD + RGB contract
 // the rest of the stock SVO chain already speaks, so nothing downstream changes.
 //
-// !!! ShadePS aliases t0-t3 with the brick pools. It must never call an SVO tracing function.
+// !!! ShadePS aliases t0-t3 with the BRICK pools. It must never call an SVO tracing function.
 // See the header of Total_Illumination_Shading.cfi. !!!
+// decision 11: it DOES read the two RAY TRACING pools - geomPool_Tris (t9) and geomPool_TTex
+// (t55), through RT_ReconstructHit. Those two are not brick pools and not aliased here; t55 was
+// moved off t28 for exactly this reason (CommonSVO.cfi). The rule that still stands unchanged
+// is the one about brickPool_Tree / Rgbs / Norm / Opac at t0-t3.
 ///////////////////////////////////////////////////////////////////////////////////
 
 pixoutShade ShadePS(vtxOutWPOS IN)
@@ -2273,43 +2283,60 @@ pixoutShade ShadePS(vtxOutWPOS IN)
 		const float3 vRayDirN = normalize(vGLD.xyz);
 		const float fSampleWeight = (VOX_RT_GLOSSY_MODE > 0.f) ? saturate(length(vGLD.xyz)) : 1.f;
 
-		// rt stage 2D. HITPOS.w carries the hit's F0 and smoothness (RT_PackHitMaterial);
-		// ALD.w carries the emissive hue code + 1, signed by the lighting model. Before 2D the
-		// reflectance came through PackRGB at 3 bits per channel and CE's 0.0369 dielectric F0
-		// quantised to exactly 0, so SpecularBRDF returned 0 at every non-metal hit and the
-		// reflection had no specular response at all.
-		float3 vReflectance; float fSmoothness;
-		RT_UnpackHitMaterial(vGPO.w, vReflectance, fSmoothness);
+		///////////////////////////////////////////////////////////////////////////////////
+		// decision 11 - THE HIT MATERIAL IS BUILT HERE, not in the tracer.
+		//
+		// The tracer handed over an identity (which triangle, which material record, where on
+		// the triangle) and RT_ReconstructHit turns it into a surface: tangent frame, raw uv,
+		// base + extras + blend records, every atlas sample, the detail map, the blend layer,
+		// the per type parameters, F0, smoothness and the emissive. It lives in ShadePS because
+		// ConeTracePS could not hold it and a BVH walk in one entry point (report 06a); this
+		// pass has no traversal and plenty of room, which is why the blend layer is on again.
+		//
+		// fCamDist is rebuilt from the g-data: the reflecting surface is the hit position walked
+		// back along the ray by the hit distance. That is the tracer's own ray origin to within
+		// the R01 surface offset (a couple of millimetres), and it feeds only the 1/d normal-map
+		// fade, which is off unless e_svoTI_RT_NormalsFading is set.
+		///////////////////////////////////////////////////////////////////////////////////
+		const float4 vGID = refl_GID.SampleLevel(ssSvoPointClamp, IN.baseTC.xy, 0);
 
-		const float3 vEmmTint = RT_UnpackEmissiveHue(vGAL.w);
+		const float  fHitDist = abs(vGLD.w);
+		const float3 vSurfaceRel = vGPO.xyz - vRayDirN * fHitDist;   // camera-relative
+		const float  fCamDist = length(vSurfaceRel);
 
-		// rt stage 5B (decision 10): the hit's material TYPE and its per type parameters.
-		uint nMatCode; float fMatParam; bool bMatExtras;
-		RT_UnpackHitMatCode(refl_GMAT.SampleLevel(ssSvoPointClamp, IN.baseTC.xy, 0).x, nMatCode, fMatParam, bMatExtras);
-		const float3 vMatRgb = refl_GMAT.SampleLevel(ssSvoPointClamp, IN.baseTC.xy, 0).yzw;
+		SRTHit hit;
+		const bool bHitMat = RT_ReconstructHit(vGID, fCamDist, fHitDist, hit);
 
-		// The sign of the packed emissive hue is stage 2D's veg-leaves marker and is kept as the
-		// fallback, so a record written before the tag existed still gets the two-sided model.
-		const bool bTagVegLeaves = (nMatCode == VOX_RT_MATCODE_VEG_LEAVES) || (vGAL.w < 0);
-		const bool bTagSkin      = (nMatCode == VOX_RT_MATCODE_HUMAN_SKIN);
-		const bool bTagGlass     = (nMatCode == VOX_RT_MATCODE_GLASS);
-		const bool bTagWater     = (nMatCode == VOX_RT_MATCODE_WATER);
+		const uint  nMatCode   = hit.nMatCode;
+		const float fMatParam  = hit.fMatParam;
+		const bool  bMatExtras = hit.bExtras;
+
+		// A miss keeps the probe-fallback surface RT_ProcessBestHit used to write into the
+		// g-data: normal along the ray, albedo and F0 exactly 1 so the probe term passes through
+		// the energy split unmodified, smoothness 1. RT_ReconstructHit already initialises the
+		// first three; only the normal depends on this pass' ray.
+		const float3 vHitNormal = bHitMat ? hit.vNormalWS : vRayDirN;
+
+		const bool bTagVegLeaves = bHitMat && (nMatCode == VOX_RT_MATCODE_VEG_LEAVES);
+		const bool bTagSkin      = bHitMat && (nMatCode == VOX_RT_MATCODE_HUMAN_SKIN);
+		const bool bTagGlass     = bHitMat && (nMatCode == VOX_RT_MATCODE_GLASS);
+		const bool bTagWater     = bHitMat && (nMatCode == VOX_RT_MATCODE_WATER);
 
 		MaterialAttribsCommon commonAttribs = (MaterialAttribsCommon)0;
-		commonAttribs.NormalWorld = normalize(vGAL.xyz);
-		commonAttribs.Albedo      = vGNO.xyz;
-		commonAttribs.Reflectance = vReflectance;
-		commonAttribs.Smoothness  = fSmoothness;
+		commonAttribs.NormalWorld = vHitNormal;
+		commonAttribs.Albedo      = hit.vAlbedo;
+		commonAttribs.Reflectance = hit.vReflectance;
+		commonAttribs.Smoothness  = hit.fSmoothness;
 
 		// VEGETATION LEAVES (tag 0.25) and HUMAN SKIN (tag 2) share CE's one forward answer to
 		// "light comes through this surface": LIGHTINGMODEL_TRANSMITTANCE, which makes
 		// Callback_ShadingDirect call ThinTranslucencyBRDF (shadeLib.cfi:952-964) INSTEAD OF the
 		// diffuse BRDF - it is a substitution, not an addition, which is why the leaf is not
-		// twice as bright as the trunk. The colour is the material's own now:
+		// twice as bright as the trunk. The colour is the material's own:
 		//   Vegetation.cfx:503-512  saturate(BackDiffuseMultiplier * translucencyMap) * TransmittanceColor
 		//   HumanSkin.cfx:286-298   exp((1 - saturate(translucencyMap * TranslucencyMultiplier)) * (-8, -40, -64))
-		// Both are resolved per texel at the hit (RT_ProcessBestHit) and arrive in the HITMAT
-		// float3. A leaf material whose record predates the extras keeps the old grey 0.5.
+		// Both are resolved per texel by RT_ReconstructHit. A leaf material whose record carries
+		// no extras keeps the old grey 0.5.
 		//
 		// SKIN IS THE FORWARD APPROXIMATION AND NOTHING MORE. CE's skin is
 		// LIGHTINGMODEL_TRANSMITTANCE plus a SCREEN SPACE subsurface blur keyed on
@@ -2319,7 +2346,7 @@ pixoutShade ShadePS(vtxOutWPOS IN)
 		if (bTagVegLeaves || bTagSkin)
 		{
 			commonAttribs.LightingModel = LIGHTINGMODEL_TRANSMITTANCE;
-			commonAttribs.Transmittance = bMatExtras ? (half3)vMatRgb : (half3)0.5f;
+			commonAttribs.Transmittance = bMatExtras ? (half3)hit.vMatRgb : (half3)0.5f;
 		}
 
 		// GLASS (tag 3): Glass.cfx:575-586 shades the pane from its TINT, not from its albedo -
@@ -2329,7 +2356,7 @@ pixoutShade ShadePS(vtxOutWPOS IN)
 		// density x depth, Water.cfx:1116-1117) takes the albedo's place, so the sun and the
 		// SVO GI light the water body the same way they light any other diffuse surface.
 		if (bTagGlass || bTagWater)
-			commonAttribs.Albedo = vMatRgb;
+			commonAttribs.Albedo = hit.vMatRgb;
 
 		ForwardShadingAttribs fwdAttribs = (ForwardShadingAttribs)0;
 		fwdAttribs.screenUV        = IN.baseTC.xy;
@@ -2343,8 +2370,10 @@ pixoutShade ShadePS(vtxOutWPOS IN)
 		fwdAttribs.custom.LightingModel = commonAttribs.LightingModel;
 		fwdAttribs.custom.Transmittance = (commonAttribs.LightingModel == LIGHTINGMODEL_TRANSMITTANCE)
 		                                  ? (float3)commonAttribs.Transmittance : (float3)0.f;
-		// emittance rides in the LENGTH of the packed normal
-		fwdAttribs.custom.Emittance     = max(length(vGAL.xyz) - 1.f, 0.f);
+		// decision 11: the emissive magnitude is an fp32 local now, not the length of an fp16
+		// normal, and its hue (hit.vEmissiveHue) is a real float3 instead of a 3 bit per channel
+		// PackRGB code in ALD.w.
+		fwdAttribs.custom.Emittance     = max(hit.fEmittance, 0.f);
 		fwdAttribs.custom.RayDirection  = bNoHit ? -vRayDirN : vRayDirN;
 		// traced sun shadow rays are stage 4; the cascades do the work today
 		fwdAttribs.custom.SunShadowRT   = 1.f;
@@ -2485,13 +2514,13 @@ pixoutShade ShadePS(vtxOutWPOS IN)
 		// Emissive, exactly Illum.cfx IlluminationPS:
 		//     emittance = MatEmissiveColor.rgb * MatEmissiveColor.w * MAT_EMISSIVE_UNIT_SCALE
 		//                 * PS_HDR_RANGE_ADAPT_MAX * GetEmittanceMask(baseTC)
-		// Emittance (the normal's length) and vEmmTint (hitpos.w's integer part) multiply back
+		// Emittance (the magnitude) and hit.vEmissiveHue multiply back
 		// to the first four factors times the mask; PS_HDR_RANGE_ADAPT_MAX is the one that was
 		// missing. It has to be here, on the exposed side of the divide below, because the
 		// divide + ApplyGI's multiply cancel and emissive would otherwise land one exposure
 		// factor short of the same surface seen directly. NOT multiplied by albedo: that is
 		// Neo's borrowed-hue trick for a scalar-only atlas, and we carry a real hue now.
-		acc += fwdAttribs.custom.Emittance * vEmmTint * PS_HDR_RANGE_ADAPT_MAX;
+		acc += fwdAttribs.custom.Emittance * hit.vEmissiveHue * PS_HDR_RANGE_ADAPT_MAX;
 
 		// rt stage 4A, energy audit error 3 / E4. Every VOXEL specular pixel is multiplied by
 		// e_svoTI_SpecularAmplifier inside the cone trace (CommonSVO.cfi:1323-1328,
@@ -2600,7 +2629,7 @@ pixoutShade ShadePS(vtxOutWPOS IN)
 				else if (nMatCode == VOX_RT_MATCODE_TERRAIN)    vTagCol = float3(0.6f, 0.4f, 0.15f);
 				else                                            vTagCol = float3(1.f, 1.f, 0.f);
 
-				acc = bNoHit ? (float3)0.f : vTagCol;
+				acc = bHitMat ? vTagCol : (float3)0.f;
 				bRawDebug = true;
 			}
 			else if (nDbg == 17)
@@ -2611,7 +2640,54 @@ pixoutShade ShadePS(vtxOutWPOS IN)
 				// a CPU-side problem (the producer did not emit extras) and not a shader one;
 				// the "extras N" counter on the r_DisplayInfo 2 "RT BVH:" line is the other half
 				// of the same question.
-				acc = (bNoHit || !bMatExtras) ? (float3)0.f : (float3)1.f;
+				acc = (!bHitMat || !bMatExtras) ? (float3)0.f : (float3)1.f;
+				bRawDebug = true;
+			}
+			// decision 11: views 2, 3, 10, 11 and 12 used to be answered by RT_GetDebugColor
+			// inside ConeTracePS, out of the values it reconstructed there. It reconstructs
+			// nothing now, so they are answered here, out of RT_ReconstructHit - the same five
+			// pictures, of the same five quantities, one pass later.
+			else if (nDbg == 2)
+			{
+				// 2 = the hit's world-space SHADING normal (normal map + blend + detail
+				// applied), as the usual 0.5 + 0.5 * n colour.
+				acc = bHitMat ? (vHitNormal * 0.5f + 0.5f) : (float3)0.f;
+				bRawDebug = true;
+			}
+			else if (nDbg == 3)
+			{
+				// 3 = the hit's albedo, after the material tint, the blend layer and the
+				// detail map's albedo delta. Compare with the same surface seen directly.
+				acc = bHitMat ? hit.vAlbedo : (float3)0.f;
+				bRawDebug = true;
+			}
+			else if (nDbg == 10)
+			{
+				// rt stage 2C (e): the RAW atlas normal texel of the hit, tangent space, before
+				// the distance fade and before the rotation into world space. Flat lilac
+				// (0.5, 0.5, 1) everywhere means the atlas normal layer is flat or missing; a
+				// magenta tint (the .w < 0 marker) means the record carries no normal slot.
+				acc = bHitMat ? ((hit.vDbgAtlasNormal.w < 0.f) ? float3(1, 0, 1) : hit.vDbgAtlasNormal.xyz)
+				              : (float3)0.f;
+				bRawDebug = true;
+			}
+			else if (nDbg == 11)
+			{
+				// 11 = the hit's smoothness. Black = 0 (a perfectly rough hit, no gloss lobe),
+				// white = 1. A material that reads FLAT here while the direct view is modulated
+				// is the missing smoothness-map slot in the record, not a shader bug.
+				acc = bHitMat ? (float3)saturate(hit.fSmoothness) : (float3)0.f;
+				bRawDebug = true;
+			}
+			else if (nDbg == 12)
+			{
+				// 12 = the hit's reflectance (F0), x8 so CE's 0.0369 dielectric reads as a mid
+				// grey (0.30) instead of near black and a metal reads as its tint at or near
+				// clipping. BLACK means the material record really has no reflectance.
+				// decision 11: this is now the value itself - the stage 2D pack/unpack round
+				// trip it used to be shown through is gone, because the value no longer crosses
+				// a render target.
+				acc = bHitMat ? saturate(hit.vReflectance * 8.f) : (float3)0.f;
 				bRawDebug = true;
 			}
 			else if (nDbg == 18)
