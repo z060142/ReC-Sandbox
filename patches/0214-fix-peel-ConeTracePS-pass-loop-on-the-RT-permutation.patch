@@ -1,0 +1,135 @@
+From 452a2c7d223feb6224cc2fbb93e8203040567ee1 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Mon, 14 Sep 2026 10:38:34 +0800
+Subject: [PATCH 214/214] fix: peel ConeTracePS' pass loop on the RT
+ permutation (X3511 unroll failure)
+
+The engine could not compile Total_Illumination@ConeTracePS(X1):
+
+  (2098,3): error X3511: forced to unroll loop, but unrolling failed.
+
+The loop is the stock pass loop `for (int p = 0; p < nPassesNum; p++)` in ConeTracePS.
+With %_RT_TILED_SHADING (e_svoTI_TraceVoxels, on by default) its body inlines
+ConeTraceTree, which under %_RT_QUALITY now also inlines RT_TraverseTris - a BVH stack
+`while` with the per-leaf triangle `for` nested inside it. fxc then insists on unrolling
+the pass loop and its unroller refuses the resulting body size.
+
+It is not a gradient sample and not an [unroll] on a runtime bound: [loop] on the same
+loop only turns X3511 into X3531, marking every inner loop [loop] changes nothing, and
+deleting the `for` header while keeping the identical body compiles clean at every -O
+level. Minimal reproducing flag set: %_RT_QUALITY + %_RT_TILED_SHADING.
+
+So under #if %_RT_QUALITY the pass loop is peeled by hand into its single pass, and
+nPassesNum is pinned to 1 there (#if %_RT_MOTION_BLUR && !%_RT_QUALITY). The RT path
+could never have run two passes: g_rtInfo is one global hit record, so a second pass
+overwrites the g-data ShadePS reads. Without %_RT_QUALITY the #else branch is the stock
+`for` and the native path's text is unchanged.
+
+Also silences X3556 on our own integer arithmetic: UnpackRGB and RT_UnpackHitMaterial
+divided and modded a uint by the plain int literals RT_RGB_RANGE / RT_HUE_RANGE, which
+fxc compiles as a signed divide. New RT_RGB_RANGE_U / RT_HUE_RANGE_U unsigned literals.
+The other X3556 sites in this shader (ComputeDataTC, GetDiffuseKernel's index,
+DemosaicPS' nRange / 2) are stock and untouched.
+
+rtharness2/validate.sh (outside git) now carries the real specular-pixel flag set from
+CSvoRenderer::GetRunTimeFlags as a permanent fixture - it never set %_RT_TILED_SHADING
+before, which is why this only showed up in the engine. 33 compiles, all green.
+Report: scene-notes/rt/reports/06a-unroll-fix.md.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SCUvWGLCsqzm3VNMzp4uiS
+---
+ .../Shaders/HWScripts/CryFX/CommonSVO_RT.cfi   | 17 +++++++++++------
+ .../HWScripts/CryFX/Total_Illumination.cfx     | 18 +++++++++++++++++-
+ 2 files changed, 28 insertions(+), 7 deletions(-)
+
+diff --git a/Engine/Shaders/HWScripts/CryFX/CommonSVO_RT.cfi b/Engine/Shaders/HWScripts/CryFX/CommonSVO_RT.cfi
+index 16932c68..b75bec87 100644
+--- a/Engine/Shaders/HWScripts/CryFX/CommonSVO_RT.cfi
++++ b/Engine/Shaders/HWScripts/CryFX/CommonSVO_RT.cfi
+@@ -432,15 +432,18 @@ uint2 ExtractUint2(const float fVal)
+ }
+ 
+ #define RT_RGB_RANGE 8
++#define RT_RGB_RANGE_U 8u
+ 
+ float3 UnpackRGB(const float fVal)
+ {
+ 	uint n = (uint)abs(fVal);
+ 
++	// Unsigned literals: a uint against a plain int literal is a SIGNED divide/modulo to fxc,
++	// which is the slow path and warns X3556. Both operands are unsigned by construction here.
+ 	float3 col;
+-	col.x = n % RT_RGB_RANGE; n /= RT_RGB_RANGE;
+-	col.y = n % RT_RGB_RANGE; n /= RT_RGB_RANGE;
+-	col.z = n % RT_RGB_RANGE;
++	col.x = n % RT_RGB_RANGE_U; n /= RT_RGB_RANGE_U;
++	col.y = n % RT_RGB_RANGE_U; n /= RT_RGB_RANGE_U;
++	col.z = n % RT_RGB_RANGE_U;
+ 
+ 	return col * (1.f / (RT_RGB_RANGE - 1));
+ }
+@@ -510,6 +513,7 @@ float PackRGB(const float3 col)
+ // RT_HUE_RANGE: levels per channel in the reflectance hue code (6^3 = 216).
+ // RT_SMOOTH_STEPS: smoothIdx in [0, 255]. RT_GREY_STEPS: greyIdx in [0, 255].
+ #define RT_HUE_RANGE     6
++#define RT_HUE_RANGE_U   6u
+ #define RT_SMOOTH_STEPS  255
+ #define RT_GREY_STEPS    255
+ 
+@@ -541,10 +545,11 @@ void RT_UnpackHitMaterial(const float fPacked, out float3 vReflectance, out floa
+ 
+ 	const float fGrey = (float)greyIdx * (1.f / RT_GREY_STEPS);
+ 
++	// unsigned literal: see UnpackRGB - an int literal turns these into signed divides (X3556)
+ 	float3 vHue;
+-	vHue.x = hueCode % RT_HUE_RANGE; hueCode /= RT_HUE_RANGE;
+-	vHue.y = hueCode % RT_HUE_RANGE; hueCode /= RT_HUE_RANGE;
+-	vHue.z = hueCode % RT_HUE_RANGE;
++	vHue.x = hueCode % RT_HUE_RANGE_U; hueCode /= RT_HUE_RANGE_U;
++	vHue.y = hueCode % RT_HUE_RANGE_U; hueCode /= RT_HUE_RANGE_U;
++	vHue.z = hueCode % RT_HUE_RANGE_U;
+ 
+ 	vReflectance = (fGrey * fGrey) * (vHue * (1.f / (RT_HUE_RANGE - 1)));
+ }
+diff --git a/Engine/Shaders/HWScripts/CryFX/Total_Illumination.cfx b/Engine/Shaders/HWScripts/CryFX/Total_Illumination.cfx
+index 30e5d1ba..9d35377a 100644
+--- a/Engine/Shaders/HWScripts/CryFX/Total_Illumination.cfx
++++ b/Engine/Shaders/HWScripts/CryFX/Total_Illumination.cfx
+@@ -1915,7 +1915,12 @@ pixoutMRTTrace ConeTracePS(vtxOutWPOS IN)
+ 
+ 	const int nFramesNum = (SVO_TargetResScale.w /*|| !IsDiffuseMode()*/) ? 1 : 2;
+ 
+-	#if %_RT_MOTION_BLUR
++	// rt: dual tracing (%_RT_MOTION_BLUR) runs the kernel twice and averages. The software
++	// triangle tracer cannot: g_rtInfo is one global hit record, so a second pass overwrites
++	// the first pass' hit and the g-data handed to ShadePS would describe only the last ray.
++	// On the RT permutation the pass count is therefore pinned to one. Without %_RT_QUALITY
++	// this preprocesses to exactly the stock two lines.
++	#if %_RT_MOTION_BLUR && !%_RT_QUALITY
+ 	const int nPassesNum = 2;
+ 	#else
+ 	const int nPassesNum = 1;
+@@ -1927,8 +1932,19 @@ pixoutMRTTrace ConeTracePS(vtxOutWPOS IN)
+ 	bool bRTWriteGData = false;
+ #endif
+ 
++#if %_RT_QUALITY
++	// rt: fxc cannot build this loop once the software triangle tracer (RT_TraverseTris, a
++	// stack walk with a triangle loop inside it) is inlined next to the voxel cone trace:
++	// it insists on unrolling the pass loop and then reports X3511 "unrolling failed" on the
++	// body's size ([loop] only turns that into X3531). The pass count is one on this
++	// permutation (see nPassesNum above), so the loop is peeled by hand into its single pass.
++	// Without %_RT_QUALITY the stock `for` in the #else below is what compiles, unchanged.
++	const int p = 0;
++	{
++#else
+ 	for (int p = 0; p < nPassesNum; p++)
+ 	{
++#endif
+ 		int s = (nFramesNum == 2) ? (int(SVO_FrameIdByte.x) & 1) : 0;
+ 		s += p * nFramesNum;
+ 
+-- 
+2.47.1.windows.1
+
