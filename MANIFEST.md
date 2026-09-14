@@ -1,11 +1,12 @@
 # Sync manifest
 
 Baseline : main @ a34100a9 (pristine CRYENGINE 5.7.1)
-Dev      : experimental-rt @ 452a2c7d
-Synced   : 2026-09-14 11:18
+Dev      : experimental-rt @ ff66520f
+Synced   : 2026-09-14 20:37
 
 ## Commits (newest first)
 
+- ff66520f fix: the peeled pass loop opened a brace in each #if branch and CryFX dropped the whole .cfx
 - 452a2c7d fix: peel ConeTracePS' pass loop on the RT permutation (X3511 unroll failure)
 - 56dd8dca feat: volumetric clouds in ray traced reflections (decision 09 section 9.2)
 - 0cf232d6 feat: factor the volumetric cloud shape and density functions into CloudsCommon.cfi
