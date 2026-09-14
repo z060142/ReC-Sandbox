@@ -1,0 +1,203 @@
+From b24fca9fe62b01fd6a95eefa00a6bd1be6c87f41 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Mon, 14 Sep 2026 23:04:34 +0800
+Subject: [PATCH 222/225] fix: publish a low res system copy only when it is
+ complete (GetLowResSystemCopy race)
+
+Report 06c S3 / F6.3. The miss path inserted an EMPTY map entry under the modify
+lock, dropped back to the READ lock, and only then ran PrepareLowResSystemCopy
+into that entry. Two threads therefore race:
+
+ - a reader that arrives in between finds the entry and returns a zero sized copy,
+   or dereferences m_lowResSystemCopy.GetElements() while PodArray::PreAllocate
+   is reallocating it - a pointer into freed memory;
+ - two threads that miss together both run EF_LoadImage + DXTDecompress into the
+   same PodArray.
+
+Stock only reached this from one thread at 32x32, so it never showed. The mesh
+ray tracing producer asks for up to six slots per material at 256x256 from every
+job worker, which makes both routine.
+
+The copy is now prepared into a local and published complete under the modify
+lock, so a reader sees either nothing or a finished entry, and one dedicated
+critical section serialises the preparation itself - N workers asking for the
+same texture queue on it instead of all queueing a disk read, and the later ones
+then find the finished entry and do no work.
+
+Also: when a SMALLER slot already holds a copy that its own cap did not clamp,
+the pixels are reused instead of loading and decompressing the file again. A
+separate entry is still published per slot because m_nLowResSystemCopyAtlasId is
+per slot consumer state.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SCUvWGLCsqzm3VNMzp4uiS
+---
+ .../RenderDll/Common/Textures/Texture.cpp     | 138 ++++++++++++++----
+ 1 file changed, 110 insertions(+), 28 deletions(-)
+
+diff --git a/Code/CryEngine/RenderDll/Common/Textures/Texture.cpp b/Code/CryEngine/RenderDll/Common/Textures/Texture.cpp
+index 7e37fd25..e2bd1ab2 100644
+--- a/Code/CryEngine/RenderDll/Common/Textures/Texture.cpp
++++ b/Code/CryEngine/RenderDll/Common/Textures/Texture.cpp
+@@ -3566,48 +3566,130 @@ const int CTexture::GetTextureID() const
+ 
+ #ifdef TEXTURE_GET_SYSTEM_COPY_SUPPORT
+ 
++//! Data race fixed here (SVO RT report 06c S3 / F6.3, 06d fix 3b).
++//!
++//! The original miss path inserted an EMPTY map entry under the modify lock, dropped back to the
++//! READ lock, and only then ran PrepareLowResSystemCopy into that entry. Two failures follow:
++//!
++//!  1. a second thread that took the read lock in between found the entry, saw
++//!     m_nLowResCopyWidth == 0 and an empty PodArray, and returned that as a valid copy - or, worse,
++//!     read m_lowResSystemCopy.GetElements() while PreAllocate was reallocating it underneath, i.e.
++//!     a pointer to freed memory;
++//!  2. two threads that missed at the same time both ran PrepareLowResSystemCopy on the SAME entry,
++//!     so two EF_LoadImage + DXTDecompress passes wrote into one PodArray concurrently.
++//!
++//! Stock only ever reached this from one thread at 32x32, so it never showed. The mesh ray tracing
++//! producer asks for up to six texture slots per material at 256x256 from every job worker, which
++//! makes both failures routine.
++//!
++//! The fix: a copy is PREPARED into a local and only PUBLISHED, complete, under the modify lock, so
++//! no reader can ever observe a half built entry; and one dedicated critical section serialises the
++//! preparation itself, so N workers asking for the same texture queue on it instead of all queueing
++//! a disk read - the second one finds the finished entry and does no work at all.
+ const ColorB* CTexture::GetLowResSystemCopy(uint16& width, uint16& height, int** ppUserData, int maxTexSize)
+ {
+-	AUTO_READLOCK(s_LowResSystemCopyLock);
+-
+ 	// find slot based on requested texture size, snap texture size to power of 2
+-	int slot = CLAMP((int)log2(maxTexSize) - 4, 0, TEX_SYS_COPY_MAX_SLOTS - 1);
++	const int slot = CLAMP((int)log2(maxTexSize) - 4, 0, TEX_SYS_COPY_MAX_SLOTS - 1);
+ 	maxTexSize = (int)exp2(slot + 4);
+ 
+-	LowResSystemCopyType::iterator it = s_LowResSystemCopy[slot].find(this);
+-
+-	// load if not ready yet
+-	if (it == CTexture::s_LowResSystemCopy[slot].end())
++	// caller must hold s_LowResSystemCopyLock (read or modify) across this
++	auto fetch = [&](int fromSlot) -> const ColorB*
+ 	{
+-		if (m_eTT != eTT_2D || (m_nMips <= 1 && (m_nWidth > maxTexSize || m_nHeight > maxTexSize)) || m_eDstFormat < eTF_BC1 || m_eDstFormat > eTF_BC7)
++		LowResSystemCopyType::iterator it = s_LowResSystemCopy[fromSlot].find(this);
++
++		if (it == s_LowResSystemCopy[fromSlot].end())
+ 			return nullptr;
+ 
+-		// to switch to modify we need to unlock first
+-		s_LowResSystemCopyLock.UnlockRead();
+-		{ // to reduce contention, we want to hold the modify lock as shortly as possible
+-			AUTO_MODIFYLOCK(s_LowResSystemCopyLock);
+-			s_LowResSystemCopy[slot][this]; // make a map entry for this
+-		}
+-		
+-		// 'restore' AUTO_READLOCK
+-		s_LowResSystemCopyLock.LockRead();
+-		it = s_LowResSystemCopy[slot].find(this);
+-		SLowResSystemCopy& rCopy = it->second;
+-		PrepareLowResSystemCopy(maxTexSize, rCopy.m_lowResSystemCopy, rCopy.m_nLowResCopyWidth, rCopy.m_nLowResCopyHeight);
++		width = it->second.m_nLowResCopyWidth;
++		height = it->second.m_nLowResCopyHeight;
++
++		if (ppUserData)
++			*ppUserData = &it->second.m_nLowResSystemCopyAtlasId;
++
++		return it->second.m_lowResSystemCopy.GetElements();
++	};
++
++	{
++		AUTO_READLOCK(s_LowResSystemCopyLock);
++
++		if (const ColorB* pReady = fetch(slot))
++			return pReady;
+ 	}
+ 
+-	if (it != CTexture::s_LowResSystemCopy[slot].end())
++	if (m_eTT != eTT_2D || (m_nMips <= 1 && (m_nWidth > maxTexSize || m_nHeight > maxTexSize)) || m_eDstFormat < eTF_BC1 || m_eDstFormat > eTF_BC7)
++		return nullptr;
++
++	static CryCriticalSection s_prepareLock;
++
++	CryAutoLock<CryCriticalSection> prepareLock(s_prepareLock);
++
++	// somebody else may have published it while this thread waited for the prepare lock
+ 	{
+-		width = (*it).second.m_nLowResCopyWidth;
+-		height = (*it).second.m_nLowResCopyHeight;
+-		if (ppUserData)
+-			*ppUserData = &(*it).second.m_nLowResSystemCopyAtlasId;
+-		return (*it).second.m_lowResSystemCopy.GetElements();
++		AUTO_READLOCK(s_LowResSystemCopyLock);
++
++		if (const ColorB* pReady = fetch(slot))
++			return pReady;
++	}
++
++	PodArray<ColorB> built;
++	uint16           builtW = 0, builtH = 0;
++
++	// A SMALLER slot whose copy was not clamped by its own cap holds bit for bit the same image this
++	// slot would produce (PrepareLowResSystemCopy only ever downscales by dropping mips, and the sRGB
++	// pass is the same), so reuse it instead of loading and decompressing the file a second time.
++	// A separate entry is still published for this slot: m_nLowResSystemCopyAtlasId is per slot
++	// consumer state (stock voxelization owns the 32x32 one, ray tracing owns its own).
++	{
++		AUTO_READLOCK(s_LowResSystemCopyLock);
++
++		for (int lower = 0; lower < slot && !builtW; lower++)
++		{
++			const int lowerMax = 1 << (lower + 4);
++
++			LowResSystemCopyType::iterator it = s_LowResSystemCopy[lower].find(this);
++
++			if (it == s_LowResSystemCopy[lower].end())
++				continue;
++
++			const SLowResSystemCopy& rSrc = it->second;
++
++			if (!rSrc.m_nLowResCopyWidth || !rSrc.m_nLowResCopyHeight)
++				continue;
++
++			if (rSrc.m_nLowResCopyWidth >= lowerMax || rSrc.m_nLowResCopyHeight >= lowerMax)
++				continue;   // that slot's cap may have cut it down; this slot would keep more
++
++			built.AddList(rSrc.m_lowResSystemCopy);
++			builtW = rSrc.m_nLowResCopyWidth;
++			builtH = rSrc.m_nLowResCopyHeight;
++		}
+ 	}
+ 
+-	assert(!"CTexture::GetLowResSystemCopy failed");
++	if (!builtW)
++		PrepareLowResSystemCopy(maxTexSize, built, builtW, builtH);
++
++	{
++		AUTO_MODIFYLOCK(s_LowResSystemCopyLock);
++
++		// an empty entry is published on failure too, exactly as before, so a texture that cannot be
++		// decompressed is not re-loaded from disk on every call
++		SLowResSystemCopy& rCopy = s_LowResSystemCopy[slot][this];
++
++		if (rCopy.m_lowResSystemCopy.IsEmpty())
++		{
++			rCopy.m_lowResSystemCopy.AddList(built);
++			rCopy.m_nLowResCopyWidth = builtW;
++			rCopy.m_nLowResCopyHeight = builtH;
++		}
++
++		width = rCopy.m_nLowResCopyWidth;
++		height = rCopy.m_nLowResCopyHeight;
+ 
+-	return NULL;
++		if (ppUserData)
++			*ppUserData = &rCopy.m_nLowResSystemCopyAtlasId;
++
++		return rCopy.m_lowResSystemCopy.GetElements();
++	}
+ }
+ 
+ bool CTexture::PrepareLowResSystemCopy(const uint16 maxTexSize, PodArray<ColorB>& textureData, uint16& width, uint16& height)
+-- 
+2.47.1.windows.1
+

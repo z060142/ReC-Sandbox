@@ -175,6 +175,31 @@ public:
 	void RTReleaseTexSlice(int slice);
 	void RTMarkTexsDirty(int firstSlice, int slices);
 
+	//! One material record set that was written with no textures because its low resolution copies
+	//! were not ready yet (report 06d fix 3a). The record layout of a material does NOT depend on
+	//! whether its copies exist - only the slot ids and the atlas UV scale do - so the set can be
+	//! rebuilt and written back over the same records once the prefetch worker has the pixels.
+	struct SRTMatPatch
+	{
+		_smart_ptr<IMaterial> pMat;
+		PodArray<ITexture*>   waitFor;      //!< copies this material is waiting for
+		PodArray<int>         slices;       //!< atlas references the patch owns, released with it
+		bool                  bTerrain = false;
+		bool                  bApplied = false;   //!< kept afterwards only to own its atlas slices
+		int                   absRecord = 0;
+		int                   recordCount = 0;
+		int                   chunkStart = 0;
+	};
+
+	void RTQueueMatPatch(IMaterial* pMat, bool bTerrain, int absRecord, int recordCount, int chunkStart, const PodArray<ITexture*>& waitFor);
+	void RTApplyMatPatches();
+	//! Drops the patches of a chunk that is being reclaimed. Caller holds m_arrRTPoolTexs.m_Lock.
+	void RTDropMatPatchesForChunk(int chunkStart);
+
+	//! Allocates (and zeroes) the two CPU mirrors on the main thread, before any worker can be the
+	//! first to do it while holding the pool lock in exclusive mode (report 06c S5).
+	void RTPrepareMirrors();
+
 	void RTUploadDirtySlices();
 
 	//! Known gap 7.2 - one atlas UV scale per material. Counted and warned about once per level.
@@ -244,8 +269,10 @@ public:
 	int                      m_rtTexPoolZ = 0;
 	PodArray<SRTChunk>       m_arrRTFreeChunks;
 	PodArray<SRTPendingFree> m_arrRTPendingFree;
-	PodArray<uint8>          m_arrRTDirtyTris;    //!< one flag per Z slice of the record pool
-	PodArray<uint8>          m_arrRTDirtyTexs;    //!< one flag per Z slice of the material atlas
+	//! One stamp per Z slice: 0 = clean, otherwise the main frame id + 1 the slice was dirtied in.
+	//! The stamp is what makes the budgeted upload oldest-first, so a slice can never starve.
+	PodArray<uint32>         m_arrRTDirtyTris;    //!< one stamp per Z slice of the record pool
+	PodArray<uint32>         m_arrRTDirtyTexs;    //!< one stamp per Z slice of the material atlas
 	PodArray<int>            m_arrRTTexSliceRef;  //!< refcount per atlas slice
 	PodArray<int*>           m_arrRTTexSliceOwner;//!< back pointer into the texture object's atlas id
 	CryCriticalSection       m_rtPendingLock;
@@ -258,6 +285,23 @@ public:
 	bool                     m_rtStatsLogged = false;     //!< log line already printed for this voxelization pass
 	bool                     m_rtWasReady = true;
 	bool                     m_rtSelfTestDone = false;
+
+	// pool upload cadence and cost (report 06d, S1)
+	uint                     m_rtLastPoolFrameId = ~0u;   //!< main frame id the upload last ran in
+	int                      m_rtUploadSlices = 0;        //!< slices uploaded in that frame
+	int64                    m_rtUploadBytes = 0;         //!< bytes submitted in that frame
+	float                    m_rtUploadMs = 0.f;          //!< main thread cost of that upload
+	int64                    m_rtUploadBytesTotal = 0;    //!< bytes submitted since the level started
+	float                    m_rtUploadMsTotal = 0.f;
+	int                      m_rtStallFrames = 0;         //!< frames where RT main thread work passed 4 ms
+	float                    m_rtEnableStartTime = -1.f;  //!< async time the first RT frame ran at
+
+	//! Material record sets waiting for their texture copies (report 06d fix 3a). Pointers, not
+	//! values: PodArray has no value semantics a std::vector could rely on.
+	std::vector<SRTMatPatch*> m_arrRTMatPatches;
+	int                       m_rtMatPatchesApplied = 0;
+	int                       m_rtMatPatchesPending = 0;
+
 	SRTBuildStats            m_rtStats;
 	SRTDynStats              m_rtDynStats;   //!< per frame dynamic BVH (stage 3A)
 };

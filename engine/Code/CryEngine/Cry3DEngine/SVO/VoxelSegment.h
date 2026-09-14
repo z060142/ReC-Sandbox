@@ -329,7 +329,18 @@ public:
 	static void  ErrorTerminate(const char* format, ...);
 	Vec3i        GetDxtDim();
 	void         AddTriangle(const SRayHitTriangleIndexed& ht, int trId, PodArray<int>*& rpNodeTrisXYZ, PodArrayRT<SRayHitVertex>* pVertInArea);
-	static int   CheckStoreTextureInPool(SShaderItem* pShItem, EEfResTextures texSlot, uint16& nTexW, uint16& nTexH, PodArray<int>& arrTexSlicesOut, EEfResTextures eEncodeAs = EFTT_UNKNOWN, EEfResTextures eSmoothnessSlot = EFTT_SMOOTHNESS);
+	//! pDeferredOut, when given, collects the textures whose low resolution system copy is not ready
+	//! yet: the slot is emitted as 0 (no texture) and the copy is requested from the prefetch worker
+	//! instead of being loaded and decompressed here (report 06d fix 3a).
+	static int   CheckStoreTextureInPool(SShaderItem* pShItem, EEfResTextures texSlot, uint16& nTexW, uint16& nTexH, PodArray<int>& arrTexSlicesOut, EEfResTextures eEncodeAs = EFTT_UNKNOWN, EEfResTextures eSmoothnessSlot = EFTT_SMOOTHNESS, PodArray<ITexture*>* pDeferredOut = nullptr);
+
+	//! Low resolution texture copy prefetch (report 06d fix 3a). One dedicated worker owns the file
+	//! reads and the BC decompression; the voxelization jobs only ask and carry on.
+	static void  RTStartTexPrefetch();
+	static void  RTStopTexPrefetch();
+	static bool  RTIsTexCopyReady(ITexture* pTex);
+	static bool  RTRequestTexCopy(ITexture* pTex);   //!< true when it is already there
+	static void  RTGetTexPrefetchStats(int& done, int& pending);
 	ColorB*      ApplyHighPass(uint16& nTexW, uint16& nTexH, const ColorB* pTexRgbOr);
 	void         ComputeDistancesFast_MinDistToSurf(ColorB* pTex3dOptRGBA, ColorB* pTex3dOptNorm, ColorB* pTex3dOptOpac, int threadId);
 	void         CropVoxTexture(int threadId, bool bCompSurfDist);
@@ -346,8 +357,8 @@ public:
 	void         SetID(int32 nID)          { m_segmentID = nID; }
 	void         BuildStaticBVH();
 	void         ReleaseRTChunk();
-	void         FillRTMaterialRecord(const SRayHitTriangleIndexed& tr, SRTMatRecordSet& out);
-	static void  RTFillMaterialRecord(IMaterial* pMat, bool bTerrain, PodArray<int>& arrTexSlicesOut, SRTMatRecordSet& out);
+	void         FillRTMaterialRecord(const SRayHitTriangleIndexed& tr, SRTMatRecordSet& out, PodArray<ITexture*>* pDeferredOut = nullptr);
+	static void  RTFillMaterialRecord(IMaterial* pMat, bool bTerrain, PodArray<int>& arrTexSlicesOut, SRTMatRecordSet& out, PodArray<ITexture*>* pDeferredOut = nullptr);
 	static bool  BuildStaticBVHRecords(const PodArray<SRTBuildTri>& arrTris, const Vec4& qb, int recordBase, PodArray<Vec4>& arrOut, PodArray<int>* pRelocFloats, SRTBuildStats& stats);
 	static void  RunRTSelfTest();
 

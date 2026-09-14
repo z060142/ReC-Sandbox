@@ -1,0 +1,173 @@
+From c14530708340bdc05d4f198cae08868f0ec165d5 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Mon, 14 Sep 2026 23:02:46 +0800
+Subject: [PATCH 221/225] perf: run the RT dynamic update once per rendered
+ frame and cache the object query
+
+Report 06c S7. RTUpdateDynamic sits at the top of CSvoEnv::Render, which the
+stock CrySleep(5) sync update spin calls ~130 times inside a single frame id.
+Nothing in the scene advances between two of those calls, so the collection, the
+per object refit, the CPU skinning and the record emit produced the same answer
+~130 times and threw 129 of them away - measured at 0.4 to 1.2 ms each, i.e. 13
+to 50 % of the main thread during every re-voxelization.
+
+- gate RTUpdateDynamic on CVoxelSegment::m_currPassMainFrameID, which only
+  advances in CSvoManager::OnFrameStart. Skinning and the water ring therefore
+  also run exactly once per rendered frame, for the visible characters only, as
+  before.
+- hold the GetObjectsByTypeInBox result across frames, re-querying when the
+  camera moves more than a twentieth of e_svoTI_RT_MaxDistCam or after
+  e_svoTI_RT_DynRefreshFrames frames. Each query is a full octree walk into a
+  temporary PodArray and the count+fill pattern runs it twice per type, so this
+  is six walks per frame over a 200 m box.
+  The cvar defaults to 1 (walk every frame): above 1 the raw IRenderNode
+  pointers outlive their frame and an object deleted in between would dangle.
+  Making a longer reuse safe needs an octree invalidation hook, which is outside
+  this change - the mechanism is in place, the unsafe default is not taken.
+- CRY_PROFILE_SECTION markers on the collection, the skinning, the water pass
+  and BuildStaticBVH.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SCUvWGLCsqzm3VNMzp4uiS
+---
+ .../Cry3DEngine/SVO/VoxelSegment.cpp          | 79 ++++++++++++++++---
+ 1 file changed, 67 insertions(+), 12 deletions(-)
+
+diff --git a/Code/CryEngine/Cry3DEngine/SVO/VoxelSegment.cpp b/Code/CryEngine/Cry3DEngine/SVO/VoxelSegment.cpp
+index e3a9f10f..f8c4d4e8 100644
+--- a/Code/CryEngine/Cry3DEngine/SVO/VoxelSegment.cpp
++++ b/Code/CryEngine/Cry3DEngine/SVO/VoxelSegment.cpp
+@@ -3938,6 +3938,8 @@ void CVoxelSegment::BuildStaticBVH()
+ 	if (!m_pTrisInArea || !m_pTrisInArea->Count() || !m_pVertInArea || !m_pMatsInArea)
+ 		return;
+ 
++	CRY_PROFILE_SECTION(PROFILE_3DENGINE, "CVoxelSegment::BuildStaticBVH");
++
+ 	const float startTime = GetCurAsyncTimeSec();
+ 
+ 	SRTBuildStats stats;
+@@ -4249,6 +4251,12 @@ PodArray<int> g_rtDynPrevTexSlices;
+ int           g_rtDynPrevRecords = 0;
+ int           g_rtDynPrevMats = 0;
+ 
++// cached dynamic object query (report 06c F9); see the comment at the collect step
++PodArray<IRenderNode*> g_rtDynNodesCached;
++Vec3                   g_rtDynCacheCamPos(0.f, 0.f, 0.f);
++uint                   g_rtDynCacheFrameId = ~0u;
++bool                   g_rtDynCacheValid = false;
++
+ //! Quantisation bounds of one world box: XY centre plus the larger XY extent, as for a static cell.
+ Vec4 RT_DynQuantBounds(const AABB& box)
+ {
+@@ -5400,6 +5408,10 @@ void CVoxelSegment::RTClearDynamicCache()
+ 
+ 	g_rtSkinCache.clear();
+ 	RT_ClearWaterCache();
++	g_rtDynNodesCached.Reset();
++	g_rtDynCacheValid = false;
++	g_rtDynCacheFrameId = ~0u;
++
+ 	g_rtDynPrevTexSlices.Reset();
+ 	g_rtDynPrevRecords = 0;
+ 	g_rtDynPrevMats = 0;
+@@ -5410,6 +5422,19 @@ void CVoxelSegment::RTUpdateDynamic()
+ 	if (!GetCVars()->e_svoTI_RT_Active || !gSvoEnv)
+ 		return;
+ 
++	// ONCE per rendered frame (report 06c S7 / F4). CSvoManager::Render's sync update spin calls
++	// CSvoEnv::Render() ~130 times inside a single frame id and nothing in the scene advances between
++	// two of those calls, so the whole collection, the per object refit, the CPU skinning and the
++	// record emit were rebuilt and thrown away ~130 times - 13 to 50 % of the main thread, on work
++	// whose result is identical every time. m_currPassMainFrameID only advances in OnFrameStart, so
++	// this gate is exactly "once per frame the engine really renders".
++	static uint s_lastDynFrameId = ~0u;
++
++	if (s_lastDynFrameId == GetCurrPassMainFrameID())
++		return;
++
++	s_lastDynFrameId = GetCurrPassMainFrameID();
++
+ 	const bool bMeshes = (GetCVars()->e_svoTI_RT_Dynamic != 0);
+ 	const bool bWater = (GetCVars()->e_svoTI_RT_Water != 0);
+ 	const bool bEnabled = bMeshes || bWater;
+@@ -5444,21 +5469,47 @@ void CVoxelSegment::RTUpdateDynamic()
+ 		areaBox.Expand(Vec3(distCam));
+ 
+ 		// ---- collect --------------------------------------------------------------------------
+-		PodArray<IRenderNode*> arrNodes;
+-
+-		const EERType arrTypes[3] = { eERType_MovableBrush, eERType_Brush, eERType_Character };
+-
+-		for (int t = 0; bMeshes && t < 3; t++)
+-		{
+-			const int objCount = (int)gEnv->p3DEngine->GetObjectsByTypeInBox(arrTypes[t], areaBox, (IRenderNode**)0);
+-			if (objCount <= 0)
+-				continue;
++		// The node list is held across frames (report 06c F9). Each GetObjectsByTypeInBox is a full
++		// octree walk into a temporary PodArray, and the count+fill pattern runs it twice per type,
++		// so this is six walks and six temporary allocations per frame over a 200 m box.
++		//
++		// e_svoTI_RT_DynRefreshFrames defaults to 1 (walk every frame) on purpose: above 1 these raw
++		// IRenderNode pointers outlive the frame they were collected in, and an object deleted in
++		// between would be dereferenced. Making >1 safe needs an invalidation hook in the octree,
++		// which is outside this change; the cvar is here so the cost can be traded when a scene is
++		// known to be static.
++		const int   refreshFrames = max(1, GetCVars()->e_svoTI_RT_DynRefreshFrames);
++		const float camMoveLimit = distCam * 0.05f;
++
++		const bool bReQuery = !bMeshes || !g_rtDynCacheValid
++		                      || (int)(GetCurrPassMainFrameID() - g_rtDynCacheFrameId) >= refreshFrames
++		                      || camPos.GetSquaredDistance(g_rtDynCacheCamPos) > camMoveLimit * camMoveLimit;
++
++		if (bReQuery)
++		{
++			CRY_PROFILE_SECTION(PROFILE_3DENGINE, "RTUpdateDynamic_Collect");
++
++			g_rtDynNodesCached.Clear();
++			g_rtDynCacheValid = bMeshes;
++			g_rtDynCacheFrameId = GetCurrPassMainFrameID();
++			g_rtDynCacheCamPos = camPos;
++
++			const EERType arrTypes[3] = { eERType_MovableBrush, eERType_Brush, eERType_Character };
++
++			for (int t = 0; bMeshes && t < 3; t++)
++			{
++				const int objCount = (int)gEnv->p3DEngine->GetObjectsByTypeInBox(arrTypes[t], areaBox, (IRenderNode**)0);
++				if (objCount <= 0)
++					continue;
+ 
+-			const int first = arrNodes.Count();
+-			arrNodes.PreAllocate(first + objCount, first + objCount);
+-			gEnv->p3DEngine->GetObjectsByTypeInBox(arrTypes[t], areaBox, arrNodes.GetElements() + first);
++				const int first = g_rtDynNodesCached.Count();
++				g_rtDynNodesCached.PreAllocate(first + objCount, first + objCount);
++				gEnv->p3DEngine->GetObjectsByTypeInBox(arrTypes[t], areaBox, g_rtDynNodesCached.GetElements() + first);
++			}
+ 		}
+ 
++		PodArray<IRenderNode*>& arrNodes = g_rtDynNodesCached;
++
+ 		PodArray<SRTDynSource> arrSources;
+ 
+ 		for (int n = 0; n < arrNodes.Count(); n++)
+@@ -5589,6 +5640,8 @@ void CVoxelSegment::RTUpdateDynamic()
+ 		// also the least interesting thing to keep when the segment is full.
+ 		if (bWater)
+ 		{
++			CRY_PROFILE_SECTION(PROFILE_3DENGINE, "RTUpdateDynamic_Water");
++
+ 			PodArray<SRTWaterSurface> arrWater;
+ 			RT_CollectWaterSurfaces(camPos, distCam, distRay, arrWater);
+ 
+@@ -5635,6 +5688,8 @@ void CVoxelSegment::RTUpdateDynamic()
+ 		// on the characters that matter most in the picture; the rest keep their bind pose, which is
+ 		// exactly what stage 3A did for all of them.
+ 		{
++			CRY_PROFILE_SECTION(PROFILE_3DENGINE, "RTUpdateDynamic_Skinning");
++
+ 			const float skinStart = GetCurAsyncTimeSec();
+ 			const int   skinMaxTris = max(0, GetCVars()->e_svoTI_RT_SkinMaxTris);
+ 			int         skinTris = 0;
+-- 
+2.47.1.windows.1
+

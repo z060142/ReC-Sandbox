@@ -1,11 +1,17 @@
 # Sync manifest
 
 Baseline : main @ a34100a9 (pristine CRYENGINE 5.7.1)
-Dev      : experimental-rt @ 0f2b0817
-Synced   : 2026-09-14 22:56
+Dev      : experimental-rt @ b4b9847d
+Synced   : 2026-09-14 23:17
 
 ## Commits (newest first)
 
+- b4b9847d feat: put the RT upload cost, the stall count and the enable totals on the HUD and in the log
+- df8a4dc6 fix: prove the sync update spin is not re-armed by RT work, and time it
+- 195c2e3c perf: produce the RT low resolution texture copies on one worker, patch the records later
+- b24fca9f fix: publish a low res system copy only when it is complete (GetLowResSystemCopy race)
+- c1453070 perf: run the RT dynamic update once per rendered frame and cache the object query
+- be42f63b perf: bound the SVO RT pool upload and stop it running inside the sync update spin
 - 0f2b0817 docs: record why d8f5dad4's blend-layer gate never gated anything in the engine
 - 51009ff4 feat: rebuild the hit material in ShadePS, not in the tracer (decision 11)
 - d8f5dad4 fix: gate the blend layer at a ray hit so ConeTracePS fits fxc again
@@ -267,6 +273,7 @@ Synced   : 2026-09-14 22:56
 - M	Code/CryEngine/RenderDll/Common/RendererResources.h
 - A	Code/CryEngine/RenderDll/Common/Textures/Image/ExrImage.cpp
 - A	Code/CryEngine/RenderDll/Common/Textures/Image/ExrImage.h
+- M	Code/CryEngine/RenderDll/Common/Textures/Texture.cpp
 - M	Code/CryEngine/RenderDll/Common/Textures/Texture.h
 - M	Code/CryEngine/RenderDll/XRenderD3D9/CMakeLists.txt
 - M	Code/CryEngine/RenderDll/XRenderD3D9/D3DHWShader.cpp

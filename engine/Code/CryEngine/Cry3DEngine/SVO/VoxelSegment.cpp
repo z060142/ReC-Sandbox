@@ -3249,6 +3249,181 @@ bool CVoxelSegment::BuildStaticBVHRecords(const PodArray<SRTBuildTri>& arrTris, 
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// Mesh ray tracing - low resolution texture copy prefetch (report 06c S3, report 06d fix 3a)
+//
+// CTexture::GetLowResSystemCopy is a SYNCHRONOUS EF_LoadImage (a DDS read off disk) plus a BC
+// decompress on the calling thread. Stock voxelization asked for one 32x32 copy per material; the
+// ray tracing producer asks for up to six roles per material at 256x256, from every job worker at
+// once, inside the soup read lock. That is what turned a re-voxelization into minutes of saturated
+// disk queue and starved cores.
+//
+// Here one dedicated worker owns every miss. A producer that asks for a texture whose copy is not
+// cached yet gets "not ready", emits the material with no texture for that slot, and carries on; the
+// cell's material records are patched in place (CSvoEnv::RTApplyMatPatches) once the copies land.
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+namespace
+{
+class CRTTexPrefetchThread final : public IThread
+{
+public:
+	CRTTexPrefetchThread() : m_semaphore(4096), m_bRun(true) {}
+
+	virtual void ThreadEntry() override
+	{
+		MEMSTAT_CONTEXT(EMemStatContextType::Other, "SvoRTTexPrefetch");
+
+		while (m_bRun)
+		{
+			m_semaphore.Acquire();
+
+			if (!m_bRun)
+				break;
+
+			_smart_ptr<ITexture> pTex;
+
+			{
+				CryAutoLock<CryCriticalSection> lock(m_lock);
+
+				if (m_queue.empty())
+					continue;
+
+				pTex = m_queue.front();
+				m_queue.pop_front();
+			}
+
+			if (pTex)
+			{
+				uint16 w = 0, h = 0;
+				int*   pSlotId = nullptr;
+
+				// the only place in the RT path that is allowed to pay for a miss
+				pTex->GetLowResSystemCopy(w, h, &pSlotId, gSvoEnv ? gSvoEnv->GetRTTexRes() : 256);
+			}
+
+			{
+				CryAutoLock<CryCriticalSection> lock(m_lock);
+
+				// "ready" means ATTEMPTED: a texture that cannot produce a copy at all must not be
+				// requested again every frame for the rest of the level
+				m_ready.insert(pTex.get());
+				m_pending.erase(pTex.get());
+				m_done++;
+			}
+		}
+	}
+
+	void SignalStopWork()
+	{
+		m_bRun = false;
+		m_semaphore.Release();
+	}
+
+	bool IsReady(ITexture* pTex)
+	{
+		CryAutoLock<CryCriticalSection> lock(m_lock);
+		return m_ready.find(pTex) != m_ready.end();
+	}
+
+	//! true when it is already there; otherwise the request is queued (once) and false is returned
+	bool Request(ITexture* pTex)
+	{
+		{
+			CryAutoLock<CryCriticalSection> lock(m_lock);
+
+			if (m_ready.find(pTex) != m_ready.end())
+				return true;
+
+			if (m_pending.find(pTex) != m_pending.end())
+				return false;
+
+			m_pending.insert(pTex);
+			m_queue.push_back(_smart_ptr<ITexture>(pTex));
+		}
+
+		m_semaphore.Release();
+
+		return false;
+	}
+
+	void GetStats(int& done, int& pending)
+	{
+		CryAutoLock<CryCriticalSection> lock(m_lock);
+		done = m_done;
+		pending = (int)m_pending.size();
+	}
+
+private:
+	CryCriticalSection              m_lock;
+	std::list<_smart_ptr<ITexture>> m_queue;
+	std::set<ITexture*>             m_pending;
+	std::set<ITexture*>             m_ready;
+	CrySemaphore                    m_semaphore;
+	volatile bool                   m_bRun;
+	int                             m_done = 0;
+};
+
+CRTTexPrefetchThread* g_pRTTexPrefetch = nullptr;
+}
+
+void CVoxelSegment::RTStartTexPrefetch()
+{
+	if (g_pRTTexPrefetch)
+		return;
+
+	CRTTexPrefetchThread* pThread = new CRTTexPrefetchThread();
+
+	if (!gEnv->pThreadManager->SpawnThread(pThread, "SvoRTTexPrefetch"))
+	{
+		delete pThread;
+		CryWarning(VALIDATOR_MODULE_3DENGINE, VALIDATOR_WARNING,
+		           "SVO RT: could not spawn the texture prefetch worker, falling back to synchronous copies");
+		return;
+	}
+
+	g_pRTTexPrefetch = pThread;
+}
+
+void CVoxelSegment::RTStopTexPrefetch()
+{
+	if (!g_pRTTexPrefetch)
+		return;
+
+	g_pRTTexPrefetch->SignalStopWork();
+	gEnv->pThreadManager->JoinThread(g_pRTTexPrefetch, eJM_Join);
+
+	delete g_pRTTexPrefetch;
+	g_pRTTexPrefetch = nullptr;
+}
+
+bool CVoxelSegment::RTIsTexCopyReady(ITexture* pTex)
+{
+	if (!pTex || !g_pRTTexPrefetch || !GetCVars()->e_svoTI_RT_TexPrefetch)
+		return true;
+
+	return g_pRTTexPrefetch->IsReady(pTex);
+}
+
+bool CVoxelSegment::RTRequestTexCopy(ITexture* pTex)
+{
+	if (!pTex)
+		return true;
+
+	if (!g_pRTTexPrefetch || !GetCVars()->e_svoTI_RT_TexPrefetch)
+		return true;   // the old synchronous behaviour: the caller loads it itself
+
+	return g_pRTTexPrefetch->Request(pTex);
+}
+
+void CVoxelSegment::RTGetTexPrefetchStats(int& done, int& pending)
+{
+	done = pending = 0;
+
+	if (g_pRTTexPrefetch)
+		g_pRTTexPrefetch->GetStats(done, pending);
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 // Mesh ray tracing - material texture atlas (rt decision 04)
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -3269,7 +3444,7 @@ static ILINE int RT_ResampleIndex(int dst, int dstSize, int srcSize)
 //! explicitly for the %BLENDLAYER set (rt decision 10), whose second normal map lives in
 //! EFTT_CUSTOM_SECONDARY but has to be encoded exactly like an EFTT_NORMALS _ddna slice, with its own
 //! smoothness donor (EFTT_DECAL_OVERLAY = Illum's smoothness2Tex) instead of EFTT_SMOOTHNESS.
-int CVoxelSegment::CheckStoreTextureInPool(SShaderItem* pShItem, EEfResTextures texSlot, uint16& nTexW, uint16& nTexH, PodArray<int>& arrTexSlicesOut, EEfResTextures eEncodeAs, EEfResTextures eSmoothnessSlot)
+int CVoxelSegment::CheckStoreTextureInPool(SShaderItem* pShItem, EEfResTextures texSlot, uint16& nTexW, uint16& nTexH, PodArray<int>& arrTexSlicesOut, EEfResTextures eEncodeAs, EEfResTextures eSmoothnessSlot, PodArray<ITexture*>* pDeferredOut)
 {
 	const int maxTexSizeXY = gSvoEnv->GetRTTexRes();
 
@@ -3279,6 +3454,15 @@ int CVoxelSegment::CheckStoreTextureInPool(SShaderItem* pShItem, EEfResTextures 
 	int*          pSysTexId = nullptr;
 
 	nTexW = nTexH = 0;
+
+	// The normals encoding folds a second texture (the smoothness donor) into this slice, so both
+	// have to be there before the slice is written - otherwise the gloss map would be baked in as a
+	// flat 255 and the patch pass could not tell the difference afterwards.
+	ITexture* pSmoothITex = nullptr;
+
+	if (eEnc == EFTT_NORMALS && pShItem && pShItem->m_pShaderResources)
+		if (SEfResTexture* pSmoothResTex = pShItem->m_pShaderResources->GetTexture(eSmoothnessSlot))
+			pSmoothITex = pSmoothResTex->m_Sampler.m_pITex;
 
 	if (pShItem)
 	{
@@ -3291,6 +3475,29 @@ int CVoxelSegment::CheckStoreTextureInPool(SShaderItem* pShItem, EEfResTextures 
 					{
 						AUTO_MODIFYLOCK(m_arrLockedTextures.m_Lock);
 						m_arrLockedTextures[pITex] = pITex;
+
+						if (pSmoothITex)
+							m_arrLockedTextures[pSmoothITex] = pSmoothITex;
+					}
+
+					// Ask the prefetch worker instead of loading and decompressing here. Both have to
+					// be requested, not just the first missing one, or the two waits would serialise.
+					bool bReady = RTRequestTexCopy(pITex);
+
+					if (pSmoothITex && !RTRequestTexCopy(pSmoothITex))
+						bReady = false;
+
+					if (!bReady)
+					{
+						if (pDeferredOut)
+						{
+							pDeferredOut->Add(pITex);
+
+							if (pSmoothITex)
+								pDeferredOut->Add(pSmoothITex);
+						}
+
+						return 0;
 					}
 
 					pTexRgbOr = pITex->GetLowResSystemCopy(nTexW, nTexH, &pSysTexId, maxTexSizeXY);
@@ -3582,16 +3789,16 @@ static bool RT_HasBlendLayerShader(SShaderItem* pShItem)
 
 //! One material as the pool stores it (rt decision 02 2.5 for the base record, decision 10 for the
 //! extras and the blend layer record). See SRTMatRecordSet for the placement rules.
-void CVoxelSegment::FillRTMaterialRecord(const SRayHitTriangleIndexed& tr, SRTMatRecordSet& out)
+void CVoxelSegment::FillRTMaterialRecord(const SRayHitTriangleIndexed& tr, SRTMatRecordSet& out, PodArray<ITexture*>* pDeferredOut)
 {
 	SSvoMatInfo& rMI = m_pMatsInArea->GetAt(tr.materialID);
 
-	RTFillMaterialRecord(rMI.pMat, tr.hitObjectType == HIT_OBJ_TYPE_TERRAIN, m_rtTexSlices, out);
+	RTFillMaterialRecord(rMI.pMat, tr.hitObjectType == HIT_OBJ_TYPE_TERRAIN, m_rtTexSlices, out, pDeferredOut);
 }
 
 //! The material record itself, independent of where the triangle came from: the static soup and the
 //! per frame dynamic collection (stage 3A) fill identical records from the same leaf material.
-void CVoxelSegment::RTFillMaterialRecord(IMaterial* pInMat, bool bTerrain, PodArray<int>& arrTexSlicesOut, SRTMatRecordSet& out)
+void CVoxelSegment::RTFillMaterialRecord(IMaterial* pInMat, bool bTerrain, PodArray<int>& arrTexSlicesOut, SRTMatRecordSet& out, PodArray<ITexture*>* pDeferredOut)
 {
 	ZeroStruct(out);
 
@@ -3613,7 +3820,7 @@ void CVoxelSegment::RTFillMaterialRecord(IMaterial* pInMat, bool bTerrain, PodAr
 
 	if (bTerrain)
 	{
-		albSlot = CheckStoreTextureInPool(nullptr, EFTT_DIFFUSE, texW, texH, arrTexSlicesOut);
+		albSlot = CheckStoreTextureInPool(nullptr, EFTT_DIFFUSE, texW, texH, arrTexSlicesOut, EFTT_UNKNOWN, EFTT_SMOOTHNESS, pDeferredOut);
 
 		const float mul = GetTerrain() ? GetTerrain()->GetTerrainTextureMultiplier() : 1.f;
 		tint = ColorF(mul, mul, mul, 1.f);
@@ -3622,10 +3829,10 @@ void CVoxelSegment::RTFillMaterialRecord(IMaterial* pInMat, bool bTerrain, PodAr
 	}
 	else if (pShItem)
 	{
-		albSlot = CheckStoreTextureInPool(pShItem, EFTT_DIFFUSE, texW, texH, arrTexSlicesOut);
-		norSlot = CheckStoreTextureInPool(pShItem, EFTT_NORMALS, norW, norH, arrTexSlicesOut);
-		spcSlot = CheckStoreTextureInPool(pShItem, EFTT_SPECULAR, spcW, spcH, arrTexSlicesOut);
-		emiSlot = CheckStoreTextureInPool(pShItem, EFTT_EMITTANCE, emiW, emiH, arrTexSlicesOut);
+		albSlot = CheckStoreTextureInPool(pShItem, EFTT_DIFFUSE, texW, texH, arrTexSlicesOut, EFTT_UNKNOWN, EFTT_SMOOTHNESS, pDeferredOut);
+		norSlot = CheckStoreTextureInPool(pShItem, EFTT_NORMALS, norW, norH, arrTexSlicesOut, EFTT_UNKNOWN, EFTT_SMOOTHNESS, pDeferredOut);
+		spcSlot = CheckStoreTextureInPool(pShItem, EFTT_SPECULAR, spcW, spcH, arrTexSlicesOut, EFTT_UNKNOWN, EFTT_SMOOTHNESS, pDeferredOut);
+		emiSlot = CheckStoreTextureInPool(pShItem, EFTT_EMITTANCE, emiW, emiH, arrTexSlicesOut, EFTT_UNKNOWN, EFTT_SMOOTHNESS, pDeferredOut);
 
 		if (IRenderShaderResources* pShRes = pShItem->m_pShaderResources)
 		{
@@ -3709,7 +3916,7 @@ void CVoxelSegment::RTFillMaterialRecord(IMaterial* pInMat, bool bTerrain, PodAr
 		// so the source channels are g,a = tangent normal xy, r = albedo delta, b = gloss delta.
 		// It is therefore copied into the atlas RAW (no _ddna reconstruction, no alpha rewrite) and
 		// the consumer applies the .garb swizzle and the *2-1 itself.
-		detailSlot = CheckStoreTextureInPool(pShItem, EFTT_DETAIL_OVERLAY, detW, detH, arrTexSlicesOut);
+		detailSlot = CheckStoreTextureInPool(pShItem, EFTT_DETAIL_OVERLAY, detW, detH, arrTexSlicesOut, EFTT_UNKNOWN, EFTT_SMOOTHNESS, pDeferredOut);
 
 		// CM_DetailTilingAndAlphaRef.xy, filled from the detail slot's texture modificator
 		// (ShaderResources.cpp RT_UpdateConstants, :622-629)
@@ -3727,7 +3934,7 @@ void CVoxelSegment::RTFillMaterialRecord(IMaterial* pInMat, bool bTerrain, PodAr
 		// One slot, two meanings - exactly as in CE, where Illum's BlendTex and Vegetation's /
 		// HumanSkin's opacityTex are both TM_Opacity (Illum.cfx:58, Vegetation.cfx:73, the OPACITYMAP
 		// macro). The tag says which: blend mask for tag 0, translucency mask for 0.25 and 2.
-		opacitySlot = CheckStoreTextureInPool(pShItem, EFTT_OPACITY, opaW, opaH, arrTexSlicesOut);
+		opacitySlot = CheckStoreTextureInPool(pShItem, EFTT_OPACITY, opaW, opaH, arrTexSlicesOut, EFTT_UNKNOWN, EFTT_SMOOTHNESS, pDeferredOut);
 	}
 
 	if (bHasBlend)
@@ -3854,9 +4061,9 @@ void CVoxelSegment::RTFillMaterialRecord(IMaterial* pInMat, bool bTerrain, PodAr
 		//     vNormalTS   = lerp(vNormalTS, vNormal2, f)          <- Bump2Tex
 		uint16 b0W = 0, b0H = 0, b1W = 0, b1H = 0;
 
-		const int albSlot2 = CheckStoreTextureInPool(pShItem, EFTT_CUSTOM, b0W, b0H, arrTexSlicesOut);
+		const int albSlot2 = CheckStoreTextureInPool(pShItem, EFTT_CUSTOM, b0W, b0H, arrTexSlicesOut, EFTT_UNKNOWN, EFTT_SMOOTHNESS, pDeferredOut);
 		const int norSlot2 = CheckStoreTextureInPool(pShItem, EFTT_CUSTOM_SECONDARY, b1W, b1H, arrTexSlicesOut,
-		                                             EFTT_NORMALS, EFTT_DECAL_OVERLAY);
+		                                             EFTT_NORMALS, EFTT_DECAL_OVERLAY, pDeferredOut);
 
 		float layer2Spec = 0.04f;   // Illum.cfx:313, Vegetation.cfx:293
 		RT_GetMatParam(pRes, "BlendLayer2Specular", &layer2Spec, 1);
@@ -3902,6 +4109,171 @@ static void RT_AppendMatRecordSet(const SRTMatRecordSet& set, int localRecord, i
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// Mesh ray tracing - deferred material record patching (report 06d fix 3a)
+//
+// A material emitted while its low resolution texture copies were still being produced carries no
+// texture slots. Its record COUNT does not depend on the copies - only the slot ids and the atlas UV
+// scale do, and the extras / blend layer records come from the shader and the material flags - so
+// the set can be rebuilt once the copies land and written back over exactly the same records.
+// Defined here, not in SceneTree.cpp, because it needs RT_AppendMatRecordSet.
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+void CSvoEnv::RTQueueMatPatch(IMaterial* pMat, bool bTerrain, int absRecord, int recordCount, int chunkStart, const PodArray<ITexture*>& waitFor)
+{
+	if (!recordCount || absRecord <= 0)
+		return;
+
+	AUTO_LOCK(m_rtPendingLock);   // called from the voxelization workers
+
+	SRTMatPatch* p = new SRTMatPatch();
+
+	p->pMat = pMat;
+	p->bTerrain = bTerrain;
+	p->absRecord = absRecord;
+	p->recordCount = recordCount;
+	p->chunkStart = chunkStart;
+	p->waitFor.AddList(const_cast<PodArray<ITexture*>&>(waitFor));
+
+	m_arrRTMatPatches.push_back(p);
+	m_rtMatPatchesPending++;
+}
+
+//! Caller holds m_arrRTPoolTexs.m_Lock in modify mode (RTProcessPendingFrees).
+void CSvoEnv::RTDropMatPatchesForChunk(int chunkStart)
+{
+	AUTO_LOCK(m_rtPendingLock);
+
+	for (size_t i = 0; i < m_arrRTMatPatches.size(); )
+	{
+		SRTMatPatch* p = m_arrRTMatPatches[i];
+
+		if (p->chunkStart == chunkStart)
+		{
+			for (int s = 0; s < p->slices.Count(); s++)
+				RTReleaseTexSlice(p->slices[s]);
+
+			if (!p->bApplied)
+				m_rtMatPatchesPending--;
+
+			delete p;
+			m_arrRTMatPatches.erase(m_arrRTMatPatches.begin() + i);
+		}
+		else
+		{
+			i++;
+		}
+	}
+}
+
+void CSvoEnv::RTApplyMatPatches()
+{
+	if (!m_rtMatPatchesPending)
+		return;
+
+	CRY_PROFILE_SECTION(PROFILE_3DENGINE, "CSvoEnv::RTApplyMatPatches");
+
+	// Rebuilding a material record re-copies up to six 256 KB texture slices into the atlas, so it
+	// is budgeted like everything else on this path: the cells keep tracing their tint until then.
+	int budget = 4;
+
+	// The ready patches are DETACHED under the pending lock and processed without it: the fill below
+	// takes the atlas lock, and RTDropMatPatchesForChunk takes the pending lock while already holding
+	// the atlas lock, so holding both here in the other order would deadlock. Only the main thread
+	// removes from this list, and it runs the two passes one after the other, so a detached patch
+	// cannot be freed underneath us.
+	std::vector<SRTMatPatch*> arrReady;
+
+	{
+		AUTO_LOCK(m_rtPendingLock);
+
+		for (size_t i = 0; i < m_arrRTMatPatches.size() && budget > 0; )
+		{
+			SRTMatPatch* p = m_arrRTMatPatches[i];
+
+			if (p->bApplied)
+			{
+				i++;   // done; it stays in the list only to own its atlas references
+				continue;
+			}
+
+			bool bReady = true;
+			for (int w = 0; w < p->waitFor.Count() && bReady; w++)
+				bReady = CVoxelSegment::RTIsTexCopyReady(p->waitFor[w]);
+
+			if (!bReady)
+			{
+				i++;
+				continue;
+			}
+
+			budget--;
+			m_rtMatPatchesPending--;
+			arrReady.push_back(p);
+			m_arrRTMatPatches.erase(m_arrRTMatPatches.begin() + i);
+		}
+	}
+
+	for (size_t i = 0; i < arrReady.size(); i++)
+	{
+		SRTMatPatch* p = arrReady[i];
+
+		SRTMatRecordSet     set;
+		PodArray<ITexture*> arrStillDeferred;
+
+		CVoxelSegment::RTFillMaterialRecord(p->pMat, p->bTerrain, p->slices, set, &arrStillDeferred);
+
+		if (arrStillDeferred.Count())
+		{
+			// a copy this material needs was only discovered now (a slot the first pass never got
+			// to): keep waiting for it instead of publishing a half textured record
+			p->waitFor.AddList(arrStillDeferred);
+
+			AUTO_LOCK(m_rtPendingLock);
+			m_arrRTMatPatches.push_back(p);
+			m_rtMatPatchesPending++;
+			continue;
+		}
+
+		if (set.RecordCount() == p->recordCount)
+		{
+			PodArray<Vec4> arrRecords;
+			RT_AppendMatRecordSet(set, 0, p->absRecord, arrRecords, nullptr);
+
+			AUTO_MODIFYLOCK(m_arrRTPoolTris.m_Lock);
+
+			const int poolRecords = GetRTPoolRecords();
+
+			if (m_arrRTPoolTris.Count() && p->absRecord + p->recordCount <= poolRecords)
+			{
+				memcpy(m_arrRTPoolTris.GetElements() + (size_t)p->absRecord * SVO_RT_RECORD_TEXELS,
+				       arrRecords.GetElements(), arrRecords.GetDataSize());
+
+				RTMarkTrisDirty(p->absRecord, p->recordCount);
+
+				m_rtMatPatchesApplied++;
+			}
+		}
+		else
+		{
+			// the record layout is supposed to be independent of the texture copies; if it ever is
+			// not, drop the patch rather than write a set of another size over its neighbours
+			CryWarning(VALIDATOR_MODULE_3DENGINE, VALIDATOR_WARNING,
+			           "SVO RT: material record set changed size while waiting for its textures (%d -> %d), patch dropped",
+			           p->recordCount, set.RecordCount());
+		}
+
+		// The patch is KEPT, with its work done: it owns the atlas references the records it just
+		// wrote point at, and the only thing entitled to give those back is the chunk being
+		// reclaimed. Its waitFor list is cleared so the pass above skips it from now on.
+		p->bApplied = true;
+		p->waitFor.Reset();
+
+		AUTO_LOCK(m_rtPendingLock);
+		m_arrRTMatPatches.push_back(p);
+	}
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 // Mesh ray tracing - per cell static BVH build (rt decisions 02, 03, 04)
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -3938,6 +4310,8 @@ void CVoxelSegment::BuildStaticBVH()
 	if (!m_pTrisInArea || !m_pTrisInArea->Count() || !m_pVertInArea || !m_pMatsInArea)
 		return;
 
+	CRY_PROFILE_SECTION(PROFILE_3DENGINE, "CVoxelSegment::BuildStaticBVH");
+
 	const float startTime = GetCurAsyncTimeSec();
 
 	SRTBuildStats stats;
@@ -3949,6 +4323,18 @@ void CVoxelSegment::BuildStaticBVH()
 	PodArray<int> arrOldTexSlices;
 	arrOldTexSlices.AddList(m_rtTexSlices);
 	m_rtTexSlices.Clear();
+
+	//! One material whose record set went out without its textures (report 06d fix 3a).
+	struct SRTDeferredMat
+	{
+		_smart_ptr<IMaterial> pMat;
+		PodArray<ITexture*>   waitFor;
+		bool                  bTerrain;
+		int                   localRecord;
+		int                   recordCount;
+	};
+
+	std::vector<SRTDeferredMat> arrDeferredMats;
 
 	PodArray<SRTBuildTri> arrBuild;
 	PodArray<Vec4>        arrRecords;
@@ -4055,12 +4441,27 @@ void CVoxelSegment::BuildStaticBVH()
 			}
 			else
 			{
-				SRTMatRecordSet matSet;
-				FillRTMaterialRecord(tr, matSet);
+				SRTMatRecordSet     matSet;
+				PodArray<ITexture*> arrDeferred;
+
+				FillRTMaterialRecord(tr, matSet, &arrDeferred);
 
 				localMatId = matRecords;
 				matKeyToLocalId[matKey] = localMatId;
 				matRecords += matSet.RecordCount();
+
+				// this material was written with no textures because its low resolution copies are
+				// still being produced; remember where its records live so they can be filled in
+				if (arrDeferred.Count())
+				{
+					SRTDeferredMat dm;
+					dm.pMat = m_pMatsInArea->GetAt(tr.materialID).pMat;
+					dm.bTerrain = (tr.hitObjectType == HIT_OBJ_TYPE_TERRAIN);
+					dm.localRecord = localMatId;
+					dm.recordCount = matSet.RecordCount();
+					dm.waitFor.AddList(arrDeferred);
+					arrDeferredMats.push_back(dm);
+				}
 
 				stats.extras += matSet.bExtras ? 1 : 0;
 				stats.blends += matSet.bBlend ? 1 : 0;
@@ -4142,6 +4543,16 @@ void CVoxelSegment::BuildStaticBVH()
 	m_rtChunkStart = chunkStart;
 	m_rtChunkCount = allocRecords;
 	m_rtRootRecord = chunkStart + matRecords;
+
+	// The chunk start is only known now, so the deferred material records can only be registered
+	// here. A patch is dropped again when its chunk is reclaimed (RTDropMatPatchesForChunk), which
+	// covers a cell that is re-voxelized before its textures ever arrived.
+	for (size_t d = 0; d < arrDeferredMats.size(); d++)
+	{
+		const SRTDeferredMat& dm = arrDeferredMats[d];
+
+		gSvoEnv->RTQueueMatPatch(dm.pMat, dm.bTerrain, chunkStart + dm.localRecord, dm.recordCount, chunkStart, dm.waitFor);
+	}
 
 	if (GetCVars()->e_svoDebug)
 	{
@@ -4248,6 +4659,12 @@ TRTSkinCache  g_rtSkinCache;
 PodArray<int> g_rtDynPrevTexSlices;
 int           g_rtDynPrevRecords = 0;
 int           g_rtDynPrevMats = 0;
+
+// cached dynamic object query (report 06c F9); see the comment at the collect step
+PodArray<IRenderNode*> g_rtDynNodesCached;
+Vec3                   g_rtDynCacheCamPos(0.f, 0.f, 0.f);
+uint                   g_rtDynCacheFrameId = ~0u;
+bool                   g_rtDynCacheValid = false;
 
 //! Quantisation bounds of one world box: XY centre plus the larger XY extent, as for a static cell.
 Vec4 RT_DynQuantBounds(const AABB& box)
@@ -5400,6 +5817,10 @@ void CVoxelSegment::RTClearDynamicCache()
 
 	g_rtSkinCache.clear();
 	RT_ClearWaterCache();
+	g_rtDynNodesCached.Reset();
+	g_rtDynCacheValid = false;
+	g_rtDynCacheFrameId = ~0u;
+
 	g_rtDynPrevTexSlices.Reset();
 	g_rtDynPrevRecords = 0;
 	g_rtDynPrevMats = 0;
@@ -5409,6 +5830,19 @@ void CVoxelSegment::RTUpdateDynamic()
 {
 	if (!GetCVars()->e_svoTI_RT_Active || !gSvoEnv)
 		return;
+
+	// ONCE per rendered frame (report 06c S7 / F4). CSvoManager::Render's sync update spin calls
+	// CSvoEnv::Render() ~130 times inside a single frame id and nothing in the scene advances between
+	// two of those calls, so the whole collection, the per object refit, the CPU skinning and the
+	// record emit were rebuilt and thrown away ~130 times - 13 to 50 % of the main thread, on work
+	// whose result is identical every time. m_currPassMainFrameID only advances in OnFrameStart, so
+	// this gate is exactly "once per frame the engine really renders".
+	static uint s_lastDynFrameId = ~0u;
+
+	if (s_lastDynFrameId == GetCurrPassMainFrameID())
+		return;
+
+	s_lastDynFrameId = GetCurrPassMainFrameID();
 
 	const bool bMeshes = (GetCVars()->e_svoTI_RT_Dynamic != 0);
 	const bool bWater = (GetCVars()->e_svoTI_RT_Water != 0);
@@ -5444,20 +5878,46 @@ void CVoxelSegment::RTUpdateDynamic()
 		areaBox.Expand(Vec3(distCam));
 
 		// ---- collect --------------------------------------------------------------------------
-		PodArray<IRenderNode*> arrNodes;
+		// The node list is held across frames (report 06c F9). Each GetObjectsByTypeInBox is a full
+		// octree walk into a temporary PodArray, and the count+fill pattern runs it twice per type,
+		// so this is six walks and six temporary allocations per frame over a 200 m box.
+		//
+		// e_svoTI_RT_DynRefreshFrames defaults to 1 (walk every frame) on purpose: above 1 these raw
+		// IRenderNode pointers outlive the frame they were collected in, and an object deleted in
+		// between would be dereferenced. Making >1 safe needs an invalidation hook in the octree,
+		// which is outside this change; the cvar is here so the cost can be traded when a scene is
+		// known to be static.
+		const int   refreshFrames = max(1, GetCVars()->e_svoTI_RT_DynRefreshFrames);
+		const float camMoveLimit = distCam * 0.05f;
 
-		const EERType arrTypes[3] = { eERType_MovableBrush, eERType_Brush, eERType_Character };
+		const bool bReQuery = !bMeshes || !g_rtDynCacheValid
+		                      || (int)(GetCurrPassMainFrameID() - g_rtDynCacheFrameId) >= refreshFrames
+		                      || camPos.GetSquaredDistance(g_rtDynCacheCamPos) > camMoveLimit * camMoveLimit;
 
-		for (int t = 0; bMeshes && t < 3; t++)
+		if (bReQuery)
 		{
-			const int objCount = (int)gEnv->p3DEngine->GetObjectsByTypeInBox(arrTypes[t], areaBox, (IRenderNode**)0);
-			if (objCount <= 0)
-				continue;
+			CRY_PROFILE_SECTION(PROFILE_3DENGINE, "RTUpdateDynamic_Collect");
 
-			const int first = arrNodes.Count();
-			arrNodes.PreAllocate(first + objCount, first + objCount);
-			gEnv->p3DEngine->GetObjectsByTypeInBox(arrTypes[t], areaBox, arrNodes.GetElements() + first);
+			g_rtDynNodesCached.Clear();
+			g_rtDynCacheValid = bMeshes;
+			g_rtDynCacheFrameId = GetCurrPassMainFrameID();
+			g_rtDynCacheCamPos = camPos;
+
+			const EERType arrTypes[3] = { eERType_MovableBrush, eERType_Brush, eERType_Character };
+
+			for (int t = 0; bMeshes && t < 3; t++)
+			{
+				const int objCount = (int)gEnv->p3DEngine->GetObjectsByTypeInBox(arrTypes[t], areaBox, (IRenderNode**)0);
+				if (objCount <= 0)
+					continue;
+
+				const int first = g_rtDynNodesCached.Count();
+				g_rtDynNodesCached.PreAllocate(first + objCount, first + objCount);
+				gEnv->p3DEngine->GetObjectsByTypeInBox(arrTypes[t], areaBox, g_rtDynNodesCached.GetElements() + first);
+			}
 		}
+
+		PodArray<IRenderNode*>& arrNodes = g_rtDynNodesCached;
 
 		PodArray<SRTDynSource> arrSources;
 
@@ -5589,6 +6049,8 @@ void CVoxelSegment::RTUpdateDynamic()
 		// also the least interesting thing to keep when the segment is full.
 		if (bWater)
 		{
+			CRY_PROFILE_SECTION(PROFILE_3DENGINE, "RTUpdateDynamic_Water");
+
 			PodArray<SRTWaterSurface> arrWater;
 			RT_CollectWaterSurfaces(camPos, distCam, distRay, arrWater);
 
@@ -5635,6 +6097,8 @@ void CVoxelSegment::RTUpdateDynamic()
 		// on the characters that matter most in the picture; the rest keep their bind pose, which is
 		// exactly what stage 3A did for all of them.
 		{
+			CRY_PROFILE_SECTION(PROFILE_3DENGINE, "RTUpdateDynamic_Skinning");
+
 			const float skinStart = GetCurAsyncTimeSec();
 			const int   skinMaxTris = max(0, GetCVars()->e_svoTI_RT_SkinMaxTris);
 			int         skinTris = 0;

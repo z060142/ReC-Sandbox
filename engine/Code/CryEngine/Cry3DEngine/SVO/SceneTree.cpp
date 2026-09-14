@@ -122,6 +122,7 @@ bool CSvoEnv::Render()
 	// which is why CheckUpdateMeshPools() is called here and not only after the brick updates.
 	if (GetCVars()->e_svoTI_RT_Active)
 	{
+		RTPrepareMirrors();
 		CVoxelSegment::RTUpdateDynamic();
 		CheckUpdateMeshPools();
 	}
@@ -218,7 +219,10 @@ bool CSvoEnv::Render()
 
 			m_pSvoRoot->Render(0, 1, 0, arrVertsOut, m_arrForStreaming, GetPlayableArea());
 
-			CheckUpdateMeshPools();
+			// (report 06c F3) the second CheckUpdateMeshPools() of the frame used to live here and
+			// doubled the upload traffic. It is redundant: the slices this traversal dirties are
+			// static cell slices, which the budgeted upload is allowed to carry into the next frame
+			// (a cell whose root texel is stale falls back to voxel cone tracing until it lands).
 		}
 
 	#ifdef FEATURE_SVO_GI_DVR // direct volume rendering
@@ -997,6 +1001,14 @@ CSvoEnv::~CSvoEnv()
 {
 	SAFE_DELETE(m_pStreamEngine);
 	assert(CVoxelSegment::m_streamingTasksInProgress == 0);
+
+	// the texture prefetch worker touches gSvoEnv, so it has to be gone before anything else is
+	CVoxelSegment::RTStopTexPrefetch();
+
+	for (size_t i = 0; i < m_arrRTMatPatches.size(); i++)
+		delete m_arrRTMatPatches[i];
+	m_arrRTMatPatches.clear();
+	m_rtMatPatchesPending = 0;
 
 	// the per object dynamic BVH cache holds render mesh references; drop them with the SVO
 	CVoxelSegment::RTClearDynamicCache();
@@ -2389,9 +2401,16 @@ void CSvoEnv::RTProcessPendingFrees()
 
 	{
 		AUTO_MODIFYLOCK(m_arrRTPoolTexs.m_Lock);
+
 		for (int i = 0; i < arrDue.Count(); i++)
 			if (arrDue[i].count == 0)
 				RTReleaseTexSlice(arrDue[i].start);
+
+		// a chunk that is gone takes its deferred material patches - and the atlas references those
+		// patches own - with it
+		for (int i = 0; i < arrDue.Count(); i++)
+			if (arrDue[i].count > 0)
+				RTDropMatPatchesForChunk(arrDue[i].start);
 	}
 }
 
@@ -2401,12 +2420,17 @@ void CSvoEnv::RTMarkTrisDirty(int firstRecord, int records)
 	if (records <= 0 || !m_arrRTDirtyTris.Count())
 		return;
 
+	// the stamp is the frame the slice went dirty in; a slice that is already dirty KEEPS its older
+	// stamp, so a slice the dynamic path rewrites every frame can never push a static slice out
+	const uint32 stamp = GetCurrPassMainFrameID() + 1;
+
 	const int sliceTexels = m_rtPoolXY * m_rtPoolXY;
 	const int z0 = CLAMP(firstRecord * SVO_RT_RECORD_TEXELS / sliceTexels, 0, m_arrRTDirtyTris.Count() - 1);
 	const int z1 = CLAMP(((firstRecord + records) * SVO_RT_RECORD_TEXELS - 1) / sliceTexels, 0, m_arrRTDirtyTris.Count() - 1);
 
 	for (int z = z0; z <= z1; z++)
-		m_arrRTDirtyTris[z] = 1;
+		if (!m_arrRTDirtyTris[z])
+			m_arrRTDirtyTris[z] = stamp;
 }
 
 //! Caller holds m_arrRTPoolTexs.m_Lock in modify mode.
@@ -2415,11 +2439,14 @@ void CSvoEnv::RTMarkTexsDirty(int firstSlice, int slices)
 	if (slices <= 0 || !m_arrRTDirtyTexs.Count())
 		return;
 
+	const uint32 stamp = GetCurrPassMainFrameID() + 1;
+
 	const int z0 = CLAMP(firstSlice, 0, m_arrRTDirtyTexs.Count() - 1);
 	const int z1 = CLAMP(firstSlice + slices - 1, 0, m_arrRTDirtyTexs.Count() - 1);
 
 	for (int z = z0; z <= z1; z++)
-		m_arrRTDirtyTexs[z] = 1;
+		if (!m_arrRTDirtyTexs[z])
+			m_arrRTDirtyTexs[z] = stamp;
 }
 
 //! Free list over Z slices (never a ring). Caller holds m_arrRTPoolTexs.m_Lock in modify mode.
@@ -2486,11 +2513,163 @@ void CSvoEnv::RTReleaseTexSlice(int slice)
 	}
 }
 
+//! One budgeted pass over a dirty stamp array: uploads the oldest dirty run first, coalescing
+//! adjacent dirty slices into one UpdateTextureRegion, and stops as soon as budgetBytes is reached.
+//! Slices that were not uploaded keep their stamp and are picked up by the next frame.
+//! Returns the bytes submitted; slicesOut is incremented by the slices uploaded.
+static size_t RTUploadDirtyRuns(int textureId, const byte* pBase, PodArray<uint32>& arrDirty,
+                                size_t sliceBytes, int xy, ETEX_Format texFormat,
+                                size_t budgetBytes, int& slicesOut)
+{
+	if (!textureId || !pBase || !arrDirty.Count() || !sliceBytes)
+		return 0;
+
+	size_t used = 0;
+
+	while (true)
+	{
+		// oldest first: the smallest non zero stamp is the slice that has been waiting longest
+		int    oldest = -1;
+		uint32 oldestStamp = ~0u;
+
+		for (int z = 0; z < arrDirty.Count(); z++)
+			if (arrDirty[z] && arrDirty[z] < oldestStamp)
+			{
+				oldestStamp = arrDirty[z];
+				oldest = z;
+			}
+
+		if (oldest < 0)
+			break;
+
+		// coalesce: the oldest slice usually sits inside a run of dirty slices, and one region of N
+		// slices costs the render thread one command instead of N
+		int z0 = oldest;
+		while (z0 > 0 && arrDirty[z0 - 1])
+			z0--;
+
+		int z1 = z0;
+		while (z1 < arrDirty.Count() && arrDirty[z1] && used + (size_t)(z1 - z0 + 1) * sliceBytes <= budgetBytes)
+			z1++;
+
+		if (z1 == z0)
+		{
+			// not even one slice fits in what is left. Carry it to the next frame - unless nothing
+			// at all has gone out yet, because a budget below one slice must not stall the pool
+			// forever (that would leave the GPU tracing records it never received).
+			if (used)
+				break;
+
+			z1 = z0 + 1;
+		}
+
+		for (int z = z0; z < z1; z++)
+			arrDirty[z] = 0;
+
+		gEnv->pRenderer->UpdateTextureInVideoMemory(textureId, const_cast<byte*>(pBase) + (size_t)z0 * sliceBytes,
+		                                           0, 0, xy, xy, texFormat, z0, z1 - z0);
+
+		used += (size_t)(z1 - z0) * sliceBytes;
+		slicesOut += z1 - z0;
+
+		if (used >= budgetBytes)
+			break;
+	}
+
+	return used;
+}
+
+//! S5 / report 06c F7: the two 64 MB CPU mirrors used to be allocated - and zeroed by
+//! PodArray::PreAllocate, 16k first touch page faults each - by whichever voxelization worker
+//! happened to commit the first chunk, WHILE it held the pool lock in exclusive mode, with every
+//! other worker and the main thread queued behind it. Allocating them here instead costs exactly the
+//! same, on the main thread, on the first RT frame, when nothing is contending.
+//!
+//! The zeroing itself is KEPT rather than dropped: RTMarkTrisDirty marks whole Z slices, so the
+//! padding around a committed chunk is uploaded with it, and an unzeroed mirror would put heap
+//! garbage into the pool that the consumer could walk into as a BVH node. What the fix removes is
+//! the 128 MB of copying at texture creation time (the textures are created empty below), not the
+//! one-off zeroing of the mirrors.
+void CSvoEnv::RTPrepareMirrors()
+{
+	if (!GetCVars()->e_svoTI_RT_Active)
+		return;
+
+	RTCachePoolDims();
+
+	if (m_rtPoolXY <= 0 || m_rtTexRes <= 0)
+		return;
+
+	if (!m_arrRTPoolTris.Count())
+	{
+		CRY_PROFILE_SECTION(PROFILE_3DENGINE, "CSvoEnv::RTPrepareMirrors_Tris");
+
+		AUTO_MODIFYLOCK(m_arrRTPoolTris.m_Lock);
+
+		m_arrRTPoolTris.CheckAllocated(m_rtPoolXY * m_rtPoolXY * m_rtPoolZ);
+
+		if (m_arrRTDirtyTris.Count() != m_rtPoolZ)
+			m_arrRTDirtyTris.PreAllocate(m_rtPoolZ, m_rtPoolZ);
+	}
+
+	if (!m_arrRTPoolTexs.Count())
+	{
+		CRY_PROFILE_SECTION(PROFILE_3DENGINE, "CSvoEnv::RTPrepareMirrors_Texs");
+
+		AUTO_MODIFYLOCK(m_arrRTPoolTexs.m_Lock);
+
+		m_arrRTPoolTexs.CheckAllocated(m_rtTexRes * m_rtTexRes * m_rtTexPoolZ);
+
+		if (m_arrRTTexSliceRef.Count() != m_rtTexPoolZ)
+		{
+			m_arrRTTexSliceRef.PreAllocate(m_rtTexPoolZ, m_rtTexPoolZ);
+			m_arrRTTexSliceOwner.PreAllocate(m_rtTexPoolZ, m_rtTexPoolZ);
+			m_arrRTDirtyTexs.PreAllocate(m_rtTexPoolZ, m_rtTexPoolZ);
+		}
+	}
+
+	if (m_rtEnableStartTime < 0.f)
+		m_rtEnableStartTime = GetCurAsyncTimeSec();
+
+	// the one worker that is allowed to load and decompress the low resolution material copies
+	CVoxelSegment::RTStartTexPrefetch();
+}
+
 //! Dirty Z slice upload, replacing the old ring buffer write offset logic (rt decision 02, 2.4).
+//!
+//! Cadence (report 06d, fix S1). This runs ONCE per rendered frame, on the main thread's frame path,
+//! because CTexture::UpdateTextureRegion called off the render thread copies the whole region into a
+//! std::make_shared<std::vector<uint8>> and appends an eRC_LambdaCall to the render thread's FILL
+//! buffer - which is only consumed at a frame boundary. The stock CrySleep(5) sync update spin calls
+//! CSvoEnv::Render() ~100-150 times inside ONE frame id and never reaches a frame boundary, so every
+//! byte submitted from inside it stayed allocated: 4 MB per iteration, ~0.5 GB/s, gigabytes over a
+//! long re-voxelization. That is the machine wide stall.
+//!
+//! Budget: at most e_svoTI_RT_UploadBudgetMB per frame, oldest dirty slice first. A single region is
+//! therefore never larger than the budget (one tri pool slice is 1 MB at the default 256 x 256, one
+//! atlas slice 256 KB), and the dirty stamps carry the remainder into the following frames.
 void CSvoEnv::RTUploadDirtySlices()
 {
 	if (!GetCVars()->e_svoTI_RT_Active)
 		return;
+
+	CRY_PROFILE_SECTION(PROFILE_3DENGINE, "CSvoEnv::RTUploadDirtySlices");
+
+	const float startTime = GetCurAsyncTimeSec();
+
+	const size_t budgetTotal = (size_t)max(0, GetCVars()->e_svoTI_RT_UploadBudgetMB) * 1024 * 1024;
+
+	// Half the budget is reserved for the atlas whenever the atlas has anything waiting: a long
+	// re-voxelization dirties dozens of record slices at once and would otherwise keep the material
+	// pixels out of VRAM for many frames, i.e. correct records pointing at empty texture slices.
+	bool bTexsDirty = false;
+	for (int z = 0; z < m_arrRTDirtyTexs.Count() && !bTexsDirty; z++)
+		bTexsDirty = (m_arrRTDirtyTexs[z] != 0);
+
+	const size_t budgetTexs = bTexsDirty ? budgetTotal / 2 : 0;
+
+	int    slices = 0;
+	size_t bytes = 0;
 
 	{
 		AUTO_MODIFYLOCK(m_arrRTPoolTris.m_Lock);
@@ -2502,40 +2681,19 @@ void CSvoEnv::RTUploadDirtySlices()
 
 			if (!m_arrRTPoolTris.m_textureId)
 			{
-				m_arrRTPoolTris.m_textureId = gEnv->pRenderer->UploadToVideoMemory3D((byte*)m_arrRTPoolTris.GetElements(),
+				// Created EMPTY, exactly like the stock SVO brick pools (VoxelSegment.cpp passes NULL):
+				// handing the whole mirror to UploadToVideoMemory3D costs a 64 MB std::vector copy on
+				// the main thread before the render thread ever sees it. Every slice that holds data is
+				// dirty already, so the budgeted path below fills the texture over the next frames.
+				m_arrRTPoolTris.m_textureId = gEnv->pRenderer->UploadToVideoMemory3D(nullptr,
 				                                                                     W, W, D, eTF_R32G32B32A32F, eTF_R32G32B32A32F, 1, false, FILTER_POINT, 0, 0, FT_DONT_STREAM, eLittleEndian, nullptr, true);
 
-				for (int z = 0; z < m_arrRTDirtyTris.Count(); z++)
-					m_arrRTDirtyTris[z] = 0;
-
-				PrintMessage("SVO RT: record pool texture created (%d x %d x %d)", W, W, D);
+				PrintMessage("SVO RT: record pool texture created empty (%d x %d x %d), filled by the dirty slice path", W, W, D);
 			}
-			else
-			{
-				int z = 0;
-				while (z < m_arrRTDirtyTris.Count())
-				{
-					if (!m_arrRTDirtyTris[z])
-					{
-						z++;
-						continue;
-					}
 
-					int z1 = z;
-					while (z1 < m_arrRTDirtyTris.Count() && m_arrRTDirtyTris[z1])
-					{
-						m_arrRTDirtyTris[z1] = 0;
-						z1++;
-					}
-
-					gEnv->pRenderer->UpdateTextureInVideoMemory(
-					  m_arrRTPoolTris.m_textureId,
-					  (byte*)(m_arrRTPoolTris.GetElements() + (size_t)z * W * W),
-					  0, 0, W, W, eTF_R32G32B32A32F, z, z1 - z);
-
-					z = z1;
-				}
-			}
+			bytes += RTUploadDirtyRuns(m_arrRTPoolTris.m_textureId, (const byte*)m_arrRTPoolTris.GetElements(),
+			                           m_arrRTDirtyTris, (size_t)W * W * sizeof(Vec4), W, eTF_R32G32B32A32F,
+			                           budgetTotal - budgetTexs, slices);
 		}
 	}
 
@@ -2549,42 +2707,24 @@ void CSvoEnv::RTUploadDirtySlices()
 
 			if (!m_arrRTPoolTexs.m_textureId)
 			{
-				m_arrRTPoolTexs.m_textureId = gEnv->pRenderer->UploadToVideoMemory3D((byte*)m_arrRTPoolTexs.GetElements(),
+				m_arrRTPoolTexs.m_textureId = gEnv->pRenderer->UploadToVideoMemory3D(nullptr,
 				                                                                     A, A, Zt, m_voxTexFormat, m_voxTexFormat, 1, false, FILTER_LINEAR, 0, 0, FT_DONT_STREAM, eLittleEndian, nullptr, true);
 
-				for (int z = 0; z < m_arrRTDirtyTexs.Count(); z++)
-					m_arrRTDirtyTexs[z] = 0;
-
-				PrintMessage("SVO RT: material atlas texture created (%d x %d x %d)", A, A, Zt);
+				PrintMessage("SVO RT: material atlas texture created empty (%d x %d x %d), filled by the dirty slice path", A, A, Zt);
 			}
-			else
-			{
-				int z = 0;
-				while (z < m_arrRTDirtyTexs.Count())
-				{
-					if (!m_arrRTDirtyTexs[z])
-					{
-						z++;
-						continue;
-					}
 
-					int z1 = z;
-					while (z1 < m_arrRTDirtyTexs.Count() && m_arrRTDirtyTexs[z1])
-					{
-						m_arrRTDirtyTexs[z1] = 0;
-						z1++;
-					}
-
-					gEnv->pRenderer->UpdateTextureInVideoMemory(
-					  m_arrRTPoolTexs.m_textureId,
-					  (byte*)(m_arrRTPoolTexs.GetElements() + (size_t)z * A * A),
-					  0, 0, A, A, m_voxTexFormat, z, z1 - z);
-
-					z = z1;
-				}
-			}
+			// whatever the record pool left unspent goes to the atlas
+			bytes += RTUploadDirtyRuns(m_arrRTPoolTexs.m_textureId, (const byte*)m_arrRTPoolTexs.GetElements(),
+			                           m_arrRTDirtyTexs, (size_t)A * A * sizeof(ColorB), A, m_voxTexFormat,
+			                           budgetTotal - bytes, slices);
 		}
 	}
+
+	m_rtUploadSlices = slices;
+	m_rtUploadBytes = (int64)bytes;
+	m_rtUploadMs = (GetCurAsyncTimeSec() - startTime) * 1000.f;
+	m_rtUploadBytesTotal += (int64)bytes;
+	m_rtUploadMsTotal += m_rtUploadMs;
 }
 
 void CSvoEnv::CheckUpdateMeshPools()
@@ -2592,11 +2732,25 @@ void CSvoEnv::CheckUpdateMeshPools()
 	if (!GetCVars()->e_svoTI_RT_Active)
 		return;
 
+	// Once per RENDERED frame. CSvoManager::Render's sync update spin calls CSvoEnv::Render() over
+	// and over inside a single frame id (CVoxelSegment::m_currPassMainFrameID only advances in
+	// OnFrameStart), and CSvoEnv::Render itself used to call this twice. Both of those are what made
+	// the upload unbounded; the frame id gate removes both at once.
+	if (m_rtLastPoolFrameId == GetCurrPassMainFrameID())
+		return;
+
+	m_rtLastPoolFrameId = GetCurrPassMainFrameID();
+
 	FUNCTION_PROFILER_3DENGINE;
 
+	RTApplyMatPatches();
 	RTUploadDirtySlices();
 	RTProcessPendingFrees();
 	RTLogStatsWhenReady();
+
+	// a frame in which the RT main thread work went over 4 ms is a frame the user can feel
+	if (m_rtUploadMs + m_rtDynStats.ms > 4.f)
+		m_rtStallFrames++;
 }
 
 //! Known gap 7.2 (report 01b): the material record carries one atlas UV scale, taken from the
@@ -2646,10 +2800,16 @@ void CSvoEnv::RTFormatDynLine(char* szOut, size_t bufSize) const
 {
 	const SRTDynStats& st = m_rtDynStats;
 
+	int texCopiesDone = 0, texCopiesPending = 0;
+	CVoxelSegment::RTGetTexPrefetchStats(texCopiesDone, texCopiesPending);
+
 	cry_sprintf(szOut, bufSize, "RT dyn: %d of %d objs, %d K tris, %d records, %d mats, ovf %d, cache %d, water %d tris, "
-	                            "skinned %d chars, %d K verts, %d stale, %.2f ms, %.2f ms",
+	                            "skinned %d chars, %d K verts, %d stale, %.2f ms, %.2f ms | upload %d sl %.2f MB %.2f ms, "
+	                            "stall %d, tex %d/%d, pat %d/%d",
 	            st.objs, st.objsFound, st.tris / 1000, st.records, st.mats, st.overflowed, st.cached, st.waterTris,
-	            st.skinnedChars, st.skinnedVerts / 1000, st.skinReused, st.skinMs, st.ms);
+	            st.skinnedChars, st.skinnedVerts / 1000, st.skinReused, st.skinMs, st.ms,
+	            m_rtUploadSlices, (double)m_rtUploadBytes / (1024.0 * 1024.0), m_rtUploadMs,
+	            m_rtStallFrames, texCopiesDone, texCopiesPending, m_rtMatPatchesApplied, m_rtMatPatchesPending);
 }
 
 //! Belt and braces for the HUD: print the same two lines to the log once, when a voxelization pass
@@ -2674,11 +2834,24 @@ void CSvoEnv::RTLogStatsWhenReady()
 	m_rtWasReady = true;
 	m_rtStatsLogged = true;
 
-	char szLine[256];
+	char szLine[512];
 	RTFormatPoolLine(szLine, sizeof(szLine));
 	PrintMessage("SVO RT: %s", szLine);
 	RTFormatBvhLine(szLine, sizeof(szLine));
 	PrintMessage("SVO RT: %s", szLine);
+
+	// What the whole enable event cost, once per level: this is the number to compare against when
+	// the next round changes anything on this path (report 06d).
+	int texCopiesDone = 0, texCopiesPending = 0;
+	CVoxelSegment::RTGetTexPrefetchStats(texCopiesDone, texCopiesPending);
+
+	PrintMessage("SVO RT enable: %d cells built, %.1f MB uploaded in %.0f ms of main thread over %.1f s, "
+	             "%d texture copies (%d still queued), %d material records patched (%d queued), %d frames over 4 ms",
+	             m_rtStats.cells,
+	             (double)m_rtUploadBytesTotal / (1024.0 * 1024.0), m_rtUploadMsTotal,
+	             m_rtEnableStartTime >= 0.f ? (GetCurAsyncTimeSec() - m_rtEnableStartTime) : 0.f,
+	             texCopiesDone, texCopiesPending, m_rtMatPatchesApplied, m_rtMatPatchesPending,
+	             m_rtStallFrames);
 }
 
 bool C3DEngine::GetSvoStaticTextures(I3DEngine::SSvoStaticTexInfo& svoInfo, PodArray<I3DEngine::SLightTI>* pLightsTI_S, PodArray<I3DEngine::SLightTI>* pLightsTI_D)

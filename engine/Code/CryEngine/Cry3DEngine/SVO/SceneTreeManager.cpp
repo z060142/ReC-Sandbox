@@ -34,7 +34,8 @@ void CSvoManager::CheckAllocateGlobalCloud()
 
 char* CSvoManager::GetStatusString(int lineId)
 {
-	static char szText[256] = "";
+	// 512, not 256: the RT dyn line now carries the upload cost and the stall counter as well
+	static char szText[512] = "";
 
 	int slotId = 0;
 
@@ -234,11 +235,27 @@ void CSvoManager::Render(bool bSyncUpdate)
 
 			if (gSvoEnv->m_svoFreezeTime > 0)
 			{
-				// perform synchronous SVO update, usually happens in first frames after level loading
+				// Synchronous SVO update spin. STOCK BEHAVIOUR, deliberately unchanged (report 06c
+				// S2): CSvoNode::Render re-arms m_svoFreezeTime every time it deletes a force
+				// recreate child, i.e. from inside this loop, so e_svoTI_MaxSyncUpdateTime only
+				// fires after that many seconds with NO node recreated - the main thread is gone for
+				// the whole re-voxelization, not for two seconds. That is true with RT off as well.
+				//
+				// What mesh ray tracing must not do is make it worse, and it does not: no RT code
+				// path writes m_svoFreezeTime or m_bForceRecreate (the chunk commit, the atlas
+				// writes, the dirty marks and the pool upload all stay inside the RT pools), and
+				// RTUpdateDynamic and the pool upload are now gated on the main frame id, which does
+				// not advance inside this loop. So RT work runs at most ONCE per spin, not at spin
+				// rate, and it cannot extend the spin.
+				const float spinStart = gEnv->pTimer->GetAsyncCurTime();
+				int         spinIterations = 0;
+
 				while (gSvoEnv->m_svoFreezeTime > 0)
 				{
 					gSvoEnv->Render();
 					gEnv->pSystem->GetStreamEngine()->Update();
+
+					spinIterations++;
 
 					if ((gEnv->pTimer->GetAsyncCurTime() - gSvoEnv->m_svoFreezeTime) > GetCVars()->e_svoTI_MaxSyncUpdateTime)
 					{
@@ -250,6 +267,13 @@ void CSvoManager::Render(bool bSyncUpdate)
 				}
 
 				gSvoEnv->m_svoFreezeTime = -1;
+
+				// one line that settles how long the main thread was actually unavailable
+				if (GetCVars()->e_svoTI_RT_Active && spinIterations > 1)
+				{
+					PrintMessage("SVO sync update: %d iterations, %.2f s (the main thread is blocked for all of it - stock 5.7.1 behaviour)",
+					             spinIterations, gEnv->pTimer->GetAsyncCurTime() - spinStart);
+				}
 			}
 			else
 			{
