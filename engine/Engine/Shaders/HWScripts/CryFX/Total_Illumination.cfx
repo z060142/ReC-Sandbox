@@ -1932,22 +1932,23 @@ pixoutMRTTrace ConeTracePS(vtxOutWPOS IN)
 	bool bRTWriteGData = false;
 #endif
 
-#if %_RT_QUALITY
-	// rt: fxc cannot build this loop once the software triangle tracer (RT_TraverseTris, a
-	// stack walk with a triangle loop inside it) is inlined next to the voxel cone trace:
-	// it insists on unrolling the pass loop and then reports X3511 "unrolling failed" on the
-	// body's size ([loop] only turns that into X3531). The pass count is one on this
-	// permutation (see nPassesNum above), so the loop is peeled by hand into its single pass.
-	// Without %_RT_QUALITY the stock `for` in the #else below is what compiles, unchanged.
-	// CryFX counts braces on the RAW text before preprocessing: a `{` in each #if branch
-	// desyncs the function extent and the parser drops every technique in the file.
-	// So the brace is shared after the #endif and the RT branch uses a constant `if`.
-	const int p = 0;
-	if (p == 0)
-#else
+	// rt 2026-09-14: THE BVH WALK NEVER SITS INSIDE THIS LOOP. fxc force-unrolls the pass loop
+	// (X3557) and cannot build the body once the software triangle tracer - RT_TraverseTris, a
+	// stack walk with a triangle loop in it, plus RT_ProcessBestHit - is inlined next to the
+	// voxel cone trace: X3511 "unrolling failed", and [loop] only turns that into X3531. The
+	// 2026-09-13 answer was to peel the loop by hand, which just moved the failure to an fxc
+	// "internal error: compilation aborted unexpectedly" later in the same compile.
+	// The structural answer: the call below passes a LITERAL 0 for ConeTraceTreeAndSky's
+	// fMultTriRT, so the whole triangle path constant-folds out of the loop body and what fxc
+	// unrolls here is exactly the stock cone trace; an RT pixel leaves the loop on its first
+	// line and gets ONE triangle trace after it. The stock `for` is the only loop header again.
 	for (int p = 0; p < nPassesNum; p++)
-#endif
 	{
+#if %_RT_QUALITY
+		// an RT pixel does no cone pass at all - see the post-loop block
+		if (bUseRT)
+			break;
+#endif
 		int s = (nFramesNum == 2) ? (int(SVO_FrameIdByte.x) & 1) : 0;
 		s += p * nFramesNum;
 
@@ -1999,18 +2000,9 @@ pixoutMRTTrace ConeTracePS(vtxOutWPOS IN)
 
 			power = exp2(10.h * fAverSmoothness + 1.h);
 
-#if %_RT_QUALITY
-			// rt stage 2C, finding (b). A triangle ray is a RAY, not a cone: it takes the exact
-			// mirror direction and no per-pixel kernel jitter. CE's "kern += vFocus*power/25"
-			// below is a stochastic gloss lobe whose offset comes from GetDiffuseKernel indexed
-			// by the screen-space dither tile, so on a surface that falls just under the .95
-			// knee it prints that tile into the reflection as a regular grid and blurs it. Neo
-			// is categorical about it: for a mirror "kern = vFocus" unless _RTGI_GLOSSY_REFLECTIONS
-			// is on (neo:1468-1472), and the glossy lobe is our stage 4.
-			if (bUseRT)
-				kern = vFocusRT;
-			else
-#endif
+			// rt stage 2C, finding (b): a triangle ray is a RAY, not a cone - it takes the exact
+			// mirror direction and no per-pixel kernel jitter. That is the post-loop block's
+			// business now; an RT pixel never reaches this line.
 			if (fAverSmoothness < .95)
 			kern += vFocus * power / 25;
 			else
@@ -2030,12 +2022,9 @@ pixoutMRTTrace ConeTracePS(vtxOutWPOS IN)
 		// rt stage 2C, finding (a)/(b): portal bending picks a portal with `i & 3`, i.e. with the
 		// screen-space dither tile, and bends the ray toward it - another per-pixel grid printed
 		// into the reflection, and geometrically wrong for a mirror in any case. It is a cone
-		// tracing importance-sampling trick; a triangle ray does not get one.
-		#if %_RT_QUALITY
-		if (SvoTreeSettings5.y && !bUseRT)
-		#else
+		// tracing importance-sampling trick; a triangle ray does not get one, and does not reach
+		// this line.
 		if (SvoTreeSettings5.y)
-		#endif
 		{
 			float4 arrBestPortalPos[MAX_BEST_PORTALS];
 			float4 arrBestPortalDir[MAX_BEST_PORTALS];
@@ -2069,64 +2058,10 @@ pixoutMRTTrace ConeTracePS(vtxOutWPOS IN)
 		fRayLen = VOX_CONE_MAX_LEN;
 	#endif
 
-#if %_RT_QUALITY
-		if (bUseRT)
-		{
-			// triangle rays get their own length budget, not the cone length
-			fRayLen = VOX_MAX_RT_DIST_RAY;
-
-			// R01 (decision 03 section 3.6): the G-buffer position sits within depth precision of the
-			// triangle that produced it, so push the origin off the surface along the shading normal,
-			// scaled with distance, instead of relying on the 1 mm hit epsilon alone.
-			r.startpoint += normalize(vNor0) * max(0.002f, 0.0002f * fDistM);
-
-			RT_ResetInfo(vFocusRT, VOX_MAX_RT_DIST_RAY, fDistM, RT_GetStippleAlphaRef(nXY), false);
-		}
-#else
-		const bool bUseRT = false;
-#endif
-
-		vC = ConeTraceTreeAndSky(fRayLen, r, SvoParamsDiffuse.x + power / 10000, SvoParamsInject.z, bUseRT ? 1 : 0, false, false, bUseRT ? float3(0, 0, 0) : normalize(vNor0));
-
-#if %_RT_QUALITY
-		// rt stage 2: a hit (or a deliberate miss) leaves this pixel carrying g-data, which the
-		// ShadePass turns into ALD + RGB. An `incomplete` traversal falls through to the voxel
-		// cone result and is therefore NOT g-data (decision 03 section 3.5).
-		bRTWriteGData = bUseRT && g_rtInfo.hitpos.w > 0 && !g_rtInfo.best.incomplete;
-
-	#if %_RT_PARTICLE_SHADOW
-		if (bUseRT)
-		{
-			if ((int)VOX_RT_DEBUG_MODE == 6)
-			{
-				// Debug view 6 = the stage-1 provisional colour (decision 06 section 6.5): the
-				// triangle albedo substituted into CE's own "voxel radiance / voxel albedo"
-				// irradiance trick. Kept as a view because it needs no light data at all, so it
-				// still shows a picture when the ShadePass resources are wrong.
-				if (bRTWriteGData && g_rtInfo.best.vAlb.a > 0)
-				{
-					const float3 vIrradiance = g_rtInfo.cellValid
-						? RT_SampleVoxelIrradiance(g_rtInfo.cellTC, g_rtInfo.cellMin, g_rtInfo.cellMax, g_rtInfo.hitpos.xyz)
-						: (float3)1.f;
-
-					vC.xyz = g_rtInfo.albedo_smoothness.xyz * vIrradiance;
-					vC.a = 1;
-				}
-
-				bRTWriteGData = false; // this pixel is final; ShadePS must leave it alone
-			}
-			else
-			{
-				float3 vDebug;
-				if (RT_GetDebugColor(vDebug))
-				{
-					vC = float4(vDebug, 1);
-					bRTWriteGData = false;
-				}
-			}
-		}
-	#endif
-#endif
+		// rt: LITERAL 0. ConeTraceTreeAndSky / ConeTraceTree / ConeTraceBrick all gate the
+		// triangle walk on this constant, so the loop body fxc unrolls is the stock cone trace
+		// and nothing else. The triangle instantiation is the one call after the loop.
+		vC = ConeTraceTreeAndSky(fRayLen, r, SvoParamsDiffuse.x + power / 10000, SvoParamsInject.z, 0, false, false, normalize(vNor0));
 
 #if %_RT_NO_TESSELLATION
 		vC *= lerp(1.f, SvoParamsInject.w, saturate(fAverTransmittanceY * 8));
@@ -2139,6 +2074,90 @@ pixoutMRTTrace ConeTracePS(vtxOutWPOS IN)
 		vALD.w += fBr;
 		vRGB.xyz += vC.xyz;
 	}
+
+#if %_RT_QUALITY
+	// rt 2026-09-14: THE ONE TRIANGLE TRACE. Outside every loop, and the only place in this
+	// shader that instantiates ConeTraceTreeAndSky with a non-zero fMultTriRT - the argument is
+	// the LITERAL 1, so the BVH walk exists exactly once in the compiled shader. The RT pixel
+	// broke out of the pass loop above without tracing anything, so this block owns the whole
+	// post-trace contract for it: the ALD/RGB write (which doubles as the incomplete-traversal
+	// fallback), bRTWriteGData, and the debug views.
+	if (bUseRT)
+	{
+		Ray rRT;
+
+		// finding (b): the exact mirror direction (or the stage-4B GGX sample), no per-pixel
+		// kernel jitter, no portal bending - see the two notes in the loop body above.
+		rRT.direction = normalize(vFocusRT);
+		rRT.startpoint = vPos0;
+
+		#if %_RT_TILED_SHADING && %_RT_NO_TESSELLATION
+		  rRT.startpoint += (vFocus * fAverTransmittanceY) * (VOX_MIN_VOX_SIZE + fDistM*.025f);
+		#endif
+
+		// R01 (decision 03 section 3.6): the G-buffer position sits within depth precision of the
+		// triangle that produced it, so push the origin off the surface along the shading normal,
+		// scaled with distance, instead of relying on the 1 mm hit epsilon alone.
+		rRT.startpoint += normalize(vNor0) * max(0.002f, 0.0002f * fDistM);
+
+		// RT_IsTriPixel is false in diffuse mode, so this is always the specular cone severity.
+		const half powerRT = exp2(10.h * fAverSmoothness + 1.h);
+
+		RT_ResetInfo(vFocusRT, VOX_MAX_RT_DIST_RAY, fDistM, RT_GetStippleAlphaRef(nXY), false);
+
+		// triangle rays get their own length budget, not the cone length. vSurfNorm is 0 so the
+		// traversal ray is the unadvanced one (see ConeTraceTree).
+		float4 vCRT = ConeTraceTreeAndSky(VOX_MAX_RT_DIST_RAY, rRT, SvoParamsDiffuse.x + powerRT / 10000, SvoParamsInject.z, 1, false, false, float3(0, 0, 0));
+
+		// rt stage 2: a hit (or a deliberate miss) leaves this pixel carrying g-data, which the
+		// ShadePass turns into ALD + RGB. An `incomplete` traversal falls through to the voxel
+		// cone result and is therefore NOT g-data (decision 03 section 3.5).
+		bRTWriteGData = g_rtInfo.hitpos.w > 0 && !g_rtInfo.best.incomplete;
+
+	#if %_RT_PARTICLE_SHADOW
+		if ((int)VOX_RT_DEBUG_MODE == 6)
+		{
+			// Debug view 6 = the stage-1 provisional colour (decision 06 section 6.5): the
+			// triangle albedo substituted into CE's own "voxel radiance / voxel albedo"
+			// irradiance trick. Kept as a view because it needs no light data at all, so it
+			// still shows a picture when the ShadePass resources are wrong.
+			if (bRTWriteGData && g_rtInfo.best.vAlb.a > 0)
+			{
+				const float3 vIrradiance = g_rtInfo.cellValid
+					? RT_SampleVoxelIrradiance(g_rtInfo.cellTC, g_rtInfo.cellMin, g_rtInfo.cellMax, g_rtInfo.hitpos.xyz)
+					: (float3)1.f;
+
+				vCRT.xyz = g_rtInfo.albedo_smoothness.xyz * vIrradiance;
+				vCRT.a = 1;
+			}
+
+			bRTWriteGData = false; // this pixel is final; ShadePS must leave it alone
+		}
+		else
+		{
+			float3 vDebug;
+			if (RT_GetDebugColor(vDebug))
+			{
+				vCRT = float4(vDebug, 1);
+				bRTWriteGData = false;
+			}
+		}
+	#endif
+
+	#if %_RT_NO_TESSELLATION
+		vCRT *= lerp(1.f, SvoParamsInject.w, saturate(fAverTransmittanceY * 8));
+	#endif
+
+		// the loop contributed nothing, so this is an assignment, not an accumulation; the pass
+		// count is pinned to one on this permutation so there is no division either. When
+		// bRTWriteGData is set the block below overwrites both of these with the g-data; when the
+		// traversal came back incomplete they stay, and they are the voxel cone fallback.
+		const float fBrRT = length(vCRT.xyz);
+		vALD.xyz = rRT.direction * fBrRT;
+		vALD.w   = fBrRT;
+		vRGB.xyz = vCRT.xyz;
+	}
+#endif
 
 	vRGB.xyz += 0.001f;
 	vRGB.w = fNewDepth;

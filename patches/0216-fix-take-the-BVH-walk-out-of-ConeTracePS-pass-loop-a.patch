@@ -1,0 +1,371 @@
+From fe294c9dde2da39a6df820052ea08285f1c02e84 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Mon, 14 Sep 2026 21:47:55 +0800
+Subject: [PATCH 216/217] fix: take the BVH walk out of ConeTracePS' pass loop
+ and make fMultTriRT fold
+
+The engine's own HLSL compiler could not build Total_Illumination@ConeTracePS(X1):
+"internal error: compilation aborted unexpectedly". The harness had reported the
+permutation clean because its failure test grepped for ": error", which fxc does
+not print for an internal error - both compilers (Windows SDK 10.0.26100.7705 and
+the engine's C:/Windows/System32/d3dcompiler_47.dll, 10.0.26100.9444) fail on it
+in exactly the same way, so the compiler binary was never the difference.
+
+Cause, from a git bisect of the RT branch with the engine compiler: ConeTracePS
+built cleanly up to 122bb991 (dynamic meshes) and started failing at 7d884755
+(full material reconstruction at the hit). The triangle tracer and the voxel cone
+tracer were sharing one instantiation of ConeTraceTree - the call passed the
+runtime value "bUseRT ? 1 : 0" for fMultTriRT, so RT_TraverseTris and
+RT_ProcessBestHit had to be generated inside the cone body as well. On top of
+that the 2026-09-13 loop peel (const int p = 0; if (p == 0)) had only hidden the
+earlier X3511 "forced to unroll loop, but unrolling failed" behind the internal
+error.
+
+Structural change:
+
+* ConeTracePS: the stock "for (int p = 0; p < nPassesNum; p++)" is the only loop
+  header again - the hand peel is gone. The call inside it passes the LITERAL 0
+  for fMultTriRT, i.e. exactly the text the native path preprocesses to, so the
+  loop body fxc unrolls is the stock cone trace and nothing else. An RT pixel
+  breaks out on the loop's first line and gets ONE ConeTraceTreeAndSky call with
+  the LITERAL 1 after the loop, followed by the whole post-trace contract it
+  needs: bRTWriteGData, the debug views, the NO_TESSELLATION multiply and the
+  ALD/RGB write that doubles as the incomplete-traversal fallback. The in-loop
+  RT special cases (mirror kernel, portal bending opt-out, ray length, origin
+  offset, RT_ResetInfo) moved into that block; the loop body is stock again.
+
+* ConeTraceTree: fMultTriRT is const. ConeTraceBrick takes it inout (it zeroes
+  the multiplier past VOX_MAX_RT_DIST_RAY so the voxels stop shrinking) and one
+  write from an inlined callee turns the constant into a phi, after which nothing
+  folds. The RT gates now read the const parameter and ConeTraceBrick gets a
+  mutable copy of its own.
+
+The native path is unchanged: without %_RT_QUALITY every added line preprocesses
+away and the call site is character for character CE 5.7.1's.
+
+This is not yet the whole fix. With both compilers the three ConeTracePS entries
+that carry the engine's real specular flag set still hit the same internal error:
+the triangle tracer plus RT_ProcessBestHit's material reconstruction is over
+fxc's capacity for this entry point by less than the blend-layer block of
+decision 10 (removing either half of that block compiles). See
+scene-notes/rt/reports/06a-unroll-fix.md for the measurements and the options.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SCUvWGLCsqzm3VNMzp4uiS
+---
+ Engine/Shaders/HWScripts/CryFX/CommonSVO.cfi  |  26 ++-
+ .../HWScripts/CryFX/Total_Illumination.cfx    | 179 ++++++++++--------
+ 2 files changed, 117 insertions(+), 88 deletions(-)
+
+diff --git a/Engine/Shaders/HWScripts/CryFX/CommonSVO.cfi b/Engine/Shaders/HWScripts/CryFX/CommonSVO.cfi
+index 1764643d..3d4aba50 100644
+--- a/Engine/Shaders/HWScripts/CryFX/CommonSVO.cfi
++++ b/Engine/Shaders/HWScripts/CryFX/CommonSVO.cfi
+@@ -1002,12 +1002,22 @@ bool ConeTraceBrick(const float3 vRayStartPos, inout Ray r, const float _fDistan
+ }
+ 
+ float4 ConeTraceTree(Ray rayForTree, const float fLodRatio, out float4 vPos0, out float4 vNormal, float _fDistanceIn, float fDistanceMax,
+-                     const float fAlphaRefMin = 0.f, float fAlphaRefMax = 1.f, const int nPredictionMode = 0, float fMultTriRT = 0, const int nTraceMode = 0, const bool bApplyGlobalDensity = false, const bool bSpecular = false,
++                     const float fAlphaRefMin = 0.f, float fAlphaRefMax = 1.f, const int nPredictionMode = 0, const float fMultTriRTIn = 0, const int nTraceMode = 0, const bool bApplyGlobalDensity = false, const bool bSpecular = false,
+                      bool bUseLighting = false, float3 vSurfNorm = 0, const int nDebugMode = 0, float fStepSize = 0.5f)
+ {
+-#if !%_RT_QUALITY
+-	fMultTriRT = 0;
++	// rt 2026-09-14: the triangle multiplier is a COMPILE TIME CONSTANT at every call site - 0 on
++	// the cone path, 1 on the single triangle-RT call in ConeTracePS - and it has to stay one all
++	// the way down or the RT gates below stop folding. ConeTraceBrick takes it `inout` (it zeroes
++	// the multiplier past VOX_MAX_RT_DIST_RAY so the voxels stop shrinking); one write from an
++	// inlined callee turns the constant into a phi, and after that fxc keeps RT_TraverseTris and
++	// RT_ProcessBestHit in the cone instantiation too. So the gates read the const parameter and
++	// ConeTraceBrick is handed a mutable copy of its own.
++#if %_RT_QUALITY
++	const float fMultTriRT = fMultTriRTIn;
++#else
++	const float fMultTriRT = 0;
+ #endif
++	float fMultTriRTBrick = fMultTriRT;
+ 
+ #if %_RT_SAMPLE5
+ 	bUseLighting = true;
+@@ -1076,14 +1086,14 @@ float4 ConeTraceTree(Ray rayForTree, const float fLodRatio, out float4 vPos0, ou
+ 		if (fDistM > VOX_MAX_NODE_SIZE * 3)
+ 		{
+ 			ConeTraceBrick_SS_Far(vRayStartPos, rayForTree, _fDistanceIn, fDistance, fDistanceMax,
+-			                      vPos0, vNormal, 0, vRgbOutSS, VOX_MAX_ALPHA, fLodRatio, fAlphaRefMin, fAlphaRefMax, nPredictionMode, fMultTriRT, (nTraceMode == SVO_TRACE_MODE_AIR), bApplyGlobalDensity, bSpecular, bUseLighting,
++			                      vPos0, vNormal, 0, vRgbOutSS, VOX_MAX_ALPHA, fLodRatio, fAlphaRefMin, fAlphaRefMax, nPredictionMode, fMultTriRTBrick, (nTraceMode == SVO_TRACE_MODE_AIR), bApplyGlobalDensity, bSpecular, bUseLighting,
+ 			                      vBestHitPosOpa);
+ 			return vRgbOutSS;
+ 		}
+ 		else if (fDistM > VOX_MAX_NODE_SIZE * 2)
+ 		{
+ 			ConeTraceBrick_SS_Far(vRayStartPos, rayForTree, _fDistanceIn, fDistance, fDistanceMax,
+-			                      vPos0, vNormal, 0, vRgbOutSS, VOX_MAX_ALPHA, fLodRatio, fAlphaRefMin, fAlphaRefMax, nPredictionMode, fMultTriRT, (nTraceMode == SVO_TRACE_MODE_AIR), bApplyGlobalDensity, bSpecular, bUseLighting,
++			                      vPos0, vNormal, 0, vRgbOutSS, VOX_MAX_ALPHA, fLodRatio, fAlphaRefMin, fAlphaRefMax, nPredictionMode, fMultTriRTBrick, (nTraceMode == SVO_TRACE_MODE_AIR), bApplyGlobalDensity, bSpecular, bUseLighting,
+ 			                      vBestHitPosOpa);
+ 		}
+ 	}
+@@ -1092,7 +1102,7 @@ float4 ConeTraceTree(Ray rayForTree, const float fLodRatio, out float4 vPos0, ou
+ 	if (!IsDiffuseMode() && nTraceMode == SVO_TRACE_MODE_GEOMETRY)
+ 	{
+ 		ConeTraceBrick_SSR(vRayStartPos, rayForSS, _fDistanceIn, fDistanceSS, fDistanceMax,
+-		                   vPos0, vNormal, 0, vRgbOutSS, VOX_MAX_ALPHA, fLodRatio, fAlphaRefMin, fAlphaRefMax, nPredictionMode, fMultTriRT, (nTraceMode == SVO_TRACE_MODE_AIR), bApplyGlobalDensity, bSpecular, bUseLighting,
++		                   vPos0, vNormal, 0, vRgbOutSS, VOX_MAX_ALPHA, fLodRatio, fAlphaRefMin, fAlphaRefMax, nPredictionMode, fMultTriRTBrick, (nTraceMode == SVO_TRACE_MODE_AIR), bApplyGlobalDensity, bSpecular, bUseLighting,
+ 		                   vBestHitPosOpa);
+ 
+ 		if (!IsDiffuseMode() && nTraceMode == SVO_TRACE_MODE_GEOMETRY)
+@@ -1219,7 +1229,7 @@ float4 ConeTraceTree(Ray rayForTree, const float fLodRatio, out float4 vPos0, ou
+ 
+ 			/*if(nTraceMode == SVO_TRACE_MODE_TERRAIN)
+ 			   bGoToNextNode = ConeTraceBrick_Terrain(vRayStartPos, rayForTree, _fDistanceIn, fDistance, fDistanceMax,
+-			   vPos0, vNormal, curNode.vTC, vRgbOut, fMaxAlpha, fLodRatio, fAlphaRefMin, fAlphaRefMax, nPredictionMode, fMultTriRT, (nTraceMode == SVO_TRACE_MODE_AIR), bApplyGlobalDensity, bSpecular, fIsoValPrev);
++			   vPos0, vNormal, curNode.vTC, vRgbOut, fMaxAlpha, fLodRatio, fAlphaRefMin, fAlphaRefMax, nPredictionMode, fMultTriRTBrick, (nTraceMode == SVO_TRACE_MODE_AIR), bApplyGlobalDensity, bSpecular, fIsoValPrev);
+ 			   else*/
+ #if %_RT_SAMPLE6
+ 			bool bStaticBvhCell = false;
+@@ -1255,7 +1265,7 @@ float4 ConeTraceTree(Ray rayForTree, const float fLodRatio, out float4 vPos0, ou
+ 			if (!bStaticBvhCell)
+ #endif
+ 			bGoToNextNode = ConeTraceBrick(vRayStartPos, rayForTree, _fDistanceIn, fDistance, fDistanceMax,
+-			                               vPos0, vNormal, curNode.vTC, vRgbOut, fMaxAlpha, fLodRatio, fAlphaRefMin, fAlphaRefMax, nPredictionMode, fMultTriRT, (nTraceMode == SVO_TRACE_MODE_AIR), bApplyGlobalDensity, bSpecular, bUseLighting,
++			                               vPos0, vNormal, curNode.vTC, vRgbOut, fMaxAlpha, fLodRatio, fAlphaRefMin, fAlphaRefMax, nPredictionMode, fMultTriRTBrick, (nTraceMode == SVO_TRACE_MODE_AIR), bApplyGlobalDensity, bSpecular, bUseLighting,
+ 			                               vBestHitPosOpa, nDebugMode, vSurfNormOffset, fStepSize, fNearestHitDist);
+ 
+ 			if (vRgbOut.a >= fMaxAlpha)
+diff --git a/Engine/Shaders/HWScripts/CryFX/Total_Illumination.cfx b/Engine/Shaders/HWScripts/CryFX/Total_Illumination.cfx
+index 23649f84..281c888c 100644
+--- a/Engine/Shaders/HWScripts/CryFX/Total_Illumination.cfx
++++ b/Engine/Shaders/HWScripts/CryFX/Total_Illumination.cfx
+@@ -1932,22 +1932,23 @@ pixoutMRTTrace ConeTracePS(vtxOutWPOS IN)
+ 	bool bRTWriteGData = false;
+ #endif
+ 
+-#if %_RT_QUALITY
+-	// rt: fxc cannot build this loop once the software triangle tracer (RT_TraverseTris, a
+-	// stack walk with a triangle loop inside it) is inlined next to the voxel cone trace:
+-	// it insists on unrolling the pass loop and then reports X3511 "unrolling failed" on the
+-	// body's size ([loop] only turns that into X3531). The pass count is one on this
+-	// permutation (see nPassesNum above), so the loop is peeled by hand into its single pass.
+-	// Without %_RT_QUALITY the stock `for` in the #else below is what compiles, unchanged.
+-	// CryFX counts braces on the RAW text before preprocessing: a `{` in each #if branch
+-	// desyncs the function extent and the parser drops every technique in the file.
+-	// So the brace is shared after the #endif and the RT branch uses a constant `if`.
+-	const int p = 0;
+-	if (p == 0)
+-#else
++	// rt 2026-09-14: THE BVH WALK NEVER SITS INSIDE THIS LOOP. fxc force-unrolls the pass loop
++	// (X3557) and cannot build the body once the software triangle tracer - RT_TraverseTris, a
++	// stack walk with a triangle loop in it, plus RT_ProcessBestHit - is inlined next to the
++	// voxel cone trace: X3511 "unrolling failed", and [loop] only turns that into X3531. The
++	// 2026-09-13 answer was to peel the loop by hand, which just moved the failure to an fxc
++	// "internal error: compilation aborted unexpectedly" later in the same compile.
++	// The structural answer: the call below passes a LITERAL 0 for ConeTraceTreeAndSky's
++	// fMultTriRT, so the whole triangle path constant-folds out of the loop body and what fxc
++	// unrolls here is exactly the stock cone trace; an RT pixel leaves the loop on its first
++	// line and gets ONE triangle trace after it. The stock `for` is the only loop header again.
+ 	for (int p = 0; p < nPassesNum; p++)
+-#endif
+ 	{
++#if %_RT_QUALITY
++		// an RT pixel does no cone pass at all - see the post-loop block
++		if (bUseRT)
++			break;
++#endif
+ 		int s = (nFramesNum == 2) ? (int(SVO_FrameIdByte.x) & 1) : 0;
+ 		s += p * nFramesNum;
+ 
+@@ -1999,18 +2000,9 @@ pixoutMRTTrace ConeTracePS(vtxOutWPOS IN)
+ 
+ 			power = exp2(10.h * fAverSmoothness + 1.h);
+ 
+-#if %_RT_QUALITY
+-			// rt stage 2C, finding (b). A triangle ray is a RAY, not a cone: it takes the exact
+-			// mirror direction and no per-pixel kernel jitter. CE's "kern += vFocus*power/25"
+-			// below is a stochastic gloss lobe whose offset comes from GetDiffuseKernel indexed
+-			// by the screen-space dither tile, so on a surface that falls just under the .95
+-			// knee it prints that tile into the reflection as a regular grid and blurs it. Neo
+-			// is categorical about it: for a mirror "kern = vFocus" unless _RTGI_GLOSSY_REFLECTIONS
+-			// is on (neo:1468-1472), and the glossy lobe is our stage 4.
+-			if (bUseRT)
+-				kern = vFocusRT;
+-			else
+-#endif
++			// rt stage 2C, finding (b): a triangle ray is a RAY, not a cone - it takes the exact
++			// mirror direction and no per-pixel kernel jitter. That is the post-loop block's
++			// business now; an RT pixel never reaches this line.
+ 			if (fAverSmoothness < .95)
+ 			kern += vFocus * power / 25;
+ 			else
+@@ -2030,12 +2022,9 @@ pixoutMRTTrace ConeTracePS(vtxOutWPOS IN)
+ 		// rt stage 2C, finding (a)/(b): portal bending picks a portal with `i & 3`, i.e. with the
+ 		// screen-space dither tile, and bends the ray toward it - another per-pixel grid printed
+ 		// into the reflection, and geometrically wrong for a mirror in any case. It is a cone
+-		// tracing importance-sampling trick; a triangle ray does not get one.
+-		#if %_RT_QUALITY
+-		if (SvoTreeSettings5.y && !bUseRT)
+-		#else
++		// tracing importance-sampling trick; a triangle ray does not get one, and does not reach
++		// this line.
+ 		if (SvoTreeSettings5.y)
+-		#endif
+ 		{
+ 			float4 arrBestPortalPos[MAX_BEST_PORTALS];
+ 			float4 arrBestPortalDir[MAX_BEST_PORTALS];
+@@ -2069,76 +2058,106 @@ pixoutMRTTrace ConeTracePS(vtxOutWPOS IN)
+ 		fRayLen = VOX_CONE_MAX_LEN;
+ 	#endif
+ 
+-#if %_RT_QUALITY
+-		if (bUseRT)
+-		{
+-			// triangle rays get their own length budget, not the cone length
+-			fRayLen = VOX_MAX_RT_DIST_RAY;
+-
+-			// R01 (decision 03 section 3.6): the G-buffer position sits within depth precision of the
+-			// triangle that produced it, so push the origin off the surface along the shading normal,
+-			// scaled with distance, instead of relying on the 1 mm hit epsilon alone.
+-			r.startpoint += normalize(vNor0) * max(0.002f, 0.0002f * fDistM);
++		// rt: LITERAL 0. ConeTraceTreeAndSky / ConeTraceTree / ConeTraceBrick all gate the
++		// triangle walk on this constant, so the loop body fxc unrolls is the stock cone trace
++		// and nothing else. The triangle instantiation is the one call after the loop.
++		vC = ConeTraceTreeAndSky(fRayLen, r, SvoParamsDiffuse.x + power / 10000, SvoParamsInject.z, 0, false, false, normalize(vNor0));
+ 
+-			RT_ResetInfo(vFocusRT, VOX_MAX_RT_DIST_RAY, fDistM, RT_GetStippleAlphaRef(nXY), false);
+-		}
+-#else
+-		const bool bUseRT = false;
++#if %_RT_NO_TESSELLATION
++		vC *= lerp(1.f, SvoParamsInject.w, saturate(fAverTransmittanceY * 8));
+ #endif
+ 
+-		vC = ConeTraceTreeAndSky(fRayLen, r, SvoParamsDiffuse.x + power / 10000, SvoParamsInject.z, bUseRT ? 1 : 0, false, false, bUseRT ? float3(0, 0, 0) : normalize(vNor0));
++		vC /= nPassesNum;
++
++		float fBr = length(vC.xyz);
++		vALD.xyz += r.direction * fBr;
++		vALD.w += fBr;
++		vRGB.xyz += vC.xyz;
++	}
+ 
+ #if %_RT_QUALITY
++	// rt 2026-09-14: THE ONE TRIANGLE TRACE. Outside every loop, and the only place in this
++	// shader that instantiates ConeTraceTreeAndSky with a non-zero fMultTriRT - the argument is
++	// the LITERAL 1, so the BVH walk exists exactly once in the compiled shader. The RT pixel
++	// broke out of the pass loop above without tracing anything, so this block owns the whole
++	// post-trace contract for it: the ALD/RGB write (which doubles as the incomplete-traversal
++	// fallback), bRTWriteGData, and the debug views.
++	if (bUseRT)
++	{
++		Ray rRT;
++
++		// finding (b): the exact mirror direction (or the stage-4B GGX sample), no per-pixel
++		// kernel jitter, no portal bending - see the two notes in the loop body above.
++		rRT.direction = normalize(vFocusRT);
++		rRT.startpoint = vPos0;
++
++		#if %_RT_TILED_SHADING && %_RT_NO_TESSELLATION
++		  rRT.startpoint += (vFocus * fAverTransmittanceY) * (VOX_MIN_VOX_SIZE + fDistM*.025f);
++		#endif
++
++		// R01 (decision 03 section 3.6): the G-buffer position sits within depth precision of the
++		// triangle that produced it, so push the origin off the surface along the shading normal,
++		// scaled with distance, instead of relying on the 1 mm hit epsilon alone.
++		rRT.startpoint += normalize(vNor0) * max(0.002f, 0.0002f * fDistM);
++
++		// RT_IsTriPixel is false in diffuse mode, so this is always the specular cone severity.
++		const half powerRT = exp2(10.h * fAverSmoothness + 1.h);
++
++		RT_ResetInfo(vFocusRT, VOX_MAX_RT_DIST_RAY, fDistM, RT_GetStippleAlphaRef(nXY), false);
++
++		// triangle rays get their own length budget, not the cone length. vSurfNorm is 0 so the
++		// traversal ray is the unadvanced one (see ConeTraceTree).
++		float4 vCRT = ConeTraceTreeAndSky(VOX_MAX_RT_DIST_RAY, rRT, SvoParamsDiffuse.x + powerRT / 10000, SvoParamsInject.z, 1, false, false, float3(0, 0, 0));
++
+ 		// rt stage 2: a hit (or a deliberate miss) leaves this pixel carrying g-data, which the
+ 		// ShadePass turns into ALD + RGB. An `incomplete` traversal falls through to the voxel
+ 		// cone result and is therefore NOT g-data (decision 03 section 3.5).
+-		bRTWriteGData = bUseRT && g_rtInfo.hitpos.w > 0 && !g_rtInfo.best.incomplete;
++		bRTWriteGData = g_rtInfo.hitpos.w > 0 && !g_rtInfo.best.incomplete;
+ 
+ 	#if %_RT_PARTICLE_SHADOW
+-		if (bUseRT)
++		if ((int)VOX_RT_DEBUG_MODE == 6)
+ 		{
+-			if ((int)VOX_RT_DEBUG_MODE == 6)
++			// Debug view 6 = the stage-1 provisional colour (decision 06 section 6.5): the
++			// triangle albedo substituted into CE's own "voxel radiance / voxel albedo"
++			// irradiance trick. Kept as a view because it needs no light data at all, so it
++			// still shows a picture when the ShadePass resources are wrong.
++			if (bRTWriteGData && g_rtInfo.best.vAlb.a > 0)
+ 			{
+-				// Debug view 6 = the stage-1 provisional colour (decision 06 section 6.5): the
+-				// triangle albedo substituted into CE's own "voxel radiance / voxel albedo"
+-				// irradiance trick. Kept as a view because it needs no light data at all, so it
+-				// still shows a picture when the ShadePass resources are wrong.
+-				if (bRTWriteGData && g_rtInfo.best.vAlb.a > 0)
+-				{
+-					const float3 vIrradiance = g_rtInfo.cellValid
+-						? RT_SampleVoxelIrradiance(g_rtInfo.cellTC, g_rtInfo.cellMin, g_rtInfo.cellMax, g_rtInfo.hitpos.xyz)
+-						: (float3)1.f;
+-
+-					vC.xyz = g_rtInfo.albedo_smoothness.xyz * vIrradiance;
+-					vC.a = 1;
+-				}
++				const float3 vIrradiance = g_rtInfo.cellValid
++					? RT_SampleVoxelIrradiance(g_rtInfo.cellTC, g_rtInfo.cellMin, g_rtInfo.cellMax, g_rtInfo.hitpos.xyz)
++					: (float3)1.f;
+ 
+-				bRTWriteGData = false; // this pixel is final; ShadePS must leave it alone
++				vCRT.xyz = g_rtInfo.albedo_smoothness.xyz * vIrradiance;
++				vCRT.a = 1;
+ 			}
+-			else
++
++			bRTWriteGData = false; // this pixel is final; ShadePS must leave it alone
++		}
++		else
++		{
++			float3 vDebug;
++			if (RT_GetDebugColor(vDebug))
+ 			{
+-				float3 vDebug;
+-				if (RT_GetDebugColor(vDebug))
+-				{
+-					vC = float4(vDebug, 1);
+-					bRTWriteGData = false;
+-				}
++				vCRT = float4(vDebug, 1);
++				bRTWriteGData = false;
+ 			}
+ 		}
+ 	#endif
+-#endif
+-
+-#if %_RT_NO_TESSELLATION
+-		vC *= lerp(1.f, SvoParamsInject.w, saturate(fAverTransmittanceY * 8));
+-#endif
+ 
+-		vC /= nPassesNum;
++	#if %_RT_NO_TESSELLATION
++		vCRT *= lerp(1.f, SvoParamsInject.w, saturate(fAverTransmittanceY * 8));
++	#endif
+ 
+-		float fBr = length(vC.xyz);
+-		vALD.xyz += r.direction * fBr;
+-		vALD.w += fBr;
+-		vRGB.xyz += vC.xyz;
++		// the loop contributed nothing, so this is an assignment, not an accumulation; the pass
++		// count is pinned to one on this permutation so there is no division either. When
++		// bRTWriteGData is set the block below overwrites both of these with the g-data; when the
++		// traversal came back incomplete they stay, and they are the voxel cone fallback.
++		const float fBrRT = length(vCRT.xyz);
++		vALD.xyz = rRT.direction * fBrRT;
++		vALD.w   = fBrRT;
++		vRGB.xyz = vCRT.xyz;
+ 	}
++#endif
+ 
+ 	vRGB.xyz += 0.001f;
+ 	vRGB.w = fNewDepth;
+-- 
+2.47.1.windows.1
+

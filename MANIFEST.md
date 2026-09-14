@@ -1,11 +1,13 @@
 # Sync manifest
 
 Baseline : main @ a34100a9 (pristine CRYENGINE 5.7.1)
-Dev      : experimental-rt @ ff66520f
-Synced   : 2026-09-14 20:37
+Dev      : experimental-rt @ d8f5dad4
+Synced   : 2026-09-14 21:57
 
 ## Commits (newest first)
 
+- d8f5dad4 fix: gate the blend layer at a ray hit so ConeTracePS fits fxc again
+- fe294c9d fix: take the BVH walk out of ConeTracePS' pass loop and make fMultTriRT fold
 - ff66520f fix: the peeled pass loop opened a brace in each #if branch and CryFX dropped the whole .cfx
 - 452a2c7d fix: peel ConeTracePS' pass loop on the RT permutation (X3511 unroll failure)
 - 56dd8dca feat: volumetric clouds in ray traced reflections (decision 09 section 9.2)
