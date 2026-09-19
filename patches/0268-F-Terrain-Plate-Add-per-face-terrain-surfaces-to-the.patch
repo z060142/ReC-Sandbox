@@ -1,0 +1,494 @@
+From a9c7a39802a9ea22c5bf8839442e48f79bdf2da5 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Wed, 2 Sep 2026 06:59:46 +0800
+Subject: [PATCH 268/307] !F (Terrain Plate) Add per-face terrain surfaces to
+ the collision mesh.
+
+Assign terrain surface IDs per triangle in the physics trimesh while keeping a
+single render subset. Contacts follow layer boundaries without adding render
+draw calls or changing terrain integration geometry.
+---
+ .../Geometry/TerrainPlateComponent.cpp        | 323 +++++++++++++++++-
+ .../Geometry/TerrainPlateComponent.h          |  53 ++-
+ 2 files changed, 367 insertions(+), 9 deletions(-)
+
+diff --git a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
+index 9679435d..91050d65 100644
+--- a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
++++ b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
+@@ -1048,6 +1048,9 @@ void STerrainPlateBakeGroup::Serialize(Serialization::IArchive& archive)
+ 	archive(plate.m_bakeMode, "BakeMode", "Bake Mode");
+ 	archive(plate.m_bakePriority, "BakePriority", "Bake Priority");
+ 	archive(plate.m_bakeOffset, "BakeOffset", "Bake Offset");
++	// Decision 08. An ordinary row, drawn here with its real label; its hidden top level twin carries the
++	// archive key and the default. @see STerrainPlateUIGroup for why the row has to be emitted twice.
++	archive(plate.m_bLiveTerrainColour, "LiveTerrainColour", "Terrain Colour From Plate");
+ }
+ 
+ // The Weld drawer. Edge Weld itself is a top level row, same as Bake Into Terrain above.
+@@ -2268,15 +2271,49 @@ void CTerrainPlateComponent::RegenerateMesh()
+ 	// holding a part built from the old mesh. IStatObj::SetPhysGeom(nullptr) is the accessor that does
+ 	// unregister (StatObj.h:402), and the slot part must be removed before that, because
+ 	// CEntityPhysics::RemoveSlotGeometry decides what to remove from the statobj's phys geom.
+-	// Decision 09. Sampled here, before the physics geometry exists, because the ids are an input to it:
+-	// this is where the per face table of step 2 is solved. The rays are terrain only and cost nothing
+-	// next to the mesh generation above, and this is the one place that always runs when the plate moves,
+-	// is rescaled or is regenerated - i.e. exactly when the ground under it may be a different layer.
++	// Decision 09, option A2. The per face surface ids are an INPUT to the collision trimesh, so both the
++	// mesh snapshot and the sampling have to happen here, while the indexed mesh is still alive -
++	// Invalidate() below frees it (StatObjConstr.cpp:697). The snapshot is the whole mesh, culled
++	// triangles included: P18's rule is that a buried triangle leaves the drawn subset and stays in the
++	// physics trimesh, and building the trimesh by hand must not quietly change that.
++	//
++	// Note the ORDER: totalIndexCount, not visibleIndexCount, and the two subsets are irrelevant here.
++	// The render mesh is untouched by all of this - it stays one chunk with nMatID 0, so no draw call is
++	// added and the terrain integration path sees exactly what it saw before.
++	bool bPhysMeshCached = false;
++	if (bPhysicalize && IsPhysSurfaceFromTerrainEnabled())
++	{
++		bPhysMeshCached = CachePhysicsMesh(pPositions, totalVertexCount, pIndices, totalIndexCount);
++	}
++	else
++	{
++		// Type changed to Render, the property or the cvar turned off: drop the snapshot, so that nothing
++		// downstream can build a per face trimesh out of a mesh that is no longer the current one.
++		ReleasePhysicsMeshCache();
++	}
++
+ 	BuildPhysicsSurfaceMapping();
+ 
++	// Built BEFORE the old trimesh is dropped, so that a failure here cannot leave the plate without
++	// collision: on null the stock Invalidate(true) path below runs exactly as it always has.
++	phys_geometry* pPerFacePhysGeom = bPhysMeshCached ? CreatePhysicsGeometryFromCache() : nullptr;
++
+ 	ReleasePhysicsGeometry();
+ 
+-	m_pStatObj->Invalidate(bPhysicalize);
++	if (pPerFacePhysGeom != nullptr)
++	{
++		m_pStatObj->SetPhysGeom(pPerFacePhysGeom, PHYS_GEOM_TYPE_DEFAULT);
++	}
++
++	m_pStatObj->Invalidate(bPhysicalize && pPerFacePhysGeom == nullptr);
++
++	// The cache only exists for the editor's repaint probe, which rebuilds the trimesh without
++	// regenerating the mesh. Nothing can repaint a layer at run time, so a launcher build gives the
++	// memory straight back.
++	if (gEnv == nullptr || !gEnv->IsEditor())
++	{
++		ReleasePhysicsMeshCache();
++	}
+ 
+ 	// CStatObj::PhysicalizeGeomType builds the trimesh with 16 bit indices and bails out on the first
+ 	// index >= 0xffff (StatObjPhys.cpp:166), so a plate denser than 65535 vertices silently ends up
+@@ -3259,6 +3296,43 @@ bool CTerrainPlateComponent::GetCommitAppearance(SAppearance& outAppearance) con
+ 	return true;
+ }
+ 
++//! Decision 08, the live terrain colour overlay. Everything here is READ ONLY and derived from the
++//! plate's current state: the overlay owns no data on the plate at all, because the thing it paints is a
++//! cache (the engine's terrain colour atlas) whose truth is the level's own CRGBLayer. There is no
++//! baseline to capture and nothing to restore - the editor marks the terrain texture sectors dirty and
++//! the engine's own pull repaints them from the untouched source. @see
++//! Sandbox/EditorQt/Terrain/TerrainPlateColourOverlay.h.
++//!
++//! The footprint, the tint and the albedo switch are the SAME ones GetCommitAppearance /
++//! GetCommitAppearanceFootprint give terrain.commit_plate_colour, and the editor evaluates the rim with
++//! the same GetCommitWeightAtWorld - so the preview is the commit, before the commit.
++bool CTerrainPlateComponent::GetLiveColourState(int& outX1, int& outY1, int& outSize, ColorB& outTint,
++                                                bool& outUseAlbedo, bool& outSettling) const
++{
++	// Bake Into Terrain gates it because the tick box lives in the Bake drawer, and that drawer is absent
++	// while Bake Into Terrain is off (@see Serialize(IArchive&, STerrainPlateBakeGroup&, ...)). A colour
++	// the user cannot see the switch for would be a trap.
++	if (!m_bLiveTerrainColour || !m_bBakeIntoTerrain)
++		return false;
++
++	SAppearance appearance;
++	if (!GetCommitAppearance(appearance) || !appearance.bWriteColour)
++		return false;
++
++	if (!GetCommitAppearanceFootprint(outX1, outY1, outSize) || outSize <= 0)
++		return false;
++
++	outTint = appearance.tint;
++	outUseAlbedo = appearance.bUseAlbedo;
++
++	// The debounce input. Every dirty terrain texture sector is a whole tile DXT recompress plus an
++	// upload, so a drag must not repaint per frame. These are exactly the flags the plate's own deferred
++	// rebuild rides on, so the colour settles on the same event the relief does: the drop, or the settle
++	// fallback e_TerrainPlateSettleFrames frames later.
++	outSettling = m_bDeferredXformPending || m_bBakeMoveBatchPending || m_bRegenPending;
++	return true;
++}
++
+ void CTerrainPlateComponent::OnCommitted()
+ {
+ 	// ORDER MATTERS - decision 07 settled fact 8 / research 12 section 2.6. The committed ground has to
+@@ -4566,9 +4640,47 @@ int CTerrainPlateComponent::SampleFootprintSurfaceTypes(uint32& outHash) const
+ 	return best;
+ }
+ 
++bool CTerrainPlateComponent::CachePhysicsMesh(const Vec3* pPositions, int vertexCount, const vtx_idx* pIndices, int indexCount)
++{
++	ReleasePhysicsMeshCache();
++
++	if (pPositions == nullptr || pIndices == nullptr || vertexCount < 3 || indexCount < 3)
++		return false;
++
++	// The same bail-out CStatObj::PhysicalizeGeomType makes (StatObjPhys.cpp:166): the physics trimesh is
++	// 16 bit indexed, full stop. Refusing here rather than half way through means the plate simply takes
++	// the stock path and keeps its existing "no collision over 65535 vertices" warning.
++	if (vertexCount > 0xffff)
++		return false;
++
++	m_physVertices.assign(pPositions, pPositions + vertexCount);
++
++	m_physIndices.resize((size_t)indexCount);
++	for (int i = 0; i < indexCount; ++i)
++	{
++		if (pIndices[i] >= 0xffff)
++		{
++			ReleasePhysicsMeshCache();
++			return false;
++		}
++		m_physIndices[(size_t)i] = (uint16)pIndices[i];
++	}
++
++	return true;
++}
++
++void CTerrainPlateComponent::ReleasePhysicsMeshCache()
++{
++	m_physVertices.clear();
++	m_physVertices.shrink_to_fit();
++	m_physIndices.clear();
++	m_physIndices.shrink_to_fit();
++}
++
+ void CTerrainPlateComponent::BuildPhysicsSurfaceMapping()
+ {
+ 	m_physMatMapping.clear();
++	m_physFaceMats.clear();
+ 	m_physSurfaceHash = 0;
+ 
+ 	if (!IsPhysSurfaceFromTerrainEnabled())
+@@ -4594,8 +4706,205 @@ void CTerrainPlateComponent::BuildPhysicsSurfaceMapping()
+ 
+ 	// Option D of decision 09: ONE dominant id for the whole plate. Every face of the plate carries
+ 	// nMatID 0 (both subsets do, @see RegenerateMesh), so a single entry table is all it takes -
+-	// GetMatId clamps every face to entry 0 and returns this id.
++	// GetMatId clamps every face to entry 0 and returns this id. This is also what the per face path
++	// below degrades to whenever it refuses, which is why it is computed first and unconditionally.
+ 	m_physMatMapping.assign(1, dominantId);
++
++	// ---------------------------------------------------------------- per face (option A2)
++	if (m_physVertices.empty() || m_physIndices.size() < 3)
++		return; // no cached mesh: the stock trimesh is in place and every face id is 0
++
++	// Settled fact 5 of decision 09. With a genuine multi sub material the plate's own faces already
++	// index sub-materials, and a mapping built for terrain layers would silently redefine what those
++	// slots mean. Fall back to the single dominant id, which never changes an index.
++	IMaterial* pMaterial = GetPlateMaterial();
++	if (pMaterial != nullptr && (pMaterial->GetFlags() & MTL_FLAG_MULTI_SUBMTL) != 0)
++	{
++		if (!m_bPhysSurfaceMultiSubWarned && GetPlateDebugLevel() >= 1)
++		{
++			m_bPhysSurfaceMultiSubWarned = true;
++			CryLog("TerrainPlate '%s': multi sub material, physics surface types stay on the single dominant terrain id", GetPlateName());
++		}
++		return;
++	}
++
++	const Matrix34 worldTM = GetPlateWorldTM();
++
++	// World XY bounds of the plate, from the very vertices the trimesh will be built from.
++	AABB worldBox(AABB::RESET);
++	for (const Vec3& local : m_physVertices)
++	{
++		worldBox.Add(worldTM * local);
++	}
++
++	const float unitSize = max(0.125f, gEnv->p3DEngine->GetHeightMapUnitSize());
++	const float extentX = max(0.f, worldBox.max.x - worldBox.min.x);
++	const float extentY = max(0.f, worldBox.max.y - worldBox.min.y);
++
++	// The terrain-unit grid decision 09 asks for, capped so that a very large plate cannot turn one
++	// rebuild into a hundred thousand rays. 65 per axis is 4225 terrain rays, once per rebuild; past
++	// that the grid coarsens and a layer patch smaller than one cell of it is not resolved.
++	const int gridX = clamp_tpl((int)(extentX / unitSize) + 1, 2, 65);
++	const int gridY = clamp_tpl((int)(extentY / unitSize) + 1, 2, 65);
++	const float stepX = (gridX > 1) ? (extentX / (float)(gridX - 1)) : 0.f;
++	const float stepY = (gridY > 1) ? (extentY / (float)(gridY - 1)) : 0.f;
++
++	std::vector<int> grid((size_t)gridX * gridY, -1);
++	for (int ix = 0; ix < gridX; ++ix)
++	{
++		for (int iy = 0; iy < gridY; ++iy)
++		{
++			grid[(size_t)ix * gridY + iy] = SampleTerrainSurfaceTypeId(worldBox.min.x + stepX * (float)ix,
++			                                                           worldBox.min.y + stepY * (float)iy);
++		}
++	}
++
++	// Entry 0 is the plate's own material surface type, so it is BOTH the fallback for a triangle the
++	// terrain has no answer under AND the value GetMatId's clamp produces if the table is ever lost.
++	// The two failure modes coincide on purpose (decision 09).
++	std::vector<int> mapping;
++	mapping.push_back(GetPlateMaterialSurfaceTypeId());
++
++	const size_t triangleCount = m_physIndices.size() / 3;
++	std::vector<char> faceMats((size_t)triangleCount, (char)0);
++
++	const float invStepX = (stepX > 0.f) ? (1.f / stepX) : 0.f;
++	const float invStepY = (stepY > 0.f) ? (1.f / stepY) : 0.f;
++
++	for (size_t t = 0; t < triangleCount; ++t)
++	{
++		const Vec3 centroidLocal = (m_physVertices[m_physIndices[t * 3 + 0]]
++		                            + m_physVertices[m_physIndices[t * 3 + 1]]
++		                            + m_physVertices[m_physIndices[t * 3 + 2]]) / 3.f;
++		const Vec3 centroidWorld = worldTM * centroidLocal;
++
++		const int ix = clamp_tpl((int)((centroidWorld.x - worldBox.min.x) * invStepX + 0.5f), 0, gridX - 1);
++		const int iy = clamp_tpl((int)((centroidWorld.y - worldBox.min.y) * invStepY + 0.5f), 0, gridY - 1);
++		const int id = grid[(size_t)ix * gridY + iy];
++
++		if (id < 0)
++			continue; // a hole, off the map, or the plate rises out of the terrain's reach -> entry 0
++
++		size_t entry = 1;
++		for (; entry < mapping.size() && mapping[entry] != id; ++entry) {}
++
++		if (entry == mapping.size())
++		{
++			if ((int)mapping.size() >= kPhysSurfaceMaxMappingEntries)
++			{
++				// The unsigned:7 ceiling. Unreachable with real terrain layers (the terrain itself has at
++				// most 127), but a clamp is cheaper than a proof: the surplus triangles keep entry 0.
++				continue;
++			}
++			mapping.push_back(id);
++		}
++
++		faceMats[t] = (char)entry;
++	}
++
++	m_physMatMapping.swap(mapping);
++	m_physFaceMats.swap(faceMats);
++}
++
++phys_geometry* CTerrainPlateComponent::CreatePhysicsGeometryFromCache()
++{
++	if (m_physVertices.size() < 3 || m_physIndices.size() < 3
++	    || m_physFaceMats.size() != m_physIndices.size() / 3
++	    || m_physMatMapping.empty()
++	    || gEnv == nullptr || gEnv->pPhysicalWorld == nullptr || m_pStatObj == nullptr)
++	{
++		return nullptr;
++	}
++
++	IGeomManager* pGeomManager = gEnv->pPhysicalWorld->GetGeomManager();
++	if (pGeomManager == nullptr)
++		return nullptr;
++
++	// --- Flags and BV heuristics, copied verbatim from CStatObj::PhysicalizeGeomType
++	// (StatObjPhys.cpp:186-215). The plate must get the same BV tree it gets today; the only difference
++	// between this call and the stock one is the pMats array, which is the whole point of the feature.
++	const size_t indexCount = m_physIndices.size();
++
++	int flags = mesh_multicontact1;
++	flags |= (indexCount <= 30 /*SMALL_MESH_NUM_INDEX, StatObjPhys.cpp:18*/) ? mesh_SingleBB : mesh_OBB | mesh_AABB;
++	flags |= mesh_approx_box | mesh_approx_sphere | mesh_approx_cylinder | mesh_approx_capsule;
++	flags |= mesh_shared_foreign_idx; // with pForeignIdx 0, physics assumes fidx[i] == i
++	if (gEnv->IsEditor())
++		flags |= mesh_keep_vtxmap_for_saving; // CStatObj::m_bEditor, same condition
++	flags |= mesh_full_serialization;
++
++	// Reproduced exactly as the engine has it, INCLUDING the inverted bounds: PhysicalizeGeomType sets
++	// ptmin = bbox.max and ptmax = bbox.min, so "size" is negative on every axis and the dense-OBB branch
++	// below can never be taken. Copying that rather than fixing it is deliberate - the point of this
++	// function is that the plate's collision is identical to the stock one apart from the per face ids.
++	int nMinTrisPerNode = 2;
++	int nMaxTrisPerNode = 4;
++	{
++		AABB box(AABB::RESET);
++		for (const Vec3& v : m_physVertices)
++		{
++			box.Add(v);
++		}
++		const Vec3 size = box.min - box.max;
++		if (indexCount < 600 && max(max(size.x, size.y), size.z) > 6.f)
++		{
++			nMinTrisPerNode = nMaxTrisPerNode = 1;
++		}
++	}
++
++	IGeometry* pGeom = pGeomManager->CreateMesh(
++	  strided_pointer<const Vec3>(&m_physVertices[0]),
++	  strided_pointer<unsigned short>(&m_physIndices[0]),
++	  &m_physFaceMats[0],
++	  0,
++	  (int)(indexCount / 3),
++	  flags, 0.05f /*IStatObj::Invalidate's default tolerance, IStatObj.h:461*/, nMinTrisPerNode, nMaxTrisPerNode, 2.5f);
++
++	if (pGeom == nullptr)
++		return nullptr;
++
++	// RegisterGeometry takes the mapping at the same time (geoman.h:58). The entity part's own copy is
++	// still pushed separately by ApplyPhysicsSurfaceMapping, because CEntityPhysics overwrites the part's
++	// table from the render material after physicalisation - but a geometry that carries the right table
++	// itself is what makes any consumer reading the phys_geometry directly correct too.
++	phys_geometry* pPhysGeom = pGeomManager->RegisterGeometry(pGeom, m_physFaceMats[0],
++	                                                          m_physMatMapping.data(), (int)m_physMatMapping.size());
++	pGeom->Release();
++
++	if (pPhysGeom == nullptr)
++		return nullptr;
++
++	// CStatObj::AssignPhysGeom does this and IStatObj::SetPhysGeom does not; without it the hit refinement
++	// path cannot get from a physics hit back to the stat obj (StatObjPhys.cpp:248-251).
++	if (pPhysGeom->pGeom != nullptr)
++	{
++		pPhysGeom->pGeom->SetForeignData((IStatObj*)m_pStatObj.get(), 0);
++	}
++
++	return pPhysGeom;
++}
++
++void CTerrainPlateComponent::RephysicalizePlateSurface()
++{
++	// Build first, swap second: a failed build must never leave the plate without collision.
++	phys_geometry* pPhysGeom = CreatePhysicsGeometryFromCache();
++	if (pPhysGeom == nullptr)
++	{
++		// Nothing to rebuild - the plate is on the single dominant id path, or the mesh cache is gone.
++		// Pushing the mapping is then all there is to do.
++		ApplyPhysicsSurfaceMapping();
++		return;
++	}
++
++	ReleasePhysicsGeometry();
++	m_pStatObj->SetPhysGeom(pPhysGeom, PHYS_GEOM_TYPE_DEFAULT);
++
++	// ReleasePhysicsGeometry took the slot off the physical entity; these two put it back on the new
++	// trimesh, in the same order RegenerateMesh uses. Nothing here touches a vertex, the weld, the shadow
++	// cache or the bake - a repaint moves no ground.
++	UpdateNativePhysics();
++	ApplyBaseMeshProperties();
++	ApplyPhysicsSurfaceMapping();
+ }
+ 
+ void CTerrainPlateComponent::ApplyPhysicsSurfaceMapping()
+@@ -4684,7 +4993,7 @@ void CTerrainPlateComponent::PollPhysicsSurface()
+ 		// weld, the shadow cache invalidation and the whole bake cascade for nothing - and would disturb
+ 		// the bake it re-applies (decision 09, re-physicalise triggers).
+ 		BuildPhysicsSurfaceMapping();
+-		ApplyPhysicsSurfaceMapping();
++		RephysicalizePlateSurface();
+ 		return;
+ 	}
+ 
+diff --git a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
+index 09149fa8..79e33cd2 100644
+--- a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
++++ b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
+@@ -14,6 +14,9 @@
+ #include <vector>
+ 
+ class CPlugin_CryDefaultEntities;
++//! CryPhysics' registered geometry handle. Only ever passed around here (@see CreatePhysicsGeometryFromCache),
++//! so a forward declaration keeps physinterface.h out of this header.
++struct phys_geometry;
+ 
+ namespace Serialization
+ {
+@@ -433,6 +436,18 @@ public:
+ 		               "usually enough.",
+ 		               0.f);
+ 
++		// Decision 08: the LIVE terrain colour overlay. Hidden row + a real row in the Bake drawer, the same
++		// trick every other bake knob uses - see STerrainPlateUIGroup: the label here is empty so this row
++		// does not appear at top level, while the archive still reads and writes it under "LiveTerrainColour",
++		// and STerrainPlateBakeGroup::Serialize draws it inside the drawer with its real label.
++		desc.AddMember(&CTerrainPlateComponent::m_bLiveTerrainColour, 'ltcl', "LiveTerrainColour", /*"Terrain Colour From Plate"*/ "",
++		               "On: the terrain drawn over this plate takes the plate's colour as its own terrain (macro) colour, fading "
++		               "into the surrounding painted colour over the same rim band the bake uses. It is a LIVE, non destructive "
++		               "EDITOR PREVIEW: the level's painted colour is never touched, and unticking this or deleting the plate "
++		               "brings the original ground colour straight back. It does NOT ship - the game loads the exported terrain "
++		               "texture - so use Commit Colour To Terrain (the terrain.commit_plate_colour command) to make it permanent; "
++		               "the two use the same colour and the same rim, so Commit changes nothing you can see.", false);
++
+ 		// --- Commit Bake UI parked per user 2026-09-01 (see scene-notes/terrain/reports/31-commit-ui-parked.md):
+ 		// the user asked for the stamping UI to be commented out because one component's panel is far too cluttered,
+ 		// and wants to decide later how it should be presented. The whole Commit Bake block below is
+@@ -559,6 +574,8 @@ public:
+ 	virtual float GetCommitWeightAtWorld(float worldX, float worldY, float sampleSizeMeters) const final;
+ 	virtual bool  GetCommitAlbedoAtWorld(float worldX, float worldY, ColorB& outColor) const final;
+ 	virtual bool  GetCommitAppearance(SAppearance& outAppearance) const final;
++	virtual bool  GetLiveColourState(int& outX1, int& outY1, int& outSize, ColorB& outTint,
++	                                 bool& outUseAlbedo, bool& outSettling) const final;
+ 	virtual void  OnCommitted() final;
+ 	// ~ITerrainPlateCommit
+ 
+@@ -633,9 +650,26 @@ protected:
+ 	//! whole grid into outHash - that hash is the ONLY thing that notices a layer repaint, because the
+ 	//! engine sends no notification for one (research 14 section 2.3).
+ 	int         SampleFootprintSurfaceTypes(uint32& outHash) const;
+-	//! Recomputes m_physMatMapping from the terrain (the sampling half - this is the one that casts rays).
+-	//! Called from RegenerateMesh before the physics geometry is built and from the repaint probe.
++	//! Snapshots the vertex and index streams the physics trimesh is built from, in the 16 bit index form
++	//! CreateMesh needs. False - and an empty cache - when the mesh is denser than the 16 bit limit, which
++	//! is the same bail-out CStatObj::PhysicalizeGeomType makes (StatObjPhys.cpp:166). The cache is kept
++	//! only in the editor, where a layer repaint has to rebuild the trimesh without a full RegenerateMesh.
++	bool        CachePhysicsMesh(const Vec3* pPositions, int vertexCount, const vtx_idx* pIndices, int indexCount);
++	//! Drops the cache above.
++	void        ReleasePhysicsMeshCache();
++	//! Recomputes m_physMatMapping, and m_physFaceMats when the per face path is available, from the
++	//! terrain (the sampling half - this is the one that casts rays). Called from RegenerateMesh before
++	//! the physics geometry is built, and from the repaint probe.
+ 	void        BuildPhysicsSurfaceMapping();
++	//! Builds the collision trimesh by hand, so that each triangle can carry the id of the terrain under
++	//! its own centroid. Returns a registered phys_geometry the caller hands to IStatObj::SetPhysGeom, or
++	//! null - in which case the caller falls back to IStatObj::Invalidate(true), i.e. the stock path.
++	//! Every flag and BV heuristic is copied verbatim from CStatObj::PhysicalizeGeomType
++	//! (StatObjPhys.cpp:186-231) so that the BV tree the plate gets is the one it has today.
++	phys_geometry* CreatePhysicsGeometryFromCache();
++	//! Repaint / clobber repair: rebuilds the trimesh from the cache and puts the slot back on it,
++	//! without touching the mesh, the weld, the shadow cache or the bake.
++	void        RephysicalizePlateSurface();
+ 	//! Pushes m_physMatMapping onto the entity part with pe_params_part (the cheap half - no rays).
+ 	//! Must run AFTER anything that calls CEntityPhysics::UpdateParamsFromRenderMaterial
+ 	//! (PhysicsProxy.cpp:397, :401, :882, :1265), which overwrites the part mapping from the slot's render
+@@ -812,6 +846,11 @@ protected:
+ 	bool                                         m_bCommitAlbedo = false;
+ 	ColorF                                       m_commitTint = ColorF(0.5f, 0.45f, 0.38f);
+ 
++	//! Decision 08: the live, editor only terrain colour overlay. Default OFF - it repaints ground the
++	//! user did not paint, so it has to be asked for. @see GetLiveColourState and
++	//! Sandbox/EditorQt/Terrain/TerrainPlateColourOverlay.h.
++	bool                                         m_bLiveTerrainColour = false;
++
+ 	//! Panel grouping only - no data of their own, never persisted values. @see STerrainPlateUIGroup.
+ 	STerrainPlateShapeGroup                      m_uiShape;
+ 	STerrainPlateBakeGroup                       m_uiBake;
+@@ -923,6 +962,16 @@ protected:
+ 	//! behaviour. Empty means "the feature is not active on this plate" and nothing is pushed.
+ 	//! At most kPhysSurfaceMaxMappingEntries entries: physicalentity.h:81 stores nMats in an unsigned:7.
+ 	std::vector<int>         m_physMatMapping;
++	//! One plate-local index per TRIANGLE of the collision mesh, i.e. mesh_data::pMats. Empty means the
++	//! plate is on the single dominant id path (option D) - because the per face path was refused (a multi
++	//! sub material, too many distinct layers, a mesh over the 16 bit index limit) or because the trimesh
++	//! is the stock one. char, not int: CreateMesh takes char* and the part's nMats is an unsigned:7.
++	std::vector<char>        m_physFaceMats;
++	//! The mesh the hand-built trimesh is made of, in the 16 bit index form CreateMesh needs. Filled by
++	//! RegenerateMesh and, outside the editor, released again as soon as the trimesh exists: only a layer
++	//! repaint needs to rebuild the collision without regenerating the mesh, and that is editor only.
++	std::vector<Vec3>        m_physVertices;
++	std::vector<uint16>      m_physIndices;
+ 	//! FNV-1a of the footprint probe grid's surface ids, as the live mapping was built from them.
+ 	//! Nothing in the engine announces a layer repaint (research 14 section 2.3), so this hash is the
+ 	//! whole detection mechanism: the poll re-samples the same cells and compares.
+-- 
+2.47.1.windows.1
+

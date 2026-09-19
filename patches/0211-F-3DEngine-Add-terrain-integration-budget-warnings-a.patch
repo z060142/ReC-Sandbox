@@ -1,0 +1,203 @@
+From f81f72bd5f32ea1d33ec637ef98eb61ba0966362 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Sun, 30 Aug 2026 16:20:06 +0800
+Subject: [PATCH 211/307] !F (3DEngine) Add terrain integration budget warnings
+ and debug statistics.
+
+Report objects that exceed a sector's integration budget instead of silently
+truncating them. Add per-sector counts and optional bounds for diagnosing
+accepted and rejected geometry.
+---
+ Code/CryEngine/Cry3DEngine/terrain_node.cpp   |  8 ++
+ Code/CryEngine/Cry3DEngine/terrain_sector.h   |  2 +
+ .../Cry3DEngine/terrain_sector_render.cpp     | 73 +++++++++++++++----
+ 3 files changed, 70 insertions(+), 13 deletions(-)
+
+diff --git a/Code/CryEngine/Cry3DEngine/terrain_node.cpp b/Code/CryEngine/Cry3DEngine/terrain_node.cpp
+index 400cda9e..487a6e10 100644
+--- a/Code/CryEngine/Cry3DEngine/terrain_node.cpp
++++ b/Code/CryEngine/Cry3DEngine/terrain_node.cpp
+@@ -352,6 +352,8 @@ void CTerrainNode::Init(int x1, int y1, int nNodeSize, CTerrainNode* pParent, bo
+ 	m_nNodeTextureLastUsedSec4 = (~0);
+ 	m_boxHeigtmapLocal.Reset();
+ 	m_fBBoxExtentionByObjectsIntegration = 0;
++	m_boxIntegratedObjects.Reset();
++	m_nIntegratedObjectsVerts = 0;
+ 	m_pParent = NULL;
+ 	//m_nSetupTexGensFrameId=0;
+ 
+@@ -659,6 +661,12 @@ void CTerrainNode::RenderNodeHeightmap(const SRenderingPassInfo& passInfo, Frust
+ 		}
+ 	}
+ 
++	if (GetCVars()->e_TerrainIntegrateObjectsDebug >= 2 && m_nIntegratedObjectsVerts > 0 && !m_boxIntegratedObjects.IsReset())
++	{
++		GetRenderer()->GetIRenderAuxGeom()->DrawAABB(m_boxIntegratedObjects, false, ColorB(0, 255, 0, 255), eBBD_Faceted);
++		IRenderAuxText::DrawLabelF(m_boxIntegratedObjects.GetCenter(), 1.5f, "integrated: %d verts", m_nIntegratedObjectsVerts);
++	}
++
+ 	if (GetCVars()->e_TerrainDetailMaterialsDebug)
+ 	{
+ 		int nLayersNum = 0;
+diff --git a/Code/CryEngine/Cry3DEngine/terrain_sector.h b/Code/CryEngine/Cry3DEngine/terrain_sector.h
+index 72fd8c07..d03d8f8a 100644
+--- a/Code/CryEngine/Cry3DEngine/terrain_sector.h
++++ b/Code/CryEngine/Cry3DEngine/terrain_sector.h
+@@ -500,6 +500,8 @@ public:
+ 	uint16                     m_nNodeTextureLastUsedSec4;
+ 	AABB                       m_boxHeigtmapLocal;
+ 	float                      m_fBBoxExtentionByObjectsIntegration;
++	AABB                       m_boxIntegratedObjects;    // bbox of the triangles copied in from integrated objects (debug)
++	int                        m_nIntegratedObjectsVerts; // number of vertices copied in on the last rebuild (debug)
+ 	struct CTerrainNode*       m_pParent = nullptr;
+ 	float                      m_arrfDistance[MAX_RECURSION_LEVELS] = {};
+ 	int                        m_nNodeTextureOffset = -1;
+diff --git a/Code/CryEngine/Cry3DEngine/terrain_sector_render.cpp b/Code/CryEngine/Cry3DEngine/terrain_sector_render.cpp
+index a2f8be7f..0556773c 100644
+--- a/Code/CryEngine/Cry3DEngine/terrain_sector_render.cpp
++++ b/Code/CryEngine/Cry3DEngine/terrain_sector_render.cpp
+@@ -1363,14 +1363,25 @@ uint32 CTerrainNode::GetMaterialsModificationId()
+ }
+ 
+ // Emit a warning about one object taking part in terrain integration at most once per
+-// (render node, message) pair, so a broken setup is reported without spamming the log every rebuild.
++// (render node, scope, message) triple, so a broken setup is reported without spamming the log on
++// every rebuild. pScope is nullptr for problems that belong to the object itself and the terrain
++// node for problems that belong to one sector.
+ // Only ever called from the terrain sector build, which is forced synchronous while
+ // m_bIntegrateObjectsIntoTerrain is set (see CTerrainUpdateDispatcher::AddJob), so no locking is needed.
+-static void WarnAboutIntegratedObjectOnce(IRenderNode* pRNode, const char* szMessage)
++struct SIntegratedObjectWarningKey
+ {
+-	static std::vector<std::pair<const void*, const void*>> s_reported;
++	const void* pNode;
++	const void* pScope;
++	const void* pMessage;
+ 
+-	const std::pair<const void*, const void*> key(pRNode, szMessage);
++	bool operator==(const SIntegratedObjectWarningKey& o) const { return pNode == o.pNode && pScope == o.pScope && pMessage == o.pMessage; }
++};
++
++static void WarnAboutIntegratedObjectOnce(IRenderNode* pRNode, const void* pScope, const char* szMessage, const char* szDetails = "")
++{
++	static std::vector<SIntegratedObjectWarningKey> s_reported;
++
++	const SIntegratedObjectWarningKey key = { pRNode, pScope, szMessage };
+ 
+ 	for (size_t i = 0; i < s_reported.size(); i++)
+ 	{
+@@ -1384,10 +1395,13 @@ static void WarnAboutIntegratedObjectOnce(IRenderNode* pRNode, const char* szMes
+ 	const Vec3 vPos = pRNode->GetPos();
+ 
+ 	CryWarning(VALIDATOR_MODULE_3DENGINE, VALIDATOR_WARNING,
+-	           "Terrain object integration: '%s' at (%.1f, %.1f, %.1f) %s",
+-	           szName ? szName : "<unnamed>", vPos.x, vPos.y, vPos.z, szMessage);
++	           "Terrain object integration: '%s' at (%.1f, %.1f, %.1f) %s%s",
++	           szName ? szName : "<unnamed>", vPos.x, vPos.y, vPos.z, szMessage, szDetails);
+ }
+ 
++// Peak number of vertices any single sector copied in from integrated objects since the last report.
++static int s_nPeakIntegratedObjectsVerts = 0;
++
+ // add triangles (from marked objects) intersecting terrain
+ void CTerrainNode::AppendTrianglesFromObjects(const int nOriginX, const int nOriginY, CTerrain* pTerrain, const float stepSize, const int nTerrainSize)
+ {
+@@ -1398,6 +1412,13 @@ void CTerrainNode::AppendTrianglesFromObjects(const int nOriginX, const int nOri
+ 	PodArray<IRenderNode*> lstObjects;
+ 	Get3DEngine()->GetObjectsByTypeGlobal(lstObjects, eERType_MovableBrush, &aabbTNode);
+ 
++	const int nVertsBefore = m_pUpdateTerrainTempData->m_lstTmpVertArray.Count();
++	const int nIndicesBefore = m_pUpdateTerrainTempData->m_StripsInfo.idx_array.Count();
++	int nIntegratedObjects = 0;
++
++	m_boxIntegratedObjects.Reset();
++	m_nIntegratedObjectsVerts = 0;
++
+ 	for (int i = 0; i < lstObjects.Count(); i++)
+ 	{
+ 		IRenderNode* pRNode = (IRenderNode*)lstObjects[i];
+@@ -1411,8 +1432,8 @@ void CTerrainNode::AppendTrianglesFromObjects(const int nOriginX, const int nOri
+ 		// ERF_FOB_ALLOW_TERRAIN_LAYER_BLEND the integrated triangles are built and then discarded.
+ 		if (!(pRNode->GetRndFlags() & ERF_FOB_ALLOW_TERRAIN_LAYER_BLEND))
+ 		{
+-			WarnAboutIntegratedObjectOnce(pRNode, "has GI mode 'Integrate Into Terrain' but no ERF_FOB_ALLOW_TERRAIN_LAYER_BLEND: "
+-			                                      "the integrated triangles will be killed by the stencil test (use e_TerrainBlendingDebug 2 to confirm)");
++			WarnAboutIntegratedObjectOnce(pRNode, nullptr, "has GI mode 'Integrate Into Terrain' but no ERF_FOB_ALLOW_TERRAIN_LAYER_BLEND: "
++			                                               "the integrated triangles will be killed by the stencil test (use e_TerrainBlendingDebug 2 to confirm)");
+ 		}
+ 
+ 		IRenderMesh* pRM = pRNode->GetRenderMesh(0);
+@@ -1428,6 +1449,8 @@ void CTerrainNode::AppendTrianglesFromObjects(const int nOriginX, const int nOri
+ 
+ 			if (pInds && pPos && pTangs)
+ 			{
++				const int nIndicesBeforeObject = m_pUpdateTerrainTempData->m_StripsInfo.idx_array.Count();
++
+ 				Matrix34 m34;
+ 				m34.SetIdentity();
+ 				pRNode->GetEntityStatObj(0, &m34);
+@@ -1458,13 +1481,21 @@ void CTerrainNode::AppendTrianglesFromObjects(const int nOriginX, const int nOri
+ 						int lastIndex = pChunk->nFirstIndexId + pChunk->nNumIndices;
+ 						for (int i = pChunk->nFirstIndexId; i < lastIndex; i += 3)
+ 						{
+-							if (m_pUpdateTerrainTempData->m_lstTmpVertArray.Count() + 3 > m_pUpdateTerrainTempData->m_lstTmpVertArray.MemorySize() / (int)sizeof(SVF_P2S_N4B_C4B_T1F))
+-							{
+-								break;
+-							}
++							const bool bOutOfVerts = m_pUpdateTerrainTempData->m_lstTmpVertArray.Count() + 3 > m_pUpdateTerrainTempData->m_lstTmpVertArray.MemorySize() / (int)sizeof(SVF_P2S_N4B_C4B_T1F);
++							const bool bOutOfIndices = m_pUpdateTerrainTempData->m_StripsInfo.idx_array.Count() + 3 > m_pUpdateTerrainTempData->m_StripsInfo.idx_array.MemorySize() / (int)sizeof(vtx_idx);
+ 
+-							if (m_pUpdateTerrainTempData->m_StripsInfo.idx_array.Count() + 3 > m_pUpdateTerrainTempData->m_StripsInfo.idx_array.MemorySize() / (int)sizeof(vtx_idx))
++							if (bOutOfVerts || bOutOfIndices)
+ 							{
++								// The shipped code truncated the object here without a word, which reads as
++								// "half my rock is terrain" with nothing in the log to explain it.
++								char szDetails[256];
++								cry_sprintf(szDetails, " in the terrain sector at (%d, %d); raise e_TerrainIntegrateObjectsMaxVertices (now %d)",
++								            nOriginX, nOriginY, GetCVars()->e_TerrainIntegrateObjectsMaxVertices);
++
++								WarnAboutIntegratedObjectOnce(pRNode, this,
++								                              bOutOfVerts ? "does not fit the terrain integration vertex budget and is truncated"
++								                                          : "does not fit the terrain integration index budget and is truncated",
++								                              szDetails);
+ 								break;
+ 							}
+ 
+@@ -1498,6 +1529,7 @@ void CTerrainNode::AppendTrianglesFromObjects(const int nOriginX, const int nOri
+ 							if (triBox.max.z > fElevMin && triBox.min.z < fElevMax + GetCVars()->e_TerrainIntegrateObjectsMaxHeight && Overlap::AABB_AABB2D(triBox, aabbTNode))
+ 							{
+ 								m_fBBoxExtentionByObjectsIntegration = max(m_fBBoxExtentionByObjectsIntegration, triBox.max.z - fHeightMapMax);
++								m_boxIntegratedObjects.Add(triBox);
+ 
+ 								for (int v = 0; v < 3; v++)
+ 								{
+@@ -1558,11 +1590,26 @@ void CTerrainNode::AppendTrianglesFromObjects(const int nOriginX, const int nOri
+ 						}
+ 					}
+ 				}
++
++				if (m_pUpdateTerrainTempData->m_StripsInfo.idx_array.Count() > nIndicesBeforeObject)
++					nIntegratedObjects++;
+ 			}
+ 
+ 			pRM->UnLockForThreadAccess();
+ 		}
+ 	}
++
++	m_nIntegratedObjectsVerts = m_pUpdateTerrainTempData->m_lstTmpVertArray.Count() - nVertsBefore;
++	const int nIntegratedIndices = m_pUpdateTerrainTempData->m_StripsInfo.idx_array.Count() - nIndicesBefore;
++
++	s_nPeakIntegratedObjectsVerts = max(s_nPeakIntegratedObjectsVerts, m_nIntegratedObjectsVerts);
++
++	if (GetCVars()->e_TerrainIntegrateObjectsDebug && m_nIntegratedObjectsVerts)
++	{
++		CryLog("Terrain object integration: sector at (%d, %d) took %d vertices / %d triangles from %d object(s); budget %d, peak %d",
++		       nOriginX, nOriginY, m_nIntegratedObjectsVerts, nIntegratedIndices / 3, nIntegratedObjects,
++		       GetCVars()->e_TerrainIntegrateObjectsMaxVertices, s_nPeakIntegratedObjectsVerts);
++	}
+ }
+ 
+ void CTerrainNode::SetVertexNormal(float x, float y, const float iLookupRadius, CTerrain* pTerrain, const int nTerrainSize, SVF_P2S_N4B_C4B_T1F& vert, Vec3* pTerrainNorm /*= nullptr*/)
+-- 
+2.47.1.windows.1
+

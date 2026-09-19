@@ -1,0 +1,170 @@
+From 4c9151b062d5182149e54017151f6d7f4200629b Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Thu, 3 Sep 2026 14:25:36 +0800
+Subject: [PATCH 304/307] !B (Terrain Plate) Drop the 1024 m size cap so the
+ mesh follows the gizmo.
+
+The cap added in 0d93a906 was a guard put up while the scale-compounding
+bug was still live: a defect could square the plate's size, so the size
+was clamped to min(1024 m, terrain size) to stop a 45 m plate from
+building a map-sized mesh. That root cause is fixed - the size is now a
+single authoritative read (GetWorldScale) that nothing the plate writes
+can reach - and the guard has become the defect the user actually hits.
+
+Once the clamp engages, the entity scale and the mesh part company: the
+gizmo keeps growing with every drag while the mesh stays at the clamp, so
+the handles no longer describe the thing they are scaling, and the extra
+scale silently accumulates in the entity transform. On a map smaller than
+1024 m this bites at ordinary sizes, because the terrain size was folded
+into the cap.
+
+Remove the cap and the terrain-size clamp on the MESH size entirely.
+GetWorldScale keeps only its zero guard; ClampPlateSize, kMaxPlateSizeMeters,
+the one-shot CryWarning and m_bSizeCapWarned are gone. The mesh is now
+always exactly the size the entity is scaled to.
+
+What still protects the plate, none of it a size limit:
+
+  - the idempotency self-check in RegenerateMesh (m_bSizeFeedbackWarned):
+    the size read back after a rebuild is compared with the size it was
+    built from and any difference warns at error severity. That, not the
+    cap, is the real protection against the old feedback loop.
+  - the Spacing grid clamps to 513 vertices per axis and the physics
+    surface sampler to 65 probes per axis, so vertex and ray counts are
+    bounded however large the plate is.
+  - the bake footprint is clipped to the map in ComputeBakeRect (the rect
+    is clamped to 0..hmapSize and refused when it exceeds it), so a plate
+    wider than the terrain bakes the map, not past it.
+  - the 8M-cell block check refuses an oversized bake with a warning.
+
+A deliberately huge plate - 5000 m on a 4096 m map - therefore degrades
+rather than freezes: the mesh is built at 5000 m with at most 513x513
+vertices, the bake footprint collapses onto the map and is then skipped
+with "footprint covers N x N terrain units" once the block passes 8M
+cells. The physics entity-grid traffic that 0d93a906 saw is proportional
+to the real footprint, and a footprint the user authored on purpose is
+their call, not a defect to clamp away.
+
+Files: TerrainPlateComponent.{h,cpp} only. No engine, CryCommon or editor
+change; nothing here is serialised, so levels load unchanged - a level
+saved while a plate was clamped now shows the plate at the scale actually
+stored in its entity transform.
+Build: CryDefaultEntities, Profile, bundled CMake 3.22, incremental.
+0 errors, 0 warnings.
+---
+ .../Geometry/TerrainPlateComponent.cpp        | 51 ++++---------------
+ .../Geometry/TerrainPlateComponent.h          |  7 +--
+ 2 files changed, 12 insertions(+), 46 deletions(-)
+
+diff --git a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
+index 8460807c..0ca037df 100644
+--- a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
++++ b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
+@@ -137,11 +137,6 @@ ICVar* g_pTerrainPlateCullBuriedCVar = nullptr;
+ //! so the deliberately sunk rim reads as buried while float noise cannot flip a surface vertex.
+ const float kBuriedCullMargin = 0.05f;
+ 
+-//! Hard cap on the plate's own size, per axis. A plate is a local ground feature; nothing sane needs a
+-//! kilometre of it, and a defect that inflates the size must not be allowed to build a map-sized mesh and
+-//! flood the entity grid with cell queries. The terrain's own size caps it further where it is smaller.
+-const float kMaxPlateSizeMeters = 1024.f;
+-
+ //! The plate's contacts report the surface type of the TERRAIN LAYER under them; 0 restores the stock path.
+ int    g_terrainPlatePhysSurfaceFromTerrain = 1;
+ ICVar* g_pTerrainPlatePhysSurfaceFromTerrainCVar = nullptr;
+@@ -1503,7 +1498,7 @@ Matrix34 CTerrainPlateComponent::GetPlateFrameTM() const
+ 	// carries the scale-cancelling transform, and this is the only frame that exists before the slot does.
+ 	Matrix34 frameTM = m_pEntity->GetWorldTM() * GetTransformMatrix();
+ 
+-	// Re-impose the authoritative size on the columns. GetWorldScale is zero-guarded and capped, so without
++	// Re-impose the authoritative size on the columns. GetWorldScale is the single source of it, so without
+ 	// this the frame and the size would disagree exactly when it matters - and the frame is what the weld, the
+ 	// bake footprint and the node matrix are solved against. Directions (and the sign of a mirrored axis) are
+ 	// preserved: each column is only rescaled to the length the plate is declared to have.
+@@ -1568,8 +1563,8 @@ void CTerrainPlateComponent::ApplySlotScaleCompensation()
+ 
+ 	// Solved from the node matrix rather than derived a second time from the component transform and the mesh
+ 	// size: entityWorldTM * slotLocalTM == GetPlateNodeTM() by construction, so the slot cannot drift away from
+-	// the frame the rest of the component reasons in (it did when the size was capped, or the component
+-	// transform held a scale of its own).
++	// the frame the rest of the component reasons in (it did when the component transform held a scale of
++	// its own).
+ 	Matrix34 invEntityTM;
+ 	if (!InvertPlateFrameTM(m_pEntity->GetWorldTM(), invEntityTM))
+ 		return; // a zero-scaled entity draws nothing; leave the slot alone rather than write NaNs into it
+@@ -1604,38 +1599,14 @@ Vec3 CTerrainPlateComponent::GetWorldScale() const
+ 	const Vec3 scale(authoredTM.GetColumn0().GetLength(), authoredTM.GetColumn1().GetLength(), authoredTM.GetColumn2().GetLength());
+ 
+ 	// A zero scale would divide by zero all over the generator and produces no visible geometry, so it reads 1.
+-	return ClampPlateSize(Vec3(
+-	                        (scale.x > 0.0001f) ? scale.x : 1.f,
+-	                        (scale.y > 0.0001f) ? scale.y : 1.f,
+-	                        (scale.z > 0.0001f) ? scale.z : 1.f));
+-}
+-
+-Vec3 CTerrainPlateComponent::ClampPlateSize(const Vec3& rawSize) const
+-{
+-	// The terrain caps the footprint where it is smaller than the absolute cap: a plate wider than the map
+-	// cannot be welded, baked or integrated into anything anyway.
+-	float cap = kMaxPlateSizeMeters;
+-	if (gEnv != nullptr && gEnv->p3DEngine != nullptr && gEnv->p3DEngine->GetITerrain() != nullptr)
+-	{
+-		const float terrainSize = (float)gEnv->p3DEngine->GetTerrainSize();
+-		if (terrainSize > 1.f)
+-			cap = min(cap, terrainSize);
+-	}
+-
+-	if (rawSize.x <= cap && rawSize.y <= cap && rawSize.z <= cap)
+-		return rawSize;
+-
+-	if (!m_bSizeCapWarned)
+-	{
+-		m_bSizeCapWarned = true;
+-		CryWarning(VALIDATOR_MODULE_3DENGINE, VALIDATOR_WARNING,
+-		           "Terrain Plate '%s': the entity scale asks for a %.1f x %.1f x %.1f m plate, past the %.0f m cap. "
+-		           "Clamped. A plate is a local ground feature - if this is not what you set, the entity (or a group "
+-		           "or prefab parent) carries a scale it should not; clear it and scale the plate again.",
+-		           GetPlateName(), rawSize.x, rawSize.y, rawSize.z, cap);
+-	}
+-
+-	return Vec3(min(rawSize.x, cap), min(rawSize.y, cap), min(rawSize.z, cap));
++	// Nothing else is imposed: the mesh is exactly the size the entity is scaled to, whatever that is, so the
++	// gizmo and the plate can never disagree. The guards that matter are elsewhere and are about cost, not size:
++	// the Spacing grid clamps to 513 vertices per axis, the physics surface sampler to 65 probes per axis, the
++	// bake footprint is clipped to the map and refused past 8M cells.
++	return Vec3(
++	  (scale.x > 0.0001f) ? scale.x : 1.f,
++	  (scale.y > 0.0001f) ? scale.y : 1.f,
++	  (scale.z > 0.0001f) ? scale.z : 1.f);
+ }
+ 
+ void CTerrainPlateComponent::ApplyMaterial()
+diff --git a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
+index 817913dd..315010c2 100644
+--- a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
++++ b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
+@@ -498,11 +498,8 @@ protected:
+ 	//! THE authoritative size of the plate in metres: x/y edge lengths, z relief height. Read ONLY from the
+ 	//! entity world transform and the component transform - never from the slot, which carries the plate's
+ 	//! own scale compensation, and never from the mesh, which was built from this. Components below 0.0001
+-	//! read as 1, and the result is capped (@see ClampPlateSize) so every consumer sees the same number.
++	//! read as 1; nothing else is imposed, so the mesh always matches the entity scale the gizmo shows.
+ 	Vec3        GetWorldScale() const;
+-	//! Refuses an insane footprint: a plate wider than the terrain, or than kMaxPlateSizeMeters, is clamped
+-	//! and warned about once, so a transform defect can never build a map-sized mesh again.
+-	Vec3        ClampPlateSize(const Vec3& rawSize) const;
+ 	//! Size the mesh currently in the statobj was generated at (m_lastWorldScale, guarded against zero).
+ 	Vec3        GetMeshBuildScale() const;
+ 	//! Writes the slot local transform that cancels the size already baked into the mesh, so that
+@@ -771,8 +768,6 @@ protected:
+ 	//! World scale the current mesh was generated for. The mesh itself is scale independent in XY, but
+ 	//! the normals, the weld, the skirt and the Spacing grid are not, so a scale change regenerates.
+ 	Vec3                     m_lastWorldScale = Vec3(1.f, 1.f, 1.f);
+-	//! One-shot, because a clamped plate would otherwise warn on every rebuild.
+-	mutable bool             m_bSizeCapWarned = false;
+ 	//! Fires once if a rebuild ever changes the plate's OWN size - the signature of a feedback loop, where
+ 	//! the size is read back out of something the rebuild wrote. @see RegenerateMesh.
+ 	bool                     m_bSizeFeedbackWarned = false;
+-- 
+2.47.1.windows.1
+

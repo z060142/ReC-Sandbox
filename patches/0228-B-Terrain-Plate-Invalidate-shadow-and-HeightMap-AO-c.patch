@@ -1,0 +1,129 @@
+From fbb7f8e99bee7f5ea98a3947ed1a1b4190636b99 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Mon, 31 Aug 2026 01:46:56 +0800
+Subject: [PATCH 228/307] !B (Terrain Plate) Invalidate shadow and HeightMap AO
+ caches after regeneration.
+
+Regenerating a plate updates an IStatObj in place, bypassing the normal object
+modification notification. Hash the generated positions and invalidate cached
+shadows, HeightMap AO and permanent render objects only when geometry changes.
+---
+ .../Geometry/TerrainPlateComponent.cpp        | 60 +++++++++++++++++++
+ .../Geometry/TerrainPlateComponent.h          |  5 ++
+ 2 files changed, 65 insertions(+)
+
+diff --git a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
+index 2bd30dc2..45b24ee3 100644
+--- a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
++++ b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
+@@ -540,6 +540,17 @@ void CTerrainPlateComponent::Register(Schematyc::CEnvRegistrationScope& componen
+ CTerrainPlateComponent::~CTerrainPlateComponent()
+ {
+ 	ReleaseNativePhysics();
++
++	// Removing the component takes the render node with it, and nothing in the engine invalidates the
++	// static shadow cache on unregister: C3DEngine::UnRegisterEntityImpl (3dEngine.cpp:6726) only drops
++	// the terrain sector meshes over the object's box. Without this the removed plate keeps casting into
++	// the cached cascade and into HeightMap AO until something else asks for a rebuild. The render node
++	// may already be gone by now, so the node less form is used - the same call the editor's display
++	// settings make (PanelDisplayRender.cpp:443).
++	if (m_pStatObj != nullptr && gEnv != nullptr && gEnv->p3DEngine != nullptr)
++	{
++		gEnv->p3DEngine->OnObjectModified(nullptr, ERF_CASTSHADOWMAPS);
++	}
+ }
+ 
+ void CTerrainPlateComponent::Initialize()
+@@ -1170,10 +1181,21 @@ void CTerrainPlateComponent::RegenerateMesh()
+ 
+ 	CRY_ASSERT(indexCursor == totalIndexCount);
+ 
++	// The hash is what tells a real geometry change from a rebuild that produced the same mesh (flipping
++	// Type between Render and Render and Collider re-runs everything above without moving a vertex), so
++	// that only the former pays for a shadow cache refresh. @see InvalidateShadowCache.
+ 	AABB bbox(AABB::RESET);
++	uint32 geometryHash = 2166136261u; // FNV-1a over the position stream
+ 	for (int i = 0; i < totalVertexCount; ++i)
+ 	{
+ 		bbox.Add(pPositions[i]);
++
++		uint32 vertexBits[3];
++		memcpy(vertexBits, &pPositions[i], sizeof(vertexBits));
++		for (uint32 bits : vertexBits)
++		{
++			geometryHash = (geometryHash ^ bits) * 16777619u;
++		}
+ 	}
+ 
+ 	pIndexedMesh->SetSubSetCount(1);
+@@ -1219,6 +1241,44 @@ void CTerrainPlateComponent::RegenerateMesh()
+ 	UpdateNativePhysics();
+ 
+ 	ApplyBaseMeshProperties();
++
++	if (geometryHash != m_geometryHash)
++	{
++		m_geometryHash = geometryHash;
++		InvalidateShadowCache();
++	}
++}
++
++void CTerrainPlateComponent::InvalidateShadowCache()
++{
++	// The static shadow cache (e_ShadowsCache*) and HeightMap AO are baked from the static caster list
++	// and are refreshed only when something reports a change. The engine's hook is
++	// C3DEngine::OnObjectModified (3dEngine.cpp:5074), which the editor fires for its own objects
++	// (CObjectManager::OnObjectModified, ObjectManager.cpp:3449-3453). Nothing fires it here: the mesh is
++	// replaced in place through IStatObj::GetIndexedMesh / Invalidate, so the slot keeps the same statobj
++	// pointer and neither CEntitySlot::UpdateRenderNode nor C3DEngine ever sees a geometry event. Without
++	// this call, changing Z Max, Grid or the source leaves the cached cascade and the AO showing the old
++	// silhouette until an unrelated edit invalidates them.
++	if (gEnv == nullptr || gEnv->p3DEngine == nullptr)
++		return;
++
++	IRenderNode* pRenderNode = nullptr;
++	if (m_pEntity != nullptr && GetEntitySlotId() != IEntityComponent::EmptySlotId)
++	{
++		pRenderNode = m_pEntity->GetSlotRenderNode(GetEntitySlotId());
++	}
++
++	// Same call and same flags as the editor hook: with ERF_CASTSHADOWMAPS set it requests
++	// eFullUpdateTimesliced, which covers the cached cascades and the HeightMap AO frustum at once,
++	// because CLightEntity feeds one ShadowCacheGenerator built from m_nCachedShadowsUpdateStrategy to
++	// both InitShadowFrustum and InitHeightMapAOFrustum (LightEntity.cpp:387-427); with the flag clear
++	// (shadow casting turned off on the component) it still drops the permanent render object. There is
++	// no per bounding box invalidation in 5.7.1 - C3DEngine::SetRecomputeCachedShadows(pNode, ...)
++	// (3dEngine.cpp:4889) only marks that one node as uncompiled and then sets the global strategy - so
++	// the timesliced strategy is what bounds the per frame cost, and RegenerateMesh's once per frame
++	// throttle (@see RequestRegenerate) bounds how often it is asked for while dragging.
++	const IRenderNode::RenderFlagsType renderFlags = (pRenderNode != nullptr) ? pRenderNode->GetRndFlags() : ERF_CASTSHADOWMAPS;
++	gEnv->p3DEngine->OnObjectModified(pRenderNode, renderFlags);
+ }
+ 
+ void CTerrainPlateComponent::ReleasePhysicsGeometry()
+diff --git a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
+index 5f1c34ad..eb15c807 100644
+--- a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
++++ b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
+@@ -232,6 +232,9 @@ protected:
+ 	void        UpdateNativePhysics();
+ 	//! Destroys the physical entity, but only the one this component created.
+ 	void        ReleaseNativePhysics();
++	//! Tells the engine the plate's geometry changed, so that the static shadow cache and the
++	//! HeightMap AO frustum are rebuilt instead of keeping the previous silhouette.
++	void        InvalidateShadowCache();
+ 
+ 	ETerrainPlateSource                          m_sourceMode = ETerrainPlateSource::HeightmapFile;
+ 	Schematyc::TerrainHeightmapFileName          m_heightmapPath;
+@@ -265,6 +268,8 @@ protected:
+ 	bool                     m_bOwnsPhysicalEntity = false;
+ 	bool                     m_bPhysMeshWarningIssued = false;
+ 	uint32                   m_lastRegenFrameId = 0;
++	//! FNV-1a of the position stream of the last generated mesh; 0 until the first generation.
++	uint32                   m_geometryHash = 0;
+ 	_smart_ptr<IStatObj>     m_pStatObj;
+ };
+ }
+-- 
+2.47.1.windows.1
+

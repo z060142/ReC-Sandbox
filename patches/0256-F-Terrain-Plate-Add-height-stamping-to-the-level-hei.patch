@@ -1,0 +1,545 @@
+From 2bc7f9dfc15864e9f1e8c031a769ac64dcfb0db0 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Tue, 1 Sep 2026 07:30:45 +0800
+Subject: [PATCH 256/307] !F (Terrain Plate) Add height stamping to the level
+ heightmap.
+
+Add an editor command that copies the live baked relief into CHeightmap with
+undo support and correct world-to-heightmap axis mapping. Reject values outside
+the level height range before modifying any cells.
+---
+ .../Geometry/ITerrainPlateCommit.h            |  66 ++++++
+ .../Geometry/TerrainPlateComponent.cpp        |  79 ++++++-
+ .../Geometry/TerrainPlateComponent.h          |  22 ++
+ .../EditorQt/Terrain/TerrainCommands.cpp      | 222 ++++++++++++++++++
+ .../EditorQt/Terrain/TerrainEditor.cpp        |   1 +
+ 5 files changed, 386 insertions(+), 4 deletions(-)
+ create mode 100644 Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/ITerrainPlateCommit.h
+
+diff --git a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/ITerrainPlateCommit.h b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/ITerrainPlateCommit.h
+new file mode 100644
+index 00000000..44358e5e
+--- /dev/null
++++ b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/ITerrainPlateCommit.h
+@@ -0,0 +1,66 @@
++// Copyright 2026 Crytek GmbH / Crytek Group. All rights reserved.
++
++#pragma once
++
++#include <CryExtension/CryGUID.h>
++#include <CryMath/Cry_Color.h>
++
++namespace Cry
++{
++namespace DefaultComponents
++{
++
++//! Commit Bake (decision 07): the link the editor side of the commit needs into the terrain plate.
++//!
++//! Why an interface and not the component class: CHeightmap and CRGBLayer are SANDBOX_API, exported from
++//! Sandbox.exe, so the commit itself can only run inside EditorQt (research 12 section 6.0) - while
++//! CTerrainPlateComponent lives in an engine plugin that Sandbox never links. EditorQt already has the
++//! plugin's Module directory on its include path (Code/Sandbox/EditorQt/CMakeLists.txt:1508-1513), so it
++//! can see this header; every member below is pure virtual, so calling one costs a vtable slot and no
++//! link time symbol. The precedent is ILightComponent / LensFlareUtil.cpp:490-495.
++//!
++//! How the editor gets here from an IEntityComponent*: it includes TerrainPlateComponent.h and
++//! static_casts, exactly as Plugins/EditorParticle/EntityObjectWithParticleComponent.cpp:6/19 does with
++//! CParticleComponent (research 12 section 6.4). A downcast is a compile time pointer adjustment and the
++//! calls below are all virtual, so the include costs headers and no link time symbol. The two routes that
++//! do NOT work here and were tried first: a cross cast needs RTTI, which is off for every engine module
++//! (CommonMacros.cmake:629-636); and IEntityComponent::QueryInterface, the ICryUnknown door, is protected
++//! (IEntityComponent.h:314) and so cannot be called on an IEntityComponent* from outside. This interface
++//! also deliberately does not derive from IEntityComponent - the plate already reaches IEntityComponent
++//! through CBaseMeshComponent, and a second path would make that base ambiguous.
++//!
++//! Step 1 (height commit) only uses GetCommitFootprint and OnCommitted. The appearance stamp of step 2
++//! needs the other two, and they are declared now so that step 2 does not move the vtable under a build
++//! that has already shipped.
++struct ITerrainPlateCommit
++{
++	//! Type id of CTerrainPlateComponent, for IEntity::GetComponentByTypeId. Must stay in step with
++	//! CTerrainPlateComponent::ReflectType's desc.SetGUID.
++	static CryGUID GetComponentTypeId() { return "{3F1D8B4A-6C2E-4E9F-9A21-7B5C0D4E8A13}"_cry_guid; }
++
++	//! The sector aligned square the LIVE bake currently holds in the engine terrain, in terrain units:
++	//! outX1 along world X, outY1 along world Y, outSize the edge in units. The block itself covers
++	//! (outSize + 1)^2 cells, i.e. units outX1 .. outX1 + outSize inclusive, which is the range
++	//! ITerrain::SetTerrainElevation reads (terran_edit.cpp:264).
++	//! False when there is nothing to commit: no live bake, or the plate is committed already.
++	virtual bool  GetCommitFootprint(int& outX1, int& outY1, int& outSize) const = 0;
++
++	//! Step 2. smoothstep(t) * coverage at a world XY - the SAME rim curve the height bake used, so that
++	//! the colour edge sits exactly on the height edge. 0 outside the footprint.
++	virtual float GetCommitWeightAtWorld(float worldX, float worldY) const = 0;
++
++	//! Step 2. Albedo of the plate at a world XY, for the optional colour projection. False when the
++	//! plate has no usable projection (no material, or a material the CPU cannot sample).
++	virtual bool  GetCommitAlbedoAtWorld(float worldX, float worldY, ColorB& outColor) const = 0;
++
++	//! The editor has written the committed ground into CHeightmap: adopt it as this plate's baseline,
++	//! stop defending the footprint and stop restoring it on teardown. Called INSIDE the editor's undo
++	//! group, after the heights are written and before it is accepted.
++	virtual void  OnCommitted() = 0;
++
++protected:
++	~ITerrainPlateCommit() {}
++};
++
++}
++}
+diff --git a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
+index 9995fdab..33b4bb1a 100644
+--- a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
++++ b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
+@@ -398,7 +398,7 @@ bool CTerrainPlateComponent::WantsBakeMoveBatch() const
+ {
+ 	// A plate that does not write the terrain has no footprint to unwind and no ordering to respect, so it
+ 	// keeps the plain path. A torn down plate must not bake again at all (report 18, B2).
+-	return m_bBakeIntoTerrain && !m_bBakeTornDown && m_pEntity != nullptr;
++	return m_bBakeIntoTerrain && !m_bBakeCommitted && !m_bBakeTornDown && m_pEntity != nullptr;
+ }
+ 
+ int CTerrainPlateComponent::GetEffectiveSettleFrames() const
+@@ -1025,7 +1025,7 @@ Cry::Entity::EventFlags CTerrainPlateComponent::GetEventMask() const
+ 	// Only ticked while a rebuild was throttled away or held back, while the first bake is still owed,
+ 	// or while a live bake has to be watched - so a plate that is not baking costs nothing per frame.
+ 	if (m_bRegenPending || m_bDeferredXformPending || m_bBakeMoveBatchPending || m_bInitialBakePending
+-	    || (m_bBakeIntoTerrain && (GetBakeProbeFrames() > 0 || GetPlateDebugLevel() >= 1)))
++	    || (m_bBakeIntoTerrain && !m_bBakeCommitted && (GetBakeProbeFrames() > 0 || GetPlateDebugLevel() >= 1)))
+ 	{
+ 		bitFlags |= ENTITY_EVENT_UPDATE;
+ 	}
+@@ -1505,7 +1505,7 @@ void CTerrainPlateComponent::RegenerateMesh()
+ 	//
+ 	// The cascade regenerates every member, this plate included, so returning here is not a rebuild
+ 	// skipped. Depth > 0 means we ARE that regeneration and must not start a second cascade.
+-	if (g_bakeCascadeDepth == 0 && m_bBakeIntoTerrain && !m_bBakeTornDown && !m_bInitialBakePending
++	if (g_bakeCascadeDepth == 0 && m_bBakeIntoTerrain && !m_bBakeCommitted && !m_bBakeTornDown && !m_bInitialBakePending
+ 	    && m_pEntity != nullptr && gEnv->p3DEngine != nullptr)
+ 	{
+ 		std::vector<CTerrainPlateComponent*> affected;
+@@ -2729,6 +2729,69 @@ bool CTerrainPlateComponent::RestoreBakeOnTeardownCascaded()
+ 	return true;
+ }
+ 
++bool CTerrainPlateComponent::GetCommitFootprint(int& outX1, int& outY1, int& outSize) const
++{
++	// Only a plate that currently holds a bake in the engine terrain has something to commit: the editor
++	// reads the block straight back out of the terrain (research 12 section 0.4), so what it stamps is
++	// literally what the live bake wrote - the same batches, cascades and rim shape, not a recomputation.
++	if (!m_bBakeApplied || m_bBakeCommitted || m_bakeRectSize <= 0)
++		return false;
++
++	outX1 = m_bakeRectX1;
++	outY1 = m_bakeRectY1;
++	outSize = m_bakeRectSize;
++	return true;
++}
++
++float CTerrainPlateComponent::GetCommitWeightAtWorld(float /*worldX*/, float /*worldY*/) const
++{
++	// Step 2 (appearance stamp). Declared now so that adding it later does not move the vtable.
++	return 0.f;
++}
++
++bool CTerrainPlateComponent::GetCommitAlbedoAtWorld(float /*worldX*/, float /*worldY*/, ColorB& /*outColor*/) const
++{
++	// Step 2 (appearance stamp).
++	return false;
++}
++
++void CTerrainPlateComponent::OnCommitted()
++{
++	// ORDER MATTERS - decision 07 settled fact 8 / research 12 section 2.6. The committed ground has to
++	// become this plate's baseline BEFORE Bake Into Terrain goes off, or the untick that follows would run
++	// RestoreBakeBaseline and push the OLD ground back into the engine, where it would disagree with
++	// CHeightmap until the next whole map push.
++	if (!m_bakeResult.empty())
++	{
++		m_bakeBaseline = m_bakeResult;
++	}
++
++	// The disarm proper. m_bBakeApplied false is what makes the teardown a no-op: RestoreBakeBaseline,
++	// RestoreBakeOnTeardown and RestoreBakeOnTeardownCascaded are all gated on it, so deleting a committed
++	// plate leaves the ground exactly where the commit put it. The probes go with it - they exist to put
++	// the live bake back when somebody sculpts over it, and there is no live bake left to defend.
++	m_bBakeApplied = false;
++	m_bakeProbes.clear();
++	m_bakeReapplyCount = 0;
++	m_bakeBackoffFrames = 0;
++	m_bakeReapplyWindowStart = 0;
++
++	// Serialised, so the panel still says "committed" after a reload, and so a second commit is refused.
++	// Every path that could write the terrain again is gated on it as well (ApplyBake, the overlap
++	// cascade, the move batch), which is what makes a stale property panel harmless.
++	m_bBakeCommitted = true;
++	m_bBakeIntoTerrain = false;
++
++	if (m_pEntity != nullptr)
++	{
++		m_pEntity->UpdateComponentEventMask(this);
++	}
++
++	CryLog("TerrainPlate '%s': committed into the level heightmap. The live bake is off, and deleting the "
++	       "plate no longer restores the old ground. Undo puts the terrain back; untick Committed and "
++	       "re-tick Bake Into Terrain to resume the live bake.", GetPlateName());
++}
++
+ bool CTerrainPlateComponent::VerifyBakeWrite(const SBakeTerrainMetrics& metrics)
+ {
+ 	// ITerrain::SetTerrainElevation reports nothing back. An out of range rect only warns inside the
+@@ -2843,6 +2906,14 @@ void CTerrainPlateComponent::ApplyBake()
+ 		return;
+ 	}
+ 
++	if (m_bBakeCommitted)
++	{
++		// The relief is in the level's own heightmap now. Baking it again would write it a SECOND time on
++		// top of the committed ground, which is the one way a commit can go visibly wrong. @see OnCommitted.
++		LogBakeSkip("committed");
++		return;
++	}
++
+ 	if (m_bBakeTornDown)
+ 	{
+ 		// The ground has already been given back. Anything that still reaches a mesh regeneration after
+@@ -3355,7 +3426,7 @@ void CTerrainPlateComponent::UnregisterPlate()
+ 
+ void CTerrainPlateComponent::GetBakeCascadeRects(std::vector<int>& outRects) const
+ {
+-	if (!m_bBakeIntoTerrain || m_bBakeTornDown || m_pEntity == nullptr)
++	if (!m_bBakeIntoTerrain || m_bBakeCommitted || m_bBakeTornDown || m_pEntity == nullptr)
+ 		return;
+ 
+ 	const SBakeTerrainMetrics metrics = GetBakeTerrainMetrics();
+diff --git a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
+index 51ebbbc7..a464db57 100644
+--- a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
++++ b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
+@@ -3,6 +3,7 @@
+ #pragma once
+ 
+ #include "BaseMeshComponent.h"
++#include "ITerrainPlateCommit.h"
+ 
+ #include <CrySchematyc/ResourceTypes.h>
+ #include <CrySchematyc/Utils/SharedString.h>
+@@ -156,6 +157,7 @@ void UnregisterTerrainPlateCVars();
+ //! terrain integration path exactly like an ordinary mesh component does.
+ class CTerrainPlateComponent
+ 	: public CBaseMeshComponent
++	, public ITerrainPlateCommit
+ {
+ public:
+ 	//! e_TerrainPlateCullBuried changed: the classification lives in the index buffer, so every plate in
+@@ -280,6 +282,14 @@ public:
+ 		               "Only matters when two baking plates overlap.",
+ 		               0);
+ 
++		desc.AddMember(&CTerrainPlateComponent::m_bBakeCommitted, 'bcmt', "BakeCommitted", "Committed",
++		               "Read only, set by Commit To Terrain (the terrain.commit_plate editor command): the relief has been written "
++		               "into the level's own heightmap and is now ordinary terrain. While this is on the plate never writes the live "
++		               "bake again and deleting it leaves the committed ground alone, so the plate can be removed whenever you like. "
++		               "An undo of the commit puts the old terrain back but does not clear this: untick it and re-tick Bake Into "
++		               "Terrain to resume the live bake.",
++		               false);
++
+ 		desc.AddMember(&CTerrainPlateComponent::m_renderParameters, 'rend', "Render", "Rendering Settings", "Settings for the rendered representation of the component", plateRenderDefaults);
+ 		desc.AddMember(&CTerrainPlateComponent::m_physics, 'phys', "Physics", "Physics Settings",
+ 		               "Physical properties for the object. With Type = Render and Collider the plate physicalizes itself as a static "
+@@ -293,6 +303,14 @@ public:
+ 	//! Regenerates the mesh from the cached height field (no file access).
+ 	virtual void RegenerateMesh();
+ 
++	// ITerrainPlateCommit (@see ITerrainPlateCommit.h; step 1 implements the footprint and the disarm,
++	// the two appearance queries arrive with step 2)
++	virtual bool  GetCommitFootprint(int& outX1, int& outY1, int& outSize) const final;
++	virtual float GetCommitWeightAtWorld(float worldX, float worldY) const final;
++	virtual bool  GetCommitAlbedoAtWorld(float worldX, float worldY, ColorB& outColor) const final;
++	virtual void  OnCommitted() final;
++	// ~ITerrainPlateCommit
++
+ protected:
+ 	//! Loads the source into m_heightField if the source changed since the last load.
+ 	void        LoadSourceIfNeeded();
+@@ -475,6 +493,10 @@ protected:
+ 	bool                                         m_bBakeIntoTerrain = false;
+ 	ETerrainPlateBakeMode                        m_bakeMode = ETerrainPlateBakeMode::Raise;
+ 	Schematyc::Range<-128, 127, -128, 127, int>  m_bakePriority = 0;
++	//! Commit Bake: the relief lives in the level's CHeightmap now, so this plate must never write the
++	//! terrain again and must never restore anything. Serialised, unlike m_bBakeTornDown, because the
++	//! commit is permanent and the panel has to keep saying so after a reload. @see OnCommitted.
++	bool                                         m_bBakeCommitted = false;
+ 
+ 	// Cached state, never serialised: the mesh is always rebuilt on load.
+ 	STerrainPlateHeightField m_heightField;
+diff --git a/Code/Sandbox/EditorQt/Terrain/TerrainCommands.cpp b/Code/Sandbox/EditorQt/Terrain/TerrainCommands.cpp
+index 6d20cced..7d2b6161 100644
+--- a/Code/Sandbox/EditorQt/Terrain/TerrainCommands.cpp
++++ b/Code/Sandbox/EditorQt/Terrain/TerrainCommands.cpp
+@@ -2,13 +2,21 @@
+ #include "StdAfx.h"
+ 
+ #include "QT/QToolTabManager.h"
++#include "Objects/EntityObject.h"
+ #include "Objects/SelectionGroup.h"
++#include "Terrain/Heightmap.h"
+ #include "Terrain/TerrainLayerUndoObject.h"
+ #include "Terrain/TerrainManager.h"
+ #include "Vegetation/VegetationMap.h"
+ #include "TerrainTexturePainter.h"
+ #include "IEditorImpl.h"
+ 
++// Commit Bake (decision 07 step 1). EditorQt already has the plugin's Module directory on its include
++// path (CMakeLists.txt:1508-1513) and this is a header only downcast onto a pure virtual interface, so
++// nothing here needs a symbol out of CryDefaultEntities. Same shape as
++// Plugins/EditorParticle/EntityObjectWithParticleComponent.cpp:6 and LensFlareUtil.cpp:10.
++#include <DefaultComponents/Geometry/TerrainPlateComponent.h>
++
+ #include <BoostPythonMacros.h>
+ #include <Controls/QuestionDialog.h>
+ #include <EditorFramework/Events.h>
+@@ -280,6 +288,213 @@ static void PyRepositionVegetation()
+ 	}
+ }
+ 
++//! Commit Bake, step 1: stamps the LIVE bake of every selected terrain plate into the level's own
++//! heightmap, so that the relief stops being a plate's runtime footprint and becomes ordinary terrain -
++//! saved in Heightmap.dat, pushed back into the engine on every load (CryEditDoc.cpp:122) and therefore
++//! there after the plate is deleted. Decision 07 step 1; the traced facts behind every line below are in
++//! research/12-commit-bake.md.
++//!
++//! The block is read straight back out of the live engine terrain rather than recomputed, which is what
++//! makes it the SAME block the bake produced: every batch, cascade, priority and rim shape that went into
++//! the live footprint is already in the ground. The loss is the engine's 12 bit per sector quantisation,
++//! a few mm, against the heightmap's own 1.6 cm save quantisation (research 12 section 0.4).
++static void PyCommitTerrainPlate()
++{
++	using Cry::DefaultComponents::CTerrainPlateComponent;
++	using Cry::DefaultComponents::ITerrainPlateCommit;
++
++	CHeightmap* pHeightmap = GetIEditorImpl()->GetHeightmap();
++	I3DEngine* p3DEngine = GetIEditorImpl()->Get3DEngine();
++	if (pHeightmap == nullptr || p3DEngine == nullptr || p3DEngine->GetITerrain() == nullptr)
++	{
++		CryWarning(VALIDATOR_MODULE_EDITOR, VALIDATOR_WARNING, "terrain.commit_plate: no terrain (is a level loaded?)");
++		return;
++	}
++
++	const CSelectionGroup* pSelection = GetIEditorImpl()->GetSelection();
++	if (pSelection == nullptr || pSelection->IsEmpty())
++	{
++		CryWarning(VALIDATOR_MODULE_EDITOR, VALIDATOR_WARNING,
++		           "terrain.commit_plate: nothing selected. Select the terrain plate entities to commit and run it again.");
++		return;
++	}
++
++	// The plates first, so that a refusal below can be reported before a single height is written.
++	std::vector<std::pair<IEntity*, CTerrainPlateComponent*>> plates;
++	for (int i = 0; i < pSelection->GetCount(); ++i)
++	{
++		CBaseObject* pObject = pSelection->GetObject(i);
++		if (pObject == nullptr || !pObject->IsKindOf(RUNTIME_CLASS(CEntityObject)))
++			continue;
++
++		IEntity* pEntity = static_cast<CEntityObject*>(pObject)->GetIEntity();
++		if (pEntity == nullptr)
++			continue;
++
++		IEntityComponent* pComponent = pEntity->GetComponentByTypeId(ITerrainPlateCommit::GetComponentTypeId());
++		if (pComponent == nullptr)
++			continue;
++
++		plates.emplace_back(pEntity, static_cast<CTerrainPlateComponent*>(pComponent));
++	}
++
++	if (plates.empty())
++	{
++		CryWarning(VALIDATOR_MODULE_EDITOR, VALIDATOR_WARNING,
++		           "terrain.commit_plate: no Terrain Plate component in the selection.");
++		return;
++	}
++
++	const float unitSize = pHeightmap->GetUnitSize();
++	// The heightmap is stored transposed against the world: heightmap X is the world Y unit and heightmap
++	// Y is the world X unit, with the linear index x + y * width (Heightmap.h:82,
++	// CHeightmap::WorldToHmap/HmapToWorld, Heightmap.cpp:557-566, and the same swap in every consumer -
++	// the sculpt brush at TerrainBrushTool.cpp:461-462, the texture painter at
++	// TerrainTexturePainter.cpp:691-692). The plate's own rect is in ENGINE units, which are not swapped
++	// (SetTerrainElevation reads pTerrainBlock[worldXunit * stride + worldYunit], terran_edit.cpp:266), so
++	// the mapping here is  hmapX = worldYunit,  hmapY = worldXunit.
++	const int hmapUnitsY = (int)pHeightmap->GetWidth();    // heightmap X axis: world Y
++	const int hmapUnitsX = (int)pHeightmap->GetHeight();   // heightmap Y axis: world X
++	if (unitSize <= 0.f || hmapUnitsX <= 0 || hmapUnitsY <= 0)
++	{
++		CryWarning(VALIDATOR_MODULE_EDITOR, VALIDATOR_WARNING, "terrain.commit_plate: the level has no usable heightmap.");
++		return;
++	}
++
++	const CTimeValue startTime = gEnv->pTimer->GetAsyncTime();
++	int committed = 0;
++
++	// One undo group for the whole run: Ctrl+Z puts the terrain of every committed plate back at once.
++	// The undo does NOT reach the components' Committed flag - it is runtime state, not a terrain edit -
++	// so an undo leaves disarmed plates over restored ground; the log line says how to re-arm them.
++	CUndo undo("Commit Terrain Plate");
++
++	for (const std::pair<IEntity*, CTerrainPlateComponent*>& entry : plates)
++	{
++		IEntity* pEntity = entry.first;
++		ITerrainPlateCommit* pCommit = entry.second;
++
++		int rectX1 = 0, rectY1 = 0, rectSize = 0;
++		if (!pCommit->GetCommitFootprint(rectX1, rectY1, rectSize))
++		{
++			CryWarning(VALIDATOR_MODULE_EDITOR, VALIDATOR_WARNING,
++			           "terrain.commit_plate: '%s' has no live bake to commit. Tick Bake Into Terrain first (or it is committed already).",
++			           pEntity->GetName());
++			continue;
++		}
++
++		// The engine block covers units rectX1 .. rectX1 + rectSize INCLUSIVE (terran_edit.cpp:264), so the
++		// square is rectSize + 1 cells on a side.
++		const int dim = rectSize + 1;
++		const int hx0 = rectY1;   // heightmap X, world Y
++		const int hy0 = rectX1;   // heightmap Y, world X
++		const int cols = min(dim, hmapUnitsY - hx0);   // along heightmap X
++		const int rows = min(dim, hmapUnitsX - hy0);   // along heightmap Y
++		if (cols <= 0 || rows <= 0)
++		{
++			CryWarning(VALIDATOR_MODULE_EDITOR, VALIDATOR_WARNING,
++			           "terrain.commit_plate: '%s' has its footprint off the heightmap, nothing written.", pEntity->GetName());
++			continue;
++		}
++
++		// Read the committed ground back out of the engine, and find the crest before anything is written.
++		std::vector<float> block((size_t)rows * cols, 0.f);
++		float blockMin = FLT_MAX;
++		float blockMax = -FLT_MAX;
++		for (int ux = 0; ux < rows; ++ux)      // along world X
++		{
++			for (int uy = 0; uy < cols; ++uy)  // along world Y
++			{
++				// GetTerrainZ is CTerrain::GetZ, which truncates to units and returns the stored node height
++				// with no interpolation; the half unit offset only defends against a float multiply landing
++				// just under the integer. Same sampler the plate's own baseline capture uses.
++				const float z = p3DEngine->GetTerrainZ(((float)(rectX1 + ux) + 0.5f) * unitSize,
++				                                       ((float)(rectY1 + uy) + 0.5f) * unitSize);
++				block[(size_t)ux * cols + uy] = z;
++				blockMin = min(blockMin, z);
++				blockMax = max(blockMax, z);
++			}
++		}
++
++		// THE showstopper check (research 12 section 0.5). CHeightmap::Serialize saves heights as
++		// uint16 scaled by 65535 / m_fMaxHeight and clamps to 0xFFFF (Heightmap.cpp:2682-2695), and a
++		// negative height wraps through the same clamp and comes back as the ceiling. Either way the level
++		// looks right until it is reloaded, which is the worst failure mode there is - so refuse, loudly,
++		// and write nothing.
++		const float maxHeight = pHeightmap->GetMaxHeight();
++		if (blockMax > maxHeight || blockMin < 0.f)
++		{
++			CryWarning(VALIDATOR_MODULE_EDITOR, VALIDATOR_ERROR,
++			           "terrain.commit_plate: REFUSED for '%s'. The committed ground spans %.2f .. %.2f m and the level's "
++			           "terrain range is 0 .. %.2f m (Max Height). Committing it would be silently flattened to %.2f m at the "
++			           "next save and reload. Raise Max Height in Terrain Editor > Modify, or lower the plate, and try again.",
++			           pEntity->GetName(), blockMin, blockMax, maxHeight, maxHeight);
++			continue;
++		}
++
++		pHeightmap->RecordUndo(hx0, hy0, cols, rows, /*bInfo*/ false);
++
++		// A cell the bake never moved reads back as the baseline plus at most one engine quantisation step,
++		// and the sector aligned square reaches well outside the plate. Writing those cells back would stamp
++		// that noise into a pristine heightmap for no gain, so a cell is only written when it moved by more
++		// than the readback is worth. The step is the coarsest one any touched sector can have
++		// (12 bits over the block's own span, terran_edit.cpp:281-286), with a floor for a flat block.
++		const float epsilon = max(0.0001f, (blockMax - blockMin) / 4095.f);
++
++		int cellsWritten = 0;
++		float minDelta = 0.f;
++		float maxDelta = 0.f;
++		for (int ux = 0; ux < rows; ++ux)
++		{
++			for (int uy = 0; uy < cols; ++uy)
++			{
++				const float z = block[(size_t)ux * cols + uy];
++				const float previous = pHeightmap->GetXY(hx0 + uy, hy0 + ux);
++				const float delta = z - previous;
++				if (fabsf(delta) <= epsilon)
++					continue;
++
++				pHeightmap->SetXY(hx0 + uy, hy0 + ux, z);
++				++cellsWritten;
++				minDelta = min(minDelta, delta);
++				maxDelta = max(maxDelta, delta);
++			}
++		}
++
++		// UpdateEngineTerrain ignores its 4th argument and always pushes a SQUARE of side areaSize snapped
++		// out to whole sectors (Heightmap.cpp:2461-2472), so it gets the larger of the two sides.
++		const int side = max(cols, rows);
++		pHeightmap->UpdateEngineTerrain(hx0, hy0, side, side, CHeightmap::ETerrainUpdateType::Elevation);
++		GetIEditorImpl()->GetTerrainManager()->SetModified(hx0, hy0, hx0 + cols, hy0 + rows);
++
++		AABB worldBox(Vec3((float)rectX1 * unitSize, (float)rectY1 * unitSize, blockMin - 1.f),
++		              Vec3((float)(rectX1 + rows) * unitSize, (float)(rectY1 + cols) * unitSize, blockMax + 1.f));
++		GetIEditorImpl()->UpdateViews(eUpdateHeightmap, &worldBox);
++
++		// The disarm, INSIDE the undo group and only now that the heights are in: the plate adopts the
++		// committed ground as its baseline before Bake Into Terrain goes off, so the untick that follows
++		// cannot write the old ground back (research 12 section 2.6).
++		pCommit->OnCommitted();
++		++committed;
++
++		CryLog("terrain.commit_plate: '%s' committed, %d of %d cells written, delta %.3f .. %.3f m, "
++		       "units (%d,%d)+%d, ground %.2f .. %.2f m of a %.2f m range",
++		       pEntity->GetName(), cellsWritten, rows * cols, minDelta, maxDelta,
++		       rectX1, rectY1, rectSize, blockMin, blockMax, maxHeight);
++	}
++
++	if (committed > 0)
++	{
++		p3DEngine->GetITerrain()->OnTerrainPaintActionComplete();
++		GetIEditorImpl()->SetModifiedFlag();
++	}
++
++	const float elapsedMs = (gEnv->pTimer->GetAsyncTime() - startTime).GetMilliSeconds();
++	CryLog("terrain.commit_plate: %d of %d selected plate(s) committed, %.1f ms. Save the level to keep it; "
++	       "undo restores the terrain but leaves the plates disarmed (untick Committed and re-tick Bake Into Terrain).",
++	       committed, (int)plates.size(), elapsedMs);
++}
++
+ } // namespace Private_TerrainCommands
+ 
+ REGISTER_PYTHON_COMMAND(Private_TerrainCommands::PyRefineTerrainTiles, terrain, refine_tiles, "Split the tiles into smaller tiles")
+@@ -291,6 +506,13 @@ REGISTER_PYTHON_COMMAND_WITH_EXAMPLE(Private_TerrainCommands::PyRepositionVegeta
+                                      "terrain.reposition_vegetation()")
+ REGISTER_EDITOR_COMMAND_TEXT(terrain, reposition_vegetation, "Reposition Vegetation on Terrain")
+ 
++REGISTER_PYTHON_COMMAND_WITH_EXAMPLE(Private_TerrainCommands::PyCommitTerrainPlate, terrain, commit_plate,
++                                     "Writes the live bake of every selected terrain plate into the level's own heightmap, so the "
++                                     "relief becomes ordinary terrain and stays after the plate is deleted. Refuses a plate whose "
++                                     "ground would not fit the level's Max Height.",
++                                     "terrain.commit_plate()")
++REGISTER_EDITOR_COMMAND_TEXT(terrain, commit_plate, "Commit Terrain Plate To Terrain")
++
+ namespace Private_TerrainToolsCommands
+ {
+ void EnsureTerrainEditorActive()
+diff --git a/Code/Sandbox/EditorQt/Terrain/TerrainEditor.cpp b/Code/Sandbox/EditorQt/Terrain/TerrainEditor.cpp
+index 1ea61f50..1eff4a06 100644
+--- a/Code/Sandbox/EditorQt/Terrain/TerrainEditor.cpp
++++ b/Code/Sandbox/EditorQt/Terrain/TerrainEditor.cpp
+@@ -340,6 +340,7 @@ void CTerrainEditor::InitTerrainMenu()
+ 		pEditMenu->AddAction(GetAction_Deprecated("terrain.refine_tiles"), sec);
+ 
+ 		sec = pEditMenu->GetNextEmptySection();
++		pEditMenu->AddAction(GetAction_Deprecated("terrain.commit_plate"), sec);
+ 		pEditMenu->AddAction(GetAction_Deprecated("terrain.reposition_vegetation"), sec);
+ 
+ 		sec = pEditMenu->GetNextEmptySection();
+-- 
+2.47.1.windows.1
+

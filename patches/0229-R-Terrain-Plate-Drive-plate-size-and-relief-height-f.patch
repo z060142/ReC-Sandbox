@@ -1,0 +1,319 @@
+From 8698d595c0f2cf1f2de7e0433c3f6f4c11d43bd4 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Mon, 31 Aug 2026 02:43:36 +0800
+Subject: [PATCH 229/307] !R (Terrain Plate) Drive plate size and relief height
+ from the entity transform.
+
+Generate a unit plate and use transform scale as its world size and relief
+height. Recalculate spacing, welds, skirts and shading directions from world
+scale so component properties cannot disagree with the transform gizmo.
+---
+ .../Geometry/TerrainPlateComponent.cpp        | 136 ++++++++++++------
+ .../Geometry/TerrainPlateComponent.h          |  19 ++-
+ 2 files changed, 102 insertions(+), 53 deletions(-)
+
+diff --git a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
+index 45b24ee3..f9130bcc 100644
+--- a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
++++ b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
+@@ -568,13 +568,11 @@ Cry::Entity::EventFlags CTerrainPlateComponent::GetEventMask() const
+ {
+ 	Cry::Entity::EventFlags bitFlags = CBaseMeshComponent::GetEventMask();
+ 
+-	// The weld and the skirt are computed against the terrain under the plate, and in Spacing mode the
+-	// tessellation follows the world size of the plate, so all three depend on the transform. Without
+-	// them the mesh is transform independent and no rebuild is due.
+-	if (NeedsRegenerateOnTransform())
+-	{
+-		bitFlags |= ENTITY_EVENT_XFORM;
+-	}
++	// The plate is a unit plate, so its size and height live entirely in the world scale: the normals,
++	// the world metre parameters (Skirt, Weld Sink) and the Spacing grid all depend on it, and the weld
++	// and the skirt additionally depend on where the plate is. XFORM is therefore always subscribed;
++	// the handler decides whether the change actually asks for a rebuild.
++	bitFlags |= ENTITY_EVENT_XFORM;
+ 
+ 	// Only ticked while a rebuild was throttled away, so a static plate costs nothing per frame.
+ 	if (m_bRegenPending)
+@@ -594,7 +592,9 @@ void CTerrainPlateComponent::ProcessEvent(const SEntityEvent& event)
+ 		break;
+ 
+ 	case ENTITY_EVENT_XFORM:
+-		if (NeedsRegenerateOnTransform())
++		// A scale change always invalidates the mesh (@see GetWorldScale); a move or a rotation only
++		// matters when the mesh is solved against the terrain.
++		if (NeedsRegenerateOnTransform() || !GetWorldScale().IsEquivalent(m_lastWorldScale, 0.0001f))
+ 		{
+ 			RequestRegenerate();
+ 		}
+@@ -717,6 +717,19 @@ Matrix34 CTerrainPlateComponent::GetPlateWorldTM() const
+ 	return m_pEntity->GetWorldTM() * GetTransformMatrix();
+ }
+ 
++Vec3 CTerrainPlateComponent::GetWorldScale() const
++{
++	const Matrix34 worldTM = GetPlateWorldTM();
++	const Vec3 scale(worldTM.GetColumn0().GetLength(), worldTM.GetColumn1().GetLength(), worldTM.GetColumn2().GetLength());
++
++	// A zero scale would divide by zero all over the generator, and it produces no visible geometry
++	// anyway, so it is reported as 1.
++	return Vec3(
++	  (scale.x > 0.0001f) ? scale.x : 1.f,
++	  (scale.y > 0.0001f) ? scale.y : 1.f,
++	  (scale.z > 0.0001f) ? scale.z : 1.f);
++}
++
+ void CTerrainPlateComponent::ApplyMaterial()
+ {
+ 	IMaterialManager* pMaterialManager = gEnv->p3DEngine->GetMaterialManager();
+@@ -764,8 +777,12 @@ void CTerrainPlateComponent::ComputeEffectiveGrid(int& vertsX, int& vertsY)
+ 
+ 	float spacingX = 0.f;
+ 	float spacingY = 0.f;
+-	float edgeX = max(0.0001f, m_size.x);
+-	float edgeY = max(0.0001f, m_size.y);
++
++	// The local plate is a unit plate (1 x 1 m in XY), so the world edge length on an axis is simply the
++	// world scale on that axis.
++	const Vec3 worldScale = GetWorldScale();
++	const float edgeX = worldScale.x;
++	const float edgeY = worldScale.y;
+ 
+ 	if (m_gridMode == ETerrainPlateGridMode::Fixed)
+ 	{
+@@ -773,15 +790,8 @@ void CTerrainPlateComponent::ComputeEffectiveGrid(int& vertsX, int& vertsY)
+ 	}
+ 	else
+ 	{
+-		// Spacing is a world space distance, so the entity scale on each axis has to be folded in. The
+-		// two axes are resolved independently, which is why the grid may end up non square.
+-		const Matrix34 worldTM = GetPlateWorldTM();
+-		const float scaleX = worldTM.GetColumn0().GetLength();
+-		const float scaleY = worldTM.GetColumn1().GetLength();
+-
+-		edgeX *= (scaleX > 0.0001f) ? scaleX : 1.f;
+-		edgeY *= (scaleY > 0.0001f) ? scaleY : 1.f;
+-
++		// Spacing is a world space distance and the two axes are resolved independently, which is why the
++		// grid may end up non square.
+ 		const float spacing = max(0.0001f, (float)m_vertexSpacing);
+ 		vertsX = clamp_tpl((int)floorf(edgeX / spacing + 0.5f) + 1, 2, 513);
+ 		vertsY = clamp_tpl((int)floorf(edgeY / spacing + 0.5f) + 1, 2, 513);
+@@ -857,10 +867,33 @@ void CTerrainPlateComponent::RegenerateMesh()
+ 	const float fInvLastX = 1.f / (float)(nx - 1);
+ 	const float fInvLastY = 1.f / (float)(ny - 1);
+ 
+-	const float sizeX = max(0.0001f, m_size.x);
+-	const float sizeY = max(0.0001f, m_size.y);
+-	const float skirt = max(0.f, (float)m_skirt);
+-	const bool  bSkirt = (skirt > 0.f);
++	// The plate is generated as a unit plate: -0.5 .. +0.5 m in XY and 0 .. 1 m of relief. Everything the
++	// user sees in the world is that plate under the entity / component transform, so the world scale is
++	// the size of the plate (x/y) and the height of its relief (z). Local geometry is therefore scale
++	// independent, but four things are not and have to be built for this particular scale:
++	//   - the normals and the tangent frame (see below),
++	//   - Skirt and Weld Sink, which are world metres,
++	//   - the weld, which is solved in world space,
++	//   - the Spacing grid mode.
++	const Vec3 worldScale = GetWorldScale();
++	m_lastWorldScale = worldScale;
++	const Vec3 invWorldScale(1.f / worldScale.x, 1.f / worldScale.y, 1.f / worldScale.z);
++
++	// Skirt is a world distance extruded along local -Z, so it has to be divided by the world Z scale to
++	// stay the same number of metres whatever the plate is scaled to.
++	const float skirtWorld = max(0.f, (float)m_skirt);
++	const float skirt = skirtWorld * invWorldScale.z;
++	const bool  bSkirt = (skirtWorld > 0.f);
++
++	// A local direction becomes a world direction by the component wise scale (the rotation part of the
++	// transform is orthonormal and does not change any of the reasoning below), and back again by its
++	// inverse.
++	auto localDirToWorld = [&worldScale](const Vec3& v) { return Vec3(v.x * worldScale.x, v.y * worldScale.y, v.z * worldScale.z); };
++	auto worldDirToLocal = [&invWorldScale](const Vec3& v, const Vec3& fallback)
++	{
++		const Vec3 local(v.x * invWorldScale.x, v.y * invWorldScale.y, v.z * invWorldScale.z);
++		return local.IsZero() ? fallback : local.GetNormalized();
++	};
+ 
+ 	// ---------------------------------------------------------------- heights
+ 	// UVs are the sampling coordinates as well, so mirroring flips the relief and the texture together.
+@@ -899,13 +932,9 @@ void CTerrainPlateComponent::RegenerateMesh()
+ 		}
+ 	}
+ 
+-	for (float& h : heights)
+-	{
+-		h *= m_zMax;
+-	}
+-
+ 	// ---------------------------------------------------------------- positions
+-	// The plate is centred on the component origin in XY and its zero level is the component origin.
++	// Unit plate: -0.5 .. +0.5 in XY, centred on the component origin, and 0 .. 1 in Z with the zero
++	// level at the component origin. The transform turns that into metres.
+ 	std::vector<Vec3> positions((size_t)gridVertexCount);
+ 	for (int r = 0; r < ny; ++r)
+ 	{
+@@ -913,8 +942,8 @@ void CTerrainPlateComponent::RegenerateMesh()
+ 		{
+ 			const size_t index = (size_t)r * nx + c;
+ 			positions[index] = Vec3(
+-			  -sizeX * 0.5f + sizeX * ((float)c * fInvLastX),
+-			  sizeY * 0.5f - sizeY * ((float)r * fInvLastY),
++			  -0.5f + ((float)c * fInvLastX),
++			  0.5f - ((float)r * fInvLastY),
+ 			  heights[index]);
+ 		}
+ 	}
+@@ -1000,7 +1029,10 @@ void CTerrainPlateComponent::RegenerateMesh()
+ 				const size_t index = (size_t)r * nx + c;
+ 				const Vec3 world = worldTM * positions[index];
+ 				const float terrainZ = gEnv->p3DEngine->GetTerrainElevation(world.x, world.y);
+-				// The sink is a world space distance, so it is applied before the inverse transform.
++				// The sink is a world space distance, so it is applied to the world position, before the
++				// inverse transform brings the result back into the unit plate. It therefore stays the same
++				// number of metres whatever the plate is scaled to - unlike Skirt, which is extruded in local
++				// space and has to be divided by the world Z scale by hand.
+ 				const float targetZ = terrainZ - weldSink * sinkWeight;
+ 				const Vec3 conformed = invWorldTM * Vec3(world.x, world.y, targetZ);
+ 				positions[index] += (conformed - positions[index]) * weight;
+@@ -1063,6 +1095,18 @@ void CTerrainPlateComponent::RegenerateMesh()
+ 
+ 	// Grid vertices. The tangent frame is analytic: the engine's own tangent generator
+ 	// (IIndexedMesh::Optimize) re-welds and reorders the vertices, which would destroy the grid.
++	//
++	// Non-uniform scale and the normal. The engine's vertex shader transforms a normal with the plain
++	// 3x3 of the object matrix and normalises it; it does NOT use the inverse transpose. So whatever is
++	// stored here is scaled by S = (sx, sy, sz) on the way to world space. Two consequences:
++	//   1. the true normal has to be derived from the SCALED height field, because a slope that rises
++	//      1 unit over 1 unit is a different slope once the plate is 20 m wide and 3 m tall:
++	//      n_world = normalize((S * dX) x (S * dY));
++	//   2. what is stored must be the vector the shader's forward transform maps onto that normal, i.e.
++	//      n_local = normalize(S^-1 * n_world), so that normalize(S * n_local) == n_world.
++	// Tangents and bitangents are directions, so they transform the same way (t_world = S * t_local),
++	// and storing normalize(S^-1 * t_world) reproduces them in world space as well. With a uniform
++	// scale S^-1 * n_world is parallel to n_world, so this reduces to the previous behaviour.
+ 	for (int r = 0; r < ny; ++r)
+ 	{
+ 		for (int c = 0; c < nx; ++c)
+@@ -1074,22 +1118,19 @@ void CTerrainPlateComponent::RegenerateMesh()
+ 			const Vec3& pYPrev = positions[(size_t)max(0, r - 1) * nx + c]; // one row towards +Y
+ 			const Vec3& pYNext = positions[(size_t)min(ny - 1, r + 1) * nx + c];
+ 
+-			Vec3 dX = pXNext - pXPrev;   // along +X
+-			Vec3 dY = pYPrev - pYNext;   // along +Y
++			Vec3 dX = localDirToWorld(pXNext - pXPrev);   // along +X, in world metres
++			Vec3 dY = localDirToWorld(pYPrev - pYNext);   // along +Y, in world metres
+ 			if (dX.IsZero())
+ 				dX = Vec3(1.f, 0.f, 0.f);
+ 			if (dY.IsZero())
+ 				dY = Vec3(0.f, 1.f, 0.f);
+ 
+-			Vec3 normal = dX.Cross(dY);
+-			normal = normal.IsZero() ? Vec3(0.f, 0.f, 1.f) : normal.GetNormalized();
++			const Vec3 normal = worldDirToLocal(dX.Cross(dY), Vec3(0.f, 0.f, 1.f));
+ 
+ 			// dP/du and dP/dv of the UVs written below; mirroring reverses the direction of the
+ 			// texture axis relative to the geometry, hence the sign flips.
+-			Vec3 tangent = m_bMirrorX ? -dX : dX;
+-			Vec3 bitangent = m_bMirrorY ? dY : -dY;
+-			tangent = tangent.GetNormalized();
+-			bitangent = bitangent.GetNormalized();
++			const Vec3 tangent = worldDirToLocal(m_bMirrorX ? -dX : dX, Vec3(1.f, 0.f, 0.f));
++			const Vec3 bitangent = worldDirToLocal(m_bMirrorY ? dY : -dY, Vec3(0.f, 1.f, 0.f));
+ 
+ 			pPositions[index] = positions[index];
+ 			pNormals[index] = SMeshNormal(normal);
+@@ -1140,16 +1181,17 @@ void CTerrainPlateComponent::RegenerateMesh()
+ 			const int prevGridIndex = perimeter[(i + perimeterCount - 1) % perimeterCount];
+ 			const int nextGridIndex = perimeter[(i + 1) % perimeterCount];
+ 
+-			// Outward normal of an edge walked counter clockwise is (dir.y, -dir.x, 0).
++			// Outward normal of an edge walked counter clockwise is (dir.y, -dir.x, 0). Built from world
++			// space directions and stored as S^-1 of it, for the same reason as the grid normals above.
+ 			Vec3 outward(ZERO);
+-			const Vec3 dirIn = positions[gridIndex] - positions[prevGridIndex];
+-			const Vec3 dirOut = positions[nextGridIndex] - positions[gridIndex];
++			const Vec3 dirIn = localDirToWorld(positions[gridIndex] - positions[prevGridIndex]);
++			const Vec3 dirOut = localDirToWorld(positions[nextGridIndex] - positions[gridIndex]);
+ 			outward += Vec3(dirIn.y, -dirIn.x, 0.f);
+ 			outward += Vec3(dirOut.y, -dirOut.x, 0.f);
+-			outward = outward.IsZero() ? Vec3(0.f, -1.f, 0.f) : outward.GetNormalized();
++			outward = worldDirToLocal(outward, Vec3(0.f, -1.f, 0.f));
+ 
+-			Vec3 along = dirIn + dirOut;
+-			along = along.IsZero() ? Vec3(1.f, 0.f, 0.f) : along.GetNormalized();
++			const Vec3 along = worldDirToLocal(dirIn + dirOut, Vec3(1.f, 0.f, 0.f));
++			// World -Z maps to local -Z whatever the scale, so this one needs no conversion.
+ 			const Vec3 down(0.f, 0.f, -1.f);
+ 
+ 			const Vec3 top = positions[gridIndex];
+@@ -1257,7 +1299,7 @@ void CTerrainPlateComponent::InvalidateShadowCache()
+ 	// (CObjectManager::OnObjectModified, ObjectManager.cpp:3449-3453). Nothing fires it here: the mesh is
+ 	// replaced in place through IStatObj::GetIndexedMesh / Invalidate, so the slot keeps the same statobj
+ 	// pointer and neither CEntitySlot::UpdateRenderNode nor C3DEngine ever sees a geometry event. Without
+-	// this call, changing Z Max, Grid or the source leaves the cached cascade and the AO showing the old
++	// this call, changing the scale, Grid or the source leaves the cached cascade and the AO showing the old
+ 	// silhouette until an unrelated edit invalidates them.
+ 	if (gEnv == nullptr || gEnv->p3DEngine == nullptr)
+ 		return;
+diff --git a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
+index eb15c807..88d378e9 100644
+--- a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
++++ b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
+@@ -149,7 +149,9 @@ public:
+ 		desc.SetGUID("{3F1D8B4A-6C2E-4E9F-9A21-7B5C0D4E8A13}"_cry_guid);
+ 		desc.SetEditorCategory("Geometry");
+ 		desc.SetLabel("Terrain Plate");
+-		desc.SetDescription("A procedural relief plate built from a heightmap or a displacement texture, meant to be merged into the terrain");
++		desc.SetDescription("A procedural relief plate built from a heightmap or a displacement texture, meant to be merged into the terrain. "
++		                   "The plate is a unit plate: 1 x 1 m in XY and 0..1 m of relief; its size and height in the world come from the "
++		                   "entity or component transform scale (X/Y = size, Z = height of the relief).");
+ 		desc.SetIcon("icons:ObjectTypes/object.ico");
+ 		desc.SetComponentFlags({ IEntityComponent::EFlags::Transform, IEntityComponent::EFlags::Socket, IEntityComponent::EFlags::Attach });
+ 
+@@ -180,9 +182,9 @@ public:
+ 		desc.AddMember(&CTerrainPlateComponent::m_effectiveGridInfo, 'einf', "EffectiveGrid", "Effective Grid",
+ 		               "Read only: the grid that was actually generated (vertices along X x vertices along Y) and the resulting spacing in metres. "
+ 		               "Anything typed here is overwritten by the next rebuild.", Schematyc::CSharedString());
+-		desc.AddMember(&CTerrainPlateComponent::m_size, 'size', "Size", "Size", "Size of the plate in metres before the entity scale is applied", Vec2(1.f, 1.f));
+-		desc.AddMember(&CTerrainPlateComponent::m_zMax, 'zmax', "ZMax", "Z Max", "Height in metres of the fully white part of the source, before the entity scale is applied", 1.f);
+-		desc.AddMember(&CTerrainPlateComponent::m_bNormalize, 'norm', "Normalize", "Normalize", "On: the darkest sample becomes 0 and the brightest becomes Z Max. Off: the raw 0..1 value is multiplied by Z Max.", true);
++		desc.AddMember(&CTerrainPlateComponent::m_bNormalize, 'norm', "Normalize", "Normalize",
++		               "On: the darkest sample becomes 0 and the brightest becomes 1. Off: the raw 0..1 value of the source is used. "
++		               "Either way the relief spans 0..1 m before the entity scale; scale Z to set the height, and X/Y to set the size.", true);
+ 		desc.AddMember(&CTerrainPlateComponent::m_bMirrorX, 'mirx', "MirrorX", "Mirror X", "Mirrors the relief and its UVs along X (the editor cannot apply a negative scale)", false);
+ 		desc.AddMember(&CTerrainPlateComponent::m_bMirrorY, 'miry', "MirrorY", "Mirror Y", "Mirrors the relief and its UVs along Y (the editor cannot apply a negative scale)", false);
+ 
+@@ -219,6 +221,10 @@ protected:
+ 	bool        NeedsRegenerateOnTransform() const;
+ 	//! World transform of the plate slot, also valid before the slot exists.
+ 	Matrix34    GetPlateWorldTM() const;
++	//! Per axis world scale of the plate. Because the local plate is a unit plate (1 x 1 m in XY,
++	//! 0..1 m of relief), this is also the size of the plate in metres: x/y are the edge lengths and
++	//! z is the height of the relief. Components smaller than 0.0001 are reported as 1.
++	Vec3        GetWorldScale() const;
+ 	void        ApplyMaterial();
+ 	//! Half of e_TerrainIntegrateObjectsMaxVertices, or 0 when the cvar is unavailable.
+ 	int         GetIntegrationVertexBudget() const;
+@@ -245,8 +251,6 @@ protected:
+ 	Schematyc::Range<2, 513, 2, 513, int>        m_grid = 65;
+ 	Schematyc::Range<0, 1000, 0, 10, float>      m_vertexSpacing = 0.1f;
+ 	Schematyc::CSharedString                     m_effectiveGridInfo;
+-	Vec2                                         m_size = Vec2(1.f, 1.f);
+-	float                                        m_zMax = 1.f;
+ 	bool                                         m_bNormalize = true;
+ 	bool                                         m_bMirrorX = false;
+ 	bool                                         m_bMirrorY = false;
+@@ -268,6 +272,9 @@ protected:
+ 	bool                     m_bOwnsPhysicalEntity = false;
+ 	bool                     m_bPhysMeshWarningIssued = false;
+ 	uint32                   m_lastRegenFrameId = 0;
++	//! World scale the current mesh was generated for. The mesh itself is scale independent in XY, but
++	//! the normals, the weld, the skirt and the Spacing grid are not, so a scale change regenerates.
++	Vec3                     m_lastWorldScale = Vec3(1.f, 1.f, 1.f);
+ 	//! FNV-1a of the position stream of the last generated mesh; 0 until the first generation.
+ 	uint32                   m_geometryHash = 0;
+ 	_smart_ptr<IStatObj>     m_pStatObj;
+-- 
+2.47.1.windows.1
+

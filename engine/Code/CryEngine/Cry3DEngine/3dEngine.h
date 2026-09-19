@@ -845,6 +845,112 @@ public:
 	bool                  m_bIntegrateObjectsIntoTerrain;
 	bool                  m_supportOfflineProceduralVegetation = false;
 
+	//! Nodes contributing geometry to the terrain sector meshes, with the bbox they were last integrated
+	//! with (needed to rebuild the union of old and new sectors when a node moves).
+	std::map<IRenderNode*, AABB> m_integratedIntoTerrainNodes;
+
+	//! Flat copy of the boxes in m_integratedIntoTerrainNodes; queried per candidate sector per frame, so
+	//! the map's pointer chasing is avoided. Every writer of the map must refresh it.
+	std::vector<AABB>            m_integratedNodeBoxes;
+
+	void RefreshIntegratedNodeBoxes();
+
+	//! Largest non-negative STerrainIntegrationParams::heightBand among the registered integrated nodes,
+	//! or 0 when all of them defer to the cvar. Cached because the sector object query needs it on every
+	//! rebuild; recomputed by RefreshIntegratedNodeBoxes and raised by NotifyIntegrationHeightBandChanged
+	//! (editing a band does not touch the registry).
+	float m_fMaxIntegrationHeightBand = 0.f;
+
+	//! Vertical slack terrain object integration has to work with: the global cvar band, widened when a
+	//! registered object asks for a larger one. The sector object query grows UP by it and the rebuild
+	//! dirty boxes grow DOWN by it, so an object floating inside its own larger band is still looked at.
+	//! Returns the bare cvar on levels that integrate nothing, keeping the native path unchanged.
+	float GetTerrainIntegrationQueryBand() const;
+
+	//! Raise the cache after a per object band edit that did not go through the registry.
+	void  NotifyIntegrationHeightBandChanged(float fHeightBand);
+
+
+	//! Node currently inside an unregister/register pair (CBrush::SetMatrix, or the octree move done by
+	//! AsyncOctreeUpdate). The unregister half must leave the registry alone: the register half owns the
+	//! entry, and only then can it see the node as already integrating and debounce the move.
+	IRenderNode* m_pReRegisteringNode = nullptr;
+
+	//! Box already sent to ResetTerrainVertBuffers and the road rebuilds this frame. A request inside it
+	//! is duplicate work: the entity slot path registers the same node twice per frame.
+	AABB         m_lastIntegrationRebuildBox = AABB(AABB::RESET);
+	uint32       m_nLastIntegrationRebuildFrameId = 0;
+
+	//! Dirty the terrain sectors and the roads over `dirtyBox`, unless a wider box already went out this
+	//! frame.
+	void RunIntegrationRebuild(const AABB& dirtyBox);
+
+	//! True when any integrated object overlaps `box` in XY. Early-outs on levels that integrate nothing.
+	bool HasIntegratedObjectsInBoxXY(const AABB& box) const;
+
+	//! A terrain sector rebuild held back by e_TerrainIntegrateObjectsRebuildDelay.
+	struct SPendingTerrainRebuild
+	{
+		AABB   dirtyBox = AABB(AABB::RESET);
+		uint32 lastMoveFrameId = 0;
+	};
+
+	//! Debounced moves of already integrating nodes. Keys are only ever compared, never dereferenced.
+	std::map<IRenderNode*, SPendingTerrainRebuild> m_pendingTerrainRebuilds;
+
+	//! Request the terrain sector rebuild needed by a transition into/out of eGM_IntegrateIntoTerrain.
+	void UpdateTerrainObjectIntegration(IRenderNode* pEnt, EERType eERType, const AABB& aabb, bool bUnregister);
+
+	//! Runs the debounced rebuilds whose node has been still for long enough. Once per frame.
+	void FlushPendingTerrainRebuilds();
+
+	//! Integrating nodes whose LOD 0 render mesh was missing at the last scan. Keys are only ever
+	//! compared, never dereferenced; the set is rebuilt from the registry on every scan.
+	std::set<IRenderNode*> m_integrationNodesAwaitingMesh;
+	uint32                 m_nLastIntegrationMeshScanFrameId = 0;
+
+	//! Rebuilds the terrain around integrating objects whose render mesh has just finished streaming.
+	//! The bounded per sector retry is only a safety net; this is what actually closes the hole.
+	void UpdateIntegrationMeshArrivals();
+
+	//! Stamps every integrated brush the terrain draws in full this frame so CBrush::Render can skip its
+	//! own camera draw. Must run after the terrain traversal picked its sectors and before the outdoor
+	//! octree traversal, otherwise the verdict is a frame late.
+	void UpdateIntegratedObjectDrawSuppression(const SRenderingPassInfo& passInfo);
+
+	//! Rebuild every road overlapping `box` in XY so it re-drapes over a moved/added/removed integrating
+	//! object. No-op while e_RoadsFollowIntegratedObjects is 0.
+	void RequestRoadRebuildsInArea(const AABB& box);
+
+	//! One integrating object, cached in world space for the duration of a road rebuild.
+	struct SIntegratedHeightNode
+	{
+		AABB                          box;      //!< world AABB of the cached triangles
+		std::vector<Vec3>             verts;    //!< 3 world space positions per triangle
+		std::vector<std::vector<int>> bins;     //!< triangle ids per XY bin, row major (binsX * binsY)
+		int                           binsX = 1;
+		int                           binsY = 1;
+		float                         binSizeX = 1.f;
+		float                         binSizeY = 1.f;
+	};
+
+	//! LOD 0 geometry cached between BeginIntegratedHeightSampling() and its matching End. Empty
+	//! otherwise, which makes GetTerrainOrIntegratedZ() a pass-through on the native path.
+	std::vector<SIntegratedHeightNode> m_integratedHeightCache;
+	int                                m_nIntegratedHeightSamplingDepth = 0;
+
+	//! Cache the LOD 0 meshes overlapping `areaBox` for cheap repeated sampling. Main thread only, must
+	//! be paired with End; nesting is allowed and keeps the outer (larger) cache.
+	void  BeginIntegratedHeightSampling(const AABB& areaBox);
+	void  EndIntegratedHeightSampling();
+
+	//! `defaultZ` raised to the highest cached integrating surface over (x, y); unchanged when no
+	//! sampling scope is open.
+	float GetTerrainOrIntegratedZ(float x, float y, float defaultZ) const;
+
+	//! True when the open sampling scope has geometry overlapping `box` in XY.
+	bool  HasIntegratedHeightSamplesIn2D(const AABB& box) const;
+
 	Vec3                  m_fogColor2;
 	Vec3                  m_fogColorRadial;
 	Vec3                  m_volFogHeightDensity;

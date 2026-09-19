@@ -1,0 +1,600 @@
+From 79c57992364c1c3f820ed16962bbcaa29e3aabb4 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Mon, 31 Aug 2026 03:33:55 +0800
+Subject: [PATCH 235/307] !F (Terrain Plate) Add priority cascades for
+ overlapping bakes.
+
+Compose overlapping bakes in ascending priority and use entity GUIDs as a
+stable tie-breaker. Restore and rebuild the complete overlap set so removing
+or moving a plate cannot leave another plate in its captured baseline.
+---
+ .../Geometry/TerrainPlateComponent.cpp        | 359 ++++++++++++++----
+ .../Geometry/TerrainPlateComponent.h          |  41 +-
+ 2 files changed, 326 insertions(+), 74 deletions(-)
+
+diff --git a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
+index 39c9f4e4..ac25d047 100644
+--- a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
++++ b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
+@@ -37,9 +37,28 @@ ICVar* g_pTerrainPlateSettleFramesCVar = nullptr;
+ int    g_terrainPlateBakeProbeFrames = 16;
+ ICVar* g_pTerrainPlateBakeProbeFramesCVar = nullptr;
+ 
+-//! Every plate that currently holds a live bake. Only used to detect overlapping footprints; the
+-//! priority cascade that would make an overlap actually correct is step 3 of decision 04.
+-std::vector<CTerrainPlateComponent*> g_bakingPlates;
++//! Bake probing: how far apart the watched cells are, in terrain units. Nine probes over a large
++//! footprint leave tens of metres between them, so a sculpt through the middle of a big plate can sit
++//! entirely between two of them and never be noticed - the gap this closes (decision 04 step 3).
++int    g_terrainPlateBakeProbeSpacing = 4;
++ICVar* g_pTerrainPlateBakeProbeSpacingCVar = nullptr;
++
++//! Every terrain plate component that is alive, registered in Initialize and removed in the destructor.
++//! That is the whole "registry" the overlap cascade needs: it follows component add / remove, entity
++//! delete and level unload by construction, and needs no level or editor hook to stay correct.
++std::vector<CTerrainPlateComponent*> g_terrainPlates;
++
++//! Greater than zero while an overlap cascade is running. Everything a cascade does - restoring,
++//! regenerating, baking - writes the terrain and would otherwise start another cascade from inside
++//! itself, and would trip every other plate's polling. One guard covers both.
++int  g_bakeCascadeDepth = 0;
++//! Frame of the last completed cascade. The polling skips that frame, so N plates that all see the
++//! terrain move in the same frame produce one cascade between them, not N.
++uint32 g_bakeCascadeFrameId = ~0u;
++//! Never restore and re-bake more than this many plates in one cascade. Unreal caps its landscape edit
++//! layers at 8 for the same reason; the cost here is one mesh regeneration plus one SetTerrainElevation
++//! per plate, so the cap is about a runaway configuration, not about the normal case.
++const size_t kBakeCascadeMaxPlates = 16;
+ 
+ //! The terrain is kept this far below the plate mesh, so the two surfaces never fight (decision 04,
+ //! rule 1). One centimetre would already be below the 12 bit quantisation of a tall sector; two is
+@@ -81,6 +100,12 @@ void RegisterTerrainPlateCVars()
+ 	                                                    "it touches and erases the bake there, and the engine sends no notification for it, so\n"
+ 	                                                    "the plate watches nine cells of its own footprint and re-applies itself when they move.\n"
+ 	                                                    "0 - no polling, the bake stays erased until the plate is edited");
++
++	g_pTerrainPlateBakeProbeSpacingCVar = REGISTER_CVAR2("e_TerrainPlateBakeProbeSpacing", &g_terrainPlateBakeProbeSpacing, 4, VF_NULL,
++	                                                     "Terrain Plate component with Bake Into Terrain = true: distance in terrain units between\n"
++	                                                     "two watched cells of the bake. The probes are also capped to one per touched terrain\n"
++	                                                     "sector and to 33 per axis. Smaller catches a smaller sculpt in the middle of a large\n"
++	                                                     "plate; the cost is one array lookup per probe per poll.");
+ }
+ 
+ void UnregisterTerrainPlateCVars()
+@@ -92,10 +117,14 @@ void UnregisterTerrainPlateCVars()
+ 
+ 		if (g_pTerrainPlateBakeProbeFramesCVar != nullptr)
+ 			gEnv->pConsole->UnregisterVariable(g_pTerrainPlateBakeProbeFramesCVar->GetName());
++
++		if (g_pTerrainPlateBakeProbeSpacingCVar != nullptr)
++			gEnv->pConsole->UnregisterVariable(g_pTerrainPlateBakeProbeSpacingCVar->GetName());
+ 	}
+ 
+ 	g_pTerrainPlateSettleFramesCVar = nullptr;
+ 	g_pTerrainPlateBakeProbeFramesCVar = nullptr;
++	g_pTerrainPlateBakeProbeSpacingCVar = nullptr;
+ }
+ 
+ int CTerrainPlateComponent::GetSettleFrames()
+@@ -633,6 +662,14 @@ CTerrainPlateComponent::~CTerrainPlateComponent()
+ {
+ 	// Before anything else: the terrain must not keep the relief of a plate that no longer exists.
+ 	// Removing the component, deleting the entity and unloading the level all end here.
++	//
++	// Out of the registry FIRST, so that nothing can start an overlap cascade on a half destructed
++	// component (a cascade regenerates the mesh of every plate it touches). The restore below is then a
++	// plain one, and an overlapping plate whose baseline contains this plate's relief heals itself on
++	// its next poll: the cells this restore just changed fail its expected-height test, so it re-captures
++	// them as the new ground - which they now are - and re-bakes on top. @see ReapplyBakeAfterExternalEdit.
++	UnregisterPlate();
++
+ 	RestoreBakeBaseline();
+ 
+ 	ReleaseNativePhysics();
+@@ -657,6 +694,8 @@ void CTerrainPlateComponent::Initialize()
+ 	// turns this into ENTITY_SLOT_STATIC_GEOMETRY on the slot.
+ 	m_bForceStaticGeometry = true;
+ 
++	RegisterPlate();
++
+ 	Rebuild();
+ }
+ 
+@@ -1501,8 +1540,11 @@ void CTerrainPlateComponent::RegenerateMesh()
+ 	}
+ 
+ 	// Last, so that the baseline is captured from the restored ground and the block is computed from the
+-	// relief this very call just solved.
+-	ApplyBake();
++	// relief this very call just solved. Cascaded, because if another baking plate shares this
++	// footprint the whole overlapping set has to be unwound and re-applied in priority order - the
++	// baseline of a plate is only the original ground if everything above it is out of the terrain when
++	// it captures. @see ApplyBakeCascaded.
++	ApplyBakeCascaded();
+ }
+ 
+ //////////////////////////////////////////////////////////////////////////
+@@ -1884,7 +1926,6 @@ void CTerrainPlateComponent::RestoreBakeBaseline()
+ 		return;
+ 
+ 	m_bBakeApplied = false;
+-	UnregisterBakingPlate();
+ 
+ 	const SBakeTerrainMetrics metrics = GetBakeTerrainMetrics();
+ 	if (metrics.IsValid() && !m_bakeBaseline.empty())
+@@ -1897,7 +1938,7 @@ void CTerrainPlateComponent::RestoreBakeBaseline()
+ 	}
+ 
+ 	m_bakeResult.clear();
+-	m_bakeProbeCount = 0;
++	m_bakeProbes.clear();
+ }
+ 
+ void CTerrainPlateComponent::ApplyBake()
+@@ -1949,52 +1990,80 @@ void CTerrainPlateComponent::ApplyBake()
+ 
+ 	m_bBakeApplied = true;
+ 	m_lastBakeProbeFrameId = gEnv->nMainFrameID;
+-	RegisterBakingPlate();
+-	BuildBakeProbes(metrics, worldTM);
++	BuildBakeProbes(metrics);
+ 	WarnOnBakeQuantisation(metrics);
+ 	AfterBakeInvalidation(GetBakeWorldBox(metrics));
+ 
+ 	if (GetTerrainIntegrateDebugLevel() >= 1)
+ 	{
+ 		const float milliseconds = (gEnv->pTimer != nullptr) ? (gEnv->pTimer->GetAsyncTime() - startTime).GetMilliSeconds() : 0.f;
+-		CryLog("TerrainPlate '%s': bake rect units (%d,%d)+%d (%d x %d sectors), %d of %d cells raised, delta %.3f .. %.3f m, %.2f ms",
++		CryLog("TerrainPlate '%s': bake rect units (%d,%d)+%d (%d x %d sectors), %d of %d cells changed, delta %.3f .. %.3f m, %.2f ms",
+ 		       m_pEntity->GetName(), m_bakeRectX1, m_bakeRectY1, m_bakeRectSize,
+ 		       m_bakeRectSize / metrics.sectorUnits, m_bakeRectSize / metrics.sectorUnits,
+ 		       cellsWritten, (m_bakeRectSize + 1) * (m_bakeRectSize + 1), minDelta, maxDelta, milliseconds);
+ 	}
+ }
+ 
+-void CTerrainPlateComponent::BuildBakeProbes(const SBakeTerrainMetrics& metrics, const Matrix34& worldTM)
++void CTerrainPlateComponent::BuildBakeProbes(const SBakeTerrainMetrics& metrics)
+ {
+-	m_bakeProbeCount = 0;
++	m_bakeProbes.clear();
+ 
+ 	const int dim = m_bakeRectSize + 1;
+ 	if ((int)m_bakeResult.size() != dim * dim)
+ 		return;
+ 
+-	// The nine probes are the corners, the edge midpoints and the centre of the PLATE footprint, inset
+-	// by 20 % so that the corner probes sample real relief instead of the falloff rim, where the bake is
+-	// the baseline by construction and would never register a change.
+-	const AABB localBox(Vec3(-0.5f, -0.5f, 0.f), Vec3(0.5f, 0.5f, 1.f));
+-	const AABB worldBox = AABB::CreateTransformedAABB(worldTM, localBox);
++	// Step 2 watched nine cells: the corners, the edge midpoints and the centre of the plate footprint.
++	// That is enough for a small plate and demonstrably not enough for a large one - on a 200 m plate the
++	// probes are 50 m apart, so a sculpt through the middle of the footprint can sit entirely between
++	// them, erase the bake over a whole sector and never be noticed. Nothing in the engine announces a
++	// terrain edit (research 08 section 2.2), so the answer here is density, not a listener: the whole
++	// rect is covered by a grid whose spacing is the smaller of e_TerrainPlateBakeProbeSpacing units and
++	// one sector, so every sector an editor push could rewrite carries at least one probe.
++	//
++	// The probes cover the SECTOR ALIGNED rect, not just the plate: an edit next to the plate but inside
++	// the rect has to be picked up too, because ReapplyBakeAfterExternalEdit re-captures it as the new
++	// ground and the block we write covers the whole rect anyway.
++	const int spacing = clamp_tpl(min(max(1, g_terrainPlateBakeProbeSpacing), metrics.sectorUnits), 1, max(1, m_bakeRectSize));
++	const int probesPerAxis = clamp_tpl(m_bakeRectSize / spacing + 1, 3, 33);
++	const float cellStep = (float)m_bakeRectSize / (float)(probesPerAxis - 1);
+ 
+-	const float insetX = (worldBox.max.x - worldBox.min.x) * 0.2f;
+-	const float insetY = (worldBox.max.y - worldBox.min.y) * 0.2f;
++	m_bakeProbes.reserve((size_t)probesPerAxis * probesPerAxis);
+ 
+-	for (int i = 0; i < 3; ++i)
++	for (int i = 0; i < probesPerAxis; ++i)
+ 	{
+-		for (int j = 0; j < 3; ++j)
++		for (int j = 0; j < probesPerAxis; ++j)
+ 		{
+-			const float wx = (worldBox.min.x + insetX) + (worldBox.max.x - worldBox.min.x - 2.f * insetX) * (float)i * 0.5f;
+-			const float wy = (worldBox.min.y + insetY) + (worldBox.max.y - worldBox.min.y - 2.f * insetY) * (float)j * 0.5f;
+-
+-			const int ux = clamp_tpl((int)floorf(wx / metrics.unitSize), m_bakeRectX1, m_bakeRectX1 + m_bakeRectSize);
+-			const int uy = clamp_tpl((int)floorf(wy / metrics.unitSize), m_bakeRectY1, m_bakeRectY1 + m_bakeRectSize);
++			const int gx = clamp_tpl((int)(cellStep * (float)i + 0.5f), 0, dim - 1);
++			const int gy = clamp_tpl((int)(cellStep * (float)j + 0.5f), 0, dim - 1);
++
++			// Snap the probe to the most changed cell of its own block. A cell where the bake happens to
++			// equal the baseline still detects a sculpt landing on it, but it cannot detect the other
++			// failure - an editor push that re-pushes CHeightmap over the sector and erases the bake -
++			// because there is nothing to erase. The cell with the largest delta detects both.
++			const int half = max(1, (int)(cellStep * 0.5f));
++			int bestX = gx, bestY = gy;
++			float bestDelta = -1.f;
++
++			for (int ox = max(0, gx - half); ox <= min(dim - 1, gx + half); ++ox)
++			{
++				for (int oy = max(0, gy - half); oy <= min(dim - 1, gy + half); ++oy)
++				{
++					const size_t index = (size_t)ox * dim + oy;
++					const float delta = fabs_tpl(m_bakeResult[index] - m_bakeBaseline[index]);
++					if (delta > bestDelta)
++					{
++						bestDelta = delta;
++						bestX = ox;
++						bestY = oy;
++					}
++				}
++			}
+ 
+-			SBakeProbe& probe = m_bakeProbes[m_bakeProbeCount++];
+-			probe.ux = ux;
+-			probe.uy = uy;
+-			probe.expectedZ = m_bakeResult[(size_t)(ux - m_bakeRectX1) * dim + (uy - m_bakeRectY1)];
++			SBakeProbe probe;
++			probe.ux = m_bakeRectX1 + bestX;
++			probe.uy = m_bakeRectY1 + bestY;
++			probe.expectedZ = m_bakeResult[(size_t)bestX * dim + bestY];
++			m_bakeProbes.push_back(probe);
+ 		}
+ 	}
+ 
+@@ -2026,13 +2095,19 @@ void CTerrainPlateComponent::BuildBakeProbes(const SBakeTerrainMetrics& metrics,
+ 
+ void CTerrainPlateComponent::PollBake()
+ {
+-	if (!m_bBakeApplied || m_bakeProbeCount == 0)
++	if (!m_bBakeApplied || m_bakeProbes.empty())
+ 		return;
+ 
+ 	const int probeFrames = GetBakeProbeFrames();
+ 	if (probeFrames <= 0)
+ 		return;
+ 
++	// Never poll from inside a cascade, and not in the frame one finished either: the terrain moved
++	// because we moved it, and reacting to our own writes is how a poll storm starts. This is also the
++	// coalescing rule - a terrain edit that disturbs several plates costs one cascade, not one per plate.
++	if (g_bakeCascadeDepth > 0 || g_bakeCascadeFrameId == gEnv->nMainFrameID)
++		return;
++
+ 	if ((int)(gEnv->nMainFrameID - m_lastBakeProbeFrameId) < probeFrames)
+ 		return;
+ 
+@@ -2042,11 +2117,10 @@ void CTerrainPlateComponent::PollBake()
+ 	if (!metrics.IsValid())
+ 		return;
+ 
+-	// Nine array lookups (CTerrain::GetZfromUnits is a clamp, a sector lookup and an index), so this is
+-	// free even at every frame.
+-	for (int i = 0; i < m_bakeProbeCount; ++i)
++	// One array lookup per probe (CTerrain::GetZfromUnits is a clamp, a sector lookup and an index), so
++	// even the 33 x 33 cap costs nothing at this rate.
++	for (const SBakeProbe& probe : m_bakeProbes)
+ 	{
+-		const SBakeProbe& probe = m_bakeProbes[i];
+ 		if (fabs_tpl(SampleTerrainUnit(metrics, probe.ux, probe.uy) - probe.expectedZ) > m_bakeProbeTolerance)
+ 		{
+ 			ReapplyBakeAfterExternalEdit(metrics);
+@@ -2152,52 +2226,207 @@ void CTerrainPlateComponent::WarnOnBakeQuantisation(const SBakeTerrainMetrics& m
+ 	}
+ }
+ 
+-void CTerrainPlateComponent::RegisterBakingPlate()
++void CTerrainPlateComponent::RegisterPlate()
+ {
+-	if (std::find(g_bakingPlates.begin(), g_bakingPlates.end(), this) == g_bakingPlates.end())
++	if (std::find(g_terrainPlates.begin(), g_terrainPlates.end(), this) == g_terrainPlates.end())
+ 	{
+-		g_bakingPlates.push_back(this);
++		g_terrainPlates.push_back(this);
+ 	}
++}
+ 
+-	if (m_bBakeOverlapWarningIssued || m_pEntity == nullptr)
+-		return;
++void CTerrainPlateComponent::UnregisterPlate()
++{
++	auto it = std::find(g_terrainPlates.begin(), g_terrainPlates.end(), this);
++	if (it != g_terrainPlates.end())
++	{
++		g_terrainPlates.erase(it);
++	}
++}
+ 
+-	// Overlapping plates: step 2 only detects and warns. Making an overlap actually correct needs the
+-	// whole set restored in reverse order and re-baked in a defined order (entity GUID, later a Bake
+-	// Priority), because each plate's baseline is captured from the terrain as it finds it - that is
+-	// step 3 of decision 04. Without it, the plate that bakes last simply wins in the overlap, and its
+-	// baseline contains the other plate's relief, so removing them in the wrong order leaves a bump.
+-	for (CTerrainPlateComponent* pOther : g_bakingPlates)
++bool CTerrainPlateComponent::GetBakeCascadeRect(int& outX1, int& outY1, int& outSize) const
++{
++	if (!m_bBakeIntoTerrain || m_pEntity == nullptr)
++		return false;
++
++	// A plate that already holds a bake is asked for the rect it holds; one that has not baked yet (a
++	// level that is still loading, or a plate whose Bake Into Terrain was just ticked) is asked for the
++	// rect it is about to take. Both have to take part in the cascade, otherwise whichever plate baked
++	// first would capture the other one's ground as its baseline and the composite would depend on the
++	// order the entity system happened to tick them in.
++	if (m_bBakeApplied && m_bakeRectSize > 0)
+ 	{
+-		if (pOther == this || pOther->m_pEntity == nullptr || !pOther->m_bBakeApplied)
+-			continue;
++		outX1 = m_bakeRectX1;
++		outY1 = m_bakeRectY1;
++		outSize = m_bakeRectSize;
++		return true;
++	}
++
++	const SBakeTerrainMetrics metrics = GetBakeTerrainMetrics();
++	if (!metrics.IsValid())
++		return false;
++
++	return ComputeBakeRect(metrics, GetPlateWorldTM(), outX1, outY1, outSize);
++}
+ 
+-		const bool bOverlaps = (m_bakeRectX1 < pOther->m_bakeRectX1 + pOther->m_bakeRectSize)
+-		                       && (pOther->m_bakeRectX1 < m_bakeRectX1 + m_bakeRectSize)
+-		                       && (m_bakeRectY1 < pOther->m_bakeRectY1 + pOther->m_bakeRectSize)
+-		                       && (pOther->m_bakeRectY1 < m_bakeRectY1 + m_bakeRectSize);
++bool CTerrainPlateComponent::BakesBefore(const CTerrainPlateComponent& other) const
++{
++	// Decision 04 rule 7: higher Bake Priority bakes later and therefore wins in the overlap. The GUID
++	// tiebreak is what makes the result reproducible - a GUID is stable across saves and loads, whereas
++	// the registry order is whatever the entity system happened to spawn.
++	if ((int)m_bakePriority != (int)other.m_bakePriority)
++		return (int)m_bakePriority < (int)other.m_bakePriority;
++
++	if (m_pEntity != nullptr && other.m_pEntity != nullptr)
++		return m_pEntity->GetGuid() < other.m_pEntity->GetGuid();
+ 
+-		if (!bOverlaps)
+-			continue;
++	return this < &other;
++}
+ 
+-		m_bBakeOverlapWarningIssued = true;
+-		pOther->m_bBakeOverlapWarningIssued = true;
++void CTerrainPlateComponent::CollectBakeCascadeSet(std::vector<CTerrainPlateComponent*>& out) const
++{
++	out.clear();
+ 
+-		CryWarning(VALIDATOR_MODULE_ENTITYSYSTEM, VALIDATOR_WARNING,
+-		           "Terrain Plate '%s': its bake footprint overlaps the baking plate '%s'. Both are baked, in entity GUID order, but "
+-		           "neither knows about the other: the one that bakes last captures the other's relief as its own ground. Keep baking "
+-		           "plates apart until Bake Priority arrives.",
+-		           m_pEntity->GetName(), pOther->m_pEntity->GetName());
++	int x1 = 0, y1 = 0, size = 0;
++	if (!GetBakeCascadeRect(x1, y1, size))
+ 		return;
++
++	std::vector<int> rects;   // x1, y1, size per entry, parallel to out
++	out.push_back(const_cast<CTerrainPlateComponent*>(this));
++	rects.push_back(x1);
++	rects.push_back(y1);
++	rects.push_back(size);
++
++	// Transitive closure over rect intersection: a third plate that only overlaps the second one still
++	// has to be unwound, because the second one's baseline will be re-captured from ground the third one
++	// is sitting on. Quadratic in the number of baking plates, but it only runs when a bake actually
++	// changes and the count is a handful.
++	for (size_t i = 0; i < out.size() && out.size() < kBakeCascadeMaxPlates; ++i)
++	{
++		const int ax1 = rects[i * 3], ay1 = rects[i * 3 + 1], aSize = rects[i * 3 + 2];
++
++		for (CTerrainPlateComponent* pOther : g_terrainPlates)
++		{
++			if (std::find(out.begin(), out.end(), pOther) != out.end())
++				continue;
++
++			int bx1 = 0, by1 = 0, bSize = 0;
++			if (!pOther->GetBakeCascadeRect(bx1, by1, bSize))
++				continue;
++
++			const bool bOverlaps = (ax1 < bx1 + bSize) && (bx1 < ax1 + aSize)
++			                       && (ay1 < by1 + bSize) && (by1 < ay1 + aSize);
++			if (!bOverlaps)
++				continue;
++
++			out.push_back(pOther);
++			rects.push_back(bx1);
++			rects.push_back(by1);
++			rects.push_back(bSize);
++
++			if (out.size() >= kBakeCascadeMaxPlates)
++				break;
++		}
+ 	}
++
++	std::stable_sort(out.begin(), out.end(),
++	                 [](const CTerrainPlateComponent* pA, const CTerrainPlateComponent* pB) { return pA->BakesBefore(*pB); });
++}
++
++void CTerrainPlateComponent::LogBakeOverlapOnce(const CTerrainPlateComponent& other)
++{
++	if (m_bBakeOverlapWarningIssued || m_pEntity == nullptr || other.m_pEntity == nullptr)
++		return;
++
++	m_bBakeOverlapWarningIssued = true;
++
++	// Step 2 raised a real warning here, because the overlap was genuinely unresolved. It is handled
++	// now, so this is only a log line - but the user still wants to know that two plates share ground
++	// and that Bake Priority is what decides which of them is on top.
++	CryLog("TerrainPlate '%s' (Bake Priority %d): footprint shared with '%s' (Bake Priority %d). The overlapping plates are "
++	       "restored and re-baked together, lowest priority first, so the higher priority plate wins where they meet.",
++	       m_pEntity->GetName(), (int)m_bakePriority, other.m_pEntity->GetName(), (int)other.m_bakePriority);
+ }
+ 
+-void CTerrainPlateComponent::UnregisterBakingPlate()
++void CTerrainPlateComponent::ApplyBakeCascaded()
+ {
+-	auto it = std::find(g_bakingPlates.begin(), g_bakingPlates.end(), this);
+-	if (it != g_bakingPlates.end())
++	// Inside a cascade the driver below has already decided who bakes when, so a participant just bakes.
++	// This is the recursion guard as well: the loop below calls RegenerateMesh, which comes straight
++	// back here, and a cascade started from inside a cascade would restore plates that are half way
++	// through being re-applied.
++	if (g_bakeCascadeDepth > 0)
++	{
++		ApplyBake();
++		return;
++	}
++
++	std::vector<CTerrainPlateComponent*> affected;
++	CollectBakeCascadeSet(affected);
++
++	if (affected.size() <= 1)
++	{
++		ApplyBake();   // the normal case: this plate owns its footprint alone
++		return;
++	}
++
++	// The cascade. Every plate captures its baseline from the terrain as it finds it, so the only way a
++	// composite is well defined is to unwind the whole overlapping set and re-apply it in one order:
++	//
++	//   restore in DESCENDING priority - the exact inverse of the order they were applied in, so each
++	//                                    plate writes back a baseline that is still the truth and the
++	//                                    terrain ends up at the original ground;
++	//   bake in ASCENDING priority     - each plate then captures the composite of everything below it,
++	//                                    and the highest priority plate is written last, so it wins.
++	//
++	// The re-bake goes through RegenerateMesh, not ApplyBake, because the ground under a plate moved and
++	// the edge weld of its mesh is solved against that ground.
++	++g_bakeCascadeDepth;
++
++	for (size_t i = affected.size(); i-- > 0; )
++	{
++		affected[i]->RestoreBakeBaseline();
++	}
++
++	for (CTerrainPlateComponent* pPlate : affected)
++	{
++		// A plate that has not reached its own first-update trigger yet would refuse to bake (decision
++		// 04 rule 5). Releasing it here is safe: we only get this far with a terrain in the engine, which
++		// is exactly what that flag waits for. This is also what makes a level load composite correctly -
++		// the first plate to tick pulls every plate it overlaps into the same ordered pass, so the result
++		// does not depend on which of them ticked first.
++		if (pPlate->m_bInitialBakePending)
++		{
++			pPlate->m_bInitialBakePending = false;
++			if (pPlate->m_pEntity != nullptr)
++			{
++				pPlate->m_pEntity->UpdateComponentEventMask(pPlate);
++			}
++		}
++
++		// For the plate that started this, that is one recursion into RegenerateMesh - harmless, because
++		// ApplyBakeCascaded is the last thing RegenerateMesh does and the guard above turns the inner call
++		// into a plain ApplyBake. It costs one extra mesh generation and buys the guarantee that every
++		// plate in the set, the seed included, is welded against the ground it actually ends up on.
++		pPlate->RegenerateMesh();
++		pPlate->m_lastBakeProbeFrameId = gEnv->nMainFrameID;
++
++		if (pPlate != this)
++		{
++			pPlate->LogBakeOverlapOnce(*this);
++			LogBakeOverlapOnce(*pPlate);
++		}
++	}
++
++	--g_bakeCascadeDepth;
++
++	// Coalescing: the cascade just rewrote the terrain under every plate in the set, and it may well have
++	// touched a sector a plate outside the set also watches. Remembering the frame lets the polling stand
++	// down for it, so N plates seeing the same terrain change produce one cascade between them, not N.
++	g_bakeCascadeFrameId = gEnv->nMainFrameID;
++
++	if (GetTerrainIntegrateDebugLevel() >= 1)
+ 	{
+-		g_bakingPlates.erase(it);
++		CryLog("TerrainPlate '%s': overlap cascade over %d plates, restored highest priority first and re-baked lowest priority first",
++		       (m_pEntity != nullptr) ? m_pEntity->GetName() : "?", (int)affected.size());
+ 	}
+ }
+ 
+diff --git a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
+index 6f4eab99..23d20f50 100644
+--- a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
++++ b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
+@@ -123,7 +123,7 @@ struct SBakeTerrainMetrics
+ 	bool IsValid() const { return hmapSize > 0 && sectorUnits > 0 && unitSize > 0.f; }
+ };
+ 
+-//! One of the nine cells the bake polling watches, with the height the bake left there.
++//! One of the cells the bake polling watches, with the height the bake left there.
+ struct SBakeProbe
+ {
+ 	int   ux = 0;
+@@ -241,6 +241,13 @@ public:
+ 		               "code at all. Turning it off (or moving, rescaling or deleting the plate) puts the original ground back first.",
+ 		               false);
+ 
++		desc.AddMember(&CTerrainPlateComponent::m_bakePriority, 'bpri', "BakePriority", "Bake Priority",
++		               "Order in which overlapping baking plates are written into the terrain: the higher priority plate bakes last "
++		               "and therefore wins where two footprints meet, with the lower one showing through as the ground it sits on. "
++		               "Plates with the same priority are ordered by their entity GUID, so the result is the same on every load. "
++		               "Only matters when two baking plates overlap.",
++		               0);
++
+ 		desc.AddMember(&CTerrainPlateComponent::m_renderParameters, 'rend', "Render", "Rendering Settings", "Settings for the rendered representation of the component", plateRenderDefaults);
+ 		desc.AddMember(&CTerrainPlateComponent::m_physics, 'phys', "Physics", "Physics Settings",
+ 		               "Physical properties for the object. With Type = Render and Collider the plate physicalizes itself as a static "
+@@ -309,18 +316,34 @@ protected:
+ 	void  AfterBakeInvalidation(const AABB& box);
+ 	//! World box of the current bake rect, from the captured baseline and the written result.
+ 	AABB  GetBakeWorldBox(const SBakeTerrainMetrics& metrics) const;
+-	//! Nine cells (corners, edge midpoints and centre of the footprint, inset so they sample real relief).
+-	void  BuildBakeProbes(const SBakeTerrainMetrics& metrics, const Matrix34& worldTM);
++	//! A grid of watched cells over the footprint, dense enough that a sculpt between two probes cannot
++	//! stay unnoticed: at least one probe per touched sector, and one every
++	//! e_TerrainPlateBakeProbeSpacing units, each snapped to the most changed cell around it.
++	void  BuildBakeProbes(const SBakeTerrainMetrics& metrics);
+ 	//! Compares the probes with the terrain every e_TerrainPlateBakeProbeFrames frames.
+ 	void  PollBake();
+ 	//! Rebuilds the baseline from what the editor left behind and re-applies the plate on top of it.
+ 	void  ReapplyBakeAfterExternalEdit(const SBakeTerrainMetrics& metrics);
+ 	//! Warns once when the bake cost a touched sector more than half of its height precision.
+ 	void  WarnOnBakeQuantisation(const SBakeTerrainMetrics& metrics);
+-	//! Adds this plate to / removes it from the list of plates holding a live bake, and warns once
+-	//! when another baking plate overlaps this one.
+-	void  RegisterBakingPlate();
+-	void  UnregisterBakingPlate();
++	//! Adds this component to / removes it from the file static registry of terrain plates. Called from
++	//! Initialize and from the destructor, so the registry follows component add / remove and level
++	//! load / unload without any level or editor hook.
++	void  RegisterPlate();
++	void  UnregisterPlate();
++	//! Sector aligned rect this plate occupies in the terrain: the live one if a bake is applied, the
++	//! one it would take otherwise. False when the plate does not bake or has no usable footprint.
++	bool  GetBakeCascadeRect(int& outX1, int& outY1, int& outSize) const;
++	//! Every baking plate transitively connected to this one by an overlapping rect, this one included,
++	//! sorted by Bake Priority and then by entity GUID.
++	void  CollectBakeCascadeSet(std::vector<CTerrainPlateComponent*>& out) const;
++	//! Cascade order: lower Bake Priority bakes first; ties by entity GUID, which is stable across loads.
++	bool  BakesBefore(const CTerrainPlateComponent& other) const;
++	//! ApplyBake for a plate that owns its footprint alone, the whole restore / re-bake cascade when it
++	//! shares it with another baking plate. This is what RegenerateMesh calls.
++	void  ApplyBakeCascaded();
++	//! Logs once that this plate shares its footprint with another one, now that the cascade handles it.
++	void  LogBakeOverlapOnce(const CTerrainPlateComponent& other);
+ 	//! Relief of the plate at a local XY, in the unit plate's 0..1 local Z. Reproduces exactly what
+ 	//! RegenerateMesh put into the mesh, Normalize and Mirror included.
+ 	float GetPlateReliefAt(float lx, float ly) const;
+@@ -348,6 +371,7 @@ protected:
+ 	Schematyc::Range<0, 1000, 0, 20, float>      m_skirt = 0.25f;
+ 	bool                                         m_bUpdateDuringDrag = false;
+ 	bool                                         m_bBakeIntoTerrain = false;
++	Schematyc::Range<-128, 127, -128, 127, int>  m_bakePriority = 0;
+ 
+ 	// Cached state, never serialised: the mesh is always rebuilt on load.
+ 	STerrainPlateHeightField m_heightField;
+@@ -393,8 +417,7 @@ protected:
+ 	//! world X and uy along world Y, the order SetTerrainElevation itself uses.
+ 	std::vector<float>       m_bakeBaseline;   //!< the original ground, restored on any change
+ 	std::vector<float>       m_bakeResult;     //!< what the last bake actually wrote
+-	SBakeProbe               m_bakeProbes[9];
+-	int                      m_bakeProbeCount = 0;
++	std::vector<SBakeProbe>  m_bakeProbes;
+ 	//! A few quantisation steps of the coarsest touched sector: a height never survives a round trip
+ 	//! through SetTerrainElevation exactly.
+ 	float                    m_bakeProbeTolerance = 0.01f;
+-- 
+2.47.1.windows.1
+

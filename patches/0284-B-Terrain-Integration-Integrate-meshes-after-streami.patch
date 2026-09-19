@@ -1,0 +1,194 @@
+From 032b6b0fad50b316b7df4299ae6dab865fe38b29 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Wed, 2 Sep 2026 11:13:02 +0800
+Subject: [PATCH 284/307] !B (Terrain Integration) Integrate meshes after
+ streaming completes.
+
+Poll registered integrating nodes for LOD 0 meshes that arrive after bounded
+sector retries are exhausted. Rebuild their accumulated bounds once the mesh
+becomes available and clear pending state on level unload.
+---
+ Code/CryEngine/Cry3DEngine/3dEngine.cpp       | 57 +++++++++++++++++++
+ Code/CryEngine/Cry3DEngine/3dEngine.h         |  9 +++
+ Code/CryEngine/Cry3DEngine/3dEngineLoad.cpp   |  1 +
+ Code/CryEngine/Cry3DEngine/terrain_node.cpp   |  6 +-
+ Code/CryEngine/Cry3DEngine/terrain_sector.h   |  3 +-
+ .../Cry3DEngine/terrain_sector_render.cpp     | 10 +++-
+ 6 files changed, 81 insertions(+), 5 deletions(-)
+
+diff --git a/Code/CryEngine/Cry3DEngine/3dEngine.cpp b/Code/CryEngine/Cry3DEngine/3dEngine.cpp
+index eb9b49bc..68471a70 100644
+--- a/Code/CryEngine/Cry3DEngine/3dEngine.cpp
++++ b/Code/CryEngine/Cry3DEngine/3dEngine.cpp
+@@ -623,6 +623,7 @@ void C3DEngine::Update()
+ 	}
+ 
+ 	FlushPendingTerrainRebuilds();
++	UpdateIntegrationMeshArrivals();
+ 
+ 	if (m_bEditor)
+ 		CRoadRenderNode::FreeStaticMemoryUsage();
+@@ -6972,6 +6973,62 @@ void C3DEngine::FlushPendingTerrainRebuilds()
+ 	}
+ }
+ 
++///////////////////////////////////////////////////////////////////////////////
++void C3DEngine::UpdateIntegrationMeshArrivals()
++{
++	if (!m_bIntegrateObjectsIntoTerrain || m_integratedIntoTerrainNodes.empty())
++	{
++		if (!m_integrationNodesAwaitingMesh.empty())
++			m_integrationNodesAwaitingMesh.clear();
++
++		return;
++	}
++
++	// Streaming latency is orders of magnitude above a few frames, so scanning the registry every frame
++	// would be pure overhead.
++	const uint32 nScanIntervalFrames = 8;
++	const uint32 nFrameId = gEnv->nMainFrameID;
++
++	if (nFrameId - m_nLastIntegrationMeshScanFrameId < nScanIntervalFrames)
++		return;
++
++	m_nLastIntegrationMeshScanFrameId = nFrameId;
++
++	// Rebuilt from the registry, so an unregistered node drops out on its own and the set cannot grow.
++	std::set<IRenderNode*> stillAwaiting;
++	AABB arrivedBox(AABB::RESET);
++	int nArrived = 0;
++
++	for (std::map<IRenderNode*, AABB>::const_iterator it = m_integratedIntoTerrainNodes.begin();
++	     it != m_integratedIntoTerrainNodes.end(); ++it)
++	{
++		IRenderNode* pNode = it->first;
++
++		// LOD 0 is the one AppendTrianglesFromObjects copies from; nothing else can close the hole.
++		if (!pNode->GetRenderMesh(0))
++		{
++			stillAwaiting.insert(pNode);
++			continue;
++		}
++
++		if (m_integrationNodesAwaitingMesh.find(pNode) == m_integrationNodesAwaitingMesh.end())
++			continue;
++
++		// Rising edge: the mesh arrived after the sector had already given up on it.
++		arrivedBox.Add(it->second);
++		arrivedBox.Add(pNode->GetBBox());
++		nArrived++;
++
++		if (GetCVars()->e_TerrainIntegrateObjectsDebug >= 1)
++			PrintMessage("TerrainIntegration: render mesh arrived for '%s', rebuilding its sectors", pNode->GetName());
++	}
++
++	m_integrationNodesAwaitingMesh.swap(stillAwaiting);
++
++	if (nArrived)
++		RunIntegrationRebuild(arrivedBox);
++}
++
+ ///////////////////////////////////////////////////////////////////////////////
+ void C3DEngine::RequestRoadRebuildsInArea(const AABB& box)
+ {
+diff --git a/Code/CryEngine/Cry3DEngine/3dEngine.h b/Code/CryEngine/Cry3DEngine/3dEngine.h
+index 5483767b..0083baee 100644
+--- a/Code/CryEngine/Cry3DEngine/3dEngine.h
++++ b/Code/CryEngine/Cry3DEngine/3dEngine.h
+@@ -888,6 +888,15 @@ public:
+ 	//! Runs the debounced rebuilds whose node has been still for long enough. Once per frame.
+ 	void FlushPendingTerrainRebuilds();
+ 
++	//! Integrating nodes whose LOD 0 render mesh was missing at the last scan. Keys are only ever
++	//! compared, never dereferenced; the set is rebuilt from the registry on every scan.
++	std::set<IRenderNode*> m_integrationNodesAwaitingMesh;
++	uint32                 m_nLastIntegrationMeshScanFrameId = 0;
++
++	//! Rebuilds the terrain around integrating objects whose render mesh has just finished streaming.
++	//! The bounded per sector retry is only a safety net; this is what actually closes the hole.
++	void UpdateIntegrationMeshArrivals();
++
+ 	//! Stamps every integrated brush the terrain draws in full this frame so CBrush::Render can skip its
+ 	//! own camera draw. Must run after the terrain traversal picked its sectors and before the outdoor
+ 	//! octree traversal, otherwise the verdict is a frame late.
+diff --git a/Code/CryEngine/Cry3DEngine/3dEngineLoad.cpp b/Code/CryEngine/Cry3DEngine/3dEngineLoad.cpp
+index 5472e2a6..59a3074d 100644
+--- a/Code/CryEngine/Cry3DEngine/3dEngineLoad.cpp
++++ b/Code/CryEngine/Cry3DEngine/3dEngineLoad.cpp
+@@ -339,6 +339,7 @@ void C3DEngine::UnloadLevel()
+ 	m_integratedIntoTerrainNodes.clear();
+ 	m_integratedNodeBoxes.clear();
+ 	m_pendingTerrainRebuilds.clear();
++	m_integrationNodesAwaitingMesh.clear();
+ 
+ 	if (gEnv->pCharacterManager)
+ 	{
+diff --git a/Code/CryEngine/Cry3DEngine/terrain_node.cpp b/Code/CryEngine/Cry3DEngine/terrain_node.cpp
+index 4d924b7f..78521cc4 100644
+--- a/Code/CryEngine/Cry3DEngine/terrain_node.cpp
++++ b/Code/CryEngine/Cry3DEngine/terrain_node.cpp
+@@ -673,11 +673,13 @@ void CTerrainNode::RenderNodeHeightmap(const SRenderingPassInfo& passInfo, Frust
+ 		bMeshIsUpToDate = RenderSector(passInfo);
+ 
+ 		// An integrated object was skipped last build because its render mesh was still streaming in;
+-		// rebuild, but only kMaxIntegrationRetries times so a mesh that never arrives cannot spin.
++		// rebuild, but only kMaxIntegrationRetries times so a mesh that never arrives cannot spin. The
++		// real fix is C3DEngine::UpdateIntegrationMeshArrivals, which rebuilds when the mesh shows up;
++		// this is the short range safety net and its budget is refilled by any non-retry invalidation.
+ 		if (m_bIntegrationRetryPending && bMeshIsUpToDate)
+ 		{
+ 			m_bIntegrationRetryPending = false;
+-			ReleaseHeightMapGeometry();
++			ReleaseHeightMapGeometry(false, NULL, true);
+ 		}
+ 	}
+ 
+diff --git a/Code/CryEngine/Cry3DEngine/terrain_sector.h b/Code/CryEngine/Cry3DEngine/terrain_sector.h
+index e0e6eccf..ae67d858 100644
+--- a/Code/CryEngine/Cry3DEngine/terrain_sector.h
++++ b/Code/CryEngine/Cry3DEngine/terrain_sector.h
+@@ -414,7 +414,8 @@ public:
+ 	void                         SetLOD(const SRenderingPassInfo& passInfo);
+ 	uint8                        GetTextureLOD(float fDistance, const SRenderingPassInfo& passInfo);
+ 
+-	void                         ReleaseHeightMapGeometry(bool bRecursive = false, const AABB* pBox = NULL);
++	// bIntegrationRetry: the caller IS the streaming retry, so the retry budget must not be replenished.
++	void                         ReleaseHeightMapGeometry(bool bRecursive = false, const AABB* pBox = NULL, bool bIntegrationRetry = false);
+ 	void                         ResetHeightMapGeometry(bool bRecursive = false, const AABB* pBox = NULL);
+ 	int                          GetSecIndex();
+ 
+diff --git a/Code/CryEngine/Cry3DEngine/terrain_sector_render.cpp b/Code/CryEngine/Cry3DEngine/terrain_sector_render.cpp
+index e6125e01..2eabd24c 100644
+--- a/Code/CryEngine/Cry3DEngine/terrain_sector_render.cpp
++++ b/Code/CryEngine/Cry3DEngine/terrain_sector_render.cpp
+@@ -643,11 +643,17 @@ void CTerrainNode::UpdateRangeInfoShift()
+ 	}
+ }
+ 
+-void CTerrainNode::ReleaseHeightMapGeometry(bool bRecursive, const AABB* pBox)
++void CTerrainNode::ReleaseHeightMapGeometry(bool bRecursive, const AABB* pBox, bool bIntegrationRetry)
+ {
+ 	if (pBox && !Overlap::AABB_AABB(*pBox, GetBBox()))
+ 		return;
+ 
++	// Any invalidation that is NOT the bounded retry itself (heightmap edit, an object move, a mesh that
++	// finally streamed in) is fresh evidence, so the retry budget starts over. Without this the budget is
++	// spent once per level and never refilled.
++	if (!bIntegrationRetry)
++		m_nIntegrationRetriesLeft = kMaxIntegrationRetries;
++
+ 	for (int i = 0; i < m_lstSurfaceTypeInfo.Count(); i++)
+ 		m_lstSurfaceTypeInfo[i].DeleteRenderMeshes(GetRenderer());
+ 
+@@ -666,7 +672,7 @@ void CTerrainNode::ReleaseHeightMapGeometry(bool bRecursive, const AABB* pBox)
+ 
+ 	if (bRecursive && m_pChilds)
+ 		for (int i = 0; i < 4; i++)
+-			m_pChilds[i].ReleaseHeightMapGeometry(bRecursive, pBox);
++			m_pChilds[i].ReleaseHeightMapGeometry(bRecursive, pBox, bIntegrationRetry);
+ }
+ 
+ void CTerrainNode::ResetHeightMapGeometry(bool bRecursive, const AABB* pBox)
+-- 
+2.47.1.windows.1
+

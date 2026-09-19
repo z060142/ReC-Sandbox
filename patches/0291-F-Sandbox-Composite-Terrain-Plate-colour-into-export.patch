@@ -1,0 +1,201 @@
+From 49c5e36db90d967c4daae8ff265288b05556476d Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Wed, 2 Sep 2026 17:28:29 +0800
+Subject: [PATCH 291/307] !F (Sandbox) Composite Terrain Plate colour into
+ exported terrain textures.
+
+Apply the live Terrain Plate colour compositor to outgoing terrain export tiles
+before compression. The game texture matches the editor preview while CRGBLayer
+and the saved level colour remain unchanged.
+---
+ Code/Sandbox/EditorQt/GameExporter.cpp        | 34 ++++++++++++++
+ .../Terrain/TerrainPlateColourOverlay.cpp     | 46 +++++++++++++++++--
+ .../Terrain/TerrainPlateColourOverlay.h       | 17 +++++++
+ 3 files changed, 94 insertions(+), 3 deletions(-)
+
+diff --git a/Code/Sandbox/EditorQt/GameExporter.cpp b/Code/Sandbox/EditorQt/GameExporter.cpp
+index 7503c96d..21c085fb 100644
+--- a/Code/Sandbox/EditorQt/GameExporter.cpp
++++ b/Code/Sandbox/EditorQt/GameExporter.cpp
+@@ -16,6 +16,7 @@
+ #include "Objects/ObjectPhysicsManager.h"
+ #include "Particles/ParticleManager.h"
+ #include "Terrain/TerrainManager.h"
++#include "Terrain/TerrainPlateColourOverlay.h"
+ #include "Terrain/TerrainTexGen.h"
+ #include "Terrain/TextureCompression.h"
+ #include "Vegetation/VegetationMap.h"
+@@ -889,6 +890,9 @@ bool CGameExporter::ExportSurfaceTexture(CPakFile& levelPakFile, const char* szF
+ 	// release header memory
+ 	ctcFile.Close();
+ 
++	// One plate scan for the whole export: the per texel composite below re-resolves out of this snapshot.
++	TerrainPlateColourOverlay::BeginExport();
++
+ 	{
+ 		CTerrainLayerTexGen LayerTexGen;        // to generate the terrain texture
+ 		CTerrainLightGen LightGen(m_settings.nApplySS, &levelPakFile, m_settings.bUpdateIndirectLighting);// to generate the surface occlusion/lighting data
+@@ -909,6 +913,7 @@ bool CGameExporter::ExportSurfaceTexture(CPakFile& levelPakFile, const char* szF
+ 
+ 		if (!_ExportSurfaceTextureRecursive(levelPakFile, fileTemp, phelper, iIndexBlockValue, phelper.m_TempMem[0].m_Quarter[0], fLeft, fTop, fWidth, fHeight))
+ 		{
++			TerrainPlateColourOverlay::EndExport();
+ 			Error("Error exporting terrain texture recursive");
+ 			return false;
+ 		}
+@@ -916,6 +921,8 @@ bool CGameExporter::ExportSurfaceTexture(CPakFile& levelPakFile, const char* szF
+ 		pSystem->GetILog()->Log("* Building AO data took %d seconds *", int(gBuildSectorAODataTime));
+ 	}
+ 
++	TerrainPlateColourOverlay::EndExport();
++
+ 	return true;
+ }
+ 
+@@ -1068,6 +1075,33 @@ bool CGameExporter::_ExportSurfaceTextureRecursive(CPakFile& levelPakFile, CCryM
+ 			CRGBLayer* pRGBLayer = GetIEditorImpl()->GetTerrainManager()->GetRGBLayer();
+ 
+ 			pRGBLayer->GetSubImageStretched(fMinX, fMinY, fMinX + fWidth, fMinY + fHeight, ref, true);
++
++			// THE plate colour reaching the game. This buffer is the outgoing export tile and nothing else:
++			// CRGBLayer was only read above, so the editor's own colour is untouched by the export. Coarser
++			// tiles need no pass of their own - they are downsampled from these leaves further down.
++			if (TerrainPlateColourOverlay::IsExportActive())
++			{
++				const float  terrainSize = (float)GetIEditorImpl()->Get3DEngine()->GetTerrainSize();
++				const uint32 dwWidth = ref.GetWidth();
++				const uint32 dwHeight = ref.GetHeight();
++
++				// The texels' own provenance: GetSubImageStretched sampled fSrc + i * extent / (n - 1), and
++				// its first (x) axis is the RGB layer's fpx, which is the world Y - the same convention
++				// CHeightmap::GetColorAtPosition hands the live overlay.
++				const float stepWorldY = (dwWidth > 1) ? fWidth * terrainSize / (float)(dwWidth - 1) : 0.f;
++				const float stepWorldX = (dwHeight > 1) ? fHeight * terrainSize / (float)(dwHeight - 1) : 0.f;
++
++				// The EXPORT tile's texel size, not the RGB layer's: it sizes the rim weight's filter
++				// footprint and picks the diffuse mip, so the pak matches what the editor drew.
++				const float texelSize = (dwWidth > 0) ? fWidth * terrainSize / (float)dwWidth : 0.f;
++
++				uint32* pRow = &ref.ValueAt(0, 0);
++				for (uint32 dwY = 0; dwY < dwHeight; ++dwY, pRow += dwWidth)
++				{
++					TerrainPlateColourOverlay::ApplyExportToRow(pRow, (int)dwWidth, fMinX * terrainSize, stepWorldY,
++					                                            fMinY * terrainSize + (float)dwY * stepWorldX, texelSize);
++				}
++			}
+ 		}
+ 
+ 		// convert RGB colour into format that has less compression artefacts for brightness variations
+diff --git a/Code/Sandbox/EditorQt/Terrain/TerrainPlateColourOverlay.cpp b/Code/Sandbox/EditorQt/Terrain/TerrainPlateColourOverlay.cpp
+index ccf48d7f..5eac11b2 100644
+--- a/Code/Sandbox/EditorQt/Terrain/TerrainPlateColourOverlay.cpp
++++ b/Code/Sandbox/EditorQt/Terrain/TerrainPlateColourOverlay.cpp
+@@ -56,6 +56,11 @@ struct SLivePlate
+ 
+ std::vector<SLivePlate> g_plates;
+ 
++//! The export's own snapshot, taken once per export. Separate from g_plates so an export cannot disturb
++//! the live preview's change detector (and so the export is unaffected by the debounce, which only exists
++//! to keep the editor's frame rate up).
++std::vector<SLivePlate> g_exportPlates;
++
+ uint32 HashCombine(uint32 seed, uint32 value)
+ {
+ 	// The usual boost mix; any avalanche would do, this is only a change detector.
+@@ -138,6 +143,10 @@ void ScanPlates(std::vector<SLivePlate>& out)
+ 		if (pEntity == nullptr)
+ 			continue;
+ 
++		// A hidden plate shows nothing, so it colours nothing - in the viewport and in the export alike.
++		if (pEntity->IsHidden())
++			continue;
++
+ 		IEntityComponent* pComponent = pEntity->GetComponentByTypeId(ITerrainPlateCommit::GetComponentTypeId());
+ 		if (pComponent == nullptr)
+ 			continue;
+@@ -306,9 +315,12 @@ void Update()
+ 	g_plates.swap(current);
+ }
+ 
+-void ApplyToRow(uint32* pRow, int count, float worldYStart, float worldStepY, float worldX, float rgbTexelSizeMeters)
++//! THE compositing loop, and the only one. The live pull and the exporter both come through here, so the
++//! exported terrain texture cannot drift from what the editor showed.
++static void ApplyPlatesToRow(const std::vector<SLivePlate>& plates, uint32* pRow, int count,
++                      float worldYStart, float worldStepY, float worldX, float rgbTexelSizeMeters)
+ {
+-	if (pRow == nullptr || count <= 0 || g_plates.empty())
++	if (pRow == nullptr || count <= 0 || plates.empty())
+ 		return;
+ 
+ 	if (gEnv == nullptr || gEnv->pEntitySystem == nullptr)
+@@ -323,7 +335,7 @@ void ApplyToRow(uint32* pRow, int count, float worldYStart, float worldStepY, fl
+ 	// texel for texel; coarser ancestor tiles keep their own wider footprint and antialias the rim.
+ 	const float sampleSize = max(fabs_tpl(worldStepY), rgbTexelSizeMeters);
+ 
+-	for (const SLivePlate& plate : g_plates)
++	for (const SLivePlate& plate : plates)
+ 	{
+ 		if (worldX < plate.worldXMin || worldX > plate.worldXMax
+ 		    || rowYMax < plate.worldYMin || rowYMin > plate.worldYMax)
+@@ -365,4 +377,32 @@ void ApplyToRow(uint32* pRow, int count, float worldYStart, float worldStepY, fl
+ 	}
+ }
+ 
++void ApplyToRow(uint32* pRow, int count, float worldYStart, float worldStepY, float worldX, float rgbTexelSizeMeters)
++{
++	ApplyPlatesToRow(g_plates, pRow, count, worldYStart, worldStepY, worldX, rgbTexelSizeMeters);
++}
++
++void BeginExport()
++{
++	// A fresh scan, not g_plates: the export can run when the live list is stale (or empty, if the overlay
++	// never ticked), and it must never inherit the preview's debounce.
++	ScanPlates(g_exportPlates);
++}
++
++void EndExport()
++{
++	g_exportPlates.clear();
++	g_exportPlates.shrink_to_fit();
++}
++
++bool IsExportActive()
++{
++	return !g_exportPlates.empty();
++}
++
++void ApplyExportToRow(uint32* pRow, int count, float worldYStart, float worldStepY, float worldX, float texelSizeMeters)
++{
++	ApplyPlatesToRow(g_exportPlates, pRow, count, worldYStart, worldStepY, worldX, texelSizeMeters);
++}
++
+ }
+diff --git a/Code/Sandbox/EditorQt/Terrain/TerrainPlateColourOverlay.h b/Code/Sandbox/EditorQt/Terrain/TerrainPlateColourOverlay.h
+index 15b5082f..a40acf91 100644
+--- a/Code/Sandbox/EditorQt/Terrain/TerrainPlateColourOverlay.h
++++ b/Code/Sandbox/EditorQt/Terrain/TerrainPlateColourOverlay.h
+@@ -44,4 +44,21 @@ bool IsActive();
+ //! footprint and the rim antialiases at every level.
+ void ApplyToRow(uint32* pRow, int count, float worldYStart, float worldStepY, float worldX, float rgbTexelSizeMeters);
+ 
++//! EXPORT. The live overlay above only edits the engine's editor side pull, and the game loads
++//! terraintexture.pak, which CGameExporter builds from CRGBLayer - so without this the plate colour never
++//! ships. BeginExport takes one snapshot of the plates asking for the overlay (hidden plates and plates
++//! with the tick box off are not in it) and ApplyExportToRow composites them into the OUTGOING export tile
++//! through the same code path ApplyToRow uses. CRGBLayer is not written and no sector is marked dirty:
++//! the editor's own colour is exactly what it was before the export.
++void BeginExport();
++void EndExport();
++
++//! True while an export snapshot holds at least one plate. The stock export stays byte identical when
++//! this is false.
++bool IsExportActive();
++
++//! One row of the export tile, in place. Same argument shape as ApplyToRow; texelSizeMeters is the EXPORT
++//! tile's own texel size, which is what makes the exported picture agree with the editor preview.
++void ApplyExportToRow(uint32* pRow, int count, float worldYStart, float worldStepY, float worldX, float texelSizeMeters);
++
+ }
+-- 
+2.47.1.windows.1
+

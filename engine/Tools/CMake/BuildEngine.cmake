@@ -436,8 +436,11 @@ if (OPTION_ENGINE OR OPTION_SHADERCACHEGEN)
 	add_subdirectory ("Code/CryEngine/CryScaleform")
 	add_subdirectory ("Code/CryEngine/RenderDll/XRenderD3D9")
 	
-	# Shaders custom project
-	if(EXISTS "${CRYENGINE_DIR}/Engine/Shaders")
+	# Shaders custom project.
+	# Test for the CMakeLists.txt itself, not just for the directory: a deployed engine folder (assets
+	# and paks) also creates Engine/Shaders, and on a case insensitive file system that made the bare
+	# directory test pass and add_subdirectory fail the whole configure.
+	if(EXISTS "${CRYENGINE_DIR}/Engine/Shaders/CMakeLists.txt")
 		add_subdirectory(Engine/Shaders)
 	endif()
 endif()

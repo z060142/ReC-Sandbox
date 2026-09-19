@@ -1,0 +1,399 @@
+From a457a76850dbc6062b2a46a5b0b69384fbc4548b Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Thu, 3 Sep 2026 03:08:30 +0800
+Subject: [PATCH 295/307] !R (Terrain Plate) Make terrain stamping a repeatable
+ action.
+
+After height stamping, adopt the stamped ground as the new baseline and keep
+the plate live. Record stamped colour state so preview and export avoid double
+blending until the plate transform or material changes.
+---
+ .../Geometry/ITerrainPlateCommit.h            |  26 +--
+ .../Geometry/TerrainPlateComponent.cpp        | 164 +++++++++++-------
+ .../Geometry/TerrainPlateComponent.h          |  32 ++--
+ 3 files changed, 138 insertions(+), 84 deletions(-)
+
+diff --git a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/ITerrainPlateCommit.h b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/ITerrainPlateCommit.h
+index 4a98f9de..52beced0 100644
+--- a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/ITerrainPlateCommit.h
++++ b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/ITerrainPlateCommit.h
+@@ -20,8 +20,9 @@ namespace DefaultComponents
+ //! IEntityComponent::QueryInterface is protected. Deliberately not derived from IEntityComponent: the
+ //! plate already reaches it through CBaseMeshComponent and a second path would make that base ambiguous.
+ //!
+-//! Two user operations, two undo groups: Stamp Height (GetCommitFootprint, OnCommitted) and Stamp Colour
+-//! (the appearance queries, OnColourStamped). Each stands alone; neither is a precondition of the other.
++//! Two user operations, two undo groups: Stamp Height (GetCommitFootprint, OnHeightStamped) and Stamp
++//! Colour (the appearance queries, OnColourStamped). Each stands alone; neither is a precondition of the
++//! other, and neither changes a single setting on the plate: a stamp is a pure, repeatable action.
+ struct ITerrainPlateCommit
+ {
+ 	//! Type id of CTerrainPlateComponent, for IEntity::GetComponentByTypeId. Must stay in step with
+@@ -39,7 +40,7 @@ struct ITerrainPlateCommit
+ 	//! The sector aligned square the LIVE bake holds in the engine terrain, in terrain units. The block
+ 	//! covers (outSize + 1)^2 cells - units outX1 .. outX1 + outSize inclusive - which is the range
+ 	//! ITerrain::SetTerrainElevation reads.
+-	//! False when there is nothing to stamp: no live bake, or the heights are stamped already.
++	//! False when there is nothing to stamp: the plate holds no live bake in the terrain.
+ 	virtual bool  GetCommitFootprint(int& outX1, int& outY1, int& outSize) const = 0;
+ 
+ 	//! The square the COLOUR stamp covers, in terrain units, same convention as GetCommitFootprint.
+@@ -80,16 +81,21 @@ struct ITerrainPlateCommit
+ 	virtual bool  GetLiveColourState(int& outX1, int& outY1, int& outSize, ColorB& outTint,
+ 	                                 bool& outSettling) const = 0;
+ 
+-	//! The editor has written the stamped ground into CHeightmap: adopt it as this plate's baseline,
+-	//! stop defending the footprint and stop restoring it on teardown. Called INSIDE the editor's undo
+-	//! group, after the heights are written and before it is accepted.
+-	virtual void  OnCommitted() = 0;
++	//! The editor has written the stamped ground into CHeightmap: adopt it as this plate's baseline. The
++	//! plate stays armed and keeps its live footprint - re-applying the bake over the ground it just
++	//! stamped is a no-op, and the restore now hands back the stamped ground rather than the old one.
++	//! Called INSIDE the editor's undo group, after the heights are written.
++	virtual void  OnHeightStamped() = 0;
+ 
+-	//! The editor has written this plate's live colour into CRGBLayer. Clears Terrain Colour From Plate,
+-	//! because the overlay and the export would otherwise blend the same colour a second time over the
+-	//! colour that is now in the level. The picture does not change: the stamp IS the overlay.
++	//! The editor has written this plate's live colour into CRGBLayer. Nothing on the panel changes; the
++	//! plate only records that the ground carries the colour, so the overlay and the export stop blending
++	//! it a second time over itself. The picture does not change: the stamp IS the overlay.
+ 	virtual void  OnColourStamped() = 0;
+ 
++	//! True while the ground under this plate already carries the colour this plate would draw (@see
++	//! OnColourStamped). Pressing Stamp Colour again is a silent success: there is nothing left to write.
++	virtual bool  IsColourStamped() const = 0;
++
+ 	//! Somebody wrote heights straight into the engine terrain over the given square (terrain units, same
+ 	//! convention as GetCommitFootprint). A plate whose live bake sits inside it has just been flattened,
+ 	//! so bring its next self repair poll forward instead of waiting out the poll interval.
+diff --git a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
+index abb3a8eb..ff7eccd3 100644
+--- a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
++++ b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
+@@ -431,7 +431,7 @@ bool CTerrainPlateComponent::WantsBakeMoveBatch() const
+ {
+ 	// A plate that does not write the terrain has no footprint to unwind and no ordering to respect; a torn
+ 	// down plate must not bake again at all.
+-	return m_bBakeIntoTerrain && !m_bBakeCommitted && !m_bBakeTornDown && m_pEntity != nullptr;
++	return m_bBakeIntoTerrain && !m_bBakeTornDown && m_pEntity != nullptr;
+ }
+ 
+ int CTerrainPlateComponent::GetEffectiveSettleFrames() const
+@@ -1010,13 +1010,14 @@ void STerrainPlateBakeGroup::Serialize(Serialization::IArchive& archive)
+ 	// AddMember: FunctorActionButton's own Serialize is edit only, which is exactly this archive.
+ 	// ar.doc() documents the row just emitted - the only tooltip channel a member with no AddMember has.
+ 	archive(plate.m_stampHeightButton, "StampHeight", "Stamp Height");
+-	archive.doc("Permanently writes the baked terrain height you see now into the level. The relief becomes ordinary "
+-	            "terrain and stays after the plate is deleted. Bake Into Terrain is unticked afterwards, because the "
+-	            "ground carries the shape itself now - the picture does not change.");
++	archive.doc("Writes the baked terrain height you see now into the level; the plate keeps working as before. The "
++	            "relief becomes ordinary terrain and stays where it is if the plate is moved or deleted. Nothing on "
++	            "this panel changes and the picture does not change, so pressing it twice is harmless.");
+ 	archive(plate.m_stampColourButton, "StampColour", "Stamp Colour");
+-	archive.doc("Permanently writes the plate's terrain colour you see now into the level. Terrain Colour From Plate "
+-	            "is unticked afterwards, because the ground carries the colour itself now - the picture does not "
+-	            "change.");
++	archive.doc("Writes the plate's terrain colour you see now into the level; the plate keeps working as before. "
++	            "The colour becomes part of the level's own terrain colour and stays where it is if the plate is "
++	            "moved or deleted. Nothing on this panel changes and the picture does not change, so pressing it "
++	            "twice is harmless.");
+ }
+ 
+ // The Weld drawer. Edge Weld itself is a top level row, same as Bake Into Terrain above.
+@@ -1037,13 +1038,8 @@ void STerrainPlateWeldGroup::Serialize(Serialization::IArchive& archive)
+ // without touching the archive creates no row at all, the only way to suppress a whole member row.
+ bool Serialize(Serialization::IArchive& archive, STerrainPlateBakeGroup& value, const char* szName, const char* szLabel)
+ {
+-	// m_bBakeCommitted keeps the drawer after Stamp Height: the plate still has a colour tick box, a Stamp Colour
+-	// button and a Bake Into Terrain to re-arm, and a drawer that vanished would put all three out of reach.
+-	if (!archive.isEdit() || value.m_pOwner == nullptr
+-	    || (!value.m_pOwner->m_bBakeIntoTerrain && !value.m_pOwner->m_bBakeCommitted))
+-	{
++	if (!archive.isEdit() || value.m_pOwner == nullptr || !value.m_pOwner->m_bBakeIntoTerrain)
+ 		return false;
+-	}
+ 
+ 	Serialization::SStruct ser(value);
+ 	return archive(ser, szName, szLabel);
+@@ -1170,7 +1166,7 @@ Cry::Entity::EventFlags CTerrainPlateComponent::GetEventMask() const
+ 
+ 	if (m_bRegenPending || m_bDeferredXformPending || m_bBakeMoveBatchPending || m_bInitialBakePending
+ 	    || bWantsPhysSurfacePoll
+-	    || (m_bBakeIntoTerrain && !m_bBakeCommitted && (GetBakeProbeFrames() > 0 || GetPlateDebugLevel() >= 1)))
++	    || (m_bBakeIntoTerrain && (GetBakeProbeFrames() > 0 || GetPlateDebugLevel() >= 1)))
+ 	{
+ 		bitFlags |= ENTITY_EVENT_UPDATE;
+ 	}
+@@ -1197,6 +1193,10 @@ void CTerrainPlateComponent::ProcessEvent(const SEntityEvent& event)
+ 		// A property change can only reach a plate the user is working on, so an entity that came back out
+ 		// of the deletion queue is allowed to bake again.
+ 		NoteBakeUserAction();
++
++		// It is also the one edit the frame/material comparison in IsColourStamped cannot see: rim falloff,
++		// grid, skirt all change the picture without moving the plate. @see ClearColourStamp.
++		ClearColourStamp();
+ 		ReArmAfterTeardown();
+ 			// A property change is a user action in an open level, so the terrain is in and the "never bake from
+ 			// Initialize" rule is satisfied. Releasing here makes ticking Bake Into Terrain apply in the same frame.
+@@ -1768,7 +1768,7 @@ void CTerrainPlateComponent::RegenerateMesh()
+ 	// restored - and the restore below is part of "anything". Deciding here gives the whole unwind to
+ 	// RunBakeCascade, and this plate still holds its live rect, so both the footprint it leaves and the one it
+ 	// takes pull neighbours in. Depth > 0 means we ARE that regeneration and must not start a second cascade.
+-	if (g_bakeCascadeDepth == 0 && m_bBakeIntoTerrain && !m_bBakeCommitted && !m_bBakeTornDown && !m_bInitialBakePending
++	if (g_bakeCascadeDepth == 0 && m_bBakeIntoTerrain && !m_bBakeTornDown && !m_bInitialBakePending
+ 	    && m_pEntity != nullptr && gEnv->p3DEngine != nullptr)
+ 	{
+ 		std::vector<CTerrainPlateComponent*> affected;
+@@ -3085,7 +3085,7 @@ bool CTerrainPlateComponent::GetCommitFootprint(int& outX1, int& outY1, int& out
+ {
+ 	// Only a plate that currently holds a bake in the engine terrain has something to commit: the editor reads
+ 	// the block straight back out of the terrain, so what it stamps is literally what the live bake wrote.
+-	if (!m_bBakeApplied || m_bBakeCommitted || m_bakeRectSize <= 0)
++	if (!m_bBakeApplied || m_bakeRectSize <= 0)
+ 		return false;
+ 
+ 	outX1 = m_bakeRectX1;
+@@ -3096,8 +3096,8 @@ bool CTerrainPlateComponent::GetCommitFootprint(int& outX1, int& outY1, int& out
+ 
+ bool CTerrainPlateComponent::GetCommitAppearanceFootprint(int& outX1, int& outY1, int& outSize) const
+ {
+-	// Deliberately NOT m_bakeRect*: the appearance commit must also work on a plate that never baked, one already
+-	// committed, and one baking now. The rect it wants is what ComputeBakeRect answers from the current transform.
++	// Deliberately NOT m_bakeRect*: the appearance stamp must also work on a plate that never baked and on one
++	// baking now. The rect it wants is what ComputeBakeRect answers from the current transform.
+ 	const SBakeTerrainMetrics metrics = GetBakeTerrainMetrics();
+ 	if (!metrics.IsValid())
+ 		return false;
+@@ -3358,7 +3358,53 @@ bool CTerrainPlateComponent::IsLiveColourEnabled() const
+ {
+ 	// The Bake drawer holds the tick box, so a plate whose drawer is gone could not switch the colour off again.
+ 	// @see the free Serialize for STerrainPlateBakeGroup, which opens the drawer on the same condition.
+-	return m_bLiveTerrainColour && (m_bBakeIntoTerrain || m_bBakeCommitted);
++	return m_bLiveTerrainColour && m_bBakeIntoTerrain;
++}
++
++bool CTerrainPlateComponent::IsColourStamped() const
++{
++	if (!m_bColourStamped)
++		return false;
++
++	// The record only stands in for the preview while the plate would draw the SAME picture, so it is checked
++	// against what the composite actually depends on: the plate frame and the material. Compared rather than
++	// cleared on an event, because no event fires for a plate that is merely loaded and the record has to
++	// survive a level load - the ground keeps the colour, so the preview has to keep standing down.
++	const Matrix34   frameTM = GetPlateFrameTM();
++	const IMaterial* pMaterial = GetPlateMaterial();
++
++	if (!m_bColourStampRefValid)
++	{
++		// First query since the stamp or since the level loaded: take the reference, trust the record.
++		m_colourStampFrameTM = frameTM;
++		m_pColourStampMaterial = pMaterial;
++		m_bColourStampRefValid = true;
++		return true;
++	}
++
++	// The pointer is only ever compared, never dereferenced, so a released material cannot be followed here.
++	if (!frameTM.IsEquivalent(m_colourStampFrameTM, 0.0001f) || pMaterial != m_pColourStampMaterial)
++	{
++		ClearColourStamp();
++		return false;
++	}
++
++	return true;
++}
++
++void CTerrainPlateComponent::ClearColourStamp() const
++{
++	// The property tree can report a property change right after an action button was pressed in it, and that
++	// is the button, not the user editing the plate. Anything else is at least a frame later.
++	if (m_bColourStamped && gEnv != nullptr && (gEnv->nMainFrameID - m_colourStampFrameId) <= 1)
++		return;
++
++	// The stamped ground colour is no longer what this plate would draw, so the preview takes over again -
++	// over ground that still carries the old stamp, which is visible and is the honest answer: the picture
++	// always shows what the plate would draw NOW. Deliberately not called from RegenerateMesh: the bake's own
++	// self repair and the overlap cascade go through it without the plate having changed at all.
++	m_bColourStamped = false;
++	m_bColourStampRefValid = false;
+ }
+ 
+ //! The live terrain colour overlay, READ ONLY throughout: what it paints is a cache (the engine's terrain colour
+@@ -3369,6 +3415,12 @@ bool CTerrainPlateComponent::GetLiveColourState(int& outX1, int& outY1, int& out
+ 	if (!IsLiveColourEnabled())
+ 		return false;
+ 
++	// The ground already carries exactly this colour (Stamp Colour wrote it). Blending it over itself would
++	// tighten the rim - lerp(dest, C, w) only equals dest where dest is already C - so the preview and the
++	// export both stand down here, and the picture comes out of CRGBLayer unchanged. @see OnColourStamped.
++	if (IsColourStamped())
++		return false;
++
+ 	if (!GetCommitAppearanceFootprint(outX1, outY1, outSize) || outSize <= 0)
+ 		return false;
+ 
+@@ -3382,50 +3434,42 @@ bool CTerrainPlateComponent::GetLiveColourState(int& outX1, int& outY1, int& out
+ 	return true;
+ }
+ 
+-void CTerrainPlateComponent::OnCommitted()
++void CTerrainPlateComponent::OnHeightStamped()
+ {
+-	// ORDER MATTERS. The committed ground has to become this plate's baseline BEFORE Bake Into Terrain goes off,
+-	// or the untick would push the OLD ground back into the engine and disagree with CHeightmap.
+-	if (!m_bakeResult.empty())
+-	{
+-		m_bakeBaseline = m_bakeResult;
+-		// m_bakeResult is the live rect's block, so the baseline's own rect follows it. @see RefreshBakeBaseline.
+-		m_bakeBaselineX1 = m_bakeRectX1;
+-		m_bakeBaselineY1 = m_bakeRectY1;
+-		m_bakeBaselineSize = m_bakeRectSize;
+-	}
+-
+-	// The disarm proper. m_bBakeApplied false makes the teardown a no-op, so deleting a committed plate leaves
+-	// the ground where the commit put it. The probes go with it: there is no live bake left to defend.
+-	m_bBakeApplied = false;
+-	m_bakeProbes.clear();
+-	m_bakeReapplyCount = 0;
+-	m_bakeBackoffFrames = 0;
+-	m_bakeReapplyWindowStart = 0;
++	// The ONLY state a height stamp changes, and it changes nothing the user can see. The stamped ground becomes
++	// this plate's baseline, so: re-applying the bake on top of it writes the same heights again (max(baseline,
++	// relief) == baseline here), the restore on a move or a delete hands back the stamped ground instead of the
++	// old one, and the probes - which expect m_bakeResult, still what the terrain holds - keep passing. Every
++	// toggle, the live footprint and m_bBakeApplied are deliberately left exactly as they were.
++	if (m_bakeResult.empty())
++		return;
+ 
+-	// Serialised, so the state survives a reload and a second stamp is refused. Every path that could write the
+-	// terrain again is gated on it, which is what makes a stale property panel harmless.
+-	m_bBakeCommitted = true;
+-	m_bBakeIntoTerrain = false;
++	m_bakeBaseline = m_bakeResult;
++	// m_bakeResult is the live rect's block, so the baseline's own rect follows it. @see RefreshBakeBaseline.
++	m_bakeBaselineX1 = m_bakeRectX1;
++	m_bakeBaselineY1 = m_bakeRectY1;
++	m_bakeBaselineSize = m_bakeRectSize;
+ 
+-	if (m_pEntity != nullptr)
+-	{
+-		m_pEntity->UpdateComponentEventMask(this);
+-	}
++	// Debug only drift reference. Re-take it against the adopted baseline, or every later line would report the
++	// whole relief as drift and read like a fault. @see LogBakeBaselineDrift.
++	m_bakeBaselineFirst.clear();
++	m_bakeBaselineFirstSize = 0;
+ 
+-	CryLog("TerrainPlate '%s': the baked relief is now part of the level heightmap. The live bake is off, and "
+-	       "deleting the plate no longer restores the old ground. Undo puts the terrain back; re-tick Bake Into "
+-	       "Terrain to resume the live bake.", GetPlateName());
++	CryLog("TerrainPlate '%s': the baked relief is now part of the level heightmap, and stays there if the plate "
++	       "moves or goes. The plate keeps working exactly as before. Undo puts the terrain back.", GetPlateName());
+ }
+ 
+ void CTerrainPlateComponent::OnColourStamped()
+ {
+-	// The colour is in CRGBLayer now, so the overlay would blend it a SECOND time over itself - and so would the
+-	// export. Unticking here is what keeps the picture the one the user pressed the button on.
+-	m_bLiveTerrainColour = false;
+-
+-	CryLog("TerrainPlate '%s': the plate colour is now part of the level's terrain colour. Terrain Colour From "
+-	       "Plate is off, because the ground already carries it; the picture is unchanged.", GetPlateName());
++	// The only state a colour stamp changes, and it changes nothing the user can see: the ground now holds the
++	// very texels the preview drew, so the preview and the export stop drawing them a second time over
++	// themselves. No tick box moves. Any edit of the plate clears it. @see ClearColourStamp, GetLiveColourState.
++	m_bColourStamped = true;
++	m_bColourStampRefValid = false;   // re-taken by the next IsColourStamped, against the plate as it is now
++	m_colourStampFrameId = (gEnv != nullptr) ? gEnv->nMainFrameID : 0;
++
++	CryLog("TerrainPlate '%s': the plate colour is now part of the level's terrain colour, and stays there if the "
++	       "plate moves or goes. Terrain Colour From Plate is untouched; the picture is unchanged.", GetPlateName());
+ }
+ 
+ void CTerrainPlateComponent::NudgeBakeAfterTerrainWrite(int rectX1, int rectY1, int rectSize)
+@@ -3553,14 +3597,6 @@ void CTerrainPlateComponent::ApplyBake()
+ 		return;
+ 	}
+ 
+-	if (m_bBakeCommitted)
+-	{
+-		// The relief is in the level's own heightmap now. Baking it again would write it a SECOND time on top of the
+-		// committed ground, which is the one way a commit can go visibly wrong. @see OnCommitted.
+-		LogBakeSkip("height already stamped");
+-		return;
+-	}
+-
+ 	if (m_bBakeTornDown)
+ 	{
+ 		// The ground has already been given back. Anything that still reaches a mesh regeneration after that - a
+@@ -4050,7 +4086,7 @@ void CTerrainPlateComponent::UnregisterPlate()
+ 
+ void CTerrainPlateComponent::GetBakeCascadeRects(std::vector<int>& outRects) const
+ {
+-	if (!m_bBakeIntoTerrain || m_bBakeCommitted || m_bBakeTornDown || m_pEntity == nullptr)
++	if (!m_bBakeIntoTerrain || m_bBakeTornDown || m_pEntity == nullptr)
+ 		return;
+ 
+ 	const SBakeTerrainMetrics metrics = GetBakeTerrainMetrics();
+diff --git a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
+index f0754686..befd13ce 100644
+--- a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
++++ b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
+@@ -379,12 +379,12 @@ public:
+ 		               "permanent.", false);
+ 
+ 		// Hidden row: no label, so the panel never shows it, while AddMember keeps it persisted under its
+-		// szName. It is internal state, not a knob - Stamp Height is the only thing that sets it.
+-		desc.AddMember(&CTerrainPlateComponent::m_bBakeCommitted, 'bcmt', "BakeCommitted", "",
+-		               "Read only, set by Stamp Height: the relief has been written into the level's own heightmap and is now "
+-		               "ordinary terrain. While this is on the plate never writes the live bake again and deleting it leaves the "
+-		               "stamped ground alone, so the plate can be removed whenever you like. An undo puts the old terrain back but "
+-		               "does not clear this.",
++		// szName. Internal state, not a knob, and it turns no feature off: the ground itself carries this
++		// plate's colour now, so the preview must not blend the same colour over it a SECOND time.
++		desc.AddMember(&CTerrainPlateComponent::m_bColourStamped, 'cstm', "ColourStamped", "",
++		               "Read only, set by Stamp Colour and cleared by any change to the plate (move, scale, material, shape): the "
++		               "plate's colour is part of the level's terrain colour, so the live preview and the export leave it alone. "
++		               "The picture is the same either way - what is in the ground IS what the preview drew.",
+ 		               false);
+ 
+ 		// The visible panel, in order: the rows follow the AddMember order, so this block IS the layout.
+@@ -452,8 +452,10 @@ public:
+ 	                                     ColorF& outLinearColor) const final;
+ 	virtual bool  GetLiveColourState(int& outX1, int& outY1, int& outSize, ColorB& outTint,
+ 	                                 bool& outSettling) const final;
+-	virtual void  OnCommitted() final;
++	void          ClearColourStamp() const;
++	virtual void  OnHeightStamped() final;
+ 	virtual void  OnColourStamped() final;
++	virtual bool  IsColourStamped() const final;
+ 	virtual void  NudgeBakeAfterTerrainWrite(int rectX1, int rectY1, int rectSize) final;
+ 	// ~ITerrainPlateCommit
+ 
+@@ -683,9 +685,19 @@ protected:
+ 	Schematyc::Range<-128, 127, -128, 127, int>  m_bakePriority = 0;
+ 	//! Per plate bake height refinement in metres, signed. 0 at the welded rim, full value at the crest.
+ 	Schematyc::Range<-100, 100, -1, 1, float>    m_bakeOffset = 0.f;
+-	//! Commit Bake: the relief lives in the level's CHeightmap now, so this plate must never write or
+-	//! restore the terrain again. Serialised, unlike m_bBakeTornDown, because the commit is permanent.
+-	bool                                         m_bBakeCommitted = false;
++	//! Stamp Colour: this plate's colour is in the level's own CRGBLayer now, so the live preview and the
++	//! export must not blend it over itself. Serialised, because the ground keeps the colour across a reload
++	//! while the plate is unchanged. Mutable: IsColourStamped is the query that finds the record stale (the
++	//! plate moved, was rescaled or took a new material) and drops it there and then.
++	mutable bool                                 m_bColourStamped = false;
++
++	//! What the plate looked like when its colour was stamped, taken lazily on the first query after the
++	//! stamp or after a level load. Only compared, never dereferenced. @see IsColourStamped.
++	mutable bool                                 m_bColourStampRefValid = false;
++	mutable Matrix34                             m_colourStampFrameTM = Matrix34(IDENTITY);
++	mutable const IMaterial*                     m_pColourStampMaterial = nullptr;
++	//! When the stamp happened, so the property change the button itself provokes cannot clear it.
++	uint32                                       m_colourStampFrameId = 0;
+ 
+ 	//! The two Bake drawer buttons. No data, so no AddMember: the drawer archives them directly, and that
+ 	//! archive is edit only. @see STerrainPlateBakeGroup::Serialize.
+-- 
+2.47.1.windows.1
+

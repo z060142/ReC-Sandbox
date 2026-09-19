@@ -1,0 +1,172 @@
+From 2b776bc4bc7c912e6d162eea4ee308c961d5594e Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Thu, 3 Sep 2026 15:26:53 +0800
+Subject: [PATCH 306/307] !B (Terrain Plate) Never ask the terrain for a height
+ below 0.
+
+A plate sunk with Ground Level over ground near sea level grew a wall and
+tall thin pillars, spammed "Entity-1 @ ... is too large or invalid" with
+the bbox centre climbing 2042 -> 2324 m, reported "the terrain did not
+move" and re-applied itself forever. The pillars survived switching Bake
+Into Terrain off. The same plate on a mountain was fine.
+
+CRYENGINE terrain cannot store a negative height, and it does not clamp -
+it wraps. CTerrain::SetTerrainElevation floors the sector quantiser origin
+at 0 (terran_edit.cpp:291, fMin = max(0, blockMin - deformation depth)) and
+then packs each cell as (uint32)int((h - fOffset) / fRange) with no clamp on
+the re-derived path (terran_edit.cpp:333) into SHeightMapItem's 12 bit
+height field. A negative step count therefore comes back as an almost
+full scale height: a spike thousands of metres tall.
+
+Everything else followed from that. The probes expected the negative
+height and read back the wrapped one, so VerifyBakeWrite said the write
+never landed and ReapplyBakeAfterExternalEdit kept repairing. Each pass
+re-derived fRange from a block already poisoned by the previous wrap, so
+the spikes grew. And RefreshBakeBaseline classifies a cell that differs
+from the stored baseline as a genuine edit and ADOPTS it, so the wreckage
+became the plate's idea of the original ground - which is why restoring
+the baseline on bake-off wrote the pillars straight back.
+
+The mesh was not at fault: its Z stays inside (h * m_reliefSign +
+m_reliefShift) * scaleZ, and the physics line prints the bbox centre of
+the terrain the edge weld was conforming to.
+
+Two changes, one cause:
+
+* ClampBakeResultToTerrainRange floors m_bakeResult at 0 in
+  ComputeBakeBlock, after the Bake Offset pass and before the delta
+  report, the write and the probes - so what is written is representable
+  and what the probes expect is what was written, and the repair loop
+  stops. One warning per plate says in plain words how deep the plate
+  wanted to go and that the floor was flattened at 0 m. There is no
+  ceiling to clamp against: fRange comes from the block's own maximum, so
+  any positive height is representable.
+
+* m_bBakeWriteLanded, set from the probe result in VerifyBakeWrite, makes
+  RefreshBakeBaseline keep the stored baseline rather than adopt the
+  ground a refused write left behind. A write that does not land can no
+  longer turn its own damage into the baseline.
+
+Mirror Z and Ground Level semantics are unchanged.
+---
+ .../Geometry/TerrainPlateComponent.cpp        | 54 ++++++++++++++++++-
+ .../Geometry/TerrainPlateComponent.h          |  9 ++++
+ 2 files changed, 61 insertions(+), 2 deletions(-)
+
+diff --git a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
+index 534f572d..8f40c9c1 100644
+--- a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
++++ b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
+@@ -2610,9 +2610,13 @@ void CTerrainPlateComponent::RefreshBakeBaseline(const SBakeTerrainMetrics& metr
+ 						const size_t index = (size_t)ux * dim + uy;
+ 						const float prior = m_bakeBaseline[(size_t)px * priorDim + py];
+ 
+-						if (fabs_tpl(current[index] - prior) <= tolerance)
++						if (!m_bBakeWriteLanded || fabs_tpl(current[index] - prior) <= tolerance)
+ 						{
+-							next[index] = prior;   // keep the float; re-reading it is what ratchets the ground down
++							// Keep the float; re-reading it is what ratchets the ground down. And when our OWN last
++							// write never landed, what is under the plate now is whatever that refused write left
++							// behind, not somebody's edit - adopting it would make the damage the new baseline and
++							// let it survive Bake Into Terrain being switched off. @see VerifyBakeWrite.
++							next[index] = prior;
+ 							++keptCells;
+ 						}
+ 						else
+@@ -2829,6 +2833,8 @@ void CTerrainPlateComponent::ComputeBakeBlock(const SBakeTerrainMetrics& metrics
+ 
+ 	ApplyBakeOffset(maxRelief);
+ 
++	ClampBakeResultToTerrainRange();
++
+ 	// Deliberately after the offset pass: what it reports is what WriteTerrainBlock is about to put in the ground.
+ 	for (size_t index = 0; index < m_bakeResult.size(); ++index)
+ 	{
+@@ -2877,6 +2883,47 @@ void CTerrainPlateComponent::ApplyBakeOffset(float maxRelief)
+ 	}
+ }
+ 
++//! CRYENGINE terrain cannot store a height below 0. CTerrain::SetTerrainElevation derives the sector quantiser
++//! as fOffset = max(0, blockMin - TERRAIN_DEFORMATION_MAX_DEPTH) and then packs every cell as
++//! (height - fOffset) / fRange TRUNCATED INTO A 12 BIT FIELD (terran_edit.cpp), so a negative height does not
++//! clamp - it wraps to a huge positive one. That is a spike of terrain thousands of metres tall, the probe read
++//! back never matches what we asked for, the plate re-applies itself forever, and RefreshBakeBaseline eventually
++//! adopts the wreckage as "the ground", which is why it survives switching Bake Into Terrain off again.
++//! So the request is floored HERE, before the write and before the probes are built from m_bakeResult, and the
++//! plate says once, in plain words, that its floor was cut off. There is no matching ceiling: fRange is derived
++//! from the block's own maximum, so any positive height is representable (resolution is WarnOnBakeQuantisation's
++//! job).
++void CTerrainPlateComponent::ClampBakeResultToTerrainRange()
++{
++	float lowest = 0.f;
++
++	for (float& value : m_bakeResult)
++	{
++		if (value < 0.f)
++		{
++			lowest = min(lowest, value);
++			value = 0.f;
++		}
++	}
++
++	if (lowest >= 0.f)
++	{
++		// A bake that stays above 0 is allowed to warn again if it is ever moved back under it.
++		m_bBakeFloorWarningIssued = false;
++		return;
++	}
++
++	if (!m_bBakeFloorWarningIssued)
++	{
++		m_bBakeFloorWarningIssued = true;
++		CryWarning(VALIDATOR_MODULE_ENTITYSYSTEM, VALIDATOR_WARNING,
++		           "Terrain Plate '%s': the plate digs down to %.2f m, but terrain cannot go below 0 m, so the baked "
++		           "ground was flattened at 0 m where the plate goes deeper. Move the plate up, reduce Ground Level "
++		           "or reduce the Z scale so its lowest point stays above 0 m.",
++		           GetPlateName(), lowest);
++	}
++}
++
+ bool CTerrainPlateComponent::WriteTerrainBlock(const SBakeTerrainMetrics& metrics, const std::vector<float>& heights)
+ {
+ 	ITerrain* pTerrain = (gEnv != nullptr && gEnv->p3DEngine != nullptr) ? gEnv->p3DEngine->GetITerrain() : nullptr;
+@@ -3594,6 +3641,9 @@ bool CTerrainPlateComponent::VerifyBakeWrite(const SBakeTerrainMetrics& metrics)
+ 		}
+ 	}
+ 
++	// A write that did not land must not be mistaken for ground somebody else edited. @see RefreshBakeBaseline.
++	m_bBakeWriteLanded = !(checked > 0 && landed == 0);
++
+ 	if (checked > 0 && landed == 0)
+ 	{
+ 		if (!m_bBakeWriteWarningIssued)
+diff --git a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
+index fcd91389..c842e896 100644
+--- a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
++++ b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
+@@ -588,6 +588,10 @@ protected:
+ 	//! Second pass of ComputeBakeBlock: the per plate Bake Offset, scaled by each cell's relief over the
+ 	//! crest, so the welded rim does not move. Called with the crest ComputeBakeBlock measured.
+ 	void  ApplyBakeOffset(float maxRelief);
++	//! Third pass: floors m_bakeResult at 0. Terrain heights below 0 are not representable - they wrap into
++	//! the 12 bit height field as huge positive spikes - so the request is cut off before it is written and
++	//! before the probes are built from it, and the plate warns once. @see ClampBakeResultToTerrainRange.
++	void  ClampBakeResultToTerrainRange();
+ 	//! One heights-only SetTerrainElevation over the current rect.
+ 	bool  WriteTerrainBlock(const SBakeTerrainMetrics& metrics, const std::vector<float>& heights);
+ 	//! Restores the original ground over the footprint of the live bake, if there is one. Must run
+@@ -863,6 +867,11 @@ protected:
+ 	bool                     m_bBakeSizeWarningIssued = false;
+ 	//! One warning per plate for a bake whose write never landed, cleared by the next one that does.
+ 	bool                     m_bBakeWriteWarningIssued = false;
++	//! Did the last write actually reach the terrain? False makes RefreshBakeBaseline keep the stored
++	//! baseline instead of adopting whatever the refused write left in the ground. @see VerifyBakeWrite.
++	bool                     m_bBakeWriteLanded = true;
++	//! One warning per plate for a bake asking the terrain to go below 0 m, cleared when it stops.
++	bool                     m_bBakeFloorWarningIssued = false;
+ 	//! e_TerrainPlateDebug 1: says once, per plate, that the component really is being ticked. If this
+ 	//! line never appears the plate never received ENTITY_EVENT_UPDATE and no bake trigger can fire.
+ 	bool                     m_bUpdateTickLogged = false;
+-- 
+2.47.1.windows.1
+

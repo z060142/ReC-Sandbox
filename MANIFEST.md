@@ -1,11 +1,112 @@
-﻿# Sync manifest
+# Sync manifest
 
 Baseline : main @ a34100a9 (pristine CRYENGINE 5.7.1)
-Dev      : dev @ 5fe1e575
-Synced   : 2026-09-19 23:38
+Dev      : dev @ c9e6c206
+Synced   : 2026-09-20 01:36
 
 ## Commits (newest first)
 
+- c9e6c206 !B (Sandbox) Repaint the colour overlay on every settled move.
+- 2b776bc4 !B (Terrain Plate) Never ask the terrain for a height below 0.
+- 60fd7a13 !F (Terrain Plate) Add Mirror Z and Ground Level so the plate can dig.
+- 4c9151b0 !B (Terrain Plate) Drop the 1024 m size cap so the mesh follows the gizmo.
+- 6dabd7eb !B (Terrain Plate) Bias the bake block address, not the pointer.
+- f6ed2ea9 !B (Sandbox) Use one stable composite order for plate colour, preview to stamp.
+- d6bbfa56 !B (3DEngine) Let a per-object height band widen the sector query.
+- f13f7fc6 !B (Sandbox) Clear the plate's colour-stamp record when Stamp Colour is undone.
+- 1b6a1ae9 !B (Sandbox) Hash the plate's own material into the colour overlay signature.
+- e549f593 !T (Sandbox) Update Stamp Colour terminology.
+- 292de5f3 !T (Sandbox) Update terrain stamp command references.
+- baba752c !B (Terrain Plate) Avoid writes when terrain is already stamped.
+- a457a768 !R (Terrain Plate) Make terrain stamping a repeatable action.
+- e3e574e5 !F (Terrain Plate) Add tooltips for terrain stamping actions.
+- b76e98a0 !F (Terrain Plate) Add multi-plate height and colour stamping.
+- 258bd845 !F (Terrain Plate) Add Stamp Height and Stamp Colour actions.
+- 49c5e36d !F (Sandbox) Composite Terrain Plate colour into exported terrain textures.
+- 5eeead6f !B (Terrain Plate) Process complete overlap sets for large plate batches.
+- 4e2cbc3b !B (Terrain Plate) Prevent scale feedback during regeneration.
+- ea4e55ae !B (3DEngine) Preserve the terrain sector height quantizer when possible.
+- c25e9db4 !B (DefaultEntities) Keep terrain-integrated component meshes resident.
+- 98520c21 !B (Roads) Enforce the vertex budget during integrated surface subdivision.
+- 25ab1a12 !B (Terrain Plate) Prevent bake baseline drift during terrain rewrites.
+- 032b6b0f !B (Terrain Integration) Integrate meshes after streaming completes.
+- 8188729a !B (Terrain Integration) Coalesce deferred sector rebuilds per frame.
+- 35e9ba47 !B (Terrain Integration) Keep the integrated geometry registry authoritative.
+- e658799a !B (Terrain Plate) Validate local bounds after surface refinement.
+- e62099b8 !B (Terrain Plate) Re-register plates restored after deletion.
+- d6cd093d !B (Terrain Plate) Guard plate frame inversion against zero scale.
+- efec0dbc !B (Terrain Plate) Preserve every plate in a bake move batch.
+- 725fad82 !R (DefaultEntities) Reduce Terrain Plate comments.
+- 22a04d61 !R (Sandbox) Reduce Terrain Plate comments.
+- aa94ac38 !R (EntitySystem, CryCommon) Reduce terrain integration comments.
+- 83379914 !R (3DEngine) Reduce terrain integration comments.
+- 8cdf456f !B (Terrain Plate) Generate plate geometry at world scale.
+- d6696314 !B (Terrain Integration) Transform integrated vertex normals correctly.
+- 06793b44 !B (Terrain Plate) Sample plate colour from the material diffuse texture.
+- 18afd864 !B (Terrain Integration) Correct the shading frame of integrated vertices.
+- f593101d !F (Terrain Plate) Expose live terrain colour through ITerrainPlateCommit.
+- a9c7a398 !F (Terrain Plate) Add per-face terrain surfaces to the collision mesh.
+- 2f5bdb70 !F (Terrain Plate) Add non-destructive terrain macro colour.
+- ffc5bed1 !F (Terrain Plate) Report the dominant terrain surface for contacts.
+- af0a1a6f !R (Terrain Plate) Keep bake and weld controls at the top level.
+- 88bbb13b !R (Terrain Plate) Group component properties into collapsible sections.
+- efe69c09 !T (DefaultEntities) Show integration parameters only in terrain integration mode.
+- 5ee5ae44 !F (Terrain Plate) Add per-plate bake offset.
+- d5194bd6 !R (Terrain Plate) Disable the displacement texture source.
+- 604fe15b !R (Terrain Plate) Hide the experimental terrain stamping controls.
+- 44d75491 !B (Terrain Integration) Apply the height band above terrain only.
+- 6279c68a !F (Terrain Integration) Suppress duplicate camera draws for integrated geometry.
+- 4c578939 !F (Terrain Plate) Add terrain colour and layer stamping.
+- 2bc7f9df !F (Terrain Plate) Add height stamping to the level heightmap.
+- 91507935 !R (Terrain Plate) Remove obsolete whole-plate visibility handling.
+- d68825d1 !B (Terrain Plate) Cull plate triangles buried below terrain.
+- 1e535c39 !B (Terrain Plate) Hide sunken plates and retain LOD 0 over integrated geometry.
+- 5bc046f2 !B (Terrain Plate) Antialias bake footprints and match the weld curve.
+- 3b45551d !F (Terrain Integration) Draw integrated geometry in the terrain base pass.
+- 1c5b454a !B (Terrain Plate) Restore terrain when a plate group is deleted.
+- 3a155565 !B (Terrain Plate) Rebuild baked relief after priority changes.
+- f8f62ef0 !B (Terrain Plate) Restore previous footprints during multi-plate moves.
+- 5e2c60e3 !B (Terrain Plate) Prevent feedback between overlapping bakes.
+- 31a31d34 !B (Terrain Plate) Restore baked terrain when a plate is deleted.
+- 7cd5d19f !B (Terrain Plate) Keep baked relief aligned when the plate is scaled.
+- 64d4c142 !B (Terrain Plate) Restore bake epsilon and slope correction defaults.
+- b4a7ada0 !F (Roads) Rebuild roads when integrated geometry changes.
+- 48c6941b !F (Roads) Follow geometry integrated into terrain.
+- a5f8ad9d !F (3DEngine) Sample surfaces from geometry integrated into terrain.
+- b1000243 !F (Terrain Plate) Report skipped terrain bake operations.
+- a6448667 !B (Terrain Plate) Keep roads and terrain decals above baked relief.
+- 95c9756c !T (Roads) Expose the terrain Z offset as e_RoadsZOffset.
+- 2a82ed92 !F (Sandbox) Add terrain.reposition_vegetation.
+- f179b931 !F (Terrain Plate) Add Raise-and-Lower bake mode.
+- 79c57992 !F (Terrain Plate) Add priority cascades for overlapping bakes.
+- e5a1e823 !F (Terrain Plate) Reapply live bakes after editor terrain updates.
+- f17d778d !F (Terrain Plate) Add live terrain relief baking.
+- 36c9c63e !F (3DEngine) Allow height-only terrain elevation updates.
+- c3541355 !F (Terrain Integration) Add sector rebuild debounce during object movement.
+- 7255a6d6 !F (Terrain Plate) Defer regeneration until an editor transform finishes.
+- 8698d595 !R (Terrain Plate) Drive plate size and relief height from the entity transform.
+- fbb7f8e9 !B (Terrain Plate) Invalidate shadow and HeightMap AO caches after regeneration.
+- f807db23 !F (Terrain Plate) Expose static geometry rendering.
+- 4c3a9c4e !F (EntitySystem) Add static geometry state for entity slots.
+- 565884ed !F (Terrain Plate) Add native static collision.
+- 852e2066 !B (Terrain Plate) Sink welded borders below the terrain surface.
+- 677c63d9 !F (Terrain Plate) Add spacing-driven non-square grids.
+- c625ed34 !F (DefaultEntities) Register the Terrain Plate component.
+- 86e8dd75 !F (Terrain Plate) Add procedural grid mesh generation.
+- 25e87bfb !F (Terrain Plate) Add CPU heightmap and displacement source loaders.
+- a21bdf5a !B (CMake) Skip Engine/Shaders when no CMakeLists.txt is present.
+- c3f2b5d7 !B (Terrain Integration) Preserve IEntity and IBrush virtual function ordering.
+- e9a8ad8d !F (DefaultEntities) Expose terrain integration parameters on mesh components.
+- fffa6dee !F (3DEngine) Add debug reporting for terrain integration classes.
+- 60631b9f !F (3DEngine) Classify integrated triangles by slope and height.
+- a33e926e !F (Terrain Integration) Add per-instance slope, blend and height parameters.
+- 1605cb56 !B (Terrain Integration) Keep integrated meshes resident and retry incomplete sector builds.
+- 44dc241d !B (3DEngine) Handle objects without materials during terrain integration.
+- f81f72bd !F (3DEngine) Add terrain integration budget warnings and debug statistics.
+- 7c2283b1 !B (3DEngine) Preserve vertical faces on integrated geometry.
+- 428e1ec1 !F (3DEngine) Expose terrain integration CVars.
+- 5ada82ed !B (Terrain Integration) Rebuild terrain sectors when geometry integration mode changes.
+- 161f7a79 !B (Terrain Integration) Enable terrain layer blending for integrated geometry.
 - 5fe1e575 feat: r_LPVTranslucentBrightness scales LPV indirect diffuse on vegetation
 - 81f12a29 feat: Light entity GI Mode drives LPV participation
 - c02118a7 feat: three-cascade LPV LOD chain + RSM depth re-encoding + SH de-ringing
@@ -219,19 +320,38 @@ Synced   : 2026-09-19 23:38
 - M	CMakeSettings.json
 - M	Code/CryEngine/Cry3DEngine/3dEngine.cpp
 - M	Code/CryEngine/Cry3DEngine/3dEngine.h
+- M	Code/CryEngine/Cry3DEngine/3dEngineLoad.cpp
+- M	Code/CryEngine/Cry3DEngine/Brush.cpp
+- M	Code/CryEngine/Cry3DEngine/Brush.h
 - M	Code/CryEngine/Cry3DEngine/LightEntity.cpp
 - M	Code/CryEngine/Cry3DEngine/LightEntity.h
 - M	Code/CryEngine/Cry3DEngine/ObjectsTree.cpp
+- M	Code/CryEngine/Cry3DEngine/RoadRenderNode.cpp
 - M	Code/CryEngine/Cry3DEngine/SVO/SceneTree.cpp
 - M	Code/CryEngine/Cry3DEngine/ShadowCache.cpp
 - M	Code/CryEngine/Cry3DEngine/ShadowCache.h
 - M	Code/CryEngine/Cry3DEngine/SkyLightManager.cpp
 - M	Code/CryEngine/Cry3DEngine/TimeOfDay.cpp
 - M	Code/CryEngine/Cry3DEngine/cvars.cpp
+- M	Code/CryEngine/Cry3DEngine/cvars.h
+- M	Code/CryEngine/Cry3DEngine/terrain.cpp
+- M	Code/CryEngine/Cry3DEngine/terrain.h
+- M	Code/CryEngine/Cry3DEngine/terrain_node.cpp
+- M	Code/CryEngine/Cry3DEngine/terrain_sector.h
+- M	Code/CryEngine/Cry3DEngine/terrain_sector_render.cpp
+- M	Code/CryEngine/Cry3DEngine/terran_edit.cpp
 - M	Code/CryEngine/CryCommon/CMakeLists.txt
 - M	Code/CryEngine/CryCommon/Cry3DEngine/I3DEngine.h
+- M	Code/CryEngine/CryCommon/Cry3DEngine/IRenderNode.h
+- M	Code/CryEngine/CryCommon/CryEntitySystem/IEntity.h
+- M	Code/CryEngine/CryCommon/CryEntitySystem/IEntityBasicTypes.h
 - M	Code/CryEngine/CryCommon/CryRenderer/IRenderer.h
 - A	Code/CryEngine/CryCommon/CryRenderer/SceneReferredCurves.h
+- M	Code/CryEngine/CryEntitySystem/Entity.cpp
+- M	Code/CryEngine/CryEntitySystem/Entity.h
+- M	Code/CryEngine/CryEntitySystem/EntitySlot.cpp
+- M	Code/CryEngine/CryEntitySystem/EntitySlot.h
+- M	Code/CryEngine/CryEntitySystem/RenderProxy.cpp
 - M	Code/CryEngine/RenderDll/Common/Include_HLSL_CPP_Shared.h
 - M	Code/CryEngine/RenderDll/Common/PostProcess/PostEffects.cpp
 - M	Code/CryEngine/RenderDll/Common/PostProcess/PostEffects.h
@@ -369,7 +489,14 @@ Synced   : 2026-09-19 23:38
 - A	Code/CryPlugins/CinematicCamera/docs/SceneReferredContent.md
 - A	Code/CryPlugins/CinematicCamera/docs/SceneReferredExport.md
 - A	Code/CryPlugins/CinematicCamera/docs/SceneReferredLook.md
+- M	Code/CryPlugins/CryDefaultEntities/Module/CMakeLists.txt
+- M	Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/BaseMeshComponent.h
+- A	Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/ITerrainPlateCommit.h
+- M	Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/StaticMeshComponent.cpp
+- A	Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
+- A	Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
 - M	Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Lights/EnvironmentProbeComponent.h
+- M	Code/CryPlugins/CryDefaultEntities/Module/PluginDll.cpp
 - A	Code/CryPlugins/CryPhoneTracker/Module/CMakeLists.txt
 - A	Code/CryPlugins/CryPhoneTracker/Module/PhoneTrackerComponent.cpp
 - A	Code/CryPlugins/CryPhoneTracker/Module/PhoneTrackerComponent.h
@@ -388,8 +515,21 @@ Synced   : 2026-09-19 23:38
 - A	Code/Libs/tinyexr/streamreader.hh
 - A	Code/Libs/tinyexr/tinyexr.h
 - A	Code/Libs/tinyexr/tinyexr_impl.cpp
+- M	Code/Sandbox/EditorQt/CMakeLists.txt
+- M	Code/Sandbox/EditorQt/GameEngine.cpp
+- M	Code/Sandbox/EditorQt/GameExporter.cpp
 - M	Code/Sandbox/EditorQt/LevelEditor/LevelEditorViewport.cpp
 - M	Code/Sandbox/EditorQt/LevelEditor/LevelEditorViewport.h
+- M	Code/Sandbox/EditorQt/Objects/EntityObject.cpp
+- M	Code/Sandbox/EditorQt/Terrain/Heightmap.cpp
+- M	Code/Sandbox/EditorQt/Terrain/TerrainCommands.cpp
+- M	Code/Sandbox/EditorQt/Terrain/TerrainEditor.cpp
+- A	Code/Sandbox/EditorQt/Terrain/TerrainPlateColourOverlay.cpp
+- A	Code/Sandbox/EditorQt/Terrain/TerrainPlateColourOverlay.h
+- M	Code/Sandbox/EditorQt/TerrainTexturePainter.cpp
+- M	Code/Sandbox/EditorQt/TerrainTexturePainter.h
+- M	Code/Sandbox/EditorQt/Vegetation/VegetationMap.cpp
+- M	Code/Sandbox/EditorQt/Vegetation/VegetationMap.h
 - A	Code/Sandbox/Plugins/CinematicCameraEditor/CMakeLists.txt
 - A	Code/Sandbox/Plugins/CinematicCameraEditor/CineCamAssetRegistration.cpp
 - A	Code/Sandbox/Plugins/CinematicCameraEditor/CineCamAssetRegistration.h

@@ -1,0 +1,223 @@
+From d6bbfa56b777c9e2e201a5f77a704a7fd5b9dc29 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Thu, 3 Sep 2026 14:16:52 +0800
+Subject: [PATCH 301/307] !B (3DEngine) Let a per-object height band widen the
+ sector query.
+
+CTerrainNode::AppendTrianglesFromObjects grew the sector's query AABB in Z
+by e_TerrainIntegrateObjectsMaxHeight only, and applied the per instance
+STerrainIntegrationParams::heightBand afterwards. An object whose whole
+bbox floated above terrain + the global band was therefore never returned
+by GetObjectsByTypeGlobal, so its own (larger, up to 1000 m in the UI)
+band could not be evaluated: raising the band on a floating plate did
+nothing at all.
+
+The same band is missing on the invalidation side. ReleaseHeightMapGeometry
+rejects a sector whose box does not overlap the dirty box in 3D, and a
+sector box stops at the heightmap, so the dirty box of an object sitting
+above the terrain never reached the sectors it feeds and the rebuild was
+dropped.
+
+C3DEngine now caches the largest non-negative heightBand among the
+registered integrated nodes (recomputed in RefreshIntegratedNodeBoxes,
+raised by CBrush::SetTerrainIntegrationParams because a band edit does not
+re-enter the registry, cleared on level unload).
+GetTerrainIntegrationQueryBand() returns max(cvar, that cache); the sector
+query grows UP by it and CTerrain::ResetTerrainVertBuffers grows the dirty
+box DOWN by it.
+
+Both growths are strictly widening and gated: with nothing registered, or
+with m_bIntegrateObjectsIntoTerrain off, the boxes are bit identical to the
+stock ones. The per object bObjectAirborne test and its semantics are
+unchanged - it now simply gets to run on the objects it was written for.
+---
+ Code/CryEngine/Cry3DEngine/3dEngine.cpp       | 31 +++++++++++++++++++
+ Code/CryEngine/Cry3DEngine/3dEngine.h         | 16 ++++++++++
+ Code/CryEngine/Cry3DEngine/3dEngineLoad.cpp   |  1 +
+ Code/CryEngine/Cry3DEngine/Brush.cpp          | 10 ++++++
+ Code/CryEngine/Cry3DEngine/Brush.h            |  2 +-
+ .../Cry3DEngine/terrain_sector_render.cpp     |  8 +++--
+ Code/CryEngine/Cry3DEngine/terran_edit.cpp    | 19 ++++++++++--
+ 7 files changed, 81 insertions(+), 6 deletions(-)
+
+diff --git a/Code/CryEngine/Cry3DEngine/3dEngine.cpp b/Code/CryEngine/Cry3DEngine/3dEngine.cpp
+index 68471a70..06a9ee89 100644
+--- a/Code/CryEngine/Cry3DEngine/3dEngine.cpp
++++ b/Code/CryEngine/Cry3DEngine/3dEngine.cpp
+@@ -6896,13 +6896,44 @@ void C3DEngine::RefreshIntegratedNodeBoxes()
+ 	m_integratedNodeBoxes.clear();
+ 	m_integratedNodeBoxes.reserve(m_integratedIntoTerrainNodes.size());
+ 
++	// Recomputed here rather than only raised, so removing the one object with a huge band lets the
++	// query narrow again.
++	m_fMaxIntegrationHeightBand = 0.f;
++
+ 	for (std::map<IRenderNode*, AABB>::const_iterator it = m_integratedIntoTerrainNodes.begin();
+ 	     it != m_integratedIntoTerrainNodes.end(); ++it)
+ 	{
+ 		m_integratedNodeBoxes.push_back(it->second);
++
++		// Only movable brushes carry per instance integration params, and only they are integrated.
++		if (it->first->GetRenderNodeType() == eERType_MovableBrush)
++		{
++			const float fBand = static_cast<IBrush*>(it->first)->GetTerrainIntegrationParams().heightBand;
++
++			if (fBand > m_fMaxIntegrationHeightBand)
++				m_fMaxIntegrationHeightBand = fBand;
++		}
+ 	}
+ }
+ 
++///////////////////////////////////////////////////////////////////////////////
++float C3DEngine::GetTerrainIntegrationQueryBand() const
++{
++	const float fCVarBand = GetCVars()->e_TerrainIntegrateObjectsMaxHeight;
++
++	// Strictly a widening: 0 means nothing registered asked for more than the cvar, and then the box is
++	// exactly the one the stock code built (a negative cvar included).
++	return (m_fMaxIntegrationHeightBand > fCVarBand) ? m_fMaxIntegrationHeightBand : fCVarBand;
++}
++
++///////////////////////////////////////////////////////////////////////////////
++void C3DEngine::NotifyIntegrationHeightBandChanged(float fHeightBand)
++{
++	// Negative = defer to the cvar, which never widens anything.
++	if (fHeightBand > m_fMaxIntegrationHeightBand)
++		m_fMaxIntegrationHeightBand = fHeightBand;
++}
++
+ ///////////////////////////////////////////////////////////////////////////////
+ void C3DEngine::UpdateIntegratedObjectDrawSuppression(const SRenderingPassInfo& passInfo)
+ {
+diff --git a/Code/CryEngine/Cry3DEngine/3dEngine.h b/Code/CryEngine/Cry3DEngine/3dEngine.h
+index 0083baee..e1c96e7c 100644
+--- a/Code/CryEngine/Cry3DEngine/3dEngine.h
++++ b/Code/CryEngine/Cry3DEngine/3dEngine.h
+@@ -855,6 +855,22 @@ public:
+ 
+ 	void RefreshIntegratedNodeBoxes();
+ 
++	//! Largest non-negative STerrainIntegrationParams::heightBand among the registered integrated nodes,
++	//! or 0 when all of them defer to the cvar. Cached because the sector object query needs it on every
++	//! rebuild; recomputed by RefreshIntegratedNodeBoxes and raised by NotifyIntegrationHeightBandChanged
++	//! (editing a band does not touch the registry).
++	float m_fMaxIntegrationHeightBand = 0.f;
++
++	//! Vertical slack terrain object integration has to work with: the global cvar band, widened when a
++	//! registered object asks for a larger one. The sector object query grows UP by it and the rebuild
++	//! dirty boxes grow DOWN by it, so an object floating inside its own larger band is still looked at.
++	//! Returns the bare cvar on levels that integrate nothing, keeping the native path unchanged.
++	float GetTerrainIntegrationQueryBand() const;
++
++	//! Raise the cache after a per object band edit that did not go through the registry.
++	void  NotifyIntegrationHeightBandChanged(float fHeightBand);
++
++
+ 	//! Node currently inside an unregister/register pair (CBrush::SetMatrix, or the octree move done by
+ 	//! AsyncOctreeUpdate). The unregister half must leave the registry alone: the register half owns the
+ 	//! entry, and only then can it see the node as already integrating and debounce the move.
+diff --git a/Code/CryEngine/Cry3DEngine/3dEngineLoad.cpp b/Code/CryEngine/Cry3DEngine/3dEngineLoad.cpp
+index 59a3074d..526f3c6e 100644
+--- a/Code/CryEngine/Cry3DEngine/3dEngineLoad.cpp
++++ b/Code/CryEngine/Cry3DEngine/3dEngineLoad.cpp
+@@ -338,6 +338,7 @@ void C3DEngine::UnloadLevel()
+ 	// no render node survives the level
+ 	m_integratedIntoTerrainNodes.clear();
+ 	m_integratedNodeBoxes.clear();
++	m_fMaxIntegrationHeightBand = 0.f;
+ 	m_pendingTerrainRebuilds.clear();
+ 	m_integrationNodesAwaitingMesh.clear();
+ 
+diff --git a/Code/CryEngine/Cry3DEngine/Brush.cpp b/Code/CryEngine/Cry3DEngine/Brush.cpp
+index 31e06b69..dc251d5b 100644
+--- a/Code/CryEngine/Cry3DEngine/Brush.cpp
++++ b/Code/CryEngine/Cry3DEngine/Brush.cpp
+@@ -194,6 +194,16 @@ void CBrush::Render(const struct SRendParams& _EntDrawParams, const SRenderingPa
+ 	#pragma warning( pop )                //AMD Port
+ #endif
+ 
++void CBrush::SetTerrainIntegrationParams(const STerrainIntegrationParams& params)
++{
++	m_terrainIntegrationParams = params;
++
++	// The sector object query is grown by the widest band any integrated object asks for; a band edit
++	// never passes through the registry, so the cache has to hear about it here or an object that just
++	// gained a large band would stay outside the query box until something re-registers it.
++	Get3DEngine()->NotifyIntegrationHeightBandChanged(params.heightBand);
++}
++
+ void CBrush::SetMatrix(const Matrix34& mat)
+ {
+ 	if (!IsMatrixValid(mat))
+diff --git a/Code/CryEngine/Cry3DEngine/Brush.h b/Code/CryEngine/Cry3DEngine/Brush.h
+index 7eeb4efa..4c4bab8b 100644
+--- a/Code/CryEngine/Cry3DEngine/Brush.h
++++ b/Code/CryEngine/Cry3DEngine/Brush.h
+@@ -67,7 +67,7 @@ public:
+ 	virtual void    SetDrawLast(bool enable) final { m_bDrawLast = enable; }
+ 	bool            GetDrawLast() const            { return m_bDrawLast; }
+ 
+-	virtual void                             SetTerrainIntegrationParams(const STerrainIntegrationParams& params) final { m_terrainIntegrationParams = params; }
++	virtual void                             SetTerrainIntegrationParams(const STerrainIntegrationParams& params) final;
+ 	virtual const STerrainIntegrationParams& GetTerrainIntegrationParams() const final                                  { return m_terrainIntegrationParams; }
+ 
+ 	void            Dematerialize() final;
+diff --git a/Code/CryEngine/Cry3DEngine/terrain_sector_render.cpp b/Code/CryEngine/Cry3DEngine/terrain_sector_render.cpp
+index 2eabd24c..934549c3 100644
+--- a/Code/CryEngine/Cry3DEngine/terrain_sector_render.cpp
++++ b/Code/CryEngine/Cry3DEngine/terrain_sector_render.cpp
+@@ -1501,7 +1501,9 @@ void CTerrainNode::AppendTrianglesFromObjects(const int nOriginX, const int nOri
+ {
+ 	AABB aabbTNode = GetBBox();
+ 	float fHeightMapMax = aabbTNode.max.z;
+-	aabbTNode.max.z += GetCVars()->e_TerrainIntegrateObjectsMaxHeight;
++	// Grown by the widest band in play, not by the cvar alone: an object with a larger per instance
++	// heightBand has to end up in the query result before its own band can be evaluated below.
++	aabbTNode.max.z += Get3DEngine()->GetTerrainIntegrationQueryBand();
+ 
+ 	// Push out along the vertex normal so the appended copy beats the object's own opaque pixels; it
+ 	// costs that much error against collision, shadow and road drape. Forced to 0 in full mode 2, where
+@@ -1571,8 +1573,8 @@ void CTerrainNode::AppendTrianglesFromObjects(const int nOriginX, const int nOri
+ 			integrationParams = static_cast<IBrush*>(pRNode)->GetTerrainIntegrationParams();
+ 		}
+ 
+-		// Negative = use the cvar. The object query box above is grown by the cvar only, so a larger per
+-		// object band widens the test but not the set of objects this sector looks at.
++		// Negative = use the cvar. The object query box above is grown by max(cvar, widest registered per
++		// object band), so an object whose own band is larger is still in the list and is judged by it here.
+ 		const float fHeightBand = (integrationParams.heightBand >= 0.f)
+ 		                          ? integrationParams.heightBand
+ 		                          : GetCVars()->e_TerrainIntegrateObjectsMaxHeight;
+diff --git a/Code/CryEngine/Cry3DEngine/terran_edit.cpp b/Code/CryEngine/Cry3DEngine/terran_edit.cpp
+index 96a16f29..c9b3bb63 100644
+--- a/Code/CryEngine/Cry3DEngine/terran_edit.cpp
++++ b/Code/CryEngine/Cry3DEngine/terran_edit.cpp
+@@ -505,8 +505,23 @@ void CTerrain::SetTerrainSectorTexture(int nTexSectorX, int nTexSectorY, unsigne
+ 
+ void CTerrain::ResetTerrainVertBuffers(const AABB* pBox)
+ {
+-	if (GetParentNode())
+-		GetParentNode()->ReleaseHeightMapGeometry(true, pBox);
++	if (!GetParentNode())
++		return;
++
++	// ReleaseHeightMapGeometry rejects a sector whose box does not overlap in 3D, and a sector box stops
++	// at the heightmap. Mirror image of the query growth in AppendTrianglesFromObjects: an object
++	// integrated from above sits entirely over the sectors it feeds, so the box that says "rebuild where
++	// this object is" has to reach down by the same band or the rebuild is silently dropped. Only on
++	// levels that integrate objects, so the native path passes the caller's box through untouched.
++	if (pBox && Get3DEngine()->m_bIntegrateObjectsIntoTerrain)
++	{
++		AABB grownBox = *pBox;
++		grownBox.min.z -= Get3DEngine()->GetTerrainIntegrationQueryBand();
++		GetParentNode()->ReleaseHeightMapGeometry(true, &grownBox);
++		return;
++	}
++
++	GetParentNode()->ReleaseHeightMapGeometry(true, pBox);
+ }
+ 
+ void CTerrain::SetOceanWaterLevel(float oceanWaterLevel)
+-- 
+2.47.1.windows.1
+

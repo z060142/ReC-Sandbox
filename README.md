@@ -94,6 +94,31 @@ part. Temporal filtering keeps the volume stable while the camera moves; the his
 any `r_LPV*` change. Debug views under `r_LPVDebug`. Shader: `engine/Engine/Shaders/HWScripts/CryFX/LPV.cfi`,
 renderer stage `GraphicsPipeline/LPV.{h,cpp}`. The related loose `RunTime.ext` rule above applies.
 
+### Terrain Plate
+
+An entity component (**Geometry → Terrain Plate**) that turns a heightmap (`.r16`, `.raw`, `.pgm`,
+`.bmp`) into a piece of terrain you can place, move, scale and stack anywhere: welded into the
+ground at its rim, shaded by the terrain material, colliding like the ground with the terrain's
+own surface types, receiving decals and casting shadows like terrain. **Mirror Z** and **Ground
+Level** let the same plate dig a pit, a riverbed or a crater instead of raising a hill.
+**Bake Into Terrain** writes its relief into the live terrain heightmap while the editor keeps it
+fully editable (move, scale, undo, delete: the ground follows and restores), so roads, terrain
+decals, heightmap AO, SVOGI, navmesh and vegetation placement all see it, with Bake Priority
+deciding overlaps. **Terrain Colour From Plate** paints the plate's diffuse onto the terrain, and
+the **Stamp Height** / **Stamp Colour** buttons make the result permanent, one undo step each.
+
+Around it, a working **Integrate Into Terrain** GI mode for brushes and static meshes, with a
+per-object Terrain Slope Limit, Slope Blend and Height Band, roads that drape over integrated
+objects (`e_RoadsFollowIntegratedObjects`), the `terrain.reposition_vegetation` editor command,
+and fixes to the stock 5.7.1 terrain defects that stood in the way (missing stencil flag, no
+rebuild on toggle, unreachable cvars, collapsed vertical faces, integrated normals tilted under
+non-uniform scale, deferred decals missing non-physical static entities, the 12-bit height
+quantiser ratcheting down on every rewrite). Everything is off by default: with the level flag
+`Terrain/IntegrateObjects` unset and the new cvars at their defaults the terrain behaves as
+before. No shader changes. The same work is published standalone, against stock CRYENGINE 5.7.1
+and with the full usage guide, at
+[CE-5.7.1-Terrain-system-upgrade](https://github.com/z060142/CE-5.7.1-Terrain-system-upgrade).
+
 ## Status
 
 - Verified on a physically lit interior and on the sample airfield in daylight.
@@ -130,8 +155,9 @@ of this repository.
    or by copying `engine/` over the checkout and deleting what `engine/DELETED_FILES.txt` lists.
 2. Configure with the engine's bundled CMake (`Tools/CMake/Win32/bin/cmake.exe`, Visual Studio
    17 2022, x64) and build, in the Profile configuration: `CryRenderD3D11`, `Cry3DEngine`,
-   `CryEntitySystem`, `CryDefaultEntities`, `CinematicCamera`, `CryPhoneTracker`, and
-   `CinematicCameraEditor` (the Sandbox side).
+   `CryEntitySystem`, `CryDefaultEntities`, `CinematicCamera`, `CryPhoneTracker`,
+   `CinematicCameraEditor` (the Sandbox side), and `Sandbox` itself (the Terrain Plate's colour
+   overlay and the terrain editor commands live in the editor executable).
 3. Copy the built DLLs into the engine's `bin/win_x64/` (`CinematicCameraEditor.dll` goes into
    `bin/win_x64/EditorPlugins/`), the changed `.cfx` / `.cfi` shaders into
    `engine/shaders/HWScripts/CryFX/` (the engine compiles loose shader files at startup),

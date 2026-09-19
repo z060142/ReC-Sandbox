@@ -1,0 +1,259 @@
+From a5f8ad9d1c2fbc57f4b29389355bb4bbbfb8a1ea Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Mon, 31 Aug 2026 10:37:22 +0800
+Subject: [PATCH 241/307] !F (3DEngine) Sample surfaces from geometry
+ integrated into terrain.
+
+Query LOD 0 triangles from the registered integrated geometry at a world XY
+position and return the highest valid surface. Heightmap consumers can now
+follow the actual mesh rather than the terrain below it.
+---
+ Code/CryEngine/Cry3DEngine/3dEngine.cpp | 189 ++++++++++++++++++++++++
+ Code/CryEngine/Cry3DEngine/3dEngine.h   |  31 ++++
+ 2 files changed, 220 insertions(+)
+
+diff --git a/Code/CryEngine/Cry3DEngine/3dEngine.cpp b/Code/CryEngine/Cry3DEngine/3dEngine.cpp
+index 037b76b5..a6010238 100644
+--- a/Code/CryEngine/Cry3DEngine/3dEngine.cpp
++++ b/Code/CryEngine/Cry3DEngine/3dEngine.cpp
+@@ -6878,6 +6878,195 @@ void C3DEngine::FlushPendingTerrainRebuilds()
+ 	}
+ }
+ 
++///////////////////////////////////////////////////////////////////////////////
++void C3DEngine::BeginIntegratedHeightSampling(const AABB& areaBox)
++{
++	// Nesting keeps the outer cache: it was built for a superset area, and rebuilding it here would
++	// silently shrink what the outer scope can see.
++	if (m_nIntegratedHeightSamplingDepth++ > 0)
++		return;
++
++	m_integratedHeightCache.clear();
++
++	if (m_integratedIntoTerrainNodes.empty() || areaBox.IsReset())
++		return;
++
++	// Read budget per object. A plate is a few thousand triangles; anything past this is not something
++	// a road should be draping over, and the cost is paid once per rebuild, not once per sample.
++	const int nMaxTrisPerNode = 200000;
++
++	for (std::map<IRenderNode*, AABB>::const_iterator it = m_integratedIntoTerrainNodes.begin();
++	     it != m_integratedIntoTerrainNodes.end(); ++it)
++	{
++		// The map is authoritative: an entry exists only between RegisterEntity and UnRegisterEntity, so
++		// the node is alive here. It is erased before the node is destroyed, on the unregister path of
++		// UpdateTerrainObjectIntegration().
++		IRenderNode* pRNode = it->first;
++
++		if (!Overlap::AABB_AABB2D(it->second, areaBox))
++			continue;
++
++		IRenderMesh* pRM = pRNode->GetRenderMesh(0);
++		if (!pRM)
++			continue; // not streamed in yet; the road keeps the terrain height there
++
++		SIntegratedHeightNode entry;
++		entry.box.Reset();
++
++		pRM->LockForThreadAccess();
++		{
++			int nPosStride = 0;
++			const byte* pPos = pRM->GetPosPtr(nPosStride, FSL_READ);
++			const vtx_idx* pInds = pRM->GetIndexPtr(FSL_READ);
++
++			if (pPos && pInds)
++			{
++				Matrix34 m34;
++				m34.SetIdentity();
++				pRNode->GetEntityStatObj(0, &m34);
++
++				const TRenderChunkArray& Chunks = pRM->GetChunks();
++
++				for (int nChunkId = 0; nChunkId < Chunks.size() && (int)entry.verts.size() < nMaxTrisPerNode * 3; nChunkId++)
++				{
++					const CRenderChunk* pChunk = &Chunks[nChunkId];
++
++					if (pChunk->m_nMatFlags & MTL_FLAG_NODRAW)
++						continue;
++
++					const int lastIndex = pChunk->nFirstIndexId + pChunk->nNumIndices;
++
++					for (int i = pChunk->nFirstIndexId; i + 2 < lastIndex; i += 3)
++					{
++						if ((int)entry.verts.size() >= nMaxTrisPerNode * 3)
++							break;
++
++						for (int v = 0; v < 3; v++)
++						{
++							const Vec3 vWS = m34.TransformPoint(*(const Vec3*)&pPos[nPosStride * pInds[i + v]]);
++							entry.verts.push_back(vWS);
++							entry.box.Add(vWS);
++						}
++					}
++				}
++			}
++		}
++		pRM->UnLockForThreadAccess();
++
++		const int nTris = (int)entry.verts.size() / 3;
++		if (nTris <= 0 || entry.box.IsReset())
++			continue;
++
++		// One coarse XY bin grid per object, sized so a bin holds a handful of triangles. A road samples
++		// a few thousand points per rebuild, so the grid is what keeps this off O(points * triangles).
++		const int nBins = clamp_tpl((int)sqrtf((float)nTris / 4.f), 1, 64);
++		entry.binsX = nBins;
++		entry.binsY = nBins;
++		entry.binSizeX = max(0.001f, (entry.box.max.x - entry.box.min.x) / (float)nBins);
++		entry.binSizeY = max(0.001f, (entry.box.max.y - entry.box.min.y) / (float)nBins);
++		entry.bins.resize((size_t)nBins * nBins);
++
++		for (int t = 0; t < nTris; t++)
++		{
++			const Vec3& a = entry.verts[t * 3 + 0];
++			const Vec3& b = entry.verts[t * 3 + 1];
++			const Vec3& c = entry.verts[t * 3 + 2];
++
++			const float fMinX = min(a.x, min(b.x, c.x));
++			const float fMaxX = max(a.x, max(b.x, c.x));
++			const float fMinY = min(a.y, min(b.y, c.y));
++			const float fMaxY = max(a.y, max(b.y, c.y));
++
++			const int x0 = clamp_tpl((int)((fMinX - entry.box.min.x) / entry.binSizeX), 0, nBins - 1);
++			const int x1 = clamp_tpl((int)((fMaxX - entry.box.min.x) / entry.binSizeX), 0, nBins - 1);
++			const int y0 = clamp_tpl((int)((fMinY - entry.box.min.y) / entry.binSizeY), 0, nBins - 1);
++			const int y1 = clamp_tpl((int)((fMaxY - entry.box.min.y) / entry.binSizeY), 0, nBins - 1);
++
++			for (int bx = x0; bx <= x1; bx++)
++				for (int by = y0; by <= y1; by++)
++					entry.bins[(size_t)by * nBins + bx].push_back(t);
++		}
++
++		m_integratedHeightCache.push_back(std::move(entry));
++	}
++}
++
++///////////////////////////////////////////////////////////////////////////////
++void C3DEngine::EndIntegratedHeightSampling()
++{
++	assert(m_nIntegratedHeightSamplingDepth > 0);
++
++	if (m_nIntegratedHeightSamplingDepth > 0 && --m_nIntegratedHeightSamplingDepth == 0)
++		m_integratedHeightCache.clear();
++}
++
++///////////////////////////////////////////////////////////////////////////////
++bool C3DEngine::HasIntegratedHeightSamplesIn2D(const AABB& box) const
++{
++	for (size_t n = 0; n < m_integratedHeightCache.size(); n++)
++	{
++		if (Overlap::AABB_AABB2D(m_integratedHeightCache[n].box, box))
++			return true;
++	}
++
++	return false;
++}
++
++///////////////////////////////////////////////////////////////////////////////
++float C3DEngine::GetTerrainOrIntegratedZ(float x, float y, float defaultZ) const
++{
++	// No open sampling scope (or nothing integrating nearby): this is the caller's own terrain height,
++	// unmodified. That is the byte identical native path.
++	if (m_integratedHeightCache.empty())
++		return defaultZ;
++
++	float fZ = defaultZ;
++
++	for (size_t n = 0; n < m_integratedHeightCache.size(); n++)
++	{
++		const SIntegratedHeightNode& node = m_integratedHeightCache[n];
++
++		if (x < node.box.min.x || x > node.box.max.x || y < node.box.min.y || y > node.box.max.y)
++			continue;
++
++		const int bx = clamp_tpl((int)((x - node.box.min.x) / node.binSizeX), 0, node.binsX - 1);
++		const int by = clamp_tpl((int)((y - node.box.min.y) / node.binSizeY), 0, node.binsY - 1);
++
++		const std::vector<int>& bin = node.bins[(size_t)by * node.binsX + bx];
++
++		for (size_t k = 0; k < bin.size(); k++)
++		{
++			const Vec3& a = node.verts[bin[k] * 3 + 0];
++			const Vec3& b = node.verts[bin[k] * 3 + 1];
++			const Vec3& c = node.verts[bin[k] * 3 + 2];
++
++			// A vertical ray against a triangle is a 2D barycentric test in XY plus a linear
++			// interpolation of Z. A vertical face projects to zero area and drops out on the determinant
++			// test, which is what we want: only a surface a road could lie on may raise it.
++			const float fDet = (b.y - c.y) * (a.x - c.x) + (c.x - b.x) * (a.y - c.y);
++			if (fabs_tpl(fDet) < 1e-8f)
++				continue;
++
++			const float fInvDet = 1.f / fDet;
++			const float l0 = ((b.y - c.y) * (x - c.x) + (c.x - b.x) * (y - c.y)) * fInvDet;
++			const float l1 = ((c.y - a.y) * (x - c.x) + (a.x - c.x) * (y - c.y)) * fInvDet;
++			const float l2 = 1.f - l0 - l1;
++
++			// A small negative tolerance keeps a sample that lands exactly on a shared edge from falling
++			// through the crack between the two triangles that own it.
++			const float fEdgeTol = -1e-4f;
++			if (l0 < fEdgeTol || l1 < fEdgeTol || l2 < fEdgeTol)
++				continue;
++
++			const float fHitZ = l0 * a.z + l1 * b.z + l2 * c.z;
++			if (fHitZ > fZ)
++				fZ = fHitZ;
++		}
++	}
++
++	return fZ;
++}
++
+ ///////////////////////////////////////////////////////////////////////////////
+ Vec3 C3DEngine::GetEntityRegisterPoint(IRenderNode* pEnt)
+ {
+diff --git a/Code/CryEngine/Cry3DEngine/3dEngine.h b/Code/CryEngine/Cry3DEngine/3dEngine.h
+index 88ef344d..26db5637 100644
+--- a/Code/CryEngine/Cry3DEngine/3dEngine.h
++++ b/Code/CryEngine/Cry3DEngine/3dEngine.h
+@@ -871,6 +871,37 @@ public:
+ 	//! still for long enough. Called once per frame from Update().
+ 	void FlushPendingTerrainRebuilds();
+ 
++	//! One integrating object, cached in world space for the duration of a road rebuild.
++	struct SIntegratedHeightNode
++	{
++		AABB                          box;      //!< world AABB of the cached triangles
++		std::vector<Vec3>             verts;    //!< 3 world space positions per triangle
++		std::vector<std::vector<int>> bins;     //!< triangle ids per XY bin, row major (binsX * binsY)
++		int                           binsX = 1;
++		int                           binsY = 1;
++		float                         binSizeX = 1.f;
++		float                         binSizeY = 1.f;
++	};
++
++	//! LOD 0 geometry of the eGM_IntegrateIntoTerrain nodes overlapping the area passed to
++	//! BeginIntegratedHeightSampling(), valid until the matching End. Empty otherwise, which is what
++	//! makes GetTerrainOrIntegratedZ() a plain pass-through on the native path.
++	std::vector<SIntegratedHeightNode> m_integratedHeightCache;
++	int                                m_nIntegratedHeightSamplingDepth = 0;
++
++	//! Read the LOD 0 meshes of every node in m_integratedIntoTerrainNodes overlapping `areaBox` in XY
++	//! once, so the caller can then sample them cheaply. Main thread only, and it must be paired with
++	//! EndIntegratedHeightSampling(); nesting is allowed and keeps the outer (larger) cache.
++	void  BeginIntegratedHeightSampling(const AABB& areaBox);
++	void  EndIntegratedHeightSampling();
++
++	//! `defaultZ` (the terrain height the caller already has), raised to the highest surface any cached
++	//! integrating object has over (x, y). Returns `defaultZ` unchanged when no sampling scope is open.
++	float GetTerrainOrIntegratedZ(float x, float y, float defaultZ) const;
++
++	//! True when the open sampling scope has geometry overlapping `box` in XY.
++	bool  HasIntegratedHeightSamplesIn2D(const AABB& box) const;
++
+ 	Vec3                  m_fogColor2;
+ 	Vec3                  m_fogColorRadial;
+ 	Vec3                  m_volFogHeightDensity;
+-- 
+2.47.1.windows.1
+

@@ -1,0 +1,134 @@
+From 35e9ba47c419edee6563e30eaffa3ddf24f15b4e Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Wed, 2 Sep 2026 11:07:13 +0800
+Subject: [PATCH 282/307] !B (Terrain Integration) Keep the integrated geometry
+ registry authoritative.
+
+Preserve registry entries across the unregister/register pair used for render
+node updates. GI mode changes now re-register the node so road draping, LOD
+retention and full-integration draw suppression see the current state.
+---
+ Code/CryEngine/Cry3DEngine/3dEngine.cpp       | 16 ++++++++++++++++
+ Code/CryEngine/Cry3DEngine/3dEngine.h         |  5 +++++
+ Code/CryEngine/Cry3DEngine/Brush.cpp          | 10 ++++++++--
+ Code/CryEngine/CryEntitySystem/EntitySlot.cpp | 18 +++++++-----------
+ 4 files changed, 36 insertions(+), 13 deletions(-)
+
+diff --git a/Code/CryEngine/Cry3DEngine/3dEngine.cpp b/Code/CryEngine/Cry3DEngine/3dEngine.cpp
+index 6aef5d32..c97e4cb2 100644
+--- a/Code/CryEngine/Cry3DEngine/3dEngine.cpp
++++ b/Code/CryEngine/Cry3DEngine/3dEngine.cpp
+@@ -6640,7 +6640,12 @@ void C3DEngine::AsyncOctreeUpdate(IRenderNode* pEnt, uint32 nFrameID, bool bUnRe
+ 
+ 	if (pEnt->GetParent())
+ 	{
++		// Re-registering an already inserted node: this removal is octree bookkeeping, not a real
++		// unregister, so the integration entry written above must survive it.
++		IRenderNode* const pPrevReRegistering = m_pReRegisteringNode;
++		m_pReRegisteringNode = pEnt;
+ 		UnRegisterEntityImpl(pEnt);
++		m_pReRegisteringNode = pPrevReRegistering;
+ 	}
+ 	else if (GetCVars()->e_StreamCgf && pEnt->IsAllocatedOutsideOf3DEngineDLL())
+ 	{
+@@ -6795,6 +6800,11 @@ void C3DEngine::UpdateTerrainObjectIntegration(IRenderNode* pEnt, EERType eERTyp
+ 	if (eERType != eERType_MovableBrush)
+ 		return;
+ 
++	// Half of a re-registration (SetMatrix, or the octree move inside AsyncOctreeUpdate). Dropping the
++	// entry here would lose it for good on the slot path, and would hide the move from the debounce.
++	if (bUnregister && pEnt == m_pReRegisteringNode)
++		return;
++
+ 	const bool bIntegratesNow = !bUnregister
+ 	                            && m_bIntegrateObjectsIntoTerrain
+ 	                            && pEnt->GetGIMode() == IRenderNode::eGM_IntegrateIntoTerrain;
+@@ -6846,6 +6856,12 @@ void C3DEngine::UpdateTerrainObjectIntegration(IRenderNode* pEnt, EERType eERTyp
+ 
+ 	RefreshIntegratedNodeBoxes();
+ 
++	if (GetCVars()->e_TerrainIntegrateObjectsDebug >= 1)
++	{
++		PrintMessage("TerrainIntegration: %s '%s', registry %d entries", bIntegratesNow ? "add/update" : "remove",
++		             pEnt->GetName(), (int)m_integratedIntoTerrainNodes.size());
++	}
++
+ 	// Roads drape over the object's surface, so the same dirty box has to rebuild them. Scheduling only:
+ 	// Compile() must not run from inside a (un)registration.
+ 	RequestRoadRebuildsInArea(dirtyBox);
+diff --git a/Code/CryEngine/Cry3DEngine/3dEngine.h b/Code/CryEngine/Cry3DEngine/3dEngine.h
+index faee390b..2c46754c 100644
+--- a/Code/CryEngine/Cry3DEngine/3dEngine.h
++++ b/Code/CryEngine/Cry3DEngine/3dEngine.h
+@@ -855,6 +855,11 @@ public:
+ 
+ 	void RefreshIntegratedNodeBoxes();
+ 
++	//! Node currently inside an unregister/register pair (CBrush::SetMatrix, or the octree move done by
++	//! AsyncOctreeUpdate). The unregister half must leave the registry alone: the register half owns the
++	//! entry, and only then can it see the node as already integrating and debounce the move.
++	IRenderNode* m_pReRegisteringNode = nullptr;
++
+ 	//! True when any integrated object overlaps `box` in XY. Early-outs on levels that integrate nothing.
+ 	bool HasIntegratedObjectsInBoxXY(const AABB& box) const;
+ 
+diff --git a/Code/CryEngine/Cry3DEngine/Brush.cpp b/Code/CryEngine/Cry3DEngine/Brush.cpp
+index 99a891b3..31e06b69 100644
+--- a/Code/CryEngine/Cry3DEngine/Brush.cpp
++++ b/Code/CryEngine/Cry3DEngine/Brush.cpp
+@@ -228,8 +228,14 @@ void CBrush::SetMatrix(const Matrix34& mat)
+ 	// TODO: implement this on a lower level (3DEngine's registration interface) to uniformly support this across all IRenderNode implementations
+ 	if (!(m_dwRndFlags & ERF_NO_3DENGINE_REGISTRATION))
+ 	{
+-		Get3DEngine()->UnRegisterEntityAsJob(this);
+-		Get3DEngine()->RegisterEntity(this);
++		// Mark the pair as one move: without this the unregister half drops the terrain integration entry,
++		// so the register half can never tell a move from a first registration and never debounces.
++		C3DEngine* const p3DEngine = Get3DEngine();
++		IRenderNode* const pPrevReRegistering = p3DEngine->m_pReRegisteringNode;
++		p3DEngine->m_pReRegisteringNode = this;
++		p3DEngine->UnRegisterEntityAsJob(this);
++		p3DEngine->m_pReRegisteringNode = pPrevReRegistering;
++		p3DEngine->RegisterEntity(this);
+ 	}
+ 
+ 	if (replacePhys)
+diff --git a/Code/CryEngine/CryEntitySystem/EntitySlot.cpp b/Code/CryEngine/CryEntitySystem/EntitySlot.cpp
+index 316d0d3e..5a524a21 100644
+--- a/Code/CryEngine/CryEntitySystem/EntitySlot.cpp
++++ b/Code/CryEngine/CryEntitySystem/EntitySlot.cpp
+@@ -222,17 +222,6 @@ void CEntitySlot::UpdateRenderNode(bool bForceRecreateNode)
+ 
+ 		m_pRenderNode->SetRndFlags(renderNodeFlags);
+ 
+-		// The terrain sector meshes hold a copy of every eGM_IntegrateIntoTerrain node and are rebuilt
+-		// only on request, so both directions of the transition must invalidate the covered sectors.
+-		if (bWasIntegratedIntoTerrain != (m_pRenderNode->GetGIMode() == IRenderNode::eGM_IntegrateIntoTerrain))
+-		{
+-			if (ITerrain* pTerrain = gEnv->p3DEngine ? gEnv->p3DEngine->GetITerrain() : nullptr)
+-			{
+-				AABB nodeBox = m_pRenderNode->GetBBox();
+-				pTerrain->ResetTerrainVertBuffers(&nodeBox);
+-			}
+-		}
+-
+ 		// The render node is recreated whenever the slot geometry changes, so push the parameters again.
+ 		ApplyTerrainIntegrationParams();
+ 
+@@ -249,6 +238,13 @@ void CEntitySlot::UpdateRenderNode(bool bForceRecreateNode)
+ 				gEnv->p3DEngine->RegisterEntity(m_pRenderNode);
+ 			}
+ 		}
++		// The engine tracks the eGM_IntegrateIntoTerrain nodes (road draping, terrain LOD hold, draw
++		// suppression) and updates that on registration only. Toggling the mode leaves the matrix alone,
++		// so SetMatrix above re-registers nothing; the re-register also rebuilds the covered sectors.
++		else if (bWasIntegratedIntoTerrain != (m_pRenderNode->GetGIMode() == IRenderNode::eGM_IntegrateIntoTerrain))
++		{
++			gEnv->p3DEngine->RegisterEntity(m_pRenderNode);
++		}
+ 
+ 		IMaterial* pMaterial = (m_pMaterial) ? m_pMaterial.get() : m_pEntity->GetMaterial();
+ 		if (pMaterial != m_pRenderNode->GetMaterialOverride())
+-- 
+2.47.1.windows.1
+

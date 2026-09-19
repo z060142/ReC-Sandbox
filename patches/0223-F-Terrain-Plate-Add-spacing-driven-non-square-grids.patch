@@ -1,0 +1,433 @@
+From 677c63d9afcb18c23371aa021a41e47e4feaae9c Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Mon, 31 Aug 2026 00:03:19 +0800
+Subject: [PATCH 223/307] !F (Terrain Plate) Add spacing-driven non-square
+ grids.
+
+Add a spacing mode that derives independent X and Y vertex counts from the
+world dimensions. Fixed mode keeps the existing square grid behaviour.
+---
+ .../Geometry/TerrainPlateComponent.cpp        | 203 +++++++++++++-----
+ .../Geometry/TerrainPlateComponent.h          |  42 +++-
+ 2 files changed, 184 insertions(+), 61 deletions(-)
+
+diff --git a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
+index ca047cf8..e330072f 100644
+--- a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
++++ b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
+@@ -546,9 +546,10 @@ Cry::Entity::EventFlags CTerrainPlateComponent::GetEventMask() const
+ {
+ 	Cry::Entity::EventFlags bitFlags = CBaseMeshComponent::GetEventMask();
+ 
+-	// The weld and the skirt are computed against the terrain under the plate, so both depend on where
+-	// the plate is in the world. Without them the mesh is transform independent and no rebuild is due.
+-	if (m_bEdgeWeld || (float)m_skirt > 0.f)
++	// The weld and the skirt are computed against the terrain under the plate, and in Spacing mode the
++	// tessellation follows the world size of the plate, so all three depend on the transform. Without
++	// them the mesh is transform independent and no rebuild is due.
++	if (NeedsRegenerateOnTransform())
+ 	{
+ 		bitFlags |= ENTITY_EVENT_XFORM;
+ 	}
+@@ -571,7 +572,7 @@ void CTerrainPlateComponent::ProcessEvent(const SEntityEvent& event)
+ 		break;
+ 
+ 	case ENTITY_EVENT_XFORM:
+-		if (m_bEdgeWeld || (float)m_skirt > 0.f)
++		if (NeedsRegenerateOnTransform())
+ 		{
+ 			RequestRegenerate();
+ 		}
+@@ -613,6 +614,11 @@ bool CTerrainPlateComponent::SetMaterial(int slotId, const char* szMaterial)
+ 	return false;
+ }
+ 
++bool CTerrainPlateComponent::NeedsRegenerateOnTransform() const
++{
++	return m_bEdgeWeld || (float)m_skirt > 0.f || m_gridMode == ETerrainPlateGridMode::Spacing;
++}
++
+ void CTerrainPlateComponent::Rebuild()
+ {
+ 	LoadSourceIfNeeded();
+@@ -702,25 +708,103 @@ void CTerrainPlateComponent::ApplyMaterial()
+ 	m_pEntity->SetSlotMaterial(GetEntitySlotId(), m_materialPath.value.empty() ? nullptr : pMaterial);
+ }
+ 
+-void CTerrainPlateComponent::WarnAboutVertexBudgetOnce(int gridSide, int gridVertexCount)
++int CTerrainPlateComponent::GetIntegrationVertexBudget() const
+ {
+-	if (m_bBudgetWarningIssued || gEnv->pConsole == nullptr)
+-		return;
++	if (gEnv->pConsole == nullptr)
++		return 0;
+ 
+ 	ICVar* pCVar = gEnv->pConsole->GetCVar("e_TerrainIntegrateObjectsMaxVertices");
+ 	if (pCVar == nullptr)
+-		return;
++		return 0;
+ 
++	// Half of the per sector budget: a sector usually holds more than one integrating object, and the
++	// budget is shared by all of them.
+ 	const int budget = pCVar->GetIVal();
+-	if (budget > 0 && gridVertexCount > budget / 2)
++	return (budget > 0) ? (budget / 2) : 0;
++}
++
++void CTerrainPlateComponent::ComputeEffectiveGrid(int& vertsX, int& vertsY)
++{
++	const int budgetHalf = GetIntegrationVertexBudget();
++
++	float spacingX = 0.f;
++	float spacingY = 0.f;
++	float edgeX = max(0.0001f, m_size.x);
++	float edgeY = max(0.0001f, m_size.y);
++
++	if (m_gridMode == ETerrainPlateGridMode::Fixed)
+ 	{
+-		m_bBudgetWarningIssued = true;
+-		CryWarning(VALIDATOR_MODULE_3DENGINE, VALIDATOR_WARNING,
+-		           "Terrain Plate: a %d x %d grid is %d vertices, more than half of the per sector integration budget "
+-		           "(e_TerrainIntegrateObjectsMaxVertices = %d). A second plate or object in the same sector will overflow it; "
+-		           "lower Grid or raise the cvar.",
+-		           gridSide, gridSide, gridVertexCount, budget);
++		vertsX = vertsY = clamp_tpl((int)m_grid, 2, 513);
+ 	}
++	else
++	{
++		// Spacing is a world space distance, so the entity scale on each axis has to be folded in. The
++		// two axes are resolved independently, which is why the grid may end up non square.
++		const Matrix34 worldTM = GetPlateWorldTM();
++		const float scaleX = worldTM.GetColumn0().GetLength();
++		const float scaleY = worldTM.GetColumn1().GetLength();
++
++		edgeX *= (scaleX > 0.0001f) ? scaleX : 1.f;
++		edgeY *= (scaleY > 0.0001f) ? scaleY : 1.f;
++
++		const float spacing = max(0.0001f, (float)m_vertexSpacing);
++		vertsX = clamp_tpl((int)floorf(edgeX / spacing + 0.5f) + 1, 2, 513);
++		vertsY = clamp_tpl((int)floorf(edgeY / spacing + 0.5f) + 1, 2, 513);
++
++		// Never ask for more vertices than the source has texels on that axis: past that point the
++		// bilinear sampler only interpolates and the extra triangles buy nothing.
++		if (m_heightField.IsValid())
++		{
++			vertsX = max(2, min(vertsX, m_heightField.m_width));
++			vertsY = max(2, min(vertsY, m_heightField.m_height));
++		}
++	}
++
++	// Budget. In Fixed mode the user asked for an exact grid, so it is only reported (step 1's D5
++	// warning still catches a real overflow). In Spacing mode the grid is derived, so it is clamped
++	// proportionally - both axes are scaled by the same factor, which keeps the aspect ratio.
++	if (budgetHalf > 0 && vertsX * vertsY > budgetHalf)
++	{
++		if (m_gridMode == ETerrainPlateGridMode::Fixed)
++		{
++			if (!m_bBudgetWarningIssued)
++			{
++				m_bBudgetWarningIssued = true;
++				CryWarning(VALIDATOR_MODULE_3DENGINE, VALIDATOR_WARNING,
++				           "Terrain Plate: a %d x %d grid is %d vertices, more than half of the per sector integration budget "
++				           "(e_TerrainIntegrateObjectsMaxVertices = %d). A second plate or object in the same sector will overflow it; "
++				           "lower Grid or raise the cvar.",
++				           vertsX, vertsY, vertsX * vertsY, budgetHalf * 2);
++			}
++		}
++		else
++		{
++			const int requestedX = vertsX;
++			const int requestedY = vertsY;
++			const float factor = sqrtf((float)budgetHalf / (float)(requestedX * requestedY));
++
++			vertsX = clamp_tpl((int)(requestedX * factor), 2, 513);
++			vertsY = clamp_tpl((int)(requestedY * factor), 2, 513);
++
++			if (!m_bBudgetClampWarningIssued)
++			{
++				m_bBudgetClampWarningIssued = true;
++				CryWarning(VALIDATOR_MODULE_3DENGINE, VALIDATOR_WARNING,
++				           "Terrain Plate: Vertex Spacing %.3f m over %.2f x %.2f m asks for a %d x %d grid (%d vertices), more than half of the "
++				           "per sector integration budget (e_TerrainIntegrateObjectsMaxVertices = %d). Clamped to %d x %d; raise Vertex Spacing "
++				           "or the cvar to get the density back.",
++				           (float)m_vertexSpacing, edgeX, edgeY, requestedX, requestedY, requestedX * requestedY,
++				           budgetHalf * 2, vertsX, vertsY);
++			}
++		}
++	}
++
++	spacingX = edgeX / (float)(vertsX - 1);
++	spacingY = edgeY / (float)(vertsY - 1);
++
++	char szInfo[128];
++	cry_sprintf(szInfo, "%d x %d vertices, %.3f x %.3f m spacing", vertsX, vertsY, spacingX, spacingY);
++	m_effectiveGridInfo = szInfo;
+ }
+ 
+ void CTerrainPlateComponent::RegenerateMesh()
+@@ -731,11 +815,12 @@ void CTerrainPlateComponent::RegenerateMesh()
+ 	if (m_pEntity == nullptr || gEnv->p3DEngine == nullptr)
+ 		return;
+ 
+-	const int n = clamp_tpl((int)m_grid, 2, 513);
+-	const int gridVertexCount = n * n;
+-	const float fInvLast = 1.f / (float)(n - 1);
++	int nx = 2, ny = 2;
++	ComputeEffectiveGrid(nx, ny);
+ 
+-	WarnAboutVertexBudgetOnce(n, gridVertexCount);
++	const int gridVertexCount = nx * ny;
++	const float fInvLastX = 1.f / (float)(nx - 1);
++	const float fInvLastY = 1.f / (float)(ny - 1);
+ 
+ 	const float sizeX = max(0.0001f, m_size.x);
+ 	const float sizeY = max(0.0001f, m_size.y);
+@@ -747,16 +832,16 @@ void CTerrainPlateComponent::RegenerateMesh()
+ 	std::vector<float> heights((size_t)gridVertexCount, 0.f);
+ 	std::vector<Vec2>  uvs((size_t)gridVertexCount);
+ 
+-	for (int r = 0; r < n; ++r)
++	for (int r = 0; r < ny; ++r)
+ 	{
+-		for (int c = 0; c < n; ++c)
++		for (int c = 0; c < nx; ++c)
+ 		{
+-			float u = (float)c * fInvLast;
+-			float v = (float)r * fInvLast;
++			float u = (float)c * fInvLastX;
++			float v = (float)r * fInvLastY;
+ 			if (m_bMirrorX) u = 1.f - u;
+ 			if (m_bMirrorY) v = 1.f - v;
+ 
+-			const size_t index = (size_t)r * n + c;
++			const size_t index = (size_t)r * nx + c;
+ 			uvs[index] = Vec2(u, v);
+ 			heights[index] = m_heightField.IsValid() ? m_heightField.SampleBilinear(u, v) : 0.f;
+ 		}
+@@ -787,14 +872,14 @@ void CTerrainPlateComponent::RegenerateMesh()
+ 	// ---------------------------------------------------------------- positions
+ 	// The plate is centred on the component origin in XY and its zero level is the component origin.
+ 	std::vector<Vec3> positions((size_t)gridVertexCount);
+-	for (int r = 0; r < n; ++r)
++	for (int r = 0; r < ny; ++r)
+ 	{
+-		for (int c = 0; c < n; ++c)
++		for (int c = 0; c < nx; ++c)
+ 		{
+-			const size_t index = (size_t)r * n + c;
++			const size_t index = (size_t)r * nx + c;
+ 			positions[index] = Vec3(
+-			  -sizeX * 0.5f + sizeX * ((float)c * fInvLast),
+-			  sizeY * 0.5f - sizeY * ((float)r * fInvLast),
++			  -sizeX * 0.5f + sizeX * ((float)c * fInvLastX),
++			  sizeY * 0.5f - sizeY * ((float)r * fInvLastY),
+ 			  heights[index]);
+ 		}
+ 	}
+@@ -811,14 +896,15 @@ void CTerrainPlateComponent::RegenerateMesh()
+ 		invWorldTM.Invert();
+ 
+ 		const float falloff = clamp_tpl((float)m_weldInnerFalloff, 0.f, 1.f);
+-		const float halfSpan = (float)(n - 1) * 0.5f;
++		const float halfSpanX = (float)(nx - 1) * 0.5f;
++		const float halfSpanY = (float)(ny - 1) * 0.5f;
+ 
+-		for (int r = 0; r < n; ++r)
++		for (int r = 0; r < ny; ++r)
+ 		{
+-			for (int c = 0; c < n; ++c)
++			for (int c = 0; c < nx; ++c)
+ 			{
+-				const float du = (float)min(c, n - 1 - c) / halfSpan;
+-				const float dv = (float)min(r, n - 1 - r) / halfSpan;
++				const float du = (float)min(c, nx - 1 - c) / halfSpanX;
++				const float dv = (float)min(r, ny - 1 - r) / halfSpanY;
+ 				const float d = min(du, dv);
+ 
+ 				float weight;
+@@ -839,7 +925,7 @@ void CTerrainPlateComponent::RegenerateMesh()
+ 				if (weight <= 0.f)
+ 					continue;
+ 
+-				const size_t index = (size_t)r * n + c;
++				const size_t index = (size_t)r * nx + c;
+ 				const Vec3 world = worldTM * positions[index];
+ 				const float terrainZ = gEnv->p3DEngine->GetTerrainElevation(world.x, world.y);
+ 				const Vec3 conformed = invWorldTM * Vec3(world.x, world.y, terrainZ);
+@@ -853,20 +939,20 @@ void CTerrainPlateComponent::RegenerateMesh()
+ 	std::vector<int> perimeter;
+ 	if (bSkirt)
+ 	{
+-		perimeter.reserve((size_t)4 * (n - 1));
+-		for (int c = 0; c < n - 1; ++c)
+-			perimeter.push_back((n - 1) * n + c);            // -Y edge, +X direction
+-		for (int r = n - 1; r > 0; --r)
+-			perimeter.push_back(r * n + (n - 1));            // +X edge, +Y direction
+-		for (int c = n - 1; c > 0; --c)
+-			perimeter.push_back(0 * n + c);                  // +Y edge, -X direction
+-		for (int r = 0; r < n - 1; ++r)
+-			perimeter.push_back(r * n + 0);                  // -X edge, -Y direction
++		perimeter.reserve((size_t)2 * (nx - 1) + (size_t)2 * (ny - 1));
++		for (int c = 0; c < nx - 1; ++c)
++			perimeter.push_back((ny - 1) * nx + c);          // -Y edge, +X direction
++		for (int r = ny - 1; r > 0; --r)
++			perimeter.push_back(r * nx + (nx - 1));          // +X edge, +Y direction
++		for (int c = nx - 1; c > 0; --c)
++			perimeter.push_back(c);                          // +Y edge, -X direction
++		for (int r = 0; r < ny - 1; ++r)
++			perimeter.push_back(r * nx);                     // -X edge, -Y direction
+ 	}
+ 
+ 	const int perimeterCount = (int)perimeter.size();
+ 	const int totalVertexCount = gridVertexCount + (bSkirt ? perimeterCount * 2 : 0);
+-	const int totalIndexCount = (n - 1) * (n - 1) * 6 + (bSkirt ? perimeterCount * 6 : 0);
++	const int totalIndexCount = (nx - 1) * (ny - 1) * 6 + (bSkirt ? perimeterCount * 6 : 0);
+ 
+ 	// ---------------------------------------------------------------- mesh
+ 	if (m_pStatObj == nullptr)
+@@ -903,16 +989,16 @@ void CTerrainPlateComponent::RegenerateMesh()
+ 
+ 	// Grid vertices. The tangent frame is analytic: the engine's own tangent generator
+ 	// (IIndexedMesh::Optimize) re-welds and reorders the vertices, which would destroy the grid.
+-	for (int r = 0; r < n; ++r)
++	for (int r = 0; r < ny; ++r)
+ 	{
+-		for (int c = 0; c < n; ++c)
++		for (int c = 0; c < nx; ++c)
+ 		{
+-			const size_t index = (size_t)r * n + c;
++			const size_t index = (size_t)r * nx + c;
+ 
+-			const Vec3& pXPrev = positions[(size_t)r * n + max(0, c - 1)];
+-			const Vec3& pXNext = positions[(size_t)r * n + min(n - 1, c + 1)];
+-			const Vec3& pYPrev = positions[(size_t)max(0, r - 1) * n + c]; // one row towards +Y
+-			const Vec3& pYNext = positions[(size_t)min(n - 1, r + 1) * n + c];
++			const Vec3& pXPrev = positions[(size_t)r * nx + max(0, c - 1)];
++			const Vec3& pXNext = positions[(size_t)r * nx + min(nx - 1, c + 1)];
++			const Vec3& pYPrev = positions[(size_t)max(0, r - 1) * nx + c]; // one row towards +Y
++			const Vec3& pYNext = positions[(size_t)min(ny - 1, r + 1) * nx + c];
+ 
+ 			Vec3 dX = pXNext - pXPrev;   // along +X
+ 			Vec3 dY = pYPrev - pYNext;   // along +Y
+@@ -941,14 +1027,14 @@ void CTerrainPlateComponent::RegenerateMesh()
+ 	// Grid indices, counter clockwise seen from +Z (the engine's front face winding, see
+ 	// CTerrain::MakeAreaRenderMesh).
+ 	int indexCursor = 0;
+-	for (int r = 0; r < n - 1; ++r)
++	for (int r = 0; r < ny - 1; ++r)
+ 	{
+-		for (int c = 0; c < n - 1; ++c)
++		for (int c = 0; c < nx - 1; ++c)
+ 		{
+-			const vtx_idx v00 = (vtx_idx)(r * n + c);
+-			const vtx_idx v01 = (vtx_idx)(r * n + c + 1);
+-			const vtx_idx v10 = (vtx_idx)((r + 1) * n + c);
+-			const vtx_idx v11 = (vtx_idx)((r + 1) * n + c + 1);
++			const vtx_idx v00 = (vtx_idx)(r * nx + c);
++			const vtx_idx v01 = (vtx_idx)(r * nx + c + 1);
++			const vtx_idx v10 = (vtx_idx)((r + 1) * nx + c);
++			const vtx_idx v11 = (vtx_idx)((r + 1) * nx + c + 1);
+ 
+ 			pIndices[indexCursor++] = v00;
+ 			pIndices[indexCursor++] = v10;
+@@ -1038,6 +1124,5 @@ void CTerrainPlateComponent::RegenerateMesh()
+ 	ApplyMaterial();
+ 	ApplyBaseMeshProperties();
+ }
+-
+ }
+ }
+diff --git a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
+index 7629d7f4..a3b74427 100644
+--- a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
++++ b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
+@@ -5,6 +5,7 @@
+ #include "BaseMeshComponent.h"
+ 
+ #include <CrySchematyc/ResourceTypes.h>
++#include <CrySchematyc/Utils/SharedString.h>
+ #include <CrySerialization/Decorators/ResourceFilePath.h>
+ 
+ #include <vector>
+@@ -95,6 +96,22 @@ static void ReflectType(Schematyc::CTypeDesc<ETerrainPlateSource>& desc)
+ 	desc.AddConstant(ETerrainPlateSource::DisplacementTexture, "DisplacementTexture", "Displacement Texture");
+ }
+ 
++enum class ETerrainPlateGridMode
++{
++	Fixed = 0,
++	Spacing,
++};
++
++static void ReflectType(Schematyc::CTypeDesc<ETerrainPlateGridMode>& desc)
++{
++	desc.SetGUID("{9A62C0D5-4E17-4B83-8F06-2C5D71B4EA98}"_cry_guid);
++	desc.SetLabel("Terrain Plate Grid Mode");
++	desc.SetDescription("How the tessellation of the plate is decided");
++	desc.SetDefaultValue(ETerrainPlateGridMode::Fixed);
++	desc.AddConstant(ETerrainPlateGridMode::Fixed, "Fixed", "Fixed");
++	desc.AddConstant(ETerrainPlateGridMode::Spacing, "Spacing", "Spacing");
++}
++
+ //! A procedural grid mesh built from a heightmap, hosted in an entity slot so that it reaches the
+ //! terrain integration path exactly like an ordinary mesh component does.
+ class CTerrainPlateComponent
+@@ -146,7 +163,19 @@ public:
+ 		desc.AddMember(&CTerrainPlateComponent::m_displacementPath, 'dtex', "DisplacementTexture", "Displacement Texture", "Uncompressed DDS (R8, R16, R16F, R32F, RGBA8/BGRA8). Compressed formats cannot be read on the CPU and give a flat plate. Used when Source Mode is Displacement Texture.", Schematyc::TextureFileName());
+ 		desc.AddMember(&CTerrainPlateComponent::m_materialPath, 'mat', "Material", "Material", "Material of the plate. Empty uses the engine default material; the plate needs a material to be picked up by terrain integration.", "");
+ 
+-		desc.AddMember(&CTerrainPlateComponent::m_grid, 'grid', "Grid", "Grid", "Vertices per side of the plate", 65);
++		desc.AddMember(&CTerrainPlateComponent::m_gridMode, 'gmod', "GridMode", "Grid Mode",
++		               "Fixed: Grid is the number of vertices per side. Spacing: the grid is derived from Vertex Spacing and the "
++		               "size of the plate in the world, so the density stays constant when the plate is resized or scaled.",
++		               ETerrainPlateGridMode::Fixed);
++		desc.AddMember(&CTerrainPlateComponent::m_grid, 'grid', "Grid", "Grid", "Vertices per side of the plate. Only used when Grid Mode is Fixed.", 65);
++		desc.AddMember(&CTerrainPlateComponent::m_vertexSpacing, 'vspc', "VertexSpacing", "Vertex Spacing",
++		               "Distance in metres between two vertices of the plate, measured in world space (the entity scale is taken into account). "
++		               "Only used when Grid Mode is Spacing. The result is clamped to 2..513 vertices per axis, to the resolution of the source, "
++		               "and to half of e_TerrainIntegrateObjectsMaxVertices.",
++		               0.1f);
++		desc.AddMember(&CTerrainPlateComponent::m_effectiveGridInfo, 'einf', "EffectiveGrid", "Effective Grid",
++		               "Read only: the grid that was actually generated (vertices along X x vertices along Y) and the resulting spacing in metres. "
++		               "Anything typed here is overwritten by the next rebuild.", Schematyc::CSharedString());
+ 		desc.AddMember(&CTerrainPlateComponent::m_size, 'size', "Size", "Size", "Size of the plate in metres before the entity scale is applied", Vec2(1.f, 1.f));
+ 		desc.AddMember(&CTerrainPlateComponent::m_zMax, 'zmax', "ZMax", "Z Max", "Height in metres of the fully white part of the source, before the entity scale is applied", 1.f);
+ 		desc.AddMember(&CTerrainPlateComponent::m_bNormalize, 'norm', "Normalize", "Normalize", "On: the darkest sample becomes 0 and the brightest becomes Z Max. Off: the raw 0..1 value is multiplied by Z Max.", true);
+@@ -172,17 +201,25 @@ protected:
+ 	void        LoadSourceIfNeeded();
+ 	//! Regenerates now, or once in the next frame if this frame already did.
+ 	void        RequestRegenerate();
++	//! True when the mesh depends on the entity transform (weld, skirt, or Spacing grid mode).
++	bool        NeedsRegenerateOnTransform() const;
+ 	//! World transform of the plate slot, also valid before the slot exists.
+ 	Matrix34    GetPlateWorldTM() const;
+ 	void        ApplyMaterial();
+-	void        WarnAboutVertexBudgetOnce(int gridSide, int gridVertexCount);
++	//! Half of e_TerrainIntegrateObjectsMaxVertices, or 0 when the cvar is unavailable.
++	int         GetIntegrationVertexBudget() const;
++	//! Resolves Grid Mode into the vertex counts along X and Y, clamping and warning as needed.
++	void        ComputeEffectiveGrid(int& vertsX, int& vertsY);
+ 
+ 	ETerrainPlateSource                          m_sourceMode = ETerrainPlateSource::HeightmapFile;
+ 	Schematyc::TerrainHeightmapFileName          m_heightmapPath;
+ 	Schematyc::TextureFileName                   m_displacementPath;
+ 	Schematyc::MaterialFileName                  m_materialPath;
+ 
++	ETerrainPlateGridMode                        m_gridMode = ETerrainPlateGridMode::Fixed;
+ 	Schematyc::Range<2, 513, 2, 513, int>        m_grid = 65;
++	Schematyc::Range<0, 1000, 0, 10, float>      m_vertexSpacing = 0.1f;
++	Schematyc::CSharedString                     m_effectiveGridInfo;
+ 	Vec2                                         m_size = Vec2(1.f, 1.f);
+ 	float                                        m_zMax = 1.f;
+ 	bool                                         m_bNormalize = true;
+@@ -200,6 +237,7 @@ protected:
+ 	bool                     m_bSourceLoaded = false;
+ 	bool                     m_bRegenPending = false;
+ 	bool                     m_bBudgetWarningIssued = false;
++	bool                     m_bBudgetClampWarningIssued = false;
+ 	uint32                   m_lastRegenFrameId = 0;
+ 	_smart_ptr<IStatObj>     m_pStatObj;
+ };
+-- 
+2.47.1.windows.1
+

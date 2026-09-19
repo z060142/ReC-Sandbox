@@ -1,0 +1,156 @@
+From f13f7fc66276d20993f1d8037a397656534ce908 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Thu, 3 Sep 2026 14:16:15 +0800
+Subject: [PATCH 300/307] !B (Sandbox) Clear the plate's colour-stamp record
+ when Stamp Colour is undone.
+
+terrain.stamp_plate_colour recorded only the RGB tiles
+(RecordTerrainAppearanceUndo) and then called OnColourStamped(), which sets the
+serialized m_bColourStamped. Ctrl+Z restored the tiles but left the record
+standing, so GetLiveColourState kept returning false: the preview and the export
+stayed stood down over ground that no longer carried the colour, and the plate's
+colour was simply missing from the picture until the plate was moved or edited.
+
+A second undo object, CUndoPlateColourStamp, now goes into the same
+"Stamp Plate Colour" group, recorded AFTER the tile snapshot - a step undoes its
+objects in reverse, so undo clears the record first and then restores the tiles,
+and the overlay repaints over the ground it was drawing on before the stamp.
+Redo sets it again.
+
+ITerrainPlateCommit::SetColourStampRecord is the forced setter it needs:
+ClearColourStamp deliberately ignores a clear in the frame after a stamp (the
+property tree reports the action button itself as a property change), which an
+undo must not be subject to. Nothing else on the plate changes - a stamp still
+moves no property, toggle or effect.
+---
+ .../Geometry/ITerrainPlateCommit.h            |  6 +++
+ .../Geometry/TerrainPlateComponent.cpp        | 16 +++++++
+ .../Geometry/TerrainPlateComponent.h          |  1 +
+ .../EditorQt/Terrain/TerrainCommands.cpp      | 48 +++++++++++++++++++
+ 4 files changed, 71 insertions(+)
+
+diff --git a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/ITerrainPlateCommit.h b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/ITerrainPlateCommit.h
+index 05f31493..21eb6fc9 100644
+--- a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/ITerrainPlateCommit.h
++++ b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/ITerrainPlateCommit.h
+@@ -99,6 +99,12 @@ struct ITerrainPlateCommit
+ 	//! it a second time over itself. The picture does not change: the stamp IS the overlay.
+ 	virtual void  OnColourStamped() = 0;
+ 
++	//! Undo/redo of a colour stamp: put the record back exactly as it was, forced. Not ClearColourStamp,
++	//! which ignores a clear in the frame after a stamp (the property tree reports the action button itself
++	//! as a property change) - an undo is a deliberate reversal and must always land.
++	//! Only the editor's own undo object calls this; nothing else on the plate changes.
++	virtual void  SetColourStampRecord(bool bStamped) = 0;
++
+ 	//! True while the ground under this plate already carries the colour this plate would draw (@see
+ 	//! OnColourStamped). Pressing Stamp Colour again is a silent success: there is nothing left to write.
+ 	virtual bool  IsColourStamped() const = 0;
+diff --git a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
+index ff7eccd3..03ba9936 100644
+--- a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
++++ b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
+@@ -3472,6 +3472,22 @@ void CTerrainPlateComponent::OnColourStamped()
+ 	       "plate moves or goes. Terrain Colour From Plate is untouched; the picture is unchanged.", GetPlateName());
+ }
+ 
++void CTerrainPlateComponent::SetColourStampRecord(bool bStamped)
++{
++	if (bStamped)
++	{
++		OnColourStamped();
++		return;
++	}
++
++	// Forced, unlike ClearColourStamp: an undo of the stamp restores the ground colour the tiles held before
++	// it, so the record has to go with it whatever frame it is. Leaving it would keep the preview stood down
++	// and the plate colour would simply be missing until the plate was nudged.
++	m_bColourStamped = false;
++	m_bColourStampRefValid = false;
++	m_colourStampFrameId = 0;
++}
++
+ void CTerrainPlateComponent::NudgeBakeAfterTerrainWrite(int rectX1, int rectY1, int rectSize)
+ {
+ 	if (!m_bBakeApplied || m_bakeRectSize <= 0 || rectSize <= 0 || gEnv == nullptr)
+diff --git a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
+index f2237f46..d484e3a1 100644
+--- a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
++++ b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
+@@ -459,6 +459,7 @@ public:
+ 	virtual void  OnHeightStamped() final;
+ 	virtual void  OnColourStamped() final;
+ 	virtual bool  IsColourStamped() const final;
++	virtual void  SetColourStampRecord(bool bStamped) final;
+ 	virtual void  NudgeBakeAfterTerrainWrite(int rectX1, int rectY1, int rectSize) final;
+ 	// ~ITerrainPlateCommit
+ 
+diff --git a/Code/Sandbox/EditorQt/Terrain/TerrainCommands.cpp b/Code/Sandbox/EditorQt/Terrain/TerrainCommands.cpp
+index ddff515d..38a3cb52 100644
+--- a/Code/Sandbox/EditorQt/Terrain/TerrainCommands.cpp
++++ b/Code/Sandbox/EditorQt/Terrain/TerrainCommands.cpp
+@@ -646,6 +646,49 @@ static void PyStampPlateHeight()
+ 	       stamped, (int)plates.size(), elapsedMs);
+ }
+ 
++//! The PLATE half of one colour stamp's undo step. RecordTerrainAppearanceUndo restores the RGB tiles;
++//! this restores the plate's "the ground already carries my colour" record, which is what makes the live
++//! preview stand down. Without it an undo gave back the old ground colour while the preview stayed stood
++//! down, so the plate's colour was missing from the picture until the plate was nudged.
++//! Recorded AFTER the tile undo object, because a step undoes its objects in reverse: the record is
++//! cleared first, then the tiles come back, and the preview takes over the restored ground.
++class CUndoPlateColourStamp : public IUndoObject
++{
++public:
++	explicit CUndoPlateColourStamp(EntityId plateId) : m_plateId(plateId) {}
++
++private:
++	virtual const char* GetDescription() override { return "Terrain Plate Colour Stamp"; }
++	virtual void        Undo(bool bUndo) override { SetRecord(false); }
++	virtual void        Redo() override           { SetRecord(true); }
++
++	void SetRecord(bool bStamped)
++	{
++		using Cry::DefaultComponents::CTerrainPlateComponent;
++		using Cry::DefaultComponents::ITerrainPlateCommit;
++
++		// Re-resolved every time: the plate can be deleted between the stamp and the undo, and the tiles are
++		// restored either way.
++		if (gEnv == nullptr || gEnv->pEntitySystem == nullptr)
++			return;
++
++		IEntity* pEntity = gEnv->pEntitySystem->GetEntity(m_plateId);
++		if (pEntity == nullptr)
++			return;
++
++		IEntityComponent* pComponent = pEntity->GetComponentByTypeId(ITerrainPlateCommit::GetComponentTypeId());
++		if (pComponent == nullptr)
++			return;
++
++		// Through the INTERFACE, always: the overrides are final, so a call on the concrete type devirtualises
++		// and Sandbox has no symbol for it.
++		ITerrainPlateCommit* pCommit = static_cast<CTerrainPlateComponent*>(pComponent);
++		pCommit->SetColourStampRecord(bStamped);
++	}
++
++	EntityId m_plateId;
++};
++
+ //! Writes the terrain colour every selected plate is SHOWING into the level's own CRGBLayer, so the colour
+ //! is permanent, ships with the level and survives the plate being moved or deleted.
+ //!
+@@ -854,6 +897,11 @@ static void PyStampPlateColour()
+ 		// The colour is in the level now, so the preview has to stop compositing it a second time - over the
+ 		// viewport AND over the export. No setting changes; the picture does not change either, because what
+ 		// was written IS what the preview drew, and the repaint below reads it straight back out of CRGBLayer.
++		// Recorded after the tile snapshot above, so an undo clears the record first and then restores the
++		// tiles: the preview is live again over exactly the ground it was drawing on before the stamp.
++		if (CUndo::IsRecording())
++			CUndo::Record(new CUndoPlateColourStamp(pEntity->GetId()));
++
+ 		pCommit->OnColourStamped();
+ 
+ 		const int hx0 = rectY1;   // heightmap X, world Y
+-- 
+2.47.1.windows.1
+

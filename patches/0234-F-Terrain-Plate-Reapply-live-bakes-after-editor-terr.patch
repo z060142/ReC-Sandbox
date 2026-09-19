@@ -1,0 +1,395 @@
+From e5a1e8232e1597a978ab72cfb46921fabd58d28a Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Mon, 31 Aug 2026 03:20:52 +0800
+Subject: [PATCH 234/307] !F (Terrain Plate) Reapply live bakes after editor
+ terrain updates.
+
+Editor terrain operations can overwrite a live bake without notifying the
+component. Probe the footprint at a low frequency and reapply the bake when
+the terrain differs beyond its quantization tolerance.
+---
+ .../Geometry/TerrainPlateComponent.cpp        | 236 +++++++++++++++++-
+ .../Geometry/TerrainPlateComponent.h          |  25 ++
+ 2 files changed, 259 insertions(+), 2 deletions(-)
+
+diff --git a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
+index 5fa93f52..39c9f4e4 100644
+--- a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
++++ b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
+@@ -31,6 +31,12 @@ namespace
+ int    g_terrainPlateSettleFrames = 6;
+ ICVar* g_pTerrainPlateSettleFramesCVar = nullptr;
+ 
++//! Bake polling: any editor terrain push (sculpt, undo, even a layer paint) rewrites the sectors it
++//! covers and erases the bake there, and the engine has no notification for it
++//! (scene-notes/terrain/research/08-virtual-bake.md section 2.2, trigger T1).
++int    g_terrainPlateBakeProbeFrames = 16;
++ICVar* g_pTerrainPlateBakeProbeFramesCVar = nullptr;
++
+ //! Every plate that currently holds a live bake. Only used to detect overlapping footprints; the
+ //! priority cascade that would make an overlap actually correct is step 3 of decision 04.
+ std::vector<CTerrainPlateComponent*> g_bakingPlates;
+@@ -39,6 +45,11 @@ std::vector<CTerrainPlateComponent*> g_bakingPlates;
+ //! rule 1). One centimetre would already be below the 12 bit quantisation of a tall sector; two is
+ //! the value the decision fixed and it is still invisible.
+ const float kBakeEpsilonMeters = 0.02f;
++//! Heights are stored as 12 bit per sector: fRange = (fMax - fMin) / 0x0FFF (terran_edit.cpp:291).
++const float kTerrainHeightQuantSteps = 4095.f;
++//! TERRAIN_DEFORMATION_MAX_DEPTH (I3DEngine.h:662): the head room SetTerrainElevation reserves below
++//! a sector's minimum before it quantises.
++const float kTerrainDeformationDepth = 3.f;
+ 
+ //! e_TerrainIntegrateObjectsDebug, the cvar the rest of the terrain integration work logs under.
+ int GetTerrainIntegrateDebugLevel()
+@@ -62,6 +73,14 @@ void RegisterTerrainPlateCVars()
+ 	                                                 "runs anyway. This is only a fallback - the normal trigger is the editor's mouse up\n"
+ 	                                                 "event ENTITY_EVENT_XFORM_FINISHED_EDITOR.\n"
+ 	                                                 "0 - no fallback, only the mouse up event flushes");
++
++	g_pTerrainPlateBakeProbeFramesCVar = REGISTER_CVAR2("e_TerrainPlateBakeProbeFrames", &g_terrainPlateBakeProbeFrames, 16, VF_NULL,
++	                                                    "Terrain Plate component with Bake Into Terrain = true: number of frames between two\n"
++	                                                    "checks that the bake is still in the terrain. Any editor terrain operation (sculpt,\n"
++	                                                    "undo, layer paint, leaving game mode) re-pushes the editor heightmap over the sectors\n"
++	                                                    "it touches and erases the bake there, and the engine sends no notification for it, so\n"
++	                                                    "the plate watches nine cells of its own footprint and re-applies itself when they move.\n"
++	                                                    "0 - no polling, the bake stays erased until the plate is edited");
+ }
+ 
+ void UnregisterTerrainPlateCVars()
+@@ -69,9 +88,14 @@ void UnregisterTerrainPlateCVars()
+ 	if (gEnv != nullptr && gEnv->pConsole != nullptr)
+ 	{
+ 		if (g_pTerrainPlateSettleFramesCVar != nullptr)
+-			gEnv->pConsole->UnregisterVariable(g_pTerrainPlateSettleFramesCVar->GetName());	}
++			gEnv->pConsole->UnregisterVariable(g_pTerrainPlateSettleFramesCVar->GetName());
++
++		if (g_pTerrainPlateBakeProbeFramesCVar != nullptr)
++			gEnv->pConsole->UnregisterVariable(g_pTerrainPlateBakeProbeFramesCVar->GetName());
++	}
+ 
+ 	g_pTerrainPlateSettleFramesCVar = nullptr;
++	g_pTerrainPlateBakeProbeFramesCVar = nullptr;
+ }
+ 
+ int CTerrainPlateComponent::GetSettleFrames()
+@@ -79,6 +103,11 @@ int CTerrainPlateComponent::GetSettleFrames()
+ 	return max(0, g_terrainPlateSettleFrames);
+ }
+ 
++int CTerrainPlateComponent::GetBakeProbeFrames()
++{
++	return max(0, g_terrainPlateBakeProbeFrames);
++}
++
+ float STerrainPlateHeightField::SampleBilinear(float u, float v) const
+ {
+ 	if (!IsValid())
+@@ -651,7 +680,8 @@ Cry::Entity::EventFlags CTerrainPlateComponent::GetEventMask() const
+ 
+ 	// Only ticked while a rebuild was throttled away or held back, while the first bake is still owed,
+ 	// or while a live bake has to be watched - so a plate that is not baking costs nothing per frame.
+-	if (m_bRegenPending || m_bDeferredXformPending || m_bInitialBakePending)
++	if (m_bRegenPending || m_bDeferredXformPending || m_bInitialBakePending
++	    || (m_bBakeIntoTerrain && GetBakeProbeFrames() > 0))
+ 	{
+ 		bitFlags |= ENTITY_EVENT_UPDATE;
+ 	}
+@@ -737,6 +767,10 @@ void CTerrainPlateComponent::ProcessEvent(const SEntityEvent& event)
+ 					m_pEntity->UpdateComponentEventMask(this);
+ 				}
+ 			}
++			else
++			{
++				PollBake();
++			}
+ 		}
+ 		break;
+ 
+@@ -1516,6 +1550,12 @@ float SampleTerrainUnit(const SBakeTerrainMetrics& metrics, int ux, int uy)
+ 	return gEnv->p3DEngine->GetTerrainZ(((float)cx + 0.5f) * metrics.unitSize, ((float)cy + 0.5f) * metrics.unitSize);
+ }
+ 
++//! The quantisation step SetTerrainElevation will give a sector holding this height span
++//! (terran_edit.cpp:281-286).
++float TerrainQuantStep(float fMin, float fMax)
++{
++	return (max(0.f, fMin - kTerrainDeformationDepth) < fMax) ? ((fMax - max(0.f, fMin - kTerrainDeformationDepth)) / kTerrainHeightQuantSteps) : 0.f;
++}
+ }
+ 
+ float CTerrainPlateComponent::GetPlateReliefAt(float lx, float ly) const
+@@ -1857,6 +1897,7 @@ void CTerrainPlateComponent::RestoreBakeBaseline()
+ 	}
+ 
+ 	m_bakeResult.clear();
++	m_bakeProbeCount = 0;
+ }
+ 
+ void CTerrainPlateComponent::ApplyBake()
+@@ -1907,7 +1948,10 @@ void CTerrainPlateComponent::ApplyBake()
+ 		return;
+ 
+ 	m_bBakeApplied = true;
++	m_lastBakeProbeFrameId = gEnv->nMainFrameID;
+ 	RegisterBakingPlate();
++	BuildBakeProbes(metrics, worldTM);
++	WarnOnBakeQuantisation(metrics);
+ 	AfterBakeInvalidation(GetBakeWorldBox(metrics));
+ 
+ 	if (GetTerrainIntegrateDebugLevel() >= 1)
+@@ -1920,6 +1964,194 @@ void CTerrainPlateComponent::ApplyBake()
+ 	}
+ }
+ 
++void CTerrainPlateComponent::BuildBakeProbes(const SBakeTerrainMetrics& metrics, const Matrix34& worldTM)
++{
++	m_bakeProbeCount = 0;
++
++	const int dim = m_bakeRectSize + 1;
++	if ((int)m_bakeResult.size() != dim * dim)
++		return;
++
++	// The nine probes are the corners, the edge midpoints and the centre of the PLATE footprint, inset
++	// by 20 % so that the corner probes sample real relief instead of the falloff rim, where the bake is
++	// the baseline by construction and would never register a change.
++	const AABB localBox(Vec3(-0.5f, -0.5f, 0.f), Vec3(0.5f, 0.5f, 1.f));
++	const AABB worldBox = AABB::CreateTransformedAABB(worldTM, localBox);
++
++	const float insetX = (worldBox.max.x - worldBox.min.x) * 0.2f;
++	const float insetY = (worldBox.max.y - worldBox.min.y) * 0.2f;
++
++	for (int i = 0; i < 3; ++i)
++	{
++		for (int j = 0; j < 3; ++j)
++		{
++			const float wx = (worldBox.min.x + insetX) + (worldBox.max.x - worldBox.min.x - 2.f * insetX) * (float)i * 0.5f;
++			const float wy = (worldBox.min.y + insetY) + (worldBox.max.y - worldBox.min.y - 2.f * insetY) * (float)j * 0.5f;
++
++			const int ux = clamp_tpl((int)floorf(wx / metrics.unitSize), m_bakeRectX1, m_bakeRectX1 + m_bakeRectSize);
++			const int uy = clamp_tpl((int)floorf(wy / metrics.unitSize), m_bakeRectY1, m_bakeRectY1 + m_bakeRectSize);
++
++			SBakeProbe& probe = m_bakeProbes[m_bakeProbeCount++];
++			probe.ux = ux;
++			probe.uy = uy;
++			probe.expectedZ = m_bakeResult[(size_t)(ux - m_bakeRectX1) * dim + (uy - m_bakeRectY1)];
++		}
++	}
++
++	// Tolerance: a height never survives the round trip through SetTerrainElevation exactly, because the
++	// sector re-quantises to 12 bits over its own span. A few steps of the coarsest touched sector is
++	// still far below anything an editor operation would do.
++	float quantStep = 0.f;
++	const int sectorsPerSide = max(1, m_bakeRectSize / metrics.sectorUnits);
++	for (int sx = 0; sx < sectorsPerSide; ++sx)
++	{
++		for (int sy = 0; sy < sectorsPerSide; ++sy)
++		{
++			float fMin = FLT_MAX, fMax = -FLT_MAX;
++			for (int ux = sx * metrics.sectorUnits; ux <= (sx + 1) * metrics.sectorUnits; ++ux)
++			{
++				for (int uy = sy * metrics.sectorUnits; uy <= (sy + 1) * metrics.sectorUnits; ++uy)
++				{
++					const float z = m_bakeResult[(size_t)min(ux, dim - 1) * dim + min(uy, dim - 1)];
++					fMin = min(fMin, z);
++					fMax = max(fMax, z);
++				}
++			}
++			quantStep = max(quantStep, TerrainQuantStep(fMin, fMax));
++		}
++	}
++
++	m_bakeProbeTolerance = max(0.002f, quantStep * 4.f);
++}
++
++void CTerrainPlateComponent::PollBake()
++{
++	if (!m_bBakeApplied || m_bakeProbeCount == 0)
++		return;
++
++	const int probeFrames = GetBakeProbeFrames();
++	if (probeFrames <= 0)
++		return;
++
++	if ((int)(gEnv->nMainFrameID - m_lastBakeProbeFrameId) < probeFrames)
++		return;
++
++	m_lastBakeProbeFrameId = gEnv->nMainFrameID;
++
++	const SBakeTerrainMetrics metrics = GetBakeTerrainMetrics();
++	if (!metrics.IsValid())
++		return;
++
++	// Nine array lookups (CTerrain::GetZfromUnits is a clamp, a sector lookup and an index), so this is
++	// free even at every frame.
++	for (int i = 0; i < m_bakeProbeCount; ++i)
++	{
++		const SBakeProbe& probe = m_bakeProbes[i];
++		if (fabs_tpl(SampleTerrainUnit(metrics, probe.ux, probe.uy) - probe.expectedZ) > m_bakeProbeTolerance)
++		{
++			ReapplyBakeAfterExternalEdit(metrics);
++			return;
++		}
++	}
++}
++
++void CTerrainPlateComponent::ReapplyBakeAfterExternalEdit(const SBakeTerrainMetrics& metrics)
++{
++	const int dim = m_bakeRectSize + 1;
++	if ((int)m_bakeBaseline.size() != dim * dim || (int)m_bakeResult.size() != dim * dim)
++		return;
++
++	// What just happened: some editor operation pushed CHeightmap over part of this rect and erased the
++	// bake there. The naive answer - restore the stored baseline and bake again - would undo the user's
++	// edit, because the stored baseline is the ground as it was BEFORE the edit. The naive opposite -
++	// recapture the whole rect as the new baseline - would fold the surviving part of our own bake into
++	// the baseline, so turning Bake off later would never give the original ground back.
++	//
++	// So the baseline is rebuilt cell by cell, using the fact that we know exactly what we wrote:
++	//   * the cell still holds our baked height  -> the editor did not touch it, the stored baseline is
++	//                                               still the truth under the plate; keep it;
++	//   * the cell holds something else          -> the editor rewrote it, and what is there now IS the
++	//                                               new ground; take it as the new baseline.
++	// A sculpt next to the plate but inside the sector-aligned rect therefore survives, and a sculpt
++	// under the plate becomes the new ground the plate sits on. A full-map push (leaving game mode,
++	// resize, a layer paint, which re-pushes elevations too) fails the first test everywhere and hands
++	// the pristine CHeightmap back as the baseline, which is exactly right.
++	int recapturedCells = 0;
++	for (int ux = 0; ux < dim; ++ux)
++	{
++		for (int uy = 0; uy < dim; ++uy)
++		{
++			const size_t index = (size_t)ux * dim + uy;
++			const float current = SampleTerrainUnit(metrics, m_bakeRectX1 + ux, m_bakeRectY1 + uy);
++
++			if (fabs_tpl(current - m_bakeResult[index]) > m_bakeProbeTolerance)
++			{
++				m_bakeBaseline[index] = current;
++				++recapturedCells;
++			}
++		}
++	}
++
++	if (GetTerrainIntegrateDebugLevel() >= 1)
++	{
++		CryLog("TerrainPlate '%s': terrain changed under the bake, %d of %d cells re-captured as the new ground",
++		       m_pEntity->GetName(), recapturedCells, dim * dim);
++	}
++
++	// RegenerateMesh restores the corrected baseline first (so the rect now holds the NEW ground, the
++	// user's edit included), then re-welds the mesh against it and bakes on top of it. m_bBakeApplied is
++	// deliberately left true so that the restore actually runs.
++	RegenerateMesh();
++}
++
++void CTerrainPlateComponent::WarnOnBakeQuantisation(const SBakeTerrainMetrics& metrics)
++{
++	if (m_bBakeQuantWarningIssued)
++		return;
++
++	// A sector encodes its heights as 12 bits over its own span (terran_edit.cpp:281-291), so raising
++	// part of a sector by a lot costs precision everywhere in it - including the untouched terrain
++	// around the plate. Decision 04, rule 9: say so once.
++	const int dim = m_bakeRectSize + 1;
++	const int sectorsPerSide = max(1, m_bakeRectSize / metrics.sectorUnits);
++
++	for (int sx = 0; sx < sectorsPerSide; ++sx)
++	{
++		for (int sy = 0; sy < sectorsPerSide; ++sy)
++		{
++			float baseMin = FLT_MAX, baseMax = -FLT_MAX, bakedMin = FLT_MAX, bakedMax = -FLT_MAX;
++
++			for (int ux = sx * metrics.sectorUnits; ux <= (sx + 1) * metrics.sectorUnits; ++ux)
++			{
++				for (int uy = sy * metrics.sectorUnits; uy <= (sy + 1) * metrics.sectorUnits; ++uy)
++				{
++					const size_t index = (size_t)min(ux, dim - 1) * dim + min(uy, dim - 1);
++					baseMin = min(baseMin, m_bakeBaseline[index]);
++					baseMax = max(baseMax, m_bakeBaseline[index]);
++					bakedMin = min(bakedMin, m_bakeResult[index]);
++					bakedMax = max(bakedMax, m_bakeResult[index]);
++				}
++			}
++
++			const float stepBefore = TerrainQuantStep(baseMin, baseMax);
++			const float stepAfter = TerrainQuantStep(bakedMin, bakedMax);
++
++			if (stepBefore > 0.f && stepAfter > stepBefore * 2.f)
++			{
++				m_bBakeQuantWarningIssued = true;
++				CryWarning(VALIDATOR_MODULE_ENTITYSYSTEM, VALIDATOR_WARNING,
++				           "Terrain Plate '%s': the bake more than doubled the height quantisation step of the terrain sector at units (%d,%d) "
++				           "(%.1f mm -> %.1f mm). A sector stores 12 bit heights over its own span, so the terrain around the plate loses "
++				           "precision too. Use a shorter plate, or move it so that its relief does not cross a sector with a small height range.",
++				           m_pEntity->GetName(),
++				           m_bakeRectX1 + sx * metrics.sectorUnits, m_bakeRectY1 + sy * metrics.sectorUnits,
++				           stepBefore * 1000.f, stepAfter * 1000.f);
++				return;
++			}
++		}
++	}
++}
++
+ void CTerrainPlateComponent::RegisterBakingPlate()
+ {
+ 	if (std::find(g_bakingPlates.begin(), g_bakingPlates.end(), this) == g_bakingPlates.end())
+diff --git a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
+index 4e5337c2..6f4eab99 100644
+--- a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
++++ b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
+@@ -123,6 +123,14 @@ struct SBakeTerrainMetrics
+ 	bool IsValid() const { return hmapSize > 0 && sectorUnits > 0 && unitSize > 0.f; }
+ };
+ 
++//! One of the nine cells the bake polling watches, with the height the bake left there.
++struct SBakeProbe
++{
++	int   ux = 0;
++	int   uy = 0;
++	float expectedZ = 0.f;
++};
++
+ //! Registers / removes the console variables owned by the terrain plate component. Called from the
+ //! plugin's Initialize and destructor, because a cvar must never outlive the module that owns it.
+ void RegisterTerrainPlateCVars();
+@@ -301,6 +309,14 @@ protected:
+ 	void  AfterBakeInvalidation(const AABB& box);
+ 	//! World box of the current bake rect, from the captured baseline and the written result.
+ 	AABB  GetBakeWorldBox(const SBakeTerrainMetrics& metrics) const;
++	//! Nine cells (corners, edge midpoints and centre of the footprint, inset so they sample real relief).
++	void  BuildBakeProbes(const SBakeTerrainMetrics& metrics, const Matrix34& worldTM);
++	//! Compares the probes with the terrain every e_TerrainPlateBakeProbeFrames frames.
++	void  PollBake();
++	//! Rebuilds the baseline from what the editor left behind and re-applies the plate on top of it.
++	void  ReapplyBakeAfterExternalEdit(const SBakeTerrainMetrics& metrics);
++	//! Warns once when the bake cost a touched sector more than half of its height precision.
++	void  WarnOnBakeQuantisation(const SBakeTerrainMetrics& metrics);
+ 	//! Adds this plate to / removes it from the list of plates holding a live bake, and warns once
+ 	//! when another baking plate overlaps this one.
+ 	void  RegisterBakingPlate();
+@@ -310,6 +326,8 @@ protected:
+ 	float GetPlateReliefAt(float lx, float ly) const;
+ 	//! Projects a world XY straight down onto the plate surface. False when it misses the plate.
+ 	bool  SamplePlateSurface(const Matrix34& worldTM, float worldX, float worldY, float& outWorldZ, float& outLocalX, float& outLocalY) const;
++	//! Frames between two probe passes, from e_TerrainPlateBakeProbeFrames. 0 disables the polling.
++	static int GetBakeProbeFrames();
+ 
+ 	ETerrainPlateSource                          m_sourceMode = ETerrainPlateSource::HeightmapFile;
+ 	Schematyc::TerrainHeightmapFileName          m_heightmapPath;
+@@ -375,7 +393,14 @@ protected:
+ 	//! world X and uy along world Y, the order SetTerrainElevation itself uses.
+ 	std::vector<float>       m_bakeBaseline;   //!< the original ground, restored on any change
+ 	std::vector<float>       m_bakeResult;     //!< what the last bake actually wrote
++	SBakeProbe               m_bakeProbes[9];
++	int                      m_bakeProbeCount = 0;
++	//! A few quantisation steps of the coarsest touched sector: a height never survives a round trip
++	//! through SetTerrainElevation exactly.
++	float                    m_bakeProbeTolerance = 0.01f;
++	uint32                   m_lastBakeProbeFrameId = 0;
+ 	bool                     m_bBakeOverlapWarningIssued = false;
++	bool                     m_bBakeQuantWarningIssued = false;
+ 	bool                     m_bBakeSizeWarningIssued = false;
+ };
+ }
+-- 
+2.47.1.windows.1
+

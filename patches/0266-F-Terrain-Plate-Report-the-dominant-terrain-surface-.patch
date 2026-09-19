@@ -1,0 +1,652 @@
+From ffc5bed14566b05f5bf4828caf547ccf177cae94 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Wed, 2 Sep 2026 06:50:56 +0800
+Subject: [PATCH 266/307] !F (Terrain Plate) Report the dominant terrain
+ surface for contacts.
+
+Map plate collision contacts to the dominant terrain surface type below the
+plate. Footsteps, impacts, effects and friction then match the terrain material
+seen on the integrated surface.
+---
+ .../Geometry/TerrainPlateComponent.cpp        | 430 ++++++++++++++++++
+ .../Geometry/TerrainPlateComponent.h          |  90 ++++
+ 2 files changed, 520 insertions(+)
+
+diff --git a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
+index bc6db6be..9679435d 100644
+--- a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
++++ b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
+@@ -206,6 +206,32 @@ ICVar* g_pTerrainPlateCullBuriedCVar = nullptr;
+ //! correctly seen as buried, while float noise cannot flip a vertex that is meant to sit on the surface.
+ const float kBuriedCullMargin = 0.05f;
+ 
++//! Decision 09: the plate's contacts report the surface type of the TERRAIN LAYER under them instead of
++//! the plate material's single one. Kill switch, restoring the stock physicalise path bit for bit.
++int    g_terrainPlatePhysSurfaceFromTerrain = 1;
++ICVar* g_pTerrainPlatePhysSurfaceFromTerrainCVar = nullptr;
++
++//! Frames between two checks that the terrain layers under the plate are still the ones its physics
++//! mapping was built from. Editor only - a layer cannot be repainted at run time - and the check is
++//! kPhysSurfaceProbeGrid^2 terrain rays, so the default is deliberately slower than the bake probe.
++int    g_terrainPlatePhysSurfaceProbeFrames = 32;
++ICVar* g_pTerrainPlatePhysSurfaceProbeFramesCVar = nullptr;
++
++//! Probes per axis over the plate's world footprint. 25 rays: enough to pick the dominant layer and to
++//! notice a repaint, cheap enough to run on every plate in the level every 32 frames.
++const int kPhysSurfaceProbeGrid = 5;
++
++//! Hard ceiling on the mapping table. CPhysicalEntity's part stores nMats in an unsigned:7
++//! (physicalentity.h:81), so 128 entries would wrap to 0 - the same kludge the terrain itself works
++//! around at terrain_load.cpp:190. A plate footprint realistically sees fewer than ten.
++const int kPhysSurfaceMaxMappingEntries = 127;
++
++//! Metres above the terrain the surface sampling ray starts, and how far down it travels. The start has
++//! to clear the plate's own relief and the margin the weld sinks the rim by; the length has to reach
++//! back down through both. Generous, because the ray only ever tests the heightfield.
++const float kPhysSurfaceRayUp = 32.f;
++const float kPhysSurfaceRayLength = 128.f;
++
+ //! Bake trigger / bake apply tracing. The bake chain has a dozen places where it can legitimately do
+ //! nothing (the property is off, the level's terrain is not in yet, the footprint is empty, the write
+ //! was refused), and until this cvar existed every one of them was a silent return: the user ticked
+@@ -337,6 +363,29 @@ void RegisterTerrainPlateCVars()
+ 		g_pTerrainPlateCullBuriedCVar->AddOnChange(&CTerrainPlateComponent::OnCullBuriedCVarChanged);
+ 	}
+ 
++	g_pTerrainPlatePhysSurfaceFromTerrainCVar = REGISTER_CVAR2("e_TerrainPlatePhysSurfaceFromTerrain", &g_terrainPlatePhysSurfaceFromTerrain, 1, VF_NULL,
++	                                                          "Terrain Plate component: take the surface types the plate's COLLISION reports - footstep sounds,\n"
++	                                                          "bullet impact effects and decals, particles, friction - from the terrain layers painted under the\n"
++	                                                          "plate instead of from the plate's single material. The ids are sampled with downward terrain rays\n"
++	                                                          "when the plate is rebuilt, and re-sampled a moment after a layer under it is repainted.\n"
++	                                                          "This is the global kill switch; each plate also has a Physics Surface From Terrain tick box.\n"
++	                                                          "1 - default\n"
++	                                                          "0 - stock behaviour, bit for bit: the whole plate reports its own material's surface type");
++
++	// The per face ids are baked into the physics trimesh, so the cvar can only take effect by rebuilding
++	// every plate - exactly like e_TerrainPlateCullBuried above.
++	if (g_pTerrainPlatePhysSurfaceFromTerrainCVar != nullptr)
++	{
++		g_pTerrainPlatePhysSurfaceFromTerrainCVar->AddOnChange(&CTerrainPlateComponent::OnPhysSurfaceCVarChanged);
++	}
++
++	g_pTerrainPlatePhysSurfaceProbeFramesCVar = REGISTER_CVAR2("e_TerrainPlatePhysSurfaceProbeFrames", &g_terrainPlatePhysSurfaceProbeFrames, 32, VF_NULL,
++	                                                           "Terrain Plate component with Physics Surface From Terrain on: number of frames between two checks\n"
++	                                                           "that the terrain layers under the plate are still the ones its collision was built from. Nothing in\n"
++	                                                           "the engine announces a layer repaint, so the plate samples 5 x 5 cells of its own footprint and\n"
++	                                                           "re-applies itself when they change. Editor only - terrain cannot be repainted at run time.\n"
++	                                                           "0 - no polling, a repaint only takes effect when the plate is next edited or the level reloaded");
++
+ 	g_pTerrainPlateDebugCVar = REGISTER_CVAR2("e_TerrainPlateDebug", &g_terrainPlateDebug, 0, VF_NULL,
+ 	                                          "Terrain Plate component: trace the bake trigger and the bake itself.\n"
+ 	                                          "0 - off\n"
+@@ -376,6 +425,12 @@ void UnregisterTerrainPlateCVars()
+ 		if (g_pTerrainPlateCullBuriedCVar != nullptr)
+ 			gEnv->pConsole->UnregisterVariable(g_pTerrainPlateCullBuriedCVar->GetName());
+ 
++		if (g_pTerrainPlatePhysSurfaceFromTerrainCVar != nullptr)
++			gEnv->pConsole->UnregisterVariable(g_pTerrainPlatePhysSurfaceFromTerrainCVar->GetName());
++
++		if (g_pTerrainPlatePhysSurfaceProbeFramesCVar != nullptr)
++			gEnv->pConsole->UnregisterVariable(g_pTerrainPlatePhysSurfaceProbeFramesCVar->GetName());
++
+ 		if (g_pTerrainPlateDebugCVar != nullptr)
+ 			gEnv->pConsole->UnregisterVariable(g_pTerrainPlateDebugCVar->GetName());
+ 	}
+@@ -388,6 +443,8 @@ void UnregisterTerrainPlateCVars()
+ 	g_pTerrainPlateBakeEdgeAACVar = nullptr;
+ 	g_pTerrainPlateBakeWeldCurveCVar = nullptr;
+ 	g_pTerrainPlateCullBuriedCVar = nullptr;
++	g_pTerrainPlatePhysSurfaceFromTerrainCVar = nullptr;
++	g_pTerrainPlatePhysSurfaceProbeFramesCVar = nullptr;
+ 	g_pTerrainPlateDebugCVar = nullptr;
+ }
+ 
+@@ -1159,9 +1216,22 @@ Cry::Entity::EventFlags CTerrainPlateComponent::GetEventMask() const
+ 	// branch (:818-838), and while the entity, its slot and the terrain are all still whole.
+ 	bitFlags |= ENTITY_EVENT_DONE;
+ 
++	// IEntity::SetMaterial runs CEntityPhysics::OnGlobalEntityMaterialChanged (PhysicsProxy.cpp:390-404)
++	// and then sends this, so it is the hook that lets the plate push its own mapping back over the one
++	// the new material just installed. @see ApplyPhysicsSurfaceMapping.
++	bitFlags |= ENTITY_EVENT_MATERIAL;
++
+ 	// Only ticked while a rebuild was throttled away or held back, while the first bake is still owed,
+ 	// or while a live bake has to be watched - so a plate that is not baking costs nothing per frame.
++	// The terrain surface probe is the fourth reason, and it is editor only: nothing can repaint a layer
++	// at run time, so a launcher build never subscribes for it (@see PollPhysicsSurface).
++	const bool bWantsPhysSurfacePoll = m_bPhysSurfaceFromTerrain && g_terrainPlatePhysSurfaceFromTerrain != 0
++	                                   && ((uint32)m_type & (uint32)EMeshType::Collider) != 0
++	                                   && g_terrainPlatePhysSurfaceProbeFrames > 0
++	                                   && gEnv != nullptr && gEnv->IsEditor();
++
+ 	if (m_bRegenPending || m_bDeferredXformPending || m_bBakeMoveBatchPending || m_bInitialBakePending
++	    || bWantsPhysSurfacePoll
+ 	    || (m_bBakeIntoTerrain && !m_bBakeCommitted && (GetBakeProbeFrames() > 0 || GetPlateDebugLevel() >= 1)))
+ 	{
+ 		bitFlags |= ENTITY_EVENT_UPDATE;
+@@ -1331,6 +1401,11 @@ void CTerrainPlateComponent::ProcessEvent(const SEntityEvent& event)
+ 			{
+ 				PollBake();
+ 			}
++
++			// Independent of the bake polling above on purpose: PollBake early-returns unless a bake is
++			// live, and it compares heights, so it cannot see a layer repaint under a plate that does not
++			// bake at all (decision 09, re-physicalise triggers). @see PollPhysicsSurface.
++			PollPhysicsSurface();
+ 		}
+ 		break;
+ 
+@@ -1366,6 +1441,33 @@ void CTerrainPlateComponent::ProcessEvent(const SEntityEvent& event)
+ 		return; // someone else owns that slot
+ 
+ 	CBaseMeshComponent::ProcessEvent(event);
++
++	// Decision 09, settled fact 4: every one of these events ends in a call that rewrites the part's
++	// material mapping from the slot's RENDER material, which throws away the terrain ids the plate put
++	// there. The base class handler above is itself one of them (ApplyBaseMeshProperties ->
++	// UnphysicalizeSlot / PhysicalizeSlot -> CEntityPhysics::AddSlotGeometry, PhysicsProxy.cpp:1138-1151),
++	// which is why this sits AFTER it rather than in the switch. Pushing the cached table again is a
++	// single pe_params_part and casts no rays, so re-applying more often than strictly necessary is free.
++	//  * COMPONENT_PROPERTY_CHANGED / SLOT_CHANGED - the base class re-physicalises the slot.
++	//  * PHYSICAL_TYPE_CHANGED           - a physics component took the entity over and re-physicalised it
++	//                                      (PhysicsProxy.cpp:882).
++	//  * MATERIAL                        - IEntity::SetMaterial ran OnGlobalEntityMaterialChanged first
++	//                                      (PhysicsProxy.cpp:390-404, i.e. the :397 / :401 call sites).
++	// The remaining known site, UpdateSlotGeometry (:1265), is reached from IEntity::SetStatObj with
++	// bUpdatePhysics - which RegenerateMesh deliberately passes false for - and is covered there anyway by
++	// the ApplyPhysicsSurfaceMapping at the end of the rebuild. Anything not on this list is caught by the
++	// read-back half of PollPhysicsSurface.
++	switch (event.event)
++	{
++	case ENTITY_EVENT_COMPONENT_PROPERTY_CHANGED:
++	case ENTITY_EVENT_SLOT_CHANGED:
++	case ENTITY_EVENT_PHYSICAL_TYPE_CHANGED:
++	case ENTITY_EVENT_MATERIAL:
++		ApplyPhysicsSurfaceMapping();
++		break;
++	default:
++		break;
++	}
+ }
+ 
+ bool CTerrainPlateComponent::SetMaterial(int slotId, const char* szMaterial)
+@@ -2166,6 +2268,12 @@ void CTerrainPlateComponent::RegenerateMesh()
+ 	// holding a part built from the old mesh. IStatObj::SetPhysGeom(nullptr) is the accessor that does
+ 	// unregister (StatObj.h:402), and the slot part must be removed before that, because
+ 	// CEntityPhysics::RemoveSlotGeometry decides what to remove from the statobj's phys geom.
++	// Decision 09. Sampled here, before the physics geometry exists, because the ids are an input to it:
++	// this is where the per face table of step 2 is solved. The rays are terrain only and cost nothing
++	// next to the mesh generation above, and this is the one place that always runs when the plate moves,
++	// is rescaled or is regenerated - i.e. exactly when the ground under it may be a different layer.
++	BuildPhysicsSurfaceMapping();
++
+ 	ReleasePhysicsGeometry();
+ 
+ 	m_pStatObj->Invalidate(bPhysicalize);
+@@ -2195,6 +2303,12 @@ void CTerrainPlateComponent::RegenerateMesh()
+ 
+ 	ApplyBaseMeshProperties();
+ 
++	// Last of the physics chain, and it has to be: UpdateNativePhysics -> IEntity::Physicalize ends in
++	// CEntityPhysics::UpdateParamsFromRenderMaterial (PhysicsProxy.cpp:882) and ApplyBaseMeshProperties ->
++	// PhysicalizeSlot ends in AddSlotGeometry (:1138-1151), and both write the part's mapping from the
++	// slot's render material. Anything pushed before them is discarded. @see ApplyPhysicsSurfaceMapping.
++	ApplyPhysicsSurfaceMapping();
++
+ 	if (geometryHash != m_geometryHash)
+ 	{
+ 		m_geometryHash = geometryHash;
+@@ -4298,5 +4412,321 @@ void CTerrainPlateComponent::ReleaseNativePhysics()
+ 	physParams.type = PE_NONE;
+ 	m_pEntity->Physicalize(physParams);
+ }
++
++//////////////////////////////////////////////////////////////////////////
++// Physics surface types from the terrain (decision 09).
++//
++// The whole feature is one number in one place: the part's pMatMapping. A contact never carries a raw
++// face id - CPhysicalEntity::GetMatId (physicalentity.h:330-339) clamps the face id to [0, nMats-1] and
++// returns pMatMapping[thatIndex], and every producer of a surface type goes through it (collision events,
++// living entity ground contacts i.e. footsteps, rigid body contacts, ray_hit::surface_idx). Terrain and
++// objects fill that table from the same global ISurfaceTypeManager id space: the terrain at
++// terrain_load.cpp:179-191 (arrMatMapping[layer] = layerMat->GetSurfaceTypeId(), with the GetSubMtl(2)
++// layer convention), an object at Material.cpp:579-593 (FillSurfaceTypeIds). IMaterialEffects then keys
++// its lookup on that id and nothing else (MaterialEffects.cpp:544-573) - by the time the number reaches
++// the effect table there is nothing "terrain" about it. So a plate part whose mapping holds a terrain
++// layer's surface type id resolves exactly as the terrain under it does.
++//
++// Two consequences that shape the code below:
++//  * the table is OVERWRITTEN from the slot's render material by CEntityPhysics, at PhysicsProxy.cpp:882
++//    (end of Physicalize), :1265 (UpdateSlotGeometry) and :397 / :401 (OnGlobalEntityMaterialChanged),
++//    and by AddSlotGeometry (:1138-1151) on a slot physicalise. Everything we push has to be pushed
++//    AGAIN after each of those - @see ApplyPhysicsSurfaceMapping and its call sites.
++//  * losing the table is harmless: nMats falls back to 1 and GetMatId's clamp sends every face to entry
++//    0, which is the plate's own surface type - i.e. exactly the behaviour before this feature existed.
++//    No crash, no pink, and no need for a defensive path.
++//////////////////////////////////////////////////////////////////////////
++
++bool CTerrainPlateComponent::IsPhysSurfaceFromTerrainEnabled() const
++{
++	if (!m_bPhysSurfaceFromTerrain || g_terrainPlatePhysSurfaceFromTerrain == 0)
++		return false;
++
++	if (((uint32)m_type & (uint32)EMeshType::Collider) == 0)
++		return false;
++
++	if (m_pEntity == nullptr || GetEntitySlotId() == IEntityComponent::EmptySlotId)
++		return false;
++
++	return gEnv != nullptr && gEnv->p3DEngine != nullptr && gEnv->p3DEngine->GetITerrain() != nullptr
++	       && gEnv->pPhysicalWorld != nullptr;
++}
++
++IMaterial* CTerrainPlateComponent::GetPlateMaterial() const
++{
++	// The same order CEntityPhysics::UpdateParamsFromRenderMaterial uses (PhysicsProxy.cpp:154-158): the
++	// slot override wins, the statobj's own material is the fallback. ApplyMaterial keeps both in step.
++	if (m_pEntity != nullptr && GetEntitySlotId() != IEntityComponent::EmptySlotId)
++	{
++		if (IMaterial* pSlotMaterial = m_pEntity->GetSlotMaterial(GetEntitySlotId()))
++			return pSlotMaterial;
++	}
++
++	return (m_pStatObj != nullptr) ? m_pStatObj->GetMaterial() : nullptr;
++}
++
++int CTerrainPlateComponent::GetPlateMaterialSurfaceTypeId() const
++{
++	IMaterial* pMaterial = GetPlateMaterial();
++	if (pMaterial == nullptr)
++		return 0;
++
++	int surfaceTypeIds[MAX_SUB_MATERIALS];
++	memset(surfaceTypeIds, 0, sizeof(surfaceTypeIds));
++	const int numIds = pMaterial->FillSurfaceTypeIds(surfaceTypeIds);
++
++	// Entry 0 is what the stock path gives every face of the plate today, so it is the right fallback:
++	// wherever the terrain has no answer the plate keeps behaving exactly as it does now.
++	return (numIds > 0) ? surfaceTypeIds[0] : 0;
++}
++
++int CTerrainPlateComponent::SampleTerrainSurfaceTypeId(float worldX, float worldY) const
++{
++	if (gEnv == nullptr || gEnv->pPhysicalWorld == nullptr || gEnv->p3DEngine == nullptr)
++		return -1;
++
++	// I3DEngine / ITerrain expose no per position surface type getter (research 14 section 2.1), but
++	// physics does: ray_hit::surface_idx is pent->GetMatId(...) of the heightfield cell, i.e. the terrain's
++	// own answer already mapped through arrMatMapping. Restricting the ray to ent_terrain means the plate
++	// itself, and anything else standing here, cannot be hit.
++	const float startZ = gEnv->p3DEngine->GetTerrainElevation(worldX, worldY) + kPhysSurfaceRayUp;
++
++	ray_hit hit;
++	memset(&hit, 0, sizeof(hit));
++
++	IPhysicalWorld::SRWIParams rp;
++	rp.Init(Vec3(worldX, worldY, startZ), Vec3(0.f, 0.f, -kPhysSurfaceRayLength), ent_terrain,
++	        rwi_stop_at_pierceable, SCollisionClass(0, 0), &hit, 1);
++
++	// A terrain hole is not hit (rwi_ignore_terrain_holes is deliberately NOT set), so a hole answers -1
++	// and the caller falls back to the plate's own material - which is what the ground there does too.
++	if (gEnv->pPhysicalWorld->RayWorldIntersection(rp) <= 0 || hit.dist < 0.f)
++		return -1;
++
++	return (int)hit.surface_idx;
++}
++
++int CTerrainPlateComponent::SampleFootprintSurfaceTypes(uint32& outHash) const
++{
++	outHash = 2166136261u; // FNV-1a, same shape as the geometry hash
++
++	if (m_pEntity == nullptr)
++		return -1;
++
++	const Matrix34 worldTM = GetPlateWorldTM();
++
++	// Counts per distinct id over the grid. A footprint sees a handful of layers, so a small linear scan
++	// beats any container here.
++	int ids[kPhysSurfaceProbeGrid * kPhysSurfaceProbeGrid];
++	int counts[kPhysSurfaceProbeGrid * kPhysSurfaceProbeGrid];
++	int distinct = 0;
++
++	for (int i = 0; i < kPhysSurfaceProbeGrid; ++i)
++	{
++		for (int j = 0; j < kPhysSurfaceProbeGrid; ++j)
++		{
++			// The plate is a unit plate: -0.5 .. +0.5 in local XY. Sampling on the local grid and
++			// transforming to the world follows the plate's rotation and scale for free.
++			const float u = -0.5f + (float)i / (float)(kPhysSurfaceProbeGrid - 1);
++			const float v = -0.5f + (float)j / (float)(kPhysSurfaceProbeGrid - 1);
++			const Vec3 world = worldTM * Vec3(u, v, 0.f);
++
++			const int id = SampleTerrainSurfaceTypeId(world.x, world.y);
++
++			// The hash covers the misses too: a layer painted over what used to be a hole, or a plate that
++			// grew past the edge of the map, both have to count as a change.
++			outHash = (outHash ^ (uint32)(id + 1)) * 16777619u;
++
++			if (id < 0)
++				continue;
++
++			int k = 0;
++			for (; k < distinct && ids[k] != id; ++k) {}
++			if (k == distinct)
++			{
++				ids[distinct] = id;
++				counts[distinct] = 0;
++				++distinct;
++			}
++			++counts[k];
++		}
++	}
++
++	int best = -1;
++	int bestCount = 0;
++	for (int k = 0; k < distinct; ++k)
++	{
++		if (counts[k] > bestCount)
++		{
++			bestCount = counts[k];
++			best = ids[k];
++		}
++	}
++
++	return best;
++}
++
++void CTerrainPlateComponent::BuildPhysicsSurfaceMapping()
++{
++	m_physMatMapping.clear();
++	m_physSurfaceHash = 0;
++
++	if (!IsPhysSurfaceFromTerrainEnabled())
++		return;
++
++	uint32 hash = 0;
++	const int dominantId = SampleFootprintSurfaceTypes(hash);
++	m_physSurfaceHash = hash;
++
++	if (dominantId < 0)
++	{
++		// The terrain answered nowhere under this plate (off the map, all holes, or the plate hovers out
++		// of the heightfield's reach). Leaving the mapping empty means nothing is pushed and the stock
++		// material mapping stands - which is precisely the requested fallback, so there is no second code
++		// path for it.
++		if (!m_bPhysSurfaceFallbackWarned && GetPlateDebugLevel() >= 1)
++		{
++			m_bPhysSurfaceFallbackWarned = true;
++			CryLog("TerrainPlate '%s': no terrain surface type under the footprint, physics keeps the plate's own material", GetPlateName());
++		}
++		return;
++	}
++
++	// Option D of decision 09: ONE dominant id for the whole plate. Every face of the plate carries
++	// nMatID 0 (both subsets do, @see RegenerateMesh), so a single entry table is all it takes -
++	// GetMatId clamps every face to entry 0 and returns this id.
++	m_physMatMapping.assign(1, dominantId);
++}
++
++void CTerrainPlateComponent::ApplyPhysicsSurfaceMapping()
++{
++	m_physMatsApplied = 0;
++
++	if (m_physMatMapping.empty() || m_pEntity == nullptr)
++		return;
++
++	const int slotId = GetEntitySlotId();
++	if (slotId == IEntityComponent::EmptySlotId)
++		return;
++
++	IPhysicalEntity* pPhysicalEntity = m_pEntity->GetPhysicalEntity();
++	if (pPhysicalEntity == nullptr)
++		return;
++
++	// The counter move to settled fact 4 of decision 09: CEntityPhysics has just overwritten the part's
++	// table from the slot's render material, so we push ours over it. CPhysicalEntity::SetParams copies
++	// the array into a table it owns (physicalentity.cpp:490-512), so m_physMatMapping does not have to
++	// outlive this call - but it does anyway, because the re-apply after the next clobber needs it.
++	pe_params_part partParams;
++	partParams.partid = m_pEntity->GetPhysicalEntityPartId0(slotId);
++	partParams.nMats = (int)m_physMatMapping.size();
++	partParams.pMatMapping = m_physMatMapping.data();
++
++	if (pPhysicalEntity->SetParams(&partParams) != 0)
++	{
++		m_physMatsApplied = (int)m_physMatMapping.size();
++
++		if (GetPlateDebugLevel() >= 2)
++		{
++			CryLog("TerrainPlate '%s': physics surface mapping applied, %d entr%s, first id %d",
++			       GetPlateName(), m_physMatsApplied, (m_physMatsApplied == 1) ? "y" : "ies", m_physMatMapping[0]);
++		}
++	}
++	else if (!m_bPhysSurfaceFallbackWarned && GetPlateDebugLevel() >= 1)
++	{
++		// The part is not there (the entity is owned by something that did not take our slot). Nothing to
++		// repair: without the mapping the plate reports its own material, i.e. today's behaviour.
++		m_bPhysSurfaceFallbackWarned = true;
++		CryLog("TerrainPlate '%s': physics part not found, physics keeps the plate's own material", GetPlateName());
++	}
++}
++
++void CTerrainPlateComponent::PollPhysicsSurface()
++{
++	// Terrain layers cannot be repainted at run time, and the clobber paths all go through events the
++	// component already handles there, so the poll costs a launcher build nothing at all.
++	if (gEnv == nullptr || !gEnv->IsEditor())
++		return;
++
++	if (!IsPhysSurfaceFromTerrainEnabled())
++		return;
++
++	// A rebuild or a move batch is about to redo all of this from scratch; and a bake cascade is writing
++	// the terrain right now, so nothing read out of it would be stable.
++	if (m_bRegenPending || m_bDeferredXformPending || m_bBakeMoveBatchPending || g_bakeCascadeDepth > 0)
++		return;
++
++	const int probeFrames = max(0, g_terrainPlatePhysSurfaceProbeFrames);
++	if (probeFrames <= 0)
++		return;
++
++	if ((int)(gEnv->nMainFrameID - m_lastPhysSurfaceProbeFrameId) < probeFrames)
++		return;
++
++	m_lastPhysSurfaceProbeFrameId = gEnv->nMainFrameID;
++
++	// Half of the probe: did a layer under the plate change? Nothing in the engine says so -
++	// CHeightmap::UpdateEngineTerrain pushes surface bits without moving a height, OnTerrainModified only
++	// notifies AI, and ITerrain::OnTerrainPaintActionComplete has an empty engine body (research 14
++	// section 2.3) - and PollBake compares heights only, so it is blind to a repaint by construction.
++	// kPhysSurfaceProbeGrid^2 terrain rays every e_TerrainPlatePhysSurfaceProbeFrames frames is the price.
++	uint32 hash = 0;
++	SampleFootprintSurfaceTypes(hash);
++
++	if (hash != m_physSurfaceHash)
++	{
++		if (GetPlateDebugLevel() >= 1)
++		{
++			CryLog("TerrainPlate '%s': terrain layers under the plate changed, re-applying the physics surface types", GetPlateName());
++		}
++
++		// The PHYSICS half only. A repaint moves no vertex, so a full RegenerateMesh would re-run the
++		// weld, the shadow cache invalidation and the whole bake cascade for nothing - and would disturb
++		// the bake it re-applies (decision 09, re-physicalise triggers).
++		BuildPhysicsSurfaceMapping();
++		ApplyPhysicsSurfaceMapping();
++		return;
++	}
++
++	// Other half: did something we did not enumerate overwrite the mapping? This is the belt to the
++	// braces of re-applying at every known clobber site, and it costs one GetParams.
++	if (m_physMatMapping.empty() || m_physMatsApplied <= 0)
++		return;
++
++	IPhysicalEntity* pPhysicalEntity = m_pEntity->GetPhysicalEntity();
++	if (pPhysicalEntity == nullptr)
++		return;
++
++	pe_params_part partParams;
++	partParams.partid = m_pEntity->GetPhysicalEntityPartId0(GetEntitySlotId());
++	if (pPhysicalEntity->GetParams(&partParams) == 0)
++		return;
++
++	// A clobber from the render material usually restores the SAME entry count (a single material fills
++	// one id), so the count alone is not enough - the values have to be compared.
++	const bool bLost = partParams.pMatMapping == nullptr
++	                   || partParams.nMats != (int)m_physMatMapping.size()
++	                   || memcmp(partParams.pMatMapping, m_physMatMapping.data(), m_physMatMapping.size() * sizeof(int)) != 0;
++
++	if (bLost)
++	{
++		if (GetPlateDebugLevel() >= 1)
++		{
++			CryLog("TerrainPlate '%s': physics surface mapping was overwritten, re-applying", GetPlateName());
++		}
++
++		ApplyPhysicsSurfaceMapping();
++	}
++}
++
++void CTerrainPlateComponent::OnPhysSurfaceCVarChanged(ICVar* /*pCVar*/)
++{
++	// Same reasoning and the same index walk as OnCullBuriedCVarChanged: the per face ids live in the
++	// physics trimesh, so the cvar only means something once every plate has been built again.
++	for (size_t i = 0; i < g_terrainPlates.size(); ++i)
++	{
++		g_terrainPlates[i]->RequestRegenerate();
++	}
++}
+ }
+ }
+diff --git a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
+index 957f5362..09149fa8 100644
+--- a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
++++ b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
+@@ -292,6 +292,11 @@ public:
+ 	//! RegisterTerrainPlateCVars hands it to ICVar::AddOnChange as a plain function.
+ 	static void OnCullBuriedCVarChanged(ICVar* pCVar);
+ 
++	//! e_TerrainPlatePhysSurfaceFromTerrain changed. The per face ids the feature writes live inside the
++	//! physics trimesh, so - exactly like the buried cull above - the cvar can only take effect by
++	//! rebuilding every plate. Public for the same reason: ICVar::AddOnChange takes a plain function.
++	static void OnPhysSurfaceCVarChanged(ICVar* pCVar);
++
+ protected:
+ 	friend CPlugin_CryDefaultEntities;
+ 	// The panel groups draw this component's own members. @see STerrainPlateUIGroup.
+@@ -517,6 +522,23 @@ public:
+ 
+ 		desc.AddMember(&CTerrainPlateComponent::m_uiEditor, 'egrp', "EditorGroup", "-Editor", "How the plate behaves while it is being edited. No effect at game time.", STerrainPlateEditorGroup());
+ 
++		// A physics row, so it sits immediately in front of Physics Settings rather than inside one of the
++		// four shape / bake drawers (decision 09 asks for "the same section as Type = Collider"; the P19
++		// drawer structure has no physics drawer, and adding one for a single tick box would cost a row
++		// for nothing). It stays visible with Type = Render, where it simply does nothing, for the same
++		// reason Bake Into Terrain stays visible on a plate with no terrain: a row that disappears is
++		// harder to find again than a row that is inert.
++		desc.AddMember(&CTerrainPlateComponent::m_bPhysSurfaceFromTerrain, 'psft', "PhysSurfaceFromTerrain", "Physics Surface From Terrain",
++		               "On (default): what a contact with the plate reports as its surface type - the footstep sound, the bullet "
++		               "impact particle and decal, the vehicle dust, the friction - is taken from the TERRAIN LAYER painted under "
++		               "the plate, instead of from the plate's single material. The layers are sampled when the plate is rebuilt "
++		               "and again a moment after a layer under it is repainted. Where the terrain has no answer (a hole, off the "
++		               "map, or a part of the plate the terrain does not reach) the plate's own material is used. "
++		               "Off: the whole plate reports its own material's surface type, which is the behaviour before this option "
++		               "existed. Needs Type = Collider to mean anything. The console kill switch is "
++		               "e_TerrainPlatePhysSurfaceFromTerrain 0.",
++		               true);
++
+ 		desc.AddMember(&CTerrainPlateComponent::m_renderParameters, 'rend', "Render", "Rendering Settings", "Settings for the rendered representation of the component", plateRenderDefaults);
+ 		desc.AddMember(&CTerrainPlateComponent::m_physics, 'phys', "Physics", "Physics Settings",
+ 		               "Physical properties for the object. With Type = Render and Collider the plate physicalizes itself as a static "
+@@ -580,6 +602,50 @@ protected:
+ 	void        UpdateNativePhysics();
+ 	//! Destroys the physical entity, but only the one this component created.
+ 	void        ReleaseNativePhysics();
++
++	// ---------------------------------------------------------------- physics surface types (decision 09)
++	// The plate carries ONE material, so every contact on it - footstep, bullet, particle, friction -
++	// resolves to that one material's surface type, whatever the terrain under the plate looks like. The
++	// fix is that a contact carries the MAPPED id: CPhysicalEntity::GetMatId (physicalentity.h:330-339)
++	// runs the raw per face id through the part's pMatMapping, and terrain and objects share one global
++	// ISurfaceTypeManager id space (terrain_load.cpp:179-191 vs Material.cpp:579-593). So a plate part
++	// whose mapping holds a TERRAIN LAYER's surface type id resolves exactly as the terrain does
++	// (MaterialEffects.cpp:544-573 is keyed by that id and knows nothing about "terrain").
++	// @see research/14-plate-physics-surface-types.md, decisions/09-plate-surface-types.md.
++
++	//! True when this plate should take its physics surface types from the terrain: the per plate property,
++	//! the cvar kill switch, a collider type, an entity and a terrain.
++	bool        IsPhysSurfaceFromTerrainEnabled() const;
++	//! The material the plate actually renders and physicalises with (slot override first, then the
++	//! statobj's), or null.
++	IMaterial*  GetPlateMaterial() const;
++	//! Surface type id of the plate's own material, i.e. entry 0 of FillSurfaceTypeIds. This is both the
++	//! fallback wherever the terrain has no answer and what the part degrades to if the mapping is ever
++	//! lost, which is why the two are deliberately the same number.
++	int         GetPlateMaterialSurfaceTypeId() const;
++	//! Global surface type id of the terrain under (worldX, worldY), or -1 when the terrain has no answer
++	//! (off the map, a hole, or no hit). A downward RayWorldIntersection limited to ent_terrain: its
++	//! ray_hit::surface_idx IS the number a footstep on that patch would report (physicalworld.cpp:4514),
++	//! palette, GetSubMtl(2) wrinkle and hole sentinels included - nothing is re-derived here.
++	int         SampleTerrainSurfaceTypeId(float worldX, float worldY) const;
++	//! Samples the kPhysSurfaceProbeGrid x kPhysSurfaceProbeGrid grid over the plate's world footprint.
++	//! Returns the dominant (modal) id, or -1 when the terrain answered nowhere, and FNV-1a hashes the
++	//! whole grid into outHash - that hash is the ONLY thing that notices a layer repaint, because the
++	//! engine sends no notification for one (research 14 section 2.3).
++	int         SampleFootprintSurfaceTypes(uint32& outHash) const;
++	//! Recomputes m_physMatMapping from the terrain (the sampling half - this is the one that casts rays).
++	//! Called from RegenerateMesh before the physics geometry is built and from the repaint probe.
++	void        BuildPhysicsSurfaceMapping();
++	//! Pushes m_physMatMapping onto the entity part with pe_params_part (the cheap half - no rays).
++	//! Must run AFTER anything that calls CEntityPhysics::UpdateParamsFromRenderMaterial
++	//! (PhysicsProxy.cpp:397, :401, :882, :1265), which overwrites the part mapping from the slot's render
++	//! material and would otherwise discard this.
++	void        ApplyPhysicsSurfaceMapping();
++	//! Editor only, every e_TerrainPlatePhysSurfaceProbeFrames frames: re-samples the footprint grid and
++	//! re-physicalises the surface half when a layer under the plate was repainted, and heals the mapping
++	//! if some path we did not enumerate clobbered it. Deliberately independent of PollBake, which
++	//! early-returns unless a bake is live (TerrainPlateComponent.cpp, PollBake) and compares heights only.
++	void        PollPhysicsSurface();
+ 	//! Tells the engine the plate's geometry changed, so that the static shadow cache and the
+ 	//! HeightMap AO frustum are rebuilt instead of keeping the previous silhouette.
+ 	void        InvalidateShadowCache();
+@@ -723,6 +789,10 @@ protected:
+ 	Schematyc::Range<0, 100, 0, 2, float>        m_weldSink = 0.1f;
+ 	Schematyc::Range<0, 1000, 0, 20, float>      m_skirt = 0.25f;
+ 	bool                                         m_bUpdateDuringDrag = false;
++	//! Decision 09: the plate's contacts report the terrain layer's surface type instead of the plate
++	//! material's. Default on, because the user's complaint is precisely that the single material cannot
++	//! be tuned; off is bit for bit the behaviour before the feature existed.
++	bool                                         m_bPhysSurfaceFromTerrain = true;
+ 	bool                                         m_bBakeIntoTerrain = false;
+ 	ETerrainPlateBakeMode                        m_bakeMode = ETerrainPlateBakeMode::Raise;
+ 	Schematyc::Range<-128, 127, -128, 127, int>  m_bakePriority = 0;
+@@ -845,6 +915,26 @@ protected:
+ 	//! e_TerrainPlateDebug 1: says once, per plate, that the component really is being ticked. If this
+ 	//! line never appears the plate never received ENTITY_EVENT_UPDATE and no bake trigger can fire.
+ 	bool                     m_bUpdateTickLogged = false;
++
++	// ---------------------------------------------------------------- physics surface types, runtime only
++	//! Plate local index -> global ISurfaceTypeManager id, the table pushed onto the entity part with
++	//! pe_params_part. Entry 0 is always the plate's own material surface type, so that the clamp in
++	//! CPhysicalEntity::GetMatId (an out of range face id lands on entry 0) degrades to exactly today's
++	//! behaviour. Empty means "the feature is not active on this plate" and nothing is pushed.
++	//! At most kPhysSurfaceMaxMappingEntries entries: physicalentity.h:81 stores nMats in an unsigned:7.
++	std::vector<int>         m_physMatMapping;
++	//! FNV-1a of the footprint probe grid's surface ids, as the live mapping was built from them.
++	//! Nothing in the engine announces a layer repaint (research 14 section 2.3), so this hash is the
++	//! whole detection mechanism: the poll re-samples the same cells and compares.
++	uint32                   m_physSurfaceHash = 0;
++	//! Number of mapping entries the part was last given, so the poll can notice a clobber without
++	//! re-sampling anything.
++	int                      m_physMatsApplied = 0;
++	uint32                   m_lastPhysSurfaceProbeFrameId = 0;
++	//! One line per plate, per reason: a multi sub material refusing the per face split, and a sampling
++	//! or mapping failure that fell back to the plate's own material. Both are e_TerrainPlateDebug only.
++	bool                     m_bPhysSurfaceMultiSubWarned = false;
++	bool                     m_bPhysSurfaceFallbackWarned = false;
+ };
+ }
+ }
+-- 
+2.47.1.windows.1
+

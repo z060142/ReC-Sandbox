@@ -1,0 +1,104 @@
+From d6696314866cf11c4557750cd28487882b76bd9b Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Wed, 2 Sep 2026 08:15:59 +0800
+Subject: [PATCH 272/307] !B (Terrain Integration) Transform integrated vertex
+ normals correctly.
+
+Transform normals with the inverse-transpose relationship required by
+non-uniform plate scale instead of applying the object matrix twice. Include
+the blend-height CVar in terrain refresh state so edits rebuild sector data.
+---
+ Code/CryEngine/Cry3DEngine/3dEngine.cpp       |  3 +-
+ .../Cry3DEngine/terrain_sector_render.cpp     | 62 ++++++++++++++++++-
+ 2 files changed, 63 insertions(+), 2 deletions(-)
+
+diff --git a/Code/CryEngine/Cry3DEngine/3dEngine.cpp b/Code/CryEngine/Cry3DEngine/3dEngine.cpp
+index eca3fbf0..eaef3838 100644
+--- a/Code/CryEngine/Cry3DEngine/3dEngine.cpp
++++ b/Code/CryEngine/Cry3DEngine/3dEngine.cpp
+@@ -762,7 +762,8 @@ void C3DEngine::ProcessCVarsChange()
+ 		GetCVars()->e_TerrainIntegrateObjectsMaxVertices +
+ 		GetCVars()->e_TerrainIntegrateObjectsMaxHeight +
+ 		GetCVars()->e_TerrainIntegrateObjectsFull +
+-		GetCVars()->e_TerrainIntegrateObjectsPushOut;
++		GetCVars()->e_TerrainIntegrateObjectsPushOut +
++		GetCVars()->e_TerrainIntegrateObjectsNormalBlendHeight;
+ 
+ 	if (m_fRefreshSceneDataCVarsSumm != -1 && m_fRefreshSceneDataCVarsSumm != fNewCVarsSumm)
+ 	{
+diff --git a/Code/CryEngine/Cry3DEngine/terrain_sector_render.cpp b/Code/CryEngine/Cry3DEngine/terrain_sector_render.cpp
+index 9ddd52b9..ebea6ccb 100644
+--- a/Code/CryEngine/Cry3DEngine/terrain_sector_render.cpp
++++ b/Code/CryEngine/Cry3DEngine/terrain_sector_render.cpp
+@@ -1768,7 +1768,67 @@ void CTerrainNode::AppendTrianglesFromObjects(const int nOriginX, const int nOri
+ 
+ 								SPipTangents& basis = *(SPipTangents*)&pTangs[nTangsStride * pInds[i + v]];
+ 
+-								vNormWS[v] = m34.TransformVector(basis.GetN()).GetNormalized();
++								// World space surface normal of the source vertex (report 40).
++								//
++								// The shipped line was m34.TransformVector(basis.GetN()), i.e. take the object
++								// space normal out of the tangent frame first (GetN() = T x B * sign, in OBJECT
++								// space) and transform that vector by the object matrix. A normal is a covector:
++								// it transforms by the inverse transpose, not by the matrix. With a rotation and
++								// a uniform scale the two agree, so this is invisible on ordinary brushes - but a
++								// Terrain Plate is a UNIT plate whose size and relief height live entirely in a
++								// deliberately NON-uniform world scale S = (sx, sy, sz). There
++								//     cross(S^-1 a, S^-1 b) = det(S^-1) * S * cross(a, b),
++								// so the object space cross product already carries one factor of S the wrong way
++								// and the TransformVector applies a second: the normal that reached the vertex
++								// buffer was tilted by S^2 instead of S^-1. On a plate 20 m wide and 3 m tall that
++								// is a factor of ~44 in the horizontal component - a 1 degree slope was handed a
++								// 45 degree normal, and most of a gentle mound got a nearly HORIZONTAL normal.
++								//
++								// Consequences on the appended copy, all of them what the user sees:
++								//  - Terrain.cfx:369 builds the detail layer's tangent space view ray from this
++								//    normal (row 2 of mTangentToWS, :557) and ParallaxOcclusionMap steps the ray
++								//    by delta = V.xy * height / (-V.z * steps) (shadeLib.cfi:1141, note that the
++								//    max() guard on that divisor is commented out in stock). A near horizontal
++								//    normal makes V.z cross zero in the MIDDLE of a visible surface: at the
++								//    crossing delta blows up (the layer smears into streaks) and past it delta
++								//    changes sign (the relief displaces the opposite way). The crossing is a
++								//    function of the camera, so it is a line that slides as the camera moves,
++								//    jitters when it does not, and separates further as the POM height is raised.
++								//  - Terrain.cfx:328-336 picks the layer's projection weight by the dominant axis
++								//    of this normal, so a gentle mound was drawing the X or Y projected layer.
++								//  - the 2 cm push out below is along this normal, so the copy was pushed
++								//    sideways instead of out.
++								//
++								// The fix is to do the cross product in WORLD space, which is the definition of
++								// the surface normal for any affine matrix and needs no inverse: transform the
++								// tangent and the bitangent (true directions, they DO transform by the matrix)
++								// and cross them there. For a uniform scale this is the old value up to a
++								// positive scalar, so nothing changes for ordinary objects.
++								Vec4 vTangent, vBitangent;
++								basis.GetTB(vTangent, vBitangent);
++								const Vec3 vTangentWS = m34.TransformVector(Vec3(vTangent.x, vTangent.y, vTangent.z));
++								const Vec3 vBitangentWS = m34.TransformVector(Vec3(vBitangent.x, vBitangent.y, vBitangent.z));
++								Vec3 vNormFromTB = vTangentWS.Cross(vBitangentWS) * vTangent.w;
++
++								// The old value is still the reference for which hemisphere the normal belongs
++								// to: S and S^-1 never move a vector by 90 degrees or more, so its sign is right
++								// even when its tilt is not, and this also survives a mirroring matrix, whose
++								// negative determinant flips the world space cross product.
++								const Vec3 vNormLegacy = m34.TransformVector(basis.GetN());
++
++								if (vNormFromTB.GetLengthSquared() > 1e-12f)
++								{
++									if (vNormFromTB.Dot(vNormLegacy) < 0.f)
++										vNormFromTB = -vNormFromTB;
++
++									vNormWS[v] = vNormFromTB.GetNormalized();
++								}
++								else
++								{
++									// Degenerate tangent frame (zero length or parallel T and B): the object
++									// space normal is all there is.
++									vNormWS[v] = vNormLegacy.GetNormalized();
++								}
+ 
+ 								vPosWS[v] += vNormWS[v] * fPushOut;
+ 
+-- 
+2.47.1.windows.1
+

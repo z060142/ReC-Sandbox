@@ -1,0 +1,216 @@
+From 4e2cbc3b8be62d307c33bd65259a5314563f48d6 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Wed, 2 Sep 2026 14:05:09 +0800
+Subject: [PATCH 289/307] !B (Terrain Plate) Prevent scale feedback during
+ regeneration.
+
+Read plate scale from one transform source that is independent of the slot
+compensation written by the component. Mesh generation, rendering and physics
+therefore cannot feed compensated scale back into the next rebuild.
+---
+ .../Geometry/TerrainPlateComponent.cpp        | 113 +++++++++++++++---
+ .../Geometry/TerrainPlateComponent.h          |  15 ++-
+ 2 files changed, 112 insertions(+), 16 deletions(-)
+
+diff --git a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
+index 5d2d888a..6ff95c86 100644
+--- a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
++++ b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
+@@ -125,6 +125,11 @@ ICVar* g_pTerrainPlateCullBuriedCVar = nullptr;
+ //! so the deliberately sunk rim reads as buried while float noise cannot flip a surface vertex.
+ const float kBuriedCullMargin = 0.05f;
+ 
++//! Hard cap on the plate's own size, per axis. A plate is a local ground feature; nothing sane needs a
++//! kilometre of it, and a defect that inflates the size must not be allowed to build a map-sized mesh and
++//! flood the entity grid with cell queries. The terrain's own size caps it further where it is smaller.
++const float kMaxPlateSizeMeters = 1024.f;
++
+ //! The plate's contacts report the surface type of the TERRAIN LAYER under them; 0 restores the stock path.
+ int    g_terrainPlatePhysSurfaceFromTerrain = 1;
+ ICVar* g_pTerrainPlatePhysSurfaceFromTerrainCVar = nullptr;
+@@ -1414,8 +1419,24 @@ Matrix34 CTerrainPlateComponent::GetPlateFrameTM() const
+ 		return Matrix34(IDENTITY);
+ 
+ 	// Built from the entity and the component transform rather than read back from the slot: the slot local TM
+-	// now carries the scale-cancelling transform, and this is the only frame that exists before the slot does.
+-	return m_pEntity->GetWorldTM() * GetTransformMatrix();
++	// carries the scale-cancelling transform, and this is the only frame that exists before the slot does.
++	Matrix34 frameTM = m_pEntity->GetWorldTM() * GetTransformMatrix();
++
++	// Re-impose the authoritative size on the columns. GetWorldScale is zero-guarded and capped, so without
++	// this the frame and the size would disagree exactly when it matters - and the frame is what the weld, the
++	// bake footprint and the node matrix are solved against. Directions (and the sign of a mirrored axis) are
++	// preserved: each column is only rescaled to the length the plate is declared to have.
++	const Vec3 size = GetWorldScale();
++	static const Vec3 kAxis[3] = { Vec3(1.f, 0.f, 0.f), Vec3(0.f, 1.f, 0.f), Vec3(0.f, 0.f, 1.f) };
++
++	for (int i = 0; i < 3; ++i)
++	{
++		const Vec3  column = frameTM.GetColumn(i);
++		const float length = column.GetLength();
++		frameTM.SetColumn(i, (length > 1e-6f) ? column * (size[i] / length) : kAxis[i] * size[i]);
++	}
++
++	return frameTM;
+ }
+ 
+ bool CTerrainPlateComponent::InvertPlateFrameTM(const Matrix34& frameTM, Matrix34& outInvTM)
+@@ -1458,17 +1479,22 @@ void CTerrainPlateComponent::ApplySlotScaleCompensation()
+ 	// The renderer reconstructs the vertex normal as cross(T, B) in OBJECT space and multiplies it by the object
+ 	// matrix, tilting it by S^2 instead of S^-1 under a non-uniform scale - so no tangent stream can make a
+ 	// non-uniformly scaled node shade correctly. The cure is to leave no scale on the node: the mesh is in metres
+-	// and the slot local transform is the component transform with the mesh's build size divided out. During a
+-	// deferred drag the columns are NOT unit: the ratio stretches the plate live, and returns to 1 on rebuild.
++	// and the slot carries the transform that puts the node back at unit scale. During a deferred drag the
++	// columns are NOT unit: the ratio stretches the plate live, and returns to 1 on rebuild.
+ 	const int slotId = GetEntitySlotId();
+ 	if (m_pEntity == nullptr || slotId == IEntityComponent::EmptySlotId)
+ 		return;
+ 
+-	const Vec3 meshScale = GetMeshBuildScale();
+-	Matrix34 slotLocalTM = GetTransformMatrix();
+-	slotLocalTM.SetColumn(0, slotLocalTM.GetColumn(0) / meshScale.x);
+-	slotLocalTM.SetColumn(1, slotLocalTM.GetColumn(1) / meshScale.y);
+-	slotLocalTM.SetColumn(2, slotLocalTM.GetColumn(2) / meshScale.z);
++	// Solved from the node matrix rather than derived a second time from the component transform and the mesh
++	// size: entityWorldTM * slotLocalTM == GetPlateNodeTM() by construction, so the slot cannot drift away from
++	// the frame the rest of the component reasons in (it did when the size was capped, or the component
++	// transform held a scale of its own).
++	Matrix34 invEntityTM;
++	if (!InvertPlateFrameTM(m_pEntity->GetWorldTM(), invEntityTM))
++		return; // a zero-scaled entity draws nothing; leave the slot alone rather than write NaNs into it
++
++	const Vec3     meshScale = GetMeshBuildScale();
++	const Matrix34 slotLocalTM = invEntityTM * GetPlateNodeTM();
+ 
+ 	m_pEntity->SetSlotLocalTM(slotId, slotLocalTM);
+ 
+@@ -1485,14 +1511,50 @@ void CTerrainPlateComponent::ApplySlotScaleCompensation()
+ 
+ Vec3 CTerrainPlateComponent::GetWorldScale() const
+ {
+-	const Matrix34 worldTM = GetPlateFrameTM();
+-	const Vec3 scale(worldTM.GetColumn0().GetLength(), worldTM.GetColumn1().GetLength(), worldTM.GetColumn2().GetLength());
++	if (m_pEntity == nullptr)
++		return Vec3(1.f, 1.f, 1.f);
++
++	// THE authoritative read, and the reason it does not go through GetPlateFrameTM (which would recurse):
++	// the entity's world transform and the component's own transform are the only two matrices the plate
++	// never writes. The slot local TM is excluded on purpose - it carries the compensation this component
++	// puts there itself (@see ApplySlotScaleCompensation), and so is the mesh, which was built from this
++	// very number. Reading the size back out of either is what makes a rebuild grow the plate.
++	const Matrix34 authoredTM = m_pEntity->GetWorldTM() * GetTransformMatrix();
++	const Vec3 scale(authoredTM.GetColumn0().GetLength(), authoredTM.GetColumn1().GetLength(), authoredTM.GetColumn2().GetLength());
+ 
+ 	// A zero scale would divide by zero all over the generator and produces no visible geometry, so it reads 1.
+-	return Vec3(
+-	  (scale.x > 0.0001f) ? scale.x : 1.f,
+-	  (scale.y > 0.0001f) ? scale.y : 1.f,
+-	  (scale.z > 0.0001f) ? scale.z : 1.f);
++	return ClampPlateSize(Vec3(
++	                        (scale.x > 0.0001f) ? scale.x : 1.f,
++	                        (scale.y > 0.0001f) ? scale.y : 1.f,
++	                        (scale.z > 0.0001f) ? scale.z : 1.f));
++}
++
++Vec3 CTerrainPlateComponent::ClampPlateSize(const Vec3& rawSize) const
++{
++	// The terrain caps the footprint where it is smaller than the absolute cap: a plate wider than the map
++	// cannot be welded, baked or integrated into anything anyway.
++	float cap = kMaxPlateSizeMeters;
++	if (gEnv != nullptr && gEnv->p3DEngine != nullptr && gEnv->p3DEngine->GetITerrain() != nullptr)
++	{
++		const float terrainSize = (float)gEnv->p3DEngine->GetTerrainSize();
++		if (terrainSize > 1.f)
++			cap = min(cap, terrainSize);
++	}
++
++	if (rawSize.x <= cap && rawSize.y <= cap && rawSize.z <= cap)
++		return rawSize;
++
++	if (!m_bSizeCapWarned)
++	{
++		m_bSizeCapWarned = true;
++		CryWarning(VALIDATOR_MODULE_3DENGINE, VALIDATOR_WARNING,
++		           "Terrain Plate '%s': the entity scale asks for a %.1f x %.1f x %.1f m plate, past the %.0f m cap. "
++		           "Clamped. A plate is a local ground feature - if this is not what you set, the entity (or a group "
++		           "or prefab parent) carries a scale it should not; clear it and scale the plate again.",
++		           GetPlateName(), rawSize.x, rawSize.y, rawSize.z, cap);
++	}
++
++	return Vec3(min(rawSize.x, cap), min(rawSize.y, cap), min(rawSize.z, cap));
+ }
+ 
+ void CTerrainPlateComponent::ApplyMaterial()
+@@ -2171,6 +2233,27 @@ void CTerrainPlateComponent::RegenerateMesh()
+ 	// Last, so the baseline is captured from the restored ground and the block from the relief just solved.
+ 	// Cascaded, because a baseline is only the original ground if everything above it is out of the terrain.
+ 	ApplyBakeCascaded();
++
++	// Idempotency. Regenerating must be a pure function of the plate's authored transform: if the size read
++	// AFTER the rebuild differs from the size it was built at, something the rebuild wrote (the slot, the mesh,
++	// the render node's bounds) has fed back into the size, and the next rebuild will multiply again. That is
++	// the defect that grew a plate to the size of the map; say so once, loudly, rather than let it compound.
++	const Vec3 sizeAfter = GetWorldScale();
++	if (!sizeAfter.IsEquivalent(worldScale, 0.001f) && !m_bSizeFeedbackWarned)
++	{
++		m_bSizeFeedbackWarned = true;
++		CryWarning(VALIDATOR_MODULE_3DENGINE, VALIDATOR_ERROR,
++		           "Terrain Plate '%s': rebuilding changed the plate's own size, %.3f x %.3f x %.3f m -> %.3f x %.3f x %.3f m. "
++		           "The size must depend only on the entity and component transforms; this is a feedback loop and the plate "
++		           "will keep growing. Please report it.",
++		           GetPlateName(), worldScale.x, worldScale.y, worldScale.z, sizeAfter.x, sizeAfter.y, sizeAfter.z);
++	}
++
++	if (GetPlateDebugLevel() >= 1)
++	{
++		CryLog("TerrainPlate '%s': rebuild done, size in %.3f x %.3f x %.3f m, size out %.3f x %.3f x %.3f m, grid %d x %d",
++		       GetPlateName(), worldScale.x, worldScale.y, worldScale.z, sizeAfter.x, sizeAfter.y, sizeAfter.z, nx, ny);
++	}
+ }
+ 
+ // Virtual bake: the plate's low frequency relief written into the live engine terrain.
+diff --git a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
+index d31f24ed..1b0f98d9 100644
+--- a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
++++ b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
+@@ -507,6 +507,8 @@ protected:
+ 	//! The plate's DESIGN frame: maps the NORMALISED unit plate (-0.5 .. +0.5 in XY, 0 .. 1 in Z) onto the
+ 	//! world, so it carries the plate's size in its scale. Entity world TM times component TM - NOT the
+ 	//! slot world matrix, which carries no scale (@see GetPlateNodeTM). Valid before the slot exists.
++	//! Its column lengths are re-imposed from GetWorldScale, so the frame, the node, the slot compensation
++	//! and the grid can never disagree about how big the plate is.
+ 	Matrix34    GetPlateFrameTM() const;
+ 	//! Inverse of a plate frame, refused when the frame is singular. The single guard against a zero scale
+ 	//! turning every vertex it touches into NaN; Matrix34::Invert has none of its own.
+@@ -515,8 +517,14 @@ protected:
+ 	//! each column. The mesh is generated in world metres, so the slot cancels the scale (@see
+ 	//! ApplySlotScaleCompensation); the columns are unit length except during a deferred drag.
+ 	Matrix34    GetPlateNodeTM() const;
+-	//! Size of the plate in metres: x/y edge lengths, z relief height. Components below 0.0001 read as 1.
++	//! THE authoritative size of the plate in metres: x/y edge lengths, z relief height. Read ONLY from the
++	//! entity world transform and the component transform - never from the slot, which carries the plate's
++	//! own scale compensation, and never from the mesh, which was built from this. Components below 0.0001
++	//! read as 1, and the result is capped (@see ClampPlateSize) so every consumer sees the same number.
+ 	Vec3        GetWorldScale() const;
++	//! Refuses an insane footprint: a plate wider than the terrain, or than kMaxPlateSizeMeters, is clamped
++	//! and warned about once, so a transform defect can never build a map-sized mesh again.
++	Vec3        ClampPlateSize(const Vec3& rawSize) const;
+ 	//! Size the mesh currently in the statobj was generated at (m_lastWorldScale, guarded against zero).
+ 	Vec3        GetMeshBuildScale() const;
+ 	//! Writes the slot local transform that cancels the size already baked into the mesh, so that
+@@ -778,6 +786,11 @@ protected:
+ 	//! World scale the current mesh was generated for. The mesh itself is scale independent in XY, but
+ 	//! the normals, the weld, the skirt and the Spacing grid are not, so a scale change regenerates.
+ 	Vec3                     m_lastWorldScale = Vec3(1.f, 1.f, 1.f);
++	//! One-shot, because a clamped plate would otherwise warn on every rebuild.
++	mutable bool             m_bSizeCapWarned = false;
++	//! Fires once if a rebuild ever changes the plate's OWN size - the signature of a feedback loop, where
++	//! the size is read back out of something the rebuild wrote. @see RegenerateMesh.
++	bool                     m_bSizeFeedbackWarned = false;
+ 	//! Vertex counts the last RegenerateMesh actually produced; the bake evaluates the same piecewise
+ 	//! surface. 0 until the first generation, when GetPlateReliefAt falls back to the source resolution.
+ 	int                      m_lastGridX = 0;
+-- 
+2.47.1.windows.1
+

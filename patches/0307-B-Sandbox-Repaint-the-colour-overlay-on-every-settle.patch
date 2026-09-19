@@ -1,0 +1,158 @@
+From c9e6c2065b76e670b07fb4cfbb6ee5a560076e41 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Thu, 3 Sep 2026 15:55:14 +0800
+Subject: [PATCH 307/307] !B (Sandbox) Repaint the colour overlay on every
+ settled move.
+
+With Terrain Colour From Plate on, nudging a plate a few metres at a time
+occasionally left the terrain colour behind: it stayed painted at the old
+position and never appeared at the new one. Ctrl+Z put the plate back onto
+its own stale colour, so it looked "restored", and the next move made it
+follow again.
+
+The sequence that lost the update:
+
+1. The plate is painted at A. g_plates holds its signature.
+2. The user moves it a few metres to B.
+3. ENTITY_EVENT_XFORM arms m_bDeferredXformPending, so the overlay reports
+   bSettling and carries the old state forward - correct, that is the
+   debounce.
+4. The plate settles. The overlay rescans and computes the same signature
+   it had at A, so it takes the "nothing changed" branch and marks no
+   sector dirty. The signature was built out of GetCommitAppearanceFootprint,
+   i.e. ComputeBakeRect, which is SECTOR aligned because SetTerrainElevation
+   asserts whole sectors - so it only changes when the plate crosses a whole
+   terrain sector, tens of metres. The picture inside that rect, however, is
+   drawn from the continuous transform (GetCommitWeightAtWorld and
+   GetCommitAlbedoAtWorld sample the live plate frame).
+5. Nothing else in the build dirties the colour atlas - the height bake only
+   arms m_eElevTexEditingState - so the tile kept the pixels it was
+   compressed with at A. The only reason a sub-sector move ever repainted
+   at all was CTerrainNode::StreamOnComplete re-arming the flag when that
+   node's diffuse tile happened to restream, which is what made the bug
+   intermittent rather than permanent.
+
+The fix, in the overlay only, bookkeeping only:
+
+- MakeLivePlate folds the plate entity's world matrix into the signature
+  next to the sector-aligned rect, so a move, a rotate or a scale is a
+  change at the resolution the picture is actually drawn at. Twelve float
+  hashes per plate per frame, constant - it does not scale with the plate's
+  size or footprint.
+- The settle branch and the throttle branch carry the previous entry forward
+  WHOLE instead of copying the signature and the four rect floats over a
+  freshly scanned tint. g_plates is now exactly the state the atlas was last
+  PAINTED with, and the change detector always compares against that, never
+  against a state nobody painted - which was a second way for the settled
+  frame to agree with itself and skip the only repaint the move would get.
+
+No extra DXT recompress beyond the one the skipped update owed: both gates
+stay in front of the repaint, and every plate the overlay can see is a
+baking plate (IsLiveColourEnabled requires Bake Into Terrain, which is
+exactly WantsBakeMoveBatch), so its whole drag takes the deferred path and
+still pays one repaint on release.
+
+Known and left alone: an edit to the diffuse map inside the same material is
+still not in the signature and repaints on the next update.
+---
+ .../Terrain/TerrainPlateColourOverlay.cpp     | 50 ++++++++++++-------
+ 1 file changed, 33 insertions(+), 17 deletions(-)
+
+diff --git a/Code/Sandbox/EditorQt/Terrain/TerrainPlateColourOverlay.cpp b/Code/Sandbox/EditorQt/Terrain/TerrainPlateColourOverlay.cpp
+index 110b06bc..e5502368 100644
+--- a/Code/Sandbox/EditorQt/Terrain/TerrainPlateColourOverlay.cpp
++++ b/Code/Sandbox/EditorQt/Terrain/TerrainPlateColourOverlay.cpp
+@@ -45,7 +45,7 @@ struct SLivePlate
+ 	ColorB               tint = ColorB(255, 255, 255, 255);
+ 
+ 	//! Everything the look depends on, folded into one value. On a change the sectors under the OLD and
+-	//! the NEW footprint are marked dirty.
++	//! the NEW footprint are marked dirty. @see MakeLivePlate for what goes into it.
+ 	uint32               signature = 0;
+ 	uint32               lastRepaintFrame = 0;
+ 
+@@ -189,6 +189,22 @@ bool MakeLivePlate(IEntity* pEntity, float unitSize, SLivePlate& out)
+ 	signature = HashFloat(signature, plate.worldYMin);
+ 	signature = HashFloat(signature, plate.worldXMax);
+ 	signature = HashFloat(signature, plate.worldYMax);
++
++	// The plate's own transform, and NOT only the footprint above: GetCommitAppearanceFootprint answers
++	// ComputeBakeRect, which is SECTOR aligned (SetTerrainElevation asserts whole sectors), so the rect only
++	// changes when the plate crosses a whole terrain sector - tens of metres. The picture inside the rect is
++	// drawn from the continuous transform (GetCommitWeightAtWorld / GetCommitAlbedoAtWorld sample the live
++	// frame), so a move of a few metres changed everything the user can see while leaving the rect, and with
++	// it the old signature, identical: no sector was ever marked dirty and the colour stayed behind at the
++	// old position. Every component of the world matrix, so a rotate and a scale count as a move too.
++	const Matrix34 worldTM = pEntity->GetWorldTM();
++	for (int column = 0; column < 4; ++column)
++	{
++		const Vec3 axis = worldTM.GetColumn(column);
++		signature = HashFloat(signature, axis.x);
++		signature = HashFloat(signature, axis.y);
++		signature = HashFloat(signature, axis.z);
++	}
+ 	signature = HashCombine(signature, ((uint32)tint.r << 16) | ((uint32)tint.g << 8) | (uint32)tint.b);
+ 	// The plate's OWN material, through the interface: the plate is not necessarily slot 0, so the entity's
+ 	// slot 0 override would miss a material change on any other slot.
+@@ -298,6 +314,10 @@ void Update()
+ 		return;
+ 	}
+ 
++	// g_plates is not "the plates as they were last seen": it is the state the terrain colour atlas was last
++	// PAINTED with. Every branch below that decides not to repaint puts the previous painted entry back, and
++	// the comparison is always against that - which is what makes a change impossible to lose, however many
++	// frames the debounce holds it for.
+ 	std::vector<SLivePlate> current;
+ 	ScanPlates(current);
+ 
+@@ -322,35 +342,31 @@ void Update()
+ 			continue;
+ 		}
+ 
+-		// Mid drag: carry the last repainted state forward so the change stays pending and the ground
+-		// repaints once, on release.
++		// Mid drag: carry the last PAINTED state forward whole, so the change stays pending and the ground
++		// repaints once, on release. The whole entry and not a few fields: g_plates is the record of what
++		// the terrain atlas is currently showing, and the next frame compares against THAT. A partial copy
++		// left the entry describing a state that was never painted (the carried signature said one tint,
++		// the entry carried another), and the frame that finally settled could then agree with it and skip
++		// the only repaint the move was ever going to get.
+ 		if (pPrevious != nullptr && plate.bSettling)
+ 		{
+-			plate.signature = pPrevious->signature;
+-			plate.worldXMin = pPrevious->worldXMin;
+-			plate.worldYMin = pPrevious->worldYMin;
+-			plate.worldXMax = pPrevious->worldXMax;
+-			plate.worldYMax = pPrevious->worldYMax;
+-			plate.lastRepaintFrame = pPrevious->lastRepaintFrame;
++			plate = *pPrevious;
+ 			continue;
+ 		}
+ 
+ 		if (pPrevious != nullptr && (frameId - pPrevious->lastRepaintFrame) < kRepaintFrameInterval)
+ 		{
+-			// Too soon: carry the OLD state forward so the change stays pending. This is the throttle,
++			// Too soon: carry the PAINTED state forward so the change stays pending. This is the throttle,
+ 			// not a drop.
+-			plate.signature = pPrevious->signature;
+-			plate.worldXMin = pPrevious->worldXMin;
+-			plate.worldYMin = pPrevious->worldYMin;
+-			plate.worldXMax = pPrevious->worldXMax;
+-			plate.worldYMax = pPrevious->worldYMax;
+-			plate.lastRepaintFrame = pPrevious->lastRepaintFrame;
++			plate = *pPrevious;
+ 			continue;
+ 		}
+ 
+ 		if (pPrevious != nullptr)
+ 		{
+-			// A move repaints the ground the plate LEFT as well as the ground it arrived on.
++			// A move repaints the ground the plate LEFT as well as the ground it arrived on. pPrevious is the
++			// LAST PAINTED footprint, not the last scanned one, so a drag that crossed several positions
++			// while settling still hands back every sector it actually put colour on.
+ 			MarkSectorsDirty(pPrevious->worldXMin, pPrevious->worldYMin, pPrevious->worldXMax, pPrevious->worldYMax);
+ 		}
+ 
+-- 
+2.47.1.windows.1
+

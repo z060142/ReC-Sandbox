@@ -1,0 +1,524 @@
+From 91507935166f17c4b4dc1442cf5d38c623aab686 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Tue, 1 Sep 2026 07:05:45 +0800
+Subject: [PATCH 255/307] !R (Terrain Plate) Remove obsolete whole-plate
+ visibility handling.
+
+Per-triangle buried-geometry culling covers fully and partially sunken plates.
+Remove the redundant whole-plate visibility polling and retain the LOD hold.
+---
+ .../Geometry/TerrainPlateComponent.cpp        | 322 +-----------------
+ .../Geometry/TerrainPlateComponent.h          |  42 +--
+ 2 files changed, 13 insertions(+), 351 deletions(-)
+
+diff --git a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
+index 7be72846..9995fdab 100644
+--- a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
++++ b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
+@@ -167,46 +167,6 @@ ICVar* g_pTerrainPlateBakeEdgeAACVar = nullptr;
+ int    g_terrainPlateBakeWeldCurve = 1;
+ ICVar* g_pTerrainPlateBakeWeldCurveCVar = nullptr;
+ 
+-//! P17 half A, decision 02: "sunk -> the terrain wins the depth test, the plate is simply hidden".
+-//! That sentence is only true while the terrain the depth test uses is the LOD 0 heightfield. From LOD 1
+-//! outwards the terrain mesh samples the heightmap every 2^level units, so between two sampled nodes it
+-//! draws the CHORD over whatever is in between: a decimated surface that dips locally below the real
+-//! ground by up to m_geomError, which is metre class on any interesting terrain (@see research 11 1.2).
+-//! Wherever that dip goes under a sunken plate, the plate's own darker material wins the depth test and
+-//! pokes through the ground in a scalloped band that grows with distance. It is not a shadow, not the
+-//! bake (Raise mode never touches the terrain under a sunken plate) and not the base pass; the plate is
+-//! simply visible where it was designed to be invisible.
+-//! The engine already has the exact semantic for "do not draw this in camera passes, but keep everything
+-//! else": ERF_HIDDEN_FROM_CAMERA (IRenderNode.h:225), tested in CBrush::Render (Brush.cpp:158, :820)
+-//! only when the pass is neither a shadow pass nor a recursive one - so shadows, the static shadow
+-//! cache, HeightMap AO, SVOGI voxelisation, physics, the navmesh and the editor's CPU hit test all keep
+-//! working (@see research 10 3.2, which established this flag for step 2 of the base pass work).
+-//! So: when the plate is entirely under the ground, stop its camera draw. At LOD 0 that changes nothing
+-//! - the terrain was covering it anyway - and at every coarser LOD there is now nothing left to poke
+-//! through. It is deliberately an ALL OR NOTHING test: a plate with any part above the terrain keeps
+-//! drawing, because the crossing region is a per triangle problem and belongs to decision 06 C4.
+-//! Escape hatch: e_TerrainPlateHideSunken 0 restores the stock behaviour (the plate always draws itself,
+-//! and pokes through again at distance).
+-int    g_terrainPlateHideSunken = 1;
+-ICVar* g_pTerrainPlateHideSunkenCVar = nullptr;
+-
+-//! Metres of ground the plate has to be under before it is called buried. Deliberately smaller than the
+-//! default Weld Sink (0.1 m), so that the outer ring of a welded plate - which is pulled up onto the
+-//! terrain surface minus that sink on purpose - still passes.
+-const float kSunkenHideClearance = 0.05f;
+-//! ...and the clearance the test is repeated with once the plate IS hidden. The gap between the two is
+-//! the hysteresis that stops a plate sitting exactly on the threshold from flickering between the two
+-//! states on consecutive polls.
+-const float kSunkenShowClearance = 0.f;
+-//! Frames between two re-tests of a plate that is currently hidden. It is what notices the ground being
+-//! sculpted away above a buried plate, and what repairs the flag if the slot render node was recreated
+-//! by something other than our own rebuild.
+-const uint32 kSunkenPollFrames = 16;
+-//! Cap on the sample grid, i.e. on the cost of one decision. 257 x 257 at two samples per terrain unit
+-//! covers a footprint of 128 terrain units; past that the test would have to sample coarser than the
+-//! terrain itself and could no longer promise it had seen every bump, so it refuses to hide instead.
+-const int kSunkenMaxSamplesPerAxis = 257;
+-
+ //! P18, 2026-08-31, screenshot verified by the user with a red debug material: the band that pokes
+ //! through the ground at distance is NOT "the plate". It is the plate's BELOW GROUND surface regions and
+ //! its SKIRT - the parts that the terrain integration classifies as rejected (the height band test
+@@ -216,9 +176,11 @@ const int kSunkenMaxSamplesPerAxis = 257;
+ //! that promise only holds for the surface the depth test actually rasterises, and a terrain sector at
+ //! LOD >= 1 draws the chord between two sampled heightmap nodes, dipping locally below the real ground by
+ //! up to m_geomError. Wherever it dips, the buried geometry is revealed.
+-//! P17 half A hides the WHOLE plate, and it never fires in practice, because a real plate is a mound with
+-//! buried edges: partially sunken, so one sample above ground vetoes the hide. C4 only pushes the reveal
+-//! distance out. The thing that has to go is therefore not the plate but the buried triangles.
++//! P17 half A hid the WHOLE plate, and it never fired in practice, because a real plate is a mound with
++//! buried edges: partially sunken, so one sample above ground vetoed the hide. It was removed once this
++//! rule landed - a fully buried plate simply ends up with zero drawn triangles here. P17 half C4
++//! (e_TerrainIntegrateObjectsLodHoldDistance) only pushes the reveal distance out, and stays.
++//! The thing that has to go is therefore not the plate but the buried triangles.
+ //! So: during mesh generation, classify every triangle against the terrain the weld already samples, and
+ //! move a triangle whose three vertices are ALL below that terrain into a second, MTL_FLAG_NODRAW subset.
+ //! A NODRAW subset is the engine's own idiom for "geometry that exists but is not drawn":
+@@ -237,10 +199,9 @@ const int kSunkenMaxSamplesPerAxis = 257;
+ int    g_terrainPlateCullBuried = 1;
+ ICVar* g_pTerrainPlateCullBuriedCVar = nullptr;
+ 
+-//! Metres a vertex has to be under the terrain before it counts as buried. The same 0.05 m as
+-//! kSunkenHideClearance, and for the same reason: it is half the default Weld Sink (0.1 m), so the welded
+-//! rim - which is pushed under the ground ON PURPOSE - is correctly seen as buried, while float noise
+-//! cannot flip a vertex that is meant to sit on the surface.
++//! Metres a vertex has to be under the terrain before it counts as buried. 0.05 m, which is half the
++//! default Weld Sink (0.1 m), so the welded rim - which is pushed under the ground ON PURPOSE - is
++//! correctly seen as buried, while float noise cannot flip a vertex that is meant to sit on the surface.
+ const float kBuriedCullMargin = 0.05f;
+ 
+ //! Bake trigger / bake apply tracing. The bake chain has a dozen places where it can legitimately do
+@@ -353,27 +314,6 @@ void RegisterTerrainPlateCVars()
+ 	                                                  "    on purpose\n"
+ 	                                                  "0 - the cosine falloff, as before");
+ 
+-	g_pTerrainPlateHideSunkenCVar = REGISTER_CVAR2("e_TerrainPlateHideSunken", &g_terrainPlateHideSunken, 1, VF_NULL,
+-	                                              "Terrain Plate component: stop the plate drawing itself in camera passes while its whole\n"
+-	                                              "surface is below the terrain over its footprint. A sunken plate is meant to be hidden by\n"
+-	                                              "the terrain in the depth test, and near the camera it is - but a terrain sector at LOD 1 or\n"
+-	                                              "coarser samples the heightmap every 2^level units and draws the chord in between, which dips\n"
+-	                                              "locally below the real ground by up to a metre and lets the plate poke through in a band\n"
+-	                                              "that grows with distance.\n"
+-	                                              "The plate keeps casting shadows, keeps its HeightMap AO and SVOGI contribution, keeps its\n"
+-	                                              "collision and stays selectable: this is ERF_HIDDEN_FROM_CAMERA, not ERF_HIDDEN.\n"
+-	                                              "A plate with ANY part above the terrain keeps drawing - the crossing edge is a separate\n"
+-	                                              "problem (e_TerrainIntegrateObjectsLodHoldDistance).\n"
+-	                                              "1 - default\n"
+-	                                              "0 - stock behaviour: the plate always draws itself");
+-
+-	// A VISIBLE plate does not tick, so without this the cvar would only take effect on plates that
+-	// happen to be hidden already, or on the next edit. @see CTerrainPlateComponent::WantsSunkenHideTick.
+-	if (g_pTerrainPlateHideSunkenCVar != nullptr)
+-	{
+-		g_pTerrainPlateHideSunkenCVar->AddOnChange(&CTerrainPlateComponent::OnHideSunkenCVarChanged);
+-	}
+-
+ 	g_pTerrainPlateCullBuriedCVar = REGISTER_CVAR2("e_TerrainPlateCullBuried", &g_terrainPlateCullBuried, 1, VF_NULL,
+ 	                                              "Terrain Plate component: leave the plate's buried triangles out of the DRAWN geometry. A\n"
+ 	                                              "triangle is buried when all three of its vertices are more than 5 cm below the terrain\n"
+@@ -389,7 +329,7 @@ void RegisterTerrainPlateCVars()
+ 	                                              "0 - stock behaviour: every triangle is drawn");
+ 
+ 	// The classification is baked into the index buffer, so the cvar can only take effect by rebuilding
+-	// every plate's mesh - unlike e_TerrainPlateHideSunken, which is a render flag.
++	// every plate's mesh; it is not a render flag that could simply be re-written.
+ 	if (g_pTerrainPlateCullBuriedCVar != nullptr)
+ 	{
+ 		g_pTerrainPlateCullBuriedCVar->AddOnChange(&CTerrainPlateComponent::OnCullBuriedCVarChanged);
+@@ -431,9 +371,6 @@ void UnregisterTerrainPlateCVars()
+ 		if (g_pTerrainPlateBakeWeldCurveCVar != nullptr)
+ 			gEnv->pConsole->UnregisterVariable(g_pTerrainPlateBakeWeldCurveCVar->GetName());
+ 
+-		if (g_pTerrainPlateHideSunkenCVar != nullptr)
+-			gEnv->pConsole->UnregisterVariable(g_pTerrainPlateHideSunkenCVar->GetName());
+-
+ 		if (g_pTerrainPlateCullBuriedCVar != nullptr)
+ 			gEnv->pConsole->UnregisterVariable(g_pTerrainPlateCullBuriedCVar->GetName());
+ 
+@@ -448,7 +385,6 @@ void UnregisterTerrainPlateCVars()
+ 	g_pTerrainPlateBakeSlopeCorrectCVar = nullptr;
+ 	g_pTerrainPlateBakeEdgeAACVar = nullptr;
+ 	g_pTerrainPlateBakeWeldCurveCVar = nullptr;
+-	g_pTerrainPlateHideSunkenCVar = nullptr;
+ 	g_pTerrainPlateCullBuriedCVar = nullptr;
+ 	g_pTerrainPlateDebugCVar = nullptr;
+ }
+@@ -1089,7 +1025,6 @@ Cry::Entity::EventFlags CTerrainPlateComponent::GetEventMask() const
+ 	// Only ticked while a rebuild was throttled away or held back, while the first bake is still owed,
+ 	// or while a live bake has to be watched - so a plate that is not baking costs nothing per frame.
+ 	if (m_bRegenPending || m_bDeferredXformPending || m_bBakeMoveBatchPending || m_bInitialBakePending
+-	    || WantsSunkenHideTick()
+ 	    || (m_bBakeIntoTerrain && (GetBakeProbeFrames() > 0 || GetPlateDebugLevel() >= 1)))
+ 	{
+ 		bitFlags |= ENTITY_EVENT_UPDATE;
+@@ -1144,17 +1079,6 @@ void CTerrainPlateComponent::ProcessEvent(const SEntityEvent& event)
+ 		break;
+ 
+ 	case ENTITY_EVENT_XFORM:
+-		// The plate has moved, so any hide decided at the old place is void RIGHT NOW - before the
+-		// rebuild below is queued, deferred, batched or skipped entirely. Dropping the flag is free; the
+-		// re-test costs a grid of samples and is left to the update tick, which is why this is a clear
+-		// and not an UpdateSunkenHide: a drag sends one of these per frame. Lifting a buried plate out of
+-		// the ground therefore shows it again in the same frame, whatever the rebuild path decides.
+-		if (m_bSunkenHidden || (g_terrainPlateHideSunken != 0 && !m_bSunkenRecheckPending))
+-		{
+-			ClearSunkenHide();
+-			m_pEntity->UpdateComponentEventMask(this);
+-		}
+-
+ 		// A scale change always invalidates the mesh (@see GetWorldScale); a move or a rotation only
+ 		// matters when the mesh is solved against the terrain.
+ 		if (NeedsRegenerateOnTransform() || !GetWorldScale().IsEquivalent(m_lastWorldScale, 0.0001f))
+@@ -1259,9 +1183,6 @@ void CTerrainPlateComponent::ProcessEvent(const SEntityEvent& event)
+ 				if (gEnv->p3DEngine != nullptr && gEnv->p3DEngine->GetITerrain() != nullptr)
+ 				{
+ 					m_bInitialBakePending = false;
+-					// The terrain has only just arrived, so no hide decided before this point saw the real
+-					// ground - and a plate that does not bake gets no rebuild here to decide it either.
+-					m_bSunkenRecheckPending = true;
+ 					if (m_bBakeIntoTerrain)
+ 					{
+ 						RegenerateMesh();
+@@ -1273,29 +1194,6 @@ void CTerrainPlateComponent::ProcessEvent(const SEntityEvent& event)
+ 			{
+ 				PollBake();
+ 			}
+-
+-			// Sunken plate hiding. Two reasons to re-decide: something asked for it (a transform, a bake,
+-			// a probe repair, the terrain arriving), or the plate is currently hidden and the ground above
+-			// it could have been sculpted away without anybody sending an event. A visible plate with
+-			// nothing pending never gets here, so the test costs nothing in the common case.
+-			// Never while a rebuild, a settle or a move batch is owed: those are about to change both the
+-			// plate and the ground, and the hide is cleared for their duration anyway.
+-			if ((m_bSunkenRecheckPending || m_bSunkenHidden)
+-			    && !m_bRegenPending && !m_bDeferredXformPending && !m_bBakeMoveBatchPending && !m_bInitialBakePending)
+-			{
+-				const bool bDue = m_bSunkenRecheckPending
+-				                  || (uint32)(gEnv->nMainFrameID - m_lastSunkenCheckFrameId) >= kSunkenPollFrames;
+-
+-				if (bDue)
+-				{
+-					const bool bWantedTickBefore = WantsSunkenHideTick();
+-					UpdateSunkenHide();
+-					if (bWantedTickBefore != WantsSunkenHideTick())
+-					{
+-						m_pEntity->UpdateComponentEventMask(this);
+-					}
+-				}
+-			}
+ 		}
+ 		break;
+ 
+@@ -1592,11 +1490,6 @@ void CTerrainPlateComponent::RegenerateMesh()
+ 	m_bDeferredXformPending = false;
+ 	m_lastRegenFrameId = gEnv->nMainFrameID;
+ 
+-	// FIRST, before the mesh, the terrain or the bake move: a hide is only ever valid for the geometry
+-	// and the ground it was decided against, and a stale one is a hole. Decided again at the very end of
+-	// this function, once both are final. @see ClearSunkenHide.
+-	ClearSunkenHide();
+-
+ 	// P15. If this plate shares ground with other baking plates, the whole set has to be unwound BEFORE
+ 	// anything is restored - and the restore below is part of "anything". Until now the cascade decision
+ 	// was taken at the very end of this function, in ApplyBakeCascaded, by which time this plate had
+@@ -2170,19 +2063,6 @@ void CTerrainPlateComponent::RegenerateMesh()
+ 	// baseline of a plate is only the original ground if everything above it is out of the terrain when
+ 	// it captures. @see ApplyBakeCascaded.
+ 	ApplyBakeCascaded();
+-
+-	// After the bake, because the bake is allowed to move the very ground this asks about. The plate is
+-	// hidden from camera passes from here on if - and only if - it is buried everywhere. @see
+-	// UpdateSunkenHide; the matching ClearSunkenHide is at the top of this function.
+-	UpdateSunkenHide();
+-
+-	// A plate that just went under has to start ticking so it can come back out again. Not during
+-	// Initialize (m_bInitialBakePending is still set there): the component record is not finished yet,
+-	// and the mask that Initialize asks for already contains the update tick for the first bake.
+-	if (m_pEntity != nullptr && !m_bInitialBakePending)
+-	{
+-		m_pEntity->UpdateComponentEventMask(this);
+-	}
+ }
+ 
+ //////////////////////////////////////////////////////////////////////////
+@@ -3268,11 +3148,6 @@ bool CTerrainPlateComponent::HealOrphanedBakeRect(const SBakeTerrainMetrics& met
+ 
+ void CTerrainPlateComponent::ReapplyBakeAfterExternalEdit(const SBakeTerrainMetrics& metrics)
+ {
+-	// Somebody moved the ground under this plate. That is the one terrain change the plate is told about
+-	// without a rebuild, so it is also where the hide has to be given up and asked for again - before the
+-	// repair, not after it. @see ClearSunkenHide.
+-	ClearSunkenHide();
+-
+ 	const int dim = m_bakeRectSize + 1;
+ 	if ((int)m_bakeBaseline.size() != dim * dim || (int)m_bakeResult.size() != dim * dim)
+ 		return;
+@@ -3443,176 +3318,10 @@ void CTerrainPlateComponent::WarnOnBakeQuantisation(const SBakeTerrainMetrics& m
+ 	}
+ }
+ 
+-//////////////////////////////////////////////////////////////////////////
+-// Sunken plate hiding (P17 half A). @see the e_TerrainPlateHideSunken comment at the top of this file.
+-//////////////////////////////////////////////////////////////////////////
+-
+-bool CTerrainPlateComponent::IsPlateFullySunken(float clearance) const
+-{
+-	if (m_pEntity == nullptr || gEnv == nullptr || gEnv->p3DEngine == nullptr)
+-		return false;
+-
+-	const SBakeTerrainMetrics metrics = GetBakeTerrainMetrics();
+-	if (!metrics.IsValid())
+-		return false;
+-
+-	const Matrix34 worldTM = GetPlateWorldTM();
+-
+-	// The same unit box the bake footprint is built from: local Z runs 0..1 and carries the relief, so
+-	// the transformed box is the world extent of the plate surface, skirt excluded (the skirt only ever
+-	// goes down, and a skirt hanging below buried ground is buried too).
+-	const AABB localBox(Vec3(-0.5f, -0.5f, 0.f), Vec3(0.5f, 0.5f, 1.f));
+-	const AABB worldBox = AABB::CreateTransformedAABB(worldTM, localBox);
+-
+-	const float sizeX = worldBox.max.x - worldBox.min.x;
+-	const float sizeY = worldBox.max.y - worldBox.min.y;
+-	if (sizeX <= 0.f || sizeY <= 0.f)
+-		return false;
+-
+-	// At least two samples per terrain unit along each axis, so no bump of the plate can hide between two
+-	// samples of the surface the terrain mesh interpolates. @see kSunkenMaxSamplesPerAxis for the cap.
+-	const float wantedSpacing = metrics.unitSize * 0.5f;
+-	const int   samplesX = (int)ceilf(sizeX / wantedSpacing) + 1;
+-	const int   samplesY = (int)ceilf(sizeY / wantedSpacing) + 1;
+-
+-	if (samplesX > kSunkenMaxSamplesPerAxis || samplesY > kSunkenMaxSamplesPerAxis)
+-	{
+-		if (!m_bSunkenSizeWarningIssued)
+-		{
+-			m_bSunkenSizeWarningIssued = true;
+-			CryWarning(VALIDATOR_MODULE_ENTITYSYSTEM, VALIDATOR_WARNING,
+-			           "Terrain Plate '%s': footprint of %.0f x %.0f m is too large for the sunken plate test "
+-			           "(e_TerrainPlateHideSunken); the plate keeps drawing itself, as it did before the test existed",
+-			           GetPlateName(), sizeX, sizeY);
+-		}
+-		return false;
+-	}
+-
+-	const int nx = max(2, samplesX);
+-	const int ny = max(2, samplesY);
+-	const float stepX = sizeX / (float)(nx - 1);
+-	const float stepY = sizeY / (float)(ny - 1);
+-
+-	const float invUnit = 1.f / metrics.unitSize;
+-
+-	bool bAnyInside = false;
+-
+-	for (int sx = 0; sx < nx; ++sx)
+-	{
+-		const float worldX = worldBox.min.x + stepX * (float)sx;
+-
+-		for (int sy = 0; sy < ny; ++sy)
+-		{
+-			const float worldY = worldBox.min.y + stepY * (float)sy;
+-
+-			float plateZ = 0.f, lx = 0.f, ly = 0.f;
+-			if (!SamplePlateSurface(worldTM, worldX, worldY, plateZ, lx, ly))
+-				continue;   // outside the rotated plate: the terrain there is nobody's business
+-
+-			bAnyInside = true;
+-
+-			// The terrain mesh draws the quad between four heightmap nodes, so over that quad it is
+-			// never lower than the lowest of the four. Comparing against that minimum is what makes the
+-			// answer safe for the surface that is actually rasterised, rather than for the single node
+-			// GetZ would have returned - and it is the same GetZ the depth test's LOD 0 mesh is built
+-			// from (BuildVertices, terrain_sector_render.cpp).
+-			const int ux = (int)floorf(worldX * invUnit);
+-			const int uy = (int)floorf(worldY * invUnit);
+-
+-			float terrainZ = SampleTerrainUnit(metrics, ux, uy);
+-			terrainZ = min(terrainZ, SampleTerrainUnit(metrics, ux + 1, uy));
+-			terrainZ = min(terrainZ, SampleTerrainUnit(metrics, ux, uy + 1));
+-			terrainZ = min(terrainZ, SampleTerrainUnit(metrics, ux + 1, uy + 1));
+-
+-			if (terrainZ - plateZ < clearance)
+-				return false;   // this much of the plate is at or above the ground: it has to keep drawing
+-		}
+-	}
+-
+-	return bAnyInside;
+-}
+-
+-void CTerrainPlateComponent::ApplySunkenHideFlag(bool bHide)
+-{
+-	if (m_pEntity == nullptr || GetEntitySlotId() == IEntityComponent::EmptySlotId)
+-		return;
+-
+-	// ERF_HIDDEN_FROM_CAMERA, not ERF_HIDDEN: CBrush::Render tests it only outside shadow and recursive
+-	// passes (Brush.cpp:158-163, :820-825), and no other consumer in the engine reads it, so the shadow
+-	// caster list, the static shadow cache, HeightMap AO, the SVOGI voxelisation, physics and the
+-	// editor's CPU hit test are all untouched. @see research 10, section 3.2.
+-	if (IRenderNode* pRenderNode = m_pEntity->GetSlotRenderNode(GetEntitySlotId()))
+-	{
+-		pRenderNode->SetRndFlags(ERF_HIDDEN_FROM_CAMERA, bHide);
+-	}
+-}
+-
+-void CTerrainPlateComponent::ClearSunkenHide()
+-{
+-	// Unconditional, and it runs BEFORE the thing that will change the answer, never after. A hide that
+-	// survives the plate being lifted, the ground being dug out or the mesh being rebuilt is a hole in
+-	// the world for as long as it lasts, and the streaming retry latch of the terrain integration is the
+-	// standing example of exactly that mistake (@see research 10, hazard 6).
+-	m_bSunkenRecheckPending = true;
+-
+-	if (m_bSunkenHidden)
+-	{
+-		m_bSunkenHidden = false;
+-		ApplySunkenHideFlag(false);
+-	}
+-}
+-
+-void CTerrainPlateComponent::UpdateSunkenHide()
+-{
+-	m_bSunkenRecheckPending = false;
+-	m_lastSunkenCheckFrameId = (gEnv != nullptr) ? gEnv->nMainFrameID : 0;
+-
+-	if (g_terrainPlateHideSunken == 0)
+-	{
+-		// Turned off from the console: give the draw back in the same frame.
+-		if (m_bSunkenHidden)
+-		{
+-			m_bSunkenHidden = false;
+-			ApplySunkenHideFlag(false);
+-		}
+-		return;
+-	}
+-
+-	const bool bSunken = IsPlateFullySunken(m_bSunkenHidden ? kSunkenShowClearance : kSunkenHideClearance);
+-
+-	if (bSunken != m_bSunkenHidden)
+-	{
+-		m_bSunkenHidden = bSunken;
+-
+-		if (GetPlateDebugLevel() >= 1)
+-		{
+-			CryLog("TerrainPlate '%s': %s (sunken plate hiding)", GetPlateName(),
+-			       bSunken ? "hidden from camera, the terrain covers it everywhere" : "drawing again, part of it is above the ground");
+-		}
+-	}
+-
+-	// Written every time, not only on a change: the slot render node is recreated by every mesh rebuild
+-	// and by anything else that reassigns the slot, and a recreated node comes back with the flag clear.
+-	ApplySunkenHideFlag(m_bSunkenHidden);
+-}
+-
+-void CTerrainPlateComponent::OnHideSunkenCVarChanged(ICVar* /*pCVar*/)
+-{
+-	for (CTerrainPlateComponent* pPlate : g_terrainPlates)
+-	{
+-		pPlate->m_bSunkenRecheckPending = true;
+-
+-		if (pPlate->m_pEntity != nullptr)
+-		{
+-			pPlate->m_pEntity->UpdateComponentEventMask(pPlate);
+-		}
+-	}
+-}
+-
+ void CTerrainPlateComponent::OnCullBuriedCVarChanged(ICVar* /*pCVar*/)
+ {
+-	// Unlike the hide flag, this one is not a render node flag that can simply be re-written: the split is
+-	// in the index buffer, so the only way to honour the new value is to build the mesh again.
++	// This is not a render node flag that can simply be re-written: the split is in the index buffer, so
++	// the only way to honour the new value is to build the mesh again.
+ 	// RequestRegenerate rather than RegenerateMesh, so that toggling the cvar while several plates share
+ 	// ground coalesces into one rebuild per plate per frame and the bake cascade runs from the update tick
+ 	// like every other rebuild does.
+@@ -3627,15 +3336,6 @@ void CTerrainPlateComponent::OnCullBuriedCVarChanged(ICVar* /*pCVar*/)
+ 	}
+ }
+ 
+-bool CTerrainPlateComponent::WantsSunkenHideTick() const
+-{
+-	// A visible plate costs nothing per frame: it is re-tested by the events that can change the answer
+-	// (a transform, a property change, a rebuild, a bake) and not by a poll. A HIDDEN one keeps ticking,
+-	// because from then on the thing that has to be noticed is the ground above it going away, and
+-	// nothing sends an event for that.
+-	return m_bSunkenHidden || (m_bSunkenRecheckPending && g_terrainPlateHideSunken != 0);
+-}
+-
+ void CTerrainPlateComponent::RegisterPlate()
+ {
+ 	if (std::find(g_terrainPlates.begin(), g_terrainPlates.end(), this) == g_terrainPlates.end())
+diff --git a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
+index 87b4c20a..51ebbbc7 100644
+--- a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
++++ b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
+@@ -158,13 +158,9 @@ class CTerrainPlateComponent
+ 	: public CBaseMeshComponent
+ {
+ public:
+-	//! e_TerrainPlateHideSunken changed: ask every plate in the level to decide again. Without this a
+-	//! plate that is currently VISIBLE is not ticking and would not notice the cvar being turned on.
+-	//! Public only because RegisterTerrainPlateCVars hands it to ICVar::AddOnChange as a plain function.
+-	static void OnHideSunkenCVarChanged(ICVar* pCVar);
+-
+ 	//! e_TerrainPlateCullBuried changed: the classification lives in the index buffer, so every plate in
+-	//! the level has to rebuild its mesh for the cvar to mean anything. Public for the same reason.
++	//! the level has to rebuild its mesh for the cvar to mean anything. Public only because
++	//! RegisterTerrainPlateCVars hands it to ICVar::AddOnChange as a plain function.
+ 	static void OnCullBuriedCVarChanged(ICVar* pCVar);
+ 
+ protected:
+@@ -388,26 +384,6 @@ protected:
+ 	//! Warns once when the bake cost a touched sector more than half of its height precision.
+ 	void  WarnOnBakeQuantisation(const SBakeTerrainMetrics& metrics);
+ 
+-	// ------------------------------------------------------ sunken plate hiding (P17 half A)
+-	//! True when every part of the plate surface is below the terrain over the plate's footprint, i.e.
+-	//! when decision 02's "sunk -> the terrain wins the depth test" is meant to hold. Conservative in
+-	//! both directions: it compares the HIGHEST plate height over each terrain quad against the LOWEST
+-	//! of that quad's four corner heights, so it can only ever refuse to hide a plate that is in fact
+-	//! buried - never hide one that still has something to show. `clearance` is the margin in metres the
+-	//! plate has to keep below the ground before the answer is true.
+-	bool  IsPlateFullySunken(float clearance) const;
+-	//! Re-decides the hide and pushes it onto the slot render node.
+-	void  UpdateSunkenHide();
+-	//! Drops the hide immediately, with no test. Every path that is ABOUT to change the plate or the
+-	//! ground under it calls this first: a hide that outlives what justified it is a hole in the world,
+-	//! and the terrain integration retry latch is the standing proof that deciding at the end of a
+-	//! rebuild and never at the start is how holes get shipped (@see research 10, hazard 6).
+-	void  ClearSunkenHide();
+-	//! Writes ERF_HIDDEN_FROM_CAMERA onto the plate's slot render node.
+-	void  ApplySunkenHideFlag(bool bHide);
+-	//! True while the plate has to keep receiving ENTITY_EVENT_UPDATE for the hide alone.
+-	bool  WantsSunkenHideTick() const;
+-
+ 	//! Adds this component to / removes it from the file static registry of terrain plates. Called from
+ 	//! Initialize and from the destructor, so the registry follows component add / remove and level
+ 	//! load / unload without any level or editor hook.
+@@ -593,20 +569,6 @@ protected:
+ 	//! e_TerrainPlateDebug 1: says once, per plate, that the component really is being ticked. If this
+ 	//! line never appears the plate never received ENTITY_EVENT_UPDATE and no bake trigger can fire.
+ 	bool                     m_bUpdateTickLogged = false;
+-
+-	// ------------------------------------------------------ sunken plate hiding (P17 half A)
+-	//! True while ERF_HIDDEN_FROM_CAMERA is set on the plate's render node because the plate is buried.
+-	bool                     m_bSunkenHidden = false;
+-	//! Set by anything that can have changed the answer (a transform, a bake, a probe repair) and read
+-	//! by the update tick, which is what actually pays for the test.
+-	bool                     m_bSunkenRecheckPending = false;
+-	//! Frame of the last hide decision, so a hidden plate re-tests on a slow cadence instead of every
+-	//! frame - that is what catches a sculpt of the ground above it and a render node recreated
+-	//! underneath us.
+-	uint32                   m_lastSunkenCheckFrameId = 0;
+-	//! One warning per plate for a footprint too large to test within the sample cap. Mutable because
+-	//! the test itself is const and this is pure "say it once" bookkeeping.
+-	mutable bool             m_bSunkenSizeWarningIssued = false;
+ };
+ }
+ }
+-- 
+2.47.1.windows.1
+

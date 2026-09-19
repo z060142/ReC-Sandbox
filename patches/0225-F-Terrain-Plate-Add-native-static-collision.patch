@@ -1,0 +1,232 @@
+From 565884ede6d4fa28a974642635d1aaee7efe30b9 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Mon, 31 Aug 2026 01:16:11 +0800
+Subject: [PATCH 225/307] !F (Terrain Plate) Add native static collision.
+
+Physicalize the generated plate as static trimesh geometry by default. Release
+old geometry before regeneration and only remove physical entities owned by
+the component, leaving other physics components in control.
+---
+ .../Geometry/TerrainPlateComponent.cpp        | 116 ++++++++++++++++++
+ .../Geometry/TerrainPlateComponent.h          |  26 +++-
+ 2 files changed, 138 insertions(+), 4 deletions(-)
+
+diff --git a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
+index 97fa507a..e4a4d6d2 100644
+--- a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
++++ b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
+@@ -537,6 +537,11 @@ void CTerrainPlateComponent::Register(Schematyc::CEnvRegistrationScope& componen
+ 	}
+ }
+ 
++CTerrainPlateComponent::~CTerrainPlateComponent()
++{
++	ReleaseNativePhysics();
++}
++
+ void CTerrainPlateComponent::Initialize()
+ {
+ 	Rebuild();
+@@ -585,6 +590,19 @@ void CTerrainPlateComponent::ProcessEvent(const SEntityEvent& event)
+ 			m_pEntity->UpdateComponentEventMask(this);
+ 		}
+ 		break;
++
++	case ENTITY_EVENT_PHYSICAL_TYPE_CHANGED:
++		{
++			// A physics component (rigid body, character controller) re-physicalizes the whole entity,
++			// which destroys our static body first (PhysicsProxy.cpp:779). From then on the entity has an
++			// owner and the plate only contributes its slot geometry through ApplyBaseMeshProperties.
++			IPhysicalEntity* pPhysicalEntity = m_pEntity->GetPhysicalEntity();
++			if (m_bOwnsPhysicalEntity && (pPhysicalEntity == nullptr || pPhysicalEntity->GetType() != PE_STATIC))
++			{
++				m_bOwnsPhysicalEntity = false;
++			}
++		}
++		break;
+ 	}
+ 
+ 	if (event.event == ENTITY_EVENT_SLOT_CHANGED && m_pEntity->GetStatObj((int)event.nParam[0]) != m_pStatObj)
+@@ -1160,15 +1178,113 @@ void CTerrainPlateComponent::RegenerateMesh()
+ 	pIndexedMesh->SetBBox(bbox);
+ 
+ 	const bool bPhysicalize = ((uint32)m_type & (uint32)EMeshType::Collider) != 0;
++
++	// The previous generation's trimesh has to go first: CStatObj::AssignPhysGeom overwrites the entry
++	// in m_arrPhysGeomInfo without unregistering what was there (StatObjPhys.cpp:242), so calling
++	// Invalidate(true) twice would leak one phys_geometry per rebuild and leave the physical entity
++	// holding a part built from the old mesh. IStatObj::SetPhysGeom(nullptr) is the accessor that does
++	// unregister (StatObj.h:402), and the slot part must be removed before that, because
++	// CEntityPhysics::RemoveSlotGeometry decides what to remove from the statobj's phys geom.
++	ReleasePhysicsGeometry();
++
+ 	m_pStatObj->Invalidate(bPhysicalize);
+ 
++	// CStatObj::PhysicalizeGeomType builds the trimesh with 16 bit indices and bails out on the first
++	// index >= 0xffff (StatObjPhys.cpp:166), so a plate denser than 65535 vertices silently ends up
++	// without collision. Say so once instead of leaving the user guessing.
++	if (bPhysicalize && m_pStatObj->GetPhysGeom() == nullptr && !m_bPhysMeshWarningIssued)
++	{
++		m_bPhysMeshWarningIssued = true;
++		CryWarning(VALIDATOR_MODULE_3DENGINE, VALIDATOR_WARNING,
++		           "Terrain Plate: '%s' could not be turned into a physics trimesh (%d vertices, the 16 bit index limit is 65535); "
++		           "the plate is rendered but does not collide. Lower Grid or raise Vertex Spacing.",
++		           m_pEntity->GetName(), totalVertexCount);
++	}
++
+ 	// Assigning the slot re-creates the render node, which makes C3DEngine drop the terrain sector
+ 	// meshes over the union of the old and the new bounding box (3dEngine.cpp:6780). No explicit
+ 	// ResetTerrainVertBuffers here - that would only duplicate the work.
+ 	m_pEntity->SetStatObj(m_pStatObj, GetOrMakeEntitySlotId() | ENTITY_SLOT_ACTUAL, false);
+ 
+ 	ApplyMaterial();
++
++	// Before ApplyBaseMeshProperties: the base class only feeds the slot geometry to a physical entity
++	// that already exists, so the static body has to be there by then.
++	UpdateNativePhysics();
++
+ 	ApplyBaseMeshProperties();
+ }
++
++void CTerrainPlateComponent::ReleasePhysicsGeometry()
++{
++	if (m_pStatObj == nullptr || m_pStatObj->GetPhysGeom() == nullptr)
++		return;
++
++	if (m_pEntity != nullptr && GetEntitySlotId() != IEntityComponent::EmptySlotId && m_pEntity->GetPhysicalEntity() != nullptr)
++	{
++		m_pEntity->UnphysicalizeSlot(GetEntitySlotId());
++	}
++
++	m_pStatObj->SetPhysGeom(nullptr);
++}
++
++void CTerrainPlateComponent::UpdateNativePhysics()
++{
++	const int slotId = GetEntitySlotId();
++	const bool bWantsCollider = ((uint32)m_type & (uint32)EMeshType::Collider) != 0
++	                            && slotId != IEntityComponent::EmptySlotId
++	                            && m_pStatObj != nullptr
++	                            && m_pStatObj->GetPhysGeom() != nullptr;
++
++	if (!bWantsCollider)
++	{
++		ReleaseNativePhysics();
++		return;
++	}
++
++	if (m_pEntity->GetPhysicalEntity() != nullptr)
++	{
++		// Either our own static body (ApplyBaseMeshProperties re-adds the slot with the new trimesh right
++		// after this), or a rigid body / character controller that owns the entity. Never re-physicalize
++		// on top of another component: IEntity::Physicalize destroys whatever was there.
++		return;
++	}
++
++	// Same shape as a brush (CBrush::PhysicalizeOnHeap, Brush.cpp:352) and as a legacy static entity:
++	// a PE_STATIC holding the slot's trimesh. Mass 0 because a static never moves; the weight in
++	// SPhysicsParameters only starts to matter when a physics component takes the entity over, and
++	// ApplyBaseMeshProperties applies it then. The static body follows the entity by itself:
++	// CEntityPhysics::OnEntityXForm pushes pe_params_pos on every move, rotate and scale
++	// (PhysicsProxy.cpp:614).
++	SEntityPhysicalizeParams physParams;
++	physParams.type = PE_STATIC;
++	physParams.nSlot = slotId;
++	physParams.mass = 0.f;
++	physParams.density = -1.f;
++
++	// Set before the call: Physicalize sends ENTITY_EVENT_PHYSICAL_TYPE_CHANGED back into ProcessEvent.
++	m_bOwnsPhysicalEntity = true;
++	m_pEntity->Physicalize(physParams);
++	m_bOwnsPhysicalEntity = m_pEntity->GetPhysicalEntity() != nullptr;
++}
++
++void CTerrainPlateComponent::ReleaseNativePhysics()
++{
++	if (!m_bOwnsPhysicalEntity)
++		return;
++
++	m_bOwnsPhysicalEntity = false;
++
++	if (m_pEntity == nullptr)
++		return;
++
++	IPhysicalEntity* pPhysicalEntity = m_pEntity->GetPhysicalEntity();
++	if (pPhysicalEntity == nullptr || pPhysicalEntity->GetType() != PE_STATIC)
++		return;
++
++	SEntityPhysicalizeParams physParams;
++	physParams.type = PE_NONE;
++	m_pEntity->Physicalize(physParams);
++}
+ }
+ }
+diff --git a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
+index 966e7089..5f1c34ad 100644
+--- a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
++++ b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
+@@ -138,9 +138,11 @@ public:
+ 		// to GI mode Integrate Into Terrain. The three per instance integration parameters keep their
+ 		// stock defaults (90 / 0 / -1), i.e. no slope test, no blend band, global height band.
+ 		m_renderParameters.m_giMode = EMeshGIMode::IntegrateIntoTerrain;
+-		m_type = EMeshType::Render;
++		// A plate is ground: it collides out of the box, like a brush or a legacy static entity, without
++		// the user adding a physics component. @see UpdateNativePhysics.
++		m_type = EMeshType::RenderAndCollider;
+ 	}
+-	virtual ~CTerrainPlateComponent() {}
++	virtual ~CTerrainPlateComponent();
+ 
+ 	static void ReflectType(Schematyc::CTypeDesc<CTerrainPlateComponent>& desc)
+ 	{
+@@ -156,7 +158,9 @@ public:
+ 		SRenderParameters plateRenderDefaults;
+ 		plateRenderDefaults.m_giMode = EMeshGIMode::IntegrateIntoTerrain;
+ 
+-		desc.AddMember(&CTerrainPlateComponent::m_type, 'type', "Type", "Type", "Determines the behavior of the generated mesh", EMeshType::Render);
++		desc.AddMember(&CTerrainPlateComponent::m_type, 'type', "Type", "Type",
++		               "Determines the behavior of the generated mesh. Collider gives the plate its own static physics, so it can be "
++		               "walked on and collided with without any physics component on the entity.", EMeshType::RenderAndCollider);
+ 
+ 		desc.AddMember(&CTerrainPlateComponent::m_sourceMode, 'srcm', "SourceMode", "Source Mode", "Whether the relief comes from a heightmap file or from a displacement texture", ETerrainPlateSource::HeightmapFile);
+ 		desc.AddMember(&CTerrainPlateComponent::m_heightmapPath, 'hmap', "HeightmapFile", "Heightmap File", "16 bit raw/r16 (headerless, square), binary PGM (P5) or uncompressed BMP. Used when Source Mode is Heightmap File.", Schematyc::TerrainHeightmapFileName());
+@@ -194,7 +198,10 @@ public:
+ 		desc.AddMember(&CTerrainPlateComponent::m_skirt, 'skrt', "Skirt", "Skirt", "Metres of extra geometry extruded straight down from the border, so the plate still seals where the terrain does not match (steep slopes, distant sectors rendered at a coarser LOD). 0 disables the skirt.", 0.25f);
+ 
+ 		desc.AddMember(&CTerrainPlateComponent::m_renderParameters, 'rend', "Render", "Rendering Settings", "Settings for the rendered representation of the component", plateRenderDefaults);
+-		desc.AddMember(&CTerrainPlateComponent::m_physics, 'phys', "Physics", "Physics Settings", "Physical properties for the object, only used if a simple physics or character controller is applied to the entity.", SPhysicsParameters());
++		desc.AddMember(&CTerrainPlateComponent::m_physics, 'phys', "Physics", "Physics Settings",
++		               "Physical properties for the object. With Type = Render and Collider the plate physicalizes itself as a static "
++		               "body, and the weight only matters once a physics component (rigid body, character controller) takes the entity over.",
++		               SPhysicsParameters());
+ 	}
+ 
+ 	//! Rebuilds the height field from the current source and regenerates the mesh.
+@@ -217,6 +224,14 @@ protected:
+ 	int         GetIntegrationVertexBudget() const;
+ 	//! Resolves Grid Mode into the vertex counts along X and Y, clamping and warning as needed.
+ 	void        ComputeEffectiveGrid(int& vertsX, int& vertsY);
++	//! Drops the trimesh of the previous generation, on the statobj and on the physical entity.
++	void        ReleasePhysicsGeometry();
++	//! Gives the entity a static physical entity of its own when the type asks for a collider and no
++	//! physics component owns the entity yet. Called from RegenerateMesh, i.e. under the same
++	//! once-per-frame throttle as the mesh itself.
++	void        UpdateNativePhysics();
++	//! Destroys the physical entity, but only the one this component created.
++	void        ReleaseNativePhysics();
+ 
+ 	ETerrainPlateSource                          m_sourceMode = ETerrainPlateSource::HeightmapFile;
+ 	Schematyc::TerrainHeightmapFileName          m_heightmapPath;
+@@ -246,6 +261,9 @@ protected:
+ 	bool                     m_bRegenPending = false;
+ 	bool                     m_bBudgetWarningIssued = false;
+ 	bool                     m_bBudgetClampWarningIssued = false;
++	//! True while the entity's physical entity is the static one this component created.
++	bool                     m_bOwnsPhysicalEntity = false;
++	bool                     m_bPhysMeshWarningIssued = false;
+ 	uint32                   m_lastRegenFrameId = 0;
+ 	_smart_ptr<IStatObj>     m_pStatObj;
+ };
+-- 
+2.47.1.windows.1
+

@@ -1,0 +1,682 @@
+From 06793b44a89b31b8a2d1761b0a7e543fac18ac9f Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Wed, 2 Sep 2026 07:46:29 +0800
+Subject: [PATCH 271/307] !B (Terrain Plate) Sample plate colour from the
+ material diffuse texture.
+
+Sample the plate material's diffuse texture, UV transform and colour multiplier
+for live and permanent terrain colour. Select a suitable CPU mip and handle
+sRGB conversion consistently; skip materials without readable diffuse data.
+---
+ .../Geometry/ITerrainPlateCommit.h            |  44 +++-
+ .../Geometry/TerrainPlateComponent.cpp        | 219 ++++++++++++++----
+ .../Geometry/TerrainPlateComponent.h          |  60 ++++-
+ .../EditorQt/Terrain/TerrainCommands.cpp      |  30 ++-
+ .../Terrain/TerrainPlateColourOverlay.cpp     |  50 ++--
+ .../Terrain/TerrainPlateColourOverlay.h       |  19 +-
+ 6 files changed, 308 insertions(+), 114 deletions(-)
+
+diff --git a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/ITerrainPlateCommit.h b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/ITerrainPlateCommit.h
+index 26bf67a0..cecfbe53 100644
+--- a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/ITerrainPlateCommit.h
++++ b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/ITerrainPlateCommit.h
+@@ -42,11 +42,11 @@ struct ITerrainPlateCommit
+ 		//! Terrain layer to blend towards, matched with CTerrainManager::FindLayer. Empty or null: leave
+ 		//! the surface type weights alone.
+ 		const char* szLayerName = nullptr;
+-		//! Multiplied into the stamped colour. White (the default) leaves the albedo alone; with albedo
+-		//! off it IS the stamped colour. Gamma space, 0..255 per channel, like the RGB layer itself.
++		//! Multiplied into the stamped colour. White (the default) leaves the sampled diffuse alone.
++		//! Gamma space, 0..255 per channel, like the colour picker that edits it and like the RGB layer.
++		//! There is no longer a flat colour path: the source is ALWAYS the plate material's diffuse
++		//! texture, and this is only an optional filter over it.
+ 		ColorB      tint = ColorB(255, 255, 255, 255);
+-		//! Sample the plate's own material for the colour instead of using the flat tint.
+-		bool        bUseAlbedo = false;
+ 		//! Write terrain colour at all. Off: layer weights only.
+ 		bool        bWriteColour = true;
+ 	};
+@@ -79,25 +79,45 @@ struct ITerrainPlateCommit
+ 	//! point sample.
+ 	virtual float GetCommitWeightAtWorld(float worldX, float worldY, float sampleSizeMeters) const = 0;
+ 
+-	//! Step 2. Albedo of the plate at a world XY, for the optional colour projection. False when the
+-	//! plate has no usable projection (no material, or a material the CPU cannot sample).
+-	virtual bool  GetCommitAlbedoAtWorld(float worldX, float worldY, ColorB& outColor) const = 0;
++	//! THE colour sampler, shared by terrain.commit_plate_colour and by the live overlay - there is no
++	//! second source and no flat fallback, so the two tiers cannot show different colours.
++	//!
++	//! What it returns: the plate material's DIFFUSE TEXTURE, sampled bilinearly at the world position
++	//! projected top down through the plate's own UV mapping (Mirror X / Mirror Y and the material's
++	//! texture modifier tiling and offset all respected, so the pattern lines up with the plate mesh),
++	//! multiplied by the material's diffuse COLOUR exactly as the shader multiplies it.
++	//!
++	//! outLinearColor is LINEAR, not gamma: the CPU copy of an sRGB texture is already linear
++	//! (CTexture::PrepareLowResSystemCopy, Texture.cpp:3643-3652), so the conversion has to happen where
++	//! the texture's own colour space is known, and 8 bits of a linear value would crush the shadows.
++	//!
++	//! texelSizeMeters is the destination texel's size in metres. It only picks the RESOLUTION of the CPU
++	//! copy that is sampled (@see ITexture::GetLowResSystemCopy's maxTexSize), so BOTH consumers must
++	//! pass the terrain colour texel size - not their own filter footprint - or they would sample two
++	//! different mips of the same texture and drift apart.
++	//!
++	//! False when the plate has no usable projection: no material, no diffuse texture and no diffuse
++	//! colour, or a texture the CPU copy cannot decompress. There is no fallback colour to stamp, so a
++	//! false here means "leave this texel alone".
++	virtual bool  GetCommitAlbedoAtWorld(float worldX, float worldY, float texelSizeMeters,
++	                                     ColorF& outLinearColor) const = 0;
+ 
+ 	//! Decision 08 - the LIVE terrain colour overlay, the editor preview tier of the colour commit.
+ 	//! False when Terrain Colour From Plate is off, when Bake Into Terrain is off (the drawer that holds
+ 	//! the tick box goes with it), when the colour half of the commit is off, or when the plate has no
+ 	//! footprint on the terrain.
+ 	//!
+-	//! The rect is the same square GetCommitAppearanceFootprint returns, in terrain units, and outTint /
+-	//! outUseAlbedo are the same values GetCommitAppearance hands the commit - so the overlay blends the
+-	//! same source, with the same GetCommitWeightAtWorld rim, as terrain.commit_plate_colour would write.
+-	//! That equality is the point: the live tier is a preview of the commit, not a second look.
++	//! The rect is the same square GetCommitAppearanceFootprint returns, in terrain units, and outTint is
++	//! the same value GetCommitAppearance hands the commit - so the overlay blends the same source,
++	//! through the same GetCommitAlbedoAtWorld sampler and over the same GetCommitWeightAtWorld rim, as
++	//! terrain.commit_plate_colour would write. That equality is the point: the live tier is a preview of
++	//! the commit, not a second look.
+ 	//!
+ 	//! outSettling is true while the plate has deferred transform work pending, i.e. a drag is in
+ 	//! progress. Every dirty terrain texture sector costs a whole tile DXT recompress plus an upload, so
+ 	//! the editor side uses this to hold the repaint back until the plate is dropped.
+ 	virtual bool  GetLiveColourState(int& outX1, int& outY1, int& outSize, ColorB& outTint,
+-	                                 bool& outUseAlbedo, bool& outSettling) const = 0;
++	                                 bool& outSettling) const = 0;
+ 
+ 	//! Step 2. The plate's appearance commit properties. False when the plate has nothing to stamp.
+ 	//! The strings point into the component and are only valid for the duration of the call chain.
+diff --git a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
+index 91050d65..fd28d455 100644
+--- a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
++++ b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
+@@ -11,6 +11,8 @@
+ #include <CryRenderer/IRenderAuxGeom.h>
+ #include <CryRenderer/IShader.h>    // SShaderItem / SEfResTexture, for the commit albedo projection
+ #include <CryRenderer/ITexture.h>   // ITexture::GetLowResSystemCopy, ditto
++#include <CryRenderer/IImage.h>     // FIM_SRGB_READ - the colour space of that CPU copy
++#include <CryRenderer/IRenderer.h>  // IRenderer::EF_LoadImage, to ask the image file for that flag
+ #include <CrySystem/File/CryFile.h>
+ #include <CrySystem/IConsole.h>
+ #include <CrySystem/ConsoleRegistration.h>
+@@ -3179,17 +3181,53 @@ float CTerrainPlateComponent::GetCommitWeightAtWorld(float worldX, float worldY,
+ 	return clamp_tpl(weight, 0.f, 1.f);
+ }
+ 
+-bool CTerrainPlateComponent::GetCommitAlbedoAtWorld(float worldX, float worldY, ColorB& outColor) const
++//! The Commit Tint default up to 2026-09-01, an earth brown. It was a stand in from the days when the
++//! commit could stamp a FLAT colour: with no texture behind it, white would have stamped white, so the
++//! default had to look like ground. Now that the plate material's diffuse texture is the only source the
++//! tint is a filter over it, and any non white default would silently colour every plate. The default is
++//! white, and a plate that saved the old brown - which nobody could have chosen deliberately, because the
++//! panel that edits it is parked (reports/31) - reads it back as white rather than turning brown.
++static const ColorF kLegacyCommitTintDefault(0.5f, 0.45f, 0.38f);
++
++//! Rounds up to a power of two CTexture::GetLowResSystemCopy can actually serve. Its slots are
++//! 2^(slot + 4) for slot 0..TEX_SYS_COPY_MAX_SLOTS-1, i.e. 16 .. 2048 (Texture.cpp:3574-3575,
++//! Texture.h:57), and anything in between snaps DOWN to the slot below - so asking for 80 would quietly
++//! get 64. 512 is the ceiling here: one slot is a permanent decompressed copy in system RAM (1 MB at
++//! 512 x 512) and one source texel per terrain colour texel is the most that can ever be seen.
++static int RoundUpColourCopySize(int desired)
+ {
+-	// The colour source, stated plainly: the plate's own material's DIFFUSE texture, read through
+-	// ITexture::GetLowResSystemCopy - the CPU side copy the renderer keeps of every streamed texture, at
+-	// most 32 x 32 (ITexture.h:497). That is not a shortcut invented here: it is the exact source
+-	// CRYENGINE's own terrain colour synthesis uses for the same job
+-	// (CImagePainter::CalculateBaseColorFromSurfaceInfo, ImagePainter.cpp:408-436, the
+-	// e_TerrainAutoGenerateBaseTexture path). There is no CPU readable full resolution copy of a streamed
+-	// GPU texture to sample instead, and the terrain macro texture is a low frequency base that the
+-	// terrain's own detail materials multiply over anyway, so a 32 x 32 average of the plate's albedo is
+-	// the right band of the signal to stamp - the detail comes back from the Commit Layer's material.
++	int size = 32;
++	while (size < desired && size < 512)
++		size *= 2;
++	return size;
++}
++
++//! Resolves, at most once per frame, everything the per texel sampler needs. @see SColourSource.
++bool CTerrainPlateComponent::ResolveColourSource(float texelSizeMeters) const
++{
++	const int frameId = (gEnv != nullptr) ? (int)gEnv->nMainFrameID : 0;
++
++	// RESOLUTION. The CPU copy is a mip chain pick, so the question is how many source texels the plate
++	// covers on the terrain: a 40 m plate over a 0.5 m macro texel is 80 texels a side, and the stock
++	// 32 x 32 would be a five times upscale - visible as blur where the user expects the plate's pattern.
++	// Both consumers pass the terrain colour texel size (@see ITerrainPlateCommit), so both land in the
++	// same slot and see the same picture.
++	const Vec3  worldScale = GetWorldScale();
++	const float footprint = max(fabs_tpl(worldScale.x), fabs_tpl(worldScale.y));
++	const float texel = (texelSizeMeters > 0.f) ? texelSizeMeters : 0.5f;
++	const int   maxTexSize = RoundUpColourCopySize((int)ceilf(footprint / texel));
++
++	if (m_colourSource.frameId == frameId && m_colourSource.maxTexSize == maxTexSize)
++		return m_colourSource.bValid;
++
++	const void* pPreviousTexture = m_colourSource.pTextureKey;
++	const bool  bPreviousLinear = m_colourSource.bTexelsLinear;
++	const bool  bPreviousWarned = m_colourSource.bWarned;
++
++	m_colourSource = SColourSource();
++	m_colourSource.frameId = frameId;
++	m_colourSource.maxTexSize = maxTexSize;
++
+ 	if (gEnv == nullptr || gEnv->p3DEngine == nullptr)
+ 		return false;
+ 
+@@ -3214,10 +3252,94 @@ bool CTerrainPlateComponent::GetCommitAlbedoAtWorld(float worldX, float worldY,
+ 	if (shaderItem.m_pShaderResources == nullptr)
+ 		return false;
+ 
++	// The material's diffuse COLOUR. The shader multiplies it over the (linear) diffuse texture sample,
++	// so this is a linear multiplier and it is applied in linear below - that is how the plate looks.
++	m_colourSource.diffuse = shaderItem.m_pShaderResources->GetColorValue(EFTT_DIFFUSE);
++
+ 	SEfResTexture* pResTexture = shaderItem.m_pShaderResources->GetTexture(EFTT_DIFFUSE);
+-	ITexture* pTexture = (pResTexture != nullptr) ? pResTexture->m_Sampler.m_pITex : nullptr;
++	ITexture*      pTexture = (pResTexture != nullptr) ? pResTexture->m_Sampler.m_pITex : nullptr;
++
++	// The material's texture modifier, so a material that tiles its diffuse over the mesh tiles it over
++	// the terrain in exactly the same places. m_Tiling is 1 by default (SEfTexModificator::Reset).
++	if (pResTexture != nullptr && pResTexture->m_Ext.m_pTexModifier != nullptr)
++	{
++		const SEfTexModificator& modificator = *pResTexture->m_Ext.m_pTexModifier;
++		m_colourSource.tilingU = (modificator.m_Tiling[0] != 0.f) ? modificator.m_Tiling[0] : 1.f;
++		m_colourSource.tilingV = (modificator.m_Tiling[1] != 0.f) ? modificator.m_Tiling[1] : 1.f;
++		m_colourSource.offsetU = modificator.m_Offs[0];
++		m_colourSource.offsetV = modificator.m_Offs[1];
++	}
++
++	if (pTexture == nullptr)
++	{
++		// No texture at all: the material IS its diffuse colour. Black means nothing to project.
++		m_colourSource.bValid = (m_colourSource.diffuse.r > 0.f || m_colourSource.diffuse.g > 0.f
++		                         || m_colourSource.diffuse.b > 0.f);
++		return m_colourSource.bValid;
++	}
++
++	m_colourSource.pTextureKey = pTexture;
++	m_colourSource.bWarned = (pTexture == pPreviousTexture) ? bPreviousWarned : false;
++
++	uint16 textureWidth = 0, textureHeight = 0;
++	int*   pLowResSystemCopyAtlasId = nullptr;
++	const ColorB* pTexRgb = pTexture->GetLowResSystemCopy(textureWidth, textureHeight,
++	                                                      &pLowResSystemCopyAtlasId, maxTexSize);
++
++	if (pTexRgb == nullptr || textureWidth == 0 || textureHeight == 0)
++	{
++		// GetLowResSystemCopy only serves mipped 2D BC1..BC7 textures. Anything else has no CPU readable
++		// copy at all, and there is no flat colour to fall back on any more, so say so once per texture
++		// and leave the terrain alone.
++		if (!m_colourSource.bWarned)
++		{
++			m_colourSource.bWarned = true;
++			CryWarning(VALIDATOR_MODULE_3DENGINE, VALIDATOR_WARNING,
++			           "Terrain Plate: the diffuse texture '%s' has no CPU readable copy (only mipped 2D BC1..BC7 textures have "
++			           "one), so no terrain colour can be taken from this plate.", pTexture->GetName());
++		}
++		return false;
++	}
++
++	m_colourSource.pTexels = pTexRgb;
++	m_colourSource.width = (int)textureWidth;
++	m_colourSource.height = (int)textureHeight;
++
++	// COLOUR SPACE. PrepareLowResSystemCopy converts the decompressed texels to linear when the source
++	// DDS is flagged sRGB (Texture.cpp:3643-3652), which every diffuse map produced by the RC is - so the
++	// bytes are NOT in the texture's authored space and must not be srgb2rgb'd a second time (that is the
++	// double darkening the old sampler had). ITexture exposes no sRGB accessor, so ask the image file the
++	// same way the renderer's own copy does; FIM_STREAM_PREPARE keeps the read to the header and the
++	// persistent mips, and this only runs when the texture changes.
++	if (pTexture == pPreviousTexture)
++	{
++		m_colourSource.bTexelsLinear = bPreviousLinear;
++	}
++	else if (gEnv->pRenderer != nullptr)
++	{
++		_smart_ptr<IImageFile> pImage = gEnv->pRenderer->EF_LoadImage(pTexture->GetName(), FIM_STREAM_PREPARE);
++		m_colourSource.bTexelsLinear = (pImage != nullptr) && ((pImage->mfGet_Flags() & FIM_SRGB_READ) != 0);
++	}
++
++	m_colourSource.bValid = true;
++	return true;
++}
+ 
+-	const ColorF diffuse = shaderItem.m_pShaderResources->GetColorValue(EFTT_DIFFUSE);
++bool CTerrainPlateComponent::GetCommitAlbedoAtWorld(float worldX, float worldY, float texelSizeMeters,
++                                                    ColorF& outLinearColor) const
++{
++	// THE colour source, stated plainly: the plate's own material's DIFFUSE texture, read through
++	// ITexture::GetLowResSystemCopy - the CPU side copy the renderer keeps of every streamed texture. That
++	// is not a shortcut invented here: it is the exact source CRYENGINE's own terrain colour synthesis
++	// uses for the same job (CImagePainter::CalculateBaseColorFromSurfaceInfo, ImagePainter.cpp:408-436,
++	// the e_TerrainAutoGenerateBaseTexture path). There is no CPU readable full resolution copy of a
++	// streamed GPU texture to sample instead: ITexture::GetData32 would stall the pipeline on a staging
++	// download per call, and reading the source DDS through ICryPak the way the displacement loader does
++	// would mean writing a BC1..BC7 decompressor, which is what GetLowResSystemCopy already is. What DID
++	// change is the resolution: the stock call is capped at 32 x 32, and this one asks for as many texels
++	// as the plate covers on the terrain (@see ResolveColourSource).
++	if (!ResolveColourSource(texelSizeMeters))
++		return false;
+ 
+ 	// Where on the plate: the same inverse transform the bake uses, then the mesh's own UV mapping.
+ 	// RegenerateMesh gives the vertex at local (-0.5 + c/(nx-1), 0.5 - r/(ny-1)) the UV (c/(nx-1),
+@@ -3231,50 +3353,48 @@ bool CTerrainPlateComponent::GetCommitAlbedoAtWorld(float worldX, float worldY,
+ 	if (m_bMirrorX) u = 1.f - u;
+ 	if (m_bMirrorY) v = 1.f - v;
+ 
+-	ColorF albedo(1.f, 1.f, 1.f, 1.f);
++	const SColourSource& source = m_colourSource;
+ 
+-	if (pTexture != nullptr)
+-	{
+-		uint16 textureWidth = 0, textureHeight = 0;
+-		int*   pLowResSystemCopyAtlasId = nullptr;
+-		const ColorB* pTexRgb = pTexture->GetLowResSystemCopy(textureWidth, textureHeight, &pLowResSystemCopyAtlasId);
++	// The material's own tiling and offset, applied after the mesh UV - the same order the shader applies
++	// them in, so the pattern lands where the plate mesh shows it.
++	u = u * source.tilingU + source.offsetU;
++	v = v * source.tilingV + source.offsetV;
+ 
+-		if (pTexRgb == nullptr || textureWidth == 0 || textureHeight == 0)
+-			return false;   // a material the CPU cannot sample: the caller falls back to the flat tint
++	ColorF albedo(1.f, 1.f, 1.f, 1.f);
+ 
+-		// Bilinear, wrapping, in the texture's own (gamma) space - the same space the RGB layer stores.
+-		const float fx = u * (float)textureWidth - 0.5f;
+-		const float fy = v * (float)textureHeight - 0.5f;
++	if (source.pTexels != nullptr)
++	{
++		// Bilinear, wrapping.
++		const float fx = u * (float)source.width - 0.5f;
++		const float fy = v * (float)source.height - 0.5f;
+ 		const int   x0 = (int)floorf(fx);
+ 		const int   y0 = (int)floorf(fy);
+ 		const float rx = fx - (float)x0;
+ 		const float ry = fy - (float)y0;
+ 
+-		const auto texel = [pTexRgb, textureWidth, textureHeight](int x, int y)
++		const auto texel = [&source](int x, int y)
+ 		{
+-			const int wx = ((x % (int)textureWidth) + (int)textureWidth) % (int)textureWidth;
+-			const int wy = ((y % (int)textureHeight) + (int)textureHeight) % (int)textureHeight;
+-			const ColorB& c = pTexRgb[wx + wy * (int)textureWidth];
++			const int wx = ((x % source.width) + source.width) % source.width;
++			const int wy = ((y % source.height) + source.height) % source.height;
++			const ColorB& c = source.pTexels[wx + wy * source.width];
+ 			return ColorF((float)c.r / 255.f, (float)c.g / 255.f, (float)c.b / 255.f, 1.f);
+ 		};
+ 
+ 		const ColorF top = texel(x0, y0) * (1.f - rx) + texel(x0 + 1, y0) * rx;
+ 		const ColorF bottom = texel(x0, y0 + 1) * (1.f - rx) + texel(x0 + 1, y0 + 1) * rx;
+ 		albedo = top * (1.f - ry) + bottom * ry;
+-	}
+-	else if (diffuse.r == 0.f && diffuse.g == 0.f && diffuse.b == 0.f)
+-	{
+-		return false;   // no texture and no colour: nothing to project
++
++		// Into linear, once. An sRGB source is already linear in the CPU copy; anything else is raw.
++		if (!source.bTexelsLinear)
++			albedo.srgb2rgb();
+ 	}
+ 
+-	albedo.r *= diffuse.r;
+-	albedo.g *= diffuse.g;
+-	albedo.b *= diffuse.b;
++	albedo.r *= source.diffuse.r;
++	albedo.g *= source.diffuse.g;
++	albedo.b *= source.diffuse.b;
++	albedo.a = 1.f;
+ 
+-	outColor = ColorB((uint8)clamp_tpl((int)(albedo.r * 255.f + 0.5f), 0, 255),
+-	                  (uint8)clamp_tpl((int)(albedo.g * 255.f + 0.5f), 0, 255),
+-	                  (uint8)clamp_tpl((int)(albedo.b * 255.f + 0.5f), 0, 255),
+-	                  255);
++	outLinearColor = albedo;
+ 	return true;
+ }
+ 
+@@ -3287,12 +3407,22 @@ bool CTerrainPlateComponent::GetCommitAppearance(SAppearance& outAppearance) con
+ 		return false;   // nothing asked for
+ 
+ 	outAppearance.szLayerName = bHasLayer ? szLayer : nullptr;
+-	outAppearance.bUseAlbedo = m_bCommitAlbedo;
+ 	outAppearance.bWriteColour = m_bCommitColour;
+-	outAppearance.tint = ColorB((uint8)clamp_tpl((int)(m_commitTint.r * 255.f + 0.5f), 0, 255),
+-	                           (uint8)clamp_tpl((int)(m_commitTint.g * 255.f + 0.5f), 0, 255),
+-	                           (uint8)clamp_tpl((int)(m_commitTint.b * 255.f + 0.5f), 0, 255),
+-	                           255);
++
++	// MIGRATION. A level saved before 2026-09-01 carries the old earth brown default, which would now
++	// multiply the plate's diffuse and turn every existing plate brown. Read the exact old default back
++	// as white; a tint the user actually picked differs in at least one bit and is left alone.
++	ColorF tint = m_commitTint;
++	if (tint.r == kLegacyCommitTintDefault.r && tint.g == kLegacyCommitTintDefault.g
++	    && tint.b == kLegacyCommitTintDefault.b)
++	{
++		tint = ColorF(1.f, 1.f, 1.f);
++	}
++
++	outAppearance.tint = ColorB((uint8)clamp_tpl((int)(tint.r * 255.f + 0.5f), 0, 255),
++	                            (uint8)clamp_tpl((int)(tint.g * 255.f + 0.5f), 0, 255),
++	                            (uint8)clamp_tpl((int)(tint.b * 255.f + 0.5f), 0, 255),
++	                            255);
+ 	return true;
+ }
+ 
+@@ -3307,7 +3437,7 @@ bool CTerrainPlateComponent::GetCommitAppearance(SAppearance& outAppearance) con
+ //! GetCommitAppearanceFootprint give terrain.commit_plate_colour, and the editor evaluates the rim with
+ //! the same GetCommitWeightAtWorld - so the preview is the commit, before the commit.
+ bool CTerrainPlateComponent::GetLiveColourState(int& outX1, int& outY1, int& outSize, ColorB& outTint,
+-                                                bool& outUseAlbedo, bool& outSettling) const
++                                                bool& outSettling) const
+ {
+ 	// Bake Into Terrain gates it because the tick box lives in the Bake drawer, and that drawer is absent
+ 	// while Bake Into Terrain is off (@see Serialize(IArchive&, STerrainPlateBakeGroup&, ...)). A colour
+@@ -3323,7 +3453,6 @@ bool CTerrainPlateComponent::GetLiveColourState(int& outX1, int& outY1, int& out
+ 		return false;
+ 
+ 	outTint = appearance.tint;
+-	outUseAlbedo = appearance.bUseAlbedo;
+ 
+ 	// The debounce input. Every dirty terrain texture sector is a whole tile DXT recompress plus an
+ 	// upload, so a drag must not repaint per frame. These are exactly the flags the plate's own deferred
+diff --git a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
+index 79e33cd2..89dd31d9 100644
+--- a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
++++ b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
+@@ -495,14 +495,15 @@ public:
+ 		desc.AddMember(&CTerrainPlateComponent::m_bCommitColour, 'cclr', "CommitColourEnabled", /*"Commit Colour"*/ "",
+ 		               "Whether Commit Colour To Terrain writes the terrain colour at all. Off: only the Commit Layer weights are "
+ 		               "stamped, and the ground keeps whatever colour was painted there.", true);
+-		desc.AddMember(&CTerrainPlateComponent::m_bCommitAlbedo, 'calb', "CommitAlbedo", /*"Commit Albedo"*/ "",
+-		               "On: the stamped colour is sampled from this plate's own material, through the low resolution CPU copy the "
+-		               "renderer keeps of the diffuse texture (at most 32 x 32, so it carries the plate's colour distribution and "
+-		               "not its detail - the terrain macro texture is a low frequency base anyway). Off: the flat Commit Tint is "
+-		               "stamped. Either way Commit Tint multiplies the result.", false);
++		// 'calb' (Commit Albedo) was removed. It used to choose between the plate material's diffuse
++		// texture and a flat tint; a plate HAS no colour of its own other than its material, so the flat
++		// path was a stand in and the switch was a trap - and with the commit panel parked (reports/31)
++		// nobody could reach the tick box to turn the real source on. The diffuse texture is now the only
++		// source. A level that saved 'calb' simply loses the key, which yasli ignores.
+ 		desc.AddMember(&CTerrainPlateComponent::m_commitTint, 'ctnt', "CommitTint", /*"Commit Tint"*/ "",
+-		               "Colour stamped into the terrain by Commit Colour To Terrain, and the filter colour multiplied into the "
+-		               "albedo when Commit Albedo is on. White with Commit Albedo off stamps white.", ColorF(0.5f, 0.45f, 0.38f));
++		               "Optional filter colour multiplied into the plate material's diffuse before it is stamped into the terrain, "
++		               "the way a gel multiplies a lamp. White (the default) stamps the material's own colours unchanged.",
++		               ColorF(1.f, 1.f, 1.f));
+ 		// --- end of the parked Commit Bake block.
+ 
+ 		// --- The visible panel, in order. Everything above this line is either hidden (empty label) or
+@@ -572,10 +573,11 @@ public:
+ 	virtual bool  GetCommitFootprint(int& outX1, int& outY1, int& outSize) const final;
+ 	virtual bool  GetCommitAppearanceFootprint(int& outX1, int& outY1, int& outSize) const final;
+ 	virtual float GetCommitWeightAtWorld(float worldX, float worldY, float sampleSizeMeters) const final;
+-	virtual bool  GetCommitAlbedoAtWorld(float worldX, float worldY, ColorB& outColor) const final;
++	virtual bool  GetCommitAlbedoAtWorld(float worldX, float worldY, float texelSizeMeters,
++	                                     ColorF& outLinearColor) const final;
+ 	virtual bool  GetCommitAppearance(SAppearance& outAppearance) const final;
+ 	virtual bool  GetLiveColourState(int& outX1, int& outY1, int& outSize, ColorB& outTint,
+-	                                 bool& outUseAlbedo, bool& outSettling) const final;
++	                                 bool& outSettling) const final;
+ 	virtual void  OnCommitted() final;
+ 	// ~ITerrainPlateCommit
+ 
+@@ -843,14 +845,50 @@ protected:
+ 	Serialization::FunctorActionButton<std::function<void()>> m_commitColourButton;
+ 	Schematyc::CSharedString                     m_commitLayer;
+ 	bool                                         m_bCommitColour = true;
+-	bool                                         m_bCommitAlbedo = false;
+-	ColorF                                       m_commitTint = ColorF(0.5f, 0.45f, 0.38f);
++	//! Optional filter over the sampled diffuse. White = no filter. @see kLegacyCommitTintDefault for why
++	//! the exact earth brown that used to be the default is read back as white.
++	ColorF                                       m_commitTint = ColorF(1.f, 1.f, 1.f);
+ 
+ 	//! Decision 08: the live, editor only terrain colour overlay. Default OFF - it repaints ground the
+ 	//! user did not paint, so it has to be asked for. @see GetLiveColourState and
+ 	//! Sandbox/EditorQt/Terrain/TerrainPlateColourOverlay.h.
+ 	bool                                         m_bLiveTerrainColour = false;
+ 
++	//! Everything GetCommitAlbedoAtWorld would otherwise have to look up per texel: the material, its
++	//! diffuse texture, the renderer's decompressed CPU copy of that texture and the copy's colour space.
++	//! Resolved at most once per frame (a whole terrain colour tile, or a whole commit, is one frame), so
++	//! the per texel cost is a bilinear fetch. Never serialised, never valid across a frame boundary
++	//! without a re-resolve - which is also what keeps the borrowed texel pointer safe.
++	struct SColourSource
++	{
++		//! The renderer's low resolution system copy. Owned by the renderer, borrowed for one frame.
++		const ColorB* pTexels = nullptr;
++		int           width = 0;
++		int           height = 0;
++		//! The copy of an sRGB texture is stored LINEAR (Texture.cpp:3643-3652); of anything else, raw.
++		bool          bTexelsLinear = false;
++		//! The material's own diffuse colour, multiplied over the texture the way the shader does it.
++		ColorF        diffuse = ColorF(1.f, 1.f, 1.f, 1.f);
++		//! The material's texture modifier, so a tiled material tiles on the terrain too.
++		float         tilingU = 1.f;
++		float         tilingV = 1.f;
++		float         offsetU = 0.f;
++		float         offsetV = 0.f;
++
++		//! Identity of what was resolved, so a material or texture swap re-resolves and an unchanged one
++		//! does not. Opaque on purpose - the header must not need ITexture.
++		const void*   pTextureKey = nullptr;
++		int           maxTexSize = 0;
++		int           frameId = -1;
++		bool          bValid = false;
++		//! One warning per plate per texture, not one per texel.
++		bool          bWarned = false;
++	};
++	mutable SColourSource                        m_colourSource;
++
++	//! Fills m_colourSource for this frame. False when there is nothing to sample.
++	bool ResolveColourSource(float texelSizeMeters) const;
++
+ 	//! Panel grouping only - no data of their own, never persisted values. @see STerrainPlateUIGroup.
+ 	STerrainPlateShapeGroup                      m_uiShape;
+ 	STerrainPlateBakeGroup                       m_uiBake;
+diff --git a/Code/Sandbox/EditorQt/Terrain/TerrainCommands.cpp b/Code/Sandbox/EditorQt/Terrain/TerrainCommands.cpp
+index 507b728f..adf4f71a 100644
+--- a/Code/Sandbox/EditorQt/Terrain/TerrainCommands.cpp
++++ b/Code/Sandbox/EditorQt/Terrain/TerrainCommands.cpp
+@@ -799,18 +799,17 @@ static void PyCommitTerrainPlateColour()
+ 							if (weight <= 0.002f)
+ 								continue;
+ 
+-							ColorB source = appearance.tint;
+-							if (appearance.bUseAlbedo)
++							// THE colour, and the only one: the plate material's diffuse texture under this
++							// world position, at the resolution this texel size asks for. The live overlay
++							// makes the identical call with the identical texel size
++							// (TerrainPlateColourOverlay::ApplyToRow), which is what makes this command
++							// mean "make what you are looking at permanent". A texel the plate cannot
++							// colour is left as it was - there is no invented fallback colour.
++							ColorF albedo;
++							if (!pCommit->GetCommitAlbedoAtWorld(worldX, worldY, texelSize, albedo))
+ 							{
+-								ColorB albedo;
+-								if (pCommit->GetCommitAlbedoAtWorld(worldX, worldY, albedo))
+-								{
+-									source = albedo;
+-								}
+-								else
+-								{
+-									++albedoMisses;
+-								}
++								++albedoMisses;
++								continue;
+ 							}
+ 
+ 							// The blend is the painter's, line for line (ImagePainter.cpp:310-335): both sides
+@@ -829,7 +828,7 @@ static void PyCommitTerrainPlateColour()
+ 							// layout, because they came out of this very RGB layer.
+ 							uint32& destination = pTile->ValueAt(px, py);
+ 							destination = TerrainPlateColourOverlay::BlendPlateColourIntoTexel(
+-							  destination, source, appearance.tint, appearance.bUseAlbedo, weight);
++							  destination, albedo, appearance.tint, weight);
+ 							++colourTexels;
+ 						}
+ 					}
+@@ -884,13 +883,12 @@ static void PyCommitTerrainPlateColour()
+ 		pTerrainManager->SetModified(hx0, hy0, hx0 + cols, hy0 + rows);
+ 		++committed;
+ 
+-		CryLog("terrain.commit_plate_colour: '%s' stamped, %d colour texels (%s) and %d layer cells (%s), "
+-		       "units (%d,%d)+%d, world (%.1f, %.1f)-(%.1f, %.1f)%s",
++		CryLog("terrain.commit_plate_colour: '%s' stamped, %d colour texels (material diffuse x tint) and %d layer cells "
++		       "(%s), units (%d,%d)+%d, world (%.1f, %.1f)-(%.1f, %.1f)%s",
+ 		       pEntity->GetName(), colourTexels,
+-		       appearance.bUseAlbedo ? "material albedo x tint" : "flat tint",
+ 		       layerCells, (pLayer != nullptr) ? pLayer->GetLayerName().c_str() : "no layer",
+ 		       rectX1, rectY1, rectSize, worldXMin, worldYMin, worldXMax, worldYMax,
+-		       (albedoMisses > 0) ? ", albedo unavailable (fell back to the tint)" : "");
++		       (albedoMisses > 0) ? ", some texels had no sampleable material and were left alone" : "");
+ 	}
+ 
+ 	if (committed > 0)
+diff --git a/Code/Sandbox/EditorQt/Terrain/TerrainPlateColourOverlay.cpp b/Code/Sandbox/EditorQt/Terrain/TerrainPlateColourOverlay.cpp
+index 0b926dc5..56d8ddd2 100644
+--- a/Code/Sandbox/EditorQt/Terrain/TerrainPlateColourOverlay.cpp
++++ b/Code/Sandbox/EditorQt/Terrain/TerrainPlateColourOverlay.cpp
+@@ -44,8 +44,8 @@ struct SLivePlate
+ 	float                worldXMax = 0.f;
+ 	float                worldYMax = 0.f;
+ 
++	//! The user's optional filter over the sampled diffuse. White by default.
+ 	ColorB               tint = ColorB(255, 255, 255, 255);
+-	bool                 bUseAlbedo = false;
+ 
+ 	//! Everything the look depends on, folded into one value. When it changes the sectors under the OLD
+ 	//! and the NEW footprint are marked dirty.
+@@ -155,9 +155,8 @@ void ScanPlates(std::vector<SLivePlate>& out)
+ 
+ 		int    rectX1 = 0, rectY1 = 0, rectSize = 0;
+ 		ColorB tint;
+-		bool   bUseAlbedo = false;
+ 		bool   bSettling = false;
+-		if (!pCommit->GetLiveColourState(rectX1, rectY1, rectSize, tint, bUseAlbedo, bSettling) || rectSize <= 0)
++		if (!pCommit->GetLiveColourState(rectX1, rectY1, rectSize, tint, bSettling) || rectSize <= 0)
+ 			continue;
+ 
+ 		SLivePlate plate;
+@@ -167,18 +166,16 @@ void ScanPlates(std::vector<SLivePlate>& out)
+ 		plate.worldXMax = (float)(rectX1 + rectSize) * unitSize;
+ 		plate.worldYMax = (float)(rectY1 + rectSize) * unitSize;
+ 		plate.tint = tint;
+-		plate.bUseAlbedo = bUseAlbedo;
+ 
+-		// The look depends on the footprint, the tint, the albedo switch and - through
+-		// GetCommitAlbedoAtWorld - on which material the plate is wearing. A material EDIT (a different
+-		// texture assigned inside the same material) is not covered; nudging the plate repaints it.
++		// The look depends on the footprint, the tint and - through GetCommitAlbedoAtWorld - on which
++		// material the plate is wearing. A material EDIT (a different texture assigned inside the same
++		// material) is not covered; nudging the plate repaints it.
+ 		uint32 signature = 0x811c9dc5u;
+ 		signature = HashFloat(signature, plate.worldXMin);
+ 		signature = HashFloat(signature, plate.worldYMin);
+ 		signature = HashFloat(signature, plate.worldXMax);
+ 		signature = HashFloat(signature, plate.worldYMax);
+ 		signature = HashCombine(signature, ((uint32)tint.r << 16) | ((uint32)tint.g << 8) | (uint32)tint.b);
+-		signature = HashCombine(signature, bUseAlbedo ? 1u : 0u);
+ 		signature = HashCombine(signature, (uint32)(uintptr_t)pEntity->GetMaterial());
+ 		signature = HashCombine(signature, (uint32)(uintptr_t)pEntity->GetSlotMaterial(0));
+ 		plate.signature = signature;
+@@ -190,21 +187,20 @@ void ScanPlates(std::vector<SLivePlate>& out)
+ 
+ }   // anonymous namespace
+ 
+-uint32 BlendPlateColourIntoTexel(uint32 destination, ColorB source, ColorB tint, bool bUseAlbedo, float weight)
++uint32 BlendPlateColourIntoTexel(uint32 destination, const ColorF& linearAlbedo, ColorB tint, float weight)
+ {
+ 	const float recip255 = 1.f / 255.f;
+ 
+-	ColorF colourSource((float)source.r * recip255, (float)source.g * recip255, (float)source.b * recip255);
+-	colourSource.srgb2rgb();
++	// The albedo is already linear - the sampler converted it there, where the texture's own colour space
++	// was known (@see ITerrainPlateCommit::GetCommitAlbedoAtWorld). Only the tint arrives in gamma,
++	// because it is a colour picker value.
++	ColorF colourSource = linearAlbedo;
+ 
+-	if (bUseAlbedo)
+-	{
+-		ColorF filter((float)tint.r * recip255, (float)tint.g * recip255, (float)tint.b * recip255);
+-		filter.srgb2rgb();
+-		colourSource.r *= filter.r;
+-		colourSource.g *= filter.g;
+-		colourSource.b *= filter.b;
+-	}
++	ColorF filter((float)tint.r * recip255, (float)tint.g * recip255, (float)tint.b * recip255);
++	filter.srgb2rgb();
++	colourSource.r *= filter.r;
++	colourSource.g *= filter.g;
++	colourSource.b *= filter.b;
+ 
+ 	colourSource.clamp(0.f, 1.f);
+ 
+@@ -377,15 +373,15 @@ void ApplyToRow(uint32* pRow, int count, float worldYStart, float worldStepY, fl
+ 			if (weight <= kWeightEpsilon)
+ 				continue;
+ 
+-			ColorB source = plate.tint;
+-			if (plate.bUseAlbedo)
+-			{
+-				ColorB albedo;
+-				if (pCommit->GetCommitAlbedoAtWorld(worldX, worldY, albedo))
+-					source = albedo;
+-			}
++			// THE colour: the plate material's diffuse texture under this world position. The commit
++			// makes the identical call with the identical texel size, so the two tiers sample the same
++			// resolution of the same texture at the same place. A plate whose material cannot be sampled
++			// at all stamps nothing rather than falling back to some invented colour.
++			ColorF albedo;
++			if (!pCommit->GetCommitAlbedoAtWorld(worldX, worldY, rgbTexelSizeMeters, albedo))
++				continue;
+ 
+-			pRow[i] = BlendPlateColourIntoTexel(pRow[i], source, plate.tint, plate.bUseAlbedo, weight);
++			pRow[i] = BlendPlateColourIntoTexel(pRow[i], albedo, plate.tint, weight);
+ 		}
+ 	}
+ }
+diff --git a/Code/Sandbox/EditorQt/Terrain/TerrainPlateColourOverlay.h b/Code/Sandbox/EditorQt/Terrain/TerrainPlateColourOverlay.h
+index f228a4cf..5efec19a 100644
+--- a/Code/Sandbox/EditorQt/Terrain/TerrainPlateColourOverlay.h
++++ b/Code/Sandbox/EditorQt/Terrain/TerrainPlateColourOverlay.h
+@@ -6,6 +6,14 @@
+ 
+ //! Decision 08 - the plate's diffuse as the terrain's macro colour, LIVE and non destructive.
+ //!
++//! WHAT COLOUR. The plate material's DIFFUSE TEXTURE, sampled at the world position projected top down
++//! through the plate's own UV mapping, times the material's diffuse colour - i.e. what the plate mesh
++//! itself shows. That is the only source; the flat tint that used to stand in for it is gone, because a
++//! plate has no colour of its own apart from its material (user, 2026-09-01). The sampler is
++//! ITerrainPlateCommit::GetCommitAlbedoAtWorld and it is the SAME call terrain.commit_plate_colour makes,
++//! at the same resolution, which is what makes Commit Colour mean "make what you are looking at
++//! permanent".
++//!
+ //! Where this sits. The engine's runtime macro colour is a pooled atlas whose editor half is a PULL:
+ //! CTerrainNode::SetupTexturing sees a node marked eTES_SectorIsModified_AtlasIsDirty and calls
+ //! CTerrainNode::UpdateNodeTextureFromEditorData (terrain_node.cpp:117-142, :528-583), which builds the
+@@ -36,9 +44,14 @@ namespace TerrainPlateColourOverlay
+ //!
+ //! destination and the return value are one terrain colour texel in the RGB layer's packed layout,
+ //! blue | green << 8 | red << 16 (RGBLayer.h:63), which is also the layout CHeightmap::GetColorAtPosition
+-//! hands to the engine. source is the plate's albedo when bUseAlbedo is set, otherwise the flat tint;
+-//! tint multiplies the albedo when bUseAlbedo is set (and IS the source when it is not).
+-uint32 BlendPlateColourIntoTexel(uint32 destination, ColorB source, ColorB tint, bool bUseAlbedo, float weight);
++//! hands to the engine.
++//!
++//! linearAlbedo is what ITerrainPlateCommit::GetCommitAlbedoAtWorld returned - the plate material's
++//! diffuse texture times its diffuse colour, already LINEAR, which is why it arrives as a ColorF and not
++//! as a byte triple. There is no flat colour path anywhere any more: a plate has no colour of its own
++//! other than its material. tint is the user's optional filter, a gamma space picker value, white by
++//! default; it multiplies the albedo the way a gel multiplies a lamp.
++uint32 BlendPlateColourIntoTexel(uint32 destination, const ColorF& linearAlbedo, ColorB tint, float weight);
+ 
+ //! Once per editor frame. Re-enumerates the plates whose Terrain Colour From Plate is on, and marks the
+ //! terrain texture sectors under a plate that appeared, moved, changed or went away, so that the engine
+-- 
+2.47.1.windows.1
+

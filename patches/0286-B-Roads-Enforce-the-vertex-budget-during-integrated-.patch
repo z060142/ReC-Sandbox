@@ -1,0 +1,146 @@
+From 98520c215a23142cb28a14e5355456066173b7a6 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Wed, 2 Sep 2026 11:17:25 +0800
+Subject: [PATCH 286/307] !B (Roads) Enforce the vertex budget during
+ integrated surface subdivision.
+
+Measure all road trapezoids before subdivision and choose one factor that fits
+the road-wide vertex budget. Integrated surface detail is reduced uniformly
+instead of allowing an oversized segment to remove the entire road mesh.
+---
+ Code/CryEngine/Cry3DEngine/RoadRenderNode.cpp | 101 +++++++++++++++---
+ 1 file changed, 89 insertions(+), 12 deletions(-)
+
+diff --git a/Code/CryEngine/Cry3DEngine/RoadRenderNode.cpp b/Code/CryEngine/Cry3DEngine/RoadRenderNode.cpp
+index fae708bb..81f52a51 100644
+--- a/Code/CryEngine/Cry3DEngine/RoadRenderNode.cpp
++++ b/Code/CryEngine/Cry3DEngine/RoadRenderNode.cpp
+@@ -241,6 +241,89 @@ void CRoadRenderNode::Compile() PREFAST_SUPPRESS_WARNING(6262) //function uses >
+ 		float fChunksNum = (float)((nVertsNumAll - 2) / 2);
+ 		float fTexStep = (m_serializedData.arrTexCoors[1] - m_serializedData.arrTexCoors[0]) / fChunksNum;
+ 
++		// Budget the subdivision over the WHOLE road, not per trapezoid: exceeding the merge cap below
++		// deletes the entire road, so the feature must never be able to reach it. Pick the largest uniform
++		// subdiv whose total grid still fits, and cache it per trapezoid (the integrated test is not cheap).
++		PodArray<int> arrTrapSubdiv, arrTrapCellsX, arrTrapCellsY;
++		int nRequestedSubdiv = 1;
++		int nUsedSubdiv = 1;
++
++		if (bFollowIntegrated)
++		{
++			nRequestedSubdiv = clamp_tpl(GetCVars()->e_RoadsFollowIntegratedObjectsSubdiv, 1, 8);
++
++			const float fUnitSize = GetTerrain()->GetHeightMapUnitSize();
++			const int nMaxGridVerts = 4096; // per trapezoid, on top of the road-wide budget
++
++			for (int nVertId = 0; nVertId <= nVertsNumAll - 4; nVertId += 2)
++			{
++				const Vec3* pVerts = &m_arrVerts[nVertId];
++
++				if (pVerts[0] == pVerts[1] ||
++				    pVerts[1] == pVerts[2] ||
++				    pVerts[2] == pVerts[3] ||
++				    pVerts[3] == pVerts[0])
++				{
++					// skipped by the build loop below, so it costs nothing
++					arrTrapSubdiv.Add(0);
++					arrTrapCellsX.Add(0);
++					arrTrapCellsY.Add(0);
++					continue;
++				}
++
++				AABB WSBBox;
++				WSBBox.Reset();
++				for (int i = 0; i < 4; i++)
++					WSBBox.Add(Vec3(pVerts[i].x, pVerts[i].y, pVerts[i].z));
++
++				const float x1 = std::floor(WSBBox.min.x / fUnitSize) * fUnitSize;
++				const float x2 = std::floor(WSBBox.max.x / fUnitSize) * fUnitSize + fUnitSize;
++				const float y1 = std::floor(WSBBox.min.y / fUnitSize) * fUnitSize;
++				const float y2 = std::floor(WSBBox.max.y / fUnitSize) * fUnitSize + fUnitSize;
++
++				const int nCellsX = max(1, int((x2 - x1) / fUnitSize));
++				const int nCellsY = max(1, int((y2 - y1) / fUnitSize));
++
++				int nSubdivMax = 1;
++				if (Get3DEngine()->HasIntegratedHeightSamplesIn2D(WSBBox))
++				{
++					nSubdivMax = nRequestedSubdiv;
++					while (nSubdivMax > 1 && (nCellsX * nSubdivMax + 1) * (nCellsY * nSubdivMax + 1) > nMaxGridVerts)
++						nSubdivMax--;
++				}
++
++				arrTrapSubdiv.Add(nSubdivMax);
++				arrTrapCellsX.Add(nCellsX);
++				arrTrapCellsY.Add(nCellsY);
++			}
++
++			// Leave headroom: clipping adds vertices on top of the grid counted here.
++			const int64 nVertexBudget = (int64)nMaxVerticesToMerge - (int64)nMaxVerticesToMerge / 8;
++
++			for (nUsedSubdiv = nRequestedSubdiv; nUsedSubdiv > 1; nUsedSubdiv--)
++			{
++				int64 nTotalVerts = 0;
++				for (int i = 0; i < arrTrapSubdiv.Count(); i++)
++				{
++					if (arrTrapSubdiv[i] <= 0)
++						continue;
++					const int s = min(nUsedSubdiv, arrTrapSubdiv[i]);
++					nTotalVerts += (int64)(arrTrapCellsX[i] * s + 1) * (int64)(arrTrapCellsY[i] * s + 1);
++				}
++
++				if (nTotalVerts <= nVertexBudget)
++					break;
++			}
++
++			// At subdiv 1 the cost is the stock grid: if that still overflows it is the pre-existing limit.
++			for (int i = 0; i < arrTrapSubdiv.Count(); i++)
++				arrTrapSubdiv[i] = min(arrTrapSubdiv[i], nUsedSubdiv);
++
++			if (nUsedSubdiv < nRequestedSubdiv && GetCVars()->e_TerrainIntegrateObjectsDebug)
++				PrintMessage("Road '%s': integrated-object subdiv reduced %d -> %d to stay under the %d vertex budget",
++				             GetName(), nRequestedSubdiv, nUsedSubdiv, nMaxVerticesToMerge);
++		}
++
+ 		// for every trapezoid
+ 		for (int nVertId = 0; nVertId <= nVertsNumAll - 4; nVertId += 2)
+ 		{
+@@ -276,21 +359,14 @@ void CRoadRenderNode::Compile() PREFAST_SUPPRESS_WARNING(6262) //function uses >
+ 			float y2 = std::floor(WSBBox.max.y / unitSize) * unitSize + unitSize;
+ 
+ 			// The heightmap grid only resolves an integrated object at terrain cell size. Subdivide it
+-			// where one is present; bounds stay cell aligned so holes and quad diagonals are unaffected.
++			// where one is present; the factor was budgeted road-wide above so the merge cap cannot be hit.
+ 			int nSubdiv = 1;
+ 			float fStep = unitSize;
+ 
+-			if (bFollowIntegrated && Get3DEngine()->HasIntegratedHeightSamplesIn2D(WSBBox))
++			if (bFollowIntegrated)
+ 			{
+-				nSubdiv = clamp_tpl(GetCVars()->e_RoadsFollowIntegratedObjectsSubdiv, 1, 8);
+-
+-				const int nCellsX = max(1, int((x2 - x1) / unitSize));
+-				const int nCellsY = max(1, int((y2 - y1) / unitSize));
+-				const int nMaxGridVerts = 4096; // per trapezoid; the whole road is capped at 32k below
+-
+-				while (nSubdiv > 1 && (nCellsX * nSubdiv + 1) * (nCellsY * nSubdiv + 1) > nMaxGridVerts)
+-					nSubdiv--;
+-
++				const int nTrapIdx = nVertId / 2;
++				nSubdiv = (nTrapIdx < arrTrapSubdiv.Count()) ? max(1, arrTrapSubdiv[nTrapIdx]) : 1;
+ 				fStep = unitSize / (float)nSubdiv;
+ 			}
+ 
+@@ -747,7 +823,8 @@ void CRoadRenderNode::OnTerrainChanged()
+ 		Vec3& vPos = *(Vec3*)&pPos[i * nPosStride];
+ 		const float fX = vWSBoxCenter.x + vPos.x;
+ 		const float fY = vWSBoxCenter.y + vPos.y;
+-		vPos.z = RoadSurfaceZ(bFollowIntegrated, fX, fY, GetTerrain()->GetZApr(fX, fY)) + 0.01f - vWSBoxCenter.z;
++		// Same offset the render path applies, so the two refresh paths agree once the cvar is changed.
++		vPos.z = RoadSurfaceZ(bFollowIntegrated, fX, fY, GetTerrain()->GetZApr(fX, fY)) + max(0.f, GetCVars()->e_RoadsZOffset) - vWSBoxCenter.z;
+ 	}
+ 	m_pRenderMesh->UnlockStream(VSF_GENERAL);
+ 
+-- 
+2.47.1.windows.1
+

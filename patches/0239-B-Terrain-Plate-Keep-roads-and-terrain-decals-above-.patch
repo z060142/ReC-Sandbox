@@ -1,0 +1,174 @@
+From a644866772ecc334bcb1b000e8dfbdb03310df34 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Mon, 31 Aug 2026 09:58:51 +0800
+Subject: [PATCH 239/307] !B (Terrain Plate) Keep roads and terrain decals
+ above baked relief.
+
+Reduce the bake epsilon and optionally compensate the cell-minimum filter for
+the local plate slope. This keeps roads and terrain decals above the baked
+surface without allowing terrain to intersect the plate.
+---
+ .../Geometry/TerrainPlateComponent.cpp        | 104 +++++++++++++++++-
+ 1 file changed, 100 insertions(+), 4 deletions(-)
+
+diff --git a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
+index b6ee7954..6851728f 100644
+--- a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
++++ b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
+@@ -61,9 +61,31 @@ uint32 g_bakeCascadeFrameId = ~0u;
+ const size_t kBakeCascadeMaxPlates = 16;
+ 
+ //! The terrain is kept this far below the plate mesh, so the two surfaces never fight (decision 04,
+-//! rule 1). One centimetre would already be below the 12 bit quantisation of a tall sector; two is
+-//! the value the decision fixed and it is still invisible.
+-const float kBakeEpsilonMeters = 0.02f;
++//! rule 1). It is also the whole budget a road or a terrain decal has to stay visible on a baked
++//! plate: a road renders at terrainZ + e_RoadsZOffset (0.01 m, RoadRenderNode::Render) with a LEQUAL
++//! depth test and no depth write, so anything standing above terrainZ + 0.01 buries it. The step 2
++//! value of 0.02 did exactly that. 0.005 leaves the road 5 mm of margin and is still four decimal
++//! orders above what the depth buffer can resolve at any distance a road is drawn at
++//! (scene-notes/terrain/reports/14-roads-decals-on-top.md section 2).
++//! Revert switch: e_TerrainPlateBakeEpsilon 0.02 restores step 2 behaviour exactly.
++float  g_terrainPlateBakeEpsilon = 0.005f;
++ICVar* g_pTerrainPlateBakeEpsilonCVar = nullptr;
++
++//! Slope correction of the bake Min filter. The plain Min filter takes the lowest plate height over
++//! the half unit halo around a terrain node, which on a slope of gradient g sinks that node about
++//! 0.5 * unitSize * |g| below the plate - 29 cm on a 30 degree slope with a 1 m unit size - and buries
++//! every road and terrain decal on the plate no matter how small the epsilon is. Subtracting the
++//! plate own tangent plane before taking the minimum removes exactly that linear part: the filter
++//! becomes exact on a locally planar plate and still catches every dip, which is what the Min filter
++//! is there for. Revert switch: e_TerrainPlateBakeSlopeCorrect 0.
++int    g_terrainPlateBakeSlopeCorrect = 1;
++ICVar* g_pTerrainPlateBakeSlopeCorrectCVar = nullptr;
++
++//! Clamped so a typo in the console cannot invert the guarantee that the terrain stays under the mesh.
++float GetBakeEpsilonMeters()
++{
++	return clamp_tpl(g_terrainPlateBakeEpsilon, 0.f, 1.f);
++}
+ //! Heights are stored as 12 bit per sector: fRange = (fMax - fMin) / 0x0FFF (terran_edit.cpp:291).
+ const float kTerrainHeightQuantSteps = 4095.f;
+ //! TERRAIN_DEFORMATION_MAX_DEPTH (I3DEngine.h:662): the head room SetTerrainElevation reserves below
+@@ -106,6 +128,23 @@ void RegisterTerrainPlateCVars()
+ 	                                                     "two watched cells of the bake. The probes are also capped to one per touched terrain\n"
+ 	                                                     "sector and to 33 per axis. Smaller catches a smaller sculpt in the middle of a large\n"
+ 	                                                     "plate; the cost is one array lookup per probe per poll.");
++
++	g_pTerrainPlateBakeEpsilonCVar = REGISTER_CVAR2("e_TerrainPlateBakeEpsilon", &g_terrainPlateBakeEpsilon, 0.005f, VF_NULL,
++	                                                "Terrain Plate component with Bake Into Terrain = true: how far in metres the baked\n"
++	                                                "terrain is kept below the plate mesh. It is also the margin a road or a terrain decal has\n"
++	                                                "to win by: both are drawn on the terrain surface with a LEQUAL depth test and no depth\n"
++	                                                "write, a road at terrainZ + e_RoadsZOffset (0.01), so a value at or above 0.01 makes roads\n"
++	                                                "and terrain decals disappear under the plate.\n"
++	                                                "0.02 - the step 2 value, roads and terrain decals are buried\n"
++	                                                "0.005 - default, 5 mm of margin for the road, still far above depth buffer noise");
++
++	g_pTerrainPlateBakeSlopeCorrectCVar = REGISTER_CVAR2("e_TerrainPlateBakeSlopeCorrect", &g_terrainPlateBakeSlopeCorrect, 1, VF_NULL,
++	                                                     "Terrain Plate component with Bake Into Terrain = true: subtract the plate local tangent\n"
++	                                                     "plane before the bake Min filter takes the lowest plate height over a terrain cell. Without\n"
++	                                                     "it the filter sinks a sloped plate terrain by about half a terrain cell of slope drop,\n"
++	                                                     "which buries roads and terrain decals on the plate.\n"
++	                                                     "0 - plain Min filter (step 2 behaviour)\n"
++	                                                     "1 - default, slope corrected: exact on a planar plate, still catches every dip");
+ }
+ 
+ void UnregisterTerrainPlateCVars()
+@@ -120,11 +159,19 @@ void UnregisterTerrainPlateCVars()
+ 
+ 		if (g_pTerrainPlateBakeProbeSpacingCVar != nullptr)
+ 			gEnv->pConsole->UnregisterVariable(g_pTerrainPlateBakeProbeSpacingCVar->GetName());
++
++		if (g_pTerrainPlateBakeEpsilonCVar != nullptr)
++			gEnv->pConsole->UnregisterVariable(g_pTerrainPlateBakeEpsilonCVar->GetName());
++
++		if (g_pTerrainPlateBakeSlopeCorrectCVar != nullptr)
++			gEnv->pConsole->UnregisterVariable(g_pTerrainPlateBakeSlopeCorrectCVar->GetName());
+ 	}
+ 
+ 	g_pTerrainPlateSettleFramesCVar = nullptr;
+ 	g_pTerrainPlateBakeProbeFramesCVar = nullptr;
+ 	g_pTerrainPlateBakeProbeSpacingCVar = nullptr;
++	g_pTerrainPlateBakeEpsilonCVar = nullptr;
++	g_pTerrainPlateBakeSlopeCorrectCVar = nullptr;
+ }
+ 
+ int CTerrainPlateComponent::GetSettleFrames()
+@@ -1769,6 +1816,14 @@ void CTerrainPlateComponent::ComputeBakeBlock(const SBakeTerrainMetrics& metrics
+ 
+ 			float plateMin = centreZ;
+ 			int   samplesTaken = 0;
++
++			// The halo samples are kept so the slope correction below can run a second pass over them.
++			// samplesPerAxis is clamped to 6, so 36 covers the whole grid.
++			float sampleZ[36];
++			float sampleDX[36];
++			float sampleDY[36];
++			int   sampleCount = 0;
++
+ 			for (int sx = 0; sx < samplesPerAxis; ++sx)
+ 			{
+ 				for (int sy = 0; sy < samplesPerAxis; ++sy)
+@@ -1780,17 +1835,58 @@ void CTerrainPlateComponent::ComputeBakeBlock(const SBakeTerrainMetrics& metrics
+ 					if (SamplePlateSurface(worldTM, px, py, z, ignoreX, ignoreY))
+ 					{
+ 						plateMin = min(plateMin, z);
++
++						if (sampleCount < (int)CRY_ARRAY_COUNT(sampleZ))
++						{
++							sampleZ[sampleCount] = z;
++							sampleDX[sampleCount] = px - worldX;
++							sampleDY[sampleCount] = py - worldY;
++							++sampleCount;
++						}
++
+ 						++samplesTaken;
+ 					}
+ 				}
+ 			}
+ 
++			// Slope correction (report 14). The plain minimum above is the plate height at the node minus the
++			// drop of the plate over half a terrain cell, so on a slope it puts the terrain node well under the
++			// mesh and buries the road standing on it. Subtracting the plate own tangent plane first leaves
++			// only the deviation from that plane: zero on a locally planar plate (the node then lands on the
++			// mesh, minus the epsilon), still negative inside any dip, which is the case the Min filter exists
++			// for. The gradient is a least squares fit over the same halo samples, taken only when the cell is
++			// fully covered: the sample grid is then symmetric around the node, sum(dx) is zero and the fit
++			// reduces to the two closed forms below. A partly covered cell sits on the rim of a rotated plate,
++			// where the falloff blends the whole cell back to the baseline anyway.
++			if (g_terrainPlateBakeSlopeCorrect != 0 && sampleCount > 1 && samplesTaken == samplesPerAxis * samplesPerAxis)
++			{
++				float sumXX = 0.f, sumYY = 0.f, sumXZ = 0.f, sumYZ = 0.f;
++				for (int i = 0; i < sampleCount; ++i)
++				{
++					sumXX += sampleDX[i] * sampleDX[i];
++					sumYY += sampleDY[i] * sampleDY[i];
++					sumXZ += sampleDX[i] * sampleZ[i];
++					sumYZ += sampleDY[i] * sampleZ[i];
++				}
++
++				const float gradX = (sumXX > 1e-6f) ? (sumXZ / sumXX) : 0.f;
++				const float gradY = (sumYY > 1e-6f) ? (sumYZ / sumYY) : 0.f;
++
++				float corrected = centreZ;
++				for (int i = 0; i < sampleCount; ++i)
++					corrected = min(corrected, sampleZ[i] - gradX * sampleDX[i] - gradY * sampleDY[i]);
++
++				// Never above the plate height at the node, and never below what the plain Min filter would have
++				// written: the correction can only give ground back, never take more.
++				plateMin = clamp_tpl(corrected, plateMin, centreZ);
++			}
++
+ 			const size_t index = (size_t)ux * dim + uy;
+ 			const float baseline = m_bakeBaseline[index];
+ 
+ 			// The plate surface the terrain is asked to meet, kept the epsilon below the mesh so the two
+ 			// can never fight (decision 04 rule 1).
+-			const float plateSurface = plateMin - kBakeEpsilonMeters;
++			const float plateSurface = plateMin - GetBakeEpsilonMeters();
+ 
+ 			// Bake Mode.
+ 			//  * Raise:          max(baseline, plate). Where the plate is above the old ground the terrain
+-- 
+2.47.1.windows.1
+

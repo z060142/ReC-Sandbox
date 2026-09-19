@@ -1,0 +1,513 @@
+From 6279c68a1ef4768d49b480e4ec6d2e7ef7e54ba7 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Tue, 1 Sep 2026 08:12:21 +0800
+Subject: [PATCH 258/307] !F (Terrain Integration) Suppress duplicate camera
+ draws for integrated geometry.
+
+Track whether every triangle of an object was accepted by the terrain sector.
+At full integration level 2, suppress that object's camera draw only where the
+terrain copy is complete, retaining fallback material for partial integration.
+---
+ Code/CryEngine/Cry3DEngine/3dEngine.cpp       | 34 +++++++
+ Code/CryEngine/Cry3DEngine/3dEngine.h         |  7 ++
+ Code/CryEngine/Cry3DEngine/Brush.cpp          | 16 ++++
+ Code/CryEngine/Cry3DEngine/Brush.h            | 18 ++++
+ Code/CryEngine/Cry3DEngine/cvars.cpp          | 12 ++-
+ Code/CryEngine/Cry3DEngine/terrain.cpp        | 48 ++++++++++
+ Code/CryEngine/Cry3DEngine/terrain.h          |  5 +
+ Code/CryEngine/Cry3DEngine/terrain_node.cpp   | 10 ++
+ Code/CryEngine/Cry3DEngine/terrain_sector.h   | 18 ++++
+ .../Cry3DEngine/terrain_sector_render.cpp     | 96 ++++++++++++++++++-
+ 10 files changed, 257 insertions(+), 7 deletions(-)
+
+diff --git a/Code/CryEngine/Cry3DEngine/3dEngine.cpp b/Code/CryEngine/Cry3DEngine/3dEngine.cpp
+index 8b08e939..eca3fbf0 100644
+--- a/Code/CryEngine/Cry3DEngine/3dEngine.cpp
++++ b/Code/CryEngine/Cry3DEngine/3dEngine.cpp
+@@ -6874,6 +6874,40 @@ void C3DEngine::RefreshIntegratedNodeBoxes()
+ 	}
+ }
+ 
++///////////////////////////////////////////////////////////////////////////////
++void C3DEngine::UpdateIntegratedObjectDrawSuppression(const SRenderingPassInfo& passInfo)
++{
++	// Full 0 and Full 1 must be bit identical to what they were, so nothing is ever stamped below 2 and
++	// no brush can carry this frame's id. The map is empty on any level that does not integrate.
++	if (GetCVars()->e_TerrainIntegrateObjectsFull < 2 || !m_bIntegrateObjectsIntoTerrain || m_integratedIntoTerrainNodes.empty())
++		return;
++
++	CTerrain* const pTerrain = GetTerrain();
++
++	if (!pTerrain)
++		return;
++
++	const int nMainFrameId = (int)passInfo.GetMainFrameID();
++
++	for (std::map<IRenderNode*, AABB>::const_iterator it = m_integratedIntoTerrainNodes.begin();
++	     it != m_integratedIntoTerrainNodes.end(); ++it)
++	{
++		IRenderNode* pNode = it->first;
++
++		// Only eERType_MovableBrush ever enters this map (UpdateTerrainObjectIntegration), and only
++		// CBrush implements the suppression, but the cast is worth guarding anyway.
++		if (pNode->GetRenderNodeType() != eERType_MovableBrush)
++			continue;
++
++		// The live box, not the cached one: the cached box is what the sectors were invalidated for and
++		// may lag a debounced move, and lagging here would be the unsafe direction.
++		if (!pTerrain->IsObjectDrawnByTerrain(pNode, pNode->GetBBox(), nMainFrameId))
++			continue;
++
++		static_cast<CBrush*>(pNode)->m_nTerrainDrawsMeFrameId = nMainFrameId;
++	}
++}
++
+ ///////////////////////////////////////////////////////////////////////////////
+ bool C3DEngine::HasIntegratedObjectsInBoxXY(const AABB& box) const
+ {
+diff --git a/Code/CryEngine/Cry3DEngine/3dEngine.h b/Code/CryEngine/Cry3DEngine/3dEngine.h
+index e633c57a..00ab1b10 100644
+--- a/Code/CryEngine/Cry3DEngine/3dEngine.h
++++ b/Code/CryEngine/Cry3DEngine/3dEngine.h
+@@ -886,6 +886,13 @@ public:
+ 	//! still for long enough. Called once per frame from Update().
+ 	void FlushPendingTerrainRebuilds();
+ 
++	//! Decision 05 step 2 (e_TerrainIntegrateObjectsFull 2). Called once per frame from CTerrain::CheckVis,
++	//! after the terrain traversal has picked this frame's sectors and before the outdoor octree is
++	//! traversed, so the verdict is exact for the same frame. Stamps every integrated brush that the
++	//! terrain is drawing in full this frame; CBrush::Render then skips its own camera draw. Objects that
++	//! are not stamped simply draw as before - the whole gate is one-sided in that direction.
++	void UpdateIntegratedObjectDrawSuppression(const SRenderingPassInfo& passInfo);
++
+ 	//! Schedule a full rebuild of every eERType_Road node whose bounding box overlaps `box` in XY, so a
+ 	//! road that drapes over an integrating object (e_RoadsFollowIntegratedObjects) follows it when the
+ 	//! object appears, moves or goes away. No-op while the cvar is 0.
+diff --git a/Code/CryEngine/Cry3DEngine/Brush.cpp b/Code/CryEngine/Cry3DEngine/Brush.cpp
+index febb2bd3..e963b979 100644
+--- a/Code/CryEngine/Cry3DEngine/Brush.cpp
++++ b/Code/CryEngine/Cry3DEngine/Brush.cpp
+@@ -160,6 +160,14 @@ void CBrush::Render(const struct SRendParams& _EntDrawParams, const SRenderingPa
+ 		const uint64 camTest = (ERF_HIDDEN_FROM_CAMERA);
+ 		if ((m_dwRndFlags & camTest) != 0)
+ 			return;
++
++		// Decision 05 step 2: the terrain is drawing all of this brush's triangles itself this frame, in
++		// the terrain base pass, with terrain shading. Drawing it a second time here is what z-fights at
++		// distance, so it is skipped - in camera passes only. Shadow and recursive passes never reach
++		// this test and keep the object exactly as it was; so do SVOGI, HeightMap AO, physics, the
++		// heightmap and Sandbox selection, none of which run through CBrush::Render.
++		if (IsDrawnByTerrainThisFrame(passInfo))
++			return;
+ 	}
+ 
+ 	if (passInfo.IsRecursivePass())
+@@ -822,6 +830,14 @@ void CBrush::Render(const CLodValue& lodValue, const SRenderingPassInfo& passInf
+ 		const uint64 camTest = (ERF_HIDDEN_FROM_CAMERA);
+ 		if ((m_dwRndFlags & camTest) != 0)
+ 			return;
++
++		// Decision 05 step 2: the terrain is drawing all of this brush's triangles itself this frame, in
++		// the terrain base pass, with terrain shading. Drawing it a second time here is what z-fights at
++		// distance, so it is skipped - in camera passes only. Shadow and recursive passes never reach
++		// this test and keep the object exactly as it was; so do SVOGI, HeightMap AO, physics, the
++		// heightmap and Sandbox selection, none of which run through CBrush::Render.
++		if (IsDrawnByTerrainThisFrame(passInfo))
++			return;
+ 	}
+ 
+ 	if (passInfo.IsRecursivePass())
+diff --git a/Code/CryEngine/Cry3DEngine/Brush.h b/Code/CryEngine/Cry3DEngine/Brush.h
+index 13e2d3c6..e9b9808f 100644
+--- a/Code/CryEngine/Cry3DEngine/Brush.h
++++ b/Code/CryEngine/Cry3DEngine/Brush.h
+@@ -136,6 +136,24 @@ public:
+ 
+ 	//! Per instance parameters of the eGM_IntegrateIntoTerrain mode. Default constructed = stock behaviour.
+ 	STerrainIntegrationParams m_terrainIntegrationParams;
++
++	//! Decision 05 step 2 (e_TerrainIntegrateObjectsFull 2). Main frame id in which the terrain was found
++	//! to be drawing every one of this brush's triangles itself, written once per frame by
++	//! C3DEngine::UpdateIntegratedObjectDrawSuppression before any object is traversed, and read by
++	//! CBrush::Render to skip the camera draw for exactly that frame. A per-draw check rather than a
++	//! persistent ERF_HIDDEN_FROM_CAMERA mutation: nothing outside the camera pass can see it, it cannot
++	//! be saved into a level or leak past a cvar change, and it expires by itself.
++	uint32 m_nTerrainDrawsMeFrameId = 0;
++
++	//! True while this brush may skip its own camera draw because the terrain is drawing it. One compare
++	//! for every brush in the scene; the selection exemption keeps the editor's GPU selection highlight
++	//! (which rides on the general pass render object) working on the object the user is dragging.
++	ILINE bool IsDrawnByTerrainThisFrame(const SRenderingPassInfo& passInfo) const
++	{
++		return m_nTerrainDrawsMeFrameId != 0
++		       && m_nTerrainDrawsMeFrameId == passInfo.GetMainFrameID()
++		       && (m_dwRndFlags & ERF_SELECTED) == 0;
++	}
+ };
+ 
+ ///////////////////////////////////////////////////////////////////////////////
+diff --git a/Code/CryEngine/Cry3DEngine/cvars.cpp b/Code/CryEngine/Cry3DEngine/cvars.cpp
+index 68649a57..ff52e421 100644
+--- a/Code/CryEngine/Cry3DEngine/cvars.cpp
++++ b/Code/CryEngine/Cry3DEngine/cvars.cpp
+@@ -549,13 +549,21 @@ void CVars::Init()
+ 	              "1 - the appended copy is also drawn by the terrain BASE pass, so it gets the terrain\n"
+ 	              "    macro colour and normal atlas. The object still draws itself as well, so the\n"
+ 	              "    surface is drawn twice (the appended copy wins the depth test)\n"
+-	              "2 - additionally hide the object from camera passes where terrain fully took it\n"
+-	              "    (not implemented yet - behaves like 1)");
++	              "2 - additionally skip the object's OWN camera draw wherever the terrain is drawing all\n"
++	              "    of its triangles this frame, which removes the double draw and the z-fighting it\n"
++	              "    causes at distance. Shadows, SVOGI, HeightMap AO, physics and selection are\n"
++	              "    unaffected, and so are reflections (the object still draws there). An object is\n"
++	              "    only skipped while every LOD 0 sector under it is the sector being drawn and took\n"
++	              "    all of its triangles; a rejected triangle, the slope transition band, a budget\n"
++	              "    overflow, a streaming retry or LOD >= 1 all put the object's own draw back.\n"
++	              "    Also forces e_TerrainIntegrateObjectsPushOut to 0.");
+ 	REGISTER_CVAR(e_TerrainIntegrateObjectsPushOut, 0.02f, VF_NULL,
+ 	              "Meters the vertices of an integrated object are pushed out along their normal before\n"
+ 	              "they are appended to the terrain sector mesh. The push exists so the appended copy\n"
+ 	              "beats the object's own opaque pixels; it costs exactly that much geometric error\n"
+ 	              "against the object's collision surface, its shadow and the road drape.\n"
++	              "Ignored (forced to 0) while e_TerrainIntegrateObjectsFull is 2: with the object's own\n"
++	              "draw gone the push has no job left and would only lift the surface off its collision.\n"
+ 	              "0.02 - stock behaviour");
+ 	REGISTER_CVAR(e_TerrainIntegrateObjectsLodHoldDistance, 0.f, VF_NULL,
+ 	              "Decision 06 C4. Metres out to which a terrain sector that contains an object with the\n"
+diff --git a/Code/CryEngine/Cry3DEngine/terrain.cpp b/Code/CryEngine/Cry3DEngine/terrain.cpp
+index f1cec3f1..1c6ebec7 100644
+--- a/Code/CryEngine/Cry3DEngine/terrain.cpp
++++ b/Code/CryEngine/Cry3DEngine/terrain.cpp
+@@ -32,6 +32,47 @@ void CTerrain::AddVisSector(CTerrainNode* pNode, FrustumMaskType passCullMask)
+ 	m_lstVisSectors.Add(STerrainVisItem(pNode, passCullMask));
+ }
+ 
++bool CTerrain::IsObjectDrawnByTerrain(const IRenderNode* pNode, const AABB& objBox, int nMainFrameId) const
++{
++	if (m_arrSecInfoPyramid.IsEmpty() || !m_pParentNode)
++		return false;
++
++	const int nSectorSize = CTerrain::GetSectorSize();
++	const int nTableSize = CTerrain::GetSectorsTableSize();
++
++	if (nSectorSize <= 0 || nTableSize <= 0)
++		return false;
++
++	// Anything hanging over the edge of the terrain has no sector to be drawn by, so it draws itself.
++	if (objBox.min.x < 0.f || objBox.min.y < 0.f || objBox.max.x >= (float)m_nTerrainSize || objBox.max.y >= (float)m_nTerrainSize)
++		return false;
++
++	// The footprint in XY only, deliberately, exactly as HasIntegratedObjectsInBoxXY: what decides
++	// which sectors have to agree is where the object lands, not how high or how deep it is.
++	const int nX0 = (int)objBox.min.x / nSectorSize;
++	const int nX1 = (int)objBox.max.x / nSectorSize;
++	const int nY0 = (int)objBox.min.y / nSectorSize;
++	const int nY1 = (int)objBox.max.y / nSectorSize;
++
++	if (nX0 < 0 || nY0 < 0 || nX1 >= nTableSize || nY1 >= nTableSize)
++		return false;
++
++	// AND over every covering sector: one object can straddle four LOD 0 sectors, each rebuilt and each
++	// LOD-selected independently, and one disagreement is enough to need the object's own draw again.
++	for (int x = nX0; x <= nX1; x++)
++	{
++		for (int y = nY0; y <= nY1; y++)
++		{
++			const CTerrainNode* pSector = m_arrSecInfoPyramid[0][x][y];
++
++			if (!pSector || !pSector->IsDrawingIntegratedObject(pNode, nMainFrameId))
++				return false;
++		}
++	}
++
++	return true;
++}
++
+ void CTerrain::CheckVis(const SRenderingPassInfo& passInfo, FrustumMaskType passCullMask)
+ {
+ 	FUNCTION_PROFILER_3DENGINE;
+@@ -54,6 +95,13 @@ void CTerrain::CheckVis(const SRenderingPassInfo& passInfo, FrustumMaskType pass
+ 		GetParentNode()->CheckVis(false, (GetCVars()->e_CoverageBufferTerrain != 0) && (GetCVars()->e_CoverageBuffer != 0), passInfo, passCullMask);
+ 	}
+ 
++	// Decision 05 step 2. Every LOD 0 sector now carries this frame's "the traversal stopped at me"
++	// stamp, and RenderScene runs this before it traverses the outdoor octree (3DEngineRender.cpp), so
++	// the answer computed here is exact for the same frame's object draws - no latch, no latency - and
++	// it is computed once on the main thread, so CBrush::Render only reads a plain frame id.
++	if (passInfo.IsGeneralPass())
++		Get3DEngine()->UpdateIntegratedObjectDrawSuppression(passInfo);
++
+ 	if (passInfo.IsGeneralPass())
+ 	{
+ 		if (m_fDistanceToSectorWithWater < 0)
+diff --git a/Code/CryEngine/Cry3DEngine/terrain.h b/Code/CryEngine/Cry3DEngine/terrain.h
+index 39d4ad72..b930a94b 100644
+--- a/Code/CryEngine/Cry3DEngine/terrain.h
++++ b/Code/CryEngine/Cry3DEngine/terrain.h
+@@ -298,6 +298,11 @@ public:
+ 	void          UpdateSectorMeshes(const SRenderingPassInfo& passInfo);
+ 	void          AddVisSector(CTerrainNode* pNode, FrustumMaskType passCullMask);
+ 
++	//! Decision 05 step 2. True only when every LOD 0 sector the object's bbox touches is, this frame,
++	//! the sector the terrain traversal stopped at AND holds all of that object's triangles. Answers
++	//! "no" to everything it is not certain about, so the failure mode is a double draw, never a hole.
++	bool          IsObjectDrawnByTerrain(const IRenderNode* pNode, const AABB& objBox, int nMainFrameId) const;
++
+ 	void          GetVegetationMaterials(std::vector<IMaterial*>*& pMatTable);
+ 	void          LoadVegetationData(PodArray<struct StatInstGroup>& rTable, PodArray<StatInstGroupChunk>& lstFileChunks, int i);
+ 
+diff --git a/Code/CryEngine/Cry3DEngine/terrain_node.cpp b/Code/CryEngine/Cry3DEngine/terrain_node.cpp
+index d63d9744..f0d5da09 100644
+--- a/Code/CryEngine/Cry3DEngine/terrain_node.cpp
++++ b/Code/CryEngine/Cry3DEngine/terrain_node.cpp
+@@ -306,6 +306,14 @@ bool CTerrainNode::CheckVis(bool bAllInside, bool bAllowRenderIntoCBuffer, const
+ 	}
+ 	else
+ 	{
++		// Decision 05 step 2: the traversal stopped here, so for this frame THIS sector's mesh is the
++		// terrain over its footprint. Only a LOD 0 sector carries appended object triangles at all
++		// (BuildVertices gates on !m_nTreeLevel), and only the general pass may suppress an object's
++		// own draw, so nothing else is worth stamping. A recursive or shadow pass deliberately leaves
++		// the stamp alone: those passes keep drawing the object (research/10 3.2).
++		if (!m_nTreeLevel && passInfo.IsGeneralPass())
++			m_nIntegrationDrawFrameId = (int)passInfo.GetMainFrameID();
++
+ 		if (Get3DEngine()->IsStatObjBufferRenderTasksAllowed() && passInfo.IsGeneralPass())
+ 		{
+ 			GetObjManager()->PushIntoCullQueue(SCheckOcclusionJobData::CreateTerrainJobData(this, boxWS, distance, passCullMask));
+@@ -383,6 +391,8 @@ void CTerrainNode::Init(int x1, int y1, int nNodeSize, CTerrainNode* pParent, bo
+ 	m_nIntegratedTrisRejected = 0;
+ 	m_bIntegrationRetryPending = false;
+ 	m_nIntegrationRetriesLeft = kMaxIntegrationRetries;
++	m_lstFullyIntegratedObjects.Clear();
++	m_nIntegrationDrawFrameId = 0;
+ 	m_pParent = NULL;
+ 	//m_nSetupTexGensFrameId=0;
+ 
+diff --git a/Code/CryEngine/Cry3DEngine/terrain_sector.h b/Code/CryEngine/Cry3DEngine/terrain_sector.h
+index ca587671..039c966d 100644
+--- a/Code/CryEngine/Cry3DEngine/terrain_sector.h
++++ b/Code/CryEngine/Cry3DEngine/terrain_sector.h
+@@ -512,6 +512,24 @@ public:
+ 	static const int           kMaxIntegrationRetries = 8;
+ 	bool                       m_bIntegrationRetryPending;// an integrated object had no render mesh yet, rebuild once more
+ 	int                        m_nIntegrationRetriesLeft; // remaining retries, so a mesh that never arrives cannot spin
++
++	// Decision 05 step 2 (e_TerrainIntegrateObjectsFull 2), the "is terrain drawing this object right
++	// now" gate. Two independent halves, both of which must hold before an object may skip its own
++	// camera draw:
++	//  - m_lstFullyIntegratedObjects: the objects this sector examined on its last rebuild and took
++	//    ENTIRELY. An object that lost even one triangle here (height band, slope limit, slope
++	//    transition band, vertex/index budget, missing render mesh, missing material, unusable chunk)
++	//    is deliberately absent, so the query fails closed and the object keeps drawing itself.
++	//    Cleared at the START of every rebuild, never at the end, so an object is never hidden on a
++	//    stale acceptance while its sector sits between invalidation and rebuild (research/10 hazard 6).
++	//  - m_nIntegrationDrawFrameId: the main frame id of the last general pass in which the terrain
++	//    traversal stopped at THIS sector, i.e. the frame in which this LOD 0 mesh is the one drawn.
++	//    Stamped in CTerrainNode::CheckVis; a coarser ancestor stopping instead leaves it stale.
++	PodArray<IRenderNode*>     m_lstFullyIntegratedObjects;
++	int                        m_nIntegrationDrawFrameId = 0;
++
++	bool                       IsDrawingIntegratedObject(const IRenderNode* pNode, int nMainFrameId) const;
++
+ 	struct CTerrainNode*       m_pParent = nullptr;
+ 	float                      m_arrfDistance[MAX_RECURSION_LEVELS] = {};
+ 	int                        m_nNodeTextureOffset = -1;
+diff --git a/Code/CryEngine/Cry3DEngine/terrain_sector_render.cpp b/Code/CryEngine/Cry3DEngine/terrain_sector_render.cpp
+index dc3dd7a9..bded5519 100644
+--- a/Code/CryEngine/Cry3DEngine/terrain_sector_render.cpp
++++ b/Code/CryEngine/Cry3DEngine/terrain_sector_render.cpp
+@@ -672,6 +672,11 @@ void CTerrainNode::ReleaseHeightMapGeometry(bool bRecursive, const AABB* pBox)
+ 	delete m_pLeafData;
+ 	m_pLeafData = NULL;
+ 
++	// Decision 05 step 2: the mesh that held the appended triangles is gone, so this sector no longer
++	// draws anything for anybody. The query below also tests m_pLeafData, but dropping the pointers
++	// here keeps the list from outliving the nodes it names.
++	m_lstFullyIntegratedObjects.Clear();
++
+ 	if (bRecursive && m_pChilds)
+ 		for (int i = 0; i < 4; i++)
+ 			m_pChilds[i].ReleaseHeightMapGeometry(bRecursive, pBox);
+@@ -1491,6 +1496,32 @@ static void ApplyIntegrationBlendWeight(SVF_P2S_N4B_C4B_T1F& vert, float fBlendW
+ }
+ 
+ // add triangles (from marked objects) intersecting terrain
++// Decision 05 step 2. "Is this sector drawing all of that object's triangles right now?" - the per
++// sector half of the e_TerrainIntegrateObjectsFull 2 gate. Every condition is written so that the
++// unknown answer is "no": an object that is not certainly being drawn by the terrain keeps its own
++// draw, which costs a double draw, while the opposite mistake costs a hole.
++bool CTerrainNode::IsDrawingIntegratedObject(const IRenderNode* pNode, int nMainFrameId) const
++{
++	// The terrain traversal has to have stopped at THIS sector in this frame's general pass. If a
++	// coarser ancestor stopped instead (LOD >= 1), or the branch was culled, the stamp is stale.
++	if (!m_nIntegrationDrawFrameId || m_nIntegrationDrawFrameId != nMainFrameId)
++		return false;
++
++	// The mesh that carries the appended triangles has to exist. Between ResetTerrainVertBuffers and
++	// the lazy rebuild there is none, and while an integrated object's render mesh is still streaming
++	// in the sector is waiting for a retry - in both windows the object has to draw itself.
++	if (!m_pLeafData || !m_pLeafData->m_pRenderMesh || m_bIntegrationRetryPending)
++		return false;
++
++	for (int i = 0; i < m_lstFullyIntegratedObjects.Count(); i++)
++	{
++		if (m_lstFullyIntegratedObjects[i] == pNode)
++			return true;
++	}
++
++	return false;
++}
++
+ void CTerrainNode::AppendTrianglesFromObjects(const int nOriginX, const int nOriginY, CTerrain* pTerrain, const float stepSize, const int nTerrainSize)
+ {
+ 	AABB aabbTNode = GetBBox();
+@@ -1500,9 +1531,13 @@ void CTerrainNode::AppendTrianglesFromObjects(const int nOriginX, const int nOri
+ 	// Distance the appended vertices are pushed out along their normal. It exists only so the appended
+ 	// copy beats the object's own opaque pixels; it costs exactly that much geometric error against the
+ 	// object's collision surface, its shadow and the road drape. Stock is the literal 0.02f this
+-	// replaces. Once the object's own draw is suppressed (e_TerrainIntegrateObjectsFull 2) the push has
+-	// no job left and should be set to 0.
+-	const float fPushOut = GetCVars()->e_TerrainIntegrateObjectsPushOut;
++	// replaces. In full mode 2 the object's own draw is suppressed, so the push has no job left and is
++	// forced to 0 (decision 05 A2): the -0.005 clip bias alone separates the appended copy from the
++	// baked grid, and the visible surface drops back onto the collision surface. The cvar is part of
++	// m_fRefreshSceneDataCVarsSumm, so switching modes rebuilds every sector.
++	const float fPushOut = (GetCVars()->e_TerrainIntegrateObjectsFull >= 2)
++	                       ? 0.f
++	                       : GetCVars()->e_TerrainIntegrateObjectsPushOut;
+ 
+ 	PodArray<IRenderNode*> lstObjects;
+ 	Get3DEngine()->GetObjectsByTypeGlobal(lstObjects, eERType_MovableBrush, &aabbTNode);
+@@ -1529,6 +1564,12 @@ void CTerrainNode::AppendTrianglesFromObjects(const int nOriginX, const int nOri
+ 	m_boxIntegratedTransition.Reset();
+ 	m_boxIntegratedRejected.Reset();
+ 
++	// Cleared at the START of the rebuild (research/10 hazard 6): between here and the moment an object
++	// is re-added below, nothing may hide itself on this sector's account. A rebuild that is abandoned
++	// half way, or one that loses an object to streaming, therefore leaves the object drawing itself -
++	// a frame of harmless double draw instead of a frame of hole.
++	m_lstFullyIntegratedObjects.Clear();
++
+ 	bool bRenderMeshMissing = false;
+ 
+ 	for (int i = 0; i < lstObjects.Count(); i++)
+@@ -1540,9 +1581,18 @@ void CTerrainNode::AppendTrianglesFromObjects(const int nOriginX, const int nOri
+ 			continue;
+ 		}
+ 
++		// Decision 05 step 2: every triangle of this object inside this sector made it into the mesh.
++		// Starts optimistic and is cleared by the first loss of any kind; only an object that survives
++		// with it still set is allowed to skip its own camera draw in full mode 2. A triangle that
++		// belongs to a neighbouring sector is not a loss - the neighbouring sector accounts for it, and
++		// the query ANDs over every sector the object's bbox touches.
++		bool bObjectFullyAccepted = true;
++
+ 		// The terrain layer overlay is stencil gated on the object's own opaque draw; without
+ 		// ERF_FOB_ALLOW_TERRAIN_LAYER_BLEND the integrated triangles are built and then discarded.
+-		if (!(pRNode->GetRndFlags() & ERF_FOB_ALLOW_TERRAIN_LAYER_BLEND))
++		// Decision 05 A7: in full mode the appended triangles are in the terrain base pass, so the
++		// stencil comes from the terrain's own draw and the flag is no longer required.
++		if (!(pRNode->GetRndFlags() & ERF_FOB_ALLOW_TERRAIN_LAYER_BLEND) && !GetCVars()->e_TerrainIntegrateObjectsFull)
+ 		{
+ 			WarnAboutIntegratedObjectOnce(pRNode, nullptr, "has GI mode 'Integrate Into Terrain' but no ERF_FOB_ALLOW_TERRAIN_LAYER_BLEND: "
+ 			                                               "the integrated triangles will be killed by the stencil test (use e_TerrainBlendingDebug 2 to confirm)");
+@@ -1580,6 +1630,7 @@ void CTerrainNode::AppendTrianglesFromObjects(const int nOriginX, const int nOri
+ 			// The LOD 0 render mesh is not resident yet (streaming). Remember it, so the sector is
+ 			// rebuilt again shortly instead of leaving a hole until the object happens to move.
+ 			bRenderMeshMissing = true;
++			bObjectFullyAccepted = false;
+ 		}
+ 
+ 		if (pRM)
+@@ -1591,6 +1642,9 @@ void CTerrainNode::AppendTrianglesFromObjects(const int nOriginX, const int nOri
+ 			vtx_idx* pInds = pRM->GetIndexPtr(FSL_READ);
+ 			byte* pTangs = pRM->GetTangentPtr(nTangsStride, FSL_READ);
+ 
++			if (!pInds || !pPos || !pTangs)
++				bObjectFullyAccepted = false;
++
+ 			if (pInds && pPos && pTangs)
+ 			{
+ 				const int nIndicesBeforeObject = m_pUpdateTerrainTempData->m_StripsInfo.idx_array.Count();
+@@ -1626,9 +1680,24 @@ void CTerrainNode::AppendTrianglesFromObjects(const int nOriginX, const int nOri
+ 						const SShaderItem& shaderItem = pMat->GetShaderItem(pChunk->m_nMatID);
+ 
+ 						if (!shaderItem.m_pShader || !shaderItem.m_pShaderResources)
++						{
++							// Unknown: it may or may not draw, so assume it does and keep the object's draw.
++							bObjectFullyAccepted = false;
++							continue;
++						}
++
++						const uint32 nShaderFlags = shaderItem.m_pShader->GetFlags();
++
++						// EF_NODRAW and MTL_FLAG_NODRAW chunks are not drawn by the object either, so
++						// leaving them out of the sector mesh costs nothing. An EF_DECAL chunk however is
++						// still drawn by the object, so it has to keep its own draw.
++						if (nShaderFlags & EF_DECAL)
++						{
++							bObjectFullyAccepted = false;
+ 							continue;
++						}
+ 
+-						if (shaderItem.m_pShader->GetFlags() & (EF_NODRAW | EF_DECAL))
++						if (nShaderFlags & EF_NODRAW)
+ 							continue;
+ 
+ 						int lastIndex = pChunk->nFirstIndexId + pChunk->nNumIndices;
+@@ -1649,6 +1718,7 @@ void CTerrainNode::AppendTrianglesFromObjects(const int nOriginX, const int nOri
+ 								                              bOutOfVerts ? "does not fit the terrain integration vertex budget and is truncated"
+ 								                                          : "does not fit the terrain integration index budget and is truncated",
+ 								                              szDetails);
++								bObjectFullyAccepted = false;
+ 								break;
+ 							}
+ 
+@@ -1690,6 +1760,7 @@ void CTerrainNode::AppendTrianglesFromObjects(const int nOriginX, const int nOri
+ 							{
+ 								nTrisRejected++;
+ 								nObjectTrisClassified++;
++								bObjectFullyAccepted = false;
+ 								if (bDebugBoxes)
+ 									m_boxIntegratedRejected.Add(triBox);
+ 								continue;
+@@ -1718,6 +1789,7 @@ void CTerrainNode::AppendTrianglesFromObjects(const int nOriginX, const int nOri
+ 								{
+ 									nTrisRejected++;
+ 									nObjectTrisClassified++;
++									bObjectFullyAccepted = false;
+ 									if (bDebugBoxes)
+ 										m_boxIntegratedRejected.Add(triBox);
+ 									continue;
+@@ -1728,6 +1800,11 @@ void CTerrainNode::AppendTrianglesFromObjects(const int nOriginX, const int nOri
+ 									const float t = (fSlopeDeg - fSlopeBandStartDeg) / fSlopeBlendDeg;
+ 									fBlendWeight = 1.f - (t * t * (3.f - 2.f * t)); // 1 - smoothstep(t)
+ 									nObjectTrisClassified++;
++
++									// The transition band exists to fade the terrain layers back into the
++									// OBJECT's own material, so a faded triangle needs that material on
++									// screen. Treat it as a partial acceptance and keep the object's draw.
++									bObjectFullyAccepted = false;
+ 								}
+ 							}
+ 
+@@ -1847,6 +1924,15 @@ void CTerrainNode::AppendTrianglesFromObjects(const int nOriginX, const int nOri
+ 
+ 			pRM->UnLockForThreadAccess();
+ 		}
++
++		// Decision 05 step 2. Publish the per object verdict for this sector. Reaching this line means
++		// the object was examined to the end: either every triangle of it that belongs to this sector is
++		// now in the mesh, or bObjectFullyAccepted was cleared on the way. Objects that left the loop
++		// early (no material) never get here and are therefore never listed, which is the safe answer.
++		// An object listed with zero triangles taken is correct too: all of its geometry belongs to a
++		// neighbouring sector, and the query ANDs this sector's verdict with that neighbour's.
++		if (bObjectFullyAccepted)
++			m_lstFullyIntegratedObjects.Add(pRNode);
+ 	}
+ 
+ 	if (bRenderMeshMissing && m_nIntegrationRetriesLeft > 0)
+-- 
+2.47.1.windows.1
+

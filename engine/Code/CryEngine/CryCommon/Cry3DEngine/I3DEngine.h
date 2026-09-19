@@ -818,6 +818,9 @@ struct ITerrain
 	//! x1, y1, nSizeX, nSizeY are in terrain units
 	//! pTerrainBlock points to a square 2D array with dimensions GetTerrainSize()
 	//! by default update only elevation.
+	//! pSurfaceData may be nullptr: only the heights change, every touched cell keeps its surface bits
+	//! (nSurfOrgX/Y and nSurfSizeX/Y are ignored). Use this for heights-only writes - there is no
+	//! lossless surface read-back, so a read-modify-write round trip would collapse blended weights.
 	virtual void SetTerrainElevation(int x1, int y1, int nSizeX, int nSizeY, float* pTerrainBlock, SSurfaceTypeItem* pSurfaceData, int nSurfOrgX, int nSurfOrgY, int nSurfSizeX, int nSurfSizeY, uint32* pResolMap, int nResolMapSizeX, int nResolMapSizeY) = 0;
 
 	//! Checks if it is possible to paint on the terrain with a given surface type ID.

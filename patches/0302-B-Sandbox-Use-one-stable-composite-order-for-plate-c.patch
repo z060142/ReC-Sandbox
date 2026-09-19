@@ -1,0 +1,270 @@
+From f6ed2ea927a2f4faacbc855941b87348e6092075 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Thu, 3 Sep 2026 14:19:43 +0800
+Subject: [PATCH 302/307] !B (Sandbox) Use one stable composite order for plate
+ colour, preview to stamp.
+
+The live preview composited overlapping colour plates in entity-iterator order,
+i.e. spawn order, which is not reproducible across a save and reload; the export
+inherited it; and Stamp Colour walked the selection in whatever order the
+selection happened to be in. Three tiers, three orders, so two plates that share
+ground could stamp in the opposite order to the one shown.
+
+There is now one order, and it is deliberately the height bake's:
+Bake Priority ascending, entity GUID as the tie-break
+(CTerrainPlateComponent::BakesBefore), so plate colour stacks the way plate
+relief does. ITerrainPlateCommit::GetCommitOrderPriority exposes it,
+TerrainPlateColourOverlay::CompositesBefore is the single comparator, ScanPlates
+sorts the preview and the export snapshots, and the colour stamp sorts the
+selection. Because each plate is written into CRGBLayer over what the previous
+one already wrote, walking the selection lowest-first reproduces the preview's
+stack texel for texel.
+
+The one case that cannot be fixed by ordering: an unselected plate that is still
+drawing live and composites UNDER a stamped plate. A stamped plate's colour
+becomes part of the ground, which is the bottom of the stack, so that plate now
+draws over it and the two swap places in the shared rim. Compositing it into the
+tiles as well was considered and rejected - it would then be blended twice, once
+in the ground and once live, which puts it on top anyway and tightens its rim
+(the effect GetLiveColourState stands down for). It is named instead, in a
+warning that says to select both and stamp them together. An unselected plate
+that composites ABOVE the stamped one is unaffected and is not warned about: it
+drew last before and it draws last now.
+
+Alternatives in scene-notes/decisions/terrain-plate-colour-stamp-order.md.
+---
+ .../Geometry/ITerrainPlateCommit.h            |  6 ++
+ .../Geometry/TerrainPlateComponent.h          |  2 +
+ .../EditorQt/Terrain/TerrainCommands.cpp      | 65 ++++++++++++++++++-
+ .../Terrain/TerrainPlateColourOverlay.cpp     | 44 +++++++++++++
+ .../Terrain/TerrainPlateColourOverlay.h       |  9 +++
+ 5 files changed, 125 insertions(+), 1 deletion(-)
+
+diff --git a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/ITerrainPlateCommit.h b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/ITerrainPlateCommit.h
+index 21eb6fc9..a718ec7b 100644
+--- a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/ITerrainPlateCommit.h
++++ b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/ITerrainPlateCommit.h
+@@ -83,6 +83,12 @@ struct ITerrainPlateCommit
+ 	virtual bool  GetLiveColourState(int& outX1, int& outY1, int& outSize, ColorB& outTint,
+ 	                                 bool& outSettling) const = 0;
+ 
++	//! Bake Priority, as the panel shows it. THE composite order for overlapping plates: lower composites
++	//! first and shows through, higher composites last and wins the rim, with the entity GUID as the
++	//! tie-break - the same rule the height bake uses (@see CTerrainPlateComponent::BakesBefore), so the
++	//! colour of two overlapping plates stacks the way their relief does.
++	virtual int   GetCommitOrderPriority() const = 0;
++
+ 	//! The material the plate actually renders with: the override on the plate's OWN slot, then the mesh's.
+ 	//! The plate is not necessarily slot 0, so the editor cannot guess it from the entity. Only ever
+ 	//! compared, never dereferenced - it is the material identity the overlay's change detector hashes.
+diff --git a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
+index d484e3a1..817913dd 100644
+--- a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
++++ b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
+@@ -453,6 +453,8 @@ public:
+ 	virtual bool  GetLiveColourState(int& outX1, int& outY1, int& outSize, ColorB& outTint,
+ 	                                 bool& outSettling) const final;
+ 	void          ClearColourStamp() const;
++	//! @see ITerrainPlateCommit::GetCommitOrderPriority. The same value BakesBefore orders by.
++	virtual int   GetCommitOrderPriority() const final { return (int)m_bakePriority; }
+ 	//! @see ITerrainPlateCommit::GetCommitMaterial. Inline, because GetPlateMaterial is protected and the
+ 	//! editor can only reach the plate through the interface.
+ 	virtual const IMaterial* GetCommitMaterial() const final { return GetPlateMaterial(); }
+diff --git a/Code/Sandbox/EditorQt/Terrain/TerrainCommands.cpp b/Code/Sandbox/EditorQt/Terrain/TerrainCommands.cpp
+index 38a3cb52..5868a70b 100644
+--- a/Code/Sandbox/EditorQt/Terrain/TerrainCommands.cpp
++++ b/Code/Sandbox/EditorQt/Terrain/TerrainCommands.cpp
+@@ -646,6 +646,58 @@ static void PyStampPlateHeight()
+ 	       stamped, (int)plates.size(), elapsedMs);
+ }
+ 
++//! Names any live colour plate that is NOT in the selection, shares ground with the plate about to be
++//! stamped, and composites UNDER it.
++//!
++//! Such a plate was blended BEFORE the stamped one in the preview, but the stamp writes into a CRGBLayer
++//! that does not carry it, and it then goes on drawing live over the stamped ground - so in the shared rim
++//! the two swap places and the picture no longer matches what the preview showed. A plate that composites
++//! OVER the stamped one is not affected: it drew last before and it draws last now.
++//! Compositing the unselected plate in as well is not the answer - it would then be blended twice, once in
++//! the ground and once live, which tightens its rim and puts it on top of the stamped plate anyway. The
++//! honest fix is to select both and stamp them together, which is what the line says.
++static void WarnAboutLivePlatesUnder(IEntity* pStampedEntity, int rectX1, int rectY1, int rectSize,
++                                     const std::vector<std::pair<IEntity*, Cry::DefaultComponents::CTerrainPlateComponent*>>& selected)
++{
++	using Cry::DefaultComponents::CTerrainPlateComponent;
++	using Cry::DefaultComponents::ITerrainPlateCommit;
++
++	for (const std::pair<IEntity*, CTerrainPlateComponent*>& entry : CollectAllTerrainPlates())
++	{
++		IEntity* pOtherEntity = entry.first;
++		if (pOtherEntity == nullptr || pOtherEntity == pStampedEntity || pOtherEntity->IsHidden())
++			continue;
++
++		bool bSelected = false;
++		for (const std::pair<IEntity*, CTerrainPlateComponent*>& sel : selected)
++			bSelected = bSelected || (sel.first == pOtherEntity);
++
++		if (bSelected)
++			continue;
++
++		// Same query the overlay makes: false means this plate is drawing no colour, so it cannot disagree
++		// with anything.
++		ITerrainPlateCommit* pOther = entry.second;
++		int    otherX1 = 0, otherY1 = 0, otherSize = 0;
++		ColorB otherTint;
++		bool   bSettling = false;
++		if (!pOther->GetLiveColourState(otherX1, otherY1, otherSize, otherTint, bSettling) || otherSize <= 0)
++			continue;
++
++		// The rects cover x1 .. x1 + size INCLUSIVE.
++		const bool bOverlaps = (rectX1 <= otherX1 + otherSize) && (otherX1 <= rectX1 + rectSize)
++		                       && (rectY1 <= otherY1 + otherSize) && (otherY1 <= rectY1 + rectSize);
++		if (!bOverlaps || !TerrainPlateColourOverlay::CompositesBefore(pOtherEntity, pStampedEntity))
++			continue;
++
++		CryWarning(VALIDATOR_MODULE_EDITOR, VALIDATOR_WARNING,
++		           "terrain.stamp_plate_colour: '%s' shares ground with '%s', which is showing colour and is not in the "
++		           "selection. '%s' has the lower Bake Priority, so it drew UNDER '%s' in the preview but will draw over "
++		           "the stamped ground where they meet. Select both and stamp them together to keep the picture.",
++		           pStampedEntity->GetName(), pOtherEntity->GetName(), pOtherEntity->GetName(), pStampedEntity->GetName());
++	}
++}
++
+ //! The PLATE half of one colour stamp's undo step. RecordTerrainAppearanceUndo restores the RGB tiles;
+ //! this restores the plate's "the ground already carries my colour" record, which is what makes the live
+ //! preview stand down. Without it an undo gave back the old ground colour while the preview stayed stood
+@@ -718,10 +770,19 @@ static void PyStampPlateColour()
+ 		return;
+ 	}
+ 
+-	const std::vector<std::pair<IEntity*, CTerrainPlateComponent*>> plates = CollectSelectedTerrainPlates("terrain.stamp_plate_colour");
++	std::vector<std::pair<IEntity*, CTerrainPlateComponent*>> plates = CollectSelectedTerrainPlates("terrain.stamp_plate_colour");
+ 	if (plates.empty())
+ 		return;
+ 
++	// THE composite order, the one the preview and the export sort themselves by. Each plate is written into
++	// CRGBLayer over what the previous one already wrote, so walking the selection in this order reproduces
++	// the preview's stack exactly; the selection's own order is arbitrary and would not.
++	std::sort(plates.begin(), plates.end(),
++	          [](const std::pair<IEntity*, CTerrainPlateComponent*>& a, const std::pair<IEntity*, CTerrainPlateComponent*>& b)
++	{
++		return TerrainPlateColourOverlay::CompositesBefore(a.first, b.first);
++	});
++
+ 	const float unitSize = pHeightmap->GetUnitSize();
+ 	const float terrainSize = (float)p3DEngine->GetTerrainSize();          // metres
+ 	const int   hmapUnitsY = (int)pHeightmap->GetWidth();                  // heightmap X axis: world Y
+@@ -800,6 +861,8 @@ static void PyStampPlateColour()
+ 			continue;
+ 		}
+ 
++		WarnAboutLivePlatesUnder(pEntity, rectX1, rectY1, rectSize, plates);
++
+ 		// The footprint in world metres and in the RGB layer's normalised measure. The normalised
+ 		// coordinate fpx is the world Y and fpy the world X, which is why every pair below reads (Y, X).
+ 		const float worldXMin = (float)rectX1 * unitSize;
+diff --git a/Code/Sandbox/EditorQt/Terrain/TerrainPlateColourOverlay.cpp b/Code/Sandbox/EditorQt/Terrain/TerrainPlateColourOverlay.cpp
+index 9df565f5..110b06bc 100644
+--- a/Code/Sandbox/EditorQt/Terrain/TerrainPlateColourOverlay.cpp
++++ b/Code/Sandbox/EditorQt/Terrain/TerrainPlateColourOverlay.cpp
+@@ -52,8 +52,24 @@ struct SLivePlate
+ 	//! A drag is in progress. The change detector holds its fire until this clears, so a drag repaints
+ 	//! once, on release.
+ 	bool                 bSettling = false;
++
++	//! The composite order: Bake Priority, then the entity GUID. @see OrderBefore.
++	int                  orderPriority = 0;
++	CryGUID              guid = CryGUID::Null();
+ };
+ 
++//! THE composite order for two plates, and the only one: lower first, so the higher priority plate is
++//! blended last and wins where two footprints meet. The GUID tie-break is what makes it reproducible - the
++//! entity iterator hands plates back in spawn order, which changes across a save and load. Deliberately
++//! the same rule as the height bake (CTerrainPlateComponent::BakesBefore), so colour stacks like relief.
++bool OrderBefore(int priorityA, const CryGUID& guidA, int priorityB, const CryGUID& guidB)
++{
++	if (priorityA != priorityB)
++		return priorityA < priorityB;
++
++	return guidA < guidB;
++}
++
+ std::vector<SLivePlate> g_plates;
+ 
+ //! The export's own snapshot, taken once per export. Separate from g_plates so an export cannot disturb
+@@ -163,6 +179,8 @@ bool MakeLivePlate(IEntity* pEntity, float unitSize, SLivePlate& out)
+ 	plate.worldXMax = (float)(rectX1 + rectSize) * unitSize;
+ 	plate.worldYMax = (float)(rectY1 + rectSize) * unitSize;
+ 	plate.tint = tint;
++	plate.orderPriority = pCommit->GetCommitOrderPriority();
++	plate.guid = pEntity->GetGuid();
+ 
+ 	// A material EDIT (a different texture inside the same material) is not covered by this hash;
+ 	// nudging the plate repaints it.
+@@ -202,10 +220,36 @@ void ScanPlates(std::vector<SLivePlate>& out)
+ 		if (MakeLivePlate(it->Next(), unitSize, plate))
+ 			out.push_back(plate);
+ 	}
++
++	// ApplyPlatesToRow blends in list order, so the list IS the composite order. The iterator hands plates
++	// back in spawn order, which is not reproducible across a reload and is not the order the stamp walks
++	// the selection in; sorting here is what makes the preview, the export and the stamp agree.
++	std::sort(out.begin(), out.end(), [](const SLivePlate& a, const SLivePlate& b)
++	{
++		return OrderBefore(a.orderPriority, a.guid, b.orderPriority, b.guid);
++	});
+ }
+ 
+ }   // anonymous namespace
+ 
++bool CompositesBefore(IEntity* pA, IEntity* pB)
++{
++	if (pA == nullptr || pB == nullptr)
++		return pA < pB;
++
++	IEntityComponent* pComponentA = pA->GetComponentByTypeId(ITerrainPlateCommit::GetComponentTypeId());
++	IEntityComponent* pComponentB = pB->GetComponentByTypeId(ITerrainPlateCommit::GetComponentTypeId());
++	if (pComponentA == nullptr || pComponentB == nullptr)
++		return pComponentA < pComponentB;
++
++	// Through the INTERFACE, always: the overrides are final, so a call on the concrete type devirtualises
++	// and Sandbox has no symbol for it.
++	const int priorityA = static_cast<ITerrainPlateCommit*>(static_cast<CTerrainPlateComponent*>(pComponentA))->GetCommitOrderPriority();
++	const int priorityB = static_cast<ITerrainPlateCommit*>(static_cast<CTerrainPlateComponent*>(pComponentB))->GetCommitOrderPriority();
++
++	return OrderBefore(priorityA, pA->GetGuid(), priorityB, pB->GetGuid());
++}
++
+ uint32 BlendPlateColourIntoTexel(uint32 destination, const ColorF& linearAlbedo, ColorB tint, float weight)
+ {
+ 	const float recip255 = 1.f / 255.f;
+diff --git a/Code/Sandbox/EditorQt/Terrain/TerrainPlateColourOverlay.h b/Code/Sandbox/EditorQt/Terrain/TerrainPlateColourOverlay.h
+index f473f958..090dbfac 100644
+--- a/Code/Sandbox/EditorQt/Terrain/TerrainPlateColourOverlay.h
++++ b/Code/Sandbox/EditorQt/Terrain/TerrainPlateColourOverlay.h
+@@ -5,6 +5,8 @@
+ #include <CryMath/Cry_Color.h>
+ #include <CryEntitySystem/IEntityBasicTypes.h>   // EntityId, for the stamp's one plate
+ 
++struct IEntity;
++
+ //! The terrain plate's diffuse as the terrain's macro colour, live and non destructive. The source is
+ //! ITerrainPlateCommit::GetCommitAlbedoAtWorld, the same call terrain.stamp_plate_colour makes at the
+ //! same resolution, so Stamp Colour means "make what you are looking at permanent".
+@@ -21,6 +23,13 @@
+ namespace TerrainPlateColourOverlay
+ {
+ 
++//! THE composite order for two overlapping plates, and the only one: Bake Priority, then the entity GUID -
++//! the same rule the height bake uses, so colour stacks the way relief does. True when pA is blended
++//! FIRST, i.e. pB wins where the two meet. The preview and the export sort themselves by it; the stamp
++//! walks the selection in it, which is what makes a multi plate stamp come out as the picture showed.
++//! Both entities must carry a terrain plate component.
++bool CompositesBefore(IEntity* pA, IEntity* pB);
++
+ //! THE blend, shared by the live overlay and by terrain.stamp_plate_colour. Both sides to linear, lerp
+ //! there, back to gamma - the terrain painter's own recipe; blending gamma values directly makes the rim
+ //! band read too dark.
+-- 
+2.47.1.windows.1
+

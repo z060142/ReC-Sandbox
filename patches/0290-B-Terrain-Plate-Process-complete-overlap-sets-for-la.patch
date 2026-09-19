@@ -1,0 +1,374 @@
+From 5eeead6fe5b310f4a9089b3c49303096022b4d64 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Wed, 2 Sep 2026 14:19:36 +0800
+Subject: [PATCH 290/307] !B (Terrain Plate) Process complete overlap sets for
+ large plate batches.
+
+Size move, teardown and overlap work from the complete affected set instead of
+a fixed 16-plate cap. Keep 16 plates as an editor recommendation and report
+larger batches without dropping their terrain restoration work.
+---
+ .../Geometry/TerrainPlateComponent.cpp        | 166 ++++++++++++------
+ .../Geometry/TerrainPlateComponent.h          |  10 +-
+ 2 files changed, 120 insertions(+), 56 deletions(-)
+
+diff --git a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
+index 6ff95c86..873ceb96 100644
+--- a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
++++ b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
+@@ -59,12 +59,14 @@ uint32 g_bakeCascadeFrameId = ~0u;
+ //! Stamped on every bake that lands, so a cascade can restore in the exact inverse of the order the terrain was
+ //! ACTUALLY laid down in. Bake Priority is not that order; the baselines nest and unwind as a stack.
+ uint64 g_bakeApplySeqCounter = 0;
+-//! Never restore and re-bake more than this many plates in one cascade; Unreal caps its landscape edit layers
+-//! at 8 for the same reason. This is about a runaway configuration, not about the normal case.
+-const size_t kBakeCascadeMaxPlates = 16;
+-//! The move batch runs against a much higher bound: a mover dropped by the cap would leave its OLD footprint in
+-//! the terrain with nothing left to restore it, and the probe repair cannot heal that. Chunked, never dropped.
+-const size_t kBakeMoveBatchMaxPlates = 256;
++//! Cost warning threshold for one cascade, NOT a cap. A plate left out of a cascade - truncated from the
++//! closure or pushed into a second chunk - misses both the ordered unwind and the composite refresh, so its
++//! probes read the other plates' relief as an external edit and the two halves restore each other for ever.
++int    g_terrainPlateBakeMaxBatch = 64;
++ICVar* g_pTerrainPlateBakeMaxBatchCVar = nullptr;
++//! Latched, so a runaway configuration costs one warning line and not one per cascade. Cleared again as soon
++//! as a cascade comes back under the threshold.
++bool   g_bakeLargeBatchWarned = false;
+ //! Frames of silence the polling owes a finished cascade. One is not enough: SetTerrainElevation rebuilds sector
+ //! meshes, atlases, the physics heightfield and roads, and a probe on our own writes starts a ping pong.
+ const uint32 kBakeCascadeQuietFrames = 3;
+@@ -82,6 +84,16 @@ const int kBakeRunawayWindowFrames = 600;
+ const int kBakeRunawayLimit = 8;
+ const int kBakeBackoffMaxFrames = 600;
+ 
++//! The valve above is per plate and cannot see a CYCLE between plates: in a ring of N plates each one seeds
++//! only every Nth repair, and a plate the cascade has just refreshed polls clean and resets its own counter.
++//! So the cycle is counted globally instead - automatic repairs since the user last touched any plate - and
++//! there is no time window: a cycle is slow (one turn per e_TerrainPlateBakeProbeFrames) but never stops.
++const int kBakeAutoRepairRunawayLimit = 64;
++int  g_bakeAutoRepairCount = 0;
++//! Latched by the valve: no plate repairs itself again until the user does something to a plate. Terrain left
++//! exactly as it is, because a half repaired composite is worse than a stale one.
++bool g_bakeAutoRepairStalled = false;
++
+ //! The terrain is kept this far below the plate mesh so the two surfaces never fight. Nearly coplanar costs
+ //! shadow map precision and shows as distant acne; e_TerrainPlateBakeEpsilon 0.005 restores the tight bake.
+ float  g_terrainPlateBakeEpsilon = 0.02f;
+@@ -186,6 +198,41 @@ int GetPlateDebugLevel()
+ {
+ 	return max(max(0, g_terrainPlateDebug), GetTerrainIntegrateDebugLevel());
+ }
++
++//! Cost threshold for one cascade. 0 disables the report; it can never make a cascade smaller.
++int GetBakeMaxBatch()
++{
++	return max(0, g_terrainPlateBakeMaxBatch);
++}
++
++//! Anything the user does to a plate re-arms the automatic repairs: the configuration has changed, so the
++//! cycle the valve saw may well be gone, and the user is there to see what happens next.
++void NoteBakeUserAction()
++{
++	// Not from inside a cascade: the transforms and teardowns a cascade causes are our own writes, and taking
++	// them for user input is exactly how a valve gets reset by the loop it is supposed to stop.
++	if (g_bakeCascadeDepth > 0)
++		return;
++
++	g_bakeAutoRepairCount = 0;
++	g_bakeAutoRepairStalled = false;
++}
++
++//! One automatic (probe driven) repair. @see kBakeAutoRepairRunawayLimit for why this is not per plate.
++void NoteBakeAutoRepair()
++{
++	if (g_bakeAutoRepairStalled || ++g_bakeAutoRepairCount <= kBakeAutoRepairRunawayLimit)
++		return;
++
++	g_bakeAutoRepairStalled = true;
++
++	CryWarning(VALIDATOR_MODULE_ENTITYSYSTEM, VALIDATOR_WARNING,
++	           "Terrain Plate: %d bake repairs have run with nothing being edited, which means the baking plates are "
++	           "rewriting the ground under each other in a cycle. All automatic repairs are now stopped and the terrain "
++	           "is left exactly as it is; move, edit or delete any baking plate to start them again. Most often this is "
++	           "too many overlapping baking plates - moving or deleting more than 16 in one operation is not recommended "
++	           "(cost grows with overlap; prefer smaller selections).", g_bakeAutoRepairCount);
++}
+ }
+ 
+ void RegisterTerrainPlateCVars()
+@@ -300,6 +347,15 @@ void RegisterTerrainPlateCVars()
+ 	                                                           "re-applies itself when they change. Editor only - terrain cannot be repainted at run time.\n"
+ 	                                                           "0 - no polling, a repaint only takes effect when the plate is next edited or the level reloaded");
+ 
++	g_pTerrainPlateBakeMaxBatchCVar = REGISTER_CVAR2("e_TerrainPlateBakeMaxBatch", &g_terrainPlateBakeMaxBatch, 64, VF_NULL,
++	                                                 "Terrain Plate component with Bake Into Terrain = true: number of plates in one restore and\n"
++	                                                 "re-bake pass above which the cost of that pass is reported. This is a WARNING THRESHOLD,\n"
++	                                                 "NOT a cap: the pass always covers the complete set of plates that share ground, because a\n"
++	                                                 "plate left out of it keeps a stale bake and then fights the plates inside the pass over the\n"
++	                                                 "shared ground for ever. Moving or deleting more than 16 baking plates in one operation is\n"
++	                                                 "not recommended (cost grows with overlap; prefer smaller selections).\n"
++	                                                 "0 - never report, whatever the pass costs");
++
+ 	g_pTerrainPlateDebugCVar = REGISTER_CVAR2("e_TerrainPlateDebug", &g_terrainPlateDebug, 0, VF_NULL,
+ 	                                          "Terrain Plate component: trace the bake trigger and the bake itself.\n"
+ 	                                          "0 - off\n"
+@@ -345,6 +401,9 @@ void UnregisterTerrainPlateCVars()
+ 		if (g_pTerrainPlatePhysSurfaceProbeFramesCVar != nullptr)
+ 			gEnv->pConsole->UnregisterVariable(g_pTerrainPlatePhysSurfaceProbeFramesCVar->GetName());
+ 
++		if (g_pTerrainPlateBakeMaxBatchCVar != nullptr)
++			gEnv->pConsole->UnregisterVariable(g_pTerrainPlateBakeMaxBatchCVar->GetName());
++
+ 		if (g_pTerrainPlateDebugCVar != nullptr)
+ 			gEnv->pConsole->UnregisterVariable(g_pTerrainPlateDebugCVar->GetName());
+ 	}
+@@ -359,6 +418,7 @@ void UnregisterTerrainPlateCVars()
+ 	g_pTerrainPlateCullBuriedCVar = nullptr;
+ 	g_pTerrainPlatePhysSurfaceFromTerrainCVar = nullptr;
+ 	g_pTerrainPlatePhysSurfaceProbeFramesCVar = nullptr;
++	g_pTerrainPlateBakeMaxBatchCVar = nullptr;
+ 	g_pTerrainPlateDebugCVar = nullptr;
+ }
+ 
+@@ -1119,6 +1179,7 @@ void CTerrainPlateComponent::ProcessEvent(const SEntityEvent& event)
+ 	case ENTITY_EVENT_COMPONENT_PROPERTY_CHANGED:
+ 		// A property change can only reach a plate the user is working on, so an entity that came back out
+ 		// of the deletion queue is allowed to bake again.
++		NoteBakeUserAction();
+ 		ReArmAfterTeardown();
+ 			// A property change is a user action in an open level, so the terrain is in and the "never bake from
+ 			// Initialize" rule is satisfied. Releasing here makes ticking Bake Into Terrain apply in the same frame.
+@@ -1153,6 +1214,9 @@ void CTerrainPlateComponent::ProcessEvent(const SEntityEvent& event)
+ 			// is on the total world scale, so gizmo, scaled group or prefab parent and script all fire it.
+ 		if (NeedsRegenerateOnTransform() || !GetWorldScale().IsEquivalent(m_lastWorldScale, 0.0001f))
+ 		{
++			// A transform is the user acting, whoever sent it, so it re-arms the stalled automatic repairs.
++			NoteBakeUserAction();
++
+ 				// With Update During Drag off, an editor transform only records that a rebuild is owed and it runs on
+ 				// mouse up. ENTITY_XFORM_EDITOR is set only for editor driven transforms, so the rest keep the old path.
+ 			const bool bEditorTransform = (event.nParam[0] & ENTITY_XFORM_EDITOR) != 0;
+@@ -1691,7 +1755,7 @@ void CTerrainPlateComponent::RegenerateMesh()
+ 	    && m_pEntity != nullptr && gEnv->p3DEngine != nullptr)
+ 	{
+ 		std::vector<CTerrainPlateComponent*> affected;
+-		CollectBakeCascadeSet(affected, kBakeCascadeMaxPlates);
++		CollectBakeCascadeSet(affected);
+ 
+ 		if (affected.size() > 1)
+ 		{
+@@ -2914,6 +2978,9 @@ void CTerrainPlateComponent::RestoreBakeOnTeardown()
+ 
+ 	m_bBakeTornDown = true;
+ 
++	// A delete changes the configuration the runaway valve latched on, so it counts as the user acting.
++	NoteBakeUserAction();
++
+ 	// Out of the registry FIRST, so nothing can start an overlap cascade on a plate on its way out. Out of the
+ 	// move batch with it, or the batch would hold a pointer to a component being destructed.
+ 	UnregisterPlate();
+@@ -2977,7 +3044,7 @@ bool CTerrainPlateComponent::RestoreBakeOnTeardownCascaded()
+ 	rects.push_back(m_bakeRectSize);
+ 
+ 	std::vector<CTerrainPlateComponent*> affected;
+-	CollectBakeCascadeSetFromRects(rects, affected, kBakeCascadeMaxPlates);
++	CollectBakeCascadeSetFromRects(rects, affected);
+ 
+ 	// The stack, not the overlap, is what decides. Our stored baseline is the ground as it was when WE baked, so
+ 	// it is still the truth for every plate that baked BEFORE us, and a lie only about those that baked AFTER:
+@@ -3687,6 +3754,11 @@ void CTerrainPlateComponent::PollBake()
+ 	if (g_bakeCascadeDepth > 0)
+ 		return;
+ 
++	// The cycle valve has fired: the terrain is left exactly as it is until the user touches a plate. Repairing
++	// on would only feed the cycle, and a half repaired composite is worse to look at than a stale one.
++	if (g_bakeAutoRepairStalled)
++		return;
++
+ 	if (g_bakeCascadeFrameId != ~0u && (uint32)(gEnv->nMainFrameID - g_bakeCascadeFrameId) < kBakeCascadeQuietFrames)
+ 		return;
+ 
+@@ -3703,7 +3775,10 @@ void CTerrainPlateComponent::PollBake()
+ 	// Second line of defence: if the rect this plate holds in the terrain is nowhere near where the plate now is,
+ 	// a transform was missed and the old footprint is an orphan.
+ 	if (HealOrphanedBakeRect(metrics))
++	{
++		NoteBakeAutoRepair();
+ 		return;
++	}
+ 
+ 	// Changing a bake cvar moves nothing in the terrain, so the probes cannot see it; compare the values the live
+ 	// bake was computed with instead. The two rim shape knobs MUST be in this list: they change every height in
+@@ -3715,6 +3790,7 @@ void CTerrainPlateComponent::PollBake()
+ 	    || m_bakeOffsetUsed != (float)m_bakeOffset)
+ 	{
+ 		ReapplyBakeAfterExternalEdit(metrics);
++		NoteBakeAutoRepair();
+ 		return;
+ 	}
+ 
+@@ -3724,6 +3800,7 @@ void CTerrainPlateComponent::PollBake()
+ 		if (fabs_tpl(SampleTerrainUnit(metrics, probe.ux, probe.uy) - probe.expectedZ) > m_bakeProbeTolerance)
+ 		{
+ 			ReapplyBakeAfterExternalEdit(metrics);
++			NoteBakeAutoRepair();
+ 			return;
+ 		}
+ 	}
+@@ -4003,7 +4080,7 @@ bool CTerrainPlateComponent::BakesBefore(const CTerrainPlateComponent& other) co
+ 	return this < &other;
+ }
+ 
+-void CTerrainPlateComponent::CollectBakeCascadeSet(std::vector<CTerrainPlateComponent*>& out, size_t maxPlates) const
++void CTerrainPlateComponent::CollectBakeCascadeSet(std::vector<CTerrainPlateComponent*>& out) const
+ {
+ 	out.clear();
+ 
+@@ -4016,18 +4093,15 @@ void CTerrainPlateComponent::CollectBakeCascadeSet(std::vector<CTerrainPlateComp
+ 
+ 	out.push_back(const_cast<CTerrainPlateComponent*>(this));
+ 
+-	CollectBakeCascadeSetFromRects(rects, out, maxPlates);
++	CollectBakeCascadeSetFromRects(rects, out);
+ }
+ 
+ void CTerrainPlateComponent::CollectBakeCascadeSetFromRects(std::vector<int>& rects,
+-                                                            std::vector<CTerrainPlateComponent*>& out,
+-                                                            size_t maxPlates)
++                                                            std::vector<CTerrainPlateComponent*>& out)
+ {
+-	bool bTruncated = false;
+-
+ 	// Transitive closure over rect intersection: a third plate that only overlaps the second still has to be
+-	// unwound. Quadratic, but it only runs when a bake changes and the count is a handful.
+-	for (size_t i = 0; i < rects.size() && out.size() < maxPlates; i += 3)
++	// unwound. Quadratic, but it only runs when a bake changes and it terminates at the registry size.
++	for (size_t i = 0; i < rects.size(); i += 3)
+ 	{
+ 		// By value: the inner loop appends to rects and would invalidate a reference into it.
+ 		const int ax1 = rects[i], ay1 = rects[i + 1], aSize = rects[i + 2];
+@@ -4053,22 +4127,29 @@ void CTerrainPlateComponent::CollectBakeCascadeSetFromRects(std::vector<int>& re
+ 
+ 			out.push_back(pOther);
+ 			rects.insert(rects.end(), otherRects.begin(), otherRects.end());
+-
+-			if (out.size() >= maxPlates)
+-			{
+-				bTruncated = true;
+-				break;
+-			}
+ 		}
+ 	}
+ 
+-	// Truncating the closure leaves plates standing on ground the cascade is about to move. Loud on purpose:
+-	// the composite over the shared footprint is no longer well defined and the user has to know.
+-	if (bTruncated)
++	// Cost only. The closure is NEVER cut short and NEVER split: the baselines nest, so a plate left outside the
++	// pass keeps a stale bake, its probes read the others' relief as an external edit, and the two halves restore
++	// each other for ever (the 16 plate cap did exactly that with 21 overlapping plates).
++	const int costLimit = GetBakeMaxBatch();
++	if (costLimit > 0 && (int)out.size() > costLimit)
++	{
++		if (!g_bakeLargeBatchWarned)
++		{
++			g_bakeLargeBatchWarned = true;
++			CryWarning(VALIDATOR_MODULE_ENTITYSYSTEM, VALIDATOR_WARNING,
++			           "Terrain Plate: %d baking plates share ground and are restored and re-baked together in one pass "
++			           "(e_TerrainPlateBakeMaxBatch = %d). The result is correct - the whole set is always done in one "
++			           "pass - but every edit of any of them now costs all %d. Moving or deleting more than 16 baking "
++			           "plates in one operation is not recommended (cost grows with overlap; prefer smaller selections).",
++			           (int)out.size(), costLimit, (int)out.size());
++		}
++	}
++	else
+ 	{
+-		CryWarning(VALIDATOR_MODULE_ENTITYSYSTEM, VALIDATOR_WARNING,
+-		           "Terrain Plate: overlap cascade truncated at %d plates. Plates beyond that keep a stale bake over the "
+-		           "shared footprint - reduce the number of overlapping baking plates.", (int)maxPlates);
++		g_bakeLargeBatchWarned = false;
+ 	}
+ 
+ 	std::stable_sort(out.begin(), out.end(),
+@@ -4101,7 +4182,7 @@ void CTerrainPlateComponent::ApplyBakeCascaded()
+ 	}
+ 
+ 	std::vector<CTerrainPlateComponent*> affected;
+-	CollectBakeCascadeSet(affected, kBakeCascadeMaxPlates);
++	CollectBakeCascadeSet(affected);
+ 
+ 	if (affected.size() <= 1)
+ 	{
+@@ -4248,6 +4329,9 @@ void CTerrainPlateComponent::FlushBakeMoveBatch()
+ 			return;
+ 	}
+ 
++	// The whole batch is one user gesture, so it clears whatever the runaway valve latched: the user has acted.
++	NoteBakeUserAction();
++
+ 	// Drain the queue first: everything below regenerates meshes and writes the terrain, and must not be able to
+ 	// re-enter the batch it is draining.
+ 	std::vector<CTerrainPlateComponent*> movers;
+@@ -4275,29 +4359,7 @@ void CTerrainPlateComponent::FlushBakeMoveBatch()
+ 		if (!pMover->WantsBakeMoveBatch())
+ 			continue;
+ 
+-		pMover->CollectBakeCascadeSet(closure, kBakeMoveBatchMaxPlates);
+-
+-		size_t newMembers = 0;
+-		for (CTerrainPlateComponent* pPlate : closure)
+-		{
+-			if (std::find(affected.begin(), affected.end(), pPlate) == affected.end())
+-			{
+-				++newMembers;
+-			}
+-		}
+-
+-		// A mover must NEVER be dropped: its old footprint is already in the ground and only its own cascade puts
+-		// it back. So the batch is split into chunks instead - less exact than one pass, but never destructive.
+-		if (!affected.empty() && affected.size() + newMembers > kBakeMoveBatchMaxPlates)
+-		{
+-			CryWarning(VALIDATOR_MODULE_ENTITYSYSTEM, VALIDATOR_WARNING,
+-			           "Terrain Plate: move batch over %d plates, split into several cascades. Every moved plate is "
+-			           "restored and re-baked, but plates shared between two chunks may need a second settle.",
+-			           (int)kBakeMoveBatchMaxPlates);
+-
+-			RunBakeCascade(affected, nullptr, "move batch chunk");
+-			affected.clear();
+-		}
++		pMover->CollectBakeCascadeSet(closure);
+ 
+ 		for (CTerrainPlateComponent* pPlate : closure)
+ 		{
+diff --git a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
+index 1b0f98d9..f5ac495c 100644
+--- a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
++++ b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
+@@ -435,7 +435,9 @@ public:
+ 		               "kept 2 cm below the plate mesh and the border of the footprint blends back to the original ground, so the "
+ 		               "terrain outside the plate and the painted surface layers everywhere are left untouched. Editor and Profile "
+ 		               "only - the game export serialises the live terrain, so the shipped level carries the bake with no release "
+-		               "code at all. Turning it off (or moving, rescaling or deleting the plate) puts the original ground back first.",
++		               "code at all. Turning it off (or moving, rescaling or deleting the plate) puts the original ground back first. "
++		               "Plates that share ground are always restored and re-baked together as one set, so moving or deleting more "
++		               "than 16 baking plates in one operation is not recommended (cost grows with overlap; prefer smaller selections).",
+ 		               false);
+ 		desc.AddMember(&CTerrainPlateComponent::m_uiBake, 'bgrp', "BakeGroup", "+Bake", "How the shape of the plate is written into the live engine terrain", STerrainPlateBakeGroup());
+ 
+@@ -641,11 +643,11 @@ protected:
+ 	//! move, the PROSPECTIVE one. A move must unwind both or it misses what it leaves behind or lands on.
+ 	void  GetBakeCascadeRects(std::vector<int>& outRects) const;
+ 	//! Every baking plate transitively overlapping this one, itself included, sorted by priority then GUID.
+-	void  CollectBakeCascadeSet(std::vector<CTerrainPlateComponent*>& out, size_t maxPlates) const;
++	//! COMPLETE, always: e_TerrainPlateBakeMaxBatch only decides when the cost of the set is reported.
++	void  CollectBakeCascadeSet(std::vector<CTerrainPlateComponent*>& out) const;
+ 	//! The closure itself, seeded with rects rather than a plate, so a plate already out of the registry (a
+ 	//! teardown) can still ask who stands on the footprint it gives back. Appends to out and sorts it.
+-	static void CollectBakeCascadeSetFromRects(std::vector<int>& rects, std::vector<CTerrainPlateComponent*>& out,
+-	                                           size_t maxPlates);
++	static void CollectBakeCascadeSetFromRects(std::vector<int>& rects, std::vector<CTerrainPlateComponent*>& out);
+ 	//! Cascade order: lower Bake Priority bakes first; ties by entity GUID, which is stable across loads.
+ 	bool  BakesBefore(const CTerrainPlateComponent& other) const;
+ 	//! ApplyBake when the plate owns its footprint alone, the whole cascade when it shares it.
+-- 
+2.47.1.windows.1
+

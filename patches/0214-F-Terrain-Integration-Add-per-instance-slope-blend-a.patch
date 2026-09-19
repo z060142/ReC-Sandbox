@@ -1,0 +1,263 @@
+From a33e926eb242681850f09a14e78f2d7f82bce09c Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Sun, 30 Aug 2026 20:12:16 +0800
+Subject: [PATCH 214/307] !F (Terrain Integration) Add per-instance slope,
+ blend and height parameters.
+
+Store slope limit, transition width and height band on each brush and preserve
+them when an entity slot recreates its render node. Defaults retain the
+existing unrestricted integration behaviour.
+---
+ Code/CryEngine/Cry3DEngine/Brush.h            |  6 +++
+ .../CryCommon/Cry3DEngine/IRenderNode.h       | 35 ++++++++++++++++
+ .../CryCommon/CryEntitySystem/IEntity.h       | 12 ++++++
+ Code/CryEngine/CryEntitySystem/Entity.cpp     | 21 ++++++++++
+ Code/CryEngine/CryEntitySystem/Entity.h       |  2 +
+ Code/CryEngine/CryEntitySystem/EntitySlot.cpp | 41 +++++++++++++++++++
+ Code/CryEngine/CryEntitySystem/EntitySlot.h   | 12 ++++++
+ 7 files changed, 129 insertions(+)
+
+diff --git a/Code/CryEngine/Cry3DEngine/Brush.h b/Code/CryEngine/Cry3DEngine/Brush.h
+index a5ee6121..13e2d3c6 100644
+--- a/Code/CryEngine/Cry3DEngine/Brush.h
++++ b/Code/CryEngine/Cry3DEngine/Brush.h
+@@ -67,6 +67,9 @@ public:
+ 	virtual void    SetDrawLast(bool enable) final { m_bDrawLast = enable; }
+ 	bool            GetDrawLast() const            { return m_bDrawLast; }
+ 
++	virtual void                             SetTerrainIntegrationParams(const STerrainIntegrationParams& params) final { m_terrainIntegrationParams = params; }
++	virtual const STerrainIntegrationParams& GetTerrainIntegrationParams() const final                                  { return m_terrainIntegrationParams; }
++
+ 	void            Dematerialize() final;
+ 	virtual void    GetMemoryUsage(ICrySizer* pSizer) const final;
+ 	static PodArray<SExportedBrushMaterial> m_lstSExportedBrushMaterials;
+@@ -130,6 +133,9 @@ public:
+ 	hidemask m_nSubObjHideMask;
+ 
+ 	stl::optional<SCameraSpaceParams> m_cameraSpaceParams = stl::nullopt;
++
++	//! Per instance parameters of the eGM_IntegrateIntoTerrain mode. Default constructed = stock behaviour.
++	STerrainIntegrationParams m_terrainIntegrationParams;
+ };
+ 
+ ///////////////////////////////////////////////////////////////////////////////
+diff --git a/Code/CryEngine/CryCommon/Cry3DEngine/IRenderNode.h b/Code/CryEngine/CryCommon/Cry3DEngine/IRenderNode.h
+index 4ea22484..1418445b 100644
+--- a/Code/CryEngine/CryCommon/Cry3DEngine/IRenderNode.h
++++ b/Code/CryEngine/CryCommon/Cry3DEngine/IRenderNode.h
+@@ -777,6 +777,37 @@ struct IVegetation : public IRenderNode
+ 	virtual float GetScale(void) const = 0;
+ };
+ 
++//! Per instance parameters of the eGM_IntegrateIntoTerrain global illumination / usage mode.
++//! The default constructed value reproduces the stock behaviour bit for bit: no slope test, no
++//! transition band and the global e_TerrainIntegrateObjectsMaxHeight height band.
++struct STerrainIntegrationParams
++{
++	//! Maximum angle between the triangle plane and the horizontal plane, in degrees, range [0, 90].
++	//! Triangles steeper than this keep the object's own material and are not copied into the terrain
++	//! sector mesh. 90 means "no slope test" and is the stock behaviour.
++	float slopeLimitDeg = 90.0f;
++
++	//! Width of the fade out band directly below slopeLimitDeg, in degrees. Inside the band the
++	//! terrain layer weights of the copied triangle are ramped down to zero. 0 means "hard edge".
++	float slopeBlendDeg = 0.0f;
++
++	//! Per object override of e_TerrainIntegrateObjectsMaxHeight, in metres. A negative value means
++	//! "use the cvar", which is the stock behaviour.
++	float heightBand = -1.0f;
++
++	bool operator==(const STerrainIntegrationParams& other) const
++	{
++		return slopeLimitDeg == other.slopeLimitDeg
++		       && slopeBlendDeg == other.slopeBlendDeg
++		       && heightBand == other.heightBand;
++	}
++
++	bool operator!=(const STerrainIntegrationParams& other) const { return !(*this == other); }
++
++	//! True when the values ask for something the stock code did not do.
++	bool IsNonDefault() const { return *this != STerrainIntegrationParams(); }
++};
++
+ struct IBrush : public IRenderNode
+ {
+ 	virtual const Matrix34& GetMatrix() const = 0;
+@@ -784,6 +815,10 @@ struct IBrush : public IRenderNode
+ 	virtual void            DisablePhysicalization(bool bDisable) = 0; //!< This render node will not be physicalized
+ 	virtual float           GetScale() const = 0;
+ 
++	//! Per instance parameters of the eGM_IntegrateIntoTerrain mode, @see STerrainIntegrationParams.
++	virtual void                             SetTerrainIntegrationParams(const STerrainIntegrationParams& params) = 0;
++	virtual const STerrainIntegrationParams& GetTerrainIntegrationParams() const = 0;
++
+ 	// Hide mask disable individual sub-objects rendering in the compound static objects
+ 	// Only implemented by few nodes.
+ 	virtual void SetSubObjectHideMask(hidemask subObjHideMask) {}
+diff --git a/Code/CryEngine/CryCommon/CryEntitySystem/IEntity.h b/Code/CryEngine/CryCommon/CryEntitySystem/IEntity.h
+index 3cec3100..70763897 100644
+--- a/Code/CryEngine/CryCommon/CryEntitySystem/IEntity.h
++++ b/Code/CryEngine/CryCommon/CryEntitySystem/IEntity.h
+@@ -31,6 +31,7 @@ struct SFogVolumeProperties;
+ struct SGeometryDebugDrawInfo;
+ struct SpawnParams;
+ struct SRenderLight;
++struct STerrainIntegrationParams;
+ 
+ class CCamera;
+ class CStream;
+@@ -1202,6 +1203,17 @@ public:
+ 	//! Returns a 3DEngine render node assigned to an Entity Slot.
+ 	virtual IRenderNode* GetSlotRenderNode(int nSlot) = 0;
+ 
++	//! Sets the per instance parameters of the eGM_IntegrateIntoTerrain mode for a slot.
++	//! The values are stored on the slot, not on the render node, because the render node is
++	//! recreated whenever the slot geometry changes. @see STerrainIntegrationParams.
++	//! \param nSlot Index of the slot.
++	virtual void SetSlotTerrainIntegrationParams(int nSlot, const STerrainIntegrationParams& params) = 0;
++
++	//! Returns the per instance parameters of the eGM_IntegrateIntoTerrain mode of a slot,
++	//! or the default constructed (= stock behaviour) value if the slot is not valid.
++	//! \param nSlot Index of the slot.
++	virtual const STerrainIntegrationParams& GetSlotTerrainIntegrationParams(int nSlot) const = 0;
++
+ 	//! Returns the network proxy associated with the entity.
+ 	//! Use the proxy to modify the entity's network behavior.
+ 	virtual INetEntity* GetNetEntity() = 0;
+diff --git a/Code/CryEngine/CryEntitySystem/Entity.cpp b/Code/CryEngine/CryEntitySystem/Entity.cpp
+index ca4c2ab5..080f3ad4 100644
+--- a/Code/CryEngine/CryEntitySystem/Entity.cpp
++++ b/Code/CryEngine/CryEntitySystem/Entity.cpp
+@@ -2519,6 +2519,27 @@ IRenderNode* CEntity::GetSlotRenderNode(int nSlot)
+ 	return nullptr;
+ }
+ 
++//////////////////////////////////////////////////////////////////////////
++void CEntity::SetSlotTerrainIntegrationParams(int nSlot, const STerrainIntegrationParams& params)
++{
++	if (CEntitySlot* pSlot = m_render.GetSlot(nSlot))
++	{
++		pSlot->SetTerrainIntegrationParams(params);
++	}
++}
++
++//////////////////////////////////////////////////////////////////////////
++const STerrainIntegrationParams& CEntity::GetSlotTerrainIntegrationParams(int nSlot) const
++{
++	if (CEntitySlot* pSlot = m_render.GetSlot(nSlot))
++	{
++		return pSlot->GetTerrainIntegrationParams();
++	}
++
++	static const STerrainIntegrationParams s_defaultParams;
++	return s_defaultParams;
++}
++
+ //////////////////////////////////////////////////////////////////////////
+ void CEntity::UpdateSlotForComponent(IEntityComponent* pComponent, bool callOnTransformChanged)
+ {
+diff --git a/Code/CryEngine/CryEntitySystem/Entity.h b/Code/CryEngine/CryEntitySystem/Entity.h
+index aecd7332..03d648ad 100644
+--- a/Code/CryEngine/CryEntitySystem/Entity.h
++++ b/Code/CryEngine/CryEntitySystem/Entity.h
+@@ -294,6 +294,8 @@ public:
+ 	virtual uint32                     GetSlotFlags(int nSlot) const final;
+ 	virtual int                        SetSlotRenderNode(int nSlot, IRenderNode* pRenderNode) final;
+ 	virtual IRenderNode*               GetSlotRenderNode(int nSlot) final;
++	virtual void                       SetSlotTerrainIntegrationParams(int nSlot, const STerrainIntegrationParams& params) final;
++	virtual const STerrainIntegrationParams& GetSlotTerrainIntegrationParams(int nSlot) const final;
+ 	virtual void                       UpdateSlotForComponent(IEntityComponent* pComponent, bool callOnTransformChanged = true) final;
+ 	virtual bool                       ShouldUpdateCharacter(int nSlot) const final;
+ 	virtual ICharacterInstance*        GetCharacter(int nSlot) final;
+diff --git a/Code/CryEngine/CryEntitySystem/EntitySlot.cpp b/Code/CryEngine/CryEntitySystem/EntitySlot.cpp
+index 49fda2ed..9ea8c347 100644
+--- a/Code/CryEngine/CryEntitySystem/EntitySlot.cpp
++++ b/Code/CryEngine/CryEntitySystem/EntitySlot.cpp
+@@ -231,6 +231,10 @@ void CEntitySlot::UpdateRenderNode(bool bForceRecreateNode)
+ 			}
+ 		}
+ 
++		// The render node is recreated whenever the slot geometry changes, so the per instance terrain
++		// integration parameters have to be pushed onto it again from their storage on the slot.
++		ApplyTerrainIntegrationParams();
++
+ 		m_pRenderNode->SetRndFlags(ERF_HIDDEN, !bSlotShouldRender);
+ 
+ 		// Update render node location
+@@ -618,6 +622,43 @@ void CEntitySlot::GetCameraSpacePos(Vec3& cameraSpacePos)
+    }
+  */
+ 
++//////////////////////////////////////////////////////////////////////////
++void CEntitySlot::SetTerrainIntegrationParams(const STerrainIntegrationParams& params)
++{
++	if (m_terrainIntegrationParams == params)
++		return;
++
++	m_terrainIntegrationParams = params;
++
++	ApplyTerrainIntegrationParams();
++}
++
++//////////////////////////////////////////////////////////////////////////
++void CEntitySlot::ApplyTerrainIntegrationParams()
++{
++	// Only eERType_MovableBrush nodes are picked up by CTerrainNode::AppendTrianglesFromObjects.
++	if (!m_pRenderNode || m_renderNodeType != eERType_MovableBrush)
++		return;
++
++	IBrush* pBrush = static_cast<IBrush*>(m_pRenderNode);
++
++	if (pBrush->GetTerrainIntegrationParams() == m_terrainIntegrationParams)
++		return;
++
++	pBrush->SetTerrainIntegrationParams(m_terrainIntegrationParams);
++
++	// The terrain sector meshes hold a classified copy of the geometry of every integrating node, so
++	// changing the classification parameters has to invalidate the sectors the node covers.
++	if (m_pRenderNode->GetGIMode() == IRenderNode::eGM_IntegrateIntoTerrain)
++	{
++		if (ITerrain* pTerrain = gEnv->p3DEngine ? gEnv->p3DEngine->GetITerrain() : nullptr)
++		{
++			AABB nodeBox = m_pRenderNode->GetBBox();
++			pTerrain->ResetTerrainVertBuffers(&nodeBox);
++		}
++	}
++}
++
+ //////////////////////////////////////////////////////////////////////////
+ void CEntitySlot::SetFlags(uint32 nFlags)
+ {
+diff --git a/Code/CryEngine/CryEntitySystem/EntitySlot.h b/Code/CryEngine/CryEntitySystem/EntitySlot.h
+index bc7f3eaa..1069528f 100644
+--- a/Code/CryEngine/CryEntitySystem/EntitySlot.h
++++ b/Code/CryEngine/CryEntitySystem/EntitySlot.h
+@@ -80,6 +80,15 @@ public:
+ 	void       SetMaterial(IMaterial* pMtl);
+ 	IMaterial* GetMaterial() const { return m_pMaterial; }
+ 
++	//! Per instance parameters of the eGM_IntegrateIntoTerrain mode. They are kept on the slot
++	//! because CEntitySlot::UpdateRenderNode recreates the render node behind our back.
++	void                             SetTerrainIntegrationParams(const STerrainIntegrationParams& params);
++	const STerrainIntegrationParams& GetTerrainIntegrationParams() const { return m_terrainIntegrationParams; }
++
++	//! Pushes m_terrainIntegrationParams onto the render node and invalidates the terrain sectors
++	//! the node covers when the value actually changed and the node integrates into the terrain.
++	void                             ApplyTerrainIntegrationParams();
++
+ 	//! Fill SEntitySlotInfo structure with contents of the Entity Slot
+ 	void GetSlotInfo(SEntitySlotInfo& slotInfo) const;
+ 
+@@ -176,6 +185,9 @@ private:
+ 
+ 	IRenderNode* m_pRenderNode = nullptr;
+ 	EERType      m_renderNodeType;
++
++	//! Default constructed = stock "Integrate Into Terrain" behaviour.
++	STerrainIntegrationParams m_terrainIntegrationParams;
+ };
+ 
+ //////////////////////////////////////////////////////////////////////////
+-- 
+2.47.1.windows.1
+

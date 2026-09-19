@@ -1,0 +1,259 @@
+From 7255a6d63ca06011e7e15533d3567288dbbc2ec1 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Mon, 31 Aug 2026 02:54:24 +0800
+Subject: [PATCH 230/307] !F (Terrain Plate) Defer regeneration until an editor
+ transform finishes.
+
+When Update During Drag is disabled, keep the existing mesh during editor
+movement and regenerate once when the transform gesture finishes. This avoids
+rebuilding weld, collision and shadow data on every drag frame.
+---
+ .../Geometry/TerrainPlateComponent.cpp        | 105 +++++++++++++++++-
+ .../Geometry/TerrainPlateComponent.h          |  23 ++++
+ .../CryDefaultEntities/Module/PluginDll.cpp   |   5 +
+ 3 files changed, 127 insertions(+), 6 deletions(-)
+
+diff --git a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
+index f9130bcc..26d2fe6a 100644
+--- a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
++++ b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
+@@ -9,6 +9,7 @@
+ #include <Cry3DEngine/ImageExtensionHelper.h>
+ #include <CrySystem/File/CryFile.h>
+ #include <CrySystem/IConsole.h>
++#include <CrySystem/ConsoleRegistration.h>
+ #include <CryString/CryPath.h>
+ 
+ namespace Cry
+@@ -16,6 +17,46 @@ namespace Cry
+ namespace DefaultComponents
+ {
+ 
++namespace
++{
++//! Fallback for the deferred update: if ENTITY_EVENT_XFORM_FINISHED_EDITOR never arrives (a transform
++//! typed into the property panel, or a tool that moves objects without going through CObjectMode), the
++//! held back rebuild still runs once this many frames have passed without a new ENTITY_EVENT_XFORM.
++int    g_terrainPlateSettleFrames = 6;
++ICVar* g_pTerrainPlateSettleFramesCVar = nullptr;
++}
++
++void RegisterTerrainPlateCVars()
++{
++	if (gEnv == nullptr || gEnv->pConsole == nullptr || g_pTerrainPlateSettleFramesCVar != nullptr)
++		return;
++
++	g_pTerrainPlateSettleFramesCVar = REGISTER_CVAR2("e_TerrainPlateSettleFrames", &g_terrainPlateSettleFrames, 6, VF_NULL,
++	                                                 "Terrain Plate component with Update During Drag = false: number of frames without a\n"
++	                                                 "transform event after which the held back rebuild (weld, physics mesh, shadow cache)\n"
++	                                                 "runs anyway. This is only a fallback - the normal trigger is the editor's mouse up\n"
++	                                                 "event ENTITY_EVENT_XFORM_FINISHED_EDITOR.\n"
++	                                                 "0 - no fallback, only the mouse up event flushes");
++}
++
++void UnregisterTerrainPlateCVars()
++{
++	if (g_pTerrainPlateSettleFramesCVar == nullptr)
++		return;
++
++	if (gEnv != nullptr && gEnv->pConsole != nullptr)
++	{
++		gEnv->pConsole->UnregisterVariable(g_pTerrainPlateSettleFramesCVar->GetName());
++	}
++
++	g_pTerrainPlateSettleFramesCVar = nullptr;
++}
++
++int CTerrainPlateComponent::GetSettleFrames()
++{
++	return max(0, g_terrainPlateSettleFrames);
++}
++
+ float STerrainPlateHeightField::SampleBilinear(float u, float v) const
+ {
+ 	if (!IsValid())
+@@ -574,8 +615,13 @@ Cry::Entity::EventFlags CTerrainPlateComponent::GetEventMask() const
+ 	// the handler decides whether the change actually asks for a rebuild.
+ 	bitFlags |= ENTITY_EVENT_XFORM;
+ 
+-	// Only ticked while a rebuild was throttled away, so a static plate costs nothing per frame.
+-	if (m_bRegenPending)
++	// End of an editor transform gesture (mouse up). Sent by CSelectionGroup::ObjectModified
++	// (Sandbox/EditorQt/Objects/SelectionGroup.cpp:646-668) from CObjectMode::OnLButtonUp
++	// (Sandbox/Plugins/EditorCommon/LevelEditor/Tools/ObjectMode.cpp:681-686). @see FlushDeferredTransform.
++	bitFlags |= ENTITY_EVENT_XFORM_FINISHED_EDITOR;
++
++	// Only ticked while a rebuild was throttled away or held back, so a static plate costs nothing per frame.
++	if (m_bRegenPending || m_bDeferredXformPending)
+ 	{
+ 		bitFlags |= ENTITY_EVENT_UPDATE;
+ 	}
+@@ -596,15 +642,47 @@ void CTerrainPlateComponent::ProcessEvent(const SEntityEvent& event)
+ 		// matters when the mesh is solved against the terrain.
+ 		if (NeedsRegenerateOnTransform() || !GetWorldScale().IsEquivalent(m_lastWorldScale, 0.0001f))
+ 		{
+-			RequestRegenerate();
++			// With Update During Drag off, an editor transform only records that a rebuild is owed. The
++			// existing mesh keeps its shape and rides along with the entity, so the weld is wrong for the
++			// duration of the gesture; the rebuild runs once on mouse up. ENTITY_XFORM_EDITOR is set by
++			// CEntity::SetPosRotScale for every editor driven transform, so game time, TrackView and
++			// parent driven moves (ENTITY_XFORM_FROM_PARENT without the editor bit) keep the old path.
++			const bool bEditorTransform = (event.nParam[0] & ENTITY_XFORM_EDITOR) != 0;
++
++			if (bEditorTransform && !m_bUpdateDuringDrag)
++			{
++				m_bDeferredXformPending = true;
++				m_lastXformFrameId = gEnv->nMainFrameID;
++				m_pEntity->UpdateComponentEventMask(this);
++			}
++			else
++			{
++				RequestRegenerate();
++			}
++		}
++		break;
++
++	case ENTITY_EVENT_XFORM_FINISHED_EDITOR:
++		if (m_bDeferredXformPending)
++		{
++			FlushDeferredTransform();
+ 		}
+ 		break;
+ 
+ 	case ENTITY_EVENT_UPDATE:
+-		if (m_bRegenPending)
+ 		{
+-			RegenerateMesh();
+-			m_pEntity->UpdateComponentEventMask(this);
++			// Settle fallback for the deferred path: flush once no transform has been seen for N frames,
++			// in case ENTITY_EVENT_XFORM_FINISHED_EDITOR never arrives (@see FlushDeferredTransform).
++			const int settleFrames = GetSettleFrames();
++			const bool bSettled = m_bDeferredXformPending && settleFrames > 0
++			                      && (int)(gEnv->nMainFrameID - m_lastXformFrameId) >= settleFrames;
++
++			// One rebuild clears both flags, so the two reasons never cost two rebuilds.
++			if (m_bRegenPending || bSettled)
++			{
++				RegenerateMesh();
++				m_pEntity->UpdateComponentEventMask(this);
++			}
+ 		}
+ 		break;
+ 
+@@ -679,6 +757,20 @@ void CTerrainPlateComponent::RequestRegenerate()
+ 	}
+ }
+ 
++void CTerrainPlateComponent::FlushDeferredTransform()
++{
++	// Runs the whole rebuild that the drag held back: the weld against the terrain, the physics trimesh
++	// and, when the geometry really changed, the shadow cache invalidation. Deliberately not
++	// RequestRegenerate: the gesture is over, so there is nothing left to coalesce with and the user is
++	// waiting to see the result. RegenerateMesh clears both pending flags.
++	RegenerateMesh();
++
++	if (m_pEntity != nullptr)
++	{
++		m_pEntity->UpdateComponentEventMask(this);
++	}
++}
++
+ void CTerrainPlateComponent::LoadSourceIfNeeded()
+ {
+ 	const string& path = (m_sourceMode == ETerrainPlateSource::HeightmapFile) ? m_heightmapPath.value : m_displacementPath.value;
+@@ -855,6 +947,7 @@ void CTerrainPlateComponent::ComputeEffectiveGrid(int& vertsX, int& vertsY)
+ void CTerrainPlateComponent::RegenerateMesh()
+ {
+ 	m_bRegenPending = false;
++	m_bDeferredXformPending = false;
+ 	m_lastRegenFrameId = gEnv->nMainFrameID;
+ 
+ 	if (m_pEntity == nullptr || gEnv->p3DEngine == nullptr)
+diff --git a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
+index 88d378e9..1333e840 100644
+--- a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
++++ b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
+@@ -112,6 +112,11 @@ static void ReflectType(Schematyc::CTypeDesc<ETerrainPlateGridMode>& desc)
+ 	desc.AddConstant(ETerrainPlateGridMode::Spacing, "Spacing", "Spacing");
+ }
+ 
++//! Registers / removes the console variables owned by the terrain plate component. Called from the
++//! plugin's Initialize and destructor, because a cvar must never outlive the module that owns it.
++void RegisterTerrainPlateCVars();
++void UnregisterTerrainPlateCVars();
++
+ //! A procedural grid mesh built from a heightmap, hosted in an entity slot so that it reaches the
+ //! terrain integration path exactly like an ordinary mesh component does.
+ class CTerrainPlateComponent
+@@ -199,6 +204,14 @@ public:
+ 		               0.1f);
+ 		desc.AddMember(&CTerrainPlateComponent::m_skirt, 'skrt', "Skirt", "Skirt", "Metres of extra geometry extruded straight down from the border, so the plate still seals where the terrain does not match (steep slopes, distant sectors rendered at a coarser LOD). 0 disables the skirt.", 0.25f);
+ 
++		desc.AddMember(&CTerrainPlateComponent::m_bUpdateDuringDrag, 'udrg', "UpdateDuringDrag", "Update During Drag",
++		               "Off (default): while the plate is moved, rotated or scaled in the editor the mesh is left exactly as it was and simply "
++		               "follows the entity, so the weld against the terrain is temporarily wrong; the weld, the physics mesh and the shadow cache "
++		               "are all recomputed once, when the mouse button is released. On: the plate is regenerated while dragging (at most once per "
++		               "frame), which is the old behaviour and is heavy on a dense plate. Only affects editor transforms; game time and TrackView "
++		               "movement always update immediately.",
++		               false);
++
+ 		desc.AddMember(&CTerrainPlateComponent::m_renderParameters, 'rend', "Render", "Rendering Settings", "Settings for the rendered representation of the component", plateRenderDefaults);
+ 		desc.AddMember(&CTerrainPlateComponent::m_physics, 'phys', "Physics", "Physics Settings",
+ 		               "Physical properties for the object. With Type = Render and Collider the plate physicalizes itself as a static "
+@@ -217,6 +230,11 @@ protected:
+ 	void        LoadSourceIfNeeded();
+ 	//! Regenerates now, or once in the next frame if this frame already did.
+ 	void        RequestRegenerate();
++	//! Runs the rebuild that was held back for the duration of an editor transform gesture.
++	void        FlushDeferredTransform();
++	//! Frames without an ENTITY_EVENT_XFORM after which a held back rebuild is run anyway, from
++	//! e_TerrainPlateSettleFrames. 0 disables the fallback (only the mouse up event flushes).
++	static int  GetSettleFrames();
+ 	//! True when the mesh depends on the entity transform (weld, skirt, or Spacing grid mode).
+ 	bool        NeedsRegenerateOnTransform() const;
+ 	//! World transform of the plate slot, also valid before the slot exists.
+@@ -259,6 +277,7 @@ protected:
+ 	Schematyc::Range<0, 1, 0, 1, float>          m_weldInnerFalloff = 0.25f;
+ 	Schematyc::Range<0, 100, 0, 2, float>        m_weldSink = 0.1f;
+ 	Schematyc::Range<0, 1000, 0, 20, float>      m_skirt = 0.25f;
++	bool                                         m_bUpdateDuringDrag = false;
+ 
+ 	// Cached state, never serialised: the mesh is always rebuilt on load.
+ 	STerrainPlateHeightField m_heightField;
+@@ -266,6 +285,10 @@ protected:
+ 	ETerrainPlateSource      m_loadedSourceMode = ETerrainPlateSource::HeightmapFile;
+ 	bool                     m_bSourceLoaded = false;
+ 	bool                     m_bRegenPending = false;
++	//! True while a rebuild is held back until the end of an editor transform gesture.
++	bool                     m_bDeferredXformPending = false;
++	//! Frame of the last ENTITY_EVENT_XFORM that was held back, for the settle fallback.
++	uint32                   m_lastXformFrameId = 0;
+ 	bool                     m_bBudgetWarningIssued = false;
+ 	bool                     m_bBudgetClampWarningIssued = false;
+ 	//! True while the entity's physical entity is the static one this component created.
+diff --git a/Code/CryPlugins/CryDefaultEntities/Module/PluginDll.cpp b/Code/CryPlugins/CryDefaultEntities/Module/PluginDll.cpp
+index be3815ec..29beb6f0 100644
+--- a/Code/CryPlugins/CryDefaultEntities/Module/PluginDll.cpp
++++ b/Code/CryPlugins/CryDefaultEntities/Module/PluginDll.cpp
+@@ -78,6 +78,9 @@ CPlugin_CryDefaultEntities::~CPlugin_CryDefaultEntities()
+ 	{
+ 		pSystem->GetISystemEventDispatcher()->RemoveListener(this);
+ 	}
++
++	// The cvars this module registered must not outlive it.
++	Cry::DefaultComponents::UnregisterTerrainPlateCVars();
+ }
+ 
+ bool CPlugin_CryDefaultEntities::Initialize(SSystemGlobalEnvironment& env, const SSystemInitParams& initParams)
+@@ -86,6 +89,8 @@ bool CPlugin_CryDefaultEntities::Initialize(SSystemGlobalEnvironment& env, const
+ 
+ 	env.pSystem->GetISystemEventDispatcher()->RegisterListener(this, "CCryPluginManager");
+ 
++	Cry::DefaultComponents::RegisterTerrainPlateCVars();
++
+ 	return true;
+ }
+ 
+-- 
+2.47.1.windows.1
+

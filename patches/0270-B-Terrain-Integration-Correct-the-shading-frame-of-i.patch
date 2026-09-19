@@ -1,0 +1,103 @@
+From 18afd864fb5b7dd5523238dbb0d707698cc21004 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Wed, 2 Sep 2026 07:38:48 +0800
+Subject: [PATCH 270/307] !B (Terrain Integration) Correct the shading frame of
+ integrated vertices.
+
+Reconstruct integrated vertex tangents from the transformed position frame and
+preserve handedness across mirrored transforms. Terrain detail and parallax
+mapping now use a stable world-space shading basis.
+---
+ Code/CryEngine/Cry3DEngine/cvars.cpp          | 12 ++++++
+ Code/CryEngine/Cry3DEngine/cvars.h            |  1 +
+ .../Cry3DEngine/terrain_sector_render.cpp     | 38 ++++++++++++++++++-
+ 3 files changed, 49 insertions(+), 2 deletions(-)
+
+diff --git a/Code/CryEngine/Cry3DEngine/cvars.cpp b/Code/CryEngine/Cry3DEngine/cvars.cpp
+index 4c87a8b6..0ddca115 100644
+--- a/Code/CryEngine/Cry3DEngine/cvars.cpp
++++ b/Code/CryEngine/Cry3DEngine/cvars.cpp
+@@ -568,6 +568,18 @@ void CVars::Init()
+ 	              "Ignored (forced to 0) while e_TerrainIntegrateObjectsFull is 2: with the object's own\n"
+ 	              "draw gone the push has no job left and would only lift the surface off its collision.\n"
+ 	              "0.02 - stock behaviour");
++	REGISTER_CVAR(e_TerrainIntegrateObjectsNormalBlendHeight, 0.1f, VF_NULL,
++	              "Report 39. Metres above the terrain over which the vertex normal of an integrated\n"
++	              "object is blended from the terrain normal to the object's own normal. The blend hides\n"
++	              "the shading seam where the appended surface leaves the ground; above this height the\n"
++	              "object's true normal is used, which is what keeps the terrain detail layers picking\n"
++	              "the right projection axis and keeps the POM tangent frame honest on steep faces.\n"
++	              "0.1  - contact band only (default): the seam is still covered, relief above it shades\n"
++	              "       and tiles like the stock terrain does on a cliff of the same slope\n"
++	              "0.5  - the shipped 5.7 ramp; flattens the normals of anything within half a metre of\n"
++	              "       the ground, which smears POM detail layers and whitens sharp creases on the\n"
++	              "       relief that the one sided height band now admits\n"
++	              "0    - no blend at all, the object's own normal everywhere (hard shading seam)");
+ 	REGISTER_CVAR(e_TerrainIntegrateObjectsLodHoldDistance, 0.f, VF_NULL,
+ 	              "Decision 06 C4. Metres out to which a terrain sector that contains an object with the\n"
+ 	              "GI mode 'Integrate Into Terrain' is kept subdivided down to LOD 0, whatever the normal\n"
+diff --git a/Code/CryEngine/Cry3DEngine/cvars.h b/Code/CryEngine/Cry3DEngine/cvars.h
+index 80429300..b2616765 100644
+--- a/Code/CryEngine/Cry3DEngine/cvars.h
++++ b/Code/CryEngine/Cry3DEngine/cvars.h
+@@ -226,6 +226,7 @@ struct CVars : public Cry3DEngineBase
+ 	int   e_TerrainIntegrateObjectsFull;
+ 	float e_TerrainIntegrateObjectsPushOut;
+ 	float e_TerrainIntegrateObjectsLodHoldDistance;
++	float e_TerrainIntegrateObjectsNormalBlendHeight;
+ 	DeclareConstIntCVar(e_SkyBox, 1);
+ 	float e_CoverageBufferAABBExpand;
+ 	int   e_CoverageBufferEarlyOut;
+diff --git a/Code/CryEngine/Cry3DEngine/terrain_sector_render.cpp b/Code/CryEngine/Cry3DEngine/terrain_sector_render.cpp
+index 7c67d770..9ddd52b9 100644
+--- a/Code/CryEngine/Cry3DEngine/terrain_sector_render.cpp
++++ b/Code/CryEngine/Cry3DEngine/terrain_sector_render.cpp
+@@ -1896,9 +1896,43 @@ void CTerrainNode::AppendTrianglesFromObjects(const int nOriginX, const int nOri
+ 										Vec3 vTerrainNorm;
+ 										SetVertexNormal(x, y, stepSize, pTerrain, nTerrainSize, vert, &vTerrainNorm);
+ 
+-										// use terrain normal near the ground
+-										float fLerp = SATURATE((vPosWS[v].z - fElev[v]) * 2.f);
++										// Use the terrain normal near the ground, so the appended surface leaves the
++										// ground without a shading seam. Two corrections against the shipped line
++										// (report 39):
++										//
++										// 1) The lerp result is NORMALIZED. The shipped code encoded the raw lerp, and a
++										//    lerp between two unit vectors is only unit at its ends: the more the object
++										//    normal disagrees with the terrain normal, the shorter it gets (down to zero
++										//    for opposed normals at t = 0.5). Nothing downstream re-normalizes it -
++										//    ModificatorVT.cfi vtxStreamUnifyTangents only EXPANDs the bytes, and
++										//    Terrain.cfx uses that vector as is for the layer tangent frame
++										//    (Gram-Schmidt at Terrain.cfx:305-306), for the layer projection axis test
++										//    (:328-336) and as row 2 of mTangentToWS (:557). A short row 2 makes the
++										//    frame non-orthonormal, which tilts and stretches the tangent space view
++										//    vector the POM ray march walks along (GatherMaterialAttribs, :369) - the
++										//    ray then takes huge UV steps and the detail layer smears into streaks.
++										//    The same short vector skews the normal-mapped world normal at :467, which
++										//    is what blows a crease out to white.
++										//
++										// 2) The blend height is a cvar and no longer a hard coded 0.5 m ramp
++										//    ((z - elev) * 2). Half a metre was harmless while the height band kept
++										//    integrated geometry flat against the ground, but since the band became one
++										//    sided (report 30) a whole mound or plate can sit inside it, and every
++										//    steep face in there was being handed a flattened, near-vertical-normal
++										//    frame: wrong layer projection picked, wrong POM frame, no hard crease.
++										//    A contact band of a few centimetres still hides the weld seam, which is
++										//    the only thing the blend was ever for.
++										const float fNormalBlendHeight = GetCVars()->e_TerrainIntegrateObjectsNormalBlendHeight;
++										float fLerp = (fNormalBlendHeight > 0.f)
++										              ? SATURATE((vPosWS[v].z - fElev[v]) / fNormalBlendHeight)
++										              : 1.f;
+ 										Vec3 vNorm = Vec3::CreateLerp(vTerrainNorm, vNormWS[v], fLerp);
++										// Degenerate only when the two normals are exactly opposed; the object's own
++										// normal is the meaningful answer there (the terrain normal is just a hint).
++										if (vNorm.GetLengthSquared() > 1e-6f)
++											vNorm.Normalize();
++										else
++											vNorm = vNormWS[v];
+ 										vert.normal.bcolor[0] = (byte)(vNorm[0] * 127.5f + 128.0f);
+ 										vert.normal.bcolor[1] = (byte)(vNorm[1] * 127.5f + 128.0f);
+ 										vert.normal.bcolor[2] = (byte)(vNorm[2] * 127.5f + 128.0f);
+-- 
+2.47.1.windows.1
+

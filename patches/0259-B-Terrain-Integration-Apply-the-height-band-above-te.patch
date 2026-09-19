@@ -1,0 +1,168 @@
+From 44d75491df8294f04d2d805ee1aca82eeaf6c04a Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Tue, 1 Sep 2026 13:03:46 +0800
+Subject: [PATCH 259/307] !B (Terrain Integration) Apply the height band above
+ terrain only.
+
+Use the height band only to reject geometry below the terrain contact region.
+Relief rising above the ground is no longer limited by the integration band.
+---
+ Code/CryEngine/Cry3DEngine/cvars.cpp          |  9 ++--
+ Code/CryEngine/Cry3DEngine/terrain_sector.h   |  4 +-
+ .../Cry3DEngine/terrain_sector_render.cpp     | 48 ++++++++++++++++---
+ .../Geometry/BaseMeshComponent.h              |  5 +-
+ 4 files changed, 53 insertions(+), 13 deletions(-)
+
+diff --git a/Code/CryEngine/Cry3DEngine/cvars.cpp b/Code/CryEngine/Cry3DEngine/cvars.cpp
+index ff52e421..4c87a8b6 100644
+--- a/Code/CryEngine/Cry3DEngine/cvars.cpp
++++ b/Code/CryEngine/Cry3DEngine/cvars.cpp
+@@ -523,9 +523,12 @@ void CVars::Init()
+ 	              "and objects are truncated once the budget is exhausted.\n"
+ 	              "0 - disable the feature completely (also clears the level flag on the next level load)");
+ 	REGISTER_CVAR(e_TerrainIntegrateObjectsMaxHeight, 32.f, VF_NULL,
+-	              "Height band used by the level flag Terrain/IntegrateObjects: only object triangles\n"
+-	              "within this many meters above the terrain under them are integrated.\n"
+-	              "Float; values below 1 are useful for welding flat plates onto the ground");
++	              "Height band used by the level flag Terrain/IntegrateObjects. It does NOT cap how high\n"
++	              "integrated relief may rise above the terrain: it is the largest gap an object may have\n"
++	              "to the terrain under it before it counts as lifted clear of the ground, in which case\n"
++	              "none of it is integrated and it keeps its own material. It also grows the box each\n"
++	              "sector uses to look for integrated objects.\n"
++	              "Float; per object override: the Terrain Height Band component property");
+ 	REGISTER_CVAR(e_TerrainIntegrateObjectsDebug, 0, VF_NULL,
+ 	              "Debug output for the level flag Terrain/IntegrateObjects\n"
+ 	              "0 - off\n"
+diff --git a/Code/CryEngine/Cry3DEngine/terrain_sector.h b/Code/CryEngine/Cry3DEngine/terrain_sector.h
+index 039c966d..c1404b7f 100644
+--- a/Code/CryEngine/Cry3DEngine/terrain_sector.h
++++ b/Code/CryEngine/Cry3DEngine/terrain_sector.h
+@@ -505,7 +505,7 @@ public:
+ 	// Per class bboxes and counts of the last rebuild, drawn by e_TerrainIntegrateObjectsDebug 2.
+ 	AABB                       m_boxIntegratedMerged;     // full terrain layer weight (green)
+ 	AABB                       m_boxIntegratedTransition; // ramped weight inside the slope band (yellow)
+-	AABB                       m_boxIntegratedRejected;   // too steep or out of the height band (red)
++	AABB                       m_boxIntegratedRejected;   // too steep, buried, or on an airborne object (red)
+ 	int                        m_nIntegratedTrisMerged;
+ 	int                        m_nIntegratedTrisTransition;
+ 	int                        m_nIntegratedTrisRejected;
+@@ -517,7 +517,7 @@ public:
+ 	// now" gate. Two independent halves, both of which must hold before an object may skip its own
+ 	// camera draw:
+ 	//  - m_lstFullyIntegratedObjects: the objects this sector examined on its last rebuild and took
+-	//    ENTIRELY. An object that lost even one triangle here (height band, slope limit, slope
++	//    ENTIRELY. An object that lost even one triangle here (buried below the terrain, slope limit, slope
+ 	//    transition band, vertex/index budget, missing render mesh, missing material, unusable chunk)
+ 	//    is deliberately absent, so the query fails closed and the object keeps drawing itself.
+ 	//    Cleared at the START of every rebuild, never at the end, so an object is never hidden on a
+diff --git a/Code/CryEngine/Cry3DEngine/terrain_sector_render.cpp b/Code/CryEngine/Cry3DEngine/terrain_sector_render.cpp
+index bded5519..7c67d770 100644
+--- a/Code/CryEngine/Cry3DEngine/terrain_sector_render.cpp
++++ b/Code/CryEngine/Cry3DEngine/terrain_sector_render.cpp
+@@ -1547,9 +1547,9 @@ void CTerrainNode::AppendTrianglesFromObjects(const int nOriginX, const int nOri
+ 	int nIntegratedObjects = 0;
+ 
+ 	// Classification counters for the whole sector, reported by e_TerrainIntegrateObjectsDebug.
+-	int nTrisMerged = 0;     // inside the height band and flat enough: full terrain layer weight
++	int nTrisMerged = 0;     // above the terrain and flat enough: full terrain layer weight
+ 	int nTrisTransition = 0; // inside the slope transition band: ramped terrain layer weight
+-	int nTrisRejected = 0;   // too steep or outside the height band: the object material is kept
++	int nTrisRejected = 0;   // too steep, buried, or on an airborne object: the object material is kept
+ 
+ 	// Transition weight of every vertex appended below, indexed by (vertex index - nVertsBefore).
+ 	// Welded vertices are shared between triangles of different classes and keep the largest weight.
+@@ -1608,11 +1608,38 @@ void CTerrainNode::AppendTrianglesFromObjects(const int nOriginX, const int nOri
+ 
+ 		// A negative per object band means "use the cvar". Note that the object query box above is
+ 		// still grown by the cvar only, so a per object band larger than the cvar widens the per
+-		// triangle test but not the set of objects this sector looks at.
++		// object test but not the set of objects this sector looks at.
+ 		const float fHeightBand = (integrationParams.heightBand >= 0.f)
+ 		                          ? integrationParams.heightBand
+ 		                          : GetCVars()->e_TerrainIntegrateObjectsMaxHeight;
+ 
++		// USER DIRECTIVE (2026-09-01): "the terrain height band must not limit the maximum." Relief
++		// height is legitimate, so the per triangle height test below is ONE SIDED: no triangle is ever
++		// rejected for being too high above the terrain. Only the terrain contact side of the band is
++		// left there (the stock triBox.max.z > fElevMin buried test).
++		//
++		// What the upper half of the band was really for - decision 02, "plate lifted clear of the
++		// ground -> rejected -> fallback material" - is a statement about the OBJECT, not about one
++		// triangle, so it is made here, once per object: an object whose ENTIRE bounding box floats
++		// more than the band above the terrain under it is not relief, it is a lifted object, and every
++		// one of its triangles is rejected below. Without this the directive alone would make a plate
++		// hovering in mid air classify by slope only, i.e. be swallowed by the terrain mesh and (in
++		// full mode 2) have its own draw suppressed - terrain-shaded geometry floating in the sky.
++		//
++		// The threshold is deliberately the one the old per triangle upper test used, so:
++		//  - an object that used to sit entirely inside the band classifies exactly as before, which is
++		//    what keeps heightBand = -1 (default) a no-op regression-wise;
++		//  - an object that used to be entirely outside it is still rejected entirely;
++		//  - only the in-between case changes, and that is the case the directive is about: a plate
++		//    that touches the ground and rises past the band is now taken WHOLE instead of partially,
++		//    which is what lets e_TerrainIntegrateObjectsFull 2 suppress its own draw.
++		// GetZMax is the heightmap maximum over the object's whole footprint, so it is >= the terrain
++		// elevation under any single triangle of the object, and this object test is therefore never
++		// stricter than the per triangle upper test it replaces.
++		const AABB objBoxWS = pRNode->GetBBox();
++		const float fTerrainZMaxUnderObject = pTerrain->GetZMax(objBoxWS.min.x, objBoxWS.min.y, objBoxWS.max.x, objBoxWS.max.y);
++		const bool bObjectAirborne = (objBoxWS.min.z > fTerrainZMaxUnderObject + fHeightBand);
++
+ 		const float fSlopeLimitDeg = clamp_tpl(integrationParams.slopeLimitDeg, 0.f, 90.f);
+ 		const float fSlopeBlendDeg = clamp_tpl(integrationParams.slopeBlendDeg, 0.f, fSlopeLimitDeg);
+ 		const float fSlopeBandStartDeg = fSlopeLimitDeg - fSlopeBlendDeg;
+@@ -1730,7 +1757,9 @@ void CTerrainNode::AppendTrianglesFromObjects(const int nOriginX, const int nOri
+ 							AABB triBox;
+ 							triBox.Reset();
+ 
+-							float fElevMin = 10000, fElevMax = 0;
++							// Only the minimum is needed now: the height test is one sided (see above),
++							// and fElevMax existed solely for the upper half of the band.
++							float fElevMin = 10000;
+ 
+ 							for (int v = 0; v < 3; v++)
+ 							{
+@@ -1748,7 +1777,6 @@ void CTerrainNode::AppendTrianglesFromObjects(const int nOriginX, const int nOri
+ 								fElev[v] = GetTerrain()->GetZApr(vPosWS[v].x, vPosWS[v].y);
+ 
+ 								fElevMin = min(fElevMin, fElev[v]);
+-								fElevMax = max(fElevMax, fElev[v]);
+ 							}
+ 
+ 							// A triangle that belongs to a neighbouring sector is not a classification
+@@ -1756,7 +1784,15 @@ void CTerrainNode::AppendTrianglesFromObjects(const int nOriginX, const int nOri
+ 							if (!Overlap::AABB_AABB2D(triBox, aabbTNode))
+ 								continue;
+ 
+-							if (!(triBox.max.z > fElevMin && triBox.min.z < fElevMax + fHeightBand))
++							// One sided height test (user directive 2026-09-01). The contact side is the
++							// stock test, unchanged: a triangle whose top is at or below the LOWEST
++							// terrain elevation under it is buried and is rejected, so the plate's skirt
++							// and its below ground regions keep the object's own material exactly as
++							// before. There is no upper test any more - relief may rise arbitrarily far
++							// above the terrain - except that an object which floats clear of the ground
++							// altogether (bObjectAirborne, decided once above) rejects all of its
++							// triangles, which is precisely what the old upper test did in that case.
++							if (!(triBox.max.z > fElevMin) || bObjectAirborne)
+ 							{
+ 								nTrisRejected++;
+ 								nObjectTrisClassified++;
+diff --git a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/BaseMeshComponent.h b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/BaseMeshComponent.h
+index 87128d13..a360e8ee 100644
+--- a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/BaseMeshComponent.h
++++ b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/BaseMeshComponent.h
+@@ -157,8 +157,9 @@ static void ReflectType(Schematyc::CTypeDesc<SRenderParameters>& desc)
+ 	               "stopping at a hard edge. 0 (the default) is a hard edge.", 0.f);
+ 	desc.AddMember(&SRenderParameters::m_terrainHeightBand, 'tshb', "TerrainHeightBand", "Terrain Height Band",
+ 	               "Only applies with GI and Usage Mode = Integrate Into Terrain, and only when the level flag Terrain/IntegrateObjects is on. "
+-	               "Per object override in metres of e_TerrainIntegrateObjectsMaxHeight: only the part of this mesh within that many metres above "
+-	               "the terrain under it receives the terrain layers. -1 (the default) uses the global cvar value.", -1.f);
++	               "Per object override in metres of e_TerrainIntegrateObjectsMaxHeight. It does NOT limit how high the relief may rise: it is "
++	               "the maximum gap between this mesh and the terrain under it before the mesh counts as lifted clear of the ground and keeps "
++	               "its own material instead of the terrain layers. -1 (the default) uses the global cvar value.", -1.f);
+ }
+ 
+ // Base implementation for our physics mesh components
+-- 
+2.47.1.windows.1
+

@@ -1,0 +1,150 @@
+From 3a155565279cb9b07aca50dc888dd08ed3ef8a66 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Mon, 31 Aug 2026 13:12:06 +0800
+Subject: [PATCH 249/307] !B (Terrain Plate) Rebuild baked relief after
+ priority changes.
+
+Changing bake priority now unwinds the affected overlap set using its previous
+order before applying the new order. Subsequent group movement therefore has a
+clean baseline for every plate.
+---
+ .../Geometry/TerrainPlateComponent.cpp        | 65 ++++++++++++++++++-
+ .../Geometry/TerrainPlateComponent.h          |  5 ++
+ 2 files changed, 67 insertions(+), 3 deletions(-)
+
+diff --git a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
+index 10c1ec2c..c65be6cb 100644
+--- a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
++++ b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
+@@ -56,6 +56,12 @@ int  g_bakeCascadeDepth = 0;
+ //! Frame of the last completed cascade. The polling skips that frame, so N plates that all see the
+ //! terrain move in the same frame produce one cascade between them, not N.
+ uint32 g_bakeCascadeFrameId = ~0u;
++//! P15. Stamped on every bake that lands, so that a cascade can restore in the exact inverse of the order
++//! the terrain was ACTUALLY laid down in. Bake Priority is not that order: it is the order the plates WILL
++//! be applied in next time, and the user can change it between a bake and its restore. The stored
++//! baselines form a stack - the plate applied second captured the ground with the first plate's relief
++//! already in it - and a stack can only be unwound in the order it was pushed.
++uint64 g_bakeApplySeqCounter = 0;
+ //! Never restore and re-bake more than this many plates in one cascade. Unreal caps its landscape edit
+ //! layers at 8 for the same reason; the cost here is one mesh regeneration plus one SetTerrainElevation
+ //! per plate, so the cap is about a runaway configuration, not about the normal case.
+@@ -1345,6 +1351,34 @@ void CTerrainPlateComponent::RegenerateMesh()
+ 	m_bDeferredXformPending = false;
+ 	m_lastRegenFrameId = gEnv->nMainFrameID;
+ 
++	// P15. If this plate shares ground with other baking plates, the whole set has to be unwound BEFORE
++	// anything is restored - and the restore below is part of "anything". Until now the cascade decision
++	// was taken at the very end of this function, in ApplyBakeCascaded, by which time this plate had
++	// already written its own baseline over its footprint on its own. Whenever this plate was not the last
++	// one applied, that lone restore was out of order: it handed the original ground back under a plate
++	// that is still in the terrain above it, and the ordered restore that followed then wrote that plate's
++	// baseline - which contains THIS plate's relief - back over the same ground. The relief was left in
++	// the terrain owned by nobody, and the re-bake captured it into a baseline as if it were the original
++	// ground. Hoisting the decision above the restore gives the whole unwind to RunBakeCascade, which is
++	// where the ordering lives. It also makes the set correct: collected here, this plate still holds its
++	// live rect, so GetBakeCascadeRects reports the footprint it is leaving as well as the one it is
++	// taking (P14) - after the restore below only the new one survives.
++	//
++	// The cascade regenerates every member, this plate included, so returning here is not a rebuild
++	// skipped. Depth > 0 means we ARE that regeneration and must not start a second cascade.
++	if (g_bakeCascadeDepth == 0 && m_bBakeIntoTerrain && !m_bBakeTornDown && !m_bInitialBakePending
++	    && m_pEntity != nullptr && gEnv->p3DEngine != nullptr)
++	{
++		std::vector<CTerrainPlateComponent*> affected;
++		CollectBakeCascadeSet(affected);
++
++		if (affected.size() > 1)
++		{
++			RunBakeCascade(affected, this, "overlap cascade");
++			return;
++		}
++	}
++
+ 	// Put the original ground back before anything reads the terrain again. The edge weld below samples
+ 	// GetTerrainElevation, so without this it would weld the plate onto its own bake and drift upwards
+ 	// on every property change (decision 04, rule 3 / research 08 section 2.4). It also has to happen
+@@ -2592,6 +2626,9 @@ void CTerrainPlateComponent::ApplyBake()
+ 		return;   // WriteTerrainBlock has already named the reason
+ 
+ 	m_bBakeApplied = true;
++	// P15: the block is in the ground now, so this plate is on top of everything that was written before
++	// it. That is the only order the stack of baselines can be unwound in. @see RunBakeCascade.
++	m_bakeApplySeq = ++g_bakeApplySeqCounter;
+ 	m_lastBakeProbeFrameId = gEnv->nMainFrameID;
+ 	BuildBakeProbes(metrics);
+ 	WarnOnBakeQuantisation(metrics);
+@@ -3112,6 +3149,12 @@ void CTerrainPlateComponent::LogBakeOverlapOnce(const CTerrainPlateComponent& ot
+ 
+ void CTerrainPlateComponent::ApplyBakeCascaded()
+ {
++	// P15: for a baking plate the multi plate case is normally taken at the TOP of RegenerateMesh, before
++	// the plate restores its own footprint, because the restore is itself part of the ordered unwind. By
++	// the time control reaches here this plate is already out of the terrain, so the set it collects can
++	// only be a subset of the one collected up there - i.e. a single plate. The branch below is kept as
++	// the safety net for the paths that call ApplyBakeCascaded without going through that hoist.
++	//
+ 	// Inside a cascade the driver below has already decided who bakes when, so a participant just bakes.
+ 	// This is the recursion guard as well: the loop below calls RegenerateMesh, which comes straight
+ 	// back here, and a cascade started from inside a cascade would restore plates that are half way
+@@ -3148,12 +3191,21 @@ void CTerrainPlateComponent::RunBakeCascade(std::vector<CTerrainPlateComponent*>
+ 	// The cascade. Every plate captures its baseline from the terrain as it finds it, so the only way a
+ 	// composite is well defined is to unwind the whole overlapping set and re-apply it in one order:
+ 	//
+-	//   restore in DESCENDING priority - the exact inverse of the order they were applied in, so each
++	//   restore in DESCENDING apply order - the exact inverse of the order they were applied in, so each
+ 	//                                    plate writes back a baseline that is still the truth and the
+ 	//                                    terrain ends up at the original ground;
+ 	//   bake in ASCENDING priority     - each plate then captures the composite of everything below it,
+ 	//                                    and the highest priority plate is written last, so it wins.
+ 	//
++	// P15: the restore order is m_bakeApplySeq, NOT Bake Priority. The two agree for as long as nobody
++	// edits a priority, because the previous cascade baked the set in ascending priority and stamped the
++	// sequence as it went. They stop agreeing the moment the user changes a Bake Priority: the terrain
++	// still holds a stack that was pushed in the OLD order, and unwinding it in the new order writes a
++	// lower plate's baseline (which contains the higher plate's relief) back on top of ground the higher
++	// plate has already given up - resurrecting that relief as unowned ground, which the next bake then
++	// captures into its baseline as if it were the original terrain. That ghost is invisible while the
++	// plates cover it and appears the moment they are moved away. @see report 20.
++	//
+ 	// The re-bake goes through RegenerateMesh, not ApplyBake, because the ground under a plate moved and
+ 	// the edge weld of its mesh is solved against that ground.
+ 	//
+@@ -3162,9 +3214,16 @@ void CTerrainPlateComponent::RunBakeCascade(std::vector<CTerrainPlateComponent*>
+ 	// is in the set even when its new position overlaps nothing, so its old footprint is always restored.
+ 	++g_bakeCascadeDepth;
+ 
+-	for (size_t i = affected.size(); i-- > 0; )
++	// A separate order, because the set has to be RE-APPLIED in priority order and UNWOUND in the order it
++	// was written. A plate that has never baked carries sequence 0, sorts last and restores nothing.
++	std::vector<CTerrainPlateComponent*> unwind(affected);
++	std::stable_sort(unwind.begin(), unwind.end(),
++	                 [](const CTerrainPlateComponent* pA, const CTerrainPlateComponent* pB)
++	                 { return pA->m_bakeApplySeq > pB->m_bakeApplySeq; });
++
++	for (CTerrainPlateComponent* pPlate : unwind)
+ 	{
+-		affected[i]->RestoreBakeBaseline();
++		pPlate->RestoreBakeBaseline();
+ 	}
+ 
+ 	for (CTerrainPlateComponent* pPlate : affected)
+diff --git a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
+index b930035d..ef59695d 100644
+--- a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
++++ b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
+@@ -498,6 +498,11 @@ protected:
+ 	float                    m_reliefScale = 1.f;
+ 	//! True while the terrain holds this plate's bake over m_bakeRect*.
+ 	bool                     m_bBakeApplied = false;
++	//! P15. Global order in which the live bakes were written into the terrain, from g_bakeApplySeqCounter.
++	//! The cascade restores in DESCENDING order of this, not of Bake Priority: a priority the user changed
++	//! after the bake describes where the plate will go NEXT time, while the baselines in the ground are a
++	//! stack pushed in the old order. 0 means "no bake of this plate has ever landed".
++	uint64                   m_bakeApplySeq = 0;
+ 	//! True until the level is loaded. Rule 5 of decision 04: never bake from Initialize().
+ 	bool                     m_bInitialBakePending = true;
+ 	//! True once the plate has been torn down (@see RestoreBakeOnTeardown). It must never bake again
+-- 
+2.47.1.windows.1
+

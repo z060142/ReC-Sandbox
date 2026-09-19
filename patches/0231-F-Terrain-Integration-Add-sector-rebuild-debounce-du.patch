@@ -1,0 +1,201 @@
+From c35413552103809d9dbf64182e3dfd772b341449 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Mon, 31 Aug 2026 02:56:28 +0800
+Subject: [PATCH 231/307] !F (Terrain Integration) Add sector rebuild debounce
+ during object movement.
+
+Optionally accumulate the old and new bounds of moving integrated objects and
+flush one sector rebuild after movement has been idle for the configured frame
+delay. The default remains immediate rebuilding.
+---
+ Code/CryEngine/Cry3DEngine/3dEngine.cpp       | 62 +++++++++++++++++++
+ Code/CryEngine/Cry3DEngine/3dEngine.h         | 17 +++++
+ Code/CryEngine/Cry3DEngine/3dEngineLoad.cpp   |  1 +
+ Code/CryEngine/Cry3DEngine/cvars.cpp          |  8 +++
+ Code/CryEngine/Cry3DEngine/cvars.h            |  1 +
+ .../Cry3DEngine/terrain_sector_render.cpp     |  5 +-
+ 6 files changed, 92 insertions(+), 2 deletions(-)
+
+diff --git a/Code/CryEngine/Cry3DEngine/3dEngine.cpp b/Code/CryEngine/Cry3DEngine/3dEngine.cpp
+index 48e370b5..037b76b5 100644
+--- a/Code/CryEngine/Cry3DEngine/3dEngine.cpp
++++ b/Code/CryEngine/Cry3DEngine/3dEngine.cpp
+@@ -622,6 +622,10 @@ void C3DEngine::Update()
+ 		m_pTerrain->Recompile_Modified_Incrementaly_RoadRenderNodes();
+ 	}
+ 
++	// Terrain sector rebuilds that e_TerrainIntegrateObjectsRebuildDelay held back while an integrating
++	// object was being moved. No-op (one empty-map test) while the cvar is 0.
++	FlushPendingTerrainRebuilds();
++
+ 	if (m_bEditor)
+ 		CRoadRenderNode::FreeStaticMemoryUsage();
+ 
+@@ -6807,6 +6811,36 @@ void C3DEngine::UpdateTerrainObjectIntegration(IRenderNode* pEnt, EERType eERTyp
+ 	if (bWasIntegrating)
+ 		dirtyBox.Add(it->second);
+ 
++	// A node that was integrating and still is has only moved (or changed its box). Sector builds are
++	// synchronous while the level flag is on, so every frame of an editor drag pays for a full rebuild of
++	// every sector the object touches. With e_TerrainIntegrateObjectsRebuildDelay > 0 the union of the
++	// dirty boxes is accumulated instead and flushed by FlushPendingTerrainRebuilds() once the node has
++	// been still for that many frames. Entering and leaving the mode, and (un)registering, are not
++	// debounced: they are one-off transitions the user expects to see at once.
++	const bool bMovedWhileIntegrating = bIntegratesNow && bWasIntegrating;
++
++	if (bMovedWhileIntegrating && GetCVars()->e_TerrainIntegrateObjectsRebuildDelay > 0)
++	{
++		SPendingTerrainRebuild& pending = m_pendingTerrainRebuilds[pEnt];
++		pending.dirtyBox.Add(dirtyBox);
++		pending.lastMoveFrameId = gEnv->nMainFrameID;
++
++		it->second = aabb;
++		return;
++	}
++
++	// Not debounced (or no longer): anything this node still owed has to go out with this rebuild, so
++	// that the boxes it passed through are not left holding stale geometry.
++	if (!m_pendingTerrainRebuilds.empty())
++	{
++		std::map<IRenderNode*, SPendingTerrainRebuild>::iterator pendingIt = m_pendingTerrainRebuilds.find(pEnt);
++		if (pendingIt != m_pendingTerrainRebuilds.end())
++		{
++			dirtyBox.Add(pendingIt->second.dirtyBox);
++			m_pendingTerrainRebuilds.erase(pendingIt);
++		}
++	}
++
+ 	if (CTerrain* const pTerrain = GetTerrain())
+ 		pTerrain->ResetTerrainVertBuffers(&dirtyBox);
+ 
+@@ -6816,6 +6850,34 @@ void C3DEngine::UpdateTerrainObjectIntegration(IRenderNode* pEnt, EERType eERTyp
+ 		m_integratedIntoTerrainNodes.erase(it);
+ }
+ 
++///////////////////////////////////////////////////////////////////////////////
++void C3DEngine::FlushPendingTerrainRebuilds()
++{
++	if (m_pendingTerrainRebuilds.empty())
++		return;
++
++	// A delay turned back to 0 mid session flushes everything on the next frame.
++	const int nDelay = GetCVars()->e_TerrainIntegrateObjectsRebuildDelay;
++	const uint32 nFrameId = gEnv->nMainFrameID;
++
++	CTerrain* const pTerrain = GetTerrain();
++
++	for (std::map<IRenderNode*, SPendingTerrainRebuild>::iterator it = m_pendingTerrainRebuilds.begin();
++	     it != m_pendingTerrainRebuilds.end(); )
++	{
++		if (nDelay > 0 && (int)(nFrameId - it->second.lastMoveFrameId) < nDelay)
++		{
++			++it;
++			continue;
++		}
++
++		if (pTerrain != nullptr && !it->second.dirtyBox.IsReset())
++			pTerrain->ResetTerrainVertBuffers(&it->second.dirtyBox);
++
++		it = m_pendingTerrainRebuilds.erase(it);
++	}
++}
++
+ ///////////////////////////////////////////////////////////////////////////////
+ Vec3 C3DEngine::GetEntityRegisterPoint(IRenderNode* pEnt)
+ {
+diff --git a/Code/CryEngine/Cry3DEngine/3dEngine.h b/Code/CryEngine/Cry3DEngine/3dEngine.h
+index 1b594701..88ef344d 100644
+--- a/Code/CryEngine/Cry3DEngine/3dEngine.h
++++ b/Code/CryEngine/Cry3DEngine/3dEngine.h
+@@ -850,10 +850,27 @@ public:
+ 	//! a node enters or leaves eGM_IntegrateIntoTerrain, or moves while integrating.
+ 	std::map<IRenderNode*, AABB> m_integratedIntoTerrainNodes;
+ 
++	//! A terrain sector rebuild held back by e_TerrainIntegrateObjectsRebuildDelay: the union of every
++	//! dirty box recorded for that node since the last flush, and the frame of the last move.
++	struct SPendingTerrainRebuild
++	{
++		AABB   dirtyBox = AABB(AABB::RESET);
++		uint32 lastMoveFrameId = 0;
++	};
++
++	//! Moves of already integrating nodes whose rebuild is being debounced. Empty unless
++	//! e_TerrainIntegrateObjectsRebuildDelay is > 0. Keys are only ever compared, never dereferenced,
++	//! and an entry is flushed by any (un)registration of the node and by UnloadLevel.
++	std::map<IRenderNode*, SPendingTerrainRebuild> m_pendingTerrainRebuilds;
++
+ 	//! Request the terrain sector rebuild needed by any transition into/out of eGM_IntegrateIntoTerrain.
+ 	//! Called on (un)registration; pass bUnregister when the node is leaving the scene.
+ 	void UpdateTerrainObjectIntegration(IRenderNode* pEnt, EERType eERType, const AABB& aabb, bool bUnregister);
+ 
++	//! Runs the rebuilds that e_TerrainIntegrateObjectsRebuildDelay held back and whose node has now been
++	//! still for long enough. Called once per frame from Update().
++	void FlushPendingTerrainRebuilds();
++
+ 	Vec3                  m_fogColor2;
+ 	Vec3                  m_fogColorRadial;
+ 	Vec3                  m_volFogHeightDensity;
+diff --git a/Code/CryEngine/Cry3DEngine/3dEngineLoad.cpp b/Code/CryEngine/Cry3DEngine/3dEngineLoad.cpp
+index 4e304dcc..68791e19 100644
+--- a/Code/CryEngine/Cry3DEngine/3dEngineLoad.cpp
++++ b/Code/CryEngine/Cry3DEngine/3dEngineLoad.cpp
+@@ -337,6 +337,7 @@ void C3DEngine::UnloadLevel()
+ 
+ 	// no render node survives the level, so the terrain integration tracking is void from here on
+ 	m_integratedIntoTerrainNodes.clear();
++	m_pendingTerrainRebuilds.clear();
+ 
+ 	if (gEnv->pCharacterManager)
+ 	{
+diff --git a/Code/CryEngine/Cry3DEngine/cvars.cpp b/Code/CryEngine/Cry3DEngine/cvars.cpp
+index 9651b061..ca25ddc8 100644
+--- a/Code/CryEngine/Cry3DEngine/cvars.cpp
++++ b/Code/CryEngine/Cry3DEngine/cvars.cpp
+@@ -510,6 +510,14 @@ void CVars::Init()
+ 	              "    default per instance parameters are classified exactly like stock\n"
+ 	              "2 - additionally draw one bounding box per triangle class of each sector:\n"
+ 	              "    green = merged, yellow = slope transition band, red = rejected");
++	REGISTER_CVAR(e_TerrainIntegrateObjectsRebuildDelay, 0, VF_NULL,
++	              "Frames of quiet after which a *moving* object integrated into the terrain gets its\n"
++	              "sectors rebuilt. Sector builds are synchronous while Terrain/IntegrateObjects is on,\n"
++	              "so dragging an integrating object in the editor rebuilds every sector it touches on\n"
++	              "every frame of the drag. With a value > 0 the dirty boxes are accumulated instead and\n"
++	              "flushed once no movement has been seen for that many frames.\n"
++	              "Entering and leaving the mode, and (un)registering a node, always rebuild at once.\n"
++	              "0 - off, rebuild immediately on every move (stock behaviour)");
+ 	DefineConstIntCVar(e_TerrainDeformations, 0, VF_CHEAT,
+ 	                   "Allows in-game terrain surface deformations");
+ 	REGISTER_CVAR(e_TerrainEditPostponeTexturesUpdate, 10, VF_NULL,
+diff --git a/Code/CryEngine/Cry3DEngine/cvars.h b/Code/CryEngine/Cry3DEngine/cvars.h
+index cd00d295..35b672f2 100644
+--- a/Code/CryEngine/Cry3DEngine/cvars.h
++++ b/Code/CryEngine/Cry3DEngine/cvars.h
+@@ -222,6 +222,7 @@ struct CVars : public Cry3DEngineBase
+ 	int   e_TerrainIntegrateObjectsMaxVertices;
+ 	float e_TerrainIntegrateObjectsMaxHeight;
+ 	int   e_TerrainIntegrateObjectsDebug;
++	int   e_TerrainIntegrateObjectsRebuildDelay;
+ 	DeclareConstIntCVar(e_SkyBox, 1);
+ 	float e_CoverageBufferAABBExpand;
+ 	int   e_CoverageBufferEarlyOut;
+diff --git a/Code/CryEngine/Cry3DEngine/terrain_sector_render.cpp b/Code/CryEngine/Cry3DEngine/terrain_sector_render.cpp
+index 9566a45e..2a8735f4 100644
+--- a/Code/CryEngine/Cry3DEngine/terrain_sector_render.cpp
++++ b/Code/CryEngine/Cry3DEngine/terrain_sector_render.cpp
+@@ -1844,10 +1844,11 @@ void CTerrainNode::AppendTrianglesFromObjects(const int nOriginX, const int nOri
+ 	if (GetCVars()->e_TerrainIntegrateObjectsDebug && (m_nIntegratedObjectsVerts || nTrisRejected))
+ 	{
+ 		CryLog("Terrain object integration: sector at (%d, %d) took %d vertices / %d triangles from %d object(s); "
+-		       "classified %d merged / %d transition / %d rejected; budget %d, peak %d",
++		       "classified %d merged / %d transition / %d rejected; budget %d, peak %d, rebuild delay %d",
+ 		       nOriginX, nOriginY, m_nIntegratedObjectsVerts, nIntegratedIndices / 3, nIntegratedObjects,
+ 		       nTrisMerged, nTrisTransition, nTrisRejected,
+-		       GetCVars()->e_TerrainIntegrateObjectsMaxVertices, s_nPeakIntegratedObjectsVerts);
++		       GetCVars()->e_TerrainIntegrateObjectsMaxVertices, s_nPeakIntegratedObjectsVerts,
++		       GetCVars()->e_TerrainIntegrateObjectsRebuildDelay);
+ 	}
+ }
+ 
+-- 
+2.47.1.windows.1
+

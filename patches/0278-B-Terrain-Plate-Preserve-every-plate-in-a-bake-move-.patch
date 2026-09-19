@@ -1,0 +1,168 @@
+From efec0dbc95500769ca62b5083138ba73e75d4f7d Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Wed, 2 Sep 2026 11:06:34 +0800
+Subject: [PATCH 278/307] !B (Terrain Plate) Preserve every plate in a bake
+ move batch.
+
+Process oversized move batches in several bounded cascades instead of dropping
+plates beyond the cascade limit. Warn when overlap closure itself must be
+truncated.
+---
+ .../Geometry/TerrainPlateComponent.cpp        | 59 +++++++++++++++----
+ .../Geometry/TerrainPlateComponent.h          |  5 +-
+ 2 files changed, 51 insertions(+), 13 deletions(-)
+
+diff --git a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
+index 5e03c84d..aa4a7505 100644
+--- a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
++++ b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
+@@ -62,6 +62,9 @@ uint64 g_bakeApplySeqCounter = 0;
+ //! Never restore and re-bake more than this many plates in one cascade; Unreal caps its landscape edit layers
+ //! at 8 for the same reason. This is about a runaway configuration, not about the normal case.
+ const size_t kBakeCascadeMaxPlates = 16;
++//! The move batch runs against a much higher bound: a mover dropped by the cap would leave its OLD footprint in
++//! the terrain with nothing left to restore it, and the probe repair cannot heal that. Chunked, never dropped.
++const size_t kBakeMoveBatchMaxPlates = 256;
+ //! Frames of silence the polling owes a finished cascade. One is not enough: SetTerrainElevation rebuilds sector
+ //! meshes, atlases, the physics heightfield and roads, and a probe on our own writes starts a ping pong.
+ const uint32 kBakeCascadeQuietFrames = 3;
+@@ -1603,7 +1606,7 @@ void CTerrainPlateComponent::RegenerateMesh()
+ 	    && m_pEntity != nullptr && gEnv->p3DEngine != nullptr)
+ 	{
+ 		std::vector<CTerrainPlateComponent*> affected;
+-		CollectBakeCascadeSet(affected);
++		CollectBakeCascadeSet(affected, kBakeCascadeMaxPlates);
+ 
+ 		if (affected.size() > 1)
+ 		{
+@@ -2730,7 +2733,7 @@ bool CTerrainPlateComponent::RestoreBakeOnTeardownCascaded()
+ 	rects.push_back(m_bakeRectSize);
+ 
+ 	std::vector<CTerrainPlateComponent*> affected;
+-	CollectBakeCascadeSetFromRects(rects, affected);
++	CollectBakeCascadeSetFromRects(rects, affected, kBakeCascadeMaxPlates);
+ 
+ 	// The stack, not the overlap, is what decides. Our stored baseline is the ground as it was when WE baked, so
+ 	// it is still the truth for every plate that baked BEFORE us, and a lie only about those that baked AFTER:
+@@ -3736,7 +3739,7 @@ bool CTerrainPlateComponent::BakesBefore(const CTerrainPlateComponent& other) co
+ 	return this < &other;
+ }
+ 
+-void CTerrainPlateComponent::CollectBakeCascadeSet(std::vector<CTerrainPlateComponent*>& out) const
++void CTerrainPlateComponent::CollectBakeCascadeSet(std::vector<CTerrainPlateComponent*>& out, size_t maxPlates) const
+ {
+ 	out.clear();
+ 
+@@ -3749,15 +3752,18 @@ void CTerrainPlateComponent::CollectBakeCascadeSet(std::vector<CTerrainPlateComp
+ 
+ 	out.push_back(const_cast<CTerrainPlateComponent*>(this));
+ 
+-	CollectBakeCascadeSetFromRects(rects, out);
++	CollectBakeCascadeSetFromRects(rects, out, maxPlates);
+ }
+ 
+ void CTerrainPlateComponent::CollectBakeCascadeSetFromRects(std::vector<int>& rects,
+-                                                            std::vector<CTerrainPlateComponent*>& out)
++                                                            std::vector<CTerrainPlateComponent*>& out,
++                                                            size_t maxPlates)
+ {
++	bool bTruncated = false;
++
+ 	// Transitive closure over rect intersection: a third plate that only overlaps the second still has to be
+ 	// unwound. Quadratic, but it only runs when a bake changes and the count is a handful.
+-	for (size_t i = 0; i < rects.size() && out.size() < kBakeCascadeMaxPlates; i += 3)
++	for (size_t i = 0; i < rects.size() && out.size() < maxPlates; i += 3)
+ 	{
+ 		// By value: the inner loop appends to rects and would invalidate a reference into it.
+ 		const int ax1 = rects[i], ay1 = rects[i + 1], aSize = rects[i + 2];
+@@ -3784,11 +3790,23 @@ void CTerrainPlateComponent::CollectBakeCascadeSetFromRects(std::vector<int>& re
+ 			out.push_back(pOther);
+ 			rects.insert(rects.end(), otherRects.begin(), otherRects.end());
+ 
+-			if (out.size() >= kBakeCascadeMaxPlates)
++			if (out.size() >= maxPlates)
++			{
++				bTruncated = true;
+ 				break;
++			}
+ 		}
+ 	}
+ 
++	// Truncating the closure leaves plates standing on ground the cascade is about to move. Loud on purpose:
++	// the composite over the shared footprint is no longer well defined and the user has to know.
++	if (bTruncated)
++	{
++		CryWarning(VALIDATOR_MODULE_ENTITYSYSTEM, VALIDATOR_WARNING,
++		           "Terrain Plate: overlap cascade truncated at %d plates. Plates beyond that keep a stale bake over the "
++		           "shared footprint - reduce the number of overlapping baking plates.", (int)maxPlates);
++	}
++
+ 	std::stable_sort(out.begin(), out.end(),
+ 	                 [](const CTerrainPlateComponent* pA, const CTerrainPlateComponent* pB) { return pA->BakesBefore(*pB); });
+ }
+@@ -3819,7 +3837,7 @@ void CTerrainPlateComponent::ApplyBakeCascaded()
+ 	}
+ 
+ 	std::vector<CTerrainPlateComponent*> affected;
+-	CollectBakeCascadeSet(affected);
++	CollectBakeCascadeSet(affected, kBakeCascadeMaxPlates);
+ 
+ 	if (affected.size() <= 1)
+ 	{
+@@ -3993,13 +4011,32 @@ void CTerrainPlateComponent::FlushBakeMoveBatch()
+ 		if (!pMover->WantsBakeMoveBatch())
+ 			continue;
+ 
+-		pMover->CollectBakeCascadeSet(closure);
++		pMover->CollectBakeCascadeSet(closure, kBakeMoveBatchMaxPlates);
+ 
++		size_t newMembers = 0;
+ 		for (CTerrainPlateComponent* pPlate : closure)
+ 		{
+-			if (affected.size() >= kBakeCascadeMaxPlates)
+-				break;
++			if (std::find(affected.begin(), affected.end(), pPlate) == affected.end())
++			{
++				++newMembers;
++			}
++		}
++
++		// A mover must NEVER be dropped: its old footprint is already in the ground and only its own cascade puts
++		// it back. So the batch is split into chunks instead - less exact than one pass, but never destructive.
++		if (!affected.empty() && affected.size() + newMembers > kBakeMoveBatchMaxPlates)
++		{
++			CryWarning(VALIDATOR_MODULE_ENTITYSYSTEM, VALIDATOR_WARNING,
++			           "Terrain Plate: move batch over %d plates, split into several cascades. Every moved plate is "
++			           "restored and re-baked, but plates shared between two chunks may need a second settle.",
++			           (int)kBakeMoveBatchMaxPlates);
+ 
++			RunBakeCascade(affected, nullptr, "move batch chunk");
++			affected.clear();
++		}
++
++		for (CTerrainPlateComponent* pPlate : closure)
++		{
+ 			if (std::find(affected.begin(), affected.end(), pPlate) == affected.end())
+ 			{
+ 				affected.push_back(pPlate);
+diff --git a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
+index 475e3b6f..9efebf12 100644
+--- a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
++++ b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
+@@ -622,10 +622,11 @@ protected:
+ 	//! move, the PROSPECTIVE one. A move must unwind both or it misses what it leaves behind or lands on.
+ 	void  GetBakeCascadeRects(std::vector<int>& outRects) const;
+ 	//! Every baking plate transitively overlapping this one, itself included, sorted by priority then GUID.
+-	void  CollectBakeCascadeSet(std::vector<CTerrainPlateComponent*>& out) const;
++	void  CollectBakeCascadeSet(std::vector<CTerrainPlateComponent*>& out, size_t maxPlates) const;
+ 	//! The closure itself, seeded with rects rather than a plate, so a plate already out of the registry (a
+ 	//! teardown) can still ask who stands on the footprint it gives back. Appends to out and sorts it.
+-	static void CollectBakeCascadeSetFromRects(std::vector<int>& rects, std::vector<CTerrainPlateComponent*>& out);
++	static void CollectBakeCascadeSetFromRects(std::vector<int>& rects, std::vector<CTerrainPlateComponent*>& out,
++	                                           size_t maxPlates);
+ 	//! Cascade order: lower Bake Priority bakes first; ties by entity GUID, which is stable across loads.
+ 	bool  BakesBefore(const CTerrainPlateComponent& other) const;
+ 	//! ApplyBake when the plate owns its footprint alone, the whole cascade when it shares it.
+-- 
+2.47.1.windows.1
+

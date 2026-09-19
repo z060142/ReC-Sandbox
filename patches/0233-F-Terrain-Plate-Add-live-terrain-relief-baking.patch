@@ -1,0 +1,814 @@
+From f17d778d855a4e3b4723f9ed5e2287392216c09d Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Mon, 31 Aug 2026 03:20:19 +0800
+Subject: [PATCH 233/307] !F (Terrain Plate) Add live terrain relief baking.
+
+Write the plate's low-frequency relief into live terrain so terrain-dependent
+systems follow the plate. Restore the captured baseline before regeneration to
+prevent the plate from sampling and accumulating its own bake.
+---
+ .../Geometry/TerrainPlateComponent.cpp        | 599 +++++++++++++++++-
+ .../Geometry/TerrainPlateComponent.h          |  76 +++
+ 2 files changed, 668 insertions(+), 7 deletions(-)
+
+diff --git a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
+index 26d2fe6a..5fa93f52 100644
+--- a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
++++ b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
+@@ -10,7 +10,13 @@
+ #include <CrySystem/File/CryFile.h>
+ #include <CrySystem/IConsole.h>
+ #include <CrySystem/ConsoleRegistration.h>
++#include <CrySystem/ITimer.h>
+ #include <CryString/CryPath.h>
++#include <CryAISystem/IAISystem.h>
++#include <CryAISystem/INavigationSystem.h>
++#include <CryAISystem/NavigationSystem/INavigationUpdatesManager.h>
++
++#include <algorithm>
+ 
+ namespace Cry
+ {
+@@ -24,6 +30,25 @@ namespace
+ //! held back rebuild still runs once this many frames have passed without a new ENTITY_EVENT_XFORM.
+ int    g_terrainPlateSettleFrames = 6;
+ ICVar* g_pTerrainPlateSettleFramesCVar = nullptr;
++
++//! Every plate that currently holds a live bake. Only used to detect overlapping footprints; the
++//! priority cascade that would make an overlap actually correct is step 3 of decision 04.
++std::vector<CTerrainPlateComponent*> g_bakingPlates;
++
++//! The terrain is kept this far below the plate mesh, so the two surfaces never fight (decision 04,
++//! rule 1). One centimetre would already be below the 12 bit quantisation of a tall sector; two is
++//! the value the decision fixed and it is still invisible.
++const float kBakeEpsilonMeters = 0.02f;
++
++//! e_TerrainIntegrateObjectsDebug, the cvar the rest of the terrain integration work logs under.
++int GetTerrainIntegrateDebugLevel()
++{
++	if (gEnv == nullptr || gEnv->pConsole == nullptr)
++		return 0;
++
++	ICVar* pCVar = gEnv->pConsole->GetCVar("e_TerrainIntegrateObjectsDebug");
++	return (pCVar != nullptr) ? pCVar->GetIVal() : 0;
++}
+ }
+ 
+ void RegisterTerrainPlateCVars()
+@@ -41,13 +66,10 @@ void RegisterTerrainPlateCVars()
+ 
+ void UnregisterTerrainPlateCVars()
+ {
+-	if (g_pTerrainPlateSettleFramesCVar == nullptr)
+-		return;
+-
+ 	if (gEnv != nullptr && gEnv->pConsole != nullptr)
+ 	{
+-		gEnv->pConsole->UnregisterVariable(g_pTerrainPlateSettleFramesCVar->GetName());
+-	}
++		if (g_pTerrainPlateSettleFramesCVar != nullptr)
++			gEnv->pConsole->UnregisterVariable(g_pTerrainPlateSettleFramesCVar->GetName());	}
+ 
+ 	g_pTerrainPlateSettleFramesCVar = nullptr;
+ }
+@@ -580,6 +602,10 @@ void CTerrainPlateComponent::Register(Schematyc::CEnvRegistrationScope& componen
+ 
+ CTerrainPlateComponent::~CTerrainPlateComponent()
+ {
++	// Before anything else: the terrain must not keep the relief of a plate that no longer exists.
++	// Removing the component, deleting the entity and unloading the level all end here.
++	RestoreBakeBaseline();
++
+ 	ReleaseNativePhysics();
+ 
+ 	// Removing the component takes the render node with it, and nothing in the engine invalidates the
+@@ -620,8 +646,12 @@ Cry::Entity::EventFlags CTerrainPlateComponent::GetEventMask() const
+ 	// (Sandbox/Plugins/EditorCommon/LevelEditor/Tools/ObjectMode.cpp:681-686). @see FlushDeferredTransform.
+ 	bitFlags |= ENTITY_EVENT_XFORM_FINISHED_EDITOR;
+ 
+-	// Only ticked while a rebuild was throttled away or held back, so a static plate costs nothing per frame.
+-	if (m_bRegenPending || m_bDeferredXformPending)
++	// The bake must not run before the level's terrain is in the engine (decision 04, rule 5).
++	bitFlags |= ENTITY_EVENT_LEVEL_LOADED;
++
++	// Only ticked while a rebuild was throttled away or held back, while the first bake is still owed,
++	// or while a live bake has to be watched - so a plate that is not baking costs nothing per frame.
++	if (m_bRegenPending || m_bDeferredXformPending || m_bInitialBakePending)
+ 	{
+ 		bitFlags |= ENTITY_EVENT_UPDATE;
+ 	}
+@@ -635,6 +665,12 @@ void CTerrainPlateComponent::ProcessEvent(const SEntityEvent& event)
+ 	{
+ 	case ENTITY_EVENT_COMPONENT_PROPERTY_CHANGED:
+ 		Rebuild();
++		// Bake Into Terrain decides whether the component needs the per frame tick that watches the
++		// bake, so the event mask has to be re-evaluated after any property change.
++		if (m_pEntity != nullptr)
++		{
++			m_pEntity->UpdateComponentEventMask(this);
++		}
+ 		break;
+ 
+ 	case ENTITY_EVENT_XFORM:
+@@ -683,6 +719,38 @@ void CTerrainPlateComponent::ProcessEvent(const SEntityEvent& event)
+ 				RegenerateMesh();
+ 				m_pEntity->UpdateComponentEventMask(this);
+ 			}
++
++			if (m_bInitialBakePending)
++			{
++				// Sandbox never sends ENTITY_EVENT_LEVEL_LOADED when a level is opened for editing:
++				// CEntitySystem::OnLevelLoaded (EntitySystem.cpp:1503) is only reached from CryAction's
++				// game context setup (Network/CET_EntitySystem.cpp:255), i.e. from the launcher and from
++				// entering game mode. So the first update tick that finds a terrain is what releases the
++				// bake in the editor. Either way it is never Initialize() - decision 04, rule 5.
++				if (gEnv->p3DEngine != nullptr && gEnv->p3DEngine->GetITerrain() != nullptr)
++				{
++					m_bInitialBakePending = false;
++					if (m_bBakeIntoTerrain)
++					{
++						RegenerateMesh();
++					}
++					m_pEntity->UpdateComponentEventMask(this);
++				}
++			}
++		}
++		break;
++
++	case ENTITY_EVENT_LEVEL_LOADED:
++		// The launcher and game mode path. The editor has pushed the pristine CHeightmap by now
++		// (CryEditDoc.cpp:122), so the baseline the bake captures is genuinely the original ground.
++		if (m_bInitialBakePending)
++		{
++			m_bInitialBakePending = false;
++			if (m_bBakeIntoTerrain)
++			{
++				RegenerateMesh();
++			}
++			m_pEntity->UpdateComponentEventMask(this);
+ 		}
+ 		break;
+ 
+@@ -950,6 +1018,13 @@ void CTerrainPlateComponent::RegenerateMesh()
+ 	m_bDeferredXformPending = false;
+ 	m_lastRegenFrameId = gEnv->nMainFrameID;
+ 
++	// Put the original ground back before anything reads the terrain again. The edge weld below samples
++	// GetTerrainElevation, so without this it would weld the plate onto its own bake and drift upwards
++	// on every property change (decision 04, rule 3 / research 08 section 2.4). It also has to happen
++	// before the plate moves, which is why it lives here and not in ApplyBake: RegenerateMesh is the
++	// single funnel for a property change, a transform, the end of a deferred drag and the level load.
++	RestoreBakeBaseline();
++
+ 	if (m_pEntity == nullptr || gEnv->p3DEngine == nullptr)
+ 		return;
+ 
+@@ -1008,6 +1083,11 @@ void CTerrainPlateComponent::RegenerateMesh()
+ 		}
+ 	}
+ 
++	// The rescale Normalize solves is cached, because the bake has to reproduce the very same surface
++	// from the same source at arbitrary sample points (@see GetPlateReliefAt).
++	m_reliefOffset = 0.f;
++	m_reliefScale = 1.f;
++
+ 	if (m_bNormalize && m_heightField.IsValid())
+ 	{
+ 		float minHeight = heights[0], maxHeight = heights[0];
+@@ -1023,6 +1103,9 @@ void CTerrainPlateComponent::RegenerateMesh()
+ 		{
+ 			h = (h - minHeight) * invRange;
+ 		}
++
++		m_reliefOffset = minHeight;
++		m_reliefScale = invRange;
+ 	}
+ 
+ 	// ---------------------------------------------------------------- positions
+@@ -1382,6 +1465,508 @@ void CTerrainPlateComponent::RegenerateMesh()
+ 		m_geometryHash = geometryHash;
+ 		InvalidateShadowCache();
+ 	}
++
++	// Last, so that the baseline is captured from the restored ground and the block is computed from the
++	// relief this very call just solved.
++	ApplyBake();
++}
++
++//////////////////////////////////////////////////////////////////////////
++// Virtual bake: the plate's low frequency relief written into the live engine terrain.
++//
++// Why this works at all, and why there is no export code: CGameExporter::ExportHeightMap serialises
++// ITerrain::GetCompiledData (GameExporter.cpp:445), i.e. the live quantised sector arrays that
++// SetTerrainElevation writes - never the editor's CHeightmap, which nothing re-pushes during an export.
++// So a bake that exists in the engine at export time IS the shipped terrain. CHeightmap stays pristine
++// and is therefore also the baseline, re-pushed on every level load.
++// SetTerrainElevation's body is #ifndef _RELEASE (terran_edit.cpp:165): in a release build every call
++// below is an empty function, which is exactly right, because a shipped level loads the already baked
++// terrain through SetCompiledData. No #ifdef is needed here.
++//////////////////////////////////////////////////////////////////////////
++
++namespace
++{
++//! Terrain metrics of the current level. Everything in the bake is in terrain units.
++SBakeTerrainMetrics GetBakeTerrainMetrics()
++{
++	SBakeTerrainMetrics metrics;
++
++	if (gEnv == nullptr || gEnv->p3DEngine == nullptr || gEnv->p3DEngine->GetITerrain() == nullptr)
++		return metrics;
++
++	metrics.unitSize = gEnv->p3DEngine->GetHeightMapUnitSize();
++	if (metrics.unitSize <= 0.f)
++		return SBakeTerrainMetrics();
++
++	metrics.hmapSize = int(gEnv->p3DEngine->GetTerrainSize() / metrics.unitSize);
++	metrics.sectorUnits = max(1, int(gEnv->p3DEngine->GetTerrainSectorSize() / metrics.unitSize));
++	return metrics;
++}
++
++//! Height of one terrain node, exactly as it is stored.
++//! I3DEngine::GetTerrainZ is CTerrain::GetZ -> GetZfromUnits (terrain_hmap.cpp:574), which truncates
++//! the world position to units and returns the stored node height with no triangle interpolation.
++//! GetTerrainElevation (GetZApr) is not usable for this: it interpolates, and it returns
++//! TERRAIN_BOTTOM_LEVEL for any position on the x = 0 or y = 0 border (terrain_hmap.cpp:142).
++//! The half unit offset only defends against a float multiply landing just below the integer.
++float SampleTerrainUnit(const SBakeTerrainMetrics& metrics, int ux, int uy)
++{
++	const int cx = clamp_tpl(ux, 0, metrics.hmapSize - 1);
++	const int cy = clamp_tpl(uy, 0, metrics.hmapSize - 1);
++	return gEnv->p3DEngine->GetTerrainZ(((float)cx + 0.5f) * metrics.unitSize, ((float)cy + 0.5f) * metrics.unitSize);
++}
++
++}
++
++float CTerrainPlateComponent::GetPlateReliefAt(float lx, float ly) const
++{
++	if (!m_heightField.IsValid())
++		return 0.f;
++
++	// Exactly the mapping RegenerateMesh uses: the grid vertex at column c / row r sits at local
++	// (-0.5 + c/(nx-1), 0.5 - r/(ny-1)) and samples (u, v) = (c/(nx-1), r/(ny-1)) with the mirror flips
++	// applied to the sampling coordinates only.
++	float u = lx + 0.5f;
++	float v = 0.5f - ly;
++	if (m_bMirrorX) u = 1.f - u;
++	if (m_bMirrorY) v = 1.f - v;
++
++	return (m_heightField.SampleBilinear(u, v) - m_reliefOffset) * m_reliefScale;
++}
++
++bool CTerrainPlateComponent::SamplePlateSurface(const Matrix34& worldTM, float worldX, float worldY,
++                                                float& outWorldZ, float& outLocalX, float& outLocalY) const
++{
++	// The plate is a height field over its own local XY, so a terrain cell takes the plate height
++	// straight above / below it: find the local (lx, ly) whose world XY is the cell's world XY.
++	// world = t + c0 * lx + c1 * ly + c2 * lz, so the XY part is a 2x2 solve once the c2 * lz term is
++	// known. For every plate whose local Z is world Z (no rotation, or yaw only, which is what the
++	// editor's rotate gizmo produces on a ground plate) c2 has no XY part and the first solve is exact;
++	// a tilted plate needs the height, so one refinement pass feeds the sampled lz back in. A tilted
++	// plate is not a height field in world space at all, so a vertical projection is the only thing a
++	// heightmap-shaped bake can mean there.
++	const Vec3 c0 = worldTM.GetColumn0();
++	const Vec3 c1 = worldTM.GetColumn1();
++	const Vec3 c2 = worldTM.GetColumn2();
++	const Vec3 t = worldTM.GetTranslation();
++
++	const float det = c0.x * c1.y - c1.x * c0.y;
++	if (fabs_tpl(det) < 1e-8f)
++		return false; // the plate is edge on: it has no footprint
++
++	const float invDet = 1.f / det;
++	const bool bTilted = (fabs_tpl(c2.x) > 1e-6f || fabs_tpl(c2.y) > 1e-6f);
++
++	float lx = 0.f, ly = 0.f, lz = 0.f;
++	for (int iteration = 0; iteration < 2; ++iteration)
++	{
++		const float rx = worldX - t.x - c2.x * lz;
++		const float ry = worldY - t.y - c2.y * lz;
++
++		lx = (c1.y * rx - c1.x * ry) * invDet;
++		ly = (-c0.y * rx + c0.x * ry) * invDet;
++
++		if (lx < -0.5f || lx > 0.5f || ly < -0.5f || ly > 0.5f)
++			return false;
++
++		lz = GetPlateReliefAt(lx, ly);
++
++		if (!bTilted)
++			break;
++	}
++
++	outWorldZ = (worldTM * Vec3(lx, ly, lz)).z;
++	outLocalX = lx;
++	outLocalY = ly;
++	return true;
++}
++
++bool CTerrainPlateComponent::ComputeBakeRect(const SBakeTerrainMetrics& metrics, const Matrix34& worldTM,
++                                             int& outX1, int& outY1, int& outSize) const
++{
++	// The footprint is the world AABB of the rotated unit plate box, which is what research 08 section
++	// 2.6 prescribes: cells inside the AABB but outside the rotated plate simply keep the baseline.
++	const AABB localBox(Vec3(-0.5f, -0.5f, 0.f), Vec3(0.5f, 0.5f, 1.f));
++	const AABB worldBox = AABB::CreateTransformedAABB(worldTM, localBox);
++
++	const float invUnit = 1.f / metrics.unitSize;
++	const int sector = metrics.sectorUnits;
++
++	// One unit of halo, so the falloff band and the writer's inclusive upper row / column both land on
++	// cells this plate owns.
++	int x1 = (int)floorf(worldBox.min.x * invUnit) - 1;
++	int y1 = (int)floorf(worldBox.min.y * invUnit) - 1;
++	int x2 = (int)ceilf(worldBox.max.x * invUnit) + 1;
++	int y2 = (int)ceilf(worldBox.max.y * invUnit) + 1;
++
++	x1 = clamp_tpl(x1, 0, metrics.hmapSize);
++	y1 = clamp_tpl(y1, 0, metrics.hmapSize);
++	x2 = clamp_tpl(x2, 0, metrics.hmapSize);
++	y2 = clamp_tpl(y2, 0, metrics.hmapSize);
++
++	// SetTerrainElevation asserts that X1/Y1 and nSizeX/nSizeY are whole sectors (terran_edit.cpp:178-181)
++	// and it rewrites every cell of every touched sector, not only the ones inside the rect - so the
++	// block has to carry the baseline of the whole sector-aligned area, not just of the footprint.
++	x1 = (x1 / sector) * sector;
++	y1 = (y1 / sector) * sector;
++	x2 = ((x2 + sector - 1) / sector) * sector;
++	y2 = ((y2 + sector - 1) / sector) * sector;
++
++	// ... and that nSizeX == nSizeY (terran_edit.cpp:177). The extra sectors of a non-square footprint
++	// are written with their own baseline, so they end up bit identical; they only cost a sector mesh
++	// rebuild.
++	int size = max(x2 - x1, y2 - y1);
++	if (size <= 0 || size > metrics.hmapSize)
++		return false;
++
++	if (x1 + size > metrics.hmapSize) x1 = metrics.hmapSize - size;
++	if (y1 + size > metrics.hmapSize) y1 = metrics.hmapSize - size;
++	x1 = max(0, x1);
++	y1 = max(0, y1);
++
++	outX1 = x1;
++	outY1 = y1;
++	outSize = size;
++	return true;
++}
++
++void CTerrainPlateComponent::CaptureBakeBaseline(const SBakeTerrainMetrics& metrics)
++{
++	const int dim = m_bakeRectSize + 1;
++	m_bakeBaseline.resize((size_t)dim * dim);
++
++	for (int ux = 0; ux < dim; ++ux)
++	{
++		for (int uy = 0; uy < dim; ++uy)
++		{
++			m_bakeBaseline[(size_t)ux * dim + uy] = SampleTerrainUnit(metrics, m_bakeRectX1 + ux, m_bakeRectY1 + uy);
++		}
++	}
++}
++
++void CTerrainPlateComponent::ComputeBakeBlock(const SBakeTerrainMetrics& metrics, const Matrix34& worldTM,
++                                              int& outCellsWritten, float& outMinDelta, float& outMaxDelta)
++{
++	const int dim = m_bakeRectSize + 1;
++	m_bakeResult = m_bakeBaseline;
++
++	outCellsWritten = 0;
++	outMinDelta = 0.f;
++	outMaxDelta = 0.f;
++
++	const Vec3 worldScale = GetWorldScale();
++
++	// Falloff band, in the same measure the edge weld uses: the distance to the nearest plate border as
++	// a fraction of the half size, so Weld Inner Falloff means the same thing for the mesh and for the
++	// bake. The band is never allowed to be narrower than one terrain cell, otherwise a falloff of 0
++	// would put a hard step of the full relief on the border cell instead of meeting the baseline there.
++	const float minBandLocal = clamp_tpl(metrics.unitSize / max(0.0001f, 0.5f * min(worldScale.x, worldScale.y)), 0.f, 1.f);
++	const float band = clamp_tpl(max((float)m_weldInnerFalloff, minBandLocal), 0.0001f, 1.f);
++
++	// Min filter (research 08 section 2.6 / decision 04 rule 1): the cell takes the LOWEST plate height
++	// over the ground it covers, so the terrain is guaranteed to stay at or below the plate mesh and no
++	// z-fighting is possible by construction. The samples cover the cell, i.e. half a unit around the
++	// node in each direction, because a node's height drives the four quads that meet on it.
++	const float plateSpacing = m_heightField.IsValid()
++	                           ? min(worldScale.x / (float)max(1, m_heightField.m_width - 1), worldScale.y / (float)max(1, m_heightField.m_height - 1))
++	                           : metrics.unitSize;
++	const int   samplesPerAxis = clamp_tpl((int)(metrics.unitSize / max(0.0001f, plateSpacing)) + 1, 2, 6);
++	const float sampleStep = metrics.unitSize / (float)(samplesPerAxis - 1);
++
++	for (int ux = 0; ux < dim; ++ux)
++	{
++		const float worldX = (float)(m_bakeRectX1 + ux) * metrics.unitSize;
++
++		for (int uy = 0; uy < dim; ++uy)
++		{
++			const float worldY = (float)(m_bakeRectY1 + uy) * metrics.unitSize;
++
++			float centreZ, localX, localY;
++			if (!SamplePlateSurface(worldTM, worldX, worldY, centreZ, localX, localY))
++				continue; // outside the rotated plate: this cell keeps the original ground
++
++			float plateMin = centreZ;
++			for (int sx = 0; sx < samplesPerAxis; ++sx)
++			{
++				for (int sy = 0; sy < samplesPerAxis; ++sy)
++				{
++					const float px = worldX - metrics.unitSize * 0.5f + (float)sx * sampleStep;
++					const float py = worldY - metrics.unitSize * 0.5f + (float)sy * sampleStep;
++
++					float z, ignoreX, ignoreY;
++					if (SamplePlateSurface(worldTM, px, py, z, ignoreX, ignoreY))
++					{
++						plateMin = min(plateMin, z);
++					}
++				}
++			}
++
++			const size_t index = (size_t)ux * dim + uy;
++			const float baseline = m_bakeBaseline[index];
++
++			// Raise only, and never above the mesh: decision 04 rule 1. Raise-and-lower is a Bake Mode
++			// in step 3.
++			const float combined = max(baseline, plateMin - kBakeEpsilonMeters);
++
++			// Cosine falloff to the baseline over the rim, the curve CRYENGINE itself uses for the road
++			// falloff (RoadObject.cpp:631-635), so the border of the footprint is the baseline exactly.
++			const float distanceToBorder = min(0.5f - fabs_tpl(localX), 0.5f - fabs_tpl(localY)) * 2.f;
++			const float t = clamp_tpl(distanceToBorder / band, 0.f, 1.f);
++			const float weight = (1.f - cosf(gf_PI * t)) * 0.5f;
++
++			const float value = baseline + (combined - baseline) * weight;
++			const float delta = value - baseline;
++
++			if (fabs_tpl(delta) > 0.0001f)
++			{
++				++outCellsWritten;
++				outMinDelta = min(outMinDelta, delta);
++				outMaxDelta = max(outMaxDelta, delta);
++			}
++
++			m_bakeResult[index] = value;
++		}
++	}
++}
++
++bool CTerrainPlateComponent::WriteTerrainBlock(const SBakeTerrainMetrics& metrics, const std::vector<float>& heights)
++{
++	ITerrain* pTerrain = (gEnv != nullptr && gEnv->p3DEngine != nullptr) ? gEnv->p3DEngine->GetITerrain() : nullptr;
++	if (pTerrain == nullptr || m_bakeRectSize <= 0)
++		return false;
++
++	const int dim = m_bakeRectSize + 1;
++	if ((int)heights.size() != dim * dim)
++		return false;
++
++	// Argument mapping, traced in terran_edit.cpp rather than taken from the doc comment:
++	//  - X1 / Y1 / nSizeX / nSizeY are terrain UNITS and must be whole sectors (:178-181);
++	//  - the block is indexed pTerrainBlock[ux * nHmapSize + uy] (:266) with nHmapSize = terrain size in
++	//    units. ux is the world X unit and uy the world Y unit: the cell written at (ux, uy) ends up in
++	//    pHMData[xlocal * nSize + ylocal] (:302), which is what SRangeInfo::GetHeight(x, y) reads
++	//    (terrain_sector.h:191) and what CTerrain::GetZ(worldX, worldY) asks for
++	//    (terrain_hmap.cpp:579). The editor's caller passes (y1, x1) (Heightmap.cpp:2519) because
++	//    CHeightmap stores its own array transposed, NOT because the engine's axes are swapped;
++	//  - the sector loop reads x from x1 to x2 INCLUSIVE (:264), so the block must carry one extra row
++	//    and column beyond the rect - hence dim = size + 1;
++	//  - only rows X1 .. X1 + nSize are ever read, so only those are allocated and the pointer is biased
++	//    back by X1 rows. The stride still has to be the full nHmapSize. Research 08 section 1.1: this
++	//    is what keeps a 3-sector plate at 3 MB instead of 256 MB on a large terrain;
++	//  - pSurfaceData = nullptr is step 1's heights-only contract: every touched cell keeps its surface
++	//    type ids, blend weights and hole flag, so a baked plate does not repaint a single layer. The
++	//    four nSurf* arguments are ignored on that path;
++	//  - pResolMap is optional and its only product is never read (:216-227), so NULL.
++	std::vector<float> block((size_t)dim * metrics.hmapSize, 0.f);
++
++	// Reads past the terrain are clamped to nHmapSize - 1 (:268), so a rect that ends exactly on the
++	// terrain border simply does not need its last column.
++	const int copyCols = min(dim, metrics.hmapSize - m_bakeRectY1);
++	if (copyCols <= 0)
++		return false;
++
++	for (int ux = 0; ux < dim; ++ux)
++	{
++		memcpy(&block[(size_t)ux * metrics.hmapSize + m_bakeRectY1], &heights[(size_t)ux * dim], sizeof(float) * copyCols);
++	}
++
++	float* const pBlock = block.data() - (size_t)m_bakeRectX1 * metrics.hmapSize;
++
++	pTerrain->SetTerrainElevation(m_bakeRectX1, m_bakeRectY1, m_bakeRectSize, m_bakeRectSize,
++	                              pBlock, nullptr, 0, 0, 0, 0, nullptr, 0, 0);
++	return true;
++}
++
++AABB CTerrainPlateComponent::GetBakeWorldBox(const SBakeTerrainMetrics& metrics) const
++{
++	AABB box;
++	box.min.Set((float)m_bakeRectX1 * metrics.unitSize, (float)m_bakeRectY1 * metrics.unitSize, FLT_MAX);
++	box.max.Set((float)(m_bakeRectX1 + m_bakeRectSize) * metrics.unitSize, (float)(m_bakeRectY1 + m_bakeRectSize) * metrics.unitSize, -FLT_MAX);
++
++	for (float z : m_bakeBaseline)
++	{
++		box.min.z = min(box.min.z, z);
++		box.max.z = max(box.max.z, z);
++	}
++	for (float z : m_bakeResult)
++	{
++		box.min.z = min(box.min.z, z);
++		box.max.z = max(box.max.z, z);
++	}
++
++	if (box.min.z > box.max.z)
++	{
++		box.min.z = 0.f;
++		box.max.z = 0.f;
++	}
++
++	return box;
++}
++
++void CTerrainPlateComponent::AfterBakeInvalidation(const AABB& box)
++{
++	if (gEnv == nullptr || gEnv->p3DEngine == nullptr)
++		return;
++
++	// SetTerrainElevation rebuilds the sector meshes, the elevation and normal atlases, the physics
++	// heightfield and the roads in the box (terran_edit.cpp:359-431), but it does NOT touch decals: the
++	// only DeleteDecalsInRange in the terrain path is the crater one (3dEngine.cpp:1624). A terrain
++	// decal keeps the mesh it was built with (MakeAreaRenderMesh, terrain_light.cpp:23-160), so without
++	// this it floats over - or sinks into - the baked ground. Research 08 section 1.2.
++	AABB decalBox = box;
++	gEnv->p3DEngine->DeleteDecalsInRange(&decalBox, nullptr);
++
++	// The terrain silhouette moved, so the cached cascades and the HeightMap AO have to be rebuilt even
++	// when the plate mesh itself did not change (toggling Bake Into Terrain does exactly that).
++	InvalidateShadowCache();
++
++	// The navmesh is generated from the engine terrain, and at export GenerateAiAll runs after the
++	// heightmap export (GameExporter.cpp), so the shipped navmesh is correct for free. In the editor the
++	// only notification path is CHeightmap::UpdateEngineTerrain -> CGameEngine::OnTerrainModified
++	// (GameEngine.cpp:1699-1722), which an engine-side SetTerrainElevation never goes through. So the
++	// plate makes the same call itself, with the same kind of margin the editor uses. Research 09, item N.
++	if (gEnv->pAISystem != nullptr)
++	{
++		if (INavigationSystem* pNavigationSystem = gEnv->pAISystem->GetNavigationSystem())
++		{
++			if (INavigationUpdatesManager* pUpdateManager = pNavigationSystem->GetUpdateManager())
++			{
++				AABB navBox = box;
++				navBox.Expand(Vec3(2.f, 2.f, 2.f));
++				pUpdateManager->WorldChanged(navBox);
++			}
++		}
++	}
++}
++
++void CTerrainPlateComponent::RestoreBakeBaseline()
++{
++	if (!m_bBakeApplied)
++		return;
++
++	m_bBakeApplied = false;
++	UnregisterBakingPlate();
++
++	const SBakeTerrainMetrics metrics = GetBakeTerrainMetrics();
++	if (metrics.IsValid() && !m_bakeBaseline.empty())
++	{
++		const AABB box = GetBakeWorldBox(metrics);
++		if (WriteTerrainBlock(metrics, m_bakeBaseline))
++		{
++			AfterBakeInvalidation(box);
++		}
++	}
++
++	m_bakeResult.clear();
++}
++
++void CTerrainPlateComponent::ApplyBake()
++{
++	if (!m_bBakeIntoTerrain || m_bInitialBakePending)
++		return; // decision 04 rule 5: never from Initialize(), only once the level's terrain is in
++
++	if (m_pEntity == nullptr || gEnv == nullptr || gEnv->p3DEngine == nullptr)
++		return;
++
++	const SBakeTerrainMetrics metrics = GetBakeTerrainMetrics();
++	if (!metrics.IsValid())
++		return;
++
++	const CTimeValue startTime = (gEnv->pTimer != nullptr) ? gEnv->pTimer->GetAsyncTime() : CTimeValue();
++
++	const Matrix34 worldTM = GetPlateWorldTM();
++
++	int x1 = 0, y1 = 0, size = 0;
++	if (!ComputeBakeRect(metrics, worldTM, x1, y1, size))
++		return;
++
++	// The block is (size + 1) rows of the full terrain width. Refuse a footprint that would make that
++	// allocation absurd rather than eat a hundred megabytes silently.
++	if ((int64)(size + 1) * (int64)metrics.hmapSize > (int64)8 * 1024 * 1024)
++	{
++		if (!m_bBakeSizeWarningIssued)
++		{
++			m_bBakeSizeWarningIssued = true;
++			CryWarning(VALIDATOR_MODULE_ENTITYSYSTEM, VALIDATOR_WARNING,
++			           "Terrain Plate '%s': Bake Into Terrain skipped, the footprint covers %d x %d terrain units, which is too large to bake in one block",
++			           m_pEntity->GetName(), size, size);
++		}
++		return;
++	}
++
++	m_bakeRectX1 = x1;
++	m_bakeRectY1 = y1;
++	m_bakeRectSize = size;
++
++	CaptureBakeBaseline(metrics);
++
++	int cellsWritten = 0;
++	float minDelta = 0.f, maxDelta = 0.f;
++	ComputeBakeBlock(metrics, worldTM, cellsWritten, minDelta, maxDelta);
++
++	if (!WriteTerrainBlock(metrics, m_bakeResult))
++		return;
++
++	m_bBakeApplied = true;
++	RegisterBakingPlate();
++	AfterBakeInvalidation(GetBakeWorldBox(metrics));
++
++	if (GetTerrainIntegrateDebugLevel() >= 1)
++	{
++		const float milliseconds = (gEnv->pTimer != nullptr) ? (gEnv->pTimer->GetAsyncTime() - startTime).GetMilliSeconds() : 0.f;
++		CryLog("TerrainPlate '%s': bake rect units (%d,%d)+%d (%d x %d sectors), %d of %d cells raised, delta %.3f .. %.3f m, %.2f ms",
++		       m_pEntity->GetName(), m_bakeRectX1, m_bakeRectY1, m_bakeRectSize,
++		       m_bakeRectSize / metrics.sectorUnits, m_bakeRectSize / metrics.sectorUnits,
++		       cellsWritten, (m_bakeRectSize + 1) * (m_bakeRectSize + 1), minDelta, maxDelta, milliseconds);
++	}
++}
++
++void CTerrainPlateComponent::RegisterBakingPlate()
++{
++	if (std::find(g_bakingPlates.begin(), g_bakingPlates.end(), this) == g_bakingPlates.end())
++	{
++		g_bakingPlates.push_back(this);
++	}
++
++	if (m_bBakeOverlapWarningIssued || m_pEntity == nullptr)
++		return;
++
++	// Overlapping plates: step 2 only detects and warns. Making an overlap actually correct needs the
++	// whole set restored in reverse order and re-baked in a defined order (entity GUID, later a Bake
++	// Priority), because each plate's baseline is captured from the terrain as it finds it - that is
++	// step 3 of decision 04. Without it, the plate that bakes last simply wins in the overlap, and its
++	// baseline contains the other plate's relief, so removing them in the wrong order leaves a bump.
++	for (CTerrainPlateComponent* pOther : g_bakingPlates)
++	{
++		if (pOther == this || pOther->m_pEntity == nullptr || !pOther->m_bBakeApplied)
++			continue;
++
++		const bool bOverlaps = (m_bakeRectX1 < pOther->m_bakeRectX1 + pOther->m_bakeRectSize)
++		                       && (pOther->m_bakeRectX1 < m_bakeRectX1 + m_bakeRectSize)
++		                       && (m_bakeRectY1 < pOther->m_bakeRectY1 + pOther->m_bakeRectSize)
++		                       && (pOther->m_bakeRectY1 < m_bakeRectY1 + m_bakeRectSize);
++
++		if (!bOverlaps)
++			continue;
++
++		m_bBakeOverlapWarningIssued = true;
++		pOther->m_bBakeOverlapWarningIssued = true;
++
++		CryWarning(VALIDATOR_MODULE_ENTITYSYSTEM, VALIDATOR_WARNING,
++		           "Terrain Plate '%s': its bake footprint overlaps the baking plate '%s'. Both are baked, in entity GUID order, but "
++		           "neither knows about the other: the one that bakes last captures the other's relief as its own ground. Keep baking "
++		           "plates apart until Bake Priority arrives.",
++		           m_pEntity->GetName(), pOther->m_pEntity->GetName());
++		return;
++	}
++}
++
++void CTerrainPlateComponent::UnregisterBakingPlate()
++{
++	auto it = std::find(g_bakingPlates.begin(), g_bakingPlates.end(), this);
++	if (it != g_bakingPlates.end())
++	{
++		g_bakingPlates.erase(it);
++	}
+ }
+ 
+ void CTerrainPlateComponent::InvalidateShadowCache()
+diff --git a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
+index 1333e840..4e5337c2 100644
+--- a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
++++ b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
+@@ -112,6 +112,17 @@ static void ReflectType(Schematyc::CTypeDesc<ETerrainPlateGridMode>& desc)
+ 	desc.AddConstant(ETerrainPlateGridMode::Spacing, "Spacing", "Spacing");
+ }
+ 
++//! Terrain metrics of the current level, in terrain units. Invalid when there is no terrain.
++//! Namespace scope rather than a member type, so that the file local bake helpers can take one.
++struct SBakeTerrainMetrics
++{
++	float unitSize = 1.f;    //!< metres per terrain unit
++	int   hmapSize = 0;      //!< terrain size in units
++	int   sectorUnits = 1;   //!< units along one sector edge
++
++	bool IsValid() const { return hmapSize > 0 && sectorUnits > 0 && unitSize > 0.f; }
++};
++
+ //! Registers / removes the console variables owned by the terrain plate component. Called from the
+ //! plugin's Initialize and destructor, because a cvar must never outlive the module that owns it.
+ void RegisterTerrainPlateCVars();
+@@ -212,6 +223,16 @@ public:
+ 		               "movement always update immediately.",
+ 		               false);
+ 
++		desc.AddMember(&CTerrainPlateComponent::m_bBakeIntoTerrain, 'bake', "BakeIntoTerrain", "Bake Into Terrain",
++		               "Writes the low frequency shape of the plate into the live engine terrain, so that everything which reads the "
++		               "terrain height follows the plate instead of the original ground: roads, terrain decals, the terrain silhouette "
++		               "in cached shadows and HeightMap AO, SVOGI, the physics heightfield and the AI navmesh. The written terrain is "
++		               "kept 2 cm below the plate mesh and the border of the footprint blends back to the original ground, so the "
++		               "terrain outside the plate and the painted surface layers everywhere are left untouched. Editor and Profile "
++		               "only - the game export serialises the live terrain, so the shipped level carries the bake with no release "
++		               "code at all. Turning it off (or moving, rescaling or deleting the plate) puts the original ground back first.",
++		               false);
++
+ 		desc.AddMember(&CTerrainPlateComponent::m_renderParameters, 'rend', "Render", "Rendering Settings", "Settings for the rendered representation of the component", plateRenderDefaults);
+ 		desc.AddMember(&CTerrainPlateComponent::m_physics, 'phys', "Physics", "Physics Settings",
+ 		               "Physical properties for the object. With Type = Render and Collider the plate physicalizes itself as a static "
+@@ -260,6 +281,36 @@ protected:
+ 	//! HeightMap AO frustum are rebuilt instead of keeping the previous silhouette.
+ 	void        InvalidateShadowCache();
+ 
++	// ---------------------------------------------------------------- virtual bake (P5 step 2)
++	//! Sector aligned square footprint of the plate, in terrain units. False when the plate cannot be
++	//! baked (no terrain, degenerate transform, or a footprint too large to build a block for).
++	bool  ComputeBakeRect(const SBakeTerrainMetrics& metrics, const Matrix34& worldTM, int& outX1, int& outY1, int& outSize) const;
++	//! Reads the terrain heights over the current rect into m_bakeBaseline. The terrain must hold the
++	//! original ground at this point (@see RestoreBakeBaseline).
++	void  CaptureBakeBaseline(const SBakeTerrainMetrics& metrics);
++	//! Builds m_bakeResult from m_bakeBaseline and the plate surface. Reports what it changed.
++	void  ComputeBakeBlock(const SBakeTerrainMetrics& metrics, const Matrix34& worldTM, int& outCellsWritten, float& outMinDelta, float& outMaxDelta);
++	//! One heights-only SetTerrainElevation over the current rect.
++	bool  WriteTerrainBlock(const SBakeTerrainMetrics& metrics, const std::vector<float>& heights);
++	//! Restores the original ground over the footprint of the live bake, if there is one. Must run
++	//! before anything reads the terrain again (the edge weld does) and before the plate moves.
++	void  RestoreBakeBaseline();
++	//! Captures the baseline, computes the block and writes it. Does nothing until the level is loaded.
++	void  ApplyBake();
++	//! Decals, shadows and navmesh over a footprint that just changed.
++	void  AfterBakeInvalidation(const AABB& box);
++	//! World box of the current bake rect, from the captured baseline and the written result.
++	AABB  GetBakeWorldBox(const SBakeTerrainMetrics& metrics) const;
++	//! Adds this plate to / removes it from the list of plates holding a live bake, and warns once
++	//! when another baking plate overlaps this one.
++	void  RegisterBakingPlate();
++	void  UnregisterBakingPlate();
++	//! Relief of the plate at a local XY, in the unit plate's 0..1 local Z. Reproduces exactly what
++	//! RegenerateMesh put into the mesh, Normalize and Mirror included.
++	float GetPlateReliefAt(float lx, float ly) const;
++	//! Projects a world XY straight down onto the plate surface. False when it misses the plate.
++	bool  SamplePlateSurface(const Matrix34& worldTM, float worldX, float worldY, float& outWorldZ, float& outLocalX, float& outLocalY) const;
++
+ 	ETerrainPlateSource                          m_sourceMode = ETerrainPlateSource::HeightmapFile;
+ 	Schematyc::TerrainHeightmapFileName          m_heightmapPath;
+ 	Schematyc::TextureFileName                   m_displacementPath;
+@@ -278,6 +329,7 @@ protected:
+ 	Schematyc::Range<0, 100, 0, 2, float>        m_weldSink = 0.1f;
+ 	Schematyc::Range<0, 1000, 0, 20, float>      m_skirt = 0.25f;
+ 	bool                                         m_bUpdateDuringDrag = false;
++	bool                                         m_bBakeIntoTerrain = false;
+ 
+ 	// Cached state, never serialised: the mesh is always rebuilt on load.
+ 	STerrainPlateHeightField m_heightField;
+@@ -301,6 +353,30 @@ protected:
+ 	//! FNV-1a of the position stream of the last generated mesh; 0 until the first generation.
+ 	uint32                   m_geometryHash = 0;
+ 	_smart_ptr<IStatObj>     m_pStatObj;
++
++	// ---------------------------------------------------------------- virtual bake, runtime only
++	// Nothing here is reflected or serialised: the level file keeps the pristine CHeightmap, which the
++	// editor re-pushes on every load, so the baseline is re-captured from scratch each session
++	// (scene-notes/terrain/research/08-virtual-bake.md section 2.4).
++	//! Offset / scale that turn a raw source sample into the unit plate's local Z, i.e. what the
++	//! Normalize pass of the last RegenerateMesh solved for. The bake reuses them so that the baked
++	//! relief and the rendered mesh are the same surface.
++	float                    m_reliefOffset = 0.f;
++	float                    m_reliefScale = 1.f;
++	//! True while the terrain holds this plate's bake over m_bakeRect*.
++	bool                     m_bBakeApplied = false;
++	//! True until the level is loaded. Rule 5 of decision 04: never bake from Initialize().
++	bool                     m_bInitialBakePending = true;
++	//! Sector aligned square footprint of the live bake, in terrain units.
++	int                      m_bakeRectX1 = 0;
++	int                      m_bakeRectY1 = 0;
++	int                      m_bakeRectSize = 0;
++	//! (m_bakeRectSize + 1)^2 heights, row major, index (ux - X1) * dim + (uy - Y1); ux is along
++	//! world X and uy along world Y, the order SetTerrainElevation itself uses.
++	std::vector<float>       m_bakeBaseline;   //!< the original ground, restored on any change
++	std::vector<float>       m_bakeResult;     //!< what the last bake actually wrote
++	bool                     m_bBakeOverlapWarningIssued = false;
++	bool                     m_bBakeSizeWarningIssued = false;
+ };
+ }
+ }
+-- 
+2.47.1.windows.1
+

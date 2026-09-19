@@ -1,0 +1,338 @@
+From d68825d127a12014daa37fe461c1a9eb38e10ba0 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Tue, 1 Sep 2026 06:56:45 +0800
+Subject: [PATCH 254/307] !B (Terrain Plate) Cull plate triangles buried below
+ terrain.
+
+Move triangles whose vertices are all safely below terrain into a no-draw
+subset while generating the plate mesh. Buried surfaces and skirts remain
+hidden even when coarser terrain LODs dip below the full-resolution ground.
+---
+ .../Geometry/TerrainPlateComponent.cpp        | 228 +++++++++++++++---
+ .../Geometry/TerrainPlateComponent.h          |   4 +
+ 2 files changed, 201 insertions(+), 31 deletions(-)
+
+diff --git a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
+index cf6db949..7be72846 100644
+--- a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
++++ b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
+@@ -4,6 +4,7 @@
+ 
+ #include <Cry3DEngine/I3DEngine.h>
+ #include <Cry3DEngine/IIndexedMesh.h>
++#include <Cry3DEngine/IMaterial.h>   // MTL_FLAG_NODRAW, the buried subset marker
+ #include <Cry3DEngine/IStatObj.h>
+ #include <Cry3DEngine/IRenderNode.h>
+ #include <Cry3DEngine/ImageExtensionHelper.h>
+@@ -206,6 +207,42 @@ const uint32 kSunkenPollFrames = 16;
+ //! terrain itself and could no longer promise it had seen every bump, so it refuses to hide instead.
+ const int kSunkenMaxSamplesPerAxis = 257;
+ 
++//! P18, 2026-08-31, screenshot verified by the user with a red debug material: the band that pokes
++//! through the ground at distance is NOT "the plate". It is the plate's BELOW GROUND surface regions and
++//! its SKIRT - the parts that the terrain integration classifies as rejected (the height band test
++//! triBox.max.z > fElevMin, terrain_sector_render.cpp) and which therefore wear the plate's own fallback
++//! material instead of the terrain shading. They are meant to be invisible because they are buried, and
++//! decision 02 says so in as many words: "sunk -> the terrain wins the depth test". As P17 established,
++//! that promise only holds for the surface the depth test actually rasterises, and a terrain sector at
++//! LOD >= 1 draws the chord between two sampled heightmap nodes, dipping locally below the real ground by
++//! up to m_geomError. Wherever it dips, the buried geometry is revealed.
++//! P17 half A hides the WHOLE plate, and it never fires in practice, because a real plate is a mound with
++//! buried edges: partially sunken, so one sample above ground vetoes the hide. C4 only pushes the reveal
++//! distance out. The thing that has to go is therefore not the plate but the buried triangles.
++//! So: during mesh generation, classify every triangle against the terrain the weld already samples, and
++//! move a triangle whose three vertices are ALL below that terrain into a second, MTL_FLAG_NODRAW subset.
++//! A NODRAW subset is the engine's own idiom for "geometry that exists but is not drawn":
++//!  - CRenderMesh::SetMesh skips it when it builds render chunks (RenderMesh.cpp:1182, :1196, :1268), so
++//!    it never reaches any render pass, near or far, camera or shadow;
++//!  - CStatObj::PhysicalizeGeomType selects subsets by nPhysicalizeType alone (StatObjPhys.cpp:155-174),
++//!    so the collision trimesh still contains every triangle: the physics proxy does not change;
++//!  - CTerrainNode::AppendTrianglesFromObjects walks render chunks and skips NODRAW ones
++//!    (terrain_sector_render.cpp:1624), so the buried triangles leave the terrain integration copy too -
++//!    which changes nothing, because the height band test there rejected them anyway.
++//! No vertex is moved, removed or renumbered: only the ORDER of the index buffer changes, so the weld
++//! ring still welds, the UVs and the tangent frame of every surviving triangle are untouched, and the
++//! bake - which samples the plate's SOURCE height field through GetPlateReliefAt, never the render mesh -
++//! cannot see this at all.
++//! Escape hatch: e_TerrainPlateCullBuried 0 keeps every triangle in the drawn subset (stock behaviour).
++int    g_terrainPlateCullBuried = 1;
++ICVar* g_pTerrainPlateCullBuriedCVar = nullptr;
++
++//! Metres a vertex has to be under the terrain before it counts as buried. The same 0.05 m as
++//! kSunkenHideClearance, and for the same reason: it is half the default Weld Sink (0.1 m), so the welded
++//! rim - which is pushed under the ground ON PURPOSE - is correctly seen as buried, while float noise
++//! cannot flip a vertex that is meant to sit on the surface.
++const float kBuriedCullMargin = 0.05f;
++
+ //! Bake trigger / bake apply tracing. The bake chain has a dozen places where it can legitimately do
+ //! nothing (the property is off, the level's terrain is not in yet, the footprint is empty, the write
+ //! was refused), and until this cvar existed every one of them was a silent return: the user ticked
+@@ -337,6 +374,27 @@ void RegisterTerrainPlateCVars()
+ 		g_pTerrainPlateHideSunkenCVar->AddOnChange(&CTerrainPlateComponent::OnHideSunkenCVarChanged);
+ 	}
+ 
++	g_pTerrainPlateCullBuriedCVar = REGISTER_CVAR2("e_TerrainPlateCullBuried", &g_terrainPlateCullBuried, 1, VF_NULL,
++	                                              "Terrain Plate component: leave the plate's buried triangles out of the DRAWN geometry. A\n"
++	                                              "triangle is buried when all three of its vertices are more than 5 cm below the terrain\n"
++	                                              "surface under them - the surface regions of a partially sunken plate and, with the default\n"
++	                                              "Weld Sink, the whole skirt. Those parts are rejected by the terrain integration and so\n"
++	                                              "wear the plate's own fallback material; they are meant to be hidden by the ground, and near\n"
++	                                              "the camera they are, but a terrain sector at LOD 1 or coarser draws the chord between two\n"
++	                                              "heightmap nodes and dips locally below the real ground, which is what reveals them as a\n"
++	                                              "scalloped band at distance.\n"
++	                                              "Collision is NOT affected: the buried triangles stay in the physics trimesh, they are only\n"
++	                                              "moved into a MTL_FLAG_NODRAW subset. Re-evaluated on every mesh rebuild.\n"
++	                                              "1 - default\n"
++	                                              "0 - stock behaviour: every triangle is drawn");
++
++	// The classification is baked into the index buffer, so the cvar can only take effect by rebuilding
++	// every plate's mesh - unlike e_TerrainPlateHideSunken, which is a render flag.
++	if (g_pTerrainPlateCullBuriedCVar != nullptr)
++	{
++		g_pTerrainPlateCullBuriedCVar->AddOnChange(&CTerrainPlateComponent::OnCullBuriedCVarChanged);
++	}
++
+ 	g_pTerrainPlateDebugCVar = REGISTER_CVAR2("e_TerrainPlateDebug", &g_terrainPlateDebug, 0, VF_NULL,
+ 	                                          "Terrain Plate component: trace the bake trigger and the bake itself.\n"
+ 	                                          "0 - off\n"
+@@ -376,6 +434,9 @@ void UnregisterTerrainPlateCVars()
+ 		if (g_pTerrainPlateHideSunkenCVar != nullptr)
+ 			gEnv->pConsole->UnregisterVariable(g_pTerrainPlateHideSunkenCVar->GetName());
+ 
++		if (g_pTerrainPlateCullBuriedCVar != nullptr)
++			gEnv->pConsole->UnregisterVariable(g_pTerrainPlateCullBuriedCVar->GetName());
++
+ 		if (g_pTerrainPlateDebugCVar != nullptr)
+ 			gEnv->pConsole->UnregisterVariable(g_pTerrainPlateDebugCVar->GetName());
+ 	}
+@@ -388,6 +449,7 @@ void UnregisterTerrainPlateCVars()
+ 	g_pTerrainPlateBakeEdgeAACVar = nullptr;
+ 	g_pTerrainPlateBakeWeldCurveCVar = nullptr;
+ 	g_pTerrainPlateHideSunkenCVar = nullptr;
++	g_pTerrainPlateCullBuriedCVar = nullptr;
+ 	g_pTerrainPlateDebugCVar = nullptr;
+ }
+ 
+@@ -1865,28 +1927,6 @@ void CTerrainPlateComponent::RegenerateMesh()
+ 		}
+ 	}
+ 
+-	// Grid indices, counter clockwise seen from +Z (the engine's front face winding, see
+-	// CTerrain::MakeAreaRenderMesh).
+-	int indexCursor = 0;
+-	for (int r = 0; r < ny - 1; ++r)
+-	{
+-		for (int c = 0; c < nx - 1; ++c)
+-		{
+-			const vtx_idx v00 = (vtx_idx)(r * nx + c);
+-			const vtx_idx v01 = (vtx_idx)(r * nx + c + 1);
+-			const vtx_idx v10 = (vtx_idx)((r + 1) * nx + c);
+-			const vtx_idx v11 = (vtx_idx)((r + 1) * nx + c + 1);
+-
+-			pIndices[indexCursor++] = v00;
+-			pIndices[indexCursor++] = v10;
+-			pIndices[indexCursor++] = v01;
+-
+-			pIndices[indexCursor++] = v01;
+-			pIndices[indexCursor++] = v10;
+-			pIndices[indexCursor++] = v11;
+-		}
+-	}
+-
+ 	// Skirt: a duplicated border ring plus a second ring pushed straight down, closed with quads whose
+ 	// normals face outwards. The duplication is what lets the side wall have its own horizontal normal.
+ 	// The skirt starts at the welded (and sunk) ring, so with the default Weld Sink it is entirely below
+@@ -1932,21 +1972,98 @@ void CTerrainPlateComponent::RegenerateMesh()
+ 			pTangents[topBase + i] = SMeshTangents(along, down, outward);
+ 			pTangents[bottomBase + i] = SMeshTangents(along, down, outward);
+ 		}
++	}
++
++	// ---------------------------------------------------------------- buried triangle classification
++	// P18. Every vertex position is final by now (weld included), so one pass over the position stream
++	// decides, per vertex, whether it is under the ground. @see the e_TerrainPlateCullBuried comment at
++	// the top of this file for what this is for and why a NODRAW subset is the mechanism.
++	//
++	// The terrain reference is I3DEngine::GetTerrainElevation (CTerrain::GetZApr), deliberately the very
++	// same sampler the edge weld above uses. That makes the test the exact inverse of the weld's own
++	// intent: the weld pushes the outer ring Weld Sink metres BELOW this surface so that no light leaks
++	// under the border, and this test then reads those vertices as buried, which is what they are. Using a
++	// different terrain estimate here (the per quad minimum of P17's whole plate test, say) would judge
++	// the ring against a surface the weld never saw and would keep the rim on slopes, where the artefact
++	// is worst. Off the terrain GetZApr returns TERRAIN_BOTTOM_LEVEL, so nothing is ever culled there -
++	// the safe direction.
++	std::vector<char> buried;
++	const bool bCullBuried = (g_terrainPlateCullBuried != 0) && (gEnv->p3DEngine->GetITerrain() != nullptr);
++
++	if (bCullBuried)
++	{
++		const Matrix34 worldTM = GetPlateWorldTM();
++		buried.resize((size_t)totalVertexCount, 0);
++
++		for (int i = 0; i < totalVertexCount; ++i)
++		{
++			const Vec3 world = worldTM * pPositions[i];
++			const float terrainZ = gEnv->p3DEngine->GetTerrainElevation(world.x, world.y);
++			buried[(size_t)i] = (world.z < terrainZ - kBuriedCullMargin) ? 1 : 0;
++		}
++	}
++
++	// Culled triangles are not thrown away, they are moved to the END of the index buffer, where a second
++	// subset marked MTL_FLAG_NODRAW picks them up: the render mesh drops them, the physics trimesh keeps
++	// them. The buffer keeps its full totalIndexCount and no vertex is touched.
++	int indexCursor = 0;
++	std::vector<vtx_idx> culledIndices;
++
++	auto emitTriangle = [&](int a, int b, int c)
++	{
++		if (bCullBuried && buried[(size_t)a] && buried[(size_t)b] && buried[(size_t)c])
++		{
++			culledIndices.push_back((vtx_idx)a);
++			culledIndices.push_back((vtx_idx)b);
++			culledIndices.push_back((vtx_idx)c);
++			return;
++		}
++
++		pIndices[indexCursor++] = (vtx_idx)a;
++		pIndices[indexCursor++] = (vtx_idx)b;
++		pIndices[indexCursor++] = (vtx_idx)c;
++	};
++
++	// Grid indices, counter clockwise seen from +Z (the engine's front face winding, see
++	// CTerrain::MakeAreaRenderMesh).
++	for (int r = 0; r < ny - 1; ++r)
++	{
++		for (int c = 0; c < nx - 1; ++c)
++		{
++			const int v00 = r * nx + c;
++			const int v01 = r * nx + c + 1;
++			const int v10 = (r + 1) * nx + c;
++			const int v11 = (r + 1) * nx + c + 1;
++
++			emitTriangle(v00, v10, v01);
++			emitTriangle(v01, v10, v11);
++		}
++	}
++
++	// Skirt indices. The same rule applies and it is the rule the skirt was written for: the skirt exists
++	// to seal the border where the Weld Sink alone is not enough, and a skirt quad whose TOP edge is
++	// already under the ground seals nothing - it is only something to be revealed by a dipping LOD.
++	if (bSkirt)
++	{
++		const int topBase = gridVertexCount;
++		const int bottomBase = gridVertexCount + perimeterCount;
+ 
+ 		for (int i = 0; i < perimeterCount; ++i)
+ 		{
+ 			const int j = (i + 1) % perimeterCount;
+ 
+-			pIndices[indexCursor++] = (vtx_idx)(topBase + i);
+-			pIndices[indexCursor++] = (vtx_idx)(bottomBase + i);
+-			pIndices[indexCursor++] = (vtx_idx)(bottomBase + j);
+-
+-			pIndices[indexCursor++] = (vtx_idx)(topBase + i);
+-			pIndices[indexCursor++] = (vtx_idx)(bottomBase + j);
+-			pIndices[indexCursor++] = (vtx_idx)(topBase + j);
++			emitTriangle(topBase + i, bottomBase + i, bottomBase + j);
++			emitTriangle(topBase + i, bottomBase + j, topBase + j);
+ 		}
+ 	}
+ 
++	const int visibleIndexCount = indexCursor;
++
++	for (vtx_idx culled : culledIndices)
++	{
++		pIndices[indexCursor++] = culled;
++	}
++
+ 	CRY_ASSERT(indexCursor == totalIndexCount);
+ 
+ 	// The hash is what tells a real geometry change from a rebuild that produced the same mesh (flipping
+@@ -1966,11 +2083,42 @@ void CTerrainPlateComponent::RegenerateMesh()
+ 		}
+ 	}
+ 
+-	pIndexedMesh->SetSubSetCount(1);
+-	pIndexedMesh->SetSubsetIndexVertexRanges(0, 0, totalIndexCount, 0, totalVertexCount);
++	// The burial split is part of what the shadow cache holds, and it can change without a single vertex
++	// moving: a plate with Edge Weld off keeps its exact geometry while the ground under it is sculpted.
++	// Folding the visible count in is what makes InvalidateShadowCache fire in that case.
++	geometryHash = (geometryHash ^ (uint32)visibleIndexCount) * 16777619u;
++
++	// Two subsets over one index buffer: [0, visibleIndexCount) is drawn and physicalised, the rest is
++	// physicalised only. Both keep nMatID 0 and PHYS_GEOM_TYPE_DEFAULT, so CStatObj::PhysicalizeGeomType
++	// (StatObjPhys.cpp:155-174, which selects on nPhysicalizeType and never looks at nMatFlags) builds the
++	// collision trimesh from every triangle, exactly as it did with one subset - the physics proxy is
++	// unchanged by this feature in every configuration. The vertex range is the whole stream for both,
++	// because the split is per triangle and the two share vertices along their boundary.
++	const int culledIndexCount = totalIndexCount - visibleIndexCount;
++
++	pIndexedMesh->SetSubSetCount(culledIndexCount > 0 ? 2 : 1);
++	pIndexedMesh->SetSubsetIndexVertexRanges(0, 0, visibleIndexCount, 0, totalVertexCount);
+ 	pIndexedMesh->SetSubsetMaterialId(0, 0);
+ 	pIndexedMesh->SetSubsetMaterialProperties(0, 0, PHYS_GEOM_TYPE_DEFAULT);
+ 	pIndexedMesh->SetSubsetBounds(0, bbox.GetCenter(), bbox.GetRadius());
++
++	if (culledIndexCount > 0)
++	{
++		pIndexedMesh->SetSubsetIndexVertexRanges(1, visibleIndexCount, culledIndexCount, 0, totalVertexCount);
++		pIndexedMesh->SetSubsetMaterialId(1, 0);
++		pIndexedMesh->SetSubsetMaterialProperties(1, MTL_FLAG_NODRAW, PHYS_GEOM_TYPE_DEFAULT);
++		pIndexedMesh->SetSubsetBounds(1, bbox.GetCenter(), bbox.GetRadius());
++
++		if (GetPlateDebugLevel() >= 1)
++		{
++			CryLog("TerrainPlate '%s': %d of %d triangles are buried and are not drawn (e_TerrainPlateCullBuried)",
++			       GetPlateName(), culledIndexCount / 3, totalIndexCount / 3);
++		}
++	}
++
++	// The bounding box is deliberately the WHOLE mesh, culled triangles included: it is what the physics
++	// proxy, the entity slot and the terrain sector invalidation are sized from, and shrinking it to the
++	// drawn part would leave the collision outside the box it is registered with.
+ 	pIndexedMesh->SetBBox(bbox);
+ 
+ 	const bool bPhysicalize = ((uint32)m_type & (uint32)EMeshType::Collider) != 0;
+@@ -3461,6 +3609,24 @@ void CTerrainPlateComponent::OnHideSunkenCVarChanged(ICVar* /*pCVar*/)
+ 	}
+ }
+ 
++void CTerrainPlateComponent::OnCullBuriedCVarChanged(ICVar* /*pCVar*/)
++{
++	// Unlike the hide flag, this one is not a render node flag that can simply be re-written: the split is
++	// in the index buffer, so the only way to honour the new value is to build the mesh again.
++	// RequestRegenerate rather than RegenerateMesh, so that toggling the cvar while several plates share
++	// ground coalesces into one rebuild per plate per frame and the bake cascade runs from the update tick
++	// like every other rebuild does.
++	//
++	// The vector is iterated by index: RegenerateMesh can start a bake cascade, which regenerates other
++	// plates, and a plate is only ever appended to or erased from g_terrainPlates by Initialize / teardown
++	// - neither of which a rebuild triggers - but an index walk survives a reallocation that a range-for
++	// would not.
++	for (size_t i = 0; i < g_terrainPlates.size(); ++i)
++	{
++		g_terrainPlates[i]->RequestRegenerate();
++	}
++}
++
+ bool CTerrainPlateComponent::WantsSunkenHideTick() const
+ {
+ 	// A visible plate costs nothing per frame: it is re-tested by the events that can change the answer
+diff --git a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
+index ecb6ec52..87b4c20a 100644
+--- a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
++++ b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
+@@ -163,6 +163,10 @@ public:
+ 	//! Public only because RegisterTerrainPlateCVars hands it to ICVar::AddOnChange as a plain function.
+ 	static void OnHideSunkenCVarChanged(ICVar* pCVar);
+ 
++	//! e_TerrainPlateCullBuried changed: the classification lives in the index buffer, so every plate in
++	//! the level has to rebuild its mesh for the cvar to mean anything. Public for the same reason.
++	static void OnCullBuriedCVarChanged(ICVar* pCVar);
++
+ protected:
+ 	friend CPlugin_CryDefaultEntities;
+ 	static void Register(Schematyc::CEnvRegistrationScope& componentScope);
+-- 
+2.47.1.windows.1
+

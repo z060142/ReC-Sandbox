@@ -1,0 +1,1147 @@
+From b76e98a093b52de5048bd2c66fb11abff4c41a4b Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Wed, 2 Sep 2026 18:44:34 +0800
+Subject: [PATCH 293/307] !F (Terrain Plate) Add multi-plate height and colour
+ stamping.
+
+Read every selected plate from live terrain before updating CHeightmap, then
+push the union once and notify affected bakes. This preserves all selected and
+overlapping plates during a multi-plate stamp.
+---
+ .../EditorQt/Terrain/TerrainCommands.cpp      | 658 +++++++++---------
+ .../EditorQt/Terrain/TerrainEditor.cpp        |   4 +-
+ .../Terrain/TerrainPlateColourOverlay.cpp     | 155 +++--
+ .../Terrain/TerrainPlateColourOverlay.h       |  11 +
+ 4 files changed, 441 insertions(+), 387 deletions(-)
+
+diff --git a/Code/Sandbox/EditorQt/Terrain/TerrainCommands.cpp b/Code/Sandbox/EditorQt/Terrain/TerrainCommands.cpp
+index b88cf58e..007c3cb6 100644
+--- a/Code/Sandbox/EditorQt/Terrain/TerrainCommands.cpp
++++ b/Code/Sandbox/EditorQt/Terrain/TerrainCommands.cpp
+@@ -303,7 +303,7 @@ CollectSelectedTerrainPlates(const char* szCommandName)
+ 	if (pSelection == nullptr || pSelection->IsEmpty())
+ 	{
+ 		CryWarning(VALIDATOR_MODULE_EDITOR, VALIDATOR_WARNING,
+-		           "%s: nothing selected. Select the terrain plate entities to commit and run it again.", szCommandName);
++		           "%s: nothing selected. Select the terrain plate entities and run it again.", szCommandName);
+ 		return plates;
+ 	}
+ 
+@@ -332,12 +332,64 @@ CollectSelectedTerrainPlates(const char* szCommandName)
+ 	return plates;
+ }
+ 
+-//! Stamps the LIVE bake of every selected terrain plate into the level's own heightmap, so the relief
++//! Every terrain plate entity in the level, selected or not. The selection walk above cannot see the
++//! neighbours a height stamp flattens, and those are exactly the ones that have to be told.
++static std::vector<std::pair<IEntity*, Cry::DefaultComponents::CTerrainPlateComponent*>>
++CollectAllTerrainPlates()
++{
++	using Cry::DefaultComponents::CTerrainPlateComponent;
++	using Cry::DefaultComponents::ITerrainPlateCommit;
++
++	std::vector<std::pair<IEntity*, CTerrainPlateComponent*>> plates;
++
++	if (gEnv == nullptr || gEnv->pEntitySystem == nullptr)
++		return plates;
++
++	IEntityItPtr it = gEnv->pEntitySystem->GetEntityIterator();
++	if (it == nullptr)
++		return plates;
++
++	it->MoveFirst();
++	while (!it->IsEnd())
++	{
++		IEntity* pEntity = it->Next();
++		if (pEntity == nullptr)
++			continue;
++
++		IEntityComponent* pComponent = pEntity->GetComponentByTypeId(ITerrainPlateCommit::GetComponentTypeId());
++		if (pComponent != nullptr)
++			plates.emplace_back(pEntity, static_cast<CTerrainPlateComponent*>(pComponent));
++	}
++
++	return plates;
++}
++
++//! One plate's height block, read out of the live engine terrain BEFORE anything is written.
++struct SHeightStampBlock
++{
++	IEntity*                                 pEntity = nullptr;
++	Cry::DefaultComponents::ITerrainPlateCommit* pCommit = nullptr;
++
++	// Footprint in terrain units (world axes) and in heightmap units (transposed). @see the axis note below.
++	int                rectX1 = 0, rectY1 = 0, rectSize = 0;
++	int                hx0 = 0, hy0 = 0, cols = 0, rows = 0;
++
++	std::vector<float> block;
++	float              blockMin = 0.f;
++	float              blockMax = 0.f;
++};
++
++//! Writes the LIVE bake of every selected terrain plate into the level's own heightmap, so the relief
+ //! becomes ordinary terrain and survives the plate being deleted.
+ //! The block is read straight back out of the live engine terrain rather than recomputed, so it is the
+ //! SAME block the bake produced - every batch, cascade, priority and rim shape is already in the ground.
+ //! The loss is the engine's 12 bit per sector quantisation, a few mm, against the heightmap's own 1.6 cm.
+-static void PyCommitTerrainPlate()
++//!
++//! THREE PHASES, and the order is the whole point. CHeightmap::UpdateEngineTerrain pushes the EDITOR's
++//! heights over a sector snapped square, which flattens every live bake inside that square - including the
++//! ones belonging to plates that have not been read yet. So: read every block first, then write them all
++//! into CHeightmap, then push ONCE over the union, then tell the neighbours the ground moved.
++static void PyStampPlateHeight()
+ {
+ 	using Cry::DefaultComponents::CTerrainPlateComponent;
+ 	using Cry::DefaultComponents::ITerrainPlateCommit;
+@@ -346,12 +398,11 @@ static void PyCommitTerrainPlate()
+ 	I3DEngine* p3DEngine = GetIEditorImpl()->Get3DEngine();
+ 	if (pHeightmap == nullptr || p3DEngine == nullptr || p3DEngine->GetITerrain() == nullptr)
+ 	{
+-		CryWarning(VALIDATOR_MODULE_EDITOR, VALIDATOR_WARNING, "terrain.commit_plate: no terrain (is a level loaded?)");
++		CryWarning(VALIDATOR_MODULE_EDITOR, VALIDATOR_WARNING, "terrain.stamp_plate_height: no terrain (is a level loaded?)");
+ 		return;
+ 	}
+ 
+-	// The plates first, so a refusal can be reported before a single height is written.
+-	const std::vector<std::pair<IEntity*, CTerrainPlateComponent*>> plates = CollectSelectedTerrainPlates("terrain.commit_plate");
++	const std::vector<std::pair<IEntity*, CTerrainPlateComponent*>> plates = CollectSelectedTerrainPlates("terrain.stamp_plate_height");
+ 	if (plates.empty())
+ 		return;
+ 
+@@ -364,208 +415,235 @@ static void PyCommitTerrainPlate()
+ 	const int hmapUnitsX = (int)pHeightmap->GetHeight();   // heightmap Y axis: world X
+ 	if (unitSize <= 0.f || hmapUnitsX <= 0 || hmapUnitsY <= 0)
+ 	{
+-		CryWarning(VALIDATOR_MODULE_EDITOR, VALIDATOR_WARNING, "terrain.commit_plate: the level has no usable heightmap.");
++		CryWarning(VALIDATOR_MODULE_EDITOR, VALIDATOR_WARNING, "terrain.stamp_plate_height: the level has no usable heightmap.");
+ 		return;
+ 	}
+ 
+ 	const CTimeValue startTime = gEnv->pTimer->GetAsyncTime();
+-	int committed = 0;
++	const float maxHeight = pHeightmap->GetMaxHeight();
+ 
+-	// One undo group for the whole run. It does NOT reach the components' Committed flag (runtime state,
+-	// not a terrain edit), so an undo leaves disarmed plates over restored ground.
+-	CUndo undo("Commit Terrain Plate");
++	// PHASE 1 - read. Nothing is written until every selected plate has its block, because the write of the
++	// first would flatten the live bake of the second.
++	std::vector<SHeightStampBlock> jobs;
++	jobs.reserve(plates.size());
+ 
+ 	for (const std::pair<IEntity*, CTerrainPlateComponent*>& entry : plates)
+ 	{
+ 		IEntity* pEntity = entry.first;
+ 		ITerrainPlateCommit* pCommit = entry.second;
+ 
+-		int rectX1 = 0, rectY1 = 0, rectSize = 0;
+-		if (!pCommit->GetCommitFootprint(rectX1, rectY1, rectSize))
++		if (!pCommit->IsBakeIntoTerrainEnabled())
++		{
++			// Not a failure: there is no baked relief on screen, so there is nothing to keep.
++			CryLog("terrain.stamp_plate_height: '%s' - nothing to stamp: Bake Into Terrain is off.", pEntity->GetName());
++			continue;
++		}
++
++		SHeightStampBlock job;
++		job.pEntity = pEntity;
++		job.pCommit = pCommit;
++
++		if (!pCommit->GetCommitFootprint(job.rectX1, job.rectY1, job.rectSize))
+ 		{
+ 			CryWarning(VALIDATOR_MODULE_EDITOR, VALIDATOR_WARNING,
+-			           "terrain.commit_plate: '%s' has no live bake to commit. Tick Bake Into Terrain first (or it is committed already).",
+-			           pEntity->GetName());
++			           "terrain.stamp_plate_height: '%s' holds no bake in the terrain right now (its height may be stamped "
++			           "already). Nothing written.", pEntity->GetName());
+ 			continue;
+ 		}
+ 
+ 		// The engine block covers units rectX1 .. rectX1 + rectSize INCLUSIVE, so the square is
+ 		// rectSize + 1 cells on a side.
+-		const int dim = rectSize + 1;
+-		const int hx0 = rectY1;   // heightmap X, world Y
+-		const int hy0 = rectX1;   // heightmap Y, world X
+-		const int cols = min(dim, hmapUnitsY - hx0);   // along heightmap X
+-		const int rows = min(dim, hmapUnitsX - hy0);   // along heightmap Y
+-		if (cols <= 0 || rows <= 0)
++		const int dim = job.rectSize + 1;
++		job.hx0 = job.rectY1;   // heightmap X, world Y
++		job.hy0 = job.rectX1;   // heightmap Y, world X
++		job.cols = min(dim, hmapUnitsY - job.hx0);   // along heightmap X
++		job.rows = min(dim, hmapUnitsX - job.hy0);   // along heightmap Y
++		if (job.cols <= 0 || job.rows <= 0)
+ 		{
+ 			CryWarning(VALIDATOR_MODULE_EDITOR, VALIDATOR_WARNING,
+-			           "terrain.commit_plate: '%s' has its footprint off the heightmap, nothing written.", pEntity->GetName());
++			           "terrain.stamp_plate_height: REFUSED for '%s' - its footprint is off the heightmap, so the block reads "
++			           "back as 0 cells. The plate keeps its live bake.", pEntity->GetName());
+ 			continue;
+ 		}
+ 
+-		// Read the committed ground back out of the engine, and find the crest before anything is written.
+-		std::vector<float> block((size_t)rows * cols, 0.f);
+-		float blockMin = FLT_MAX;
+-		float blockMax = -FLT_MAX;
+-		for (int ux = 0; ux < rows; ++ux)      // along world X
++		job.block.assign((size_t)job.rows * job.cols, 0.f);
++		job.blockMin = FLT_MAX;
++		job.blockMax = -FLT_MAX;
++		for (int ux = 0; ux < job.rows; ++ux)      // along world X
+ 		{
+-			for (int uy = 0; uy < cols; ++uy)  // along world Y
++			for (int uy = 0; uy < job.cols; ++uy)  // along world Y
+ 			{
+ 				// GetTerrainZ truncates to units and does not interpolate; the half unit offset only defends
+ 				// against a float multiply landing just under the integer. Same sampler the baseline uses.
+-				const float z = p3DEngine->GetTerrainZ(((float)(rectX1 + ux) + 0.5f) * unitSize,
+-				                                       ((float)(rectY1 + uy) + 0.5f) * unitSize);
+-				block[(size_t)ux * cols + uy] = z;
+-				blockMin = min(blockMin, z);
+-				blockMax = max(blockMax, z);
++				const float z = p3DEngine->GetTerrainZ(((float)(job.rectX1 + ux) + 0.5f) * unitSize,
++				                                       ((float)(job.rectY1 + uy) + 0.5f) * unitSize);
++				job.block[(size_t)ux * job.cols + uy] = z;
++				job.blockMin = min(job.blockMin, z);
++				job.blockMax = max(job.blockMax, z);
+ 			}
+ 		}
+ 
+ 		// CHeightmap::Serialize saves heights as uint16 scaled by 65535 / m_fMaxHeight and clamps, and a
+ 		// negative height wraps through the same clamp to the ceiling. Either way the level looks right
+ 		// until it is reloaded, so refuse loudly and write nothing.
+-		const float maxHeight = pHeightmap->GetMaxHeight();
+-		if (blockMax > maxHeight || blockMin < 0.f)
++		if (job.blockMax > maxHeight || job.blockMin < 0.f)
+ 		{
+ 			CryWarning(VALIDATOR_MODULE_EDITOR, VALIDATOR_ERROR,
+-			           "terrain.commit_plate: REFUSED for '%s'. The committed ground spans %.2f .. %.2f m and the level's "
+-			           "terrain range is 0 .. %.2f m (Max Height). Committing it would be silently flattened to %.2f m at the "
++			           "terrain.stamp_plate_height: REFUSED for '%s'. The ground spans %.2f .. %.2f m and the level's "
++			           "terrain range is 0 .. %.2f m (Max Height). Writing it would be silently flattened to %.2f m at the "
+ 			           "next save and reload. Raise Max Height in Terrain Editor > Modify, or lower the plate, and try again.",
+-			           pEntity->GetName(), blockMin, blockMax, maxHeight, maxHeight);
++			           pEntity->GetName(), job.blockMin, job.blockMax, maxHeight, maxHeight);
+ 			continue;
+ 		}
+ 
+-		pHeightmap->RecordUndo(hx0, hy0, cols, rows, /*bInfo*/ false);
++		jobs.push_back(std::move(job));
++	}
+ 
++	if (jobs.empty())
++	{
++		CryLog("terrain.stamp_plate_height: nothing to stamp in the selection.");
++		return;
++	}
++
++	// ONE undo group for the whole button press. It does NOT reach the components' internal state (runtime
++	// state, not a terrain edit), so an undo leaves disarmed plates over restored ground.
++	CUndo undo("Stamp Plate Height");
++
++	// PHASE 2 - write, all of them, into CHeightmap only. The engine terrain is not touched yet.
++	int stamped = 0;
++	int unionHx0 = INT_MAX, unionHy0 = INT_MAX, unionHx1 = INT_MIN, unionHy1 = INT_MIN;
++	float unionZMin = FLT_MAX, unionZMax = -FLT_MAX;
++	std::vector<SHeightStampBlock*> written;
++	written.reserve(jobs.size());
++
++	for (SHeightStampBlock& job : jobs)
++	{
+ 		// The sector aligned square reaches well outside the plate, and an untouched cell still reads back
+ 		// one engine quantisation step off. Only write a cell that moved by more than that readback noise.
+ 		// The step is the coarsest any touched sector can have (12 bits over the block's span).
+-		const float epsilon = max(0.0001f, (blockMax - blockMin) / 4095.f);
++		const float epsilon = max(0.0001f, (job.blockMax - job.blockMin) / 4095.f);
++
++		int cellsToWrite = 0;
++		for (int ux = 0; ux < job.rows && cellsToWrite == 0; ++ux)
++		{
++			for (int uy = 0; uy < job.cols; ++uy)
++			{
++				if (fabsf(job.block[(size_t)ux * job.cols + uy] - pHeightmap->GetXY(job.hx0 + uy, job.hy0 + ux)) > epsilon)
++				{
++					++cellsToWrite;
++					break;
++				}
++			}
++		}
+ 
+-		int cellsWritten = 0;
++		if (cellsToWrite == 0)
++		{
++			// Refused, not disarmed: a plate that reads back as no change never had its bake in the ground, and
++			// disarming it would drop the relief for good.
++			CryWarning(VALIDATOR_MODULE_EDITOR, VALIDATOR_WARNING,
++			           "terrain.stamp_plate_height: REFUSED for '%s' - its block reads back identical to the level heightmap, "
++			           "so there is no baked relief in the terrain to keep. The plate keeps its live bake.",
++			           job.pEntity->GetName());
++			continue;
++		}
++
++		pHeightmap->RecordUndo(job.hx0, job.hy0, job.cols, job.rows, /*bInfo*/ false);
++
++		int   cellsWritten = 0;
+ 		float minDelta = 0.f;
+ 		float maxDelta = 0.f;
+-		for (int ux = 0; ux < rows; ++ux)
++		for (int ux = 0; ux < job.rows; ++ux)
+ 		{
+-			for (int uy = 0; uy < cols; ++uy)
++			for (int uy = 0; uy < job.cols; ++uy)
+ 			{
+-				const float z = block[(size_t)ux * cols + uy];
+-				const float previous = pHeightmap->GetXY(hx0 + uy, hy0 + ux);
+-				const float delta = z - previous;
++				const float z = job.block[(size_t)ux * job.cols + uy];
++				const float delta = z - pHeightmap->GetXY(job.hx0 + uy, job.hy0 + ux);
+ 				if (fabsf(delta) <= epsilon)
+ 					continue;
+ 
+-				pHeightmap->SetXY(hx0 + uy, hy0 + ux, z);
++				pHeightmap->SetXY(job.hx0 + uy, job.hy0 + ux, z);
+ 				++cellsWritten;
+ 				minDelta = min(minDelta, delta);
+ 				maxDelta = max(maxDelta, delta);
+ 			}
+ 		}
+ 
+-		// UpdateEngineTerrain ignores its 4th argument and always pushes a SQUARE of side areaSize snapped
+-		// out to whole sectors, so it gets the larger of the two sides.
+-		const int side = max(cols, rows);
+-		pHeightmap->UpdateEngineTerrain(hx0, hy0, side, side, CHeightmap::ETerrainUpdateType::Elevation);
+-		GetIEditorImpl()->GetTerrainManager()->SetModified(hx0, hy0, hx0 + cols, hy0 + rows);
+-
+-		AABB worldBox(Vec3((float)rectX1 * unitSize, (float)rectY1 * unitSize, blockMin - 1.f),
+-		              Vec3((float)(rectX1 + rows) * unitSize, (float)(rectY1 + cols) * unitSize, blockMax + 1.f));
+-		GetIEditorImpl()->UpdateViews(eUpdateHeightmap, &worldBox);
+-
+-		// The disarm, INSIDE the undo group and only now that the heights are in: the plate must adopt the
+-		// committed ground as its baseline before Bake Into Terrain goes off, or the untick writes the old
+-		// ground back.
+-		pCommit->OnCommitted();
+-		++committed;
++		unionHx0 = min(unionHx0, job.hx0);
++		unionHy0 = min(unionHy0, job.hy0);
++		unionHx1 = max(unionHx1, job.hx0 + job.cols);
++		unionHy1 = max(unionHy1, job.hy0 + job.rows);
++		unionZMin = min(unionZMin, job.blockMin);
++		unionZMax = max(unionZMax, job.blockMax);
++		written.push_back(&job);
++		++stamped;
+ 
+-		CryLog("terrain.commit_plate: '%s' committed, %d of %d cells written, delta %.3f .. %.3f m, "
++		CryLog("terrain.stamp_plate_height: '%s' stamped, %d of %d cells written, delta %.3f .. %.3f m, "
+ 		       "units (%d,%d)+%d, ground %.2f .. %.2f m of a %.2f m range",
+-		       pEntity->GetName(), cellsWritten, rows * cols, minDelta, maxDelta,
+-		       rectX1, rectY1, rectSize, blockMin, blockMax, maxHeight);
++		       job.pEntity->GetName(), cellsWritten, job.rows * job.cols, minDelta, maxDelta,
++		       job.rectX1, job.rectY1, job.rectSize, job.blockMin, job.blockMax, maxHeight);
+ 	}
+ 
+-	if (committed > 0)
++	if (stamped == 0)
+ 	{
+-		p3DEngine->GetITerrain()->OnTerrainPaintActionComplete();
+-		GetIEditorImpl()->SetModifiedFlag();
++		CryLog("terrain.stamp_plate_height: nothing was written.");
++		return;
+ 	}
+ 
+-	const float elapsedMs = (gEnv->pTimer->GetAsyncTime() - startTime).GetMilliSeconds();
+-	CryLog("terrain.commit_plate: %d of %d selected plate(s) committed, %.1f ms. Save the level to keep it; "
+-	       "undo restores the terrain but leaves the plates disarmed (untick Committed and re-tick Bake Into Terrain).",
+-	       committed, (int)plates.size(), elapsedMs);
+-}
++	// PHASE 3 - one push, over the union of everything written. UpdateEngineTerrain ignores its 4th argument
++	// and always pushes a SQUARE of side areaSize snapped out to whole sectors, so it gets the larger side.
++	const int unionCols = unionHx1 - unionHx0;
++	const int unionRows = unionHy1 - unionHy0;
++	const int side = max(unionCols, unionRows);
++	pHeightmap->UpdateEngineTerrain(unionHx0, unionHy0, side, side, CHeightmap::ETerrainUpdateType::Elevation);
++	GetIEditorImpl()->GetTerrainManager()->SetModified(unionHx0, unionHy0, unionHx1, unionHy1);
+ 
+-//! Blends one heightmap cell's surface type weights towards szLayer by weight. Same idea as
+-//! CImagePainter::LerpTerrainSurfaceType - unroll into a per layer histogram, keep the three heaviest,
+-//! renormalise, because a cell carries only SSurfaceTypeItem::kMaxSurfaceTypesNum types - but without its
+-//! two bugs (an out of range we[3] index, and a 15 scale value seeded into a 255 scale field).
+-static SSurfaceTypeItem BlendSurfaceTypeTowards(const SSurfaceTypeItem& src, uint32 layerId, float weight)
+-{
+-	float histogram[e_layerIdHole] = { 0.f };
++	AABB worldBox(Vec3((float)unionHy0 * unitSize, (float)unionHx0 * unitSize, unionZMin - 1.f),
++	              Vec3((float)unionHy1 * unitSize, (float)unionHx1 * unitSize, unionZMax + 1.f));
++	GetIEditorImpl()->UpdateViews(eUpdateHeightmap, &worldBox);
+ 
+-	for (int c = 0; c < SSurfaceTypeItem::kMaxSurfaceTypesNum; ++c)
++	// The disarm, INSIDE the undo group and only now that the heights are in: each plate must adopt the
++	// stamped ground as its baseline before Bake Into Terrain goes off, or the untick writes the old
++	// ground back.
++	for (SHeightStampBlock* pJob : written)
+ 	{
+-		if (src.ty[c] < e_layerIdHole)
+-			histogram[src.ty[c]] += (1.f - weight) * (float)src.we[c];
++		pJob->pCommit->OnCommitted();
+ 	}
+ 
+-	if (layerId < e_layerIdHole)
+-		histogram[layerId] += weight * 255.f;
+-
+-	SSurfaceTypeItem out;
+-	out.hole = src.hole;   // SetLayerIdAt preserves it too (Heightmap.cpp:2798), but do not rely on that
+-
+-	float total = 0.f;
+-	for (int c = 0; c < SSurfaceTypeItem::kMaxSurfaceTypesNum; ++c)
+-	{
+-		int   best = -1;
+-		float bestWeight = 0.f;
+-		for (int s = 0; s < e_layerIdHole; ++s)
+-		{
+-			if (histogram[s] > bestWeight)
+-			{
+-				bestWeight = histogram[s];
+-				best = s;
+-			}
+-		}
+-
+-		if (best < 0)
+-			break;
+-
+-		out.ty[c] = (uint8)best;
+-		out.we[c] = (uint8)clamp_tpl((int)(bestWeight + 0.5f), 0, 255);
+-		total += bestWeight;
+-		histogram[best] = 0.f;
+-	}
++	p3DEngine->GetITerrain()->OnTerrainPaintActionComplete();
++	GetIEditorImpl()->SetModifiedFlag();
+ 
+-	// we[0] is IMPLICIT in the engine encoding (derived as 15 - we[1] - we[2]), so it is the slot that
+-	// must absorb the rounding.
+-	if (total > 0.f)
++	// The push above wrote the EDITOR's heights over a sector snapped square, so any OTHER plate still baking
++	// inside it has just been flattened. Bring their self repair forward instead of leaving it to the poll
++	// interval. The plates that were just stamped hold no live bake any more, so the call is a no-op for them.
++	const int nudgeRectX1 = unionHy0;   // terrain units: world X
++	const int nudgeRectY1 = unionHx0;   // terrain units: world Y
++	for (const std::pair<IEntity*, CTerrainPlateComponent*>& entry : CollectAllTerrainPlates())
+ 	{
+-		int tail = 0;
+-		for (int c = 1; c < SSurfaceTypeItem::kMaxSurfaceTypesNum; ++c)
+-		{
+-			out.we[c] = (uint8)clamp_tpl((int)((float)out.we[c] * 255.f / total + 0.5f), 0, 255);
+-			tail += out.we[c];
+-		}
+-		out.we[0] = (uint8)clamp_tpl(255 - tail, 0, 255);
++		// Through the INTERFACE, always: the overrides are final, so a call on the concrete type devirtualises
++		// into a direct call and Sandbox has no symbol for it (CryDefaultEntities is never linked).
++		ITerrainPlateCommit* pOther = entry.second;
++		pOther->NudgeBakeAfterTerrainWrite(nudgeRectX1, nudgeRectY1, side);
+ 	}
+ 
+-	return out;
++	const float elapsedMs = (gEnv->pTimer->GetAsyncTime() - startTime).GetMilliSeconds();
++	CryLog("terrain.stamp_plate_height: %d of %d selected plate(s) stamped, %.1f ms. Save the level to keep it; "
++	       "undo restores the terrain but leaves the plates disarmed (re-tick Bake Into Terrain to resume the "
++	       "live bake).",
++	       stamped, (int)plates.size(), elapsedMs);
+ }
+ 
+-//! Stamps the APPEARANCE of every selected terrain plate - terrain colour and the plate's Commit Layer
+-//! surface weights - into the level's own data over the plate's footprint, fading into what was there
+-//! over the SAME rim band the height bake uses.
++//! Writes the terrain colour every selected plate is SHOWING into the level's own CRGBLayer, so the colour
++//! is permanent, ships with the level and survives the plate being deleted.
+ //!
+-//! Deliberately independent of terrain.commit_plate: its own undo group, no height precondition and no
+-//! effect on Bake Into Terrain or the baselines. Everything it needs comes from the plate's CURRENT
+-//! transform and knobs, so it can run before, after or instead of the height commit.
++//! WYSIWYG by construction: it does not re-derive the picture, it runs the live overlay's own compositing
++//! loop (TerrainPlateColourOverlay::ApplyStampToRow -> the file local ApplyPlatesToRow that
++//! CHeightmap::GetColorAtPosition and the exporter also go through) over the RGB layer's texels, at the RGB
++//! layer's own texel size. Same rim weight, same albedo sampler, same blend, same epsilon.
+ //!
+-//! The colour goes into CRGBLayer, the level's own store, which nothing regenerates - so the stamp is
+-//! permanent, ships with the level, and is reversible only by this command's undo or by repainting.
+-static void PyCommitTerrainPlateColour()
++//! Colour only. The live overlay implies no surface type weights, so stamping any would put something on the
++//! ground the user never saw. Refresh is the texture only path - UpdateSectorTexture - so this can never
++//! touch a height, which is what let the old version flatten neighbouring bakes.
++static void PyStampPlateColour()
+ {
+ 	using Cry::DefaultComponents::CTerrainPlateComponent;
+ 	using Cry::DefaultComponents::ITerrainPlateCommit;
+@@ -575,11 +653,11 @@ static void PyCommitTerrainPlateColour()
+ 	CTerrainManager* pTerrainManager = GetIEditorImpl()->GetTerrainManager();
+ 	if (pHeightmap == nullptr || p3DEngine == nullptr || p3DEngine->GetITerrain() == nullptr || pTerrainManager == nullptr)
+ 	{
+-		CryWarning(VALIDATOR_MODULE_EDITOR, VALIDATOR_WARNING, "terrain.commit_plate_colour: no terrain (is a level loaded?)");
++		CryWarning(VALIDATOR_MODULE_EDITOR, VALIDATOR_WARNING, "terrain.stamp_plate_colour: no terrain (is a level loaded?)");
+ 		return;
+ 	}
+ 
+-	const std::vector<std::pair<IEntity*, CTerrainPlateComponent*>> plates = CollectSelectedTerrainPlates("terrain.commit_plate_colour");
++	const std::vector<std::pair<IEntity*, CTerrainPlateComponent*>> plates = CollectSelectedTerrainPlates("terrain.stamp_plate_colour");
+ 	if (plates.empty())
+ 		return;
+ 
+@@ -589,7 +667,7 @@ static void PyCommitTerrainPlateColour()
+ 	const int   hmapUnitsX = (int)pHeightmap->GetHeight();                 // heightmap Y axis: world X
+ 	if (unitSize <= 0.f || terrainSize <= 0.f || hmapUnitsX <= 0 || hmapUnitsY <= 0)
+ 	{
+-		CryWarning(VALIDATOR_MODULE_EDITOR, VALIDATOR_WARNING, "terrain.commit_plate_colour: the level has no usable heightmap.");
++		CryWarning(VALIDATOR_MODULE_EDITOR, VALIDATOR_WARNING, "terrain.stamp_plate_colour: the level has no usable heightmap.");
+ 		return;
+ 	}
+ 
+@@ -599,39 +677,55 @@ static void PyCommitTerrainPlateColour()
+ 	if (pAutoBaseTexture != nullptr && pAutoBaseTexture->GetIVal() != 0)
+ 	{
+ 		CryWarning(VALIDATOR_MODULE_EDITOR, VALIDATOR_WARNING,
+-		           "terrain.commit_plate_colour: e_TerrainAutoGenerateBaseTexture is on, so the terrain colour is derived from the "
+-		           "detail materials and the colour half of this stamp will not be visible. The layer weights still apply. Set it "
+-		           "to 0 to see the stamped colour.");
++		           "terrain.stamp_plate_colour: e_TerrainAutoGenerateBaseTexture is on, so the terrain colour is derived from the "
++		           "detail materials and what is written here will not be visible. Set it to 0 to see the stamped colour.");
+ 	}
+ 
+ 	CRGBLayer* pRGBLayer = pTerrainManager->GetRGBLayer();
+-	const bool bHaveRGB = (pRGBLayer != nullptr && pRGBLayer->GetTileCountX() > 0 && pRGBLayer->GetTileCountY() > 0);
++	if (pRGBLayer == nullptr || pRGBLayer->GetTileCountX() == 0 || pRGBLayer->GetTileCountY() == 0)
++	{
++		CryWarning(VALIDATOR_MODULE_EDITOR, VALIDATOR_WARNING,
++		           "terrain.stamp_plate_colour: the level has no terrain texture allocated, so there is nowhere to write. "
++		           "Generate the terrain texture once (Terrain Editor > File) and run it again.");
++		return;
++	}
++
++	const uint32 tileCountX = pRGBLayer->GetTileCountX();   // along fpx, i.e. world Y
++	const uint32 tileCountY = pRGBLayer->GetTileCountY();   // along fpy, i.e. world X
+ 
+ 	const CTimeValue startTime = gEnv->pTimer->GetAsyncTime();
+-	int committed = 0;
++	int stamped = 0;
+ 
+-	// ONE undo group, covering this operation only - the height commit has its own, so the two never
+-	// share a step.
+-	CUndo undo("Commit Terrain Plate Colour");
++	// ONE undo group, covering this button press only - the height stamp has its own, so the two never share
++	// a step.
++	CUndo undo("Stamp Plate Colour");
+ 
+ 	for (const std::pair<IEntity*, CTerrainPlateComponent*>& entry : plates)
+ 	{
+ 		IEntity* pEntity = entry.first;
+ 		ITerrainPlateCommit* pCommit = entry.second;
+ 
++		if (!pCommit->IsLiveColourEnabled())
++		{
++			// Not a failure: the ground under this plate is showing no plate colour, so there is nothing to keep.
++			CryLog("terrain.stamp_plate_colour: '%s' - nothing to stamp: Terrain Colour From Plate is off.", pEntity->GetName());
++			continue;
++		}
++
+ 		int rectX1 = 0, rectY1 = 0, rectSize = 0;
+ 		if (!pCommit->GetCommitAppearanceFootprint(rectX1, rectY1, rectSize) || rectSize <= 0)
+ 		{
+ 			CryWarning(VALIDATOR_MODULE_EDITOR, VALIDATOR_WARNING,
+-			           "terrain.commit_plate_colour: '%s' has no footprint on the terrain.", pEntity->GetName());
++			           "terrain.stamp_plate_colour: '%s' has no footprint on the terrain.", pEntity->GetName());
+ 			continue;
+ 		}
+ 
+-		ITerrainPlateCommit::SAppearance appearance;
+-		if (!pCommit->GetCommitAppearance(appearance))
++		// The overlay's snapshot of THIS plate, read now. False means the same thing as above; the two tests
++		// come from the same query, so they cannot disagree.
++		if (!TerrainPlateColourOverlay::BeginStamp(pEntity->GetId()))
+ 		{
+ 			CryWarning(VALIDATOR_MODULE_EDITOR, VALIDATOR_WARNING,
+-			           "terrain.commit_plate_colour: '%s' has nothing to stamp - set Commit Layer, or tick Commit Colour.",
++			           "terrain.stamp_plate_colour: '%s' is showing no terrain colour right now (hidden?). Nothing written.",
+ 			           pEntity->GetName());
+ 			continue;
+ 		}
+@@ -648,217 +742,113 @@ static void PyCommitTerrainPlateColour()
+ 		const float normXMax = clamp_tpl(worldXMax / terrainSize, 0.f, 1.f);
+ 		const float normYMax = clamp_tpl(worldYMax / terrainSize, 0.f, 1.f);
+ 
+-		// The layer, plus the palette pre-flight the painter does before every dab: a sector whose 16 entry
+-		// surface type palette is full would swallow the write silently.
+-		CLayer* pLayer = nullptr;
+-		uint32  layerId = 0;
+-		if (appearance.szLayerName != nullptr)
+-		{
+-			pLayer = pTerrainManager->FindLayer(appearance.szLayerName);
+-			if (pLayer == nullptr)
+-			{
+-				CryWarning(VALIDATOR_MODULE_EDITOR, VALIDATOR_WARNING,
+-				           "terrain.commit_plate_colour: '%s' asks for terrain layer '%s', which does not exist. The layer weights "
+-				           "are left alone; check the spelling against the Terrain Editor's layer list.",
+-				           pEntity->GetName(), appearance.szLayerName);
+-			}
+-			else
+-			{
+-				const int paletteX = (int)((worldYMin + worldYMax) * 0.5f / unitSize);
+-				const int paletteY = (int)((worldXMin + worldXMax) * 0.5f / unitSize);
+-				const int paletteR = rectSize / 2 + 1;
+-				if (!p3DEngine->GetITerrain()->CanPaintSurfaceType(paletteX, paletteY, paletteR, (uint16)pLayer->GetEngineSurfaceTypeId()))
+-				{
+-					CryWarning(VALIDATOR_MODULE_EDITOR, VALIDATOR_WARNING,
+-					           "terrain.commit_plate_colour: '%s' cannot take layer '%s' - a terrain sector under it already uses its "
+-					           "full 16 surface type palette. The layer weights are skipped; the colour is still stamped.",
+-					           pEntity->GetName(), appearance.szLayerName);
+-					pLayer = nullptr;
+-				}
+-				else
+-				{
+-					layerId = pLayer->GetOrRequestLayerId();
+-				}
+-			}
+-		}
+-
+-		// One undo object per plate, snapshotting the RGB tiles AND the layer id blocks, taken BEFORE
+-		// anything is written. Same objects the texture painter records for a dab.
++		// One undo object per plate, snapshotting the RGB tiles the footprint touches, taken BEFORE anything
++		// is written. The same object the texture painter records for a dab.
+ 		RecordTerrainAppearanceUndo((normYMin + normYMax) * 0.5f, (normXMin + normXMax) * 0.5f,
+ 		                            max(normYMax - normYMin, normXMax - normXMin) * 0.5f);
+ 
+-		// Layer weights, at CELL rate. Sampled at the terrain node positions ComputeBakeBlock uses (no half
+-		// cell offset) with a one cell footprint, so the weight is bit for bit the height bake's.
+-		int layerCells = 0;
+-		const int hx0 = rectY1;   // heightmap X, world Y
+-		const int hy0 = rectX1;   // heightmap Y, world X
+-		const int cols = min(rectSize + 1, hmapUnitsY - hx0);
+-		const int rows = min(rectSize + 1, hmapUnitsX - hy0);
++		const int tileX0 = clamp_tpl((int)floorf(normYMin * tileCountX), 0, (int)tileCountX - 1);
++		const int tileX1 = clamp_tpl((int)ceilf(normYMax * tileCountX) - 1, 0, (int)tileCountX - 1);
++		const int tileY0 = clamp_tpl((int)floorf(normXMin * tileCountY), 0, (int)tileCountY - 1);
++		const int tileY1 = clamp_tpl((int)ceilf(normXMax * tileCountY) - 1, 0, (int)tileCountY - 1);
++
++		int colourTexels = 0;
+ 
+-		if (pLayer != nullptr && cols > 0 && rows > 0)
++		for (int ty = tileY0; ty <= tileY1; ++ty)
+ 		{
+-			for (int ux = 0; ux < rows; ++ux)          // along world X
++			for (int tx = tileX0; tx <= tileX1; ++tx)
+ 			{
+-				const float worldX = (float)(rectX1 + ux) * unitSize;
+-
+-				for (int uy = 0; uy < cols; ++uy)      // along world Y
+-				{
+-					const float worldY = (float)(rectY1 + uy) * unitSize;
+-
+-					const float weight = pCommit->GetCommitWeightAtWorld(worldX, worldY, unitSize);
+-					if (weight <= 0.002f)
+-						continue;
+-
+-					const SSurfaceTypeItem existing = pHeightmap->GetLayerInfoAt(hx0 + uy, hy0 + ux);
+-					pHeightmap->SetLayerIdAt(hx0 + uy, hy0 + ux, BlendSurfaceTypeTowards(existing, layerId, weight));
+-					++layerCells;
+-				}
+-			}
+-		}
++				// GetTileImage is the write handle: it loads the tile if needed and marks it dirty, unlike
++				// SetValueAt(float, float, ...), which writes through a private pointer and leaves the
++				// tile clean.
++				CImageEx* pTile = pRGBLayer->GetTileImage(tx, ty, true);
++				if (pTile == nullptr || pTile->GetWidth() <= 0 || pTile->GetHeight() <= 0)
++					continue;
+ 
+-		// Colour, at TEXEL rate.
+-		int colourTexels = 0;
+-		int albedoMisses = 0;
++				const int resX = pTile->GetWidth();
++				const int resY = pTile->GetHeight();
+ 
+-		if (appearance.bWriteColour && bHaveRGB)
+-		{
+-			const uint32 tileCountX = pRGBLayer->GetTileCountX();   // along fpx, i.e. world Y
+-			const uint32 tileCountY = pRGBLayer->GetTileCountY();   // along fpy, i.e. world X
++				// One RGB texel's own footprint in metres. The live pull derives the same number from
++				// CRGBLayer::CalcMaxLocalResolution, which IS this tile's resolution over the terrain.
++				const float texelSize = max(terrainSize / (float)(resX * (int)tileCountX),
++				                            terrainSize / (float)(resY * (int)tileCountY));
++				const float worldStepY = terrainSize / (float)(resX * (int)tileCountX);
+ 
+-			const int tileX0 = clamp_tpl((int)floorf(normYMin * tileCountX), 0, (int)tileCountX - 1);
+-			const int tileX1 = clamp_tpl((int)ceilf(normYMax * tileCountX) - 1, 0, (int)tileCountX - 1);
+-			const int tileY0 = clamp_tpl((int)floorf(normXMin * tileCountY), 0, (int)tileCountY - 1);
+-			const int tileY1 = clamp_tpl((int)ceilf(normXMax * tileCountY) - 1, 0, (int)tileCountY - 1);
++				const int px0 = clamp_tpl((int)floorf((normYMin * tileCountX - (float)tx) * resX), 0, resX - 1);
++				const int px1 = clamp_tpl((int)ceilf((normYMax * tileCountX - (float)tx) * resX), 0, resX - 1);
++				const int py0 = clamp_tpl((int)floorf((normXMin * tileCountY - (float)ty) * resY), 0, resY - 1);
++				const int py1 = clamp_tpl((int)ceilf((normXMax * tileCountY - (float)ty) * resY), 0, resY - 1);
+ 
+-			for (int ty = tileY0; ty <= tileY1; ++ty)
+-			{
+-				for (int tx = tileX0; tx <= tileX1; ++tx)
++				for (int py = py0; py <= py1; ++py)
+ 				{
+-					// GetTileImage is the write handle: it loads the tile if needed and marks it dirty, unlike
+-					// SetValueAt(float, float, ...), which writes through a private pointer and leaves the
+-					// tile clean.
+-					CImageEx* pTile = pRGBLayer->GetTileImage(tx, ty, true);
+-					if (pTile == nullptr || pTile->GetWidth() <= 0 || pTile->GetHeight() <= 0)
+-						continue;
+-
+-					const int resX = pTile->GetWidth();
+-					const int resY = pTile->GetHeight();
+-
+-					// One texel's own footprint in metres, the area the rim weight's coverage term is measured
+-					// over here. 0.5 m by default.
+-					const float texelSize = max(terrainSize / (float)(resX * (int)tileCountX),
+-					                            terrainSize / (float)(resY * (int)tileCountY));
+-
+-					const int px0 = clamp_tpl((int)floorf((normYMin * tileCountX - (float)tx) * resX), 0, resX - 1);
+-					const int px1 = clamp_tpl((int)ceilf((normYMax * tileCountX - (float)tx) * resX), 0, resX - 1);
+-					const int py0 = clamp_tpl((int)floorf((normXMin * tileCountY - (float)ty) * resY), 0, resY - 1);
+-					const int py1 = clamp_tpl((int)ceilf((normXMax * tileCountY - (float)ty) * resY), 0, resY - 1);
+-
+-					for (int py = py0; py <= py1; ++py)
+-					{
+-						const float fpy = ((float)ty + ((float)py + 0.5f) / (float)resY) / (float)tileCountY;
+-						const float worldX = fpy * terrainSize;
+-
+-						for (int px = px0; px <= px1; ++px)
+-						{
+-							const float fpx = ((float)tx + ((float)px + 0.5f) / (float)resX) / (float)tileCountX;
+-							const float worldY = fpx * terrainSize;
+-
+-							const float weight = pCommit->GetCommitWeightAtWorld(worldX, worldY, texelSize);
+-							if (weight <= 0.002f)
+-								continue;
+-
+-							// The live overlay makes the identical call with the identical texel size, which is
+-							// what makes this command mean "make what you are looking at permanent". A texel
+-							// the plate cannot colour is left as it was; there is no fallback colour.
+-							ColorF albedo;
+-							if (!pCommit->GetCommitAlbedoAtWorld(worldX, worldY, texelSize, albedo))
+-							{
+-								++albedoMisses;
+-								continue;
+-							}
+-
+-							// The blend is the painter's, line for line: both sides to linear, lerp there, back
+-							// to gamma - blending gamma values directly reads too dark. It lives in
+-							// TerrainPlateColourOverlay because the live overlay runs the very same call on
+-							// the very same rim weight, so neither tier can drift from the other.
+-							// Tile pixel layout: blue | green << 8 | red << 16, alpha unused, first axis fpx
+-							// (world Y) - the layout these destination texels already have.
+-							uint32& destination = pTile->ValueAt(px, py);
+-							destination = TerrainPlateColourOverlay::BlendPlateColourIntoTexel(
+-							  destination, albedo, appearance.tint, weight);
+-							++colourTexels;
+-						}
+-					}
++					const float fpy = ((float)ty + ((float)py + 0.5f) / (float)resY) / (float)tileCountY;
++					const float fpx0 = ((float)tx + ((float)px0 + 0.5f) / (float)resX) / (float)tileCountX;
++
++					// A tile row is contiguous in px (CImageEx::ValueAt is x + y * width), and px walks world Y -
++					// exactly the row shape the live overlay is handed by CHeightmap::GetColorAtPosition.
++					colourTexels += TerrainPlateColourOverlay::ApplyStampToRow(&pTile->ValueAt(px0, py), px1 - px0 + 1,
++					                                                          fpx0 * terrainSize, worldStepY,
++					                                                          fpy * terrainSize, texelSize);
+ 				}
+ 			}
+ 		}
+-		else if (appearance.bWriteColour && !bHaveRGB)
+-		{
+-			CryWarning(VALIDATOR_MODULE_EDITOR, VALIDATOR_WARNING,
+-			           "terrain.commit_plate_colour: the level has no terrain texture allocated, so no colour was written for '%s'. "
+-			           "Generate the terrain texture once (Terrain Editor > File) and run it again.", pEntity->GetName());
+-		}
+ 
+-		if (layerCells == 0 && colourTexels == 0)
++		TerrainPlateColourOverlay::EndStamp();
++
++		if (colourTexels == 0)
+ 		{
+ 			CryWarning(VALIDATOR_MODULE_EDITOR, VALIDATOR_WARNING,
+-			           "terrain.commit_plate_colour: '%s' wrote nothing.", pEntity->GetName());
++			           "terrain.stamp_plate_colour: '%s' wrote nothing (no sampleable material on the plate?).",
++			           pEntity->GetName());
+ 			continue;
+ 		}
+ 
+-		// Refresh. Colour into the viewport, per touched terrain texture sector - the painter's own recipe,
+-		// (iY, iX) axis order included.
+-		if (colourTexels > 0)
++		// Refresh, texture only: the painter's own recipe, (iY, iX) axis order included. Deliberately NOT
++		// UpdateEngineTerrain - that pushes editor HEIGHTS over a sector snapped square and would flatten every
++		// live bake under it. A colour stamp must not be able to move the ground.
++		const int texSectorSize = p3DEngine->GetTerrainTextureNodeSizeMeters();
++		if (texSectorSize > 0)
+ 		{
+-			const int texSectorSize = p3DEngine->GetTerrainTextureNodeSizeMeters();
+-			if (texSectorSize > 0)
+-			{
+-				const int sectorCount = (int)terrainSize / texSectorSize;
+-				const int minSecX = max((int)floorf(worldXMin / (float)texSectorSize), 0);
+-				const int minSecY = max((int)floorf(worldYMin / (float)texSectorSize), 0);
+-				const int maxSecX = min((int)ceilf(worldXMax / (float)texSectorSize), sectorCount);
+-				const int maxSecY = min((int)ceilf(worldYMax / (float)texSectorSize), sectorCount);
++			const int sectorCount = (int)terrainSize / texSectorSize;
++			const int minSecX = max((int)floorf(worldXMin / (float)texSectorSize), 0);
++			const int minSecY = max((int)floorf(worldYMin / (float)texSectorSize), 0);
++			const int maxSecX = min((int)ceilf(worldXMax / (float)texSectorSize), sectorCount);
++			const int maxSecY = min((int)ceilf(worldYMax / (float)texSectorSize), sectorCount);
+ 
+-				for (int iY = minSecY; iY < maxSecY; ++iY)
++			for (int iY = minSecY; iY < maxSecY; ++iY)
++			{
++				for (int iX = minSecX; iX < maxSecX; ++iX)
+ 				{
+-					for (int iX = minSecX; iX < maxSecX; ++iX)
+-					{
+-						pHeightmap->UpdateSectorTexture(CPoint(iY, iX), normYMin, normXMin, normYMax, normXMax);
+-					}
++					pHeightmap->UpdateSectorTexture(CPoint(iY, iX), normYMin, normXMin, normYMax, normXMax);
+ 				}
+ 			}
+ 		}
+ 
+-		// Surface bits down to the engine. UpdateEngineTerrain always pushes a square of side areaSize
+-		// snapped out to whole sectors and ignores its 4th argument.
+-		if (layerCells > 0 && cols > 0 && rows > 0)
+-		{
+-			pHeightmap->UpdateEngineTerrain(hx0, hy0, max(cols, rows), max(cols, rows), CHeightmap::ETerrainUpdateType::Paint);
+-		}
++		// The colour is in the level now, so the preview has to stop compositing it a second time - over the
++		// viewport AND over the export. The picture does not change: what was written IS the preview.
++		pCommit->OnColourStamped();
+ 
+-		pTerrainManager->SetModified(hx0, hy0, hx0 + cols, hy0 + rows);
+-		++committed;
++		const int hx0 = rectY1;   // heightmap X, world Y
++		const int hy0 = rectX1;   // heightmap Y, world X
++		pTerrainManager->SetModified(hx0, hy0, hx0 + min(rectSize + 1, hmapUnitsY - hx0),
++		                             hy0 + min(rectSize + 1, hmapUnitsX - hy0));
++		++stamped;
+ 
+-		CryLog("terrain.commit_plate_colour: '%s' stamped, %d colour texels (material diffuse x tint) and %d layer cells "
+-		       "(%s), units (%d,%d)+%d, world (%.1f, %.1f)-(%.1f, %.1f)%s",
+-		       pEntity->GetName(), colourTexels,
+-		       layerCells, (pLayer != nullptr) ? pLayer->GetLayerName().c_str() : "no layer",
+-		       rectX1, rectY1, rectSize, worldXMin, worldYMin, worldXMax, worldYMax,
+-		       (albedoMisses > 0) ? ", some texels had no sampleable material and were left alone" : "");
++		CryLog("terrain.stamp_plate_colour: '%s' stamped, %d colour texels, units (%d,%d)+%d, "
++		       "world (%.1f, %.1f)-(%.1f, %.1f)",
++		       pEntity->GetName(), colourTexels, rectX1, rectY1, rectSize, worldXMin, worldYMin, worldXMax, worldYMax);
+ 	}
+ 
+-	if (committed > 0)
++	if (stamped > 0)
+ 	{
+-		p3DEngine->GetITerrain()->OnTerrainPaintActionComplete();
+ 		GetIEditorImpl()->SetModifiedFlag();
+ 		GetIEditorImpl()->UpdateViews(eUpdateHeightmap);
+ 	}
+ 
+ 	const float elapsedMs = (gEnv->pTimer->GetAsyncTime() - startTime).GetMilliSeconds();
+-	CryLog("terrain.commit_plate_colour: %d of %d selected plate(s) stamped, %.1f ms. Save the level to keep it; "
+-	       "one undo puts the colour and the layer weights back, and it does not touch the committed heights.",
+-	       committed, (int)plates.size(), elapsedMs);
++	CryLog("terrain.stamp_plate_colour: %d of %d selected plate(s) stamped, %.1f ms. Save the level to keep it; "
++	       "one undo puts the terrain colour back, and it does not touch any height.",
++	       stamped, (int)plates.size(), elapsedMs);
+ }
+ 
+ } // namespace Private_TerrainCommands
+@@ -872,20 +862,20 @@ REGISTER_PYTHON_COMMAND_WITH_EXAMPLE(Private_TerrainCommands::PyRepositionVegeta
+                                      "terrain.reposition_vegetation()")
+ REGISTER_EDITOR_COMMAND_TEXT(terrain, reposition_vegetation, "Reposition Vegetation on Terrain")
+ 
+-REGISTER_PYTHON_COMMAND_WITH_EXAMPLE(Private_TerrainCommands::PyCommitTerrainPlate, terrain, commit_plate,
+-                                     "Writes the live bake of every selected terrain plate into the level's own heightmap, so the "
+-                                     "relief becomes ordinary terrain and stays after the plate is deleted. Refuses a plate whose "
+-                                     "ground would not fit the level's Max Height.",
+-                                     "terrain.commit_plate()")
+-REGISTER_EDITOR_COMMAND_TEXT(terrain, commit_plate, "Commit Terrain Plate Height To Terrain")
+-
+-REGISTER_PYTHON_COMMAND_WITH_EXAMPLE(Private_TerrainCommands::PyCommitTerrainPlateColour, terrain, commit_plate_colour,
+-                                     "Stamps the appearance of every selected terrain plate - terrain colour and its Commit Layer's "
+-                                     "surface weights - into the level over the plate's footprint, fading into the existing terrain "
+-                                     "over the same rim band the height bake uses. Independent of terrain.commit_plate: run it "
+-                                     "before, after or instead, with its own undo step.",
+-                                     "terrain.commit_plate_colour()")
+-REGISTER_EDITOR_COMMAND_TEXT(terrain, commit_plate_colour, "Commit Terrain Plate Colour To Terrain")
++REGISTER_PYTHON_COMMAND_WITH_EXAMPLE(Private_TerrainCommands::PyStampPlateHeight, terrain, stamp_plate_height,
++                                     "Writes the baked terrain height of every selected terrain plate into the level's own "
++                                     "heightmap, so the relief becomes ordinary terrain and stays after the plate is deleted. "
++                                     "Refuses a plate whose ground would not fit the level's Max Height, and one whose bake is "
++                                     "not in the terrain.",
++                                     "terrain.stamp_plate_height()")
++REGISTER_EDITOR_COMMAND_TEXT(terrain, stamp_plate_height, "Stamp Plate Height")
++
++REGISTER_PYTHON_COMMAND_WITH_EXAMPLE(Private_TerrainCommands::PyStampPlateColour, terrain, stamp_plate_colour,
++                                     "Writes the terrain colour every selected terrain plate is showing into the level's own "
++                                     "terrain colour, texel for texel, so it is permanent and ships with the level. Independent "
++                                     "of the height stamp: run it before, after or instead, with its own undo step.",
++                                     "terrain.stamp_plate_colour()")
++REGISTER_EDITOR_COMMAND_TEXT(terrain, stamp_plate_colour, "Stamp Plate Colour")
+ 
+ namespace Private_TerrainToolsCommands
+ {
+diff --git a/Code/Sandbox/EditorQt/Terrain/TerrainEditor.cpp b/Code/Sandbox/EditorQt/Terrain/TerrainEditor.cpp
+index 413fbfb4..d42d3f9e 100644
+--- a/Code/Sandbox/EditorQt/Terrain/TerrainEditor.cpp
++++ b/Code/Sandbox/EditorQt/Terrain/TerrainEditor.cpp
+@@ -340,8 +340,8 @@ void CTerrainEditor::InitTerrainMenu()
+ 		pEditMenu->AddAction(GetAction_Deprecated("terrain.refine_tiles"), sec);
+ 
+ 		sec = pEditMenu->GetNextEmptySection();
+-		pEditMenu->AddAction(GetAction_Deprecated("terrain.commit_plate"), sec);
+-		pEditMenu->AddAction(GetAction_Deprecated("terrain.commit_plate_colour"), sec);
++		pEditMenu->AddAction(GetAction_Deprecated("terrain.stamp_plate_height"), sec);
++		pEditMenu->AddAction(GetAction_Deprecated("terrain.stamp_plate_colour"), sec);
+ 		pEditMenu->AddAction(GetAction_Deprecated("terrain.reposition_vegetation"), sec);
+ 
+ 		sec = pEditMenu->GetNextEmptySection();
+diff --git a/Code/Sandbox/EditorQt/Terrain/TerrainPlateColourOverlay.cpp b/Code/Sandbox/EditorQt/Terrain/TerrainPlateColourOverlay.cpp
+index 5eac11b2..f015299d 100644
+--- a/Code/Sandbox/EditorQt/Terrain/TerrainPlateColourOverlay.cpp
++++ b/Code/Sandbox/EditorQt/Terrain/TerrainPlateColourOverlay.cpp
+@@ -61,6 +61,10 @@ std::vector<SLivePlate> g_plates;
+ //! to keep the editor's frame rate up).
+ std::vector<SLivePlate> g_exportPlates;
+ 
++//! The stamp's snapshot: exactly one plate, held only for the duration of terrain.stamp_plate_colour. Its own
++//! list so the stamp goes through the same compositing loop as the preview without disturbing it.
++std::vector<SLivePlate> g_stampPlates;
++
+ uint32 HashCombine(uint32 seed, uint32 value)
+ {
+ 	// The usual boost mix; any avalanche would do, this is only a change detector.
+@@ -113,22 +117,76 @@ void MarkSectorsDirty(float worldXMin, float worldYMin, float worldXMax, float w
+ 	}
+ }
+ 
+-//! Collects the plates that currently want the overlay. Once per editor frame, from Update().
+-void ScanPlates(std::vector<SLivePlate>& out)
++//! The terrain unit size, or 0 when there is no usable terrain right now.
++float GetTerrainUnitSize()
+ {
+-	out.clear();
+-
+ 	if (gEnv == nullptr || gEnv->pEntitySystem == nullptr || gEnv->p3DEngine == nullptr
+ 	    || gEnv->p3DEngine->GetITerrain() == nullptr)
+ 	{
+-		return;
++		return 0.f;
+ 	}
+ 
+ 	CHeightmap* pHeightmap = GetIEditorImpl()->GetHeightmap();
+ 	if (pHeightmap == nullptr)
+-		return;
++		return 0.f;
++
++	return max(0.f, pHeightmap->GetUnitSize());
++}
++
++//! One entity's overlay state, or false when it is not showing plate colour. THE definition of "showing",
++//! shared by the live preview, the export and the stamp, so no tier can decide differently.
++bool MakeLivePlate(IEntity* pEntity, float unitSize, SLivePlate& out)
++{
++	if (pEntity == nullptr || unitSize <= 0.f)
++		return false;
++
++	// A hidden plate shows nothing, so it colours nothing - in the viewport, the export and the stamp alike.
++	if (pEntity->IsHidden())
++		return false;
++
++	IEntityComponent* pComponent = pEntity->GetComponentByTypeId(ITerrainPlateCommit::GetComponentTypeId());
++	if (pComponent == nullptr)
++		return false;
++
++	ITerrainPlateCommit* pCommit = static_cast<CTerrainPlateComponent*>(pComponent);
++
++	int    rectX1 = 0, rectY1 = 0, rectSize = 0;
++	ColorB tint;
++	bool   bSettling = false;
++	if (!pCommit->GetLiveColourState(rectX1, rectY1, rectSize, tint, bSettling) || rectSize <= 0)
++		return false;
++
++	SLivePlate plate;
++	plate.id = pEntity->GetId();
++	plate.worldXMin = (float)rectX1 * unitSize;
++	plate.worldYMin = (float)rectY1 * unitSize;
++	plate.worldXMax = (float)(rectX1 + rectSize) * unitSize;
++	plate.worldYMax = (float)(rectY1 + rectSize) * unitSize;
++	plate.tint = tint;
++
++	// A material EDIT (a different texture inside the same material) is not covered by this hash;
++	// nudging the plate repaints it.
++	uint32 signature = 0x811c9dc5u;
++	signature = HashFloat(signature, plate.worldXMin);
++	signature = HashFloat(signature, plate.worldYMin);
++	signature = HashFloat(signature, plate.worldXMax);
++	signature = HashFloat(signature, plate.worldYMax);
++	signature = HashCombine(signature, ((uint32)tint.r << 16) | ((uint32)tint.g << 8) | (uint32)tint.b);
++	signature = HashCombine(signature, (uint32)(uintptr_t)pEntity->GetMaterial());
++	signature = HashCombine(signature, (uint32)(uintptr_t)pEntity->GetSlotMaterial(0));
++	plate.signature = signature;
++	plate.bSettling = bSettling;
++
++	out = plate;
++	return true;
++}
+ 
+-	const float unitSize = pHeightmap->GetUnitSize();
++//! Collects the plates that currently want the overlay. Once per editor frame, from Update().
++void ScanPlates(std::vector<SLivePlate>& out)
++{
++	out.clear();
++
++	const float unitSize = GetTerrainUnitSize();
+ 	if (unitSize <= 0.f)
+ 		return;
+ 
+@@ -139,48 +197,9 @@ void ScanPlates(std::vector<SLivePlate>& out)
+ 	it->MoveFirst();
+ 	while (!it->IsEnd())
+ 	{
+-		IEntity* pEntity = it->Next();
+-		if (pEntity == nullptr)
+-			continue;
+-
+-		// A hidden plate shows nothing, so it colours nothing - in the viewport and in the export alike.
+-		if (pEntity->IsHidden())
+-			continue;
+-
+-		IEntityComponent* pComponent = pEntity->GetComponentByTypeId(ITerrainPlateCommit::GetComponentTypeId());
+-		if (pComponent == nullptr)
+-			continue;
+-
+-		ITerrainPlateCommit* pCommit = static_cast<CTerrainPlateComponent*>(pComponent);
+-
+-		int    rectX1 = 0, rectY1 = 0, rectSize = 0;
+-		ColorB tint;
+-		bool   bSettling = false;
+-		if (!pCommit->GetLiveColourState(rectX1, rectY1, rectSize, tint, bSettling) || rectSize <= 0)
+-			continue;
+-
+ 		SLivePlate plate;
+-		plate.id = pEntity->GetId();
+-		plate.worldXMin = (float)rectX1 * unitSize;
+-		plate.worldYMin = (float)rectY1 * unitSize;
+-		plate.worldXMax = (float)(rectX1 + rectSize) * unitSize;
+-		plate.worldYMax = (float)(rectY1 + rectSize) * unitSize;
+-		plate.tint = tint;
+-
+-		// A material EDIT (a different texture inside the same material) is not covered by this hash;
+-		// nudging the plate repaints it.
+-		uint32 signature = 0x811c9dc5u;
+-		signature = HashFloat(signature, plate.worldXMin);
+-		signature = HashFloat(signature, plate.worldYMin);
+-		signature = HashFloat(signature, plate.worldXMax);
+-		signature = HashFloat(signature, plate.worldYMax);
+-		signature = HashCombine(signature, ((uint32)tint.r << 16) | ((uint32)tint.g << 8) | (uint32)tint.b);
+-		signature = HashCombine(signature, (uint32)(uintptr_t)pEntity->GetMaterial());
+-		signature = HashCombine(signature, (uint32)(uintptr_t)pEntity->GetSlotMaterial(0));
+-		plate.signature = signature;
+-		plate.bSettling = bSettling;
+-
+-		out.push_back(plate);
++		if (MakeLivePlate(it->Next(), unitSize, plate))
++			out.push_back(plate);
+ 	}
+ }
+ 
+@@ -317,14 +336,17 @@ void Update()
+ 
+ //! THE compositing loop, and the only one. The live pull and the exporter both come through here, so the
+ //! exported terrain texture cannot drift from what the editor showed.
+-static void ApplyPlatesToRow(const std::vector<SLivePlate>& plates, uint32* pRow, int count,
++//! Returns how many texels it actually changed, which only the stamp reads (for its log line).
++static int ApplyPlatesToRow(const std::vector<SLivePlate>& plates, uint32* pRow, int count,
+                       float worldYStart, float worldStepY, float worldX, float rgbTexelSizeMeters)
+ {
++	int blended = 0;
++
+ 	if (pRow == nullptr || count <= 0 || plates.empty())
+-		return;
++		return blended;
+ 
+ 	if (gEnv == nullptr || gEnv->pEntitySystem == nullptr)
+-		return;
++		return blended;
+ 
+ 	const float worldYEnd = worldYStart + worldStepY * (float)(count - 1);
+ 	const float rowYMin = min(worldYStart, worldYEnd);
+@@ -373,8 +395,11 @@ static void ApplyPlatesToRow(const std::vector<SLivePlate>& plates, uint32* pRow
+ 				continue;
+ 
+ 			pRow[i] = BlendPlateColourIntoTexel(pRow[i], albedo, plate.tint, weight);
++			++blended;
+ 		}
+ 	}
++
++	return blended;
+ }
+ 
+ void ApplyToRow(uint32* pRow, int count, float worldYStart, float worldStepY, float worldX, float rgbTexelSizeMeters)
+@@ -405,4 +430,32 @@ void ApplyExportToRow(uint32* pRow, int count, float worldYStart, float worldSte
+ 	ApplyPlatesToRow(g_exportPlates, pRow, count, worldYStart, worldStepY, worldX, texelSizeMeters);
+ }
+ 
++bool BeginStamp(EntityId plateId)
++{
++	g_stampPlates.clear();
++
++	// The plate's own state, read now - not g_plates, whose debounce can be a few frames behind what the user
++	// is looking at, and which the stamp must not depend on having ticked at all.
++	SLivePlate plate;
++	if (gEnv == nullptr || gEnv->pEntitySystem == nullptr
++	    || !MakeLivePlate(gEnv->pEntitySystem->GetEntity(plateId), GetTerrainUnitSize(), plate))
++	{
++		return false;
++	}
++
++	g_stampPlates.push_back(plate);
++	return true;
++}
++
++void EndStamp()
++{
++	g_stampPlates.clear();
++	g_stampPlates.shrink_to_fit();
++}
++
++int ApplyStampToRow(uint32* pRow, int count, float worldYStart, float worldStepY, float worldX, float texelSizeMeters)
++{
++	return ApplyPlatesToRow(g_stampPlates, pRow, count, worldYStart, worldStepY, worldX, texelSizeMeters);
++}
++
+ }
+diff --git a/Code/Sandbox/EditorQt/Terrain/TerrainPlateColourOverlay.h b/Code/Sandbox/EditorQt/Terrain/TerrainPlateColourOverlay.h
+index a40acf91..c21a9239 100644
+--- a/Code/Sandbox/EditorQt/Terrain/TerrainPlateColourOverlay.h
++++ b/Code/Sandbox/EditorQt/Terrain/TerrainPlateColourOverlay.h
+@@ -3,6 +3,7 @@
+ #pragma once
+ 
+ #include <CryMath/Cry_Color.h>
++#include <CryEntitySystem/IEntityBasicTypes.h>   // EntityId, for the stamp's one plate
+ 
+ //! The terrain plate's diffuse as the terrain's macro colour, live and non destructive. The source is
+ //! ITerrainPlateCommit::GetCommitAlbedoAtWorld, the same call terrain.commit_plate_colour makes at the
+@@ -61,4 +62,14 @@ bool IsExportActive();
+ //! tile's own texel size, which is what makes the exported picture agree with the editor preview.
+ void ApplyExportToRow(uint32* pRow, int count, float worldYStart, float worldStepY, float worldX, float texelSizeMeters);
+ 
++//! STAMP - terrain.stamp_plate_colour. The same three functions again, over ONE plate, writing into CRGBLayer
++//! itself: this is the tier that is permanent. BeginStamp reads that plate's overlay state as it is right now
++//! (false when the plate is showing no colour, i.e. there is nothing to make permanent); ApplyStampToRow
++//! composites one row of RGB layer texels through the very loop the preview uses and returns how many texels
++//! it changed. Fed the RGB layer's own texel size and the tile row's world mapping, the result IS the preview,
++//! texel for texel.
++bool BeginStamp(EntityId plateId);
++void EndStamp();
++int  ApplyStampToRow(uint32* pRow, int count, float worldYStart, float worldStepY, float worldX, float texelSizeMeters);
++
+ }
+-- 
+2.47.1.windows.1
+

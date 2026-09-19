@@ -1,0 +1,228 @@
+From 31a31d348dc1f5eaf69314bcb473bc814c43b823 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Mon, 31 Aug 2026 12:03:55 +0800
+Subject: [PATCH 246/307] !B (Terrain Plate) Restore baked terrain when a plate
+ is deleted.
+
+Restore the live bake when entity teardown begins, while terrain and component
+state are still valid. Undo can then recreate the plate over the true original
+ground instead of recapturing its old relief.
+---
+ .../Geometry/TerrainPlateComponent.cpp        | 111 +++++++++++++++---
+ .../Geometry/TerrainPlateComponent.h          |  14 +++
+ 2 files changed, 109 insertions(+), 16 deletions(-)
+
+diff --git a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
+index cf743b8c..ff53f0ff 100644
+--- a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
++++ b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
+@@ -179,10 +179,11 @@ void RegisterTerrainPlateCVars()
+ 	g_pTerrainPlateDebugCVar = REGISTER_CVAR2("e_TerrainPlateDebug", &g_terrainPlateDebug, 0, VF_NULL,
+ 	                                          "Terrain Plate component: trace the bake trigger and the bake itself.\n"
+ 	                                          "0 - off\n"
+-	                                          "1 - one line per bake, restore, probe repair and skip. A skip always names a reason\n"
+-	                                          "    code: bake-off, waiting-for-terrain, no-3dengine, no-terrain, rect-empty,\n"
+-	                                          "    footprint-too-large, write-no-terrain, write-empty-rect, write-size-mismatch,\n"
+-	                                          "    write-off-terrain. A bake also logs the read back of the cells it changed.\n"
++	                                          "1 - one line per bake, restore, teardown, probe repair and skip. A skip always names\n"
++	                                          "    a reason code: bake-off, torn-down, waiting-for-terrain, no-3dengine, no-terrain,\n"
++	                                          "    rect-empty, footprint-too-large, write-no-terrain, write-empty-rect,\n"
++	                                          "    write-size-mismatch, write-off-terrain. A bake also logs the read back of the\n"
++	                                          "    cells it changed.\n"
+ 	                                          "2 - additionally draw the sector aligned bake rect as a wire box over the terrain");
+ }
+ 
+@@ -763,17 +764,10 @@ void CTerrainPlateComponent::Register(Schematyc::CEnvRegistrationScope& componen
+ 
+ CTerrainPlateComponent::~CTerrainPlateComponent()
+ {
+-	// Before anything else: the terrain must not keep the relief of a plate that no longer exists.
+-	// Removing the component, deleting the entity and unloading the level all end here.
+-	//
+-	// Out of the registry FIRST, so that nothing can start an overlap cascade on a half destructed
+-	// component (a cascade regenerates the mesh of every plate it touches). The restore below is then a
+-	// plain one, and an overlapping plate whose baseline contains this plate's relief heals itself on
+-	// its next poll: the cells this restore just changed fail its expected-height test, so it re-captures
+-	// them as the new ground - which they now are - and re-bakes on top. @see ReapplyBakeAfterExternalEdit.
+-	UnregisterPlate();
+-
+-	RestoreBakeBaseline();
++	// The backstop, not the normal path: by the time a destructor runs the entity is half gone, so the
++	// teardown is done at ENTITY_EVENT_DONE / OnShutDown and this call is the one that catches a component
++	// destroyed without either (idempotent, @see RestoreBakeOnTeardown).
++	RestoreBakeOnTeardown();
+ 
+ 	ReleaseNativePhysics();
+ 
+@@ -802,6 +796,16 @@ void CTerrainPlateComponent::Initialize()
+ 	Rebuild();
+ }
+ 
++void CTerrainPlateComponent::OnShutDown()
++{
++	// Removing the Terrain Plate component from an entity that stays alive never sends
++	// ENTITY_EVENT_DONE - this is the hook that covers it. It also runs, ahead of the destructor, on the
++	// entity teardown path (CEntity::ShutDown -> m_components.Clear() -> SEntityComponentRecord::Shutdown
++	// -> CEntity::ShutDownComponent, Entity.cpp:3296), which is why the restore does not wait for the
++	// destructor any more: here the entity, its slot and the terrain are all still whole.
++	RestoreBakeOnTeardown();
++}
++
+ Cry::Entity::EventFlags CTerrainPlateComponent::GetEventMask() const
+ {
+ 	Cry::Entity::EventFlags bitFlags = CBaseMeshComponent::GetEventMask();
+@@ -820,6 +824,12 @@ Cry::Entity::EventFlags CTerrainPlateComponent::GetEventMask() const
+ 	// The bake must not run before the level's terrain is in the engine (decision 04, rule 5).
+ 	bitFlags |= ENTITY_EVENT_LEVEL_LOADED;
+ 
++	// Deleting the plate has to give the ground back, and this is the earliest and the only unconditional
++	// point on the removal path: CEntitySystem::RemoveEntity sends it (EntitySystem.cpp:801-803) before it
++	// decides between DeleteEntity, the deferred deletion queue and the "unremovable, hide it instead"
++	// branch (:818-838), and while the entity, its slot and the terrain are all still whole.
++	bitFlags |= ENTITY_EVENT_DONE;
++
+ 	// Only ticked while a rebuild was throttled away or held back, while the first bake is still owed,
+ 	// or while a live bake has to be watched - so a plate that is not baking costs nothing per frame.
+ 	if (m_bRegenPending || m_bDeferredXformPending || m_bInitialBakePending
+@@ -835,7 +845,16 @@ void CTerrainPlateComponent::ProcessEvent(const SEntityEvent& event)
+ {
+ 	switch (event.event)
+ 	{
++	case ENTITY_EVENT_DONE:
++		// The plate is being removed. Give the ground back here rather than in the destructor.
++		RestoreBakeOnTeardown();
++		break;
++
+ 	case ENTITY_EVENT_COMPONENT_PROPERTY_CHANGED:
++		// A property change can only reach a plate the user is working on, so an entity that came back out
++		// of the deletion queue is allowed to bake again.
++		m_bBakeTornDown = false;
++
+ 		// A property change is by definition a user action in a level that is already open, so the level's
+ 		// terrain is in the engine and rule 5 of decision 04 (never bake from Initialize) is satisfied -
+ 		// exactly the condition the update tick below waits for. Releasing the first bake here as well
+@@ -2233,6 +2252,57 @@ void CTerrainPlateComponent::RestoreBakeBaseline()
+ 	m_bakeProbes.clear();
+ }
+ 
++void CTerrainPlateComponent::RestoreBakeOnTeardown()
++{
++	if (m_bBakeTornDown)
++		return;
++
++	m_bBakeTornDown = true;
++
++	// Out of the registry FIRST, so that nothing can start an overlap cascade on a plate that is on its
++	// way out (a cascade regenerates the mesh of every plate it touches). The restore below is then a
++	// plain one.
++	UnregisterPlate();
++
++	// The one diagnostic the delete path never had. "no live bake" here says the plate believed it had
++	// nothing in the terrain, which is the only way a delete can leave the bake behind now that the
++	// teardown itself is unconditional.
++	if (GetPlateDebugLevel() >= 1)
++	{
++		CryLog("TerrainPlate '%s': teardown, %s", GetPlateName(),
++		       m_bBakeApplied ? "restoring the original ground over the footprint" : "no live bake to restore");
++	}
++
++	const int oldX1 = m_bakeRectX1;
++	const int oldY1 = m_bakeRectY1;
++	const int oldSize = m_bakeRectSize;
++	const bool bHadBake = m_bBakeApplied;
++
++	RestoreBakeBaseline();
++
++	if (!bHadBake || oldSize <= 0)
++		return;
++
++	// Any plate that was baking on top of this one now sits on ground that just moved under it. It heals
++	// on its next poll by itself (report 12 section 2), but it does not have to wait a whole poll interval
++	// for it: bring the next poll of every overlapping plate forward to the next frame. This is a nudge,
++	// not a cascade - a cascade must not run from a teardown.
++	for (CTerrainPlateComponent* pOther : g_terrainPlates)
++	{
++		if (pOther == this || !pOther->m_bBakeApplied || pOther->m_bakeRectSize <= 0)
++			continue;
++
++		const bool bOverlaps = (oldX1 < pOther->m_bakeRectX1 + pOther->m_bakeRectSize)
++		                       && (pOther->m_bakeRectX1 < oldX1 + oldSize)
++		                       && (oldY1 < pOther->m_bakeRectY1 + pOther->m_bakeRectSize)
++		                       && (pOther->m_bakeRectY1 < oldY1 + oldSize);
++		if (bOverlaps)
++		{
++			pOther->m_lastBakeProbeFrameId = gEnv->nMainFrameID - (uint32)max(1, GetBakeProbeFrames());
++		}
++	}
++}
++
+ bool CTerrainPlateComponent::VerifyBakeWrite(const SBakeTerrainMetrics& metrics)
+ {
+ 	// ITerrain::SetTerrainElevation reports nothing back. An out of range rect only warns inside the
+@@ -2347,6 +2417,15 @@ void CTerrainPlateComponent::ApplyBake()
+ 		return;
+ 	}
+ 
++	if (m_bBakeTornDown)
++	{
++		// The ground has already been given back. Anything that still reaches a mesh regeneration after
++		// that - a slot event during the entity teardown, a cascade started by another plate in the same
++		// frame - must not put the relief back in.
++		LogBakeSkip("torn-down");
++		return;
++	}
++
+ 	if (m_bInitialBakePending)
+ 	{
+ 		// Decision 04 rule 5: never from Initialize(), only once the level's terrain is in.
+@@ -2691,7 +2770,7 @@ void CTerrainPlateComponent::UnregisterPlate()
+ 
+ bool CTerrainPlateComponent::GetBakeCascadeRect(int& outX1, int& outY1, int& outSize) const
+ {
+-	if (!m_bBakeIntoTerrain || m_pEntity == nullptr)
++	if (!m_bBakeIntoTerrain || m_bBakeTornDown || m_pEntity == nullptr)
+ 		return false;
+ 
+ 	// A plate that already holds a bake is asked for the rect it holds; one that has not baked yet (a
+diff --git a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
+index dfa4b0ca..d720e582 100644
+--- a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
++++ b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
+@@ -163,6 +163,10 @@ protected:
+ 
+ 	// IEntityComponent
+ 	virtual void                    Initialize() final;
++	//! Called by CEntity::ShutDownComponent (Entity.cpp:3296) before the slot is freed and before the
++	//! component is released, i.e. for a component removed from the entity as well as for an entity that
++	//! is going away. @see RestoreBakeOnTeardown.
++	virtual void                    OnShutDown() final;
+ 	virtual void                    ProcessEvent(const SEntityEvent& event) final;
+ 	virtual Cry::Entity::EventFlags GetEventMask() const final;
+ 	// ~IEntityComponent
+@@ -332,6 +336,11 @@ protected:
+ 	//! Restores the original ground over the footprint of the live bake, if there is one. Must run
+ 	//! before anything reads the terrain again (the edge weld does) and before the plate moves.
+ 	void  RestoreBakeBaseline();
++	//! The single teardown funnel: takes the plate out of the registry, puts the original ground back and
++	//! refuses every further bake. Idempotent, and reached from all three ends of a plate's life -
++	//! ENTITY_EVENT_DONE (the earliest point, with the entity and the terrain still whole), OnShutDown
++	//! (a component removed from a surviving entity) and the destructor (the backstop).
++	void  RestoreBakeOnTeardown();
+ 	//! Captures the baseline, computes the block and writes it. Does nothing until the level is loaded.
+ 	void  ApplyBake();
+ 	//! Decals, shadows and navmesh over a footprint that just changed.
+@@ -453,6 +462,11 @@ protected:
+ 	bool                     m_bBakeApplied = false;
+ 	//! True until the level is loaded. Rule 5 of decision 04: never bake from Initialize().
+ 	bool                     m_bInitialBakePending = true;
++	//! True once the plate has been torn down (@see RestoreBakeOnTeardown). It must never bake again
++	//! after that, or a teardown that happens to run before the last update tick would put the relief
++	//! straight back into the terrain. Cleared again by a property change, which can only come from a
++	//! user acting on a plate that is very much alive (an entity resurrected out of the deletion queue).
++	bool                     m_bBakeTornDown = false;
+ 	//! Sector aligned square footprint of the live bake, in terrain units.
+ 	int                      m_bakeRectX1 = 0;
+ 	int                      m_bakeRectY1 = 0;
+-- 
+2.47.1.windows.1
+

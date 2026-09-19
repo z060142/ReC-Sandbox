@@ -1,0 +1,488 @@
+From b10002438f148850f93fbb38b4ac058fa441b231 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Mon, 31 Aug 2026 10:24:40 +0800
+Subject: [PATCH 240/307] !F (Terrain Plate) Report skipped terrain bake
+ operations.
+
+Trace bake entry, restoration, probing and every supported early-out reason.
+Read back the cells changed most by a bake and warn when the terrain accepted
+none of the requested height changes.
+---
+ .../Geometry/TerrainPlateComponent.cpp        | 266 +++++++++++++++++-
+ .../Geometry/TerrainPlateComponent.h          |  21 +-
+ 2 files changed, 277 insertions(+), 10 deletions(-)
+
+diff --git a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
+index 6851728f..eaa4519b 100644
+--- a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
++++ b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
+@@ -7,6 +7,7 @@
+ #include <Cry3DEngine/IStatObj.h>
+ #include <Cry3DEngine/IRenderNode.h>
+ #include <Cry3DEngine/ImageExtensionHelper.h>
++#include <CryRenderer/IRenderAuxGeom.h>
+ #include <CrySystem/File/CryFile.h>
+ #include <CrySystem/IConsole.h>
+ #include <CrySystem/ConsoleRegistration.h>
+@@ -81,6 +82,17 @@ ICVar* g_pTerrainPlateBakeEpsilonCVar = nullptr;
+ int    g_terrainPlateBakeSlopeCorrect = 1;
+ ICVar* g_pTerrainPlateBakeSlopeCorrectCVar = nullptr;
+ 
++//! Bake trigger / bake apply tracing. The bake chain has a dozen places where it can legitimately do
++//! nothing (the property is off, the level's terrain is not in yet, the footprint is empty, the write
++//! was refused), and until this cvar existed every one of them was a silent return: the user ticked
++//! Bake Into Terrain, nothing moved, and there was no way to tell which of the dozen it was.
++//! Every one of them now names itself with a reason code (@see CTerrainPlateComponent::LogBakeSkip).
++//! 0 - off
++//! 1 - log every bake, restore, probe repair and skip, with a reason code, plus the read back check
++//! 2 - additionally draw the sector aligned bake rect as a wire box over the baked terrain
++int    g_terrainPlateDebug = 0;
++ICVar* g_pTerrainPlateDebugCVar = nullptr;
++
+ //! Clamped so a typo in the console cannot invert the guarantee that the terrain stays under the mesh.
+ float GetBakeEpsilonMeters()
+ {
+@@ -101,6 +113,14 @@ int GetTerrainIntegrateDebugLevel()
+ 	ICVar* pCVar = gEnv->pConsole->GetCVar("e_TerrainIntegrateObjectsDebug");
+ 	return (pCVar != nullptr) ? pCVar->GetIVal() : 0;
+ }
++
++//! The verbosity the plate logs at: the higher of its own e_TerrainPlateDebug and the shared
++//! e_TerrainIntegrateObjectsDebug, so the lines the earlier steps already emitted keep working under
++//! the cvar they were written for.
++int GetPlateDebugLevel()
++{
++	return max(max(0, g_terrainPlateDebug), GetTerrainIntegrateDebugLevel());
++}
+ }
+ 
+ void RegisterTerrainPlateCVars()
+@@ -145,6 +165,15 @@ void RegisterTerrainPlateCVars()
+ 	                                                     "which buries roads and terrain decals on the plate.\n"
+ 	                                                     "0 - plain Min filter (step 2 behaviour)\n"
+ 	                                                     "1 - default, slope corrected: exact on a planar plate, still catches every dip");
++
++	g_pTerrainPlateDebugCVar = REGISTER_CVAR2("e_TerrainPlateDebug", &g_terrainPlateDebug, 0, VF_NULL,
++	                                          "Terrain Plate component: trace the bake trigger and the bake itself.\n"
++	                                          "0 - off\n"
++	                                          "1 - one line per bake, restore, probe repair and skip. A skip always names a reason\n"
++	                                          "    code: bake-off, waiting-for-terrain, no-3dengine, no-terrain, rect-empty,\n"
++	                                          "    footprint-too-large, write-no-terrain, write-empty-rect, write-size-mismatch,\n"
++	                                          "    write-off-terrain. A bake also logs the read back of the cells it changed.\n"
++	                                          "2 - additionally draw the sector aligned bake rect as a wire box over the terrain");
+ }
+ 
+ void UnregisterTerrainPlateCVars()
+@@ -165,6 +194,9 @@ void UnregisterTerrainPlateCVars()
+ 
+ 		if (g_pTerrainPlateBakeSlopeCorrectCVar != nullptr)
+ 			gEnv->pConsole->UnregisterVariable(g_pTerrainPlateBakeSlopeCorrectCVar->GetName());
++
++		if (g_pTerrainPlateDebugCVar != nullptr)
++			gEnv->pConsole->UnregisterVariable(g_pTerrainPlateDebugCVar->GetName());
+ 	}
+ 
+ 	g_pTerrainPlateSettleFramesCVar = nullptr;
+@@ -172,6 +204,7 @@ void UnregisterTerrainPlateCVars()
+ 	g_pTerrainPlateBakeProbeSpacingCVar = nullptr;
+ 	g_pTerrainPlateBakeEpsilonCVar = nullptr;
+ 	g_pTerrainPlateBakeSlopeCorrectCVar = nullptr;
++	g_pTerrainPlateDebugCVar = nullptr;
+ }
+ 
+ int CTerrainPlateComponent::GetSettleFrames()
+@@ -184,6 +217,19 @@ int CTerrainPlateComponent::GetBakeProbeFrames()
+ 	return max(0, g_terrainPlateBakeProbeFrames);
+ }
+ 
++const char* CTerrainPlateComponent::GetPlateName() const
++{
++	return (m_pEntity != nullptr) ? m_pEntity->GetName() : "<no entity>";
++}
++
++void CTerrainPlateComponent::LogBakeSkip(const char* szReason) const
++{
++	if (GetPlateDebugLevel() >= 1)
++	{
++		CryLog("TerrainPlate '%s': bake did nothing [%s]", GetPlateName(), szReason);
++	}
++}
++
+ float STerrainPlateHeightField::SampleBilinear(float u, float v) const
+ {
+ 	if (!IsValid())
+@@ -767,7 +813,7 @@ Cry::Entity::EventFlags CTerrainPlateComponent::GetEventMask() const
+ 	// Only ticked while a rebuild was throttled away or held back, while the first bake is still owed,
+ 	// or while a live bake has to be watched - so a plate that is not baking costs nothing per frame.
+ 	if (m_bRegenPending || m_bDeferredXformPending || m_bInitialBakePending
+-	    || (m_bBakeIntoTerrain && GetBakeProbeFrames() > 0))
++	    || (m_bBakeIntoTerrain && (GetBakeProbeFrames() > 0 || GetPlateDebugLevel() >= 1)))
+ 	{
+ 		bitFlags |= ENTITY_EVENT_UPDATE;
+ 	}
+@@ -780,6 +826,28 @@ void CTerrainPlateComponent::ProcessEvent(const SEntityEvent& event)
+ 	switch (event.event)
+ 	{
+ 	case ENTITY_EVENT_COMPONENT_PROPERTY_CHANGED:
++		// A property change is by definition a user action in a level that is already open, so the level's
++		// terrain is in the engine and rule 5 of decision 04 (never bake from Initialize) is satisfied -
++		// exactly the condition the update tick below waits for. Releasing the first bake here as well
++		// means ticking Bake Into Terrain applies in the same frame instead of waiting for a tick, and the
++		// checkbox keeps working even if the component is ever not ticked at all.
++		if (m_bInitialBakePending && gEnv->p3DEngine != nullptr && gEnv->p3DEngine->GetITerrain() != nullptr)
++		{
++			m_bInitialBakePending = false;
++
++			if (GetPlateDebugLevel() >= 1)
++			{
++				CryLog("TerrainPlate '%s': first bake released by a property change", GetPlateName());
++			}
++		}
++
++		if (GetPlateDebugLevel() >= 1)
++		{
++			CryLog("TerrainPlate '%s': property changed, Bake Into Terrain = %s, terrain %s",
++			       GetPlateName(), m_bBakeIntoTerrain ? "on" : "off",
++			       (gEnv->p3DEngine != nullptr && gEnv->p3DEngine->GetITerrain() != nullptr) ? "present" : "MISSING");
++		}
++
+ 		Rebuild();
+ 		// Bake Into Terrain decides whether the component needs the per frame tick that watches the
+ 		// bake, so the event mask has to be re-evaluated after any property change.
+@@ -823,6 +891,24 @@ void CTerrainPlateComponent::ProcessEvent(const SEntityEvent& event)
+ 
+ 	case ENTITY_EVENT_UPDATE:
+ 		{
++			// Proof of life for the whole deferred machinery: the first bake, the probe polling and the
++			// settle fallback all ride on this event. It IS delivered in Sandbox edit mode, not only in
++			// game mode - CGameEngine::Update (GameEngine.cpp:1544) calls CSystem::Update with
++			// ESYSUPDATE_EDITOR and nPauseMode 0 (ISystem.h:1070), System.cpp:2186-2193 runs the entity
++			// system with no editor gate, and CEntitySystem::UpdateEntityComponents (EntitySystem.cpp:1176)
++			// posts ENTITY_EVENT_UPDATE to every component in m_updatedEntityComponents. If this line never
++			// appears in the log, that chain is broken and nothing else about the bake can be believed.
++			if (!m_bUpdateTickLogged && GetPlateDebugLevel() >= 1)
++			{
++				m_bUpdateTickLogged = true;
++				CryLog("TerrainPlate '%s': first update tick, terrain %s, first bake %s",
++				       GetPlateName(),
++				       (gEnv->p3DEngine != nullptr && gEnv->p3DEngine->GetITerrain() != nullptr) ? "present" : "MISSING",
++				       m_bInitialBakePending ? "still owed" : "already released");
++			}
++
++			DrawBakeDebug();
++
+ 			// Settle fallback for the deferred path: flush once no transform has been seen for N frames,
+ 			// in case ENTITY_EVENT_XFORM_FINISHED_EDITOR never arrives (@see FlushDeferredTransform).
+ 			const int settleFrames = GetSettleFrames();
+@@ -1938,12 +2024,24 @@ void CTerrainPlateComponent::ComputeBakeBlock(const SBakeTerrainMetrics& metrics
+ bool CTerrainPlateComponent::WriteTerrainBlock(const SBakeTerrainMetrics& metrics, const std::vector<float>& heights)
+ {
+ 	ITerrain* pTerrain = (gEnv != nullptr && gEnv->p3DEngine != nullptr) ? gEnv->p3DEngine->GetITerrain() : nullptr;
+-	if (pTerrain == nullptr || m_bakeRectSize <= 0)
++	if (pTerrain == nullptr)
++	{
++		LogBakeSkip("write-no-terrain");
+ 		return false;
++	}
++
++	if (m_bakeRectSize <= 0)
++	{
++		LogBakeSkip("write-empty-rect");
++		return false;
++	}
+ 
+ 	const int dim = m_bakeRectSize + 1;
+ 	if ((int)heights.size() != dim * dim)
++	{
++		LogBakeSkip("write-size-mismatch");
+ 		return false;
++	}
+ 
+ 	// Argument mapping, traced in terran_edit.cpp rather than taken from the doc comment:
+ 	//  - X1 / Y1 / nSizeX / nSizeY are terrain UNITS and must be whole sectors (:178-181);
+@@ -1968,7 +2066,10 @@ bool CTerrainPlateComponent::WriteTerrainBlock(const SBakeTerrainMetrics& metric
+ 	// terrain border simply does not need its last column.
+ 	const int copyCols = min(dim, metrics.hmapSize - m_bakeRectY1);
+ 	if (copyCols <= 0)
++	{
++		LogBakeSkip("write-off-terrain");
+ 		return false;
++	}
+ 
+ 	for (int ux = 0; ux < dim; ++ux)
+ 	{
+@@ -2058,6 +2159,12 @@ void CTerrainPlateComponent::RestoreBakeBaseline()
+ 		if (WriteTerrainBlock(metrics, m_bakeBaseline))
+ 		{
+ 			AfterBakeInvalidation(box);
++
++			if (GetPlateDebugLevel() >= 1)
++			{
++				CryLog("TerrainPlate '%s': original ground restored over units (%d,%d)+%d",
++				       GetPlateName(), m_bakeRectX1, m_bakeRectY1, m_bakeRectSize);
++			}
+ 		}
+ 	}
+ 
+@@ -2065,17 +2172,139 @@ void CTerrainPlateComponent::RestoreBakeBaseline()
+ 	m_bakeProbes.clear();
+ }
+ 
++bool CTerrainPlateComponent::VerifyBakeWrite(const SBakeTerrainMetrics& metrics)
++{
++	// ITerrain::SetTerrainElevation reports nothing back. An out of range rect only warns inside the
++	// engine, a rect that is not sector aligned trips asserts a Profile build compiles out
++	// (terran_edit.cpp:177-181), and a Release build of Cry3DEngine has no function body at all
++	// (terran_edit.cpp:165: the whole thing is #ifndef _RELEASE). So the only way to know that the bake
++	// landed is to read the terrain back - three array lookups, cheap enough to do on every bake rather
++	// than only under the debug cvar.
++	const int dim = m_bakeRectSize + 1;
++	if ((int)m_bakeResult.size() != dim * dim || (int)m_bakeBaseline.size() != dim * dim)
++		return true;
++
++	// The three cells this bake moved the most: if the write reached the terrain at all it reached
++	// those. A change smaller than the sector quantisation step cannot be told apart from rounding and
++	// is not evidence either way, so it is not checked.
++	int   cells[3] = { -1, -1, -1 };
++	float deltas[3] = { 0.f, 0.f, 0.f };
++
++	for (int i = 0; i < dim * dim; ++i)
++	{
++		const float delta = fabs_tpl(m_bakeResult[i] - m_bakeBaseline[i]);
++
++		for (int slot = 0; slot < 3; ++slot)
++		{
++			if (delta > deltas[slot])
++			{
++				for (int k = 2; k > slot; --k)
++				{
++					deltas[k] = deltas[k - 1];
++					cells[k] = cells[k - 1];
++				}
++				deltas[slot] = delta;
++				cells[slot] = i;
++				break;
++			}
++		}
++	}
++
++	int checked = 0;
++	int landed = 0;
++
++	for (int slot = 0; slot < 3; ++slot)
++	{
++		if (cells[slot] < 0 || deltas[slot] <= m_bakeProbeTolerance)
++			continue;
++
++		const int   ux = cells[slot] / dim;
++		const int   uy = cells[slot] % dim;
++		const float expected = m_bakeResult[cells[slot]];
++		const float actual = SampleTerrainUnit(metrics, m_bakeRectX1 + ux, m_bakeRectY1 + uy);
++		const bool  bLanded = fabs_tpl(actual - expected) <= m_bakeProbeTolerance;
++
++		++checked;
++		landed += bLanded ? 1 : 0;
++
++		if (GetPlateDebugLevel() >= 1)
++		{
++			CryLog("TerrainPlate '%s': read back unit (%d,%d) baseline %.3f, wrote %.3f, terrain has %.3f (tolerance %.3f) - %s",
++			       GetPlateName(), m_bakeRectX1 + ux, m_bakeRectY1 + uy,
++			       m_bakeBaseline[cells[slot]], expected, actual, m_bakeProbeTolerance,
++			       bLanded ? "OK" : "NOT WRITTEN");
++		}
++	}
++
++	if (checked > 0 && landed == 0)
++	{
++		if (!m_bBakeWriteWarningIssued)
++		{
++			m_bBakeWriteWarningIssued = true;
++			CryWarning(VALIDATOR_MODULE_3DENGINE, VALIDATOR_WARNING,
++			           "Terrain Plate '%s': Bake Into Terrain wrote %d x %d terrain units at (%d,%d) but the terrain did not move. "
++			           "SetTerrainElevation reports nothing back, so the cause is one of: Cry3DEngine built as Release (its body is "
++			           "#ifndef _RELEASE), the rect not sector aligned (sector = %d units), or the rect outside the terrain "
++			           "(%d units). Run e_TerrainPlateDebug 1 for the per cell read back.",
++			           GetPlateName(), m_bakeRectSize, m_bakeRectSize, m_bakeRectX1, m_bakeRectY1,
++			           metrics.sectorUnits, metrics.hmapSize);
++		}
++		return false;
++	}
++
++	// A later bake that lands again is allowed to warn again if it ever stops landing.
++	m_bBakeWriteWarningIssued = false;
++	return true;
++}
++
++void CTerrainPlateComponent::DrawBakeDebug() const
++{
++	if (GetPlateDebugLevel() < 2 || !m_bBakeApplied || m_bakeRectSize <= 0)
++		return;
++
++	IRenderAuxGeom* pAux = (gEnv->pRenderer != nullptr) ? gEnv->pRenderer->GetIRenderAuxGeom() : nullptr;
++	if (pAux == nullptr)
++		return;
++
++	const SBakeTerrainMetrics metrics = GetBakeTerrainMetrics();
++	if (!metrics.IsValid())
++		return;
++
++	const SAuxGeomRenderFlags previousFlags = pAux->GetRenderFlags();
++	SAuxGeomRenderFlags flags = e_Def3DPublicRenderflags;
++	flags.SetDepthTestFlag(e_DepthTestOff);
++	pAux->SetRenderFlags(flags);
++	pAux->DrawAABB(GetBakeWorldBox(metrics), false, ColorB(0, 255, 0, 255), eBBD_Faceted);
++	pAux->SetRenderFlags(previousFlags);
++}
++
+ void CTerrainPlateComponent::ApplyBake()
+ {
+-	if (!m_bBakeIntoTerrain || m_bInitialBakePending)
+-		return; // decision 04 rule 5: never from Initialize(), only once the level's terrain is in
++	if (!m_bBakeIntoTerrain)
++	{
++		LogBakeSkip("bake-off");
++		return;
++	}
++
++	if (m_bInitialBakePending)
++	{
++		// Decision 04 rule 5: never from Initialize(), only once the level's terrain is in.
++		LogBakeSkip("waiting-for-terrain");
++		return;
++	}
+ 
+ 	if (m_pEntity == nullptr || gEnv == nullptr || gEnv->p3DEngine == nullptr)
++	{
++		LogBakeSkip("no-3dengine");
+ 		return;
++	}
+ 
+ 	const SBakeTerrainMetrics metrics = GetBakeTerrainMetrics();
+ 	if (!metrics.IsValid())
++	{
++		LogBakeSkip("no-terrain");
+ 		return;
++	}
+ 
+ 	const CTimeValue startTime = (gEnv->pTimer != nullptr) ? gEnv->pTimer->GetAsyncTime() : CTimeValue();
+ 
+@@ -2083,7 +2312,22 @@ void CTerrainPlateComponent::ApplyBake()
+ 
+ 	int x1 = 0, y1 = 0, size = 0;
+ 	if (!ComputeBakeRect(metrics, worldTM, x1, y1, size))
++	{
++		LogBakeSkip("rect-empty");
+ 		return;
++	}
++
++	if (GetPlateDebugLevel() >= 1)
++	{
++		// Alignment is the one thing SetTerrainElevation asserts about and the one thing a Profile build
++		// will not tell us, so it is spelled out here rather than left to be inferred from the numbers.
++		CryLog("TerrainPlate '%s': bake entry, plate at (%.2f, %.2f, %.2f), rect units (%d,%d)+%d, "
++		       "unit %.2f m, sector %d units, terrain %d units, aligned %s",
++		       GetPlateName(), worldTM.GetTranslation().x, worldTM.GetTranslation().y, worldTM.GetTranslation().z,
++		       x1, y1, size, metrics.unitSize, metrics.sectorUnits, metrics.hmapSize,
++		       ((x1 % metrics.sectorUnits) == 0 && (y1 % metrics.sectorUnits) == 0 && (size % metrics.sectorUnits) == 0)
++		       ? "yes" : "NO");
++	}
+ 
+ 	// The block is (size + 1) rows of the full terrain width. Refuse a footprint that would make that
+ 	// allocation absurd rather than eat a hundred megabytes silently.
+@@ -2096,6 +2340,7 @@ void CTerrainPlateComponent::ApplyBake()
+ 			           "Terrain Plate '%s': Bake Into Terrain skipped, the footprint covers %d x %d terrain units, which is too large to bake in one block",
+ 			           m_pEntity->GetName(), size, size);
+ 		}
++		LogBakeSkip("footprint-too-large");
+ 		return;
+ 	}
+ 
+@@ -2110,7 +2355,7 @@ void CTerrainPlateComponent::ApplyBake()
+ 	ComputeBakeBlock(metrics, worldTM, cellsWritten, minDelta, maxDelta);
+ 
+ 	if (!WriteTerrainBlock(metrics, m_bakeResult))
+-		return;
++		return;   // WriteTerrainBlock has already named the reason
+ 
+ 	m_bBakeApplied = true;
+ 	m_lastBakeProbeFrameId = gEnv->nMainFrameID;
+@@ -2118,10 +2363,13 @@ void CTerrainPlateComponent::ApplyBake()
+ 	WarnOnBakeQuantisation(metrics);
+ 	AfterBakeInvalidation(GetBakeWorldBox(metrics));
+ 
+-	if (GetTerrainIntegrateDebugLevel() >= 1)
++	// Last, so the read back sees the terrain exactly as the rest of the engine will see it.
++	VerifyBakeWrite(metrics);
++
++	if (GetPlateDebugLevel() >= 1)
+ 	{
+ 		const float milliseconds = (gEnv->pTimer != nullptr) ? (gEnv->pTimer->GetAsyncTime() - startTime).GetMilliSeconds() : 0.f;
+-		CryLog("TerrainPlate '%s': bake rect units (%d,%d)+%d (%d x %d sectors), %d of %d cells changed, delta %.3f .. %.3f m, %.2f ms",
++		CryLog("TerrainPlate '%s': bake applied, rect units (%d,%d)+%d (%d x %d sectors), %d of %d cells changed, delta %.3f .. %.3f m, %.2f ms",
+ 		       m_pEntity->GetName(), m_bakeRectX1, m_bakeRectY1, m_bakeRectSize,
+ 		       m_bakeRectSize / metrics.sectorUnits, m_bakeRectSize / metrics.sectorUnits,
+ 		       cellsWritten, (m_bakeRectSize + 1) * (m_bakeRectSize + 1), minDelta, maxDelta, milliseconds);
+@@ -2290,7 +2538,7 @@ void CTerrainPlateComponent::ReapplyBakeAfterExternalEdit(const SBakeTerrainMetr
+ 		}
+ 	}
+ 
+-	if (GetTerrainIntegrateDebugLevel() >= 1)
++	if (GetPlateDebugLevel() >= 1)
+ 	{
+ 		CryLog("TerrainPlate '%s': terrain changed under the bake, %d of %d cells re-captured as the new ground",
+ 		       m_pEntity->GetName(), recapturedCells, dim * dim);
+@@ -2547,7 +2795,7 @@ void CTerrainPlateComponent::ApplyBakeCascaded()
+ 	// down for it, so N plates seeing the same terrain change produce one cascade between them, not N.
+ 	g_bakeCascadeFrameId = gEnv->nMainFrameID;
+ 
+-	if (GetTerrainIntegrateDebugLevel() >= 1)
++	if (GetPlateDebugLevel() >= 1)
+ 	{
+ 		CryLog("TerrainPlate '%s': overlap cascade over %d plates, restored highest priority first and re-baked lowest priority first",
+ 		       (m_pEntity != nullptr) ? m_pEntity->GetName() : "?", (int)affected.size());
+diff --git a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
+index 9e9fc868..bbe84067 100644
+--- a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
++++ b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
+@@ -1,4 +1,4 @@
+-// Copyright 2026 Crytek GmbH / Crytek Group. All rights reserved.
++﻿// Copyright 2026 Crytek GmbH / Crytek Group. All rights reserved.
+ 
+ #pragma once
+ 
+@@ -373,6 +373,19 @@ protected:
+ 	bool  SamplePlateSurface(const Matrix34& worldTM, float worldX, float worldY, float& outWorldZ, float& outLocalX, float& outLocalY) const;
+ 	//! Frames between two probe passes, from e_TerrainPlateBakeProbeFrames. 0 disables the polling.
+ 	static int GetBakeProbeFrames();
++	//! Entity name for the log lines, never null even before the component has an entity.
++	const char* GetPlateName() const;
++	//! One line naming why the bake chain did nothing this time, under e_TerrainPlateDebug 1.
++	//! Every early out in ApplyBake / WriteTerrainBlock goes through here, so a bake that does nothing
++	//! always says which of them it was instead of returning silently.
++	void  LogBakeSkip(const char* szReason) const;
++	//! Reads the cells this bake changed the most back out of the terrain and compares them with what
++	//! was written. SetTerrainElevation reports nothing back and its asserts are compiled out in
++	//! Profile, so this is the only place a failed write can be noticed. Warns once when the terrain
++	//! did not move at all, and returns false in that case.
++	bool  VerifyBakeWrite(const SBakeTerrainMetrics& metrics);
++	//! e_TerrainPlateDebug 2: the sector aligned bake rect as a wire box over the baked terrain.
++	void  DrawBakeDebug() const;
+ 
+ 	ETerrainPlateSource                          m_sourceMode = ETerrainPlateSource::HeightmapFile;
+ 	Schematyc::TerrainHeightmapFileName          m_heightmapPath;
+@@ -448,6 +461,12 @@ protected:
+ 	bool                     m_bBakeOverlapWarningIssued = false;
+ 	bool                     m_bBakeQuantWarningIssued = false;
+ 	bool                     m_bBakeSizeWarningIssued = false;
++	//! One warning per plate for a bake whose write never reached the terrain, cleared by the next
++	//! bake that does land so a transient failure can warn again.
++	bool                     m_bBakeWriteWarningIssued = false;
++	//! e_TerrainPlateDebug 1: says once, per plate, that the component really is being ticked. If this
++	//! line never appears the plate never received ENTITY_EVENT_UPDATE and no bake trigger can fire.
++	bool                     m_bUpdateTickLogged = false;
+ };
+ }
+ }
+-- 
+2.47.1.windows.1
+

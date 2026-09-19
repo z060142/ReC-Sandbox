@@ -1,0 +1,597 @@
+From f8f62ef0ad4ba4313c46fd923b9d196d89d4bcc0 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Mon, 31 Aug 2026 12:46:11 +0800
+Subject: [PATCH 248/307] !B (Terrain Plate) Restore previous footprints during
+ multi-plate moves.
+
+Collect all plates moved in the same editor gesture before restoring any
+footprint. Unwind the complete old overlap set once, then regenerate and bake
+the group in deterministic cascade order.
+---
+ .../Geometry/TerrainPlateComponent.cpp        | 356 +++++++++++++++---
+ .../Geometry/TerrainPlateComponent.h          |  39 +-
+ 2 files changed, 349 insertions(+), 46 deletions(-)
+
+diff --git a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
+index def383cf..10c1ec2c 100644
+--- a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
++++ b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
+@@ -66,6 +66,19 @@ const size_t kBakeCascadeMaxPlates = 16;
+ //! ping pong between two overlapping plates starts.
+ const uint32 kBakeCascadeQuietFrames = 3;
+ 
++//! P14, the move batch. Plates whose move still owes a restore of the OLD footprint and a re-bake at the
++//! new one. Moving SEVERAL baking plates in one gesture is the case this exists for: each plate finishing
++//! its move on its own would do restore-old -> capture-new -> bake-new while the others still hold their
++//! old bakes in the ground, so with overlapping footprints (old OR new) the baselines are captured out of
++//! a terrain that is half unwound, and the old footprint of one plate can be resurrected as "ground" by
++//! the next plate's restore - the terrain left behind at the old location. Collecting the movers and
++//! running ONE ordered cascade over all of them is the only ordering that is well defined.
++std::vector<CTerrainPlateComponent*> g_bakeMoveBatch;
++//! Frame of the last plate that joined. The batch runs on the first frame after that, which is what makes
++//! it collect every plate of one gesture: a multi selection sends all its XFORM_FINISHED_EDITOR events in
++//! one frame, and a group (whose children get no such event at all) settles all its children in one frame.
++uint32 g_bakeMoveBatchFrameId = 0;
++
+ //! Safety valve for the probe repair loop. A bake repair is a user visible cost (a mesh regeneration, a
+ //! SetTerrainElevation, a sector rebuild), so a configuration that repairs itself over and over has to
+ //! say so and then stop doing it at full rate, rather than eat the frame time in silence. The plate is
+@@ -236,6 +249,27 @@ int CTerrainPlateComponent::GetSettleFrames()
+ 	return max(0, g_terrainPlateSettleFrames);
+ }
+ 
++bool CTerrainPlateComponent::WantsBakeMoveBatch() const
++{
++	// A plate that does not write the terrain has no footprint to unwind and no ordering to respect, so it
++	// keeps the plain path. A torn down plate must not bake again at all (report 18, B2).
++	return m_bBakeIntoTerrain && !m_bBakeTornDown && m_pEntity != nullptr;
++}
++
++int CTerrainPlateComponent::GetEffectiveSettleFrames() const
++{
++	if (WantsBakeMoveBatch())
++	{
++		// A baking plate can never take the immediate path: whatever moved it, its old footprint is still
++		// in the ground and has to be restored together with every other plate that moved in the same
++		// gesture. So the deferral is mandatory here, e_TerrainPlateSettleFrames 0 cannot switch it off,
++		// and Update During Drag only means "wait one frame", not "do it now".
++		return m_bUpdateDuringDrag ? 1 : max(1, GetSettleFrames());
++	}
++
++	return GetSettleFrames();
++}
++
+ int CTerrainPlateComponent::GetBakeProbeFrames()
+ {
+ 	return max(0, g_terrainPlateBakeProbeFrames);
+@@ -845,7 +879,7 @@ Cry::Entity::EventFlags CTerrainPlateComponent::GetEventMask() const
+ 
+ 	// Only ticked while a rebuild was throttled away or held back, while the first bake is still owed,
+ 	// or while a live bake has to be watched - so a plate that is not baking costs nothing per frame.
+-	if (m_bRegenPending || m_bDeferredXformPending || m_bInitialBakePending
++	if (m_bRegenPending || m_bDeferredXformPending || m_bBakeMoveBatchPending || m_bInitialBakePending
+ 	    || (m_bBakeIntoTerrain && (GetBakeProbeFrames() > 0 || GetPlateDebugLevel() >= 1)))
+ 	{
+ 		bitFlags |= ENTITY_EVENT_UPDATE;
+@@ -911,7 +945,16 @@ void CTerrainPlateComponent::ProcessEvent(const SEntityEvent& event)
+ 			// parent driven moves (ENTITY_XFORM_FROM_PARENT without the editor bit) keep the old path.
+ 			const bool bEditorTransform = (event.nParam[0] & ENTITY_XFORM_EDITOR) != 0;
+ 
+-			if (bEditorTransform && !m_bUpdateDuringDrag)
++			// P14: for a BAKING plate the editor bit is not the right test, and neither is Update During
++			// Drag. Whatever moved the plate - the gizmo, a group or a prefab parent moving its children
++			// (CEntity::InvalidateTM propagates with ENTITY_XFORM_FROM_PARENT, Entity.cpp:840, and
++			// AttachChild / DetachChild send it with no editor bit at all, Entity.cpp:539-542), TrackView,
++			// or a script - the plate is now somewhere else while its bake is still in the ground where it
++			// used to be. That restore has to be ordered against every other plate that moved with it, and
++			// the only place that ordering exists is the move batch. So ANY transform of a baking plate
++			// arms the settle countdown, and the batch does the work. Nothing here can be triggered by our
++			// own rebuild: RegenerateMesh never moves the entity.
++			if (WantsBakeMoveBatch() || (bEditorTransform && !m_bUpdateDuringDrag))
+ 			{
+ 				m_bDeferredXformPending = true;
+ 				m_lastXformFrameId = gEnv->nMainFrameID;
+@@ -951,14 +994,35 @@ void CTerrainPlateComponent::ProcessEvent(const SEntityEvent& event)
+ 
+ 			DrawBakeDebug();
+ 
++			// The move batch runs one frame after the last plate joined it, so that a whole gesture - a
++			// multi selection, whose XFORM_FINISHED_EDITOR events all arrive in one frame, or a group,
++			// whose children get none and settle together instead - lands in a single ordered pass.
++			// Deliberately NOT gated on the cascade quiet frames or on the runaway backoff: those exist to
++			// stop the POLLING reacting to our own writes (report 18, B3), and a batch is a real user
++			// move that must never be swallowed.
++			if (m_bBakeMoveBatchPending && gEnv->nMainFrameID != g_bakeMoveBatchFrameId)
++			{
++				FlushBakeMoveBatch();
++			}
++
+ 			// Settle fallback for the deferred path: flush once no transform has been seen for N frames,
+ 			// in case ENTITY_EVENT_XFORM_FINISHED_EDITOR never arrives (@see FlushDeferredTransform).
+-			const int settleFrames = GetSettleFrames();
++			// That is not only the gizmo-only and typed-in-the-panel cases of report 09: a plate inside a
++			// GROUP never gets the event either, because CSelectionGroup::ObjectModified only walks the
++			// selected objects and only sends it to OBJTYPE_ENTITY ones (SelectionGroup.cpp:646-668), and
++			// the selected object of a group move is the OBJTYPE_GROUP.
++			const int settleFrames = GetEffectiveSettleFrames();
+ 			const bool bSettled = m_bDeferredXformPending && settleFrames > 0
+ 			                      && (int)(gEnv->nMainFrameID - m_lastXformFrameId) >= settleFrames;
+ 
+-			// One rebuild clears both flags, so the two reasons never cost two rebuilds.
+-			if (m_bRegenPending || bSettled)
++			// One rebuild clears both flags, so the two reasons never cost two rebuilds. A settled baking
++			// plate goes through FlushDeferredTransform, which puts it in the batch instead of rebuilding
++			// on its own.
++			if (bSettled)
++			{
++				FlushDeferredTransform();
++			}
++			else if (m_bRegenPending)
+ 			{
+ 				RegenerateMesh();
+ 				m_pEntity->UpdateComponentEventMask(this);
+@@ -1075,6 +1139,21 @@ void CTerrainPlateComponent::RequestRegenerate()
+ 
+ void CTerrainPlateComponent::FlushDeferredTransform()
+ {
++	// A baking plate does not rebuild here. Its old footprint is still in the terrain and the restore has
++	// to be ordered against every other plate that moved in the same gesture, so it joins the move batch
++	// and the batch runs the whole thing once, next frame. @see FlushBakeMoveBatch.
++	if (WantsBakeMoveBatch())
++	{
++		m_bDeferredXformPending = false;   // consumed: the batch owns the rebuild from here
++		JoinBakeMoveBatch();
++
++		if (m_pEntity != nullptr)
++		{
++			m_pEntity->UpdateComponentEventMask(this);
++		}
++		return;
++	}
++
+ 	// Runs the whole rebuild that the drag held back: the weld against the terrain, the physics trimesh
+ 	// and, when the geometry really changed, the shadow cache invalidation. Deliberately not
+ 	// RequestRegenerate: the gesture is over, so there is nothing left to coalesce with and the user is
+@@ -2274,8 +2353,10 @@ void CTerrainPlateComponent::RestoreBakeOnTeardown()
+ 
+ 	// Out of the registry FIRST, so that nothing can start an overlap cascade on a plate that is on its
+ 	// way out (a cascade regenerates the mesh of every plate it touches). The restore below is then a
+-	// plain one.
++	// plain one. Out of the move batch with it, or the batch would hold a pointer to a component that is
++	// being destructed.
+ 	UnregisterPlate();
++	LeaveBakeMoveBatch();
+ 
+ 	// The one diagnostic the delete path never had. "no live bake" here says the plate believed it had
+ 	// nothing in the terrain, which is the only way a delete can leave the bake behind now that the
+@@ -2627,6 +2708,11 @@ void CTerrainPlateComponent::PollBake()
+ 	if (!m_bBakeApplied || m_bakeProbes.empty())
+ 		return;
+ 
++	// The batch is about to restore this plate's old footprint and re-bake it at the new one. Reacting to
++	// the terrain in the meantime would repair a bake that is on its way out.
++	if (m_bBakeMoveBatchPending || m_bDeferredXformPending)
++		return;
++
+ 	const int probeFrames = GetBakeProbeFrames();
+ 	if (probeFrames <= 0)
+ 		return;
+@@ -2650,6 +2736,11 @@ void CTerrainPlateComponent::PollBake()
+ 	if (!metrics.IsValid())
+ 		return;
+ 
++	// Second line of defence, before anything else is believed: if the rect this plate holds in the terrain
++	// is nowhere near where the plate now is, a transform was missed and the old footprint is an orphan.
++	if (HealOrphanedBakeRect(metrics))
++		return;
++
+ 	// Changing a bake cvar moves nothing in the terrain, so the probes below - which compare the terrain
+ 	// against the heights this plate last wrote - can never see it. Compare the values the live bake was
+ 	// computed with instead, so the two knobs can be A / B'd from the console without re-ticking Bake.
+@@ -2677,6 +2768,41 @@ void CTerrainPlateComponent::PollBake()
+ 	m_bBakeRunawayWarned = false;
+ }
+ 
++bool CTerrainPlateComponent::HealOrphanedBakeRect(const SBakeTerrainMetrics& metrics)
++{
++	if (!m_bBakeApplied || m_bakeRectSize <= 0 || m_bBakeTornDown || !metrics.IsValid())
++		return false;
++
++	int x1 = 0, y1 = 0, size = 0;
++	if (!ComputeBakeRect(metrics, GetPlateWorldTM(), x1, y1, size))
++		return false;   // no usable footprint right now; ApplyBake's own skip paths report that
++
++	// Only a COMPLETE separation counts. A plate that has drifted by a few units still overlaps its own
++	// rect, and the ordinary restore-and-re-bake handles that perfectly well; this is about a plate that
++	// has ended up somewhere else entirely while its relief stayed behind in the ground, which is what a
++	// transform event nobody handled looks like from here.
++	const bool bOverlaps = (x1 < m_bakeRectX1 + m_bakeRectSize) && (m_bakeRectX1 < x1 + size)
++	                       && (y1 < m_bakeRectY1 + m_bakeRectSize) && (m_bakeRectY1 < y1 + size);
++	if (bOverlaps)
++		return false;
++
++	// Loud, always, not only under the debug cvar: reaching this means an event path was missed, and a
++	// missed event that heals itself in silence is a bug that never gets reported. The baseline and the
++	// rect are both stored, so the repair itself is one SetTerrainElevation.
++	CryWarning(VALIDATOR_MODULE_ENTITYSYSTEM, VALIDATOR_WARNING,
++	           "Terrain Plate '%s': orphan-restored. The bake this plate holds in the terrain at units (%d,%d)+%d does not touch "
++	           "the footprint the plate now has at (%d,%d)+%d, so a transform of this plate was never seen by the component. The "
++	           "orphaned ground has been put back and the plate re-baked where it actually is. Please report this along with what "
++	           "was being done to the plate at the time.",
++	           GetPlateName(), m_bakeRectX1, m_bakeRectY1, m_bakeRectSize, x1, y1, size);
++
++	// RegenerateMesh restores the stored rect first (RestoreBakeBaseline still holds the OLD rect and the
++	// OLD baseline, which is exactly what has to be undone), then re-welds and bakes at the new place,
++	// cascading into anything the new footprint shares ground with.
++	RegenerateMesh();
++	return true;
++}
++
+ void CTerrainPlateComponent::ReapplyBakeAfterExternalEdit(const SBakeTerrainMetrics& metrics)
+ {
+ 	const int dim = m_bakeRectSize + 1;
+@@ -2866,29 +2992,39 @@ void CTerrainPlateComponent::UnregisterPlate()
+ 	}
+ }
+ 
+-bool CTerrainPlateComponent::GetBakeCascadeRect(int& outX1, int& outY1, int& outSize) const
++void CTerrainPlateComponent::GetBakeCascadeRects(std::vector<int>& outRects) const
+ {
+ 	if (!m_bBakeIntoTerrain || m_bBakeTornDown || m_pEntity == nullptr)
+-		return false;
++		return;
+ 
+-	// A plate that already holds a bake is asked for the rect it holds; one that has not baked yet (a
+-	// level that is still loading, or a plate whose Bake Into Terrain was just ticked) is asked for the
+-	// rect it is about to take. Both have to take part in the cascade, otherwise whichever plate baked
+-	// first would capture the other one's ground as its baseline and the composite would depend on the
+-	// order the entity system happened to tick them in.
++	const SBakeTerrainMetrics metrics = GetBakeTerrainMetrics();
++	if (!metrics.IsValid())
++		return;
++
++	// The live footprint, if the terrain is holding one. For a plate that has just been moved this is the
++	// OLD one, which is exactly the rect whose neighbours have to be unwound with it - the half that was
++	// missing before P14, when the cascade asked each plate for a single rect and took the live one
++	// as soon as there was one.
+ 	if (m_bBakeApplied && m_bakeRectSize > 0)
+ 	{
+-		outX1 = m_bakeRectX1;
+-		outY1 = m_bakeRectY1;
+-		outSize = m_bakeRectSize;
+-		return true;
++		outRects.push_back(m_bakeRectX1);
++		outRects.push_back(m_bakeRectY1);
++		outRects.push_back(m_bakeRectSize);
+ 	}
+ 
+-	const SBakeTerrainMetrics metrics = GetBakeTerrainMetrics();
+-	if (!metrics.IsValid())
+-		return false;
+-
+-	return ComputeBakeRect(metrics, GetPlateWorldTM(), outX1, outY1, outSize);
++	// The footprint the plate is about to take. Identical to the live one for a plate that has not moved,
++	// in which case it is dropped: that is the ordinary case and it must stay a single rect.
++	int x1 = 0, y1 = 0, size = 0;
++	if (ComputeBakeRect(metrics, GetPlateWorldTM(), x1, y1, size))
++	{
++		if (outRects.size() < 3 || outRects[outRects.size() - 3] != x1
++		    || outRects[outRects.size() - 2] != y1 || outRects[outRects.size() - 1] != size)
++		{
++			outRects.push_back(x1);
++			outRects.push_back(y1);
++			outRects.push_back(size);
++		}
++	}
+ }
+ 
+ bool CTerrainPlateComponent::BakesBefore(const CTerrainPlateComponent& other) const
+@@ -2909,42 +3045,46 @@ void CTerrainPlateComponent::CollectBakeCascadeSet(std::vector<CTerrainPlateComp
+ {
+ 	out.clear();
+ 
+-	int x1 = 0, y1 = 0, size = 0;
+-	if (!GetBakeCascadeRect(x1, y1, size))
++	// Every rect the members of the set occupy, as (x1, y1, size) triples. A plate contributes two of them
++	// while it is between a move and its rebuild - the footprint it still holds and the one it is taking -
++	// so both the ground it is leaving and the ground it is landing on pull their neighbours in.
++	std::vector<int> rects;
++	GetBakeCascadeRects(rects);
++	if (rects.empty())
+ 		return;
+ 
+-	std::vector<int> rects;   // x1, y1, size per entry, parallel to out
+ 	out.push_back(const_cast<CTerrainPlateComponent*>(this));
+-	rects.push_back(x1);
+-	rects.push_back(y1);
+-	rects.push_back(size);
+ 
+ 	// Transitive closure over rect intersection: a third plate that only overlaps the second one still
+ 	// has to be unwound, because the second one's baseline will be re-captured from ground the third one
+ 	// is sitting on. Quadratic in the number of baking plates, but it only runs when a bake actually
+ 	// changes and the count is a handful.
+-	for (size_t i = 0; i < out.size() && out.size() < kBakeCascadeMaxPlates; ++i)
++	for (size_t i = 0; i < rects.size() && out.size() < kBakeCascadeMaxPlates; i += 3)
+ 	{
+-		const int ax1 = rects[i * 3], ay1 = rects[i * 3 + 1], aSize = rects[i * 3 + 2];
++		// By value: the inner loop appends to rects and would invalidate a reference into it.
++		const int ax1 = rects[i], ay1 = rects[i + 1], aSize = rects[i + 2];
+ 
+ 		for (CTerrainPlateComponent* pOther : g_terrainPlates)
+ 		{
+ 			if (std::find(out.begin(), out.end(), pOther) != out.end())
+ 				continue;
+ 
+-			int bx1 = 0, by1 = 0, bSize = 0;
+-			if (!pOther->GetBakeCascadeRect(bx1, by1, bSize))
+-				continue;
++			std::vector<int> otherRects;
++			pOther->GetBakeCascadeRects(otherRects);
++
++			bool bOverlaps = false;
++			for (size_t j = 0; j + 2 < otherRects.size() && !bOverlaps; j += 3)
++			{
++				const int bx1 = otherRects[j], by1 = otherRects[j + 1], bSize = otherRects[j + 2];
++				bOverlaps = (ax1 < bx1 + bSize) && (bx1 < ax1 + aSize)
++				            && (ay1 < by1 + bSize) && (by1 < ay1 + aSize);
++			}
+ 
+-			const bool bOverlaps = (ax1 < bx1 + bSize) && (bx1 < ax1 + aSize)
+-			                       && (ay1 < by1 + bSize) && (by1 < ay1 + aSize);
+ 			if (!bOverlaps)
+ 				continue;
+ 
+ 			out.push_back(pOther);
+-			rects.push_back(bx1);
+-			rects.push_back(by1);
+-			rects.push_back(bSize);
++			rects.insert(rects.end(), otherRects.begin(), otherRects.end());
+ 
+ 			if (out.size() >= kBakeCascadeMaxPlates)
+ 				break;
+@@ -2991,6 +3131,20 @@ void CTerrainPlateComponent::ApplyBakeCascaded()
+ 		return;
+ 	}
+ 
++	RunBakeCascade(affected, this, "overlap cascade");
++}
++
++void CTerrainPlateComponent::RunBakeCascade(std::vector<CTerrainPlateComponent*>& affected,
++                                            CTerrainPlateComponent* pSeed, const char* szReason)
++{
++	if (affected.empty() || g_bakeCascadeDepth > 0)
++		return;
++
++	// The set is sorted here rather than by the callers, so that the invariant "restored in the exact
++	// inverse of the order they were applied in" belongs to this one function.
++	std::stable_sort(affected.begin(), affected.end(),
++	                 [](const CTerrainPlateComponent* pA, const CTerrainPlateComponent* pB) { return pA->BakesBefore(*pB); });
++
+ 	// The cascade. Every plate captures its baseline from the terrain as it finds it, so the only way a
+ 	// composite is well defined is to unwind the whole overlapping set and re-apply it in one order:
+ 	//
+@@ -3002,6 +3156,10 @@ void CTerrainPlateComponent::ApplyBakeCascaded()
+ 	//
+ 	// The re-bake goes through RegenerateMesh, not ApplyBake, because the ground under a plate moved and
+ 	// the edge weld of its mesh is solved against that ground.
++	//
++	// The move batch feeds the same driver a set built from SEVERAL movers instead of one seed, which is
++	// what makes N plates moving together one ordered unwind rather than N interleaved ones. Every mover
++	// is in the set even when its new position overlaps nothing, so its old footprint is always restored.
+ 	++g_bakeCascadeDepth;
+ 
+ 	for (size_t i = affected.size(); i-- > 0; )
+@@ -3032,10 +3190,10 @@ void CTerrainPlateComponent::ApplyBakeCascaded()
+ 		pPlate->RegenerateMesh();
+ 		pPlate->m_lastBakeProbeFrameId = gEnv->nMainFrameID;
+ 
+-		if (pPlate != this)
++		if (pSeed != nullptr && pPlate != pSeed)
+ 		{
+-			pPlate->LogBakeOverlapOnce(*this);
+-			LogBakeOverlapOnce(*pPlate);
++			pPlate->LogBakeOverlapOnce(*pSeed);
++			pSeed->LogBakeOverlapOnce(*pPlate);
+ 		}
+ 	}
+ 
+@@ -3057,11 +3215,123 @@ void CTerrainPlateComponent::ApplyBakeCascaded()
+ 
+ 	if (GetPlateDebugLevel() >= 1)
+ 	{
+-		CryLog("TerrainPlate '%s': overlap cascade over %d plates, restored highest priority first and re-baked lowest priority first",
+-		       (m_pEntity != nullptr) ? m_pEntity->GetName() : "?", (int)affected.size());
++		CryLog("TerrainPlate '%s': %s over %d plates, restored highest priority first and re-baked lowest priority first",
++		       (pSeed != nullptr) ? pSeed->GetPlateName() : "<batch>", szReason, (int)affected.size());
++	}
++}
++
++void CTerrainPlateComponent::JoinBakeMoveBatch()
++{
++	if (m_bBakeMoveBatchPending)
++	{
++		// Already queued. Do NOT re-stamp the batch frame here: a plate that keeps being nudged would
++		// otherwise push the flush out for ever and the old footprint would sit in the ground indefinitely.
++		return;
++	}
++
++	m_bBakeMoveBatchPending = true;
++	g_bakeMoveBatch.push_back(this);
++	g_bakeMoveBatchFrameId = gEnv->nMainFrameID;
++
++	// Everything else that is still holding a deferred transform belongs to the same gesture as far as the
++	// terrain is concerned, and has to land in THIS batch rather than form a second one that would restore
++	// its old footprints after ours have already been re-baked over. This is the mixed selection: a plain
++	// plate gets ENTITY_EVENT_XFORM_FINISHED_EDITOR on mouse up and joins immediately, while a plate inside
++	// a GROUP gets no such event and is still counting settle frames (SelectionGroup.cpp:646-668 only sends
++	// it to the selected OBJTYPE_ENTITY objects, and the selected object of a group move is the group). So
++	// their settle is pulled forward to the next tick, and the flush - one frame after the last join -
++	// waits for them by construction.
++	for (CTerrainPlateComponent* pOther : g_terrainPlates)
++	{
++		if (pOther == this || !pOther->m_bDeferredXformPending || !pOther->WantsBakeMoveBatch())
++			continue;
++
++		pOther->m_lastXformFrameId = gEnv->nMainFrameID - (uint32)max(1, pOther->GetEffectiveSettleFrames());
+ 	}
+ }
+ 
++void CTerrainPlateComponent::LeaveBakeMoveBatch()
++{
++	m_bBakeMoveBatchPending = false;
++
++	auto it = std::find(g_bakeMoveBatch.begin(), g_bakeMoveBatch.end(), this);
++	if (it != g_bakeMoveBatch.end())
++	{
++		g_bakeMoveBatch.erase(it);
++	}
++}
++
++void CTerrainPlateComponent::FlushBakeMoveBatch()
++{
++	if (g_bakeMoveBatch.empty() || g_bakeCascadeDepth > 0)
++		return;
++
++	// Wait for anything that is still mid-gesture. Component update order is whatever the entity system
++	// happened to register, so "one frame after the last join" on its own would let the plate that ticks
++	// first run the batch in the same frame a straggler is about to join it. This makes the rule order
++	// independent: no baking plate anywhere is still holding a transform it has not handed over. It cannot
++	// hang - JoinBakeMoveBatch pulls every such plate's settle forward to the next tick, and a baking
++	// plate's settle window is always at least one frame (@see GetEffectiveSettleFrames).
++	for (CTerrainPlateComponent* pOther : g_terrainPlates)
++	{
++		if (pOther->m_bDeferredXformPending && pOther->WantsBakeMoveBatch())
++			return;
++	}
++
++	// Drain the queue first: everything below regenerates meshes and writes the terrain, and must not be
++	// able to re-enter the batch it is draining.
++	std::vector<CTerrainPlateComponent*> movers;
++	movers.swap(g_bakeMoveBatch);
++
++	for (CTerrainPlateComponent* pMover : movers)
++	{
++		pMover->m_bBakeMoveBatchPending = false;
++
++		// The flag is one of the reasons a plate subscribes to ENTITY_EVENT_UPDATE, so a plate that only
++		// ticks because of it has to be allowed to stop ticking again.
++		if (pMover->m_pEntity != nullptr)
++		{
++			pMover->m_pEntity->UpdateComponentEventMask(pMover);
++		}
++	}
++
++	// The set is the union of each mover's cascade closure. A mover's closure is taken from BOTH the
++	// footprint it still holds and the one it is about to take (@see GetBakeCascadeRects), so a plate that
++	// only touches the ground a mover is leaving, and a plate that only touches the ground a mover is
++	// landing on, are both unwound with it. A mover that overlaps nothing at all is still its own closure
++	// of one, which is what guarantees its old footprint is restored rather than orphaned.
++	std::vector<CTerrainPlateComponent*> affected;
++	std::vector<CTerrainPlateComponent*> closure;
++
++	for (CTerrainPlateComponent* pMover : movers)
++	{
++		if (!pMover->WantsBakeMoveBatch())
++			continue;
++
++		pMover->CollectBakeCascadeSet(closure);
++
++		for (CTerrainPlateComponent* pPlate : closure)
++		{
++			if (affected.size() >= kBakeCascadeMaxPlates)
++				break;
++
++			if (std::find(affected.begin(), affected.end(), pPlate) == affected.end())
++			{
++				affected.push_back(pPlate);
++			}
++		}
++	}
++
++	if (affected.empty())
++		return;
++
++	// One ordered unwind for the whole gesture: restore every old footprint (descending priority, from the
++	// stored baselines), regenerate every mesh, re-capture every baseline at the new footprint, re-bake
++	// (ascending priority), then the composite refresh of report 18 B3. RunBakeCascade is the same driver
++	// the single plate overlap cascade uses - there is deliberately no second implementation.
++	RunBakeCascade(affected, nullptr, "move batch");
++}
++
+ void CTerrainPlateComponent::InvalidateShadowCache()
+ {
+ 	// The static shadow cache (e_ShadowsCache*) and HeightMap AO are baked from the static caster list
+diff --git a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
+index dc114c47..b930035d 100644
+--- a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
++++ b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
+@@ -297,6 +297,15 @@ protected:
+ 	//! Frames without an ENTITY_EVENT_XFORM after which a held back rebuild is run anyway, from
+ 	//! e_TerrainPlateSettleFrames. 0 disables the fallback (only the mouse up event flushes).
+ 	static int  GetSettleFrames();
++	//! Settle window this plate actually uses. A BAKING plate can never run without one: it holds a
++	//! footprint in the terrain that has to be restored in step with every other plate moving in the same
++	//! gesture, and that ordering only exists in the move batch. So a baking plate always waits at least
++	//! one frame, whatever e_TerrainPlateSettleFrames or Update During Drag say; Update During Drag only
++	//! shortens the wait to that single frame.
++	int         GetEffectiveSettleFrames() const;
++	//! True when this plate has a live or prospective footprint in the terrain, i.e. when a transform of
++	//! it has to go through the move batch instead of straight into a rebuild.
++	bool        WantsBakeMoveBatch() const;
+ 	//! True when the mesh depends on the entity transform (weld, skirt, or Spacing grid mode).
+ 	bool        NeedsRegenerateOnTransform() const;
+ 	//! World transform of the plate slot, also valid before the slot exists.
+@@ -367,9 +376,11 @@ protected:
+ 	//! load / unload without any level or editor hook.
+ 	void  RegisterPlate();
+ 	void  UnregisterPlate();
+-	//! Sector aligned rect this plate occupies in the terrain: the live one if a bake is applied, the
+-	//! one it would take otherwise. False when the plate does not bake or has no usable footprint.
+-	bool  GetBakeCascadeRect(int& outX1, int& outY1, int& outSize) const;
++	//! Every rect this plate occupies as far as the cascade is concerned, appended as (x1, y1, size)
++	//! triples: the LIVE one it currently holds in the terrain, and - when the plate has since been moved
++	//! or rescaled - also the PROSPECTIVE one it is about to take. A move has to unwind both, or the set
++	//! misses whichever plates the mover is leaving behind or landing on.
++	void  GetBakeCascadeRects(std::vector<int>& outRects) const;
+ 	//! Every baking plate transitively connected to this one by an overlapping rect, this one included,
+ 	//! sorted by Bake Priority and then by entity GUID.
+ 	void  CollectBakeCascadeSet(std::vector<CTerrainPlateComponent*>& out) const;
+@@ -378,6 +389,25 @@ protected:
+ 	//! ApplyBake for a plate that owns its footprint alone, the whole restore / re-bake cascade when it
+ 	//! shares it with another baking plate. This is what RegenerateMesh calls.
+ 	void  ApplyBakeCascaded();
++	//! The cascade driver itself, shared by ApplyBakeCascaded and the move batch: restore every member's
++	//! footprint in DESCENDING priority, regenerate and re-bake in ASCENDING priority, then refresh every
++	//! member's composite expectation. The set is sorted here, so callers only have to collect it.
++	static void RunBakeCascade(std::vector<CTerrainPlateComponent*>& affected, CTerrainPlateComponent* pSeed, const char* szReason);
++
++	// ------------------------------------------------------- move batch (P14: several plates at once)
++	//! Puts this plate on the list of plates whose move still owes a restore / re-bake, and pulls the
++	//! settle of every other deferring baking plate forward so that one gesture produces ONE batch.
++	void        JoinBakeMoveBatch();
++	//! Takes this plate off that list. Called from the teardown, before the pointer can go stale.
++	void        LeaveBakeMoveBatch();
++	//! Restores the OLD footprints of every plate that moved in the same gesture, then regenerates and
++	//! re-bakes them together through RunBakeCascade. Runs once for the whole batch, one frame after the
++	//! last plate joined, so a multi selection or a group cannot interleave its restores and its bakes.
++	static void FlushBakeMoveBatch();
++	//! Second line of defence against a missed transform: when the rect this plate holds in the terrain
++	//! no longer touches the footprint the plate now has, the old one is an orphan nobody will ever
++	//! restore. Puts it back and re-bakes where the plate really is. Warns loudly - this is a bug report.
++	bool  HealOrphanedBakeRect(const SBakeTerrainMetrics& metrics);
+ 	//! Logs once that this plate shares its footprint with another one, now that the cascade handles it.
+ 	void  LogBakeOverlapOnce(const CTerrainPlateComponent& other);
+ 	//! Relief of the plate at a local XY, in the unit plate's 0..1 local Z. Reproduces the surface
+@@ -434,6 +464,9 @@ protected:
+ 	bool                     m_bRegenPending = false;
+ 	//! True while a rebuild is held back until the end of an editor transform gesture.
+ 	bool                     m_bDeferredXformPending = false;
++	//! True while this plate is waiting in the move batch, i.e. the terrain still holds its bake at the
++	//! footprint it had BEFORE the move and the batch has not run yet.
++	bool                     m_bBakeMoveBatchPending = false;
+ 	//! Frame of the last ENTITY_EVENT_XFORM that was held back, for the settle fallback.
+ 	uint32                   m_lastXformFrameId = 0;
+ 	bool                     m_bBudgetWarningIssued = false;
+-- 
+2.47.1.windows.1
+

@@ -1,0 +1,185 @@
+From 5ee5ae44b5ef08abd19adc5bed1ce1dd1d18986a Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Wed, 2 Sep 2026 05:14:16 +0800
+Subject: [PATCH 262/307] !F (Terrain Plate) Add per-plate bake offset.
+
+Add a plate-specific bake adjustment that is zero at the welded edge and grows
+with relief toward the crest. This closes local gaps without translating the
+entire footprint or changing the global bake epsilon.
+---
+ .../Geometry/TerrainPlateComponent.cpp        | 80 +++++++++++++++++--
+ .../Geometry/TerrainPlateComponent.h          | 20 +++++
+ 2 files changed, 92 insertions(+), 8 deletions(-)
+
+diff --git a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
+index 865a4fc6..d2d40a4c 100644
+--- a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
++++ b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
+@@ -2323,6 +2323,10 @@ void CTerrainPlateComponent::ComputeBakeBlock(const SBakeTerrainMetrics& metrics
+ 	outMinDelta = 0.f;
+ 	outMaxDelta = 0.f;
+ 
++	// The crest of the relief this bake produces, filled in by the cell loop and consumed by
++	// ApplyBakeOffset afterwards. @see ApplyBakeOffset for why the Bake Offset needs it.
++	float maxRelief = 0.f;
++
+ 	const Vec3 worldScale = GetWorldScale();
+ 
+ 	// Falloff band, in the same measure the edge weld uses: the distance to the nearest plate border as
+@@ -2495,18 +2499,76 @@ void CTerrainPlateComponent::ComputeBakeBlock(const SBakeTerrainMetrics& metrics
+ 				weight *= coverage;
+ 
+ 			const float value = baseline + (combined - baseline) * weight;
+-			const float delta = value - baseline;
+ 
+-			if (fabs_tpl(delta) > 0.0001f)
+-			{
+-				++outCellsWritten;
+-				outMinDelta = min(outMinDelta, delta);
+-				outMaxDelta = max(outMaxDelta, delta);
+-			}
++			maxRelief = max(maxRelief, value - baseline);
+ 
+ 			m_bakeResult[index] = value;
+ 		}
+ 	}
++
++	ApplyBakeOffset(maxRelief);
++
++	// The delta accounting is deliberately after the offset pass: what it reports is what
++	// WriteTerrainBlock is about to put in the ground, offset included.
++	for (size_t index = 0; index < m_bakeResult.size(); ++index)
++	{
++		const float delta = m_bakeResult[index] - m_bakeBaseline[index];
++
++		if (fabs_tpl(delta) > 0.0001f)
++		{
++			++outCellsWritten;
++			outMinDelta = min(outMinDelta, delta);
++			outMaxDelta = max(outMaxDelta, delta);
++		}
++	}
++}
++
++//! Bake Offset (user request 2026-09-01). NOT a flat additive offset: the user asked for a knob that
++//! leaves the welded seam alone and lifts the MAXIMUM, so the shape is scaled rather than translated.
++//!
++//!   relief(cell) = bakedHeight(cell) - baseline(cell)      // what the bake raised this cell by
++//!   height(cell) += BakeOffset * saturate(relief / maxRelief)
++//!
++//! with maxRelief the largest relief this bake produced anywhere in the footprint. At the rim relief is
++//! 0 - both the falloff weight and, in Raise mode, the max with the baseline see to that - so the term
++//! is exactly 0 there and decision 04 rule 2 (the border of the footprint IS the baseline) survives
++//! untouched, with no rim weighting of its own needed. At the crest the term is the full Bake Offset,
++//! which is why the panel value reads in metres "at the highest point". In between it is linear in the
++//! relief, so the whole baked shape is pulled towards the plate mesh (positive) or away from it
++//! (negative) in proportion to how high it stands.
++//!
++//! Two clamps:
++//!  * saturate() drops cells the bake LOWERED (RaiseAndLower digging a valley, relief < 0) to a factor
++//!    of 0. Raising the floor of a cut by the crest's offset would be meaningless, and it keeps the
++//!    dug side of the plate exactly where the plain bake put it.
++//!  * in Raise mode the result is floored at the baseline, so a negative offset larger than the relief
++//!    cannot turn the mode that "can only ever add ground" into one that digs.
++void CTerrainPlateComponent::ApplyBakeOffset(float maxRelief)
++{
++	const float offset = (float)m_bakeOffset;
++
++	// A footprint the bake did not raise anywhere (a plate flat against the ground, or one that only
++	// digs) has no crest to scale against, and relief / maxRelief would be a division by zero. The
++	// offset has nothing to act on there, so it does nothing - which is also the 0 default's path.
++	if (fabs_tpl(offset) < 0.0001f || maxRelief < 0.0001f)
++		return;
++
++	for (size_t index = 0; index < m_bakeResult.size(); ++index)
++	{
++		const float baseline = m_bakeBaseline[index];
++		const float relief = m_bakeResult[index] - baseline;
++		const float factor = clamp_tpl(relief / maxRelief, 0.f, 1.f);
++
++		if (factor <= 0.f)
++			continue;
++
++		float value = m_bakeResult[index] + offset * factor;
++
++		if (m_bakeMode == ETerrainPlateBakeMode::Raise)
++			value = max(value, baseline);
++
++		m_bakeResult[index] = value;
++	}
+ }
+ 
+ bool CTerrainPlateComponent::WriteTerrainBlock(const SBakeTerrainMetrics& metrics, const std::vector<float>& heights)
+@@ -3246,6 +3308,7 @@ void CTerrainPlateComponent::BuildBakeProbes(const SBakeTerrainMetrics& metrics)
+ 	m_bakeSlopeCorrectUsed = g_terrainPlateBakeSlopeCorrect;
+ 	m_bakeEdgeAAUsed = g_terrainPlateBakeEdgeAA;
+ 	m_bakeWeldCurveUsed = g_terrainPlateBakeWeldCurve;
++	m_bakeOffsetUsed = (float)m_bakeOffset;
+ 
+ 	const int dim = m_bakeRectSize + 1;
+ 	if ((int)m_bakeResult.size() != dim * dim)
+@@ -3379,7 +3442,8 @@ void CTerrainPlateComponent::PollBake()
+ 	if (m_bakeEpsilonUsed != GetBakeEpsilonMeters()
+ 	    || m_bakeSlopeCorrectUsed != g_terrainPlateBakeSlopeCorrect
+ 	    || m_bakeEdgeAAUsed != g_terrainPlateBakeEdgeAA
+-	    || m_bakeWeldCurveUsed != g_terrainPlateBakeWeldCurve)
++	    || m_bakeWeldCurveUsed != g_terrainPlateBakeWeldCurve
++	    || m_bakeOffsetUsed != (float)m_bakeOffset)
+ 	{
+ 		ReapplyBakeAfterExternalEdit(metrics);
+ 		return;
+diff --git a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
+index 6351a969..cbc1bc1a 100644
+--- a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
++++ b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
+@@ -288,6 +288,15 @@ public:
+ 		               "Plates with the same priority are ordered by their entity GUID, so the result is the same on every load. "
+ 		               "Only matters when two baking plates overlap.",
+ 		               0);
++		desc.AddMember(&CTerrainPlateComponent::m_bakeOffset, 'boff', "BakeOffset", "Bake Offset",
++		               "Extra height in metres added to the baked terrain over this plate, on top of the global "
++		               "e_TerrainPlateBakeEpsilon. It is 0 at the welded edge and reaches the full value at the highest "
++		               "point of the relief, so the seam with the surrounding ground never moves: the baked shape is "
++		               "pulled up or pushed down proportionally to how high it stands. Positive raises the terrain "
++		               "towards the plate and closes a visible gap under the plate; negative lowers it, so terrain that "
++		               "pokes up through the plate mesh drops back below it. 0 is the plain bake. A few centimetres is "
++		               "usually enough.",
++		               0.f);
+ 
+ 		// --- Commit Bake UI parked per user 2026-09-01 (see scene-notes/terrain/reports/31-commit-ui-parked.md):
+ 		// the user asked for the stamping UI to be commented out because one component's panel is far too cluttered,
+@@ -422,6 +431,10 @@ protected:
+ 	void  CaptureBakeBaseline(const SBakeTerrainMetrics& metrics);
+ 	//! Builds m_bakeResult from m_bakeBaseline and the plate surface. Reports what it changed.
+ 	void  ComputeBakeBlock(const SBakeTerrainMetrics& metrics, const Matrix34& worldTM, int& outCellsWritten, float& outMinDelta, float& outMaxDelta);
++	//! Second pass of ComputeBakeBlock: the per plate Bake Offset, scaled by each cell's relief over the
++	//! crest of the footprint, so the welded rim does not move and the highest point moves by the full
++	//! value. Called with the crest ComputeBakeBlock measured.
++	void  ApplyBakeOffset(float maxRelief);
+ 	//! One heights-only SetTerrainElevation over the current rect.
+ 	bool  WriteTerrainBlock(const SBakeTerrainMetrics& metrics, const std::vector<float>& heights);
+ 	//! Restores the original ground over the footprint of the live bake, if there is one. Must run
+@@ -551,6 +564,9 @@ protected:
+ 	bool                                         m_bBakeIntoTerrain = false;
+ 	ETerrainPlateBakeMode                        m_bakeMode = ETerrainPlateBakeMode::Raise;
+ 	Schematyc::Range<-128, 127, -128, 127, int>  m_bakePriority = 0;
++	//! Per plate refinement of the bake height, in metres, signed. 0 at the welded rim and full value at
++	//! the crest of the relief. @see ComputeBakeBlock for the exact term.
++	Schematyc::Range<-100, 100, -1, 1, float>    m_bakeOffset = 0.f;
+ 	//! Commit Bake: the relief lives in the level's CHeightmap now, so this plate must never write the
+ 	//! terrain again and must never restore anything. Serialised, unlike m_bBakeTornDown, because the
+ 	//! commit is permanent and the panel has to keep saying so after a reload. @see OnCommitted.
+@@ -637,6 +653,10 @@ protected:
+ 	//! back to the old one for ever - the B3 bug class.
+ 	int                      m_bakeEdgeAAUsed = 0;
+ 	int                      m_bakeWeldCurveUsed = 0;
++	//! Same, for the per plate Bake Offset. A property change re-bakes through Rebuild, so this is the
++	//! belt to that braces: if the value ever reaches the component without a re-bake, PollBake sees the
++	//! mismatch and repairs instead of reading the terrain as an external edit for ever (B3).
++	float                    m_bakeOffsetUsed = 0.f;
+ 	//! A few quantisation steps of the coarsest touched sector: a height never survives a round trip
+ 	//! through SetTerrainElevation exactly.
+ 	float                    m_bakeProbeTolerance = 0.01f;
+-- 
+2.47.1.windows.1
+

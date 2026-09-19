@@ -1,0 +1,230 @@
+From 5bc046f28abf533fdc3880455088c585c91e7950 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Mon, 31 Aug 2026 15:14:12 +0800
+Subject: [PATCH 252/307] !B (Terrain Plate) Antialias bake footprints and
+ match the weld curve.
+
+Use supersampled cell coverage instead of a binary footprint edge and apply the
+same smooth rim weight used by the mesh weld. The baked outline remains stable
+across terrain LODs and follows the visible plate transition.
+---
+ .../Geometry/TerrainPlateComponent.cpp        | 126 ++++++++++++++++--
+ .../Geometry/TerrainPlateComponent.h          |   6 +
+ 2 files changed, 121 insertions(+), 11 deletions(-)
+
+diff --git a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
+index bd82db5b..a7c4d00d 100644
+--- a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
++++ b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
+@@ -120,6 +120,52 @@ ICVar* g_pTerrainPlateBakeEpsilonCVar = nullptr;
+ int    g_terrainPlateBakeSlopeCorrect = 1;
+ ICVar* g_pTerrainPlateBakeSlopeCorrectCVar = nullptr;
+ 
++//! C1, decision 06: antialias the bake's PLAN VIEW footprint with the coverage the bake already
++//! computes. Without it ComputeBakeBlock decides inside / outside pointwise AT THE TERRAIN NODE, so a
++//! cell whose node is a millimetre outside the rotated plate keeps the whole baseline while its
++//! neighbour one unit away takes the whole relief: a straight plate edge that is not axis aligned with
++//! the heightmap grid bakes as a staircase of FULL relief amplitude. At LOD >= 1 the terrain mesh
++//! samples every 2^level units, so the staircase is amplified rather than smoothed, and that is the
++//! stair the user sees once the LOD-0 appended copy stops covering it.
++//! The supersample grid over the cell already counts how many of its samples land on the plate; using
++//! that ratio as a weight turns the hard in / out decision into a proportional one, i.e. the footprint
++//! becomes coverage instead of a boolean - which is what every terrain authoring tool does, and what
++//! CRYENGINE's own road falloff (RoadObject.cpp:534-546) is the template for. We took its cosine and
++//! stopped one step short of its coverage.
++//! Safe by construction with respect to decision 04 rule 1: the weight can only ever be SCALED DOWN, so
++//! a partly covered cell can only move back TOWARDS the baseline - it can never be lifted above the plate.
++//! The coverage estimate also needs a resolution: at the minimum of 2 samples per axis a cell has only
++//! 4 coverage levels, so the staircase would merely get four treads instead of two. 4 samples per axis,
++//! i.e. 16 levels, is the floor while this is on.
++//! It changes the GROUND, not the rendering, so it fixes the stair at every LOD and with
++//! e_TerrainIntegrateObjectsFull 0 as well.
++//! Escape hatch: e_TerrainPlateBakeEdgeAA 0 restores the pointwise test bit for bit (and the old sample
++//! count). It needs a rebake, which the cvar compare in PollBake performs by itself.
++int    g_terrainPlateBakeEdgeAA = 1;
++ICVar* g_pTerrainPlateBakeEdgeAACVar = nullptr;
++
++//! C2b, decision 06: make the bake's rim curve the same curve the mesh edge weld uses.
++//! The plate mesh is welded to the ground with weight = 1 - smoothstep(d / falloff) towards the sampled
++//! terrain (@see the edge weld block in the mesh generator), while the bake ramped the relief in with a
++//! cosine over the same band. Two different S curves over one band do not agree: the cosine runs up to
++//! about 1 % of the relief ABOVE the matching smoothstep in the inner half of the band, which on a plate
++//! with a few metres of relief is a few centimetres of terrain poking through the plate mesh - in
++//! patches, because which of the two wins also depends on the terrain quad twist. While the LOD-0
++//! appended copy exists it hides the fight; when the copy goes, that intersection is the band the user
++//! reports.
++//! With the curves matched the algebra closes. Writing w for the weld's pull weight and taking the
++//! baseline as the terrain the weld samples, meshZ - bakeZ = (plateZ - bakeZ) * (1 - w) - sink, and the
++//! first term is non negative wherever the plate is above the ground: the terrain is under the mesh
++//! everywhere in the band except inside the sink sub band.
++//! The 0.1 m Weld Sink is deliberately NOT mirrored into the bake. The sink exists precisely so that the
++//! outer ring of the plate ends BELOW the ground and no light leaks under the border; baking the same
++//! sink into the terrain would put the ring back onto the terrain surface and undo it. So the one place
++//! the terrain is above the mesh is the outer quarter of the band, by design, and it is bounded by Weld
++//! Sink - not the unbounded fraction of the relief the curve mismatch produced.
++//! Escape hatch: e_TerrainPlateBakeWeldCurve 0 restores the cosine.
++int    g_terrainPlateBakeWeldCurve = 1;
++ICVar* g_pTerrainPlateBakeWeldCurveCVar = nullptr;
++
+ //! Bake trigger / bake apply tracing. The bake chain has a dozen places where it can legitimately do
+ //! nothing (the property is off, the level's terrain is not in yet, the footprint is empty, the write
+ //! was refused), and until this cvar existed every one of them was a silent return: the user ticked
+@@ -208,6 +254,28 @@ void RegisterTerrainPlateCVars()
+ 	                                                     "0 - plain Min filter: conservative (it can never leave terrain above the plate) but it\n"
+ 	                                                     "    buries anything drawn on the baked terrain surface on a slope");
+ 
++	g_pTerrainPlateBakeEdgeAACVar = REGISTER_CVAR2("e_TerrainPlateBakeEdgeAA", &g_terrainPlateBakeEdgeAA, 1, VF_NULL,
++	                                               "Terrain Plate component with Bake Into Terrain = true: weight the baked relief of every\n"
++	                                               "terrain cell by how much of that cell the plate actually covers in plan, instead of\n"
++	                                               "deciding inside / outside at the cell node only. Without it a straight plate edge that is\n"
++	                                               "not aligned to the heightmap grid bakes as a one cell staircase carrying the FULL relief,\n"
++	                                               "which the coarser terrain LODs amplify rather than smooth.\n"
++	                                               "1 - default: the footprint is coverage, so the edge bakes as a one cell ramp that stays\n"
++	                                               "    straight in plan. Forces at least 4 x 4 bake samples per cell for the estimate\n"
++	                                               "0 - the pointwise test, bit for bit as before. Both settings need a rebake, which the\n"
++	                                               "    plate performs by itself when this cvar changes");
++
++	g_pTerrainPlateBakeWeldCurveCVar = REGISTER_CVAR2("e_TerrainPlateBakeWeldCurve", &g_terrainPlateBakeWeldCurve, 1, VF_NULL,
++	                                                  "Terrain Plate component with Bake Into Terrain = true: ramp the baked relief in over the\n"
++	                                                  "rim band with the same smoothstep the mesh edge weld uses, instead of a cosine. Two\n"
++	                                                  "different S curves over one band disagree by up to about 1 % of the relief, which is the\n"
++	                                                  "terrain poking through the plate mesh in patches inside the rim band once the LOD-0\n"
++	                                                  "appended copy stops covering it.\n"
++	                                                  "1 - default: bake and weld follow the same profile; the terrain stays under the mesh\n"
++	                                                  "    across the band, except inside the Weld Sink sub band where the border is buried\n"
++	                                                  "    on purpose\n"
++	                                                  "0 - the cosine falloff, as before");
++
+ 	g_pTerrainPlateDebugCVar = REGISTER_CVAR2("e_TerrainPlateDebug", &g_terrainPlateDebug, 0, VF_NULL,
+ 	                                          "Terrain Plate component: trace the bake trigger and the bake itself.\n"
+ 	                                          "0 - off\n"
+@@ -238,6 +306,12 @@ void UnregisterTerrainPlateCVars()
+ 		if (g_pTerrainPlateBakeSlopeCorrectCVar != nullptr)
+ 			gEnv->pConsole->UnregisterVariable(g_pTerrainPlateBakeSlopeCorrectCVar->GetName());
+ 
++		if (g_pTerrainPlateBakeEdgeAACVar != nullptr)
++			gEnv->pConsole->UnregisterVariable(g_pTerrainPlateBakeEdgeAACVar->GetName());
++
++		if (g_pTerrainPlateBakeWeldCurveCVar != nullptr)
++			gEnv->pConsole->UnregisterVariable(g_pTerrainPlateBakeWeldCurveCVar->GetName());
++
+ 		if (g_pTerrainPlateDebugCVar != nullptr)
+ 			gEnv->pConsole->UnregisterVariable(g_pTerrainPlateDebugCVar->GetName());
+ 	}
+@@ -247,6 +321,8 @@ void UnregisterTerrainPlateCVars()
+ 	g_pTerrainPlateBakeProbeSpacingCVar = nullptr;
+ 	g_pTerrainPlateBakeEpsilonCVar = nullptr;
+ 	g_pTerrainPlateBakeSlopeCorrectCVar = nullptr;
++	g_pTerrainPlateBakeEdgeAACVar = nullptr;
++	g_pTerrainPlateBakeWeldCurveCVar = nullptr;
+ 	g_pTerrainPlateDebugCVar = nullptr;
+ }
+ 
+@@ -2084,7 +2160,13 @@ void CTerrainPlateComponent::ComputeBakeBlock(const SBakeTerrainMetrics& metrics
+ 	const float meshSpacing = (m_lastGridX > 1 && m_lastGridY > 1)
+ 	                          ? min(worldScale.x / (float)(m_lastGridX - 1), worldScale.y / (float)(m_lastGridY - 1))
+ 	                          : metrics.unitSize;
+-	const int   samplesPerAxis = clamp_tpl((int)(metrics.unitSize / max(0.0001f, meshSpacing)) + 1, 2, 6);
++	//
++	// C1 raises the floor from 2 to 4 while the edge antialiasing is on: the same grid is now also the
++	// coverage estimator, and 2 x 2 gives it only four levels - enough to turn a two tread staircase into
++	// a four tread one and no more. 4 x 4 is 16 levels, which is finer than the 12 bit height quantisation
++	// can carry anyway. It costs 16 SamplePlateSurface calls per cell at bake time and nothing at runtime.
++	const int   samplesPerAxisMin = (g_terrainPlateBakeEdgeAA != 0) ? 4 : 2;
++	const int   samplesPerAxis = clamp_tpl((int)(metrics.unitSize / max(0.0001f, meshSpacing)) + 1, samplesPerAxisMin, 6);
+ 	const float sampleStep = metrics.unitSize / (float)(samplesPerAxis - 1);
+ 
+ 	for (int ux = 0; ux < dim; ++ux)
+@@ -2196,21 +2278,35 @@ void CTerrainPlateComponent::ComputeBakeBlock(const SBakeTerrainMetrics& metrics
+ 			// cell is never taken below the ground. The rim falloff below then blends the whole thing back
+ 			// to the baseline over the Weld Inner Falloff band, exactly as in Raise mode - so the border of
+ 			// the footprint is still the original ground, in both modes.
++			// How much of THIS CELL's footprint the plate covers in plan, from the same supersample grid the
++			// Min filter above already walked. It is a plan view measure, not a height one: a fully covered
++			// cell is 1, a cell straddling the rotated plate border is the fraction of its area inside.
++			const int   totalSamples = samplesPerAxis * samplesPerAxis;
++			const float coverage = (totalSamples > 0) ? clamp_tpl((float)samplesTaken / (float)totalSamples, 0.f, 1.f) : 0.f;
++
+ 			const float raised = max(baseline, plateSurface);
+ 			float combined = raised;
+ 
+ 			if (m_bakeMode == ETerrainPlateBakeMode::RaiseAndLower)
+-			{
+-				const int totalSamples = samplesPerAxis * samplesPerAxis;
+-				const float coverage = (totalSamples > 0) ? clamp_tpl((float)samplesTaken / (float)totalSamples, 0.f, 1.f) : 0.f;
+ 				combined = raised + (plateSurface - raised) * coverage;
+-			}
+ 
+-			// Cosine falloff to the baseline over the rim, the curve CRYENGINE itself uses for the road
+-			// falloff (RoadObject.cpp:631-635), so the border of the footprint is the baseline exactly.
++			// Falloff to the baseline over the rim band, so the border of the footprint is the baseline
++			// exactly. C2b: the curve is the mesh edge weld's, not a cosine. The weld pulls a vertex towards
++			// the ground with 1 - smoothstep(t), so the relief it leaves is smoothstep(t) - and that is the
++			// profile the bake has to follow if the two surfaces are not to cross inside the band.
++			// @see g_terrainPlateBakeWeldCurve for the algebra and for why Weld Sink is not mirrored here.
+ 			const float distanceToBorder = min(0.5f - fabs_tpl(localX), 0.5f - fabs_tpl(localY)) * 2.f;
+ 			const float t = clamp_tpl(distanceToBorder / band, 0.f, 1.f);
+-			const float weight = (1.f - cosf(gf_PI * t)) * 0.5f;
++			float weight = (g_terrainPlateBakeWeldCurve != 0)
++			               ? (t * t * (3.f - 2.f * t))            // smoothstep(t) == 1 - the weld's 1 - smoothstep(t)
++			               : (1.f - cosf(gf_PI * t)) * 0.5f;      // the road falloff (RoadObject.cpp:631-635)
++
++			// C1: the plan view boundary is a coverage, not a boolean. Scaling the rim weight by it is the
++			// same operation the falloff already is - a blend back towards the baseline - so it inherits all
++			// of the falloff's guarantees, including that it can only ever move the cell DOWN under a raised
++			// plate and therefore never leaves terrain above the plate mesh (decision 04 rule 1).
++			if (g_terrainPlateBakeEdgeAA != 0)
++				weight *= coverage;
+ 
+ 			const float value = baseline + (combined - baseline) * weight;
+ 			const float delta = value - baseline;
+@@ -2704,9 +2800,11 @@ void CTerrainPlateComponent::BuildBakeProbes(const SBakeTerrainMetrics& metrics)
+ {
+ 	m_bakeProbes.clear();
+ 
+-	// The two knobs this bake was computed with, so PollBake can tell when the console changes them.
++	// The knobs this bake was computed with, so PollBake can tell when the console changes them.
+ 	m_bakeEpsilonUsed = GetBakeEpsilonMeters();
+ 	m_bakeSlopeCorrectUsed = g_terrainPlateBakeSlopeCorrect;
++	m_bakeEdgeAAUsed = g_terrainPlateBakeEdgeAA;
++	m_bakeWeldCurveUsed = g_terrainPlateBakeWeldCurve;
+ 
+ 	const int dim = m_bakeRectSize + 1;
+ 	if ((int)m_bakeResult.size() != dim * dim)
+@@ -2833,8 +2931,14 @@ void CTerrainPlateComponent::PollBake()
+ 
+ 	// Changing a bake cvar moves nothing in the terrain, so the probes below - which compare the terrain
+ 	// against the heights this plate last wrote - can never see it. Compare the values the live bake was
+-	// computed with instead, so the two knobs can be A / B'd from the console without re-ticking Bake.
+-	if (m_bakeEpsilonUsed != GetBakeEpsilonMeters() || m_bakeSlopeCorrectUsed != g_terrainPlateBakeSlopeCorrect)
++	// computed with instead, so the knobs can be A / B'd from the console without re-ticking Bake.
++	// The two rim shape knobs MUST be in this list: they change every height in the band, so a probe that
++	// did not know about them would read a terrain of the old shape, call it an external edit and repair
++	// the new shape away every poll.
++	if (m_bakeEpsilonUsed != GetBakeEpsilonMeters()
++	    || m_bakeSlopeCorrectUsed != g_terrainPlateBakeSlopeCorrect
++	    || m_bakeEdgeAAUsed != g_terrainPlateBakeEdgeAA
++	    || m_bakeWeldCurveUsed != g_terrainPlateBakeWeldCurve)
+ 	{
+ 		ReapplyBakeAfterExternalEdit(metrics);
+ 		return;
+diff --git a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
+index 927fc0a5..3d9d80c1 100644
+--- a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
++++ b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
+@@ -536,6 +536,12 @@ protected:
+ 	//! change does not move the terrain, so the probes cannot see it; PollBake compares these instead.
+ 	float                    m_bakeEpsilonUsed = 0.f;
+ 	int                      m_bakeSlopeCorrectUsed = 0;
++	//! Same, for the two knobs that decide the SHAPE of the rim: e_TerrainPlateBakeEdgeAA and
++	//! e_TerrainPlateBakeWeldCurve. Both change every height the bake writes over the band, so without
++	//! this the probes would compare the terrain against a m_bakeResult of the other shape and repair it
++	//! back to the old one for ever - the B3 bug class.
++	int                      m_bakeEdgeAAUsed = 0;
++	int                      m_bakeWeldCurveUsed = 0;
+ 	//! A few quantisation steps of the coarsest touched sector: a height never survives a round trip
+ 	//! through SetTerrainElevation exactly.
+ 	float                    m_bakeProbeTolerance = 0.01f;
+-- 
+2.47.1.windows.1
+

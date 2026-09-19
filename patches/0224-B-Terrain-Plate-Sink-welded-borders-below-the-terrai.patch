@@ -1,0 +1,134 @@
+From 852e2066cae7cc373eb9719c2f76deade3843948 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Mon, 31 Aug 2026 01:08:50 +0800
+Subject: [PATCH 224/307] !B (Terrain Plate) Sink welded borders below the
+ terrain surface.
+
+Terrain sampling and rendered sector triangulation can leave a visible seam at
+an exact weld. Ramp the border below the sampled surface and retain a skirt to
+keep the join covered across terrain LODs.
+---
+ .../Geometry/TerrainPlateComponent.cpp        | 52 +++++++++++++++++--
+ .../Geometry/TerrainPlateComponent.h          | 12 ++++-
+ 2 files changed, 59 insertions(+), 5 deletions(-)
+
+diff --git a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
+index e330072f..97fa507a 100644
+--- a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
++++ b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
+@@ -887,8 +887,26 @@ void CTerrainPlateComponent::RegenerateMesh()
+ 	// ---------------------------------------------------------------- edge weld
+ 	// The outermost ring is moved onto the terrain surface under it, and the move is faded out over
+ 	// Weld Inner Falloff of the half size so that the weld does not leave a step. The move is done as
+-	// a full inverse transform of the world point (x, y, terrainZ), so a welded vertex sits exactly on
+-	// the terrain even when the plate is rotated or scaled.
++	// a full inverse transform of the world point (x, y, targetZ), so a welded vertex sits exactly on
++	// the target height even when the plate is rotated or scaled.
++	//
++	// Welding exactly onto the sampled height still leaves a visible seam, because the sampled height
++	// is not the rendered terrain surface:
++	//  - I3DEngine::GetTerrainElevation is CTerrain::GetZApr (3dEngine.cpp:1518), which is already
++	//    triangle linear (GetHeightTriangulated, terrain_hmap.cpp:29) but always splits the unit quad
++	//    along the fixed fX + fY = 1 diagonal, while the rendered sector flips that diagonal per quad
++	//    at surface type boundaries (CTerrainNode::BuildIndices via CTerrain::IsMeshQuadFlipped,
++	//    terrain_sector_render.cpp:750 / terrain_hmap.cpp:733). On a flipped quad the two surfaces
++	//    differ by the quad's twist. IsMeshQuadFlipped is not part of the public I3DEngine interface,
++	//    so a plugin cannot reproduce it;
++	//  - sectors at LOD >= 1 are rendered with a coarser mesh (BuildIndices scales the step by
++	//    m_nTreeLevel), which no per vertex sampling can match;
++	//  - between two ring vertices the plate edge is a straight segment while the terrain keeps bending.
++	// The fix is therefore not a better sample but a guaranteed sign: the ring is pushed Weld Sink
++	// metres below the sampled surface, so the border always ends inside the terrain and no light can
++	// leak through it. The sink ramps in over the outer quarter of the falloff band only, so the plate
++	// stays above ground over most of the band and dives under just before the ring - the crossing and
++	// the dark crease it would otherwise show are hidden under the terrain.
+ 	if (m_bEdgeWeld && gEnv->p3DEngine->GetITerrain() != nullptr)
+ 	{
+ 		const Matrix34 worldTM = GetPlateWorldTM();
+@@ -896,6 +914,8 @@ void CTerrainPlateComponent::RegenerateMesh()
+ 		invWorldTM.Invert();
+ 
+ 		const float falloff = clamp_tpl((float)m_weldInnerFalloff, 0.f, 1.f);
++		const float weldSink = max(0.f, (float)m_weldSink);
++		const float sinkBand = falloff * 0.25f;
+ 		const float halfSpanX = (float)(nx - 1) * 0.5f;
+ 		const float halfSpanY = (float)(ny - 1) * 0.5f;
+ 
+@@ -925,10 +945,29 @@ void CTerrainPlateComponent::RegenerateMesh()
+ 				if (weight <= 0.f)
+ 					continue;
+ 
++				// Sink profile: the same 1 - smoothstep curve, but over a band four times narrower than
++				// the weld band, so the sink is still ~0 where the weld starts and full at the ring.
++				float sinkWeight;
++				if (sinkBand <= 0.f)
++				{
++					sinkWeight = (d <= 0.f) ? 1.f : 0.f;
++				}
++				else if (d >= sinkBand)
++				{
++					sinkWeight = 0.f;
++				}
++				else
++				{
++					const float ts = d / sinkBand;
++					sinkWeight = 1.f - (ts * ts * (3.f - 2.f * ts)); // 1 - smoothstep(ts)
++				}
++
+ 				const size_t index = (size_t)r * nx + c;
+ 				const Vec3 world = worldTM * positions[index];
+ 				const float terrainZ = gEnv->p3DEngine->GetTerrainElevation(world.x, world.y);
+-				const Vec3 conformed = invWorldTM * Vec3(world.x, world.y, terrainZ);
++				// The sink is a world space distance, so it is applied before the inverse transform.
++				const float targetZ = terrainZ - weldSink * sinkWeight;
++				const Vec3 conformed = invWorldTM * Vec3(world.x, world.y, targetZ);
+ 				positions[index] += (conformed - positions[index]) * weight;
+ 			}
+ 		}
+@@ -1048,6 +1087,13 @@ void CTerrainPlateComponent::RegenerateMesh()
+ 
+ 	// Skirt: a duplicated border ring plus a second ring pushed straight down, closed with quads whose
+ 	// normals face outwards. The duplication is what lets the side wall have its own horizontal normal.
++	// The skirt starts at the welded (and sunk) ring, so with the default Weld Sink it is entirely below
++	// the terrain surface: it seals the border where the sink alone is not enough (steep slopes, sectors
++	// rendered at LOD >= 1) and is never seen. It is deliberately left in the plate's single subset:
++	// terrain integration classifies triangles one by one (CTerrainNode::AppendTrianglesFromObjects),
++	// not per subset, so a second material would cost a draw call without changing the classification,
++	// and the height band test there (triBox.max.z > fElevMin) already rejects the underground skirt
++	// faces before the slope test can smear the terrain layers over a vertical wall.
+ 	if (bSkirt)
+ 	{
+ 		const int topBase = gridVertexCount;
+diff --git a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
+index a3b74427..966e7089 100644
+--- a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
++++ b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
+@@ -184,7 +184,14 @@ public:
+ 
+ 		desc.AddMember(&CTerrainPlateComponent::m_bEdgeWeld, 'weld', "EdgeWeld", "Edge Weld", "Snaps the outermost ring of vertices onto the terrain surface under it, so the border of the plate seals against the terrain", true);
+ 		desc.AddMember(&CTerrainPlateComponent::m_weldInnerFalloff, 'wfal', "WeldInnerFalloff", "Weld Inner Falloff", "Fraction of the half size over which the welded border blends back into the plate's own relief. 0 welds only the outermost ring and can leave a step.", 0.25f);
+-		desc.AddMember(&CTerrainPlateComponent::m_skirt, 'skrt', "Skirt", "Skirt", "Metres of extra geometry extruded straight down from the border, so the plate still seals where the terrain does not match. 0 disables the skirt.", 0.f);
++		desc.AddMember(&CTerrainPlateComponent::m_weldSink, 'wsnk', "WeldSink", "Weld Sink",
++		               "Metres by which the welded border is pushed below the terrain surface, so that the border always ends inside the terrain "
++		               "instead of on it. Sampling the terrain height can never reproduce the rendered terrain mesh exactly (flipped quad diagonals, "
++		               "coarser meshes at LOD >= 1, and the straight plate edge between two ring vertices), and any residual mismatch on an exact weld "
++		               "shows up as a seam. The sink is applied over the outer quarter of the Weld Inner Falloff band, so the plate is still above the "
++		               "terrain over most of the band and only dives under right at the ring. 0 restores the exact surface weld.",
++		               0.1f);
++		desc.AddMember(&CTerrainPlateComponent::m_skirt, 'skrt', "Skirt", "Skirt", "Metres of extra geometry extruded straight down from the border, so the plate still seals where the terrain does not match (steep slopes, distant sectors rendered at a coarser LOD). 0 disables the skirt.", 0.25f);
+ 
+ 		desc.AddMember(&CTerrainPlateComponent::m_renderParameters, 'rend', "Render", "Rendering Settings", "Settings for the rendered representation of the component", plateRenderDefaults);
+ 		desc.AddMember(&CTerrainPlateComponent::m_physics, 'phys', "Physics", "Physics Settings", "Physical properties for the object, only used if a simple physics or character controller is applied to the entity.", SPhysicsParameters());
+@@ -228,7 +235,8 @@ protected:
+ 
+ 	bool                                         m_bEdgeWeld = true;
+ 	Schematyc::Range<0, 1, 0, 1, float>          m_weldInnerFalloff = 0.25f;
+-	Schematyc::Range<0, 1000, 0, 20, float>      m_skirt = 0.f;
++	Schematyc::Range<0, 100, 0, 2, float>        m_weldSink = 0.1f;
++	Schematyc::Range<0, 1000, 0, 20, float>      m_skirt = 0.25f;
+ 
+ 	// Cached state, never serialised: the mesh is always rebuilt on load.
+ 	STerrainPlateHeightField m_heightField;
+-- 
+2.47.1.windows.1
+

@@ -293,6 +293,24 @@ void CVars::Init()
 	DefineConstIntCVar(e_Roads, 1, VF_CHEAT | VF_CHEAT_ALWAYS_CHECK,
 	                   "Activates drawing of road objects");
 
+	REGISTER_CVAR(e_RoadsZOffset, 0.01f, VF_NULL,
+	              "Height in metres a road is lifted above the terrain surface it was built on.\n"
+	              "A road does not write depth, so this is its whole margin against anything standing on the\n"
+	              "same ground. Raise it (0.03) if roads disappear under a baked Terrain Plate.\n"
+	              "0.01 - engine default");
+
+	REGISTER_CVAR(e_RoadsFollowIntegratedObjects, 1, VF_NULL,
+	              "1 - a road is built on the real surface of any object that renders as terrain\n"
+	              "    ('Integrate Into Terrain' GI mode), instead of on the heightmap under it\n"
+	              "0 - stock behaviour: every road vertex comes from CTerrain::GetZ alone\n"
+	              "e_RoadsZOffset still applies on top in both cases.");
+
+	REGISTER_CVAR(e_RoadsFollowIntegratedObjectsSubdiv, 4, VF_NULL,
+	              "Road tessellation multiplier inside the bounding box of an integrating object, 1 to 8.\n"
+	              "The heightmap grid a road is built on is far coarser than a plate mesh; this subdivides it\n"
+	              "so the road resolves the relief it follows. Lowered automatically at the vertex budget.\n"
+	              "1 - off. Ignored while e_RoadsFollowIntegratedObjects is 0.");
+
 	REGISTER_CVAR(e_Decals, 1, VF_NULL | VF_CHEAT_ALWAYS_CHECK,
 	              "Activates drawing of decals (game decals and hand-placed)");
 	REGISTER_CVAR(e_DecalsForceDeferred, 0, VF_NULL,
@@ -492,10 +510,65 @@ void CVars::Init()
 	REGISTER_CVAR(e_TerrainAutoGenerateBaseTextureTiling, 1.f / 16.f, VF_NULL,
 	              "Controls tiling of baked diffuse textures");
 	REGISTER_CVAR(e_TerrainIntegrateObjectsMaxVertices, 30000, VF_NULL,
-	              "Preallocate specified number of vertices to be used for objects integration into terrain (per terrain sector)\n"
-	              "0 - disable the feature completelly");
+	              "Per terrain sector vertex budget for the level flag Terrain/IntegrateObjects\n"
+	              "(objects whose GI mode is 'Integrate Into Terrain' get a copy of their LOD 0 geometry\n"
+	              "appended to the terrain sector mesh). Preallocated per LOD 0 sector on every rebuild;\n"
+	              "objects are truncated once the budget is exhausted.\n"
+	              "0 - disable the feature completely (also clears the level flag on the next level load)");
 	REGISTER_CVAR(e_TerrainIntegrateObjectsMaxHeight, 32.f, VF_NULL,
-	              "Take only trianglses close to terrain for objects integration");
+	              "Height band used by the level flag Terrain/IntegrateObjects. NOT a cap on how high\n"
+	              "integrated relief may rise: it is the largest gap an object may have to the terrain under\n"
+	              "it before it counts as airborne, in which case none of it is integrated. Also grows the\n"
+	              "box each sector uses to look for integrated objects.\n"
+	              "Per object override: the Terrain Height Band component property");
+	REGISTER_CVAR(e_TerrainIntegrateObjectsDebug, 0, VF_NULL,
+	              "Debug output for the level flag Terrain/IntegrateObjects\n"
+	              "0 - off\n"
+	              "1 - log the integrated vertex count and the merged/transition/rejected triangle counts\n"
+	              "    of every terrain sector rebuild\n"
+	              "2 - additionally draw one bounding box per triangle class of each sector:\n"
+	              "    green = merged, yellow = slope transition band, red = rejected");
+	REGISTER_CVAR(e_TerrainIntegrateObjectsRebuildDelay, 0, VF_NULL,
+	              "Frames of quiet after which a *moving* object integrated into the terrain gets its\n"
+	              "sectors rebuilt. Sector builds are synchronous, so dragging one in the editor otherwise\n"
+	              "rebuilds every sector it touches on every frame of the drag.\n"
+	              "Entering and leaving the mode, and (un)registering a node, always rebuild at once.\n"
+	              "0 - off, rebuild immediately on every move (stock behaviour)");
+	REGISTER_CVAR(e_TerrainIntegrateObjectsFull, 0, VF_NULL,
+	              "How much of the terrain an object with the GI mode 'Integrate Into Terrain' becomes.\n"
+	              "0 - stock: the appended copy is drawn by the terrain detail layers only, the object keeps\n"
+	              "    drawing its own material underneath\n"
+	              "1 - the appended copy is also drawn by the terrain BASE pass, so it gets the terrain macro\n"
+	              "    colour and normal atlas. The object still draws itself, so the surface is drawn twice\n"
+	              "2 - additionally skip the object's own camera draw wherever the terrain is drawing all of\n"
+	              "    its triangles this frame, removing the double draw and its z-fighting at distance.\n"
+	              "    Shadows, SVOGI, HeightMap AO, physics, selection and reflections are unaffected.\n"
+	              "    Any rejected triangle, budget overflow, streaming retry or LOD >= 1 puts the\n"
+	              "    object's own draw back. Also forces e_TerrainIntegrateObjectsPushOut to 0.");
+	REGISTER_CVAR(e_TerrainIntegrateObjectsPushOut, 0.02f, VF_NULL,
+	              "Metres the vertices of an integrated object are pushed out along their normal before\n"
+	              "they are appended to the terrain sector mesh, so the copy beats the object's own opaque\n"
+	              "pixels. Costs that much error against the collision surface, the shadow and the road drape.\n"
+	              "Forced to 0 while e_TerrainIntegrateObjectsFull is 2, where there is no own draw to beat.\n"
+	              "0.02 - stock behaviour");
+	REGISTER_CVAR(e_TerrainIntegrateObjectsNormalBlendHeight, 0.1f, VF_NULL,
+	              "Metres above the terrain over which the vertex normal of an integrated object is blended\n"
+	              "from the terrain normal to the object's own normal. The blend hides the shading seam at\n"
+	              "the ground; above it the true normal keeps the detail layer projection axis and the POM\n"
+	              "tangent frame honest on steep faces.\n"
+	              "0.1 - contact band only (default)\n"
+	              "0.5 - the shipped 5.7 ramp; smears POM detail layers on low relief\n"
+	              "0   - no blend, hard shading seam");
+	REGISTER_CVAR(e_TerrainIntegrateObjectsLodHoldDistance, 0.f, VF_NULL,
+	              "Metres out to which a terrain sector containing an object with the GI mode 'Integrate\n"
+	              "Into Terrain' is kept subdivided down to LOD 0, whatever the normal LOD distance says.\n"
+	              "The appended copy of such an object only exists in the LOD 0 sector mesh, so past that\n"
+	              "distance a baked plate edge turns into a staircase and the decimated ground dips below\n"
+	              "anything sitting on it. This pushes that band further out; it does not remove it.\n"
+	              "Only branches that contain an integrated object are held, so the cost is the object's\n"
+	              "footprint in LOD 0 sectors. Takes effect next frame; no sector rebuild involved.\n"
+	              "0 - default, stock LOD selection\n"
+	              "256 - a reasonable first value");
 	DefineConstIntCVar(e_TerrainDeformations, 0, VF_CHEAT,
 	                   "Allows in-game terrain surface deformations");
 	REGISTER_CVAR(e_TerrainEditPostponeTexturesUpdate, 10, VF_NULL,

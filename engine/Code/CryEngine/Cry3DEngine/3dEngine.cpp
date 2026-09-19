@@ -622,6 +622,9 @@ void C3DEngine::Update()
 		m_pTerrain->Recompile_Modified_Incrementaly_RoadRenderNodes();
 	}
 
+	FlushPendingTerrainRebuilds();
+	UpdateIntegrationMeshArrivals();
+
 	if (m_bEditor)
 		CRoadRenderNode::FreeStaticMemoryUsage();
 
@@ -754,7 +757,12 @@ void C3DEngine::ProcessCVarsChange()
 		GetFloatCVar(e_ViewDistCompMaxSize) +
 		GetCVars()->e_DecalsDeferredStatic +
 		GetCVars()->e_TerrainBlendingDebug +
-		GetCVars()->e_TerrainDetailMaterialsWeightedBlending;
+		GetCVars()->e_TerrainDetailMaterialsWeightedBlending +
+		GetCVars()->e_TerrainIntegrateObjectsMaxVertices +
+		GetCVars()->e_TerrainIntegrateObjectsMaxHeight +
+		GetCVars()->e_TerrainIntegrateObjectsFull +
+		GetCVars()->e_TerrainIntegrateObjectsPushOut +
+		GetCVars()->e_TerrainIntegrateObjectsNormalBlendHeight;
 
 	if (m_fRefreshSceneDataCVarsSumm != -1 && m_fRefreshSceneDataCVarsSumm != fNewCVarsSumm)
 	{
@@ -6607,11 +6615,8 @@ void C3DEngine::AsyncOctreeUpdate(IRenderNode* pEnt, uint32 nFrameID, bool bUnRe
 
 	auto dwRndFlags = pEnt->GetRndFlags();
 
-	if (m_bIntegrateObjectsIntoTerrain && eERType == eERType_MovableBrush && pEnt->GetGIMode() == IRenderNode::eGM_IntegrateIntoTerrain)
-	{
-		// update meshes integrated into terrain
-		GetTerrain()->ResetTerrainVertBuffers(&aabb);
-	}
+	// update meshes integrated into terrain
+	UpdateTerrainObjectIntegration(pEnt, eERType, aabb, false);
 
 	if (!(dwRndFlags & ERF_RENDER_ALWAYS) && !(dwRndFlags & ERF_CASTSHADOWMAPS))
 		if (GetCVars()->e_ObjFastRegister && pEnt->GetParent() && ((COctreeNode*)pEnt->GetParent())->IsRightNode(aabb, fObjRadiusSqr, pEnt->m_fWSMaxViewDist))
@@ -6636,7 +6641,12 @@ void C3DEngine::AsyncOctreeUpdate(IRenderNode* pEnt, uint32 nFrameID, bool bUnRe
 
 	if (pEnt->GetParent())
 	{
+		// Re-registering an already inserted node: this removal is octree bookkeeping, not a real
+		// unregister, so the integration entry written above must survive it.
+		IRenderNode* const pPrevReRegistering = m_pReRegisteringNode;
+		m_pReRegisteringNode = pEnt;
 		UnRegisterEntityImpl(pEnt);
+		m_pReRegisteringNode = pPrevReRegistering;
 	}
 	else if (GetCVars()->e_StreamCgf && pEnt->IsAllocatedOutsideOf3DEngineDLL())
 	{
@@ -6779,14 +6789,481 @@ bool C3DEngine::UnRegisterEntityImpl(IRenderNode* pEnt)
 	if (pEnt->m_pTempData)
 		pEnt->m_pTempData->ResetClipVolume();
 
-	if (m_bIntegrateObjectsIntoTerrain && eRenderNodeType == eERType_MovableBrush && pEnt->GetGIMode() == IRenderNode::eGM_IntegrateIntoTerrain)
-	{
-		// update meshes integrated into terrain
-		AABB nodeBox = pEnt->GetBBox();
-		GetTerrain()->ResetTerrainVertBuffers(&nodeBox);
-	}
+	// update meshes integrated into terrain
+	UpdateTerrainObjectIntegration(pEnt, eRenderNodeType, pEnt->GetBBox(), true);
 
 	return bFound;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+void C3DEngine::UpdateTerrainObjectIntegration(IRenderNode* pEnt, EERType eERType, const AABB& aabb, bool bUnregister)
+{
+	if (eERType != eERType_MovableBrush)
+		return;
+
+	// Half of a re-registration (SetMatrix, or the octree move inside AsyncOctreeUpdate). Dropping the
+	// entry here would lose it for good on the slot path, and would hide the move from the debounce.
+	if (bUnregister && pEnt == m_pReRegisteringNode)
+		return;
+
+	const bool bIntegratesNow = !bUnregister
+	                            && m_bIntegrateObjectsIntoTerrain
+	                            && pEnt->GetGIMode() == IRenderNode::eGM_IntegrateIntoTerrain;
+
+	std::map<IRenderNode*, AABB>::iterator it = m_integratedIntoTerrainNodes.find(pEnt);
+	const bool bWasIntegrating = (it != m_integratedIntoTerrainNodes.end());
+
+	if (!bIntegratesNow && !bWasIntegrating)
+		return;
+
+	// Union of where the object was integrated and where it is now, so no stale geometry is left behind.
+	AABB dirtyBox = aabb;
+	if (bWasIntegrating)
+		dirtyBox.Add(it->second);
+
+	// Sector builds are synchronous, so an editor drag would rebuild every touched sector every frame.
+	// Only moves are debounced; entering/leaving the mode must be visible at once.
+	const bool bMovedWhileIntegrating = bIntegratesNow && bWasIntegrating;
+
+	if (bMovedWhileIntegrating && GetCVars()->e_TerrainIntegrateObjectsRebuildDelay > 0)
+	{
+		SPendingTerrainRebuild& pending = m_pendingTerrainRebuilds[pEnt];
+		pending.dirtyBox.Add(dirtyBox);
+		pending.lastMoveFrameId = gEnv->nMainFrameID;
+
+		it->second = aabb;
+		RefreshIntegratedNodeBoxes();
+		return;
+	}
+
+	// Anything this node still owed has to go out with this rebuild.
+	if (!m_pendingTerrainRebuilds.empty())
+	{
+		std::map<IRenderNode*, SPendingTerrainRebuild>::iterator pendingIt = m_pendingTerrainRebuilds.find(pEnt);
+		if (pendingIt != m_pendingTerrainRebuilds.end())
+		{
+			dirtyBox.Add(pendingIt->second.dirtyBox);
+			m_pendingTerrainRebuilds.erase(pendingIt);
+		}
+	}
+
+	if (bIntegratesNow)
+		m_integratedIntoTerrainNodes[pEnt] = aabb;
+	else
+		m_integratedIntoTerrainNodes.erase(it);
+
+	RefreshIntegratedNodeBoxes();
+
+	if (GetCVars()->e_TerrainIntegrateObjectsDebug >= 1)
+	{
+		PrintMessage("TerrainIntegration: %s '%s', registry %d entries", bIntegratesNow ? "add/update" : "remove",
+		             pEnt->GetName(), (int)m_integratedIntoTerrainNodes.size());
+	}
+
+	RunIntegrationRebuild(dirtyBox);
+}
+
+///////////////////////////////////////////////////////////////////////////////
+void C3DEngine::RunIntegrationRebuild(const AABB& dirtyBox)
+{
+	if (dirtyBox.IsReset())
+		return;
+
+	// Sector dirtying and road scheduling are both idempotent and both consume the box lazily, so a
+	// request inside one already issued this frame is pure duplicate work.
+	const uint32 nFrameId = gEnv->nMainFrameID;
+	if (nFrameId == m_nLastIntegrationRebuildFrameId
+	    && !m_lastIntegrationRebuildBox.IsReset()
+	    && m_lastIntegrationRebuildBox.ContainsBox(dirtyBox))
+	{
+		return;
+	}
+
+	m_nLastIntegrationRebuildFrameId = nFrameId;
+	m_lastIntegrationRebuildBox = dirtyBox;
+
+	if (CTerrain* const pTerrain = GetTerrain())
+		pTerrain->ResetTerrainVertBuffers(&dirtyBox);
+
+	// Roads drape over the object's surface, so the same dirty box has to rebuild them. Scheduling only:
+	// Compile() must not run from inside a (un)registration.
+	RequestRoadRebuildsInArea(dirtyBox);
+}
+
+///////////////////////////////////////////////////////////////////////////////
+void C3DEngine::RefreshIntegratedNodeBoxes()
+{
+	m_integratedNodeBoxes.clear();
+	m_integratedNodeBoxes.reserve(m_integratedIntoTerrainNodes.size());
+
+	// Recomputed here rather than only raised, so removing the one object with a huge band lets the
+	// query narrow again.
+	m_fMaxIntegrationHeightBand = 0.f;
+
+	for (std::map<IRenderNode*, AABB>::const_iterator it = m_integratedIntoTerrainNodes.begin();
+	     it != m_integratedIntoTerrainNodes.end(); ++it)
+	{
+		m_integratedNodeBoxes.push_back(it->second);
+
+		// Only movable brushes carry per instance integration params, and only they are integrated.
+		if (it->first->GetRenderNodeType() == eERType_MovableBrush)
+		{
+			const float fBand = static_cast<IBrush*>(it->first)->GetTerrainIntegrationParams().heightBand;
+
+			if (fBand > m_fMaxIntegrationHeightBand)
+				m_fMaxIntegrationHeightBand = fBand;
+		}
+	}
+}
+
+///////////////////////////////////////////////////////////////////////////////
+float C3DEngine::GetTerrainIntegrationQueryBand() const
+{
+	const float fCVarBand = GetCVars()->e_TerrainIntegrateObjectsMaxHeight;
+
+	// Strictly a widening: 0 means nothing registered asked for more than the cvar, and then the box is
+	// exactly the one the stock code built (a negative cvar included).
+	return (m_fMaxIntegrationHeightBand > fCVarBand) ? m_fMaxIntegrationHeightBand : fCVarBand;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+void C3DEngine::NotifyIntegrationHeightBandChanged(float fHeightBand)
+{
+	// Negative = defer to the cvar, which never widens anything.
+	if (fHeightBand > m_fMaxIntegrationHeightBand)
+		m_fMaxIntegrationHeightBand = fHeightBand;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+void C3DEngine::UpdateIntegratedObjectDrawSuppression(const SRenderingPassInfo& passInfo)
+{
+	// Full 0/1 must stay bit identical to the stock path, so nothing is ever stamped below 2.
+	if (GetCVars()->e_TerrainIntegrateObjectsFull < 2 || !m_bIntegrateObjectsIntoTerrain || m_integratedIntoTerrainNodes.empty())
+		return;
+
+	CTerrain* const pTerrain = GetTerrain();
+
+	if (!pTerrain)
+		return;
+
+	const int nMainFrameId = (int)passInfo.GetMainFrameID();
+
+	for (std::map<IRenderNode*, AABB>::const_iterator it = m_integratedIntoTerrainNodes.begin();
+	     it != m_integratedIntoTerrainNodes.end(); ++it)
+	{
+		IRenderNode* pNode = it->first;
+
+		// Guard the CBrush cast below.
+		if (pNode->GetRenderNodeType() != eERType_MovableBrush)
+			continue;
+
+		// Live box, not the cached one: that one may lag a debounced move, which is the unsafe direction.
+		if (!pTerrain->IsObjectDrawnByTerrain(pNode, pNode->GetBBox(), nMainFrameId))
+			continue;
+
+		static_cast<CBrush*>(pNode)->m_nTerrainDrawsMeFrameId = nMainFrameId;
+	}
+}
+
+///////////////////////////////////////////////////////////////////////////////
+bool C3DEngine::HasIntegratedObjectsInBoxXY(const AABB& box) const
+{
+	// XY only: an integrated object may sit well above or below the sector's heightmap box (a sunken
+	// plate is the point), so only the footprint decides whether the sector must stay at LOD 0.
+	for (size_t i = 0; i < m_integratedNodeBoxes.size(); ++i)
+	{
+		if (Overlap::AABB_AABB2D(m_integratedNodeBoxes[i], box))
+			return true;
+	}
+
+	return false;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+void C3DEngine::FlushPendingTerrainRebuilds()
+{
+	if (m_pendingTerrainRebuilds.empty())
+		return;
+
+	// A delay turned back to 0 mid session flushes everything on the next frame.
+	const int nDelay = GetCVars()->e_TerrainIntegrateObjectsRebuildDelay;
+	const uint32 nFrameId = gEnv->nMainFrameID;
+
+	for (std::map<IRenderNode*, SPendingTerrainRebuild>::iterator it = m_pendingTerrainRebuilds.begin();
+	     it != m_pendingTerrainRebuilds.end(); )
+	{
+		if (nDelay > 0 && (int)(nFrameId - it->second.lastMoveFrameId) < nDelay)
+		{
+			++it;
+			continue;
+		}
+
+		RunIntegrationRebuild(it->second.dirtyBox);
+
+		it = m_pendingTerrainRebuilds.erase(it);
+	}
+}
+
+///////////////////////////////////////////////////////////////////////////////
+void C3DEngine::UpdateIntegrationMeshArrivals()
+{
+	if (!m_bIntegrateObjectsIntoTerrain || m_integratedIntoTerrainNodes.empty())
+	{
+		if (!m_integrationNodesAwaitingMesh.empty())
+			m_integrationNodesAwaitingMesh.clear();
+
+		return;
+	}
+
+	// Streaming latency is orders of magnitude above a few frames, so scanning the registry every frame
+	// would be pure overhead.
+	const uint32 nScanIntervalFrames = 8;
+	const uint32 nFrameId = gEnv->nMainFrameID;
+
+	if (nFrameId - m_nLastIntegrationMeshScanFrameId < nScanIntervalFrames)
+		return;
+
+	m_nLastIntegrationMeshScanFrameId = nFrameId;
+
+	// Rebuilt from the registry, so an unregistered node drops out on its own and the set cannot grow.
+	std::set<IRenderNode*> stillAwaiting;
+	AABB arrivedBox(AABB::RESET);
+	int nArrived = 0;
+
+	for (std::map<IRenderNode*, AABB>::const_iterator it = m_integratedIntoTerrainNodes.begin();
+	     it != m_integratedIntoTerrainNodes.end(); ++it)
+	{
+		IRenderNode* pNode = it->first;
+
+		// LOD 0 is the one AppendTrianglesFromObjects copies from; nothing else can close the hole.
+		if (!pNode->GetRenderMesh(0))
+		{
+			stillAwaiting.insert(pNode);
+			continue;
+		}
+
+		if (m_integrationNodesAwaitingMesh.find(pNode) == m_integrationNodesAwaitingMesh.end())
+			continue;
+
+		// Rising edge: the mesh arrived after the sector had already given up on it.
+		arrivedBox.Add(it->second);
+		arrivedBox.Add(pNode->GetBBox());
+		nArrived++;
+
+		if (GetCVars()->e_TerrainIntegrateObjectsDebug >= 1)
+			PrintMessage("TerrainIntegration: render mesh arrived for '%s', rebuilding its sectors", pNode->GetName());
+	}
+
+	m_integrationNodesAwaitingMesh.swap(stillAwaiting);
+
+	if (nArrived)
+		RunIntegrationRebuild(arrivedBox);
+}
+
+///////////////////////////////////////////////////////////////////////////////
+void C3DEngine::RequestRoadRebuildsInArea(const AABB& box)
+{
+	if (!GetCVars()->e_RoadsFollowIntegratedObjects)
+		return;
+
+	if (box.IsReset() || !m_pObjectsTree)
+		return;
+
+	// The object standing on a road can be anywhere above or below it, so widen the query in Z only and
+	// let the XY overlap select (same as the heightmap edit path in terran_edit.cpp).
+	AABB queryBox = box;
+	queryBox.min.z -= 1024.f;
+	queryBox.max.z += 1024.f;
+
+	PodArray<IRenderNode*> lstRoads;
+	GetObjectsByTypeGlobal(lstRoads, eERType_Road, &queryBox);
+
+	for (int i = 0; i < lstRoads.Count(); i++)
+	{
+		// Not OnTerrainChanged(): that snaps every vertex back onto the bare heightmap first.
+		((CRoadRenderNode*)lstRoads[i])->ScheduleRebuild(true);
+	}
+}
+
+///////////////////////////////////////////////////////////////////////////////
+void C3DEngine::BeginIntegratedHeightSampling(const AABB& areaBox)
+{
+	// Nesting keeps the outer cache; rebuilding here would shrink what the outer scope can see.
+	if (m_nIntegratedHeightSamplingDepth++ > 0)
+		return;
+
+	m_integratedHeightCache.clear();
+
+	if (m_integratedIntoTerrainNodes.empty() || areaBox.IsReset())
+		return;
+
+	// Read budget per object.
+	const int nMaxTrisPerNode = 200000;
+
+	for (std::map<IRenderNode*, AABB>::const_iterator it = m_integratedIntoTerrainNodes.begin();
+	     it != m_integratedIntoTerrainNodes.end(); ++it)
+	{
+		// Entries exist only between RegisterEntity and UnRegisterEntity, so the node is alive here.
+		IRenderNode* pRNode = it->first;
+
+		if (!Overlap::AABB_AABB2D(it->second, areaBox))
+			continue;
+
+		IRenderMesh* pRM = pRNode->GetRenderMesh(0);
+		if (!pRM)
+			continue; // not streamed in yet; the road keeps the terrain height there
+
+		SIntegratedHeightNode entry;
+		entry.box.Reset();
+
+		pRM->LockForThreadAccess();
+		{
+			int nPosStride = 0;
+			const byte* pPos = pRM->GetPosPtr(nPosStride, FSL_READ);
+			const vtx_idx* pInds = pRM->GetIndexPtr(FSL_READ);
+
+			if (pPos && pInds)
+			{
+				Matrix34 m34;
+				m34.SetIdentity();
+				pRNode->GetEntityStatObj(0, &m34);
+
+				const TRenderChunkArray& Chunks = pRM->GetChunks();
+
+				for (int nChunkId = 0; nChunkId < Chunks.size() && (int)entry.verts.size() < nMaxTrisPerNode * 3; nChunkId++)
+				{
+					const CRenderChunk* pChunk = &Chunks[nChunkId];
+
+					if (pChunk->m_nMatFlags & MTL_FLAG_NODRAW)
+						continue;
+
+					const int lastIndex = pChunk->nFirstIndexId + pChunk->nNumIndices;
+
+					for (int i = pChunk->nFirstIndexId; i + 2 < lastIndex; i += 3)
+					{
+						if ((int)entry.verts.size() >= nMaxTrisPerNode * 3)
+							break;
+
+						for (int v = 0; v < 3; v++)
+						{
+							const Vec3 vWS = m34.TransformPoint(*(const Vec3*)&pPos[nPosStride * pInds[i + v]]);
+							entry.verts.push_back(vWS);
+							entry.box.Add(vWS);
+						}
+					}
+				}
+			}
+		}
+		pRM->UnLockForThreadAccess();
+
+		const int nTris = (int)entry.verts.size() / 3;
+		if (nTris <= 0 || entry.box.IsReset())
+			continue;
+
+		// Coarse XY bin grid, sized for a handful of triangles per bin: keeps sampling off O(points * tris).
+		const int nBins = clamp_tpl((int)sqrtf((float)nTris / 4.f), 1, 64);
+		entry.binsX = nBins;
+		entry.binsY = nBins;
+		entry.binSizeX = max(0.001f, (entry.box.max.x - entry.box.min.x) / (float)nBins);
+		entry.binSizeY = max(0.001f, (entry.box.max.y - entry.box.min.y) / (float)nBins);
+		entry.bins.resize((size_t)nBins * nBins);
+
+		for (int t = 0; t < nTris; t++)
+		{
+			const Vec3& a = entry.verts[t * 3 + 0];
+			const Vec3& b = entry.verts[t * 3 + 1];
+			const Vec3& c = entry.verts[t * 3 + 2];
+
+			const float fMinX = min(a.x, min(b.x, c.x));
+			const float fMaxX = max(a.x, max(b.x, c.x));
+			const float fMinY = min(a.y, min(b.y, c.y));
+			const float fMaxY = max(a.y, max(b.y, c.y));
+
+			const int x0 = clamp_tpl((int)((fMinX - entry.box.min.x) / entry.binSizeX), 0, nBins - 1);
+			const int x1 = clamp_tpl((int)((fMaxX - entry.box.min.x) / entry.binSizeX), 0, nBins - 1);
+			const int y0 = clamp_tpl((int)((fMinY - entry.box.min.y) / entry.binSizeY), 0, nBins - 1);
+			const int y1 = clamp_tpl((int)((fMaxY - entry.box.min.y) / entry.binSizeY), 0, nBins - 1);
+
+			for (int bx = x0; bx <= x1; bx++)
+				for (int by = y0; by <= y1; by++)
+					entry.bins[(size_t)by * nBins + bx].push_back(t);
+		}
+
+		m_integratedHeightCache.push_back(std::move(entry));
+	}
+}
+
+///////////////////////////////////////////////////////////////////////////////
+void C3DEngine::EndIntegratedHeightSampling()
+{
+	assert(m_nIntegratedHeightSamplingDepth > 0);
+
+	if (m_nIntegratedHeightSamplingDepth > 0 && --m_nIntegratedHeightSamplingDepth == 0)
+		m_integratedHeightCache.clear();
+}
+
+///////////////////////////////////////////////////////////////////////////////
+bool C3DEngine::HasIntegratedHeightSamplesIn2D(const AABB& box) const
+{
+	for (size_t n = 0; n < m_integratedHeightCache.size(); n++)
+	{
+		if (Overlap::AABB_AABB2D(m_integratedHeightCache[n].box, box))
+			return true;
+	}
+
+	return false;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+float C3DEngine::GetTerrainOrIntegratedZ(float x, float y, float defaultZ) const
+{
+	// No open sampling scope: byte identical native path.
+	if (m_integratedHeightCache.empty())
+		return defaultZ;
+
+	float fZ = defaultZ;
+
+	for (size_t n = 0; n < m_integratedHeightCache.size(); n++)
+	{
+		const SIntegratedHeightNode& node = m_integratedHeightCache[n];
+
+		if (x < node.box.min.x || x > node.box.max.x || y < node.box.min.y || y > node.box.max.y)
+			continue;
+
+		const int bx = clamp_tpl((int)((x - node.box.min.x) / node.binSizeX), 0, node.binsX - 1);
+		const int by = clamp_tpl((int)((y - node.box.min.y) / node.binSizeY), 0, node.binsY - 1);
+
+		const std::vector<int>& bin = node.bins[(size_t)by * node.binsX + bx];
+
+		for (size_t k = 0; k < bin.size(); k++)
+		{
+			const Vec3& a = node.verts[bin[k] * 3 + 0];
+			const Vec3& b = node.verts[bin[k] * 3 + 1];
+			const Vec3& c = node.verts[bin[k] * 3 + 2];
+
+			// Vertical ray = 2D barycentric test in XY plus linear Z interpolation. Vertical faces project
+			// to zero area and drop out here, as intended.
+			const float fDet = (b.y - c.y) * (a.x - c.x) + (c.x - b.x) * (a.y - c.y);
+			if (fabs_tpl(fDet) < 1e-8f)
+				continue;
+
+			const float fInvDet = 1.f / fDet;
+			const float l0 = ((b.y - c.y) * (x - c.x) + (c.x - b.x) * (y - c.y)) * fInvDet;
+			const float l1 = ((c.y - a.y) * (x - c.x) + (a.x - c.x) * (y - c.y)) * fInvDet;
+			const float l2 = 1.f - l0 - l1;
+
+			// Negative tolerance so a sample on a shared edge does not fall through the crack.
+			const float fEdgeTol = -1e-4f;
+			if (l0 < fEdgeTol || l1 < fEdgeTol || l2 < fEdgeTol)
+				continue;
+
+			const float fHitZ = l0 * a.z + l1 * b.z + l2 * c.z;
+			if (fHitZ > fZ)
+				fZ = fHitZ;
+		}
+	}
+
+	return fZ;
 }
 
 ///////////////////////////////////////////////////////////////////////////////

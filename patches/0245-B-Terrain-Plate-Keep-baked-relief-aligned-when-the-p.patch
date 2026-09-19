@@ -1,0 +1,238 @@
+From 7cd5d19f4bf1febd36a7d30a30c8b730c9cd9382 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Mon, 31 Aug 2026 12:01:38 +0800
+Subject: [PATCH 245/307] !B (Terrain Plate) Keep baked relief aligned when the
+ plate is scaled.
+
+Evaluate baked relief from the generated grid rather than the higher-resolution
+source field. The bake now matches the visible mesh and no longer magnifies
+sub-grid valleys as the plate's vertical scale increases.
+---
+ .../Geometry/TerrainPlateComponent.cpp        | 143 ++++++++++++------
+ .../Geometry/TerrainPlateComponent.h          |  12 +-
+ 2 files changed, 109 insertions(+), 46 deletions(-)
+
+diff --git a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
+index 89621bef..cf743b8c 100644
+--- a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
++++ b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
+@@ -72,17 +72,20 @@ const size_t kBakeCascadeMaxPlates = 16;
+ float  g_terrainPlateBakeEpsilon = 0.02f;
+ ICVar* g_pTerrainPlateBakeEpsilonCVar = nullptr;
+ 
+-//! Slope correction of the bake Min filter. The plain Min filter takes the lowest plate height over
+-//! the half unit halo around a terrain node, which on a slope of gradient g sinks that node about
+-//! 0.5 * unitSize * |g| below the plate - 29 cm on a 30 degree slope with a 1 m unit size - and buries
+-//! every road and terrain decal on the plate no matter how small the epsilon is. Subtracting the
+-//! plate own tangent plane before taking the minimum removes exactly that linear part: the filter
+-//! becomes exact on a locally planar plate and still catches every dip, which is what the Min filter
+-//! is there for. It was needed only while roads and terrain decals had to survive on the baked
+-//! TERRAIN surface; since P11 they follow the plate mesh, so the correction is off by default and the
+-//! plain Min filter (the conservative one - it never leaves terrain above the plate) is back.
+-//! Escape hatch, kept: e_TerrainPlateBakeSlopeCorrect 1 restores the step 3 slope corrected filter.
+-int    g_terrainPlateBakeSlopeCorrect = 0;
++//! Slope correction of the bake Min filter, i.e. the curvature guard. The plain Min filter takes the
++//! lowest plate height over the half unit halo around a terrain node, which on a slope of gradient g
++//! sinks that node about 0.5 * unitSize * |g| below the plate - 29 cm on a 30 degree slope with a 1 m
++//! unit size - for no reason at all: the terrain mesh tilts between its nodes exactly as the plate
++//! does, so a planar plate needs no margin beyond the epsilon. Subtracting the plate's own tangent
++//! plane before taking the minimum removes exactly that linear part, leaving only the deviation from
++//! the plane: zero on a locally planar plate, still negative inside a dip - which is the one case a
++//! pointwise sample at the node would miss, because the terrain draws a straight line over the dip.
++//! P12 turned this off because roads no longer needed the tight bake; P13 turns it back on because it
++//! is half of why the baked terrain sat visibly below the plate and sank further the larger the plate
++//! was scaled (the other half was the bake sampling the SOURCE instead of the mesh, @see
++//! GetPlateReliefAt).
++//! Escape hatch, kept: e_TerrainPlateBakeSlopeCorrect 0 restores the plain, conservative Min filter.
++int    g_terrainPlateBakeSlopeCorrect = 1;
+ ICVar* g_pTerrainPlateBakeSlopeCorrectCVar = nullptr;
+ 
+ //! Bake trigger / bake apply tracing. The bake chain has a dozen places where it can legitimately do
+@@ -162,15 +165,16 @@ void RegisterTerrainPlateCVars()
+ 	                                                "0.005 - the step 3 tight bake, for a road forced onto the terrain surface\n"
+ 	                                                "        (e_RoadsFollowIntegratedObjects 0); expect distant junction shadow acne");
+ 
+-	g_pTerrainPlateBakeSlopeCorrectCVar = REGISTER_CVAR2("e_TerrainPlateBakeSlopeCorrect", &g_terrainPlateBakeSlopeCorrect, 0, VF_NULL,
++	g_pTerrainPlateBakeSlopeCorrectCVar = REGISTER_CVAR2("e_TerrainPlateBakeSlopeCorrect", &g_terrainPlateBakeSlopeCorrect, 1, VF_NULL,
+ 	                                                     "Terrain Plate component with Bake Into Terrain = true: subtract the plate local tangent\n"
+-	                                                     "plane before the bake Min filter takes the lowest plate height over a terrain cell. It buys\n"
+-	                                                     "back the half cell of slope drop the plain Min filter loses on a slope, which only mattered\n"
+-	                                                     "while roads and terrain decals lived on the baked terrain surface; since\n"
+-	                                                     "e_RoadsFollowIntegratedObjects a road follows the plate mesh instead, and keeping the baked\n"
+-	                                                     "terrain that close under the plate only costs shadow map precision at the junction.\n"
+-	                                                     "0 - default, plain Min filter: conservative, never leaves terrain above the plate\n"
+-	                                                     "1 - slope corrected: exact on a planar plate, still catches every dip");
++	                                                     "plane before the bake Min filter takes the lowest plate height over a terrain cell, so the\n"
++	                                                     "filter only ever gives ground back for real curvature. Without it the baked terrain sits\n"
++	                                                     "half a terrain cell of slope below the plate - visibly lower, and lower still the larger\n"
++	                                                     "the plate is scaled.\n"
++	                                                     "1 - default: the node lands on the plate mesh minus e_TerrainPlateBakeEpsilon, whatever\n"
++	                                                     "    the slope and the scale, and a dip between two terrain nodes still pulls it down\n"
++	                                                     "0 - plain Min filter: conservative (it can never leave terrain above the plate) but it\n"
++	                                                     "    buries anything drawn on the baked terrain surface on a slope");
+ 
+ 	g_pTerrainPlateDebugCVar = REGISTER_CVAR2("e_TerrainPlateDebug", &g_terrainPlateDebug, 0, VF_NULL,
+ 	                                          "Terrain Plate component: trace the bake trigger and the bake itself.\n"
+@@ -1243,6 +1247,11 @@ void CTerrainPlateComponent::RegenerateMesh()
+ 	int nx = 2, ny = 2;
+ 	ComputeEffectiveGrid(nx, ny);
+ 
++	// The bake evaluates the very same piecewise surface this grid produces (@see GetPlateReliefAt), so
++	// the vertex counts have to outlive the generation.
++	m_lastGridX = nx;
++	m_lastGridY = ny;
++
+ 	const int gridVertexCount = nx * ny;
+ 	const float fInvLastX = 1.f / (float)(nx - 1);
+ 	const float fInvLastY = 1.f / (float)(ny - 1);
+@@ -1744,15 +1753,47 @@ float CTerrainPlateComponent::GetPlateReliefAt(float lx, float ly) const
+ 	if (!m_heightField.IsValid())
+ 		return 0.f;
+ 
+-	// Exactly the mapping RegenerateMesh uses: the grid vertex at column c / row r sits at local
+-	// (-0.5 + c/(nx-1), 0.5 - r/(ny-1)) and samples (u, v) = (c/(nx-1), r/(ny-1)) with the mirror flips
+-	// applied to the sampling coordinates only.
+-	float u = lx + 0.5f;
+-	float v = 0.5f - ly;
+-	if (m_bMirrorX) u = 1.f - u;
+-	if (m_bMirrorY) v = 1.f - v;
++	// The mesh is NOT the source: RegenerateMesh samples the source once per grid vertex and the rendered
++	// surface is the interpolation between those vertices. Sampling the source directly here returned
++	// every valley the grid had already smoothed away, and the bake's Min filter then followed those
++	// valleys instead of the mesh - a surface local error of (source detail below the mesh), multiplied
++	// by the plate's Z scale, which is precisely the "the bigger the plate, the bigger the gap" symptom.
++	// So evaluate the mesh: snap to the grid, sample the source at the four surrounding grid VERTICES,
++	// and interpolate between them.
++	//
++	// Grid mapping, exactly as RegenerateMesh builds it: the vertex at column c / row r sits at local
++	// (-0.5 + c/(nx-1), 0.5 - r/(ny-1)) and samples (u, v) = (c/(nx-1), r/(ny-1)), with the mirror flips
++	// applied to the sampling coordinates only - so the mirrors move with the sample, not with the index.
++	const int nx = (m_lastGridX > 1) ? m_lastGridX : m_heightField.m_width;
++	const int ny = (m_lastGridY > 1) ? m_lastGridY : m_heightField.m_height;
++
++	const float cf = clamp_tpl(lx + 0.5f, 0.f, 1.f) * (float)(nx - 1);
++	const float rf = clamp_tpl(0.5f - ly, 0.f, 1.f) * (float)(ny - 1);
++
++	const int   c0 = clamp_tpl((int)floorf(cf), 0, nx - 2);
++	const int   r0 = clamp_tpl((int)floorf(rf), 0, ny - 2);
++	const float tc = clamp_tpl(cf - (float)c0, 0.f, 1.f);
++	const float tr = clamp_tpl(rf - (float)r0, 0.f, 1.f);
++
++	// The quad is evaluated bilinearly while the mesh triangulates it, so the two differ by at most half
++	// the quad's twist, inside one quad. That residual is what the half cell neighbourhood guard in
++	// ComputeBakeBlock is there to catch, on top of e_TerrainPlateBakeEpsilon.
++	const auto vertexHeight = [this, nx, ny](int c, int r)
++	{
++		float u = (float)c / (float)(nx - 1);
++		float v = (float)r / (float)(ny - 1);
++		if (m_bMirrorX) u = 1.f - u;
++		if (m_bMirrorY) v = 1.f - v;
++
++		return (m_heightField.SampleBilinear(u, v) - m_reliefOffset) * m_reliefScale;
++	};
++
++	const float h00 = vertexHeight(c0, r0);
++	const float h10 = vertexHeight(c0 + 1, r0);
++	const float h01 = vertexHeight(c0, r0 + 1);
++	const float h11 = vertexHeight(c0 + 1, r0 + 1);
+ 
+-	return (m_heightField.SampleBilinear(u, v) - m_reliefOffset) * m_reliefScale;
++	return (h00 * (1.f - tc) + h10 * tc) * (1.f - tr) + (h01 * (1.f - tc) + h11 * tc) * tr;
+ }
+ 
+ bool CTerrainPlateComponent::SamplePlateSurface(const Matrix34& worldTM, float worldX, float worldY,
+@@ -1884,14 +1925,21 @@ void CTerrainPlateComponent::ComputeBakeBlock(const SBakeTerrainMetrics& metrics
+ 	const float minBandLocal = clamp_tpl(metrics.unitSize / max(0.0001f, 0.5f * min(worldScale.x, worldScale.y)), 0.f, 1.f);
+ 	const float band = clamp_tpl(max((float)m_weldInnerFalloff, minBandLocal), 0.0001f, 1.f);
+ 
+-	// Min filter (research 08 section 2.6 / decision 04 rule 1): the cell takes the LOWEST plate height
+-	// over the ground it covers, so the terrain is guaranteed to stay at or below the plate mesh and no
+-	// z-fighting is possible by construction. The samples cover the cell, i.e. half a unit around the
+-	// node in each direction, because a node's height drives the four quads that meet on it.
+-	const float plateSpacing = m_heightField.IsValid()
+-	                           ? min(worldScale.x / (float)max(1, m_heightField.m_width - 1), worldScale.y / (float)max(1, m_heightField.m_height - 1))
+-	                           : metrics.unitSize;
+-	const int   samplesPerAxis = clamp_tpl((int)(metrics.unitSize / max(0.0001f, plateSpacing)) + 1, 2, 6);
++	// The terrain node takes the plate height AT THE NODE (GetPlateReliefAt is now the mesh surface, so a
++	// pointwise sample is the tight answer: the terrain mesh is linear between its nodes and so, over a
++	// terrain cell, is a plate quad that spans it). The half cell neighbourhood below is not a downsample
++	// any more, it is the guard against the plate curving BELOW the straight line the terrain draws
++	// between two nodes - the only case where terrain would poke through the plate.
++	//
++	// Sampling density: the frequency that matters is the MESH grid, not the resolution of the source -
++	// everything finer than a mesh quad was already smoothed away by the generation. So a Fixed grid
++	// plate scaled up asks for FEWER samples, which is right: its surface is linear over a whole quad
++	// there, and that is exactly the configuration where the old source-resolution downsample sank the
++	// bake further the bigger the plate got.
++	const float meshSpacing = (m_lastGridX > 1 && m_lastGridY > 1)
++	                          ? min(worldScale.x / (float)(m_lastGridX - 1), worldScale.y / (float)(m_lastGridY - 1))
++	                          : metrics.unitSize;
++	const int   samplesPerAxis = clamp_tpl((int)(metrics.unitSize / max(0.0001f, meshSpacing)) + 1, 2, 6);
+ 	const float sampleStep = metrics.unitSize / (float)(samplesPerAxis - 1);
+ 
+ 	for (int ux = 0; ux < dim; ++ux)
+@@ -1941,15 +1989,22 @@ void CTerrainPlateComponent::ComputeBakeBlock(const SBakeTerrainMetrics& metrics
+ 				}
+ 			}
+ 
+-			// Slope correction (report 14). The plain minimum above is the plate height at the node minus the
+-			// drop of the plate over half a terrain cell, so on a slope it puts the terrain node well under the
+-			// mesh and buries the road standing on it. Subtracting the plate own tangent plane first leaves
+-			// only the deviation from that plane: zero on a locally planar plate (the node then lands on the
+-			// mesh, minus the epsilon), still negative inside any dip, which is the case the Min filter exists
+-			// for. The gradient is a least squares fit over the same halo samples, taken only when the cell is
+-			// fully covered: the sample grid is then symmetric around the node, sum(dx) is zero and the fit
+-			// reduces to the two closed forms below. A partly covered cell sits on the rim of a rotated plate,
+-			// where the falloff blends the whole cell back to the baseline anyway.
++			// The curvature guard, and the reason the gap no longer grows with the plate's scale.
++			//
++			// The plain minimum above is the plate height at the node MINUS the drop of the plate over half a
++			// terrain cell, i.e. 0.5 * unitSize * |gradient|. That term has nothing to do with the plate
++			// poking through: the terrain mesh tilts between its nodes exactly as the plate does, so a planar
++			// plate needs no margin at all beyond the epsilon. Subtracting the plate's own tangent plane
++			// before taking the minimum removes precisely that linear part and leaves the deviation from the
++			// plane: zero on a locally planar plate (the node lands on the mesh, minus the epsilon, whatever
++			// the slope and whatever the scale), still negative inside a dip - which is the one case a
++			// pointwise sample would miss, because the terrain draws a straight line over that dip.
++			//
++			// The gradient is a least squares fit over the same half cell neighbourhood, taken only when the
++			// cell is fully covered: the sample grid is then symmetric around the node, sum(dx) is zero and
++			// the fit reduces to the two closed forms below. A partly covered cell sits on the rim of a
++			// rotated plate, where the falloff blends the whole cell back to the baseline anyway, so it keeps
++			// the conservative plain minimum.
+ 			if (g_terrainPlateBakeSlopeCorrect != 0 && sampleCount > 1 && samplesTaken == samplesPerAxis * samplesPerAxis)
+ 			{
+ 				float sumXX = 0.f, sumYY = 0.f, sumXZ = 0.f, sumYZ = 0.f;
+diff --git a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
+index 26dfb764..dfa4b0ca 100644
+--- a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
++++ b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
+@@ -366,8 +366,11 @@ protected:
+ 	void  ApplyBakeCascaded();
+ 	//! Logs once that this plate shares its footprint with another one, now that the cascade handles it.
+ 	void  LogBakeOverlapOnce(const CTerrainPlateComponent& other);
+-	//! Relief of the plate at a local XY, in the unit plate's 0..1 local Z. Reproduces exactly what
+-	//! RegenerateMesh put into the mesh, Normalize and Mirror included.
++	//! Relief of the plate at a local XY, in the unit plate's 0..1 local Z. Reproduces the surface
++	//! RegenerateMesh actually generated: the source is sampled on the MESH GRID and interpolated
++	//! between those vertices, Normalize and Mirror included, exactly as the rendered mesh does.
++	//! Sampling the source directly would return detail the mesh never had, and the deeper that detail
++	//! runs below the mesh the further the bake sinks - the error that grows with the plate's Z scale.
+ 	float GetPlateReliefAt(float lx, float ly) const;
+ 	//! Projects a world XY straight down onto the plate surface. False when it misses the plate.
+ 	bool  SamplePlateSurface(const Matrix34& worldTM, float worldX, float worldY, float& outWorldZ, float& outLocalX, float& outLocalY) const;
+@@ -428,6 +431,11 @@ protected:
+ 	//! World scale the current mesh was generated for. The mesh itself is scale independent in XY, but
+ 	//! the normals, the weld, the skirt and the Spacing grid are not, so a scale change regenerates.
+ 	Vec3                     m_lastWorldScale = Vec3(1.f, 1.f, 1.f);
++	//! Vertex counts of the mesh the last RegenerateMesh actually produced (@see ComputeEffectiveGrid).
++	//! The bake needs them to evaluate the same piecewise surface the mesh is; 0 until the first
++	//! generation, in which case GetPlateReliefAt falls back to the resolution of the source.
++	int                      m_lastGridX = 0;
++	int                      m_lastGridY = 0;
+ 	//! FNV-1a of the position stream of the last generated mesh; 0 until the first generation.
+ 	uint32                   m_geometryHash = 0;
+ 	_smart_ptr<IStatObj>     m_pStatObj;
+-- 
+2.47.1.windows.1
+

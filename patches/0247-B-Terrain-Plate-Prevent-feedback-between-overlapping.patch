@@ -1,0 +1,212 @@
+From 5e2c60e350074dc9053fe65511cc2e53f3a0eb34 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Mon, 31 Aug 2026 12:06:09 +0800
+Subject: [PATCH 247/307] !B (Terrain Plate) Prevent feedback between
+ overlapping bakes.
+
+Compare overlap probes with the final cascade composite rather than each
+plate's intermediate result. This prevents lower-priority plates from treating
+higher-priority relief as an external terrain edit.
+---
+ .../Geometry/TerrainPlateComponent.cpp        | 117 +++++++++++++++++-
+ .../Geometry/TerrainPlateComponent.h          |  12 ++
+ 2 files changed, 124 insertions(+), 5 deletions(-)
+
+diff --git a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
+index ff53f0ff..def383cf 100644
+--- a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
++++ b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
+@@ -60,6 +60,19 @@ uint32 g_bakeCascadeFrameId = ~0u;
+ //! layers at 8 for the same reason; the cost here is one mesh regeneration plus one SetTerrainElevation
+ //! per plate, so the cap is about a runaway configuration, not about the normal case.
+ const size_t kBakeCascadeMaxPlates = 16;
++//! Frames of silence the polling owes a finished cascade. One frame is not enough: SetTerrainElevation
++//! rebuilds sector meshes, the elevation and normal atlases, the physics heightfield and the roads over
++//! the box (terran_edit.cpp:359-431), and a probe that fires on the tail of our own writes is how a
++//! ping pong between two overlapping plates starts.
++const uint32 kBakeCascadeQuietFrames = 3;
++
++//! Safety valve for the probe repair loop. A bake repair is a user visible cost (a mesh regeneration, a
++//! SetTerrainElevation, a sector rebuild), so a configuration that repairs itself over and over has to
++//! say so and then stop doing it at full rate, rather than eat the frame time in silence. The plate is
++//! never silenced completely - the interval grows, so a genuine edit still settles.
++const int kBakeRunawayWindowFrames = 600;
++const int kBakeRunawayLimit = 8;
++const int kBakeBackoffMaxFrames = 600;
+ 
+ //! The terrain is kept this far below the plate mesh, so the two surfaces never fight (decision 04,
+ //! rule 1). Step 3 tightened this to 0.005 so that a road drawn on the TERRAIN surface
+@@ -2618,13 +2631,17 @@ void CTerrainPlateComponent::PollBake()
+ 	if (probeFrames <= 0)
+ 		return;
+ 
+-	// Never poll from inside a cascade, and not in the frame one finished either: the terrain moved
+-	// because we moved it, and reacting to our own writes is how a poll storm starts. This is also the
+-	// coalescing rule - a terrain edit that disturbs several plates costs one cascade, not one per plate.
+-	if (g_bakeCascadeDepth > 0 || g_bakeCascadeFrameId == gEnv->nMainFrameID)
++	// Never poll from inside a cascade, nor for a few frames after one finished: the terrain moved because
++	// we moved it, and reacting to our own writes is how a poll storm starts. This is also the coalescing
++	// rule - a terrain edit that disturbs several plates costs one cascade, not one per plate.
++	if (g_bakeCascadeDepth > 0)
++		return;
++
++	if (g_bakeCascadeFrameId != ~0u && (uint32)(gEnv->nMainFrameID - g_bakeCascadeFrameId) < kBakeCascadeQuietFrames)
+ 		return;
+ 
+-	if ((int)(gEnv->nMainFrameID - m_lastBakeProbeFrameId) < probeFrames)
++	// m_bakeBackoffFrames is 0 unless the runaway guard has fired (@see ReapplyBakeAfterExternalEdit).
++	if ((int)(gEnv->nMainFrameID - m_lastBakeProbeFrameId) < probeFrames + m_bakeBackoffFrames)
+ 		return;
+ 
+ 	m_lastBakeProbeFrameId = gEnv->nMainFrameID;
+@@ -2652,6 +2669,12 @@ void CTerrainPlateComponent::PollBake()
+ 			return;
+ 		}
+ 	}
++
++	// The terrain is exactly where the plate left it, so the plate is at rest and the runaway guard can
++	// forget everything it counted.
++	m_bakeReapplyCount = 0;
++	m_bakeBackoffFrames = 0;
++	m_bBakeRunawayWarned = false;
+ }
+ 
+ void CTerrainPlateComponent::ReapplyBakeAfterExternalEdit(const SBakeTerrainMetrics& metrics)
+@@ -2660,6 +2683,40 @@ void CTerrainPlateComponent::ReapplyBakeAfterExternalEdit(const SBakeTerrainMetr
+ 	if ((int)m_bakeBaseline.size() != dim * dim || (int)m_bakeResult.size() != dim * dim)
+ 		return;
+ 
++	// Safety valve. Every repair costs a mesh regeneration, a SetTerrainElevation and the sector rebuilds
++	// behind it, so a configuration that keeps repairing itself has to say so once and then slow down,
++	// instead of eating the frame time in silence. It is never silenced completely - the interval grows
++	// but the repair still happens, so a genuine edit still settles.
++	const uint32 frameId = gEnv->nMainFrameID;
++	if (m_bakeReapplyCount <= 0 || (int)(frameId - m_bakeReapplyWindowStart) > kBakeRunawayWindowFrames)
++	{
++		m_bakeReapplyWindowStart = frameId;
++		m_bakeReapplyCount = 0;
++		m_bakeBackoffFrames = 0;
++		m_bBakeRunawayWarned = false;
++	}
++
++	++m_bakeReapplyCount;
++
++	if (m_bakeReapplyCount > kBakeRunawayLimit)
++	{
++		m_bakeBackoffFrames = (m_bakeBackoffFrames > 0)
++		                      ? min(m_bakeBackoffFrames * 2, kBakeBackoffMaxFrames)
++		                      : max(1, GetBakeProbeFrames()) * 2;
++
++		if (!m_bBakeRunawayWarned)
++		{
++			m_bBakeRunawayWarned = true;
++			CryWarning(VALIDATOR_MODULE_ENTITYSYSTEM, VALIDATOR_WARNING,
++			           "Terrain Plate '%s': Bake Into Terrain has re-applied itself %d times in %d frames with no edit of its own. "
++			           "The plate is backing off (now one check every %d frames) so it stops costing frame time. This normally means "
++			           "the terrain under it keeps being rewritten by something else - most often another baking plate over the same "
++			           "ground; give the two plates different Bake Priority values, or stop them overlapping.",
++			           GetPlateName(), m_bakeReapplyCount, kBakeRunawayWindowFrames,
++			           max(1, GetBakeProbeFrames()) + m_bakeBackoffFrames);
++		}
++	}
++
+ 	// What just happened: some editor operation pushed CHeightmap over part of this rect and erased the
+ 	// bake there. The naive answer - restore the stored baseline and bake again - would undo the user's
+ 	// edit, because the stored baseline is the ground as it was BEFORE the edit. The naive opposite -
+@@ -2703,6 +2760,47 @@ void CTerrainPlateComponent::ReapplyBakeAfterExternalEdit(const SBakeTerrainMetr
+ 	RegenerateMesh();
+ }
+ 
++void CTerrainPlateComponent::RefreshBakeCompositeAfterCascade(const SBakeTerrainMetrics& metrics)
++{
++	const int dim = m_bakeRectSize + 1;
++	if (!m_bBakeApplied || m_bakeRectSize <= 0 || !metrics.IsValid() || (int)m_bakeResult.size() != dim * dim)
++		return;
++
++	// The bug this closes. Every plate's probes and its ReapplyBakeAfterExternalEdit test compare the
++	// terrain against m_bakeResult, i.e. against the block THIS plate wrote. In an overlap that block is
++	// not what the terrain ends up holding: the cascade writes the plates in ascending priority, so at a
++	// shared cell the terrain keeps the height of the plate above. The lower plate therefore mismatched on
++	// its very next poll, re-captured the higher plate's relief as "the new ground", re-baked, and the
++	// re-bake tripped the higher plate in turn - a cascade every poll interval, for ever, which is the
++	// stutter two overlapping plates showed no matter what Bake Priority was set to.
++	//
++	// So after a cascade every participant records what the terrain ACTUALLY holds over its rect. Its
++	// probes then expect the composite (they match at rest), and a later repair only re-captures cells
++	// that a third party really did change.
++	for (int ux = 0; ux < dim; ++ux)
++	{
++		for (int uy = 0; uy < dim; ++uy)
++		{
++			m_bakeResult[(size_t)ux * dim + uy] = SampleTerrainUnit(metrics, m_bakeRectX1 + ux, m_bakeRectY1 + uy);
++		}
++	}
++
++	for (SBakeProbe& probe : m_bakeProbes)
++	{
++		const int ux = probe.ux - m_bakeRectX1;
++		const int uy = probe.uy - m_bakeRectY1;
++		if (ux >= 0 && ux < dim && uy >= 0 && uy < dim)
++		{
++			probe.expectedZ = m_bakeResult[(size_t)ux * dim + uy];
++		}
++	}
++
++	m_lastBakeProbeFrameId = gEnv->nMainFrameID;
++	m_bakeReapplyCount = 0;
++	m_bakeBackoffFrames = 0;
++	m_bBakeRunawayWarned = false;
++}
++
+ void CTerrainPlateComponent::WarnOnBakeQuantisation(const SBakeTerrainMetrics& metrics)
+ {
+ 	if (m_bBakeQuantWarningIssued)
+@@ -2941,6 +3039,15 @@ void CTerrainPlateComponent::ApplyBakeCascaded()
+ 		}
+ 	}
+ 
++	// Every participant now takes the FINAL composite over its own rect as the heights it expects to find,
++	// instead of its own block. Without this the plates below the top one mismatch on their very next poll
++	// and the set re-bakes itself for ever. @see RefreshBakeCompositeAfterCascade.
++	const SBakeTerrainMetrics cascadeMetrics = GetBakeTerrainMetrics();
++	for (CTerrainPlateComponent* pPlate : affected)
++	{
++		pPlate->RefreshBakeCompositeAfterCascade(cascadeMetrics);
++	}
++
+ 	--g_bakeCascadeDepth;
+ 
+ 	// Coalescing: the cascade just rewrote the terrain under every plate in the set, and it may well have
+diff --git a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
+index d720e582..dc114c47 100644
+--- a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
++++ b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
+@@ -355,6 +355,11 @@ protected:
+ 	void  PollBake();
+ 	//! Rebuilds the baseline from what the editor left behind and re-applies the plate on top of it.
+ 	void  ReapplyBakeAfterExternalEdit(const SBakeTerrainMetrics& metrics);
++	//! After a cascade the terrain over this plate's rect holds the COMPOSITE of the whole overlapping
++	//! set, not this plate's own block: at a shared cell the higher priority plate was written last. Both
++	//! the probe expectations and m_bakeResult are re-read from the terrain here, so that a lower
++	//! priority plate stops seeing the plate above it as "somebody edited the terrain" on every poll.
++	void  RefreshBakeCompositeAfterCascade(const SBakeTerrainMetrics& metrics);
+ 	//! Warns once when the bake cost a touched sector more than half of its height precision.
+ 	void  WarnOnBakeQuantisation(const SBakeTerrainMetrics& metrics);
+ 	//! Adds this component to / removes it from the file static registry of terrain plates. Called from
+@@ -484,6 +489,13 @@ protected:
+ 	//! through SetTerrainElevation exactly.
+ 	float                    m_bakeProbeTolerance = 0.01f;
+ 	uint32                   m_lastBakeProbeFrameId = 0;
++	//! Runaway guard: how many probe repairs this plate has run since m_bakeReapplyWindowStart, and how
++	//! many extra frames it currently waits between two polls because of them. Reset as soon as one poll
++	//! finds the terrain exactly where the plate left it, i.e. as soon as the plate is at rest.
++	uint32                   m_bakeReapplyWindowStart = 0;
++	int                      m_bakeReapplyCount = 0;
++	int                      m_bakeBackoffFrames = 0;
++	bool                     m_bBakeRunawayWarned = false;
+ 	bool                     m_bBakeOverlapWarningIssued = false;
+ 	bool                     m_bBakeQuantWarningIssued = false;
+ 	bool                     m_bBakeSizeWarningIssued = false;
+-- 
+2.47.1.windows.1
+

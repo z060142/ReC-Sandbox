@@ -1,0 +1,272 @@
+From 60631b9ffe21376ac21ef8385169528ae4b198e8 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Sun, 30 Aug 2026 20:16:25 +0800
+Subject: [PATCH 215/307] !F (3DEngine) Classify integrated triangles by slope
+ and height.
+
+Classify LOD 0 triangles as merged, transition or rejected using the instance
+slope and height settings. Encode the transition weight into terrain layer
+weights while preserving the existing output for default parameters.
+---
+ .../Cry3DEngine/terrain_sector_render.cpp     | 190 +++++++++++++++++-
+ 1 file changed, 188 insertions(+), 2 deletions(-)
+
+diff --git a/Code/CryEngine/Cry3DEngine/terrain_sector_render.cpp b/Code/CryEngine/Cry3DEngine/terrain_sector_render.cpp
+index 9a840813..1c4b53b0 100644
+--- a/Code/CryEngine/Cry3DEngine/terrain_sector_render.cpp
++++ b/Code/CryEngine/Cry3DEngine/terrain_sector_render.cpp
+@@ -1402,6 +1402,73 @@ static void WarnAboutIntegratedObjectOnce(IRenderNode* pRNode, const void* pScop
+ // Peak number of vertices any single sector copied in from integrated objects since the last report.
+ static int s_nPeakIntegratedObjectsVerts = 0;
+ 
++// Fold a terrain integration transition weight into the 4 bit layer weights of an integrated vertex.
++//
++// SetVertexSurfaceType has written the three terrain surface type ids into color.bcolor[0..2] and
++// the weights of the types in slot 1 and slot 2 into the low and the high nibble of color.bcolor[3].
++// The weight of the type in slot 0 is implicit: both consumers - GenerateIndicesForAllSurfaces here
++// and the terrain layer vertex shader (Terrain.cfx, "decode 3 weights") - recover it as
++// 15 - w1 - w2. There is therefore no way to encode "the weights do not add up to 15": every unit
++// taken away from a real layer is handed straight to the type in slot 0.
++//
++// So to ramp the layers down we hand the residual to SRangeInfo::e_undefined (127) instead, which
++// both consumers ignore - the CPU classifier skips that id explicitly, and no layer material id can
++// ever match 127 in the shader. The two heaviest real types survive in slot 1 and slot 2 and carry
++// the scaled weights; a third type, always the lightest of the three, is dropped. That only happens
++// inside the transition band, where every layer is on its way out anyway.
++//
++// Rounding: nearest (floor(w * weight + 0.5)), then clamped so the two nibbles never claim more than
++// the 15 unit budget, and the dominant type is floored at 1 for any weight above 0 so that a
++// triangle that is still inside the band never falls completely out of the layer index lists.
++static void ApplyIntegrationBlendWeight(SVF_P2S_N4B_C4B_T1F& vert, float fBlendWeight)
++{
++	if (fBlendWeight >= 1.f)
++	{
++		// Full weight is the stock encoding; leave the vertex byte for byte as SetVertexSurfaceType
++		// wrote it, so the default parameters reproduce the shipped behaviour exactly.
++		return;
++	}
++
++	const int weightBitMask = 15;
++	const int maxSummWeight = 15;
++
++	const int arrTypes[3] = { vert.color.bcolor[0], vert.color.bcolor[1], vert.color.bcolor[2] };
++
++	int arrWeights[3];
++	arrWeights[1] = (vert.color.bcolor[3] & weightBitMask);
++	arrWeights[2] = ((vert.color.bcolor[3] >> 4) & weightBitMask);
++	arrWeights[0] = SATURATEB(maxSummWeight - arrWeights[1] - arrWeights[2]);
++
++	// The two heaviest types survive; ties keep the original slot order.
++	int nFirst = 0;
++	for (int i = 1; i < 3; i++)
++	{
++		if (arrWeights[i] > arrWeights[nFirst])
++			nFirst = i;
++	}
++
++	int nSecond = -1;
++	for (int i = 0; i < 3; i++)
++	{
++		if (i != nFirst && (nSecond < 0 || arrWeights[i] > arrWeights[nSecond]))
++			nSecond = i;
++	}
++
++	int nWeightFirst = (int)floorf((float)arrWeights[nFirst] * fBlendWeight + 0.5f);
++	int nWeightSecond = (int)floorf((float)arrWeights[nSecond] * fBlendWeight + 0.5f);
++
++	nWeightFirst = clamp_tpl(nWeightFirst, 0, maxSummWeight);
++	nWeightSecond = clamp_tpl(nWeightSecond, 0, maxSummWeight - nWeightFirst);
++
++	if (fBlendWeight > 0.f && nWeightFirst == 0)
++		nWeightFirst = 1;
++
++	vert.color.bcolor[0] = (byte)SRangeInfo::e_undefined; // takes the residual 15 - w1 - w2
++	vert.color.bcolor[1] = (byte)arrTypes[nFirst];
++	vert.color.bcolor[2] = (byte)arrTypes[nSecond];
++	vert.color.bcolor[3] = (byte)((nWeightFirst & weightBitMask) | ((nWeightSecond & weightBitMask) << 4));
++}
++
+ // add triangles (from marked objects) intersecting terrain
+ void CTerrainNode::AppendTrianglesFromObjects(const int nOriginX, const int nOriginY, CTerrain* pTerrain, const float stepSize, const int nTerrainSize)
+ {
+@@ -1416,6 +1483,15 @@ void CTerrainNode::AppendTrianglesFromObjects(const int nOriginX, const int nOri
+ 	const int nIndicesBefore = m_pUpdateTerrainTempData->m_StripsInfo.idx_array.Count();
+ 	int nIntegratedObjects = 0;
+ 
++	// Classification counters for the whole sector, reported by e_TerrainIntegrateObjectsDebug.
++	int nTrisMerged = 0;     // inside the height band and flat enough: full terrain layer weight
++	int nTrisTransition = 0; // inside the slope transition band: ramped terrain layer weight
++	int nTrisRejected = 0;   // too steep or outside the height band: the object material is kept
++
++	// Transition weight of every vertex appended below, indexed by (vertex index - nVertsBefore).
++	// Welded vertices are shared between triangles of different classes and keep the largest weight.
++	PodArray<float> arrVertBlend;
++
+ 	m_boxIntegratedObjects.Reset();
+ 	m_nIntegratedObjectsVerts = 0;
+ 
+@@ -1438,6 +1514,31 @@ void CTerrainNode::AppendTrianglesFromObjects(const int nOriginX, const int nOri
+ 			                                               "the integrated triangles will be killed by the stencil test (use e_TerrainBlendingDebug 2 to confirm)");
+ 		}
+ 
++		// Per instance classification parameters. A default constructed value means "no slope test,
++		// no transition band, global height band", i.e. exactly what the shipped code did.
++		STerrainIntegrationParams integrationParams;
++		if (pRNode->GetRenderNodeType() == eERType_MovableBrush)
++		{
++			integrationParams = static_cast<IBrush*>(pRNode)->GetTerrainIntegrationParams();
++		}
++
++		// A negative per object band means "use the cvar". Note that the object query box above is
++		// still grown by the cvar only, so a per object band larger than the cvar widens the per
++		// triangle test but not the set of objects this sector looks at.
++		const float fHeightBand = (integrationParams.heightBand >= 0.f)
++		                          ? integrationParams.heightBand
++		                          : GetCVars()->e_TerrainIntegrateObjectsMaxHeight;
++
++		const float fSlopeLimitDeg = clamp_tpl(integrationParams.slopeLimitDeg, 0.f, 90.f);
++		const float fSlopeBlendDeg = clamp_tpl(integrationParams.slopeBlendDeg, 0.f, fSlopeLimitDeg);
++		const float fSlopeBandStartDeg = fSlopeLimitDeg - fSlopeBlendDeg;
++
++		// 90 degrees accepts every possible face orientation, so skip the test entirely: with the
++		// default parameters not a single extra floating point operation runs per triangle.
++		const bool bSlopeTest = (fSlopeLimitDeg < 90.f);
++
++		int nObjectTrisClassified = 0; // triangles this object lost or faded, for the debug check
++
+ 		IRenderMesh* pRM = pRNode->GetRenderMesh(0);
+ 
+ 		if (!pRM)
+@@ -1518,6 +1619,7 @@ void CTerrainNode::AppendTrianglesFromObjects(const int nOriginX, const int nOri
+ 							}
+ 
+ 							Vec3 vPosWS[3];
++							Vec3 vPosRawWS[3];
+ 							Vec3 vNormWS[3];
+ 							float fElev[3];
+ 
+@@ -1528,7 +1630,8 @@ void CTerrainNode::AppendTrianglesFromObjects(const int nOriginX, const int nOri
+ 
+ 							for (int v = 0; v < 3; v++)
+ 							{
+-								vPosWS[v] = m34.TransformPoint((*(Vec3*)&pPos[nPosStride * pInds[i + v]]));
++								vPosRawWS[v] = m34.TransformPoint((*(Vec3*)&pPos[nPosStride * pInds[i + v]]));
++								vPosWS[v] = vPosRawWS[v];
+ 
+ 								SPipTangents& basis = *(SPipTangents*)&pTangs[nTangsStride * pInds[i + v]];
+ 
+@@ -1544,7 +1647,57 @@ void CTerrainNode::AppendTrianglesFromObjects(const int nOriginX, const int nOri
+ 								fElevMax = max(fElevMax, fElev[v]);
+ 							}
+ 
+-							if (triBox.max.z > fElevMin && triBox.min.z < fElevMax + GetCVars()->e_TerrainIntegrateObjectsMaxHeight && Overlap::AABB_AABB2D(triBox, aabbTNode))
++							// A triangle that belongs to a neighbouring sector is not a classification
++							// decision, it simply belongs to somebody else - do not count it.
++							if (!Overlap::AABB_AABB2D(triBox, aabbTNode))
++								continue;
++
++							if (!(triBox.max.z > fElevMin && triBox.min.z < fElevMax + fHeightBand))
++							{
++								nTrisRejected++;
++								nObjectTrisClassified++;
++								continue;
++							}
++
++							// Slope of the triangle plane against the horizontal plane, in [0, 90],
++							// taken from the world space face normal of the untransformed triangle
++							// (before the 2 cm push out along the vertex normals), so it is stable and
++							// unaffected by normal maps and by smoothed vertex normals. The sign of the
++							// normal is irrelevant - an overhang's underside is as flat as a floor and
++							// tiles just as well - so |n.z| is used rather than n.z.
++							float fBlendWeight = 1.f;
++
++							if (bSlopeTest)
++							{
++								const Vec3 vFaceNorm = (vPosRawWS[1] - vPosRawWS[0]) ^ (vPosRawWS[2] - vPosRawWS[0]);
++								const float fFaceNormLen = vFaceNorm.GetLength();
++
++								// A degenerate triangle has no plane; treat it as flat and let the
++								// existing degenerate index test downstream drop it.
++								const float fSlopeDeg = (fFaceNormLen > 0.f)
++								                        ? RAD2DEG(acos_tpl(clamp_tpl(fabs_tpl(vFaceNorm.z) / fFaceNormLen, 0.f, 1.f)))
++								                        : 0.f;
++
++								if (fSlopeDeg > fSlopeLimitDeg)
++								{
++									nTrisRejected++;
++									nObjectTrisClassified++;
++									continue;
++								}
++
++								if (fSlopeBlendDeg > 0.f && fSlopeDeg > fSlopeBandStartDeg)
++								{
++									const float t = (fSlopeDeg - fSlopeBandStartDeg) / fSlopeBlendDeg;
++									fBlendWeight = 1.f - (t * t * (3.f - 2.f * t)); // 1 - smoothstep(t)
++									nObjectTrisClassified++;
++								}
++							}
++
++							if (fBlendWeight < 1.f)
++								nTrisTransition++;
++							else
++								nTrisMerged++;
++
+ 							{
+ 								m_fBBoxExtentionByObjectsIntegration = max(m_fBBoxExtentionByObjectsIntegration, triBox.max.z - fHeightMapMax);
+ 								m_boxIntegratedObjects.Add(triBox);
+@@ -1595,12 +1748,36 @@ void CTerrainNode::AppendTrianglesFromObjects(const int nOriginX, const int nOri
+ 										// set terrain surface type
+ 										SetVertexSurfaceType(x, y, stepSize, pTerrain, vert);
+ 
++										// ramp the layer weights down inside the slope transition band
++										ApplyIntegrationBlendWeight(vert, fBlendWeight);
++
+ 										nIndex = m_pUpdateTerrainTempData->m_lstTmpVertArray.Count();
+ 
+ 										m_pUpdateTerrainTempData->m_lstTmpVertArray.Add(vert);
++										arrVertBlend.Add(fBlendWeight);
+ 
+ 										arrVertHash[xh & (nHashDim - 1)][yh & (nHashDim - 1)].Add(nIndex);
+ 									}
++									else
++									{
++										// The vertex is welded, so it is shared by triangles that may have
++										// been classified differently. Take the maximum weight: the seam
++										// between a merged and a faded triangle then keeps the layers of
++										// the merged side instead of tearing a hole in them.
++										const int nBlendId = nIndex - nVertsBefore;
++
++										if (nBlendId >= 0 && nBlendId < arrVertBlend.Count() && fBlendWeight > arrVertBlend[nBlendId])
++										{
++											arrVertBlend[nBlendId] = fBlendWeight;
++
++											SVF_P2S_N4B_C4B_T1F& vertCached = *(m_pUpdateTerrainTempData->m_lstTmpVertArray.GetElements() + nIndex);
++
++											// Re-encode from scratch: ApplyIntegrationBlendWeight is lossy
++											// (it replaces slot 0 with e_undefined) and cannot be undone.
++											SetVertexSurfaceType(x, y, stepSize, pTerrain, vertCached);
++											ApplyIntegrationBlendWeight(vertCached, fBlendWeight);
++										}
++									}
+ 
+ 									m_pUpdateTerrainTempData->m_StripsInfo.idx_array.Add(nIndex);
+ 								}
+@@ -1611,6 +1788,15 @@ void CTerrainNode::AppendTrianglesFromObjects(const int nOriginX, const int nOri
+ 
+ 				if (m_pUpdateTerrainTempData->m_StripsInfo.idx_array.Count() > nIndicesBeforeObject)
+ 					nIntegratedObjects++;
++
++				// Consistency check: with the default parameters not a single triangle may be rejected
++				// or faded by the classifier, otherwise the "stock defaults are stock behaviour"
++				// property is broken. Cheap: one branch per object, and only while debugging.
++				if (GetCVars()->e_TerrainIntegrateObjectsDebug && nObjectTrisClassified && !integrationParams.IsNonDefault())
++				{
++					WarnAboutIntegratedObjectOnce(pRNode, this, "has default terrain integration parameters but triangles were rejected or faded by the slope classifier "
++					                                            "(this is a bug in CTerrainNode::AppendTrianglesFromObjects)");
++				}
+ 			}
+ 
+ 			pRM->UnLockForThreadAccess();
+-- 
+2.47.1.windows.1
+

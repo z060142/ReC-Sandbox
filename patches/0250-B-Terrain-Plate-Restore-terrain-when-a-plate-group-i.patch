@@ -1,0 +1,197 @@
+From 1c5b454ab7783823535549f2734892c1b2ecd8f2 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Mon, 31 Aug 2026 13:31:52 +0800
+Subject: [PATCH 250/307] !B (Terrain Plate) Restore terrain when a plate group
+ is deleted.
+
+Batch entity teardown for grouped plates and restore the complete overlap set
+before unregistering its members. Deleting or undoing a group no longer leaves
+relief captured by another plate's baseline.
+---
+ .../Geometry/TerrainPlateComponent.cpp        | 88 +++++++++++++++++--
+ .../Geometry/TerrainPlateComponent.h          | 15 +++-
+ 2 files changed, 93 insertions(+), 10 deletions(-)
+
+diff --git a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
+index c65be6cb..bd82db5b 100644
+--- a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
++++ b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
+@@ -2406,15 +2406,25 @@ void CTerrainPlateComponent::RestoreBakeOnTeardown()
+ 	const int oldSize = m_bakeRectSize;
+ 	const bool bHadBake = m_bBakeApplied;
+ 
+-	RestoreBakeBaseline();
++	// P16: a lone RestoreBakeBaseline() here is only correct when nothing is stacked ON TOP of this
++	// plate's footprint. Deleting a GROUP tears every member down inside ONE
++	// CObjectManager::DeleteObjects call (ObjectManager.cpp:1104 -> CGroup::DeleteAllMembers,
++	// Group.cpp:439-451, then pObject->Done() at :1163 -> CEntityObject::DeleteEntity :2133 ->
++	// CEntitySystem::RemoveEntity -> ENTITY_EVENT_DONE, EntitySystem.cpp:797-799), in m_children order
++	// and in ONE frame - so there is no update tick between the members for the probe repair to heal
++	// anything, and the members restore in whatever order they were added to the group. @see report 21.
++	if (!RestoreBakeOnTeardownCascaded())
++	{
++		RestoreBakeBaseline();
++	}
+ 
+ 	if (!bHadBake || oldSize <= 0)
+ 		return;
+ 
+-	// Any plate that was baking on top of this one now sits on ground that just moved under it. It heals
+-	// on its next poll by itself (report 12 section 2), but it does not have to wait a whole poll interval
+-	// for it: bring the next poll of every overlapping plate forward to the next frame. This is a nudge,
+-	// not a cascade - a cascade must not run from a teardown.
++	// Any plate that was baking on top of this one now sits on ground that just moved under it. When the
++	// unwind above ran, they have already been re-baked on the corrected ground and this is only a cheap
++	// belt and braces; when it did not, this is the whole repair. Either way it is a nudge that brings
++	// their next poll forward, not a second cascade.
+ 	for (CTerrainPlateComponent* pOther : g_terrainPlates)
+ 	{
+ 		if (pOther == this || !pOther->m_bBakeApplied || pOther->m_bakeRectSize <= 0)
+@@ -2431,6 +2441,49 @@ void CTerrainPlateComponent::RestoreBakeOnTeardown()
+ 	}
+ }
+ 
++bool CTerrainPlateComponent::RestoreBakeOnTeardownCascaded()
++{
++	// Nothing in the ground, or we are already inside a cascade that owns the ordering (a cascade
++	// regenerates meshes, and a regeneration can in principle remove a component). Plain restore.
++	if (!m_bBakeApplied || m_bakeRectSize <= 0 || g_bakeCascadeDepth > 0)
++		return false;
++
++	if (gEnv == nullptr || gEnv->p3DEngine == nullptr || gEnv->p3DEngine->GetITerrain() == nullptr)
++		return false;
++
++	// Who else is standing on the footprint we are about to hand back, transitively. This plate is
++	// already out of the registry and m_bBakeTornDown is set, so it cannot collect itself - which is
++	// exactly what we want: it is unwind-only.
++	std::vector<int> rects;
++	rects.push_back(m_bakeRectX1);
++	rects.push_back(m_bakeRectY1);
++	rects.push_back(m_bakeRectSize);
++
++	std::vector<CTerrainPlateComponent*> affected;
++	CollectBakeCascadeSetFromRects(rects, affected);
++
++	// The stack, not the overlap, is what decides. Our stored baseline is the ground as it was when WE
++	// baked, so it is still the truth for every plate that baked BEFORE us - writing it back over our
++	// rect hands them their relief back untouched. It is a lie only about the plates that baked AFTER
++	// us: their relief is in it, and restoring it resurrects that relief as ground nobody owns, which
++	// the next member's teardown (or the re-bake after an undo) then captures as if it were the
++	// original terrain. So the ordered unwind is owed exactly when somebody up the stack is still live.
++	bool bStacked = false;
++	for (const CTerrainPlateComponent* pPlate : affected)
++	{
++		bStacked = bStacked || (pPlate->m_bBakeApplied && pPlate->m_bakeApplySeq > m_bakeApplySeq);
++	}
++
++	if (!bStacked)
++		return false;   // B2, the single plate delete: the plain restore already is the whole answer
++
++	// One ordered pass: every member of the set and this plate restore in DESCENDING m_bakeApplySeq -
++	// the exact inverse of the order the terrain was written in - and then the SURVIVORS, and only they,
++	// regenerate and re-bake in ascending Bake Priority on top of the ground we just gave back.
++	RunBakeCascade(affected, nullptr, "teardown unwind", this);
++	return true;
++}
++
+ bool CTerrainPlateComponent::VerifyBakeWrite(const SBakeTerrainMetrics& metrics)
+ {
+ 	// ITerrain::SetTerrainElevation reports nothing back. An out of range rect only warns inside the
+@@ -3092,6 +3145,12 @@ void CTerrainPlateComponent::CollectBakeCascadeSet(std::vector<CTerrainPlateComp
+ 
+ 	out.push_back(const_cast<CTerrainPlateComponent*>(this));
+ 
++	CollectBakeCascadeSetFromRects(rects, out);
++}
++
++void CTerrainPlateComponent::CollectBakeCascadeSetFromRects(std::vector<int>& rects,
++                                                            std::vector<CTerrainPlateComponent*>& out)
++{
+ 	// Transitive closure over rect intersection: a third plate that only overlaps the second one still
+ 	// has to be unwound, because the second one's baseline will be re-captured from ground the third one
+ 	// is sitting on. Quadratic in the number of baking plates, but it only runs when a bake actually
+@@ -3178,9 +3237,10 @@ void CTerrainPlateComponent::ApplyBakeCascaded()
+ }
+ 
+ void CTerrainPlateComponent::RunBakeCascade(std::vector<CTerrainPlateComponent*>& affected,
+-                                            CTerrainPlateComponent* pSeed, const char* szReason)
++                                            CTerrainPlateComponent* pSeed, const char* szReason,
++                                            CTerrainPlateComponent* pRemoved)
+ {
+-	if (affected.empty() || g_bakeCascadeDepth > 0)
++	if ((affected.empty() && pRemoved == nullptr) || g_bakeCascadeDepth > 0)
+ 		return;
+ 
+ 	// The set is sorted here rather than by the callers, so that the invariant "restored in the exact
+@@ -3216,7 +3276,16 @@ void CTerrainPlateComponent::RunBakeCascade(std::vector<CTerrainPlateComponent*>
+ 
+ 	// A separate order, because the set has to be RE-APPLIED in priority order and UNWOUND in the order it
+ 	// was written. A plate that has never baked carries sequence 0, sorts last and restores nothing.
++	//
++	// P16: pRemoved is a plate that is being torn down. It takes part in the UNWIND - its bake is in the
++	// ground and its position in the stack is exactly as load bearing as anybody else's - but not in the
++	// re-apply: it is on its way out, it is already out of the registry and m_bBakeTornDown refuses its
++	// bake anyway. @see RestoreBakeOnTeardownCascaded.
+ 	std::vector<CTerrainPlateComponent*> unwind(affected);
++	if (pRemoved != nullptr)
++	{
++		unwind.push_back(pRemoved);
++	}
+ 	std::stable_sort(unwind.begin(), unwind.end(),
+ 	                 [](const CTerrainPlateComponent* pA, const CTerrainPlateComponent* pB)
+ 	                 { return pA->m_bakeApplySeq > pB->m_bakeApplySeq; });
+@@ -3274,8 +3343,9 @@ void CTerrainPlateComponent::RunBakeCascade(std::vector<CTerrainPlateComponent*>
+ 
+ 	if (GetPlateDebugLevel() >= 1)
+ 	{
+-		CryLog("TerrainPlate '%s': %s over %d plates, restored highest priority first and re-baked lowest priority first",
+-		       (pSeed != nullptr) ? pSeed->GetPlateName() : "<batch>", szReason, (int)affected.size());
++		const CTerrainPlateComponent* pNamed = (pSeed != nullptr) ? pSeed : pRemoved;
++		CryLog("TerrainPlate '%s': %s over %d plates, restored last-applied first and re-baked lowest priority first",
++		       (pNamed != nullptr) ? pNamed->GetPlateName() : "<batch>", szReason, (int)unwind.size());
+ 	}
+ }
+ 
+diff --git a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
+index ef59695d..927fc0a5 100644
+--- a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
++++ b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
+@@ -350,6 +350,12 @@ protected:
+ 	//! ENTITY_EVENT_DONE (the earliest point, with the entity and the terrain still whole), OnShutDown
+ 	//! (a component removed from a surviving entity) and the destructor (the backstop).
+ 	void  RestoreBakeOnTeardown();
++	//! P16. The teardown half of the ordered unwind: when live plates are stacked ON TOP of the footprint
++	//! this plate is handing back, the plain restore would write their relief into the ground as terrain
++	//! nobody owns (deleting a GROUP tears every member down in one frame, so nothing heals in between).
++	//! Runs RunBakeCascade over the survivors with this plate as the unwind-only member and returns true;
++	//! returns false when the plain restore is already correct, which is every single plate delete.
++	bool  RestoreBakeOnTeardownCascaded();
+ 	//! Captures the baseline, computes the block and writes it. Does nothing until the level is loaded.
+ 	void  ApplyBake();
+ 	//! Decals, shadows and navmesh over a footprint that just changed.
+@@ -384,6 +390,10 @@ protected:
+ 	//! Every baking plate transitively connected to this one by an overlapping rect, this one included,
+ 	//! sorted by Bake Priority and then by entity GUID.
+ 	void  CollectBakeCascadeSet(std::vector<CTerrainPlateComponent*>& out) const;
++	//! The closure itself, seeded with rects rather than with a plate, so that a plate which is no longer
++	//! in the registry (a teardown) can still ask who is standing on the footprint it is giving back.
++	//! Appends to a pre-seeded out and sorts it; rects is grown as members join.
++	static void CollectBakeCascadeSetFromRects(std::vector<int>& rects, std::vector<CTerrainPlateComponent*>& out);
+ 	//! Cascade order: lower Bake Priority bakes first; ties by entity GUID, which is stable across loads.
+ 	bool  BakesBefore(const CTerrainPlateComponent& other) const;
+ 	//! ApplyBake for a plate that owns its footprint alone, the whole restore / re-bake cascade when it
+@@ -392,7 +402,10 @@ protected:
+ 	//! The cascade driver itself, shared by ApplyBakeCascaded and the move batch: restore every member's
+ 	//! footprint in DESCENDING priority, regenerate and re-bake in ASCENDING priority, then refresh every
+ 	//! member's composite expectation. The set is sorted here, so callers only have to collect it.
+-	static void RunBakeCascade(std::vector<CTerrainPlateComponent*>& affected, CTerrainPlateComponent* pSeed, const char* szReason);
++	//! pRemoved, when given, is a plate that is being torn down: it takes part in the ordered UNWIND but
++	//! is not re-baked afterwards. @see RestoreBakeOnTeardownCascaded.
++	static void RunBakeCascade(std::vector<CTerrainPlateComponent*>& affected, CTerrainPlateComponent* pSeed, const char* szReason,
++	                           CTerrainPlateComponent* pRemoved = nullptr);
+ 
+ 	// ------------------------------------------------------- move batch (P14: several plates at once)
+ 	//! Puts this plate on the list of plates whose move still owes a restore / re-bake, and pulls the
+-- 
+2.47.1.windows.1
+

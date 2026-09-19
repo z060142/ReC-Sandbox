@@ -1,0 +1,288 @@
+From 48c6941bf3e02e9aeb4f25d18f637e6148b9d5e0 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Mon, 31 Aug 2026 10:38:23 +0800
+Subject: [PATCH 242/307] !F (Roads) Follow geometry integrated into terrain.
+
+Route road height and normal samples through the integrated surface query.
+Roads drape over integrated meshes at their real resolution and fall back to
+the terrain heightmap where no integrated surface is found.
+---
+ Code/CryEngine/Cry3DEngine/RoadRenderNode.cpp | 166 ++++++++++++++++--
+ Code/CryEngine/Cry3DEngine/cvars.cpp          |  15 ++
+ Code/CryEngine/Cry3DEngine/cvars.h            |   2 +
+ 3 files changed, 171 insertions(+), 12 deletions(-)
+
+diff --git a/Code/CryEngine/Cry3DEngine/RoadRenderNode.cpp b/Code/CryEngine/Cry3DEngine/RoadRenderNode.cpp
+index 6a7215f9..20bcfdc4 100644
+--- a/Code/CryEngine/Cry3DEngine/RoadRenderNode.cpp
++++ b/Code/CryEngine/Cry3DEngine/RoadRenderNode.cpp
+@@ -24,6 +24,65 @@ CPolygonClipContext CRoadRenderNode::s_tmpClipContext;
+ ILINE Vec3 max(const Vec3& v0, const Vec3& v1) { return Vec3(max(v0.x, v1.x), max(v0.y, v1.y), max(v0.z, v1.z)); }
+ ILINE Vec3 min(const Vec3& v0, const Vec3& v1) { return Vec3(min(v0.x, v1.x), min(v0.y, v1.y), min(v0.z, v1.z)); }
+ 
++namespace
++{
++
++//! Holds a road height sampling scope open on C3DEngine for one rebuild, so the LOD 0 meshes of the
++//! objects rendering as terrain under this road are read once and then sampled cheaply.
++struct SIntegratedHeightScope
++{
++	SIntegratedHeightScope(bool bEnabled, const AABB& areaBox)
++		: m_bEnabled(bEnabled)
++	{
++		if (m_bEnabled)
++			Cry3DEngineBase::Get3DEngine()->BeginIntegratedHeightSampling(areaBox);
++	}
++
++	~SIntegratedHeightScope()
++	{
++		if (m_bEnabled)
++			Cry3DEngineBase::Get3DEngine()->EndIntegratedHeightSampling();
++	}
++
++	SIntegratedHeightScope(const SIntegratedHeightScope&) = delete;
++	SIntegratedHeightScope& operator=(const SIntegratedHeightScope&) = delete;
++
++	const bool m_bEnabled;
++};
++
++//! The height of the surface a road lies on at (x, y): the terrain height the caller already has,
++//! raised onto any object that renders as terrain there. Returns fTerrainZ unchanged with
++//! e_RoadsFollowIntegratedObjects 0, or when no such object covers the point.
++ILINE float RoadSurfaceZ(bool bFollow, float x, float y, float fTerrainZ)
++{
++	return bFollow ? Cry3DEngineBase::Get3DEngine()->GetTerrainOrIntegratedZ(x, y, fTerrainZ) : fTerrainZ;
++}
++
++//! CTerrain::GetTerrainSurfaceNormal (terrain.cpp:595) with each of its four samples put through
++//! RoadSurfaceZ, so the road is shaded by the surface it is actually lying on. Bit for bit the stock
++//! function when bFollow is false, and numerically identical to it when nothing is integrating here.
++Vec3 RoadSurfaceNormal(bool bFollow, const Vec3& vPos, float fRange)
++{
++	CTerrain* const pTerrain = Cry3DEngineBase::GetTerrain();
++
++	if (!bFollow)
++		return pTerrain->GetTerrainSurfaceNormal(vPos, fRange);
++
++	fRange += 0.05f;
++
++	const float x0 = vPos.x - fRange, x1 = vPos.x + fRange;
++	const float y0 = vPos.y - fRange, y1 = vPos.y + fRange;
++
++	const Vec3 v1(x0, y0, RoadSurfaceZ(true, x0, y0, pTerrain->GetZApr(x0, y0)));
++	const Vec3 v2(x0, y1, RoadSurfaceZ(true, x0, y1, pTerrain->GetZApr(x0, y1)));
++	const Vec3 v3(x1, y0, RoadSurfaceZ(true, x1, y0, pTerrain->GetZApr(x1, y0)));
++	const Vec3 v4(x1, y1, RoadSurfaceZ(true, x1, y1, pTerrain->GetZApr(x1, y1)));
++
++	return (v3 - v2).Cross(v4 - v1).GetNormalized();
++}
++
++} // anonymous namespace
++
+ STRUCT_INFO_BEGIN(CRoadRenderNode::SData)
+ STRUCT_VAR_INFO(arrTexCoors, TYPE_ARRAY(2, TYPE_INFO(float)))
+ STRUCT_VAR_INFO(arrTexCoorsGlobal, TYPE_ARRAY(2, TYPE_INFO(float)))
+@@ -153,10 +212,29 @@ void CRoadRenderNode::Compile() PREFAST_SUPPRESS_WARNING(6262) //function uses >
+ 		if (nVertsNumAll < 4)
+ 			return;
+ 
++		// The height sampling scope has to be open before the first height query, so its area comes from
++		// the road control points. Only XY matters (the cache is culled in 2D); the margin covers the
++		// heightmap cells the tessellation grid adds around the road below.
++		const bool bFollowIntegrated = (GetCVars()->e_RoadsFollowIntegratedObjects != 0);
++
++		AABB areaBox;
++		areaBox.Reset();
++		for (int i = 0; i < nVertsNumAll; i++)
++			areaBox.Add(m_arrVerts[i]);
++
++		if (!areaBox.IsReset())
++		{
++			const float fMargin = GetTerrain() ? (GetTerrain()->GetHeightMapUnitSize() * 2.f) : 4.f;
++			areaBox.Expand(Vec3(fMargin, fMargin, fRoadAreaZRange));
++		}
++
++		SIntegratedHeightScope heightScope(bFollowIntegrated && !areaBox.IsReset(), areaBox);
++
+ 		m_serializedData.worldSpaceBBox.Reset();
+ 		for (int i = 0; i < nVertsNumAll; i++)
+ 		{
+-			Vec3 vTmp(m_arrVerts[i].x, m_arrVerts[i].y, Get3DEngine()->GetTerrainElevation(m_arrVerts[i].x, m_arrVerts[i].y) + fRoadTerrainZOffset);
++			const float fTerrainZ = Get3DEngine()->GetTerrainElevation(m_arrVerts[i].x, m_arrVerts[i].y);
++			Vec3 vTmp(m_arrVerts[i].x, m_arrVerts[i].y, RoadSurfaceZ(bFollowIntegrated, m_arrVerts[i].x, m_arrVerts[i].y, fTerrainZ) + fRoadTerrainZOffset);
+ 			m_serializedData.worldSpaceBBox.Add(vTmp);
+ 		}
+ 
+@@ -203,21 +281,62 @@ void CRoadRenderNode::Compile() PREFAST_SUPPRESS_WARNING(6262) //function uses >
+ 			float y1 = std::floor(WSBBox.min.y / unitSize) * unitSize;
+ 			float y2 = std::floor(WSBBox.max.y / unitSize) * unitSize + unitSize;
+ 
++			// A road is tessellated on the heightmap grid, so it resolves an object that renders as terrain
++			// at terrain cell size at best. Subdivide that grid, but only over an object that is actually
++			// there, and only as far as the road vertex budget allows. The grid bounds stay cell aligned,
++			// so holes, the quad diagonal and the neighbouring trapezoids are unaffected.
++			int nSubdiv = 1;
++			float fStep = unitSize;
++
++			if (bFollowIntegrated && Get3DEngine()->HasIntegratedHeightSamplesIn2D(WSBBox))
++			{
++				nSubdiv = clamp_tpl(GetCVars()->e_RoadsFollowIntegratedObjectsSubdiv, 1, 8);
++
++				const int nCellsX = max(1, int((x2 - x1) / unitSize));
++				const int nCellsY = max(1, int((y2 - y1) / unitSize));
++				const int nMaxGridVerts = 4096; // per trapezoid; the whole road is capped at 32k below
++
++				while (nSubdiv > 1 && (nCellsX * nSubdiv + 1) * (nCellsY * nSubdiv + 1) > nMaxGridVerts)
++					nSubdiv--;
++
++				fStep = unitSize / (float)nSubdiv;
++			}
++
+ 			// make arrays of verts and indices used in trapezoid area
+ 			s_tempVertexPositions.Clear();
+ 			s_tempIndices.Clear();
+ 
+-			for (float x = x1; x <= x2; x += unitSize)
++			if (nSubdiv > 1)
++			{
++				// Indexed rather than accumulated, so the vertex count cannot drift away from dx/dy below
++				// once the step is a fraction of the unit size.
++				const int nCountX = int((x2 - x1) / fStep) + 1;
++				const int nCountY = int((y2 - y1) / fStep) + 1;
++
++				for (int ix = 0; ix < nCountX; ix++)
++				{
++					for (int iy = 0; iy < nCountY; iy++)
++					{
++						const float x = x1 + (float)ix * fStep;
++						const float y = y1 + (float)iy * fStep;
++						s_tempVertexPositions.Add(Vec3(x, y, Get3DEngine()->GetTerrainOrIntegratedZ(x, y, GetTerrain()->GetZ(x, y, true))));
++					}
++				}
++			}
++			else
+ 			{
+-				for (float y = y1; y <= y2; y += unitSize)
++				for (float x = x1; x <= x2; x += unitSize)
+ 				{
+-					s_tempVertexPositions.Add(Vec3((float)x, (float)y, GetTerrain()->GetZ(x, y, true)));
++					for (float y = y1; y <= y2; y += unitSize)
++					{
++						s_tempVertexPositions.Add(Vec3((float)x, (float)y, RoadSurfaceZ(bFollowIntegrated, x, y, GetTerrain()->GetZ(x, y, true))));
++					}
+ 				}
+ 			}
+ 
+ 			// make indices
+-			int dx = int((x2 - x1) / unitSize);
+-			int dy = int((y2 - y1) / unitSize);
++			int dx = int((x2 - x1) / fStep);
++			int dy = int((y2 - y1) / fStep);
+ 
+ 			for (int x = 0; x < dx; x++)
+ 			{
+@@ -228,14 +347,26 @@ void CRoadRenderNode::Compile() PREFAST_SUPPRESS_WARNING(6262) //function uses >
+ 					int nIdx2 = (x * (dy + 1) + y + 1);
+ 					int nIdx3 = (x * (dy + 1) + y + 1 + (dy + 1));
+ 
+-					float X_in_meters = float(x1) + float(x) * unitSize;
+-					float Y_in_meters = float(y1) + float(y) * unitSize;
++					float X_in_meters = float(x1) + float(x) * fStep;
++					float Y_in_meters = float(y1) + float(y) * fStep;
+ 
+ 					CTerrain* pTerrain = GetTerrain();
+ 
+-					if (m_bIgnoreTerrainHoles || (pTerrain && !pTerrain->GetHole(X_in_meters, Y_in_meters)))
++					// A hole and the quad diagonal are properties of the terrain cell, not of the road
++					// grid, so a subdivided quad asks the cell it sits in and a cell is never half flipped.
++					// With nSubdiv == 1 these are the loop coordinates themselves, untouched.
++					float X_cell = X_in_meters;
++					float Y_cell = Y_in_meters;
++
++					if (nSubdiv > 1)
++					{
++						X_cell = std::floor(X_in_meters / unitSize) * unitSize;
++						Y_cell = std::floor(Y_in_meters / unitSize) * unitSize;
++					}
++
++					if (m_bIgnoreTerrainHoles || (pTerrain && !pTerrain->GetHole(X_cell, Y_cell)))
+ 					{
+-						if (pTerrain && pTerrain->IsMeshQuadFlipped(X_in_meters, Y_in_meters, unitSize))
++						if (pTerrain && pTerrain->IsMeshQuadFlipped(X_cell, Y_cell, unitSize))
+ 						{
+ 							s_tempIndices.Add(nIdx0);
+ 							s_tempIndices.Add(nIdx1);
+@@ -339,7 +470,10 @@ void CRoadRenderNode::Compile() PREFAST_SUPPRESS_WARNING(6262) //function uses >
+ 
+ 				s_tempVertices.Add(tmp);
+ 
+-				Vec3 vNormal = GetTerrain()->GetTerrainSurfaceNormal(vWSPos, 0.25f);
++				// 0.25 is the stock sample radius, exactly reproduced while nSubdiv == 1. On a subdivided
++				// grid it would smooth away the very relief the subdivision was added to resolve, so it
++				// shrinks with the step.
++				Vec3 vNormal = RoadSurfaceNormal(bFollowIntegrated, vWSPos, 0.25f * fStep / unitSize);
+ 
+ 				Vec3 vBiTang = pVerts[1] - pVerts[0];
+ 				vBiTang.Normalize();
+@@ -618,10 +752,18 @@ void CRoadRenderNode::OnTerrainChanged()
+ 
+ 	Vec3 vWSBoxCenter = m_serializedData.worldSpaceBBox.GetCenter(); //vWSBoxCenter.z=0;
+ 
++	// This is only the interim refresh; ScheduleRebuild(true) below has Compile() redo the mesh from
++	// Update(). It still has to read the same surface the full rebuild will, otherwise the road snaps
++	// back onto the bare heightmap for a frame wherever an object is rendering as terrain.
++	const bool bFollowIntegrated = (GetCVars()->e_RoadsFollowIntegratedObjects != 0);
++	SIntegratedHeightScope heightScope(bFollowIntegrated, m_serializedData.worldSpaceBBox);
++
+ 	for (int i = 0, nVertsNum = m_pRenderMesh->GetVerticesCount(); i < nVertsNum; i++)
+ 	{
+ 		Vec3& vPos = *(Vec3*)&pPos[i * nPosStride];
+-		vPos.z = GetTerrain()->GetZApr(vWSBoxCenter.x + vPos.x, vWSBoxCenter.y + vPos.y) + 0.01f - vWSBoxCenter.z;
++		const float fX = vWSBoxCenter.x + vPos.x;
++		const float fY = vWSBoxCenter.y + vPos.y;
++		vPos.z = RoadSurfaceZ(bFollowIntegrated, fX, fY, GetTerrain()->GetZApr(fX, fY)) + 0.01f - vWSBoxCenter.z;
+ 	}
+ 	m_pRenderMesh->UnlockStream(VSF_GENERAL);
+ 
+diff --git a/Code/CryEngine/Cry3DEngine/cvars.cpp b/Code/CryEngine/Cry3DEngine/cvars.cpp
+index c1f4a2ac..30c88c41 100644
+--- a/Code/CryEngine/Cry3DEngine/cvars.cpp
++++ b/Code/CryEngine/Cry3DEngine/cvars.cpp
+@@ -302,6 +302,21 @@ void CVars::Init()
+ 	              "Raise it (0.03 is usually enough) if roads disappear under a baked plate on a sector with a\n"
+ 	              "large height range, where the 12 bit height quantisation eats the margin.");
+ 
++	REGISTER_CVAR(e_RoadsFollowIntegratedObjects, 1, VF_NULL,
++	              "1 - a road is built on the real surface of any object that renders as terrain\n"
++	              "    ('Integrate Into Terrain' GI mode, level flag Terrain/IntegrateObjects), instead of on\n"
++	              "    the heightmap under it. A Terrain Plate is then followed at its own mesh resolution,\n"
++	              "    baked or not, so the road hugs it up close rather than at cell resolution.\n"
++	              "0 - stock 5.7 behaviour: every road vertex comes from CTerrain::GetZ alone.\n"
++	              "e_RoadsZOffset still applies on top in both cases.");
++
++	REGISTER_CVAR(e_RoadsFollowIntegratedObjectsSubdiv, 4, VF_NULL,
++	              "Road tessellation multiplier inside the bounding box of an integrating object, 1 to 8.\n"
++	              "A road is tessellated on the terrain heightmap grid, which is far coarser than a plate mesh;\n"
++	              "this subdivides that grid so the road resolves the relief it is following. 1 disables it.\n"
++	              "The factor is lowered automatically where it would exceed the road vertex budget.\n"
++	              "Ignored while e_RoadsFollowIntegratedObjects is 0.");
++
+ 	REGISTER_CVAR(e_Decals, 1, VF_NULL | VF_CHEAT_ALWAYS_CHECK,
+ 	              "Activates drawing of decals (game decals and hand-placed)");
+ 	REGISTER_CVAR(e_DecalsForceDeferred, 0, VF_NULL,
+diff --git a/Code/CryEngine/Cry3DEngine/cvars.h b/Code/CryEngine/Cry3DEngine/cvars.h
+index c91003c8..132da71c 100644
+--- a/Code/CryEngine/Cry3DEngine/cvars.h
++++ b/Code/CryEngine/Cry3DEngine/cvars.h
+@@ -307,6 +307,8 @@ struct CVars : public Cry3DEngineBase
+ 	int   e_DecalsDeferredStatic;
+ 	DeclareConstIntCVar(e_Roads, 1);
+ 	float e_RoadsZOffset;
++	int   e_RoadsFollowIntegratedObjects;
++	int   e_RoadsFollowIntegratedObjectsSubdiv;
+ 	float e_TerrainDetailMaterialsViewDistXY;
+ 	int   e_ParticlesQuality;
+ 	DeclareConstIntCVar(e_DebugDrawShowOnlyCompound, 0);
+-- 
+2.47.1.windows.1
+

@@ -1,0 +1,128 @@
+From 1605cb5625d142e6d10df0de074a6ae6566de298 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Sun, 30 Aug 2026 16:22:47 +0800
+Subject: [PATCH 213/307] !B (Terrain Integration) Keep integrated meshes
+ resident and retry incomplete sector builds.
+
+Resolve terrain integration from both entity and slot flags so component
+meshes are loaded without streaming. Retry sectors that were built before LOD
+0 arrived, with a bounded counter to avoid permanent rebuild loops.
+---
+ Code/CryEngine/Cry3DEngine/terrain_node.cpp   | 11 ++++++++++
+ Code/CryEngine/Cry3DEngine/terrain_sector.h   |  3 +++
+ .../Cry3DEngine/terrain_sector_render.cpp     | 20 +++++++++++++++++++
+ .../CryEngine/CryEntitySystem/RenderProxy.cpp | 10 +++++++++-
+ 4 files changed, 43 insertions(+), 1 deletion(-)
+
+diff --git a/Code/CryEngine/Cry3DEngine/terrain_node.cpp b/Code/CryEngine/Cry3DEngine/terrain_node.cpp
+index 487a6e10..e5dd7e39 100644
+--- a/Code/CryEngine/Cry3DEngine/terrain_node.cpp
++++ b/Code/CryEngine/Cry3DEngine/terrain_node.cpp
+@@ -354,6 +354,8 @@ void CTerrainNode::Init(int x1, int y1, int nNodeSize, CTerrainNode* pParent, bo
+ 	m_fBBoxExtentionByObjectsIntegration = 0;
+ 	m_boxIntegratedObjects.Reset();
+ 	m_nIntegratedObjectsVerts = 0;
++	m_bIntegrationRetryPending = false;
++	m_nIntegrationRetriesLeft = kMaxIntegrationRetries;
+ 	m_pParent = NULL;
+ 	//m_nSetupTexGensFrameId=0;
+ 
+@@ -641,6 +643,15 @@ void CTerrainNode::RenderNodeHeightmap(const SRenderingPassInfo& passInfo, Frust
+ 	if ((passCullMask & kPassCullMainMask) != 0)
+ 	{
+ 		bMeshIsUpToDate = RenderSector(passInfo);
++
++		// An object with GI mode "Integrate Into Terrain" was skipped by the last build because its
++		// render mesh was still streaming in. Drop the sector mesh so it is built again, at most
++		// kMaxIntegrationRetries times in a row (a mesh that never arrives must not spin forever).
++		if (m_bIntegrationRetryPending && bMeshIsUpToDate)
++		{
++			m_bIntegrationRetryPending = false;
++			ReleaseHeightMapGeometry();
++		}
+ 	}
+ 
+ 	if ((passCullMask & ~kPassCullMainMask) != 0)
+diff --git a/Code/CryEngine/Cry3DEngine/terrain_sector.h b/Code/CryEngine/Cry3DEngine/terrain_sector.h
+index d03d8f8a..a60a1ca7 100644
+--- a/Code/CryEngine/Cry3DEngine/terrain_sector.h
++++ b/Code/CryEngine/Cry3DEngine/terrain_sector.h
+@@ -502,6 +502,9 @@ public:
+ 	float                      m_fBBoxExtentionByObjectsIntegration;
+ 	AABB                       m_boxIntegratedObjects;    // bbox of the triangles copied in from integrated objects (debug)
+ 	int                        m_nIntegratedObjectsVerts; // number of vertices copied in on the last rebuild (debug)
++	static const int           kMaxIntegrationRetries = 8;
++	bool                       m_bIntegrationRetryPending;// an integrated object had no render mesh yet, rebuild once more
++	int                        m_nIntegrationRetriesLeft; // remaining retries, so a mesh that never arrives cannot spin
+ 	struct CTerrainNode*       m_pParent = nullptr;
+ 	float                      m_arrfDistance[MAX_RECURSION_LEVELS] = {};
+ 	int                        m_nNodeTextureOffset = -1;
+diff --git a/Code/CryEngine/Cry3DEngine/terrain_sector_render.cpp b/Code/CryEngine/Cry3DEngine/terrain_sector_render.cpp
+index b3aa9854..9a840813 100644
+--- a/Code/CryEngine/Cry3DEngine/terrain_sector_render.cpp
++++ b/Code/CryEngine/Cry3DEngine/terrain_sector_render.cpp
+@@ -1419,6 +1419,8 @@ void CTerrainNode::AppendTrianglesFromObjects(const int nOriginX, const int nOri
+ 	m_boxIntegratedObjects.Reset();
+ 	m_nIntegratedObjectsVerts = 0;
+ 
++	bool bRenderMeshMissing = false;
++
+ 	for (int i = 0; i < lstObjects.Count(); i++)
+ 	{
+ 		IRenderNode* pRNode = (IRenderNode*)lstObjects[i];
+@@ -1438,6 +1440,13 @@ void CTerrainNode::AppendTrianglesFromObjects(const int nOriginX, const int nOri
+ 
+ 		IRenderMesh* pRM = pRNode->GetRenderMesh(0);
+ 
++		if (!pRM)
++		{
++			// The LOD 0 render mesh is not resident yet (streaming). Remember it, so the sector is
++			// rebuilt again shortly instead of leaving a hole until the object happens to move.
++			bRenderMeshMissing = true;
++		}
++
+ 		if (pRM)
+ 		{
+ 			pRM->LockForThreadAccess();
+@@ -1608,6 +1617,17 @@ void CTerrainNode::AppendTrianglesFromObjects(const int nOriginX, const int nOri
+ 		}
+ 	}
+ 
++	if (bRenderMeshMissing && m_nIntegrationRetriesLeft > 0)
++	{
++		m_nIntegrationRetriesLeft--;
++		m_bIntegrationRetryPending = true;
++	}
++	else if (!bRenderMeshMissing)
++	{
++		m_nIntegrationRetriesLeft = kMaxIntegrationRetries;
++		m_bIntegrationRetryPending = false;
++	}
++
+ 	m_nIntegratedObjectsVerts = m_pUpdateTerrainTempData->m_lstTmpVertArray.Count() - nVertsBefore;
+ 	const int nIntegratedIndices = m_pUpdateTerrainTempData->m_StripsInfo.idx_array.Count() - nIndicesBefore;
+ 
+diff --git a/Code/CryEngine/CryEntitySystem/RenderProxy.cpp b/Code/CryEngine/CryEntitySystem/RenderProxy.cpp
+index 3f85c2db..57c5c443 100644
+--- a/Code/CryEngine/CryEntitySystem/RenderProxy.cpp
++++ b/Code/CryEngine/CryEntitySystem/RenderProxy.cpp
+@@ -780,7 +780,15 @@ int CEntityRender::LoadGeometry(int nSlot, const char* szFilename, const char* s
+ 	}
+ 	else
+ 	{
+-		IRenderNode::EGIMode usageMode = (IRenderNode::EGIMode)((GetEntity()->m_flagsExtended & ENTITY_FLAG_EXTENDED_GI_MODE_BIT_MASK) >> ENTITY_FLAG_EXTENDED_GI_MODE_BIT_OFFSET);
++		// The GI mode is the OR of the entity extended flags and the slot flags: a component mesh
++		// (CBaseMeshComponent and friends) sets it on the slot, so looking at the entity alone missed
++		// the supported carrier of the "integrate into terrain" feature entirely.
++		const uint32 slotFlags = pSlot->GetFlags();
++		const uint32 slotGiMode = ((slotFlags & ENTITY_SLOT_GI_MODE_BIT0) ? 1 : 0)
++		                          | ((slotFlags & ENTITY_SLOT_GI_MODE_BIT1) ? 2 : 0)
++		                          | ((slotFlags & ENTITY_SLOT_GI_MODE_BIT2) ? 4 : 0);
++
++		IRenderNode::EGIMode usageMode = (IRenderNode::EGIMode)(((GetEntity()->m_flagsExtended & ENTITY_FLAG_EXTENDED_GI_MODE_BIT_MASK) >> ENTITY_FLAG_EXTENDED_GI_MODE_BIT_OFFSET) | slotGiMode);
+ 
+ 		if (usageMode == IRenderNode::eGM_IntegrateIntoTerrain)
+ 		{
+-- 
+2.47.1.windows.1
+

@@ -1,0 +1,635 @@
+From 25e87bfb0226547f6a894a60c11fac50ccaa5399 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Sun, 30 Aug 2026 23:56:49 +0800
+Subject: [PATCH 220/307] !F (Terrain Plate) Add CPU heightmap and displacement
+ source loaders.
+
+Introduce a row-major height field with bilinear sampling and loaders for
+heightmap files and displacement textures. Read sources through ICryPak so the
+runtime component does not depend on editor-only image code.
+---
+ .../Geometry/TerrainPlateComponent.cpp        | 521 ++++++++++++++++++
+ .../Geometry/TerrainPlateComponent.h          |  83 +++
+ 2 files changed, 604 insertions(+)
+ create mode 100644 Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
+ create mode 100644 Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
+
+diff --git a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
+new file mode 100644
+index 00000000..efb73a95
+--- /dev/null
++++ b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
+@@ -0,0 +1,521 @@
++// Copyright 2026 Crytek GmbH / Crytek Group. All rights reserved.
++#include "StdAfx.h"
++#include "TerrainPlateComponent.h"
++
++#include <Cry3DEngine/I3DEngine.h>
++#include <Cry3DEngine/IIndexedMesh.h>
++#include <Cry3DEngine/IStatObj.h>
++#include <Cry3DEngine/IRenderNode.h>
++#include <Cry3DEngine/ImageExtensionHelper.h>
++#include <CrySystem/File/CryFile.h>
++#include <CrySystem/IConsole.h>
++#include <CryString/CryPath.h>
++
++namespace Cry
++{
++namespace DefaultComponents
++{
++
++float STerrainPlateHeightField::SampleBilinear(float u, float v) const
++{
++	if (!IsValid())
++		return 0.f;
++
++	const float fx = clamp_tpl(u, 0.f, 1.f) * (float)(m_width - 1);
++	const float fy = clamp_tpl(v, 0.f, 1.f) * (float)(m_height - 1);
++
++	const int x0 = (int)floorf(fx);
++	const int y0 = (int)floorf(fy);
++	const float tx = fx - (float)x0;
++	const float ty = fy - (float)y0;
++
++	const float h00 = At(x0, y0);
++	const float h10 = At(x0 + 1, y0);
++	const float h01 = At(x0, y0 + 1);
++	const float h11 = At(x0 + 1, y0 + 1);
++
++	return (h00 * (1.f - tx) + h10 * tx) * (1.f - ty) + (h01 * (1.f - tx) + h11 * tx) * ty;
++}
++
++//////////////////////////////////////////////////////////////////////////
++// CPU loaders
++//////////////////////////////////////////////////////////////////////////
++
++namespace TerrainPlateLoaderDetail
++{
++
++//! Reads a whole file through ICryPak (pak aware, release safe). Never uses CImageEx: it is editor
++//! only and 8 bit per channel, which is exactly the precision trap the Sandbox importer avoids by
++//! hand rolling CHeightmap::LoadRAW.
++static bool ReadWholeFile(const char* szPath, std::vector<uint8>& out)
++{
++	CCryFile file;
++	if (!file.Open(szPath, "rb"))
++		return false;
++
++	const size_t size = file.GetLength();
++	if (size == 0)
++		return false;
++
++	out.resize(size);
++	return file.ReadRaw(out.data(), size) == size;
++}
++
++static float HalfToFloat(uint16 h)
++{
++	const uint32 sign = (uint32)(h >> 15) & 1u;
++	const uint32 exponent = (uint32)(h >> 10) & 0x1Fu;
++	const uint32 mantissa = (uint32)h & 0x3FFu;
++
++	uint32 bits;
++	if (exponent == 0)
++	{
++		if (mantissa == 0)
++		{
++			bits = sign << 31;
++		}
++		else
++		{
++			// Subnormal half: normalise it into a float.
++			uint32 e = 0;
++			uint32 m = mantissa;
++			while ((m & 0x400u) == 0)
++			{
++				m <<= 1;
++				++e;
++			}
++			m &= 0x3FFu;
++			bits = (sign << 31) | ((127 - 15 - e + 1) << 23) | (m << 13);
++		}
++	}
++	else if (exponent == 31)
++	{
++		bits = (sign << 31) | (255u << 23) | (mantissa << 13);
++	}
++	else
++	{
++		bits = (sign << 31) | ((exponent + 127 - 15) << 23) | (mantissa << 13);
++	}
++
++	float result;
++	memcpy(&result, &bits, sizeof(result));
++	return result;
++}
++
++static uint16 ReadU16LE(const uint8* p) { return (uint16)((uint16)p[0] | ((uint16)p[1] << 8)); }
++static uint16 ReadU16BE(const uint8* p) { return (uint16)(((uint16)p[0] << 8) | (uint16)p[1]); }
++static uint32 ReadU32LE(const uint8* p) { return (uint32)p[0] | ((uint32)p[1] << 8) | ((uint32)p[2] << 16) | ((uint32)p[3] << 24); }
++
++static float LuminanceFromRGB(float r, float g, float b) { return 0.2126f * r + 0.7152f * g + 0.0722f * b; }
++
++//! Headerless 16 bit little endian, square. This is byte for byte what CHeightmap::LoadRAW reads,
++//! except that the side length is inferred from the file size instead of being taken from the level.
++static bool LoadRaw16(const std::vector<uint8>& data, const char* szPath, STerrainPlateHeightField& out)
++{
++	if ((data.size() & 1) != 0)
++	{
++		CryWarning(VALIDATOR_MODULE_3DENGINE, VALIDATOR_WARNING, "Terrain Plate: '%s' has an odd byte count, it is not a 16 bit raw heightmap", szPath);
++		return false;
++	}
++
++	const size_t sampleCount = data.size() / 2;
++	const int side = (int)(sqrt((double)sampleCount) + 0.5);
++	if ((size_t)side * (size_t)side != sampleCount || side < 2)
++	{
++		CryWarning(VALIDATOR_MODULE_3DENGINE, VALIDATOR_WARNING, "Terrain Plate: '%s' holds %d 16 bit samples, which is not a square heightmap", szPath, (int)sampleCount);
++		return false;
++	}
++
++	out.m_width = side;
++	out.m_height = side;
++	out.m_values.resize(sampleCount);
++
++	for (size_t i = 0; i < sampleCount; ++i)
++	{
++		out.m_values[i] = (float)ReadU16LE(&data[i * 2]) * (1.f / 65535.f);
++	}
++
++	return true;
++}
++
++//! Binary PGM (P5). Values above 255 are big endian, as the format specifies.
++static bool LoadPgm(const std::vector<uint8>& data, const char* szPath, STerrainPlateHeightField& out)
++{
++	size_t pos = 0;
++	const size_t size = data.size();
++
++	auto skipWhitespaceAndComments = [&]()
++	{
++		while (pos < size)
++		{
++			const uint8 c = data[pos];
++			if (c == '#')
++			{
++				while (pos < size && data[pos] != '\n')
++					++pos;
++			}
++			else if (c == ' ' || c == '\t' || c == '\r' || c == '\n')
++			{
++				++pos;
++			}
++			else
++			{
++				break;
++			}
++		}
++	};
++
++	auto readInt = [&](int& value) -> bool
++	{
++		skipWhitespaceAndComments();
++		if (pos >= size || data[pos] < '0' || data[pos] > '9')
++			return false;
++		value = 0;
++		while (pos < size && data[pos] >= '0' && data[pos] <= '9')
++		{
++			value = value * 10 + (data[pos] - '0');
++			++pos;
++		}
++		return true;
++	};
++
++	if (size < 2 || data[0] != 'P' || data[1] != '5')
++	{
++		CryWarning(VALIDATOR_MODULE_3DENGINE, VALIDATOR_WARNING, "Terrain Plate: '%s' is not a binary PGM (magic P5 expected; ASCII P2 is not supported)", szPath);
++		return false;
++	}
++	pos = 2;
++
++	int width = 0, height = 0, maxValue = 0;
++	if (!readInt(width) || !readInt(height) || !readInt(maxValue) || width < 2 || height < 2 || maxValue <= 0)
++	{
++		CryWarning(VALIDATOR_MODULE_3DENGINE, VALIDATOR_WARNING, "Terrain Plate: '%s' has a malformed PGM header", szPath);
++		return false;
++	}
++
++	// Exactly one whitespace character separates the header from the raster.
++	if (pos < size)
++		++pos;
++
++	const int bytesPerSample = (maxValue > 255) ? 2 : 1;
++	const size_t needed = (size_t)width * (size_t)height * (size_t)bytesPerSample;
++	if (size - pos < needed)
++	{
++		CryWarning(VALIDATOR_MODULE_3DENGINE, VALIDATOR_WARNING, "Terrain Plate: '%s' is a truncated PGM (%d bytes of raster missing)", szPath, (int)(needed - (size - pos)));
++		return false;
++	}
++
++	out.m_width = width;
++	out.m_height = height;
++	out.m_values.resize((size_t)width * (size_t)height);
++
++	const float scale = 1.f / (float)maxValue;
++	for (size_t i = 0; i < out.m_values.size(); ++i)
++	{
++		const uint8* p = &data[pos + i * bytesPerSample];
++		const int value = (bytesPerSample == 2) ? (int)ReadU16BE(p) : (int)*p;
++		out.m_values[i] = clamp_tpl((float)value * scale, 0.f, 1.f);
++	}
++
++	return true;
++}
++
++//! Uncompressed BMP, 8 bit palettised or 24/32 bit. BMP rows are bottom up unless the height is
++//! negative, and the height field wants row 0 on top, so the rows are flipped here.
++static bool LoadBmp(const std::vector<uint8>& data, const char* szPath, STerrainPlateHeightField& out)
++{
++	if (data.size() < 54 || data[0] != 'B' || data[1] != 'M')
++	{
++		CryWarning(VALIDATOR_MODULE_3DENGINE, VALIDATOR_WARNING, "Terrain Plate: '%s' is not a BMP file", szPath);
++		return false;
++	}
++
++	const uint32 dataOffset = ReadU32LE(&data[10]);
++	const uint32 infoSize = ReadU32LE(&data[14]);
++	const int width = (int)ReadU32LE(&data[18]);
++	const int signedHeight = (int)ReadU32LE(&data[22]);
++	const int bitCount = (int)ReadU16LE(&data[28]);
++	const uint32 compression = ReadU32LE(&data[30]);
++
++	const bool bTopDown = (signedHeight < 0);
++	const int height = bTopDown ? -signedHeight : signedHeight;
++
++	if (infoSize < 40 || compression != 0 || width < 2 || height < 2)
++	{
++		CryWarning(VALIDATOR_MODULE_3DENGINE, VALIDATOR_WARNING, "Terrain Plate: '%s' is a compressed or unsupported BMP (only uncompressed BI_RGB is read)", szPath);
++		return false;
++	}
++
++	if (bitCount != 8 && bitCount != 24 && bitCount != 32)
++	{
++		CryWarning(VALIDATOR_MODULE_3DENGINE, VALIDATOR_WARNING, "Terrain Plate: '%s' is a %d bit BMP; only 8, 24 and 32 bit are read", szPath, bitCount);
++		return false;
++	}
++
++	const size_t rowStride = (((size_t)width * bitCount / 8) + 3) & ~(size_t)3;
++	if (data.size() < dataOffset + rowStride * height)
++	{
++		CryWarning(VALIDATOR_MODULE_3DENGINE, VALIDATOR_WARNING, "Terrain Plate: '%s' is a truncated BMP", szPath);
++		return false;
++	}
++
++	// 8 bit BMPs are palettised; the palette sits right behind the info header as BGRA quads.
++	float palette[256];
++	if (bitCount == 8)
++	{
++		const size_t paletteOffset = 14 + infoSize;
++		if (data.size() < paletteOffset + 256 * 4)
++		{
++			CryWarning(VALIDATOR_MODULE_3DENGINE, VALIDATOR_WARNING, "Terrain Plate: '%s' is an 8 bit BMP without a full palette", szPath);
++			return false;
++		}
++		for (int i = 0; i < 256; ++i)
++		{
++			const uint8* p = &data[paletteOffset + (size_t)i * 4];
++			palette[i] = LuminanceFromRGB((float)p[2], (float)p[1], (float)p[0]) * (1.f / 255.f);
++		}
++	}
++
++	out.m_width = width;
++	out.m_height = height;
++	out.m_values.resize((size_t)width * (size_t)height);
++
++	for (int y = 0; y < height; ++y)
++	{
++		const int srcRow = bTopDown ? y : (height - 1 - y);
++		const uint8* pRow = &data[dataOffset + (size_t)srcRow * rowStride];
++		float* pDst = &out.m_values[(size_t)y * width];
++
++		for (int x = 0; x < width; ++x)
++		{
++			if (bitCount == 8)
++			{
++				pDst[x] = palette[pRow[x]];
++			}
++			else
++			{
++				const uint8* p = pRow + (size_t)x * (bitCount / 8);
++				pDst[x] = LuminanceFromRGB((float)p[2], (float)p[1], (float)p[0]) * (1.f / 255.f);
++			}
++		}
++	}
++
++	return true;
++}
++
++//! Bytes per pixel of the uncompressed DDS formats this loader understands, 0 for everything else.
++static int GetSupportedDDSPixelSize(ETEX_Format format)
++{
++	switch (format)
++	{
++	case eTF_R8:
++	case eTF_A8:
++	case eTF_L8:
++		return 1;
++	case eTF_R16:
++	case eTF_R16F:
++		return 2;
++	case eTF_R32F:
++	case eTF_R8G8B8A8:
++	case eTF_B8G8R8A8:
++		return 4;
++	default:
++		return 0;
++	}
++}
++
++static float DecodeDDSPixel(const uint8* p, ETEX_Format format)
++{
++	switch (format)
++	{
++	case eTF_R8:
++	case eTF_A8:
++	case eTF_L8:
++		return (float)p[0] * (1.f / 255.f);
++	case eTF_R16:
++		return (float)ReadU16LE(p) * (1.f / 65535.f);
++	case eTF_R16F:
++		return HalfToFloat(ReadU16LE(p));
++	case eTF_R32F:
++		{
++			float value;
++			memcpy(&value, p, sizeof(value));
++			return value;
++		}
++	case eTF_R8G8B8A8:
++		return LuminanceFromRGB((float)p[0], (float)p[1], (float)p[2]) * (1.f / 255.f);
++	case eTF_B8G8R8A8:
++		return LuminanceFromRGB((float)p[2], (float)p[1], (float)p[0]) * (1.f / 255.f);
++	default:
++		return 0.f;
++	}
++}
++
++} // namespace TerrainPlateLoaderDetail
++
++namespace TerrainPlateLoader
++{
++
++bool LoadHeightmapFile(const char* szPath, STerrainPlateHeightField& out)
++{
++	using namespace TerrainPlateLoaderDetail;
++
++	out.Clear();
++
++	if (szPath == nullptr || szPath[0] == '\0')
++		return false;
++
++	std::vector<uint8> data;
++	if (!ReadWholeFile(szPath, data))
++	{
++		CryWarning(VALIDATOR_MODULE_3DENGINE, VALIDATOR_WARNING, "Terrain Plate: cannot open heightmap '%s'", szPath);
++		return false;
++	}
++
++	const char* szExt = PathUtil::GetExt(szPath);
++	bool bLoaded = false;
++
++	if (!stricmp(szExt, "r16") || !stricmp(szExt, "raw"))
++	{
++		bLoaded = LoadRaw16(data, szPath, out);
++	}
++	else if (!stricmp(szExt, "pgm"))
++	{
++		bLoaded = LoadPgm(data, szPath, out);
++	}
++	else if (!stricmp(szExt, "bmp"))
++	{
++		bLoaded = LoadBmp(data, szPath, out);
++	}
++	else
++	{
++		CryWarning(VALIDATOR_MODULE_3DENGINE, VALIDATOR_WARNING, "Terrain Plate: '%s' has an unsupported extension (r16, raw, pgm and bmp are read)", szPath);
++	}
++
++	if (!bLoaded)
++		out.Clear();
++
++	return bLoaded;
++}
++
++bool LoadDisplacementTexture(const char* szPath, STerrainPlateHeightField& out)
++{
++	using namespace TerrainPlateLoaderDetail;
++
++	out.Clear();
++
++	if (szPath == nullptr || szPath[0] == '\0')
++		return false;
++
++	// The texture picker hands out the source asset path; the readable data always sits in the DDS.
++	string ddsPath = szPath;
++	if (stricmp(PathUtil::GetExt(ddsPath.c_str()), "dds") != 0)
++	{
++		const string replaced = PathUtil::ReplaceExtension(ddsPath, "dds");
++		ddsPath = gEnv->pCryPak->IsFileExist(replaced.c_str()) ? replaced : (ddsPath + ".dds");
++	}
++
++	std::vector<uint8> data;
++	if (!ReadWholeFile(ddsPath.c_str(), data))
++	{
++		CryWarning(VALIDATOR_MODULE_3DENGINE, VALIDATOR_WARNING, "Terrain Plate: cannot open displacement texture '%s'", ddsPath.c_str());
++		return false;
++	}
++
++	if (data.size() < sizeof(CImageExtensionHelper::DDS_FILE_DESC))
++	{
++		CryWarning(VALIDATOR_MODULE_3DENGINE, VALIDATOR_WARNING, "Terrain Plate: '%s' is too small to be a DDS", ddsPath.c_str());
++		return false;
++	}
++
++	CImageExtensionHelper::DDS_FILE_DESC desc;
++	memcpy(&desc, data.data(), sizeof(desc));
++
++	if (!desc.IsValid())
++	{
++		CryWarning(VALIDATOR_MODULE_3DENGINE, VALIDATOR_WARNING, "Terrain Plate: '%s' is not a DDS file", ddsPath.c_str());
++		return false;
++	}
++
++	uint32 dxgiFormat = 0;
++	if (desc.header.IsDX10Ext())
++	{
++		if (data.size() < sizeof(desc) + sizeof(CImageExtensionHelper::DDS_HEADER_DXT10))
++		{
++			CryWarning(VALIDATOR_MODULE_3DENGINE, VALIDATOR_WARNING, "Terrain Plate: '%s' has a truncated DX10 header", ddsPath.c_str());
++			return false;
++		}
++		CImageExtensionHelper::DDS_HEADER_DXT10 dx10;
++		memcpy(&dx10, data.data() + sizeof(desc), sizeof(dx10));
++		dxgiFormat = dx10.dxgiFormat;
++	}
++
++	const ETEX_Format format = DDSFormats::GetFormatByDesc(desc.header.ddspf, dxgiFormat);
++	const int pixelSize = GetSupportedDDSPixelSize(format);
++	if (pixelSize == 0)
++	{
++		CryWarning(VALIDATOR_MODULE_3DENGINE, VALIDATOR_WARNING,
++		           "Terrain Plate: '%s' is in a format the CPU loader cannot read (%s). Use an uncompressed R8, R16, R16F, R32F or RGBA8 texture; the plate stays flat.",
++		           ddsPath.c_str(), CImageExtensionHelper::NameForTextureFormat(format));
++		return false;
++	}
++
++	const int width = (int)desc.header.dwWidth;
++	const int height = (int)desc.header.dwHeight;
++	if (width < 2 || height < 2)
++	{
++		CryWarning(VALIDATOR_MODULE_3DENGINE, VALIDATOR_WARNING, "Terrain Plate: '%s' is only %dx%d", ddsPath.c_str(), width, height);
++		return false;
++	}
++
++	const size_t mip0Size = (size_t)width * (size_t)height * (size_t)pixelSize;
++	const size_t headerSize = desc.GetFullHeaderSize();
++
++	const uint8* pMip0 = nullptr;
++	std::vector<uint8> chunkData;
++
++	if (data.size() >= headerSize + mip0Size)
++	{
++		pMip0 = data.data() + headerSize;
++	}
++	else
++	{
++		// The engine splits streamed textures: the .dds only holds the persistent (small) mips and the
++		// high resolution ones live in .dds.<n> chunk files, the largest mip in the highest numbered
++		// chunk (DDSSplitted::MakeName / CTexture::StreamPrepare). Take the first chunk that is large
++		// enough for mip 0.
++		for (int chunk = 15; chunk >= 1 && pMip0 == nullptr; --chunk)
++		{
++			string chunkPath;
++			chunkPath.Format("%s.%d", ddsPath.c_str(), chunk);
++			if (!gEnv->pCryPak->IsFileExist(chunkPath.c_str()))
++				continue;
++			if (ReadWholeFile(chunkPath.c_str(), chunkData) && chunkData.size() >= mip0Size)
++			{
++				pMip0 = chunkData.data();
++			}
++		}
++	}
++
++	if (pMip0 == nullptr)
++	{
++		CryWarning(VALIDATOR_MODULE_3DENGINE, VALIDATOR_WARNING, "Terrain Plate: '%s' does not contain its top mip level; the plate stays flat", ddsPath.c_str());
++		return false;
++	}
++
++	out.m_width = width;
++	out.m_height = height;
++	out.m_values.resize((size_t)width * (size_t)height);
++
++	for (size_t i = 0; i < out.m_values.size(); ++i)
++	{
++		out.m_values[i] = clamp_tpl(DecodeDDSPixel(pMip0 + i * pixelSize, format), 0.f, 1.f);
++	}
++
++	return true;
++}
++
++} // namespace TerrainPlateLoader
++
++}
++}
+diff --git a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
+new file mode 100644
+index 00000000..b4d80042
+--- /dev/null
++++ b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
+@@ -0,0 +1,83 @@
++// Copyright 2026 Crytek GmbH / Crytek Group. All rights reserved.
++
++#pragma once
++
++#include "BaseMeshComponent.h"
++
++#include <CrySchematyc/ResourceTypes.h>
++#include <CrySerialization/Decorators/ResourceFilePath.h>
++
++#include <vector>
++
++class CPlugin_CryDefaultEntities;
++
++namespace Serialization
++{
++//! File picker for the terrain plate heightmap property.
++//! Modelled on Serialization::MannequinAnimationDatabasePath (Decorators/Resources.h), i.e. a plain
++//! file dialog rather than an asset browser: .r16 / .raw / .pgm are not texture assets and therefore
++//! are not browsable with the texture picker.
++inline ResourceFilePath TerrainPlateHeightmapPath(string& path)
++{
++	return ResourceFilePath(path, "Heightmap (r16, raw, pgm, bmp)|*.r16;*.raw;*.pgm;*.bmp");
++}
++}
++
++namespace Schematyc
++{
++typedef SerializationUtils::SResourceNameSerializer<&Serialization::TerrainPlateHeightmapPath> TerrainHeightmapFileName;
++
++inline void ReflectType(CTypeDesc<TerrainHeightmapFileName>& desc)
++{
++	desc.SetGUID("{7C1F5A08-2E6B-4F0D-9B54-6F0B2A9D3C41}"_cry_guid);
++	desc.SetLabel("TerrainHeightmapFileName");
++	desc.SetDescription("Path to a heightmap file (r16, raw, pgm, bmp)");
++}
++}
++
++namespace Cry
++{
++namespace DefaultComponents
++{
++
++//! A height field sampled on the CPU, normalised to [0,1].
++//! Row major, row 0 is the +Y edge of the plate, column 0 is the -X edge. This is the orientation the
++//! Sandbox heightmap importer ends up with: CHeightmap::LoadRAW rotates the file by 270 degrees and
++//! CHeightmap::UpdateEngineTerrain then swaps X and Y again, so a file column ends up on world +X and
++//! file row 0 ends up at world +Y max (see scene-notes/terrain/research/03-terrain-plate.md section 1.1).
++struct STerrainPlateHeightField
++{
++	int                m_width = 0;
++	int                m_height = 0;
++	std::vector<float> m_values;
++
++	bool IsValid() const { return m_width > 1 && m_height > 1 && (int)m_values.size() == m_width * m_height; }
++	void Clear()         { m_width = 0; m_height = 0; m_values.clear(); }
++
++	//! Nearest sample, clamped to the border.
++	float At(int x, int y) const
++	{
++		x = clamp_tpl(x, 0, m_width - 1);
++		y = clamp_tpl(y, 0, m_height - 1);
++		return m_values[(size_t)y * m_width + x];
++	}
++
++	//! u/v in [0,1]; v = 0 is row 0, i.e. the +Y edge of the plate.
++	float SampleBilinear(float u, float v) const;
++};
++
++//! CPU loaders for the two plate sources. Everything goes through ICryPak, never through CImageEx:
++//! CImageEx is 8 bit per channel and editor only (research 03 section 1.2).
++namespace TerrainPlateLoader
++{
++//! Dispatches on the extension: .r16/.raw (headerless 16 bit LE, square), .pgm (binary P5, 8 or 16 bit),
++//! .bmp (uncompressed 8/24/32 bit, luminance).
++bool LoadHeightmapFile(const char* szPath, STerrainPlateHeightField& out);
++
++//! Uncompressed DDS only (R8, R16, R16F, R32F, RGBA8/BGRA8 luminance). Anything else fails and the
++//! caller warns and falls back to a flat plate. No GPU readback.
++bool LoadDisplacementTexture(const char* szPath, STerrainPlateHeightField& out);
++}
++
++}
++}
+-- 
+2.47.1.windows.1
+

@@ -1,0 +1,105 @@
+From 161f7a792445fffa5ef3fd9269269f3a9347500f Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Sun, 30 Aug 2026 16:11:25 +0800
+Subject: [PATCH 207/307] !B (Terrain Integration) Enable terrain layer
+ blending for integrated geometry.
+
+The terrain layer overlay requires BIT_STENCIL_ALLOW_TERRAINLAYERBLEND, but
+the integration path did not enable it. Apply the matching render-node flag
+when a slot enters terrain integration and warn once if it is missing.
+---
+ .../Cry3DEngine/terrain_sector_render.cpp     | 34 +++++++++++++++++++
+ Code/CryEngine/CryEntitySystem/EntitySlot.cpp | 21 +++++++++---
+ 2 files changed, 51 insertions(+), 4 deletions(-)
+
+diff --git a/Code/CryEngine/Cry3DEngine/terrain_sector_render.cpp b/Code/CryEngine/Cry3DEngine/terrain_sector_render.cpp
+index d12ac2f8..aa55c1d9 100644
+--- a/Code/CryEngine/Cry3DEngine/terrain_sector_render.cpp
++++ b/Code/CryEngine/Cry3DEngine/terrain_sector_render.cpp
+@@ -1351,6 +1351,32 @@ uint32 CTerrainNode::GetMaterialsModificationId()
+ 	return nModificationId;
+ }
+ 
++// Emit a warning about one object taking part in terrain integration at most once per
++// (render node, message) pair, so a broken setup is reported without spamming the log every rebuild.
++// Only ever called from the terrain sector build, which is forced synchronous while
++// m_bIntegrateObjectsIntoTerrain is set (see CTerrainUpdateDispatcher::AddJob), so no locking is needed.
++static void WarnAboutIntegratedObjectOnce(IRenderNode* pRNode, const char* szMessage)
++{
++	static std::vector<std::pair<const void*, const void*>> s_reported;
++
++	const std::pair<const void*, const void*> key(pRNode, szMessage);
++
++	for (size_t i = 0; i < s_reported.size(); i++)
++	{
++		if (s_reported[i] == key)
++			return;
++	}
++
++	s_reported.push_back(key);
++
++	const char* szName = pRNode->GetName();
++	const Vec3 vPos = pRNode->GetPos();
++
++	CryWarning(VALIDATOR_MODULE_3DENGINE, VALIDATOR_WARNING,
++	           "Terrain object integration: '%s' at (%.1f, %.1f, %.1f) %s",
++	           szName ? szName : "<unnamed>", vPos.x, vPos.y, vPos.z, szMessage);
++}
++
+ // add triangles (from marked objects) intersecting terrain
+ void CTerrainNode::AppendTrianglesFromObjects(const int nOriginX, const int nOriginY, CTerrain* pTerrain, const float stepSize, const int nTerrainSize)
+ {
+@@ -1370,6 +1396,14 @@ void CTerrainNode::AppendTrianglesFromObjects(const int nOriginX, const int nOri
+ 			continue;
+ 		}
+ 
++		// The terrain layer overlay is stencil gated on the object's own opaque draw; without
++		// ERF_FOB_ALLOW_TERRAIN_LAYER_BLEND the integrated triangles are built and then discarded.
++		if (!(pRNode->GetRndFlags() & ERF_FOB_ALLOW_TERRAIN_LAYER_BLEND))
++		{
++			WarnAboutIntegratedObjectOnce(pRNode, "has GI mode 'Integrate Into Terrain' but no ERF_FOB_ALLOW_TERRAIN_LAYER_BLEND: "
++			                                      "the integrated triangles will be killed by the stencil test (use e_TerrainBlendingDebug 2 to confirm)");
++		}
++
+ 		IRenderMesh* pRM = pRNode->GetRenderMesh(0);
+ 
+ 		if (pRM)
+diff --git a/Code/CryEngine/CryEntitySystem/EntitySlot.cpp b/Code/CryEngine/CryEntitySystem/EntitySlot.cpp
+index df58ba1a..014d7531 100644
+--- a/Code/CryEngine/CryEntitySystem/EntitySlot.cpp
++++ b/Code/CryEngine/CryEntitySystem/EntitySlot.cpp
+@@ -179,14 +179,27 @@ void CEntitySlot::UpdateRenderNode(bool bForceRecreateNode)
+ 			SetRenderNodeFlags(renderNodeFlags, ERF_ENABLE_ENTITY_RENDER_CALLBACK, 0 != (entityFlags & ENTITY_FLAG_SEND_RENDER_EVENT));
+ 			SetRenderNodeFlags(renderNodeFlags, ERF_CUSTOM_VIEW_DIST_RATIO, 0 != (entityFlags & ENTITY_FLAG_CUSTOM_VIEWDIST_RATIO));
+ 
+-			SetRenderNodeFlags(renderNodeFlags, ERF_FOB_ALLOW_TERRAIN_LAYER_BLEND, 0 != (GetFlags() & ENTITY_SLOT_ALLOW_TERRAIN_LAYER_BLEND));
++			// Resolve the GI mode first: it is the OR of the entity extended flags and the slot flags.
++			const bool bGiModeBit0 = (0 != (m_pEntity->m_flagsExtended & ENTITY_FLAG_EXTENDED_GI_MODE_BIT0)) || (0 != (GetFlags() & ENTITY_SLOT_GI_MODE_BIT0));
++			const bool bGiModeBit1 = (0 != (m_pEntity->m_flagsExtended & ENTITY_FLAG_EXTENDED_GI_MODE_BIT1)) || (0 != (GetFlags() & ENTITY_SLOT_GI_MODE_BIT1));
++			const bool bGiModeBit2 = (0 != (m_pEntity->m_flagsExtended & ENTITY_FLAG_EXTENDED_GI_MODE_BIT2)) || (0 != (GetFlags() & ENTITY_SLOT_GI_MODE_BIT2));
++
++			const IRenderNode::EGIMode giMode = (IRenderNode::EGIMode)((bGiModeBit0 ? 1 : 0) | (bGiModeBit1 ? 2 : 0) | (bGiModeBit2 ? 4 : 0));
++			const bool bIntegrateIntoTerrain = (giMode == IRenderNode::eGM_IntegrateIntoTerrain);
++
++			// The terrain layer overlay produced by the "integrate into terrain" path is stencil gated on
++			// BIT_STENCIL_ALLOW_TERRAINLAYERBLEND, which the object's own opaque draw only writes when it
++			// carries ERF_FOB_ALLOW_TERRAIN_LAYER_BLEND. Without the flag the integrated triangles are
++			// generated and then killed by the stencil test, i.e. the feature silently does nothing.
++			// Force the flag on whenever the resolved GI mode asks for terrain integration.
++			SetRenderNodeFlags(renderNodeFlags, ERF_FOB_ALLOW_TERRAIN_LAYER_BLEND, bIntegrateIntoTerrain || (0 != (GetFlags() & ENTITY_SLOT_ALLOW_TERRAIN_LAYER_BLEND)));
+ 			SetRenderNodeFlags(renderNodeFlags, ERF_FOB_ALLOW_DECAL_BLEND, 0 != (GetFlags() & ENTITY_SLOT_ALLOW_DECAL_BLEND));
+ 			SetRenderNodeFlags(renderNodeFlags, ERF_FOB_RENDER_AFTER_POSTPROCESSING, 0 != (GetFlags() & ENTITY_SLOT_RENDER_AFTER_POSTPROCESSING));
+ 			SetRenderNodeFlags(renderNodeFlags, ERF_FOB_NEAREST, 0 != (GetFlags() & ENTITY_SLOT_RENDER_NEAREST));
+ 
+-			SetRenderNodeFlags(renderNodeFlags, ERF_GI_MODE_BIT0, (0 != (m_pEntity->m_flagsExtended & ENTITY_FLAG_EXTENDED_GI_MODE_BIT0)) || (0 != (GetFlags() & ENTITY_SLOT_GI_MODE_BIT0)));
+-			SetRenderNodeFlags(renderNodeFlags, ERF_GI_MODE_BIT1, (0 != (m_pEntity->m_flagsExtended & ENTITY_FLAG_EXTENDED_GI_MODE_BIT1)) || (0 != (GetFlags() & ENTITY_SLOT_GI_MODE_BIT1)));
+-			SetRenderNodeFlags(renderNodeFlags, ERF_GI_MODE_BIT2, (0 != (m_pEntity->m_flagsExtended & ENTITY_FLAG_EXTENDED_GI_MODE_BIT2)) || (0 != (GetFlags() & ENTITY_SLOT_GI_MODE_BIT2)));
++			SetRenderNodeFlags(renderNodeFlags, ERF_GI_MODE_BIT0, bGiModeBit0);
++			SetRenderNodeFlags(renderNodeFlags, ERF_GI_MODE_BIT1, bGiModeBit1);
++			SetRenderNodeFlags(renderNodeFlags, ERF_GI_MODE_BIT2, bGiModeBit2);
+ 
+ 			if (renderNodeFlags & ERF_CASTSHADOWMAPS)
+ 				renderNodeFlags |= ERF_HAS_CASTSHADOWMAPS;
+-- 
+2.47.1.windows.1
+

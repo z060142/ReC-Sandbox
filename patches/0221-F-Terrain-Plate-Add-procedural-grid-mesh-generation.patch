@@ -1,0 +1,683 @@
+From 86e8dd7541dfb1acbdf776607dd6af9ebf2566b2 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Sun, 30 Aug 2026 23:57:13 +0800
+Subject: [PATCH 221/307] !F (Terrain Plate) Add procedural grid mesh
+ generation.
+
+Generate an indexed grid as an IStatObj and attach it through the standard mesh
+component path. The plate therefore supports materials, render parameters and
+terrain integration without a separate render implementation.
+---
+ .../Geometry/TerrainPlateComponent.cpp        | 522 ++++++++++++++++++
+ .../Geometry/TerrainPlateComponent.h          | 124 +++++
+ 2 files changed, 646 insertions(+)
+
+diff --git a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
+index efb73a95..ca047cf8 100644
+--- a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
++++ b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
+@@ -517,5 +517,527 @@ bool LoadDisplacementTexture(const char* szPath, STerrainPlateHeightField& out)
+ 
+ } // namespace TerrainPlateLoader
+ 
++//////////////////////////////////////////////////////////////////////////
++// Component
++//////////////////////////////////////////////////////////////////////////
++
++void CTerrainPlateComponent::Register(Schematyc::CEnvRegistrationScope& componentScope)
++{
++	{
++		auto pFunction = SCHEMATYC_MAKE_ENV_FUNCTION(&CTerrainPlateComponent::Rebuild, "{2A9C4F17-8D3E-4A55-B0C6-1E7F4D82A9B0}"_cry_guid, "Rebuild");
++		pFunction->SetDescription("Reloads the source and rebuilds the plate mesh");
++		pFunction->SetFlags({ Schematyc::EEnvFunctionFlags::Member, Schematyc::EEnvFunctionFlags::Construction });
++		componentScope.Register(pFunction);
++	}
++	{
++		auto pFunction = SCHEMATYC_MAKE_ENV_FUNCTION(&CTerrainPlateComponent::RegenerateMesh, "{5B0E2D93-71A4-4C8F-8E12-9D3A6C05F7B2}"_cry_guid, "RegenerateMesh");
++		pFunction->SetDescription("Rebuilds the plate mesh from the already loaded source");
++		pFunction->SetFlags({ Schematyc::EEnvFunctionFlags::Member, Schematyc::EEnvFunctionFlags::Construction });
++		componentScope.Register(pFunction);
++	}
++}
++
++void CTerrainPlateComponent::Initialize()
++{
++	Rebuild();
++}
++
++Cry::Entity::EventFlags CTerrainPlateComponent::GetEventMask() const
++{
++	Cry::Entity::EventFlags bitFlags = CBaseMeshComponent::GetEventMask();
++
++	// The weld and the skirt are computed against the terrain under the plate, so both depend on where
++	// the plate is in the world. Without them the mesh is transform independent and no rebuild is due.
++	if (m_bEdgeWeld || (float)m_skirt > 0.f)
++	{
++		bitFlags |= ENTITY_EVENT_XFORM;
++	}
++
++	// Only ticked while a rebuild was throttled away, so a static plate costs nothing per frame.
++	if (m_bRegenPending)
++	{
++		bitFlags |= ENTITY_EVENT_UPDATE;
++	}
++
++	return bitFlags;
++}
++
++void CTerrainPlateComponent::ProcessEvent(const SEntityEvent& event)
++{
++	switch (event.event)
++	{
++	case ENTITY_EVENT_COMPONENT_PROPERTY_CHANGED:
++		Rebuild();
++		break;
++
++	case ENTITY_EVENT_XFORM:
++		if (m_bEdgeWeld || (float)m_skirt > 0.f)
++		{
++			RequestRegenerate();
++		}
++		break;
++
++	case ENTITY_EVENT_UPDATE:
++		if (m_bRegenPending)
++		{
++			RegenerateMesh();
++			m_pEntity->UpdateComponentEventMask(this);
++		}
++		break;
++	}
++
++	if (event.event == ENTITY_EVENT_SLOT_CHANGED && m_pEntity->GetStatObj((int)event.nParam[0]) != m_pStatObj)
++		return; // someone else owns that slot
++
++	CBaseMeshComponent::ProcessEvent(event);
++}
++
++bool CTerrainPlateComponent::SetMaterial(int slotId, const char* szMaterial)
++{
++	if (slotId == GetEntitySlotId())
++	{
++		if (IMaterial* pMaterial = gEnv->p3DEngine->GetMaterialManager()->LoadMaterial(szMaterial, false))
++		{
++			m_materialPath.value = szMaterial;
++			m_pEntity->SetSlotMaterial(GetEntitySlotId(), pMaterial);
++		}
++		else if (szMaterial[0] == '\0')
++		{
++			m_materialPath.value.clear();
++			m_pEntity->SetSlotMaterial(GetEntitySlotId(), nullptr);
++		}
++
++		return true;
++	}
++
++	return false;
++}
++
++void CTerrainPlateComponent::Rebuild()
++{
++	LoadSourceIfNeeded();
++	RegenerateMesh();
++}
++
++void CTerrainPlateComponent::RequestRegenerate()
++{
++	// At most one rebuild per frame: dragging the entity fires ENTITY_EVENT_XFORM continuously.
++	if (gEnv->nMainFrameID != m_lastRegenFrameId)
++	{
++		RegenerateMesh();
++		return;
++	}
++
++	if (!m_bRegenPending)
++	{
++		m_bRegenPending = true;
++		if (m_pEntity != nullptr)
++		{
++			m_pEntity->UpdateComponentEventMask(this);
++		}
++	}
++}
++
++void CTerrainPlateComponent::LoadSourceIfNeeded()
++{
++	const string& path = (m_sourceMode == ETerrainPlateSource::HeightmapFile) ? m_heightmapPath.value : m_displacementPath.value;
++
++	if (m_bSourceLoaded && m_loadedSourceMode == m_sourceMode && m_loadedSource == path)
++		return;
++
++	m_heightField.Clear();
++
++	if (!path.empty())
++	{
++		if (m_sourceMode == ETerrainPlateSource::HeightmapFile)
++		{
++			TerrainPlateLoader::LoadHeightmapFile(path.c_str(), m_heightField);
++		}
++		else
++		{
++			TerrainPlateLoader::LoadDisplacementTexture(path.c_str(), m_heightField);
++		}
++	}
++
++	m_loadedSource = path;
++	m_loadedSourceMode = m_sourceMode;
++	m_bSourceLoaded = true;
++}
++
++Matrix34 CTerrainPlateComponent::GetPlateWorldTM() const
++{
++	if (m_pEntity == nullptr)
++		return Matrix34(IDENTITY);
++
++	const int slotId = GetEntitySlotId();
++	if (slotId != IEntityComponent::EmptySlotId)
++		return m_pEntity->GetSlotWorldTM(slotId);
++
++	return m_pEntity->GetWorldTM() * GetTransformMatrix();
++}
++
++void CTerrainPlateComponent::ApplyMaterial()
++{
++	IMaterialManager* pMaterialManager = gEnv->p3DEngine->GetMaterialManager();
++
++	IMaterial* pMaterial = nullptr;
++	if (!m_materialPath.value.empty())
++	{
++		pMaterial = pMaterialManager->LoadMaterial(m_materialPath.value, false);
++	}
++
++	// A procedural statobj has no material of its own, and CTerrainNode::AppendTrianglesFromObjects
++	// skips any integrating node whose IRenderNode::GetMaterial() is null. Fall back to the engine
++	// default material so that a freshly added plate is picked up by the integrate path right away.
++	if (pMaterial == nullptr)
++	{
++		pMaterial = pMaterialManager->GetDefaultMaterial();
++	}
++
++	if (m_pStatObj != nullptr)
++	{
++		m_pStatObj->SetMaterial(pMaterial);
++	}
++
++	m_pEntity->SetSlotMaterial(GetEntitySlotId(), m_materialPath.value.empty() ? nullptr : pMaterial);
++}
++
++void CTerrainPlateComponent::WarnAboutVertexBudgetOnce(int gridSide, int gridVertexCount)
++{
++	if (m_bBudgetWarningIssued || gEnv->pConsole == nullptr)
++		return;
++
++	ICVar* pCVar = gEnv->pConsole->GetCVar("e_TerrainIntegrateObjectsMaxVertices");
++	if (pCVar == nullptr)
++		return;
++
++	const int budget = pCVar->GetIVal();
++	if (budget > 0 && gridVertexCount > budget / 2)
++	{
++		m_bBudgetWarningIssued = true;
++		CryWarning(VALIDATOR_MODULE_3DENGINE, VALIDATOR_WARNING,
++		           "Terrain Plate: a %d x %d grid is %d vertices, more than half of the per sector integration budget "
++		           "(e_TerrainIntegrateObjectsMaxVertices = %d). A second plate or object in the same sector will overflow it; "
++		           "lower Grid or raise the cvar.",
++		           gridSide, gridSide, gridVertexCount, budget);
++	}
++}
++
++void CTerrainPlateComponent::RegenerateMesh()
++{
++	m_bRegenPending = false;
++	m_lastRegenFrameId = gEnv->nMainFrameID;
++
++	if (m_pEntity == nullptr || gEnv->p3DEngine == nullptr)
++		return;
++
++	const int n = clamp_tpl((int)m_grid, 2, 513);
++	const int gridVertexCount = n * n;
++	const float fInvLast = 1.f / (float)(n - 1);
++
++	WarnAboutVertexBudgetOnce(n, gridVertexCount);
++
++	const float sizeX = max(0.0001f, m_size.x);
++	const float sizeY = max(0.0001f, m_size.y);
++	const float skirt = max(0.f, (float)m_skirt);
++	const bool  bSkirt = (skirt > 0.f);
++
++	// ---------------------------------------------------------------- heights
++	// UVs are the sampling coordinates as well, so mirroring flips the relief and the texture together.
++	std::vector<float> heights((size_t)gridVertexCount, 0.f);
++	std::vector<Vec2>  uvs((size_t)gridVertexCount);
++
++	for (int r = 0; r < n; ++r)
++	{
++		for (int c = 0; c < n; ++c)
++		{
++			float u = (float)c * fInvLast;
++			float v = (float)r * fInvLast;
++			if (m_bMirrorX) u = 1.f - u;
++			if (m_bMirrorY) v = 1.f - v;
++
++			const size_t index = (size_t)r * n + c;
++			uvs[index] = Vec2(u, v);
++			heights[index] = m_heightField.IsValid() ? m_heightField.SampleBilinear(u, v) : 0.f;
++		}
++	}
++
++	if (m_bNormalize && m_heightField.IsValid())
++	{
++		float minHeight = heights[0], maxHeight = heights[0];
++		for (float h : heights)
++		{
++			minHeight = min(minHeight, h);
++			maxHeight = max(maxHeight, h);
++		}
++
++		const float range = maxHeight - minHeight;
++		const float invRange = (range > FLT_EPSILON) ? (1.f / range) : 0.f;
++		for (float& h : heights)
++		{
++			h = (h - minHeight) * invRange;
++		}
++	}
++
++	for (float& h : heights)
++	{
++		h *= m_zMax;
++	}
++
++	// ---------------------------------------------------------------- positions
++	// The plate is centred on the component origin in XY and its zero level is the component origin.
++	std::vector<Vec3> positions((size_t)gridVertexCount);
++	for (int r = 0; r < n; ++r)
++	{
++		for (int c = 0; c < n; ++c)
++		{
++			const size_t index = (size_t)r * n + c;
++			positions[index] = Vec3(
++			  -sizeX * 0.5f + sizeX * ((float)c * fInvLast),
++			  sizeY * 0.5f - sizeY * ((float)r * fInvLast),
++			  heights[index]);
++		}
++	}
++
++	// ---------------------------------------------------------------- edge weld
++	// The outermost ring is moved onto the terrain surface under it, and the move is faded out over
++	// Weld Inner Falloff of the half size so that the weld does not leave a step. The move is done as
++	// a full inverse transform of the world point (x, y, terrainZ), so a welded vertex sits exactly on
++	// the terrain even when the plate is rotated or scaled.
++	if (m_bEdgeWeld && gEnv->p3DEngine->GetITerrain() != nullptr)
++	{
++		const Matrix34 worldTM = GetPlateWorldTM();
++		Matrix34 invWorldTM = worldTM;
++		invWorldTM.Invert();
++
++		const float falloff = clamp_tpl((float)m_weldInnerFalloff, 0.f, 1.f);
++		const float halfSpan = (float)(n - 1) * 0.5f;
++
++		for (int r = 0; r < n; ++r)
++		{
++			for (int c = 0; c < n; ++c)
++			{
++				const float du = (float)min(c, n - 1 - c) / halfSpan;
++				const float dv = (float)min(r, n - 1 - r) / halfSpan;
++				const float d = min(du, dv);
++
++				float weight;
++				if (falloff <= 0.f)
++				{
++					weight = (d <= 0.f) ? 1.f : 0.f;
++				}
++				else if (d >= falloff)
++				{
++					weight = 0.f;
++				}
++				else
++				{
++					const float t = d / falloff;
++					weight = 1.f - (t * t * (3.f - 2.f * t)); // 1 - smoothstep(t)
++				}
++
++				if (weight <= 0.f)
++					continue;
++
++				const size_t index = (size_t)r * n + c;
++				const Vec3 world = worldTM * positions[index];
++				const float terrainZ = gEnv->p3DEngine->GetTerrainElevation(world.x, world.y);
++				const Vec3 conformed = invWorldTM * Vec3(world.x, world.y, terrainZ);
++				positions[index] += (conformed - positions[index]) * weight;
++			}
++		}
++	}
++
++	// ---------------------------------------------------------------- perimeter (skirt)
++	// Counter clockwise seen from above, starting at the -X/-Y corner.
++	std::vector<int> perimeter;
++	if (bSkirt)
++	{
++		perimeter.reserve((size_t)4 * (n - 1));
++		for (int c = 0; c < n - 1; ++c)
++			perimeter.push_back((n - 1) * n + c);            // -Y edge, +X direction
++		for (int r = n - 1; r > 0; --r)
++			perimeter.push_back(r * n + (n - 1));            // +X edge, +Y direction
++		for (int c = n - 1; c > 0; --c)
++			perimeter.push_back(0 * n + c);                  // +Y edge, -X direction
++		for (int r = 0; r < n - 1; ++r)
++			perimeter.push_back(r * n + 0);                  // -X edge, -Y direction
++	}
++
++	const int perimeterCount = (int)perimeter.size();
++	const int totalVertexCount = gridVertexCount + (bSkirt ? perimeterCount * 2 : 0);
++	const int totalIndexCount = (n - 1) * (n - 1) * 6 + (bSkirt ? perimeterCount * 6 : 0);
++
++	// ---------------------------------------------------------------- mesh
++	if (m_pStatObj == nullptr)
++	{
++		m_pStatObj = gEnv->p3DEngine->CreateStatObj();
++		if (m_pStatObj == nullptr)
++			return;
++
++		// Keeps the system memory copy of the mesh alive, which the terrain integration pass reads
++		// through IRenderMesh::GetPosPtr(FSL_READ).
++		m_pStatObj->SetFlags(m_pStatObj->GetFlags() | STATIC_OBJECT_DYNAMIC);
++	}
++
++	IIndexedMesh* pIndexedMesh = m_pStatObj->GetIndexedMesh(true);
++	if (pIndexedMesh == nullptr)
++		return;
++
++	pIndexedMesh->FreeStreams();
++	pIndexedMesh->SetVertexCount(totalVertexCount);
++	pIndexedMesh->SetFaceCount(0);
++	pIndexedMesh->SetTexCoordCount(totalVertexCount);
++	pIndexedMesh->SetTangentCount(totalVertexCount);
++	pIndexedMesh->SetIndexCount(totalIndexCount);
++
++	CMesh* pMesh = pIndexedMesh->GetMesh();
++	Vec3* const pPositions = pMesh->GetStreamPtr<Vec3>(CMesh::POSITIONS);
++	SMeshNormal* const pNormals = pMesh->GetStreamPtr<SMeshNormal>(CMesh::NORMALS);
++	SMeshTexCoord* const pTexCoords = pMesh->GetStreamPtr<SMeshTexCoord>(CMesh::TEXCOORDS);
++	SMeshTangents* const pTangents = pMesh->GetStreamPtr<SMeshTangents>(CMesh::TANGENTS);
++	vtx_idx* const pIndices = pMesh->GetStreamPtr<vtx_idx>(CMesh::INDICES);
++
++	if (!pPositions || !pNormals || !pTexCoords || !pTangents || !pIndices)
++		return;
++
++	// Grid vertices. The tangent frame is analytic: the engine's own tangent generator
++	// (IIndexedMesh::Optimize) re-welds and reorders the vertices, which would destroy the grid.
++	for (int r = 0; r < n; ++r)
++	{
++		for (int c = 0; c < n; ++c)
++		{
++			const size_t index = (size_t)r * n + c;
++
++			const Vec3& pXPrev = positions[(size_t)r * n + max(0, c - 1)];
++			const Vec3& pXNext = positions[(size_t)r * n + min(n - 1, c + 1)];
++			const Vec3& pYPrev = positions[(size_t)max(0, r - 1) * n + c]; // one row towards +Y
++			const Vec3& pYNext = positions[(size_t)min(n - 1, r + 1) * n + c];
++
++			Vec3 dX = pXNext - pXPrev;   // along +X
++			Vec3 dY = pYPrev - pYNext;   // along +Y
++			if (dX.IsZero())
++				dX = Vec3(1.f, 0.f, 0.f);
++			if (dY.IsZero())
++				dY = Vec3(0.f, 1.f, 0.f);
++
++			Vec3 normal = dX.Cross(dY);
++			normal = normal.IsZero() ? Vec3(0.f, 0.f, 1.f) : normal.GetNormalized();
++
++			// dP/du and dP/dv of the UVs written below; mirroring reverses the direction of the
++			// texture axis relative to the geometry, hence the sign flips.
++			Vec3 tangent = m_bMirrorX ? -dX : dX;
++			Vec3 bitangent = m_bMirrorY ? dY : -dY;
++			tangent = tangent.GetNormalized();
++			bitangent = bitangent.GetNormalized();
++
++			pPositions[index] = positions[index];
++			pNormals[index] = SMeshNormal(normal);
++			pTexCoords[index] = SMeshTexCoord(uvs[index].x, uvs[index].y);
++			pTangents[index] = SMeshTangents(tangent, bitangent, normal);
++		}
++	}
++
++	// Grid indices, counter clockwise seen from +Z (the engine's front face winding, see
++	// CTerrain::MakeAreaRenderMesh).
++	int indexCursor = 0;
++	for (int r = 0; r < n - 1; ++r)
++	{
++		for (int c = 0; c < n - 1; ++c)
++		{
++			const vtx_idx v00 = (vtx_idx)(r * n + c);
++			const vtx_idx v01 = (vtx_idx)(r * n + c + 1);
++			const vtx_idx v10 = (vtx_idx)((r + 1) * n + c);
++			const vtx_idx v11 = (vtx_idx)((r + 1) * n + c + 1);
++
++			pIndices[indexCursor++] = v00;
++			pIndices[indexCursor++] = v10;
++			pIndices[indexCursor++] = v01;
++
++			pIndices[indexCursor++] = v01;
++			pIndices[indexCursor++] = v10;
++			pIndices[indexCursor++] = v11;
++		}
++	}
++
++	// Skirt: a duplicated border ring plus a second ring pushed straight down, closed with quads whose
++	// normals face outwards. The duplication is what lets the side wall have its own horizontal normal.
++	if (bSkirt)
++	{
++		const int topBase = gridVertexCount;
++		const int bottomBase = gridVertexCount + perimeterCount;
++
++		for (int i = 0; i < perimeterCount; ++i)
++		{
++			const int gridIndex = perimeter[i];
++			const int prevGridIndex = perimeter[(i + perimeterCount - 1) % perimeterCount];
++			const int nextGridIndex = perimeter[(i + 1) % perimeterCount];
++
++			// Outward normal of an edge walked counter clockwise is (dir.y, -dir.x, 0).
++			Vec3 outward(ZERO);
++			const Vec3 dirIn = positions[gridIndex] - positions[prevGridIndex];
++			const Vec3 dirOut = positions[nextGridIndex] - positions[gridIndex];
++			outward += Vec3(dirIn.y, -dirIn.x, 0.f);
++			outward += Vec3(dirOut.y, -dirOut.x, 0.f);
++			outward = outward.IsZero() ? Vec3(0.f, -1.f, 0.f) : outward.GetNormalized();
++
++			Vec3 along = dirIn + dirOut;
++			along = along.IsZero() ? Vec3(1.f, 0.f, 0.f) : along.GetNormalized();
++			const Vec3 down(0.f, 0.f, -1.f);
++
++			const Vec3 top = positions[gridIndex];
++			const Vec3 bottom = top - Vec3(0.f, 0.f, skirt);
++
++			pPositions[topBase + i] = top;
++			pPositions[bottomBase + i] = bottom;
++			pNormals[topBase + i] = SMeshNormal(outward);
++			pNormals[bottomBase + i] = SMeshNormal(outward);
++			pTexCoords[topBase + i] = SMeshTexCoord(uvs[gridIndex].x, uvs[gridIndex].y);
++			pTexCoords[bottomBase + i] = SMeshTexCoord(uvs[gridIndex].x, uvs[gridIndex].y);
++			pTangents[topBase + i] = SMeshTangents(along, down, outward);
++			pTangents[bottomBase + i] = SMeshTangents(along, down, outward);
++		}
++
++		for (int i = 0; i < perimeterCount; ++i)
++		{
++			const int j = (i + 1) % perimeterCount;
++
++			pIndices[indexCursor++] = (vtx_idx)(topBase + i);
++			pIndices[indexCursor++] = (vtx_idx)(bottomBase + i);
++			pIndices[indexCursor++] = (vtx_idx)(bottomBase + j);
++
++			pIndices[indexCursor++] = (vtx_idx)(topBase + i);
++			pIndices[indexCursor++] = (vtx_idx)(bottomBase + j);
++			pIndices[indexCursor++] = (vtx_idx)(topBase + j);
++		}
++	}
++
++	CRY_ASSERT(indexCursor == totalIndexCount);
++
++	AABB bbox(AABB::RESET);
++	for (int i = 0; i < totalVertexCount; ++i)
++	{
++		bbox.Add(pPositions[i]);
++	}
++
++	pIndexedMesh->SetSubSetCount(1);
++	pIndexedMesh->SetSubsetIndexVertexRanges(0, 0, totalIndexCount, 0, totalVertexCount);
++	pIndexedMesh->SetSubsetMaterialId(0, 0);
++	pIndexedMesh->SetSubsetMaterialProperties(0, 0, PHYS_GEOM_TYPE_DEFAULT);
++	pIndexedMesh->SetSubsetBounds(0, bbox.GetCenter(), bbox.GetRadius());
++	pIndexedMesh->SetBBox(bbox);
++
++	const bool bPhysicalize = ((uint32)m_type & (uint32)EMeshType::Collider) != 0;
++	m_pStatObj->Invalidate(bPhysicalize);
++
++	// Assigning the slot re-creates the render node, which makes C3DEngine drop the terrain sector
++	// meshes over the union of the old and the new bounding box (3dEngine.cpp:6780). No explicit
++	// ResetTerrainVertBuffers here - that would only duplicate the work.
++	m_pEntity->SetStatObj(m_pStatObj, GetOrMakeEntitySlotId() | ENTITY_SLOT_ACTUAL, false);
++
++	ApplyMaterial();
++	ApplyBaseMeshProperties();
++}
++
+ }
+ }
+diff --git a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
+index b4d80042..7629d7f4 100644
+--- a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
++++ b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
+@@ -79,5 +79,129 @@ bool LoadHeightmapFile(const char* szPath, STerrainPlateHeightField& out);
+ bool LoadDisplacementTexture(const char* szPath, STerrainPlateHeightField& out);
+ }
+ 
++enum class ETerrainPlateSource
++{
++	HeightmapFile = 0,
++	DisplacementTexture,
++};
++
++static void ReflectType(Schematyc::CTypeDesc<ETerrainPlateSource>& desc)
++{
++	desc.SetGUID("{0E4D6C1B-6A48-4B26-9C7E-5B1D0A2F8E73}"_cry_guid);
++	desc.SetLabel("Terrain Plate Source");
++	desc.SetDescription("Where the plate takes its relief from");
++	desc.SetDefaultValue(ETerrainPlateSource::HeightmapFile);
++	desc.AddConstant(ETerrainPlateSource::HeightmapFile, "HeightmapFile", "Heightmap File");
++	desc.AddConstant(ETerrainPlateSource::DisplacementTexture, "DisplacementTexture", "Displacement Texture");
++}
++
++//! A procedural grid mesh built from a heightmap, hosted in an entity slot so that it reaches the
++//! terrain integration path exactly like an ordinary mesh component does.
++class CTerrainPlateComponent
++	: public CBaseMeshComponent
++{
++protected:
++	friend CPlugin_CryDefaultEntities;
++	static void Register(Schematyc::CEnvRegistrationScope& componentScope);
++
++	// IEntityComponent
++	virtual void                    Initialize() final;
++	virtual void                    ProcessEvent(const SEntityEvent& event) final;
++	virtual Cry::Entity::EventFlags GetEventMask() const final;
++	// ~IEntityComponent
++
++	// IEditorEntityComponent
++	virtual bool SetMaterial(int slotId, const char* szMaterial) override;
++	// ~IEditorEntityComponent
++
++public:
++	CTerrainPlateComponent()
++	{
++		// A plate exists to be merged into the terrain, so unlike the other mesh components it defaults
++		// to GI mode Integrate Into Terrain. The three per instance integration parameters keep their
++		// stock defaults (90 / 0 / -1), i.e. no slope test, no blend band, global height band.
++		m_renderParameters.m_giMode = EMeshGIMode::IntegrateIntoTerrain;
++		m_type = EMeshType::Render;
++	}
++	virtual ~CTerrainPlateComponent() {}
++
++	static void ReflectType(Schematyc::CTypeDesc<CTerrainPlateComponent>& desc)
++	{
++		desc.SetGUID("{3F1D8B4A-6C2E-4E9F-9A21-7B5C0D4E8A13}"_cry_guid);
++		desc.SetEditorCategory("Geometry");
++		desc.SetLabel("Terrain Plate");
++		desc.SetDescription("A procedural relief plate built from a heightmap or a displacement texture, meant to be merged into the terrain");
++		desc.SetIcon("icons:ObjectTypes/object.ico");
++		desc.SetComponentFlags({ IEntityComponent::EFlags::Transform, IEntityComponent::EFlags::Socket, IEntityComponent::EFlags::Attach });
++
++		desc.AddBase<IEditorEntityComponent>();
++
++		SRenderParameters plateRenderDefaults;
++		plateRenderDefaults.m_giMode = EMeshGIMode::IntegrateIntoTerrain;
++
++		desc.AddMember(&CTerrainPlateComponent::m_type, 'type', "Type", "Type", "Determines the behavior of the generated mesh", EMeshType::Render);
++
++		desc.AddMember(&CTerrainPlateComponent::m_sourceMode, 'srcm', "SourceMode", "Source Mode", "Whether the relief comes from a heightmap file or from a displacement texture", ETerrainPlateSource::HeightmapFile);
++		desc.AddMember(&CTerrainPlateComponent::m_heightmapPath, 'hmap', "HeightmapFile", "Heightmap File", "16 bit raw/r16 (headerless, square), binary PGM (P5) or uncompressed BMP. Used when Source Mode is Heightmap File.", Schematyc::TerrainHeightmapFileName());
++		desc.AddMember(&CTerrainPlateComponent::m_displacementPath, 'dtex', "DisplacementTexture", "Displacement Texture", "Uncompressed DDS (R8, R16, R16F, R32F, RGBA8/BGRA8). Compressed formats cannot be read on the CPU and give a flat plate. Used when Source Mode is Displacement Texture.", Schematyc::TextureFileName());
++		desc.AddMember(&CTerrainPlateComponent::m_materialPath, 'mat', "Material", "Material", "Material of the plate. Empty uses the engine default material; the plate needs a material to be picked up by terrain integration.", "");
++
++		desc.AddMember(&CTerrainPlateComponent::m_grid, 'grid', "Grid", "Grid", "Vertices per side of the plate", 65);
++		desc.AddMember(&CTerrainPlateComponent::m_size, 'size', "Size", "Size", "Size of the plate in metres before the entity scale is applied", Vec2(1.f, 1.f));
++		desc.AddMember(&CTerrainPlateComponent::m_zMax, 'zmax', "ZMax", "Z Max", "Height in metres of the fully white part of the source, before the entity scale is applied", 1.f);
++		desc.AddMember(&CTerrainPlateComponent::m_bNormalize, 'norm', "Normalize", "Normalize", "On: the darkest sample becomes 0 and the brightest becomes Z Max. Off: the raw 0..1 value is multiplied by Z Max.", true);
++		desc.AddMember(&CTerrainPlateComponent::m_bMirrorX, 'mirx', "MirrorX", "Mirror X", "Mirrors the relief and its UVs along X (the editor cannot apply a negative scale)", false);
++		desc.AddMember(&CTerrainPlateComponent::m_bMirrorY, 'miry', "MirrorY", "Mirror Y", "Mirrors the relief and its UVs along Y (the editor cannot apply a negative scale)", false);
++
++		desc.AddMember(&CTerrainPlateComponent::m_bEdgeWeld, 'weld', "EdgeWeld", "Edge Weld", "Snaps the outermost ring of vertices onto the terrain surface under it, so the border of the plate seals against the terrain", true);
++		desc.AddMember(&CTerrainPlateComponent::m_weldInnerFalloff, 'wfal', "WeldInnerFalloff", "Weld Inner Falloff", "Fraction of the half size over which the welded border blends back into the plate's own relief. 0 welds only the outermost ring and can leave a step.", 0.25f);
++		desc.AddMember(&CTerrainPlateComponent::m_skirt, 'skrt', "Skirt", "Skirt", "Metres of extra geometry extruded straight down from the border, so the plate still seals where the terrain does not match. 0 disables the skirt.", 0.f);
++
++		desc.AddMember(&CTerrainPlateComponent::m_renderParameters, 'rend', "Render", "Rendering Settings", "Settings for the rendered representation of the component", plateRenderDefaults);
++		desc.AddMember(&CTerrainPlateComponent::m_physics, 'phys', "Physics", "Physics Settings", "Physical properties for the object, only used if a simple physics or character controller is applied to the entity.", SPhysicsParameters());
++	}
++
++	//! Rebuilds the height field from the current source and regenerates the mesh.
++	virtual void Rebuild();
++
++	//! Regenerates the mesh from the cached height field (no file access).
++	virtual void RegenerateMesh();
++
++protected:
++	//! Loads the source into m_heightField if the source changed since the last load.
++	void        LoadSourceIfNeeded();
++	//! Regenerates now, or once in the next frame if this frame already did.
++	void        RequestRegenerate();
++	//! World transform of the plate slot, also valid before the slot exists.
++	Matrix34    GetPlateWorldTM() const;
++	void        ApplyMaterial();
++	void        WarnAboutVertexBudgetOnce(int gridSide, int gridVertexCount);
++
++	ETerrainPlateSource                          m_sourceMode = ETerrainPlateSource::HeightmapFile;
++	Schematyc::TerrainHeightmapFileName          m_heightmapPath;
++	Schematyc::TextureFileName                   m_displacementPath;
++	Schematyc::MaterialFileName                  m_materialPath;
++
++	Schematyc::Range<2, 513, 2, 513, int>        m_grid = 65;
++	Vec2                                         m_size = Vec2(1.f, 1.f);
++	float                                        m_zMax = 1.f;
++	bool                                         m_bNormalize = true;
++	bool                                         m_bMirrorX = false;
++	bool                                         m_bMirrorY = false;
++
++	bool                                         m_bEdgeWeld = true;
++	Schematyc::Range<0, 1, 0, 1, float>          m_weldInnerFalloff = 0.25f;
++	Schematyc::Range<0, 1000, 0, 20, float>      m_skirt = 0.f;
++
++	// Cached state, never serialised: the mesh is always rebuilt on load.
++	STerrainPlateHeightField m_heightField;
++	string                   m_loadedSource;
++	ETerrainPlateSource      m_loadedSourceMode = ETerrainPlateSource::HeightmapFile;
++	bool                     m_bSourceLoaded = false;
++	bool                     m_bRegenPending = false;
++	bool                     m_bBudgetWarningIssued = false;
++	uint32                   m_lastRegenFrameId = 0;
++	_smart_ptr<IStatObj>     m_pStatObj;
++};
+ }
+ }
+-- 
+2.47.1.windows.1
+

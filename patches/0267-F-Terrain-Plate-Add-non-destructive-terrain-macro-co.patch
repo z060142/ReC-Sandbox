@@ -1,0 +1,623 @@
+From 2f5bdb708c624d94a1bc7f4cd2a70faf76132e5a Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Wed, 2 Sep 2026 06:59:19 +0800
+Subject: [PATCH 267/307] !F (Terrain Plate) Add non-destructive terrain macro
+ colour.
+
+Composite the plate appearance into the editor terrain colour atlas as it is
+generated, using the existing footprint falloff. The source heightmap colour
+data is not modified.
+---
+ Code/Sandbox/EditorQt/CMakeLists.txt          |   2 +
+ Code/Sandbox/EditorQt/GameEngine.cpp          |   7 +
+ Code/Sandbox/EditorQt/Terrain/Heightmap.cpp   |  13 +
+ .../EditorQt/Terrain/TerrainCommands.cpp      |  43 +-
+ .../Terrain/TerrainPlateColourOverlay.cpp     | 393 ++++++++++++++++++
+ .../Terrain/TerrainPlateColourOverlay.h       |  62 +++
+ 6 files changed, 489 insertions(+), 31 deletions(-)
+ create mode 100644 Code/Sandbox/EditorQt/Terrain/TerrainPlateColourOverlay.cpp
+ create mode 100644 Code/Sandbox/EditorQt/Terrain/TerrainPlateColourOverlay.h
+
+diff --git a/Code/Sandbox/EditorQt/CMakeLists.txt b/Code/Sandbox/EditorQt/CMakeLists.txt
+index 050e0bea..d1309be9 100644
+--- a/Code/Sandbox/EditorQt/CMakeLists.txt
++++ b/Code/Sandbox/EditorQt/CMakeLists.txt
+@@ -1053,6 +1053,8 @@ add_sources("Editor_Uber_Terrain.cpp"
+ 		"Terrain/GenerationParam.cpp"
+ 		"Terrain/GenerationParam.h"
+ 		"Terrain/Heightmap.cpp"
++		"Terrain/TerrainPlateColourOverlay.cpp"
++		"Terrain/TerrainPlateColourOverlay.h"
+ 		"Terrain/Heightmap.h"
+ 		"Terrain/Layer.cpp"
+ 		"Terrain/Layer.h"
+diff --git a/Code/Sandbox/EditorQt/GameEngine.cpp b/Code/Sandbox/EditorQt/GameEngine.cpp
+index 78855bfc..d6a4f0ae 100644
+--- a/Code/Sandbox/EditorQt/GameEngine.cpp
++++ b/Code/Sandbox/EditorQt/GameEngine.cpp
+@@ -22,6 +22,7 @@
+ #include "Prefabs/PrefabManager.h"
+ #include "ProjectManagement/Utils.h"
+ #include "Terrain/Heightmap.h"
++#include "Terrain/TerrainPlateColourOverlay.h"
+ #include "Terrain/SurfaceType.h"
+ #include "Terrain/TerrainGrid.h"
+ #include "TerrainLighting.h"
+@@ -1541,6 +1542,12 @@ void CGameEngine::Update()
+ 		if (bUpdateAIPhysics)
+ 			updateFlags |= ESYSUPDATE_EDITOR_AI_PHYSICS;
+ 
++		// Decision 08: the live terrain colour overlay of the terrain plates. It only marks terrain
++		// texture sectors dirty; the paint itself happens inside the engine's own pull, later in this
++		// Update, through CHeightmap::GetColorAtPosition. Editor branch only - the overlay is an editor
++		// preview by nature (the game loads terraintexture.pak). @see Terrain/TerrainPlateColourOverlay.h.
++		TerrainPlateColourOverlay::Update();
++
+ 		GetIEditorImpl()->GetSystem()->Update(updateFlags);
+ 
+ 		// Update flow system in simulation mode.
+diff --git a/Code/Sandbox/EditorQt/Terrain/Heightmap.cpp b/Code/Sandbox/EditorQt/Terrain/Heightmap.cpp
+index c685f186..a53dfcf0 100644
+--- a/Code/Sandbox/EditorQt/Terrain/Heightmap.cpp
++++ b/Code/Sandbox/EditorQt/Terrain/Heightmap.cpp
+@@ -6,6 +6,7 @@
+ #include "Terrain/Noise.h"
+ #include "Terrain/SurfaceType.h"
+ #include "Terrain/TerrainManager.h"
++#include "Terrain/TerrainPlateColourOverlay.h"
+ #include "Util/DynamicArray2D.h"
+ #include "Util/ImagePainter.h"
+ #include "Vegetation/VegetationMap.h"
+@@ -2866,6 +2867,18 @@ ColorB CHeightmap::GetColorAtPosition(const float x, const float y, ColorB* colo
+ 				cx += cs;
+ 			}
+ 		}
++
++		// Decision 08, the live terrain colour of an integrated terrain plate. This is the ONLY caller of
++		// this function: CTerrainNode::UpdateNodeTextureFromEditorData builds one terrain colour tile row
++		// by row out of it and DXT compresses the result into the atlas slot (terrain_node.cpp:528-583).
++		// So compositing here puts the plate's colour into what the engine renders and leaves the level's
++		// own colour alone - m_terrainRGBTexture is read above and never written. That matters: CRGBLayer
++		// flushes every dirty tile to disk on every level save (RGBLayer.cpp:1088), so a "virtual" write
++		// there would become permanent at the next Ctrl+S. Untick, move or delete the plate and the same
++		// pull repaints this tile from the untouched source. @see TerrainPlateColourOverlay.h.
++		TerrainPlateColourOverlay::ApplyToRow((uint32*)colors, colorsNum,
++		                                      CLAMP(x, 0, fLevelSize - 1.f), xStep,
++		                                      CLAMP(y, 0, fLevelSize - 1.f), texelSize * fLevelSize);
+ 	}
+ 	else
+ 	{
+diff --git a/Code/Sandbox/EditorQt/Terrain/TerrainCommands.cpp b/Code/Sandbox/EditorQt/Terrain/TerrainCommands.cpp
+index 80be0232..507b728f 100644
+--- a/Code/Sandbox/EditorQt/Terrain/TerrainCommands.cpp
++++ b/Code/Sandbox/EditorQt/Terrain/TerrainCommands.cpp
+@@ -7,6 +7,7 @@
+ #include "Terrain/Heightmap.h"
+ #include "Terrain/Layer.h"
+ #include "Terrain/RGBLayer.h"
++#include "Terrain/TerrainPlateColourOverlay.h"
+ #include "Terrain/TerrainLayerUndoObject.h"
+ #include "Terrain/TerrainManager.h"
+ #include <Util/Image.h>
+@@ -815,40 +816,20 @@ static void PyCommitTerrainPlateColour()
+ 							// The blend is the painter's, line for line (ImagePainter.cpp:310-335): both sides
+ 							// to linear, lerp there, back to gamma. Blending gamma values directly would make
+ 							// the rim band read too dark.
+-							const float recip255 = 1.f / 255.f;
+-
+-							ColorF colourSource((float)source.r * recip255, (float)source.g * recip255, (float)source.b * recip255);
+-							colourSource.srgb2rgb();
+-
+-							if (appearance.bUseAlbedo)
+-							{
+-								ColorF filter((float)appearance.tint.r * recip255, (float)appearance.tint.g * recip255,
+-								              (float)appearance.tint.b * recip255);
+-								filter.srgb2rgb();
+-								colourSource.r *= filter.r;
+-								colourSource.g *= filter.g;
+-								colourSource.b *= filter.b;
+-							}
+-
+-							colourSource.clamp(0.f, 1.f);
+-
++							//
++							// It lives in TerrainPlateColourOverlay because the LIVE overlay (decision 08)
++							// runs the very same call on the very same rim weight, one line of
++							// TerrainPlateColourOverlay::ApplyToRow. That shared call is what makes the two
++							// tiers WYSIWYG: this command means "make what you are looking at permanent",
++							// and neither tier can drift from the other without breaking the other.
++							//
+ 							// Tile pixel layout: blue | green << 8 | red << 16, alpha unused (RGBLayer.h:63),
+ 							// and the image's first axis is fpx, i.e. world Y (CRGBLayer::GetValueAt,
+-							// RGBLayer.cpp:273-281).
++							// RGBLayer.cpp:273-281). The overlay's destination texels are in that same
++							// layout, because they came out of this very RGB layer.
+ 							uint32& destination = pTile->ValueAt(px, py);
+-
+-							ColorF colourDest((float)((destination >> 16) & 0xff) * recip255,
+-							                  (float)((destination >> 8) & 0xff) * recip255,
+-							                  (float)(destination & 0xff) * recip255);
+-							colourDest.srgb2rgb();
+-
+-							ColorF colourOut = colourSource * weight + colourDest * (1.f - weight);
+-							colourOut.rgb2srgb();
+-							colourOut *= 255.f;
+-
+-							destination = ((uint32)clamp_tpl((int)colourOut.r, 0, 255) << 16)
+-							              | ((uint32)clamp_tpl((int)colourOut.g, 0, 255) << 8)
+-							              | (uint32)clamp_tpl((int)colourOut.b, 0, 255);
++							destination = TerrainPlateColourOverlay::BlendPlateColourIntoTexel(
++							  destination, source, appearance.tint, appearance.bUseAlbedo, weight);
+ 							++colourTexels;
+ 						}
+ 					}
+diff --git a/Code/Sandbox/EditorQt/Terrain/TerrainPlateColourOverlay.cpp b/Code/Sandbox/EditorQt/Terrain/TerrainPlateColourOverlay.cpp
+new file mode 100644
+index 00000000..0b926dc5
+--- /dev/null
++++ b/Code/Sandbox/EditorQt/Terrain/TerrainPlateColourOverlay.cpp
+@@ -0,0 +1,393 @@
++// Copyright 2026 Crytek GmbH / Crytek Group. All rights reserved.
++#include "StdAfx.h"
++
++#include "Terrain/TerrainPlateColourOverlay.h"
++
++#include "Terrain/Heightmap.h"
++#include "IEditorImpl.h"
++
++// Decision 08. EditorQt already has the plugin's Module directory on its include path
++// (CMakeLists.txt:1508-1513) and this is a header only downcast onto a pure virtual interface, so
++// nothing here needs a symbol out of CryDefaultEntities - same shape as TerrainCommands.cpp:21.
++#include <DefaultComponents/Geometry/TerrainPlateComponent.h>
++
++#include <CryEntitySystem/IEntitySystem.h>
++
++namespace TerrainPlateColourOverlay
++{
++
++namespace
++{
++
++using Cry::DefaultComponents::CTerrainPlateComponent;
++using Cry::DefaultComponents::ITerrainPlateCommit;
++
++//! Debounce floor. One dirty terrain texture sector costs a whole tile DXT recompress plus an upload, so
++//! a plate that keeps changing (a drag with Update During Drag on, a slider being scrubbed) must not get
++//! one per frame. A plate that reports itself settling is held back entirely and repaints on release;
++//! this interval is the backstop for the ones that do not.
++const uint32 kRepaintFrameInterval = 6;
++
++//! A weight below this contributes less than half a quantisation step and is skipped, exactly as
++//! terrain.commit_plate_colour skips it. Keeping the same epsilon keeps the two footprints identical.
++const float  kWeightEpsilon = 0.002f;
++
++struct SLivePlate
++{
++	//! The entity, not the component pointer: ApplyToRow re-resolves through the entity system so a
++	//! plate deleted between Update() and the engine's pull cannot leave a dangling interface pointer.
++	EntityId             id = INVALID_ENTITYID;
++
++	// Footprint in world metres, XY only.
++	float                worldXMin = 0.f;
++	float                worldYMin = 0.f;
++	float                worldXMax = 0.f;
++	float                worldYMax = 0.f;
++
++	ColorB               tint = ColorB(255, 255, 255, 255);
++	bool                 bUseAlbedo = false;
++
++	//! Everything the look depends on, folded into one value. When it changes the sectors under the OLD
++	//! and the NEW footprint are marked dirty.
++	uint32               signature = 0;
++	uint32               lastRepaintFrame = 0;
++
++	//! The plate has deferred transform work pending, i.e. it is being dragged. The change detector holds
++	//! its fire until this clears, so a drag repaints once, on release.
++	bool                 bSettling = false;
++};
++
++std::vector<SLivePlate> g_plates;
++
++uint32 HashCombine(uint32 seed, uint32 value)
++{
++	// The usual boost mix; any avalanche would do, this is only a change detector.
++	return seed ^ (value + 0x9e3779b9u + (seed << 6) + (seed >> 2));
++}
++
++uint32 HashFloat(uint32 seed, float value)
++{
++	uint32 bits = 0;
++	memcpy(&bits, &value, sizeof(bits));
++	return HashCombine(seed, bits);
++}
++
++//! Marks every terrain texture sector the box touches, through the editor's own refresh path. This is
++//! the recipe the terrain texture painter uses for a dab (TerrainTexturePainter.cpp:727-760) and the one
++//! terrain.commit_plate_colour reuses, including the (iY, iX) / (minY, minX) axis order:
++//! CHeightmap::UpdateSectorTexture -> CTerrainGrid::LockSectorTexture -> I3DEngine::SetTerrainSectorTexture,
++//! which walks the node and every ancestor and sets eTES_SectorIsModified_AtlasIsDirty
++//! (terran_edit.cpp:456-475, terrain_node.cpp:518-526). Going straight to SetTerrainSectorTexture would
++//! be wrong: the engine only arms the dirty flag for a node whose editor texture id is non zero, and
++//! LockSectorTexture is what creates that id.
++void MarkSectorsDirty(float worldXMin, float worldYMin, float worldXMax, float worldYMax)
++{
++	CHeightmap* pHeightmap = GetIEditorImpl()->GetHeightmap();
++	I3DEngine*  p3DEngine = GetIEditorImpl()->Get3DEngine();
++	if (pHeightmap == nullptr || p3DEngine == nullptr || p3DEngine->GetITerrain() == nullptr)
++		return;
++
++	const float terrainSize = (float)p3DEngine->GetTerrainSize();
++	const int   texSectorSize = p3DEngine->GetTerrainTextureNodeSizeMeters();
++	if (terrainSize <= 0.f || texSectorSize <= 0)
++		return;
++
++	const int sectorCount = (int)terrainSize / texSectorSize;
++	if (sectorCount <= 0)
++		return;
++
++	const int minSecX = max((int)floorf(worldXMin / (float)texSectorSize), 0);
++	const int minSecY = max((int)floorf(worldYMin / (float)texSectorSize), 0);
++	const int maxSecX = min((int)ceilf(worldXMax / (float)texSectorSize), sectorCount);
++	const int maxSecY = min((int)ceilf(worldYMax / (float)texSectorSize), sectorCount);
++
++	const float normXMin = clamp_tpl(worldXMin / terrainSize, 0.f, 1.f);
++	const float normYMin = clamp_tpl(worldYMin / terrainSize, 0.f, 1.f);
++	const float normXMax = clamp_tpl(worldXMax / terrainSize, 0.f, 1.f);
++	const float normYMax = clamp_tpl(worldYMax / terrainSize, 0.f, 1.f);
++
++	for (int iY = minSecY; iY < maxSecY; ++iY)
++	{
++		for (int iX = minSecX; iX < maxSecX; ++iX)
++		{
++			pHeightmap->UpdateSectorTexture(CPoint(iY, iX), normYMin, normXMin, normYMax, normXMax);
++		}
++	}
++}
++
++//! Walks the entity system and collects the plates that currently want the overlay. Once per editor
++//! frame, from Update(). Plates are rare and GetComponentByTypeId is a short scan over one entity's
++//! components, so this is a vector walk, not a search.
++void ScanPlates(std::vector<SLivePlate>& out)
++{
++	out.clear();
++
++	if (gEnv == nullptr || gEnv->pEntitySystem == nullptr || gEnv->p3DEngine == nullptr
++	    || gEnv->p3DEngine->GetITerrain() == nullptr)
++	{
++		return;
++	}
++
++	CHeightmap* pHeightmap = GetIEditorImpl()->GetHeightmap();
++	if (pHeightmap == nullptr)
++		return;
++
++	const float unitSize = pHeightmap->GetUnitSize();
++	if (unitSize <= 0.f)
++		return;
++
++	IEntityItPtr it = gEnv->pEntitySystem->GetEntityIterator();
++	if (it == nullptr)
++		return;
++
++	it->MoveFirst();
++	while (!it->IsEnd())
++	{
++		IEntity* pEntity = it->Next();
++		if (pEntity == nullptr)
++			continue;
++
++		IEntityComponent* pComponent = pEntity->GetComponentByTypeId(ITerrainPlateCommit::GetComponentTypeId());
++		if (pComponent == nullptr)
++			continue;
++
++		ITerrainPlateCommit* pCommit = static_cast<CTerrainPlateComponent*>(pComponent);
++
++		int    rectX1 = 0, rectY1 = 0, rectSize = 0;
++		ColorB tint;
++		bool   bUseAlbedo = false;
++		bool   bSettling = false;
++		if (!pCommit->GetLiveColourState(rectX1, rectY1, rectSize, tint, bUseAlbedo, bSettling) || rectSize <= 0)
++			continue;
++
++		SLivePlate plate;
++		plate.id = pEntity->GetId();
++		plate.worldXMin = (float)rectX1 * unitSize;
++		plate.worldYMin = (float)rectY1 * unitSize;
++		plate.worldXMax = (float)(rectX1 + rectSize) * unitSize;
++		plate.worldYMax = (float)(rectY1 + rectSize) * unitSize;
++		plate.tint = tint;
++		plate.bUseAlbedo = bUseAlbedo;
++
++		// The look depends on the footprint, the tint, the albedo switch and - through
++		// GetCommitAlbedoAtWorld - on which material the plate is wearing. A material EDIT (a different
++		// texture assigned inside the same material) is not covered; nudging the plate repaints it.
++		uint32 signature = 0x811c9dc5u;
++		signature = HashFloat(signature, plate.worldXMin);
++		signature = HashFloat(signature, plate.worldYMin);
++		signature = HashFloat(signature, plate.worldXMax);
++		signature = HashFloat(signature, plate.worldYMax);
++		signature = HashCombine(signature, ((uint32)tint.r << 16) | ((uint32)tint.g << 8) | (uint32)tint.b);
++		signature = HashCombine(signature, bUseAlbedo ? 1u : 0u);
++		signature = HashCombine(signature, (uint32)(uintptr_t)pEntity->GetMaterial());
++		signature = HashCombine(signature, (uint32)(uintptr_t)pEntity->GetSlotMaterial(0));
++		plate.signature = signature;
++		plate.bSettling = bSettling;
++
++		out.push_back(plate);
++	}
++}
++
++}   // anonymous namespace
++
++uint32 BlendPlateColourIntoTexel(uint32 destination, ColorB source, ColorB tint, bool bUseAlbedo, float weight)
++{
++	const float recip255 = 1.f / 255.f;
++
++	ColorF colourSource((float)source.r * recip255, (float)source.g * recip255, (float)source.b * recip255);
++	colourSource.srgb2rgb();
++
++	if (bUseAlbedo)
++	{
++		ColorF filter((float)tint.r * recip255, (float)tint.g * recip255, (float)tint.b * recip255);
++		filter.srgb2rgb();
++		colourSource.r *= filter.r;
++		colourSource.g *= filter.g;
++		colourSource.b *= filter.b;
++	}
++
++	colourSource.clamp(0.f, 1.f);
++
++	ColorF colourDest((float)((destination >> 16) & 0xff) * recip255,
++	                  (float)((destination >> 8) & 0xff) * recip255,
++	                  (float)(destination & 0xff) * recip255);
++	colourDest.srgb2rgb();
++
++	ColorF colourOut = colourSource * weight + colourDest * (1.f - weight);
++	colourOut.rgb2srgb();
++	colourOut *= 255.f;
++
++	return ((uint32)clamp_tpl((int)colourOut.r, 0, 255) << 16)
++	       | ((uint32)clamp_tpl((int)colourOut.g, 0, 255) << 8)
++	       | (uint32)clamp_tpl((int)colourOut.b, 0, 255);
++}
++
++bool IsActive()
++{
++	return !g_plates.empty();
++}
++
++void Update()
++{
++	if (gEnv == nullptr)
++		return;
++
++	// No terrain (no level, or a level being torn down): drop everything without marking anything. The
++	// next level repaints from its own CRGBLayer, which this module never wrote to.
++	if (gEnv->p3DEngine == nullptr || gEnv->p3DEngine->GetITerrain() == nullptr)
++	{
++		g_plates.clear();
++		return;
++	}
++
++	std::vector<SLivePlate> current;
++	ScanPlates(current);
++
++	const uint32 frameId = gEnv->nMainFrameID;
++
++	// Plates that appeared, moved or changed.
++	for (SLivePlate& plate : current)
++	{
++		const SLivePlate* pPrevious = nullptr;
++		for (const SLivePlate& previous : g_plates)
++		{
++			if (previous.id == plate.id)
++			{
++				pPrevious = &previous;
++				break;
++			}
++		}
++
++		if (pPrevious != nullptr && pPrevious->signature == plate.signature)
++		{
++			plate.lastRepaintFrame = pPrevious->lastRepaintFrame;
++			continue;
++		}
++
++		// Mid drag. Carry the last repainted state forward so the change stays pending: the drag costs no
++		// tile recompress at all and the ground repaints once, when the plate is dropped.
++		if (pPrevious != nullptr && plate.bSettling)
++		{
++			plate.signature = pPrevious->signature;
++			plate.worldXMin = pPrevious->worldXMin;
++			plate.worldYMin = pPrevious->worldYMin;
++			plate.worldXMax = pPrevious->worldXMax;
++			plate.worldYMax = pPrevious->worldYMax;
++			plate.lastRepaintFrame = pPrevious->lastRepaintFrame;
++			continue;
++		}
++
++		if (pPrevious != nullptr && (frameId - pPrevious->lastRepaintFrame) < kRepaintFrameInterval)
++		{
++			// Too soon. Carry the OLD state forward so the change is still pending and gets picked up on a
++			// later frame - this is the throttle, not a drop. One dirty sector is a whole tile DXT
++			// recompress plus an upload, so this is the floor even for a plate that never reports itself
++			// settling (Update During Drag on, or a slider being scrubbed).
++			plate.signature = pPrevious->signature;
++			plate.worldXMin = pPrevious->worldXMin;
++			plate.worldYMin = pPrevious->worldYMin;
++			plate.worldXMax = pPrevious->worldXMax;
++			plate.worldYMax = pPrevious->worldYMax;
++			plate.lastRepaintFrame = pPrevious->lastRepaintFrame;
++			continue;
++		}
++
++		if (pPrevious != nullptr)
++		{
++			// A move repaints the ground the plate LEFT as well as the ground it arrived on.
++			MarkSectorsDirty(pPrevious->worldXMin, pPrevious->worldYMin, pPrevious->worldXMax, pPrevious->worldYMax);
++		}
++
++		MarkSectorsDirty(plate.worldXMin, plate.worldYMin, plate.worldXMax, plate.worldYMax);
++		plate.lastRepaintFrame = frameId;
++	}
++
++	// Plates that went away: deleted, unticked, or Bake Into Terrain switched off. Repaint the ground
++	// they used to cover; the pull reads CRGBLayer, which never held their colour, so it comes back
++	// exactly as it was.
++	for (const SLivePlate& previous : g_plates)
++	{
++		bool bStillLive = false;
++		for (const SLivePlate& plate : current)
++		{
++			if (plate.id == previous.id)
++			{
++				bStillLive = true;
++				break;
++			}
++		}
++
++		if (!bStillLive)
++			MarkSectorsDirty(previous.worldXMin, previous.worldYMin, previous.worldXMax, previous.worldYMax);
++	}
++
++	g_plates.swap(current);
++}
++
++void ApplyToRow(uint32* pRow, int count, float worldYStart, float worldStepY, float worldX, float rgbTexelSizeMeters)
++{
++	if (pRow == nullptr || count <= 0 || g_plates.empty())
++		return;
++
++	if (gEnv == nullptr || gEnv->pEntitySystem == nullptr)
++		return;
++
++	const float worldYEnd = worldYStart + worldStepY * (float)(count - 1);
++	const float rowYMin = min(worldYStart, worldYEnd);
++	const float rowYMax = max(worldYStart, worldYEnd);
++
++	// The rim weight is an area measure and sampleSizeMeters is the area it is measured over. The colour
++	// commit measures it over ONE RGB TEXEL (reports/29 section 3), and the leaf terrain colour tile is
++	// finer than that, so the floor here makes the leaf tile - the one seen up close - agree with the
++	// commit texel for texel. Ancestor tiles are coarser and use their own, wider footprint, which is
++	// what antialiases the rim at distance.
++	const float sampleSize = max(fabs_tpl(worldStepY), rgbTexelSizeMeters);
++
++	for (const SLivePlate& plate : g_plates)
++	{
++		if (worldX < plate.worldXMin || worldX > plate.worldXMax
++		    || rowYMax < plate.worldYMin || rowYMin > plate.worldYMax)
++		{
++			continue;
++		}
++
++		// Re-resolve through the entity id rather than trusting the cached pointer: the pull runs inside
++		// the engine update, and an entity deleted between Update() and here would leave a dangling
++		// interface pointer. GetEntity is an array lookup and this is once per row, not once per texel.
++		IEntity* pEntity = gEnv->pEntitySystem->GetEntity(plate.id);
++		if (pEntity == nullptr)
++			continue;
++
++		IEntityComponent* pComponent = pEntity->GetComponentByTypeId(ITerrainPlateCommit::GetComponentTypeId());
++		if (pComponent == nullptr)
++			continue;
++
++		ITerrainPlateCommit* pCommit = static_cast<CTerrainPlateComponent*>(pComponent);
++
++		for (int i = 0; i < count; ++i)
++		{
++			const float worldY = worldYStart + worldStepY * (float)i;
++			if (worldY < plate.worldYMin || worldY > plate.worldYMax)
++				continue;
++
++			// THE rim weight, the same call terrain.commit_plate_colour makes
++			// (TerrainCommands.cpp, PyCommitTerrainPlateColour): identical curve, identical knobs,
++			// identical epsilon, so the preview and the commit cannot drift.
++			const float weight = pCommit->GetCommitWeightAtWorld(worldX, worldY, sampleSize);
++			if (weight <= kWeightEpsilon)
++				continue;
++
++			ColorB source = plate.tint;
++			if (plate.bUseAlbedo)
++			{
++				ColorB albedo;
++				if (pCommit->GetCommitAlbedoAtWorld(worldX, worldY, albedo))
++					source = albedo;
++			}
++
++			pRow[i] = BlendPlateColourIntoTexel(pRow[i], source, plate.tint, plate.bUseAlbedo, weight);
++		}
++	}
++}
++
++}
+diff --git a/Code/Sandbox/EditorQt/Terrain/TerrainPlateColourOverlay.h b/Code/Sandbox/EditorQt/Terrain/TerrainPlateColourOverlay.h
+new file mode 100644
+index 00000000..f228a4cf
+--- /dev/null
++++ b/Code/Sandbox/EditorQt/Terrain/TerrainPlateColourOverlay.h
+@@ -0,0 +1,62 @@
++// Copyright 2026 Crytek GmbH / Crytek Group. All rights reserved.
++
++#pragma once
++
++#include <CryMath/Cry_Color.h>
++
++//! Decision 08 - the plate's diffuse as the terrain's macro colour, LIVE and non destructive.
++//!
++//! Where this sits. The engine's runtime macro colour is a pooled atlas whose editor half is a PULL:
++//! CTerrainNode::SetupTexturing sees a node marked eTES_SectorIsModified_AtlasIsDirty and calls
++//! CTerrainNode::UpdateNodeTextureFromEditorData (terrain_node.cpp:117-142, :528-583), which builds the
++//! tile row by row out of C3DEngine::m_pEditorHeightmap->GetColorAtPosition and DXT compresses it into
++//! the atlas slot. That callback IS CHeightmap. So the overlay is applied to the row buffer CHeightmap
++//! hands back (Heightmap.cpp, GetColorAtPosition) - the OUTGOING buffer only. CRGBLayer, the level's
++//! actual colour, is never written: CRGBLayer::Serialize flushes every dirty tile to disk on every level
++//! save (RGBLayer.cpp:1088), so anything written there would silently become permanent at Ctrl+S
++//! (research 13 section B / section 3).
++//!
++//! Consequences that fall out of that choice, all of them wanted:
++//!  * nothing to restore. The atlas is a cache; its truth is CRGBLayer. Untick, move or delete a plate
++//!    and the same pull repaints the tile from the untouched source. There is no baseline array and no
++//!    restore bug class (research 13 section 1.3-1.4).
++//!  * it survives streaming for free: CTerrainSectorTexture's StreamOnComplete re-arms the dirty flag
++//!    (terrain_sector_tex.cpp:170-173), so the next pull re-applies the overlay.
++//!  * EDITOR ONLY, by nature. The game loads terraintexture.pak, which is produced from CRGBLayer by
++//!    CGameExporter::ExportSurfaceTexture (GameExporter.cpp:1068-1070). Nothing written into the atlas
++//!    can reach it. Shipping the colour is what terrain.commit_plate_colour (Commit Colour) is for, and
++//!    the two tiers share BlendPlateColourIntoTexel and ITerrainPlateCommit::GetCommitWeightAtWorld, so
++//!    "Commit Colour" means literally "make what you are looking at permanent".
++namespace TerrainPlateColourOverlay
++{
++
++//! THE blend, shared by the live overlay and by terrain.commit_plate_colour. Both sides to linear, lerp
++//! there, back to gamma - the terrain painter's own recipe (ImagePainter.cpp:310-335); blending gamma
++//! values directly makes the rim band read too dark.
++//!
++//! destination and the return value are one terrain colour texel in the RGB layer's packed layout,
++//! blue | green << 8 | red << 16 (RGBLayer.h:63), which is also the layout CHeightmap::GetColorAtPosition
++//! hands to the engine. source is the plate's albedo when bUseAlbedo is set, otherwise the flat tint;
++//! tint multiplies the albedo when bUseAlbedo is set (and IS the source when it is not).
++uint32 BlendPlateColourIntoTexel(uint32 destination, ColorB source, ColorB tint, bool bUseAlbedo, float weight);
++
++//! Once per editor frame. Re-enumerates the plates whose Terrain Colour From Plate is on, and marks the
++//! terrain texture sectors under a plate that appeared, moved, changed or went away, so that the engine
++//! pull repaints them. Debounced: a plate that reports itself settling (a drag in progress) is left
++//! alone until it settles, and no plate repaints more often than kRepaintFrameInterval.
++void Update();
++
++//! True when at least one plate is currently asking for the overlay. Cheap; the stock path must stay
++//! byte identical when this is false.
++bool IsActive();
++
++//! Composites the live plates over one row of terrain colour texels, in place. Called from
++//! CHeightmap::GetColorAtPosition with the row it is about to return.
++//!
++//! The engine asks for a row along WORLD Y at a fixed world X (terrain_node.cpp:562 passes m_nOriginY
++//! first and m_nOriginX second, and CHeightmap's first argument is the fpx of the RGB layer, which is
++//! the world Y - research 12 sections 1.2 and 3.1). worldStepY is the node's own texel size in metres,
++//! so ancestor tiles automatically get a wider filter footprint and the rim antialiases at every level.
++void ApplyToRow(uint32* pRow, int count, float worldYStart, float worldStepY, float worldX, float rgbTexelSizeMeters);
++
++}
+-- 
+2.47.1.windows.1
+

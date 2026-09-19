@@ -1,0 +1,185 @@
+From 5ada82ed162fa1b8c0667958950a0fc5ca631b02 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Sun, 30 Aug 2026 16:14:36 +0800
+Subject: [PATCH 208/307] !B (Terrain Integration) Rebuild terrain sectors when
+ geometry integration mode changes.
+
+Terrain sectors contain copies of integrated geometry and must be invalidated
+when an object enters, leaves or moves. Track the previous object bounds and
+rebuild the union of the old and new areas on every transition.
+---
+ Code/CryEngine/Cry3DEngine/3dEngine.cpp       | 47 ++++++++++++++-----
+ Code/CryEngine/Cry3DEngine/3dEngine.h         |  9 ++++
+ Code/CryEngine/Cry3DEngine/3dEngineLoad.cpp   |  3 ++
+ Code/CryEngine/CryEntitySystem/EntitySlot.cpp | 14 ++++++
+ .../Sandbox/EditorQt/Objects/EntityObject.cpp | 14 ++++--
+ 5 files changed, 72 insertions(+), 15 deletions(-)
+
+diff --git a/Code/CryEngine/Cry3DEngine/3dEngine.cpp b/Code/CryEngine/Cry3DEngine/3dEngine.cpp
+index ae9926bc..30ca3cb5 100644
+--- a/Code/CryEngine/Cry3DEngine/3dEngine.cpp
++++ b/Code/CryEngine/Cry3DEngine/3dEngine.cpp
+@@ -6607,11 +6607,8 @@ void C3DEngine::AsyncOctreeUpdate(IRenderNode* pEnt, uint32 nFrameID, bool bUnRe
+ 
+ 	auto dwRndFlags = pEnt->GetRndFlags();
+ 
+-	if (m_bIntegrateObjectsIntoTerrain && eERType == eERType_MovableBrush && pEnt->GetGIMode() == IRenderNode::eGM_IntegrateIntoTerrain)
+-	{
+-		// update meshes integrated into terrain
+-		GetTerrain()->ResetTerrainVertBuffers(&aabb);
+-	}
++	// update meshes integrated into terrain
++	UpdateTerrainObjectIntegration(pEnt, eERType, aabb, false);
+ 
+ 	if (!(dwRndFlags & ERF_RENDER_ALWAYS) && !(dwRndFlags & ERF_CASTSHADOWMAPS))
+ 		if (GetCVars()->e_ObjFastRegister && pEnt->GetParent() && ((COctreeNode*)pEnt->GetParent())->IsRightNode(aabb, fObjRadiusSqr, pEnt->m_fWSMaxViewDist))
+@@ -6779,16 +6776,44 @@ bool C3DEngine::UnRegisterEntityImpl(IRenderNode* pEnt)
+ 	if (pEnt->m_pTempData)
+ 		pEnt->m_pTempData->ResetClipVolume();
+ 
+-	if (m_bIntegrateObjectsIntoTerrain && eRenderNodeType == eERType_MovableBrush && pEnt->GetGIMode() == IRenderNode::eGM_IntegrateIntoTerrain)
+-	{
+-		// update meshes integrated into terrain
+-		AABB nodeBox = pEnt->GetBBox();
+-		GetTerrain()->ResetTerrainVertBuffers(&nodeBox);
+-	}
++	// update meshes integrated into terrain
++	UpdateTerrainObjectIntegration(pEnt, eRenderNodeType, pEnt->GetBBox(), true);
+ 
+ 	return bFound;
+ }
+ 
++///////////////////////////////////////////////////////////////////////////////
++void C3DEngine::UpdateTerrainObjectIntegration(IRenderNode* pEnt, EERType eERType, const AABB& aabb, bool bUnregister)
++{
++	if (eERType != eERType_MovableBrush)
++		return;
++
++	const bool bIntegratesNow = !bUnregister
++	                            && m_bIntegrateObjectsIntoTerrain
++	                            && pEnt->GetGIMode() == IRenderNode::eGM_IntegrateIntoTerrain;
++
++	std::map<IRenderNode*, AABB>::iterator it = m_integratedIntoTerrainNodes.find(pEnt);
++	const bool bWasIntegrating = (it != m_integratedIntoTerrainNodes.end());
++
++	if (!bIntegratesNow && !bWasIntegrating)
++		return;
++
++	// Drop the sector meshes over the union of where the object was integrated and where it is now,
++	// so that enabling the mode, disabling it, and moving an integrated object all leave no stale
++	// geometry behind. The rebuild itself is lazy (the meshes are freed here, rebuilt when drawn).
++	AABB dirtyBox = aabb;
++	if (bWasIntegrating)
++		dirtyBox.Add(it->second);
++
++	if (CTerrain* const pTerrain = GetTerrain())
++		pTerrain->ResetTerrainVertBuffers(&dirtyBox);
++
++	if (bIntegratesNow)
++		m_integratedIntoTerrainNodes[pEnt] = aabb;
++	else
++		m_integratedIntoTerrainNodes.erase(it);
++}
++
+ ///////////////////////////////////////////////////////////////////////////////
+ Vec3 C3DEngine::GetEntityRegisterPoint(IRenderNode* pEnt)
+ {
+diff --git a/Code/CryEngine/Cry3DEngine/3dEngine.h b/Code/CryEngine/Cry3DEngine/3dEngine.h
+index 429887d4..1b594701 100644
+--- a/Code/CryEngine/Cry3DEngine/3dEngine.h
++++ b/Code/CryEngine/Cry3DEngine/3dEngine.h
+@@ -845,6 +845,15 @@ public:
+ 	bool                  m_bIntegrateObjectsIntoTerrain;
+ 	bool                  m_supportOfflineProceduralVegetation = false;
+ 
++	//! Render nodes currently contributing geometry to the terrain sector meshes, with the bounding box
++	//! they were last integrated with. Used to rebuild the union of the old and the new sectors whenever
++	//! a node enters or leaves eGM_IntegrateIntoTerrain, or moves while integrating.
++	std::map<IRenderNode*, AABB> m_integratedIntoTerrainNodes;
++
++	//! Request the terrain sector rebuild needed by any transition into/out of eGM_IntegrateIntoTerrain.
++	//! Called on (un)registration; pass bUnregister when the node is leaving the scene.
++	void UpdateTerrainObjectIntegration(IRenderNode* pEnt, EERType eERType, const AABB& aabb, bool bUnregister);
++
+ 	Vec3                  m_fogColor2;
+ 	Vec3                  m_fogColorRadial;
+ 	Vec3                  m_volFogHeightDensity;
+diff --git a/Code/CryEngine/Cry3DEngine/3dEngineLoad.cpp b/Code/CryEngine/Cry3DEngine/3dEngineLoad.cpp
+index a5e84dac..4e304dcc 100644
+--- a/Code/CryEngine/Cry3DEngine/3dEngineLoad.cpp
++++ b/Code/CryEngine/Cry3DEngine/3dEngineLoad.cpp
+@@ -335,6 +335,9 @@ void C3DEngine::UnloadLevel()
+ 	m_bInUnload = true;
+ 	m_szLevelFolder[0] = 0;
+ 
++	// no render node survives the level, so the terrain integration tracking is void from here on
++	m_integratedIntoTerrainNodes.clear();
++
+ 	if (gEnv->pCharacterManager)
+ 	{
+ 		CryComment("Flushing animation jobs contexts");
+diff --git a/Code/CryEngine/CryEntitySystem/EntitySlot.cpp b/Code/CryEngine/CryEntitySystem/EntitySlot.cpp
+index 014d7531..49fda2ed 100644
+--- a/Code/CryEngine/CryEntitySystem/EntitySlot.cpp
++++ b/Code/CryEngine/CryEntitySystem/EntitySlot.cpp
+@@ -162,6 +162,7 @@ void CEntitySlot::UpdateRenderNode(bool bForceRecreateNode)
+ 		EERType renderNodeType = m_pRenderNode->GetRenderNodeType();
+ 
+ 		IRenderNode::RenderFlagsType renderNodeFlags = m_pRenderNode->GetRndFlags();
++		const bool bWasIntegratedIntoTerrain = (m_pRenderNode->GetGIMode() == IRenderNode::eGM_IntegrateIntoTerrain);
+ 		bool bSelected, bHighlighted;
+ 		m_pEntity->GetEditorObjectInfo(bSelected, bHighlighted);
+ 		m_pRenderNode->SetEditorObjectInfo(bSelected, bHighlighted);
+@@ -217,6 +218,19 @@ void CEntitySlot::UpdateRenderNode(bool bForceRecreateNode)
+ 
+ 		m_pRenderNode->SetRndFlags(renderNodeFlags);
+ 
++		// The terrain sector meshes contain a copy of the geometry of every eGM_IntegrateIntoTerrain
++		// node, and are only rebuilt on request. Any transition into or out of that mode therefore has to
++		// invalidate the sectors the node covers - on enable as well as on disable (the shipped code only
++		// did it on disable, and relied on the re-registration to catch the enable case).
++		if (bWasIntegratedIntoTerrain != (m_pRenderNode->GetGIMode() == IRenderNode::eGM_IntegrateIntoTerrain))
++		{
++			if (ITerrain* pTerrain = gEnv->p3DEngine ? gEnv->p3DEngine->GetITerrain() : nullptr)
++			{
++				AABB nodeBox = m_pRenderNode->GetBBox();
++				pTerrain->ResetTerrainVertBuffers(&nodeBox);
++			}
++		}
++
+ 		m_pRenderNode->SetRndFlags(ERF_HIDDEN, !bSlotShouldRender);
+ 
+ 		// Update render node location
+diff --git a/Code/Sandbox/EditorQt/Objects/EntityObject.cpp b/Code/Sandbox/EditorQt/Objects/EntityObject.cpp
+index 1fa2c1f4..76798866 100644
+--- a/Code/Sandbox/EditorQt/Objects/EntityObject.cpp
++++ b/Code/Sandbox/EditorQt/Objects/EntityObject.cpp
+@@ -4283,15 +4283,21 @@ void CEntityObject::OnEntityFlagsChange(IVariable* var)
+ 			flags &= ~ENTITY_FLAG_NO_DECALNODE_DECALS;
+ 		}
+ 
+-		// Detect disabling of IntegrateIntoTerrain feature and request terrain mesh update
++		// Detect enabling *or* disabling of the IntegrateIntoTerrain feature and request terrain mesh update
+ 		if ((flagsEx & ENTITY_FLAG_EXTENDED_GI_MODE_BIT_MASK) ^ (mv_giMode << ENTITY_FLAG_EXTENDED_GI_MODE_BIT_OFFSET))
+ 		{
+ 			IRenderNode* pRenderNode = m_pEntity->GetRenderNode();
+ 
+-			if (pRenderNode && pRenderNode->GetGIMode() == IRenderNode::eGM_IntegrateIntoTerrain)
++			const bool bWasIntegrating = pRenderNode && pRenderNode->GetGIMode() == IRenderNode::eGM_IntegrateIntoTerrain;
++			const bool bWillIntegrate = pRenderNode && ((int)mv_giMode == (int)IRenderNode::eGM_IntegrateIntoTerrain);
++
++			if (bWasIntegrating || bWillIntegrate)
+ 			{
+-				AABB nodeBox = pRenderNode->GetBBox();
+-				gEnv->p3DEngine->GetITerrain()->ResetTerrainVertBuffers(&nodeBox);
++				if (ITerrain* pTerrain = gEnv->p3DEngine->GetITerrain())
++				{
++					AABB nodeBox = pRenderNode->GetBBox();
++					pTerrain->ResetTerrainVertBuffers(&nodeBox);
++				}
+ 			}
+ 		}
+ 
+-- 
+2.47.1.windows.1
+

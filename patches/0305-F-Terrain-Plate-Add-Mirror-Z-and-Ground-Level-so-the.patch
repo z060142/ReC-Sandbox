@@ -1,0 +1,234 @@
+From 60fd7a130b6a5cea0fbcee9be5b343228445eab3 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Thu, 3 Sep 2026 15:06:05 +0800
+Subject: [PATCH 305/307] !F (Terrain Plate) Add Mirror Z and Ground Level so
+ the plate can dig.
+
+Two new Shape rows, in the existing drawer, next to Mirror X / Mirror Y.
+
+Mirror Z (bool, default off) reads the relief upside down (h -> 1 - h,
+after Normalize), so a hill map becomes a pit map. On its own it cannot
+produce a below-ground surface: the shaped relief still spans 0..1 above
+the pivot.
+
+Ground Level (float 0..1, default 0) says which height of the normalised
+relief sits on the ground the plate stands on. 0 is exactly the old
+behaviour - the rim is on the ground and everything rises. Raising it
+sinks the part of the relief below that level under the ground; 1 puts
+the highest point on the ground and everything else below. The mesh Z
+becomes (h - groundLevel) * scaleZ, the pivot stays at the ground and
+Edge Weld still pulls the outer ring onto the terrain.
+
+Both are one affine step on the normalised relief, cached beside the
+Normalize rescale as m_reliefSign / m_reliefShift, so RegenerateMesh and
+GetPlateReliefAt - the surface the bake, the weld and the colour commit
+all evaluate - stay the same surface. The defaults are the identity, so
+a plate that uses neither is unchanged. The bake maths is untouched: a
+sunken relief is written by the existing Raise And Lower branch.
+
+Two places assumed the relief never goes below the pivot:
+
+* ComputeBakeRect's local box spanned Z 0..1. On a rotated or tilted
+  plate that Z extent projects into the world XY footprint, so it now
+  spans -groundLevel .. 1 - groundLevel.
+
+* The buried-triangle cull classified against the ORIGINAL ground:
+  RegenerateMesh restores the baseline at the top and bakes at the very
+  bottom, so a crater floor was culled into the NODRAW subset and the
+  plate vanished. While Ground Level > 0 and the plate bakes with Raise
+  And Lower, the grid vertices are exempt - the bake is about to put the
+  terrain the epsilon under them. The welded ring and the skirt keep the
+  test, because the bake's rim falloff leaves the original ground where
+  it is and Weld Sink puts them under it on purpose.
+
+Guard: turning Ground Level up from 0 while Bake Into Terrain is on and
+Bake Mode is Raise would leave the sunken part buried and culled, i.e.
+the plate disappears. That one property change switches Bake Mode to
+Raise And Lower once and logs a plain line saying so. The previous value
+is a runtime cache seeded in Initialize, so loading a plate that was
+saved with a Ground Level is not an edit and nothing is ever switched
+silently later.
+---
+ .../Geometry/TerrainPlateComponent.cpp        | 62 ++++++++++++++++++-
+ .../Geometry/TerrainPlateComponent.h          | 26 +++++++-
+ 2 files changed, 84 insertions(+), 4 deletions(-)
+
+diff --git a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
+index 0ca037df..534f572d 100644
+--- a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
++++ b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
+@@ -984,6 +984,8 @@ void STerrainPlateShapeGroup::Serialize(Serialization::IArchive& archive)
+ 	archive(plate.m_effectiveGridInfo, "EffectiveGrid", "Effective Grid");
+ 	archive(plate.m_bMirrorX, "MirrorX", "Mirror X");
+ 	archive(plate.m_bMirrorY, "MirrorY", "Mirror Y");
++	archive(plate.m_bMirrorZ, "MirrorZ", "Mirror Z");
++	archive(plate.m_groundLevel, "GroundLevel", "Ground Level");
+ }
+ 
+ // The Bake drawer. Its master tick box, Bake Into Terrain, is a top level row of its own and is deliberately NOT
+@@ -1115,6 +1117,10 @@ void CTerrainPlateComponent::Initialize()
+ 
+ 	RegisterPlate();
+ 
++	// The Bake Mode guard compares against this, so a plate that was SAVED with a Ground Level is not read as
++	// somebody raising it now. @see ENTITY_EVENT_COMPONENT_PROPERTY_CHANGED.
++	m_lastGroundLevel = (float)m_groundLevel;
++
+ 	Rebuild();
+ }
+ 
+@@ -1205,6 +1211,21 @@ void CTerrainPlateComponent::ProcessEvent(const SEntityEvent& event)
+ 			}
+ 		}
+ 
++		// Ground Level just left 0 while the bake only ever adds ground: the part of the relief that is now under
++		// the plate's ground would stay buried under the untouched terrain and be culled, so the plate simply
++		// disappears. Raise And Lower is the mode that makes the setting mean anything, so it is switched here -
++		// once, on the edit that causes it, and never behind the user's back at any later time.
++		if ((float)m_groundLevel > 0.f && m_lastGroundLevel <= 0.f
++		    && m_bBakeIntoTerrain && m_bakeMode == ETerrainPlateBakeMode::Raise)
++		{
++			m_bakeMode = ETerrainPlateBakeMode::RaiseAndLower;
++			CryLog("Terrain Plate '%s': Ground Level is above 0, so Bake Mode was switched to Raise And Lower - "
++			       "otherwise the terrain would not follow the plate down and the sunken part would stay buried.",
++			       GetPlateName());
++		}
++
++		m_lastGroundLevel = (float)m_groundLevel;
++
+ 		if (GetPlateDebugLevel() >= 1)
+ 		{
+ 			CryLog("TerrainPlate '%s': property changed, Bake Into Terrain = %s, terrain %s",
+@@ -1835,8 +1856,20 @@ void CTerrainPlateComponent::RegenerateMesh()
+ 		m_reliefScale = invRange;
+ 	}
+ 
++	// Mirror Z (h -> 1 - h) and Ground Level (h -> h - level) are one affine step on the normalised relief, and
++	// the bake has to reproduce it at arbitrary points too, so it is cached beside the Normalize rescale. The
++	// defaults are the identity, so a plate that uses neither gets the very same numbers as before.
++	m_reliefSign = m_bMirrorZ ? -1.f : 1.f;
++	m_reliefShift = (m_bMirrorZ ? 1.f : 0.f) - (float)m_groundLevel;
++
++	for (float& h : heights)
++	{
++		h = h * m_reliefSign + m_reliefShift;
++	}
++
+ 	// ---------------------------------------------------------------- positions
+-	// Unit plate: -0.5 .. +0.5 in XY centred on the component origin, 0 .. 1 in Z. The transform makes metres.
++	// Unit plate: -0.5 .. +0.5 in XY centred on the component origin, -Ground Level .. 1 - Ground Level in Z.
++	// The transform makes metres. Z 0 is the ground the plate stands on, so a negative Z is a dug pit.
+ 	std::vector<Vec3> positions((size_t)gridVertexCount);
+ 	for (int r = 0; r < ny; ++r)
+ 	{
+@@ -2078,6 +2111,16 @@ void CTerrainPlateComponent::RegenerateMesh()
+ 	std::vector<char> buried;
+ 	const bool bCullBuried = (g_terrainPlateCullBuried != 0) && (gEnv->p3DEngine->GetITerrain() != nullptr);
+ 
++	// The terrain read below is the ORIGINAL ground: RegenerateMesh restored it at the top, and this plate's own
++	// bake only runs at the very end. A relief that dips BELOW the plate's ground (Ground Level > 0) is therefore
++	// classified against ground the bake is about to dig away, and the pit would be culled and never drawn. So the
++	// interior of such a plate is exempt while it bakes with lowering: the terrain there ends up the epsilon under
++	// the mesh, i.e. not buried. The WELDED ring and the skirt keep the test - the bake's rim falloff leaves the
++	// original ground exactly where it is, so they really are buried, which is what Weld Sink puts them there for.
++	const bool bReliefBelowGround = ((float)m_groundLevel > 0.f);
++	const bool bBakeExemptsInterior = bReliefBelowGround && m_bBakeIntoTerrain && !m_bBakeTornDown
++	                                  && (m_bakeMode == ETerrainPlateBakeMode::RaiseAndLower);
++
+ 	if (bCullBuried)
+ 	{
+ 		// The node matrix, not the frame: pPositions is the emitted stream and that is in metres.
+@@ -2086,6 +2129,15 @@ void CTerrainPlateComponent::RegenerateMesh()
+ 
+ 		for (int i = 0; i < totalVertexCount; ++i)
+ 		{
++			if (bBakeExemptsInterior && i < gridVertexCount)
++			{
++				const int c = i % nx;
++				const int r = i / nx;
++				const bool bOuterRing = m_bEdgeWeld && (c == 0 || c == nx - 1 || r == 0 || r == ny - 1);
++				if (!bOuterRing)
++					continue;   // the ground under this vertex follows the plate down, so it is not buried
++			}
++
+ 			const Vec3 world = nodeTM * pPositions[i];
+ 			const float terrainZ = gEnv->p3DEngine->GetTerrainElevation(world.x, world.y);
+ 			buried[(size_t)i] = (world.z < terrainZ - kBuriedCullMargin) ? 1 : 0;
+@@ -2377,7 +2429,8 @@ float CTerrainPlateComponent::GetPlateReliefAt(float lx, float ly) const
+ 		if (m_bMirrorX) u = 1.f - u;
+ 		if (m_bMirrorY) v = 1.f - v;
+ 
+-		return (m_heightField.SampleBilinear(u, v) - m_reliefOffset) * m_reliefScale;
++		// Normalize rescale, then the Mirror Z / Ground Level step - the same two the mesh grid went through.
++		return ((m_heightField.SampleBilinear(u, v) - m_reliefOffset) * m_reliefScale) * m_reliefSign + m_reliefShift;
+ 	};
+ 
+ 	const float h00 = vertexHeight(c0, r0);
+@@ -2444,7 +2497,10 @@ bool CTerrainPlateComponent::ComputeBakeRect(const SBakeTerrainMetrics& metrics,
+ {
+ 	// The footprint is the world AABB of the rotated unit plate box: cells inside the AABB but outside the
+ 	// rotated plate simply keep the baseline.
+-	const AABB localBox(Vec3(-0.5f, -0.5f, 0.f), Vec3(0.5f, 0.5f, 1.f));
++	// Ground Level slides the relief band down, and on a ROTATED plate the local Z extent is part of the world
++	// footprint, so it is taken from the band the plate actually occupies rather than assumed to start at 0.
++	const float groundLevel = (float)m_groundLevel;
++	const AABB localBox(Vec3(-0.5f, -0.5f, -groundLevel), Vec3(0.5f, 0.5f, 1.f - groundLevel));
+ 	const AABB worldBox = AABB::CreateTransformedAABB(worldTM, localBox);
+ 
+ 	const float invUnit = 1.f / metrics.unitSize;
+diff --git a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
+index 315010c2..fcd91389 100644
+--- a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
++++ b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
+@@ -325,9 +325,22 @@ public:
+ 		               "Anything typed here is overwritten by the next rebuild.", Schematyc::CSharedString());
+ 		desc.AddMember(&CTerrainPlateComponent::m_bNormalize, 'norm', "Normalize", /*"Normalize"*/ "",
+ 		               "On: the darkest sample becomes 0 and the brightest becomes 1. Off: the raw 0..1 value of the source is used. "
+-		               "Either way the relief spans 0..1 m before the entity scale; scale Z to set the height, and X/Y to set the size.", true);
++		               "Either way the relief spans 0..1 m before the entity scale; scale Z to set the height, and X/Y to set the size. "
++		               "Ground Level slides that band down, so part of it can end up below the plate's own ground.", true);
+ 		desc.AddMember(&CTerrainPlateComponent::m_bMirrorX, 'mirx', "MirrorX", /*"Mirror X"*/ "", "Mirrors the relief and its UVs along X (the editor cannot apply a negative scale)", false);
+ 		desc.AddMember(&CTerrainPlateComponent::m_bMirrorY, 'miry', "MirrorY", /*"Mirror Y"*/ "", "Mirrors the relief and its UVs along Y (the editor cannot apply a negative scale)", false);
++		desc.AddMember(&CTerrainPlateComponent::m_bMirrorZ, 'mirz', "MirrorZ", /*"Mirror Z"*/ "",
++		               "Reads the relief upside down, so the darkest sample becomes the highest point and a hill map becomes a pit map. "
++		               "The UVs are not touched. On its own the plate still only rises out of the ground - use Ground Level to sink it.",
++		               false);
++		desc.AddMember(&CTerrainPlateComponent::m_groundLevel, 'glvl', "GroundLevel", /*"Ground Level"*/ "",
++		               "Which height of the relief sits on the ground the plate stands on, measured on the 0..1 relief and so "
++		               "independent of the Z scale. 0 (default) puts the bottom of the relief on the ground, so the whole plate rises "
++		               "out of it - the behaviour before this option existed. Raising it sinks everything BELOW that level under the "
++		               "ground, so a pit is dug instead of a hill added; 1 puts the highest point of the relief on the ground and "
++		               "everything else below it. The border is still welded to the surrounding ground. Anything below the ground "
++		               "needs Bake Mode = Raise And Lower for the terrain to follow the plate down.",
++		               0.f);
+ 
+ 		// Edge Weld and Bake Into Terrain sit further down, right in front of the drawer they open.
+ 		desc.AddMember(&CTerrainPlateComponent::m_weldInnerFalloff, 'wfal', "WeldInnerFalloff", /*"Weld Inner Falloff"*/ "", "Fraction of the half size over which the welded border blends back into the plate's own relief. 0 welds only the outermost ring and can leave a step.", 0.25f);
+@@ -675,6 +688,10 @@ protected:
+ 	bool                                         m_bNormalize = true;
+ 	bool                                         m_bMirrorX = false;
+ 	bool                                         m_bMirrorY = false;
++	//! Reads the relief upside down (h -> 1 - h, after Normalize): a hill map becomes a pit map.
++	bool                                         m_bMirrorZ = false;
++	//! Which height of the normalised relief sits on the plate's ground. 0 = the old behaviour, everything rises.
++	Schematyc::Range<0, 1, 0, 1, float>          m_groundLevel = 0.f;
+ 
+ 	bool                                         m_bEdgeWeld = true;
+ 	Schematyc::Range<0, 1, 0, 1, float>          m_weldInnerFalloff = 0.25f;
+@@ -785,6 +802,13 @@ protected:
+ 	//! pass solved them, so the baked relief and the rendered mesh are the same surface.
+ 	float                    m_reliefOffset = 0.f;
+ 	float                    m_reliefScale = 1.f;
++	//! Mirror Z and Ground Level, folded into one affine step applied AFTER the Normalize rescale:
++	//! h = h * m_reliefSign + m_reliefShift. Defaults are the identity, i.e. the pre-feature relief.
++	float                    m_reliefSign = 1.f;
++	float                    m_reliefShift = 0.f;
++	//! Ground Level as the last property change saw it, so the Bake Mode guard fires on the 0 -> > 0 edit
++	//! only. Seeded in Initialize, so loading a plate that already has one is not an edit. @see ProcessEvent.
++	float                    m_lastGroundLevel = 0.f;
+ 	//! True while the terrain holds this plate's bake over m_bakeRect*.
+ 	bool                     m_bBakeApplied = false;
+ 	//! Global order in which the live bakes landed. The cascade restores in DESCENDING order of THIS, not
+-- 
+2.47.1.windows.1
+

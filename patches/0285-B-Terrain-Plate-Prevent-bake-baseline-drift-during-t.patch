@@ -1,0 +1,224 @@
+From 25ab1a126a24f9caf5507f9888d4f853325b5f48 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Wed, 2 Sep 2026 11:16:38 +0800
+Subject: [PATCH 285/307] !B (Terrain Plate) Prevent bake baseline drift during
+ terrain rewrites.
+
+Keep the floating-point bake baseline as the source of truth across restore and
+reapply cycles. Refresh only areas changed externally so terrain quantization
+cannot ratchet untouched cells downward.
+---
+ .../Geometry/TerrainPlateComponent.cpp        | 134 +++++++++++++++++-
+ .../Geometry/TerrainPlateComponent.h          |  21 ++-
+ 2 files changed, 148 insertions(+), 7 deletions(-)
+
+diff --git a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
+index 9c3f7665..5d2d888a 100644
+--- a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
++++ b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.cpp
+@@ -2351,18 +2351,138 @@ bool CTerrainPlateComponent::ComputeBakeRect(const SBakeTerrainMetrics& metrics,
+ 	return true;
+ }
+ 
+-void CTerrainPlateComponent::CaptureBakeBaseline(const SBakeTerrainMetrics& metrics)
++void CTerrainPlateComponent::RefreshBakeBaseline(const SBakeTerrainMetrics& metrics)
+ {
+ 	const int dim = m_bakeRectSize + 1;
+-	m_bakeBaseline.resize((size_t)dim * dim);
++	const int priorDim = m_bakeBaselineSize + 1;
++	const bool bHavePrior = (m_bakeBaselineSize > 0) && ((int)m_bakeBaseline.size() == priorDim * priorDim);
+ 
++	std::vector<float> current((size_t)dim * dim);
+ 	for (int ux = 0; ux < dim; ++ux)
+ 	{
+ 		for (int uy = 0; uy < dim; ++uy)
+ 		{
+-			m_bakeBaseline[(size_t)ux * dim + uy] = SampleTerrainUnit(metrics, m_bakeRectX1 + ux, m_bakeRectY1 + uy);
++			current[(size_t)ux * dim + uy] = SampleTerrainUnit(metrics, m_bakeRectX1 + ux, m_bakeRectY1 + uy);
+ 		}
+ 	}
++
++	int adoptedCells = 0;
++	int keptCells = 0;
++
++	if (!bHavePrior)
++	{
++		// The one and only capture from ground nobody baked: pristine terrain, or the ground an external
++		// editor left behind after this plate had given its own footprint back.
++		m_bakeBaseline.swap(current);
++	}
++	else
++	{
++		// Cells with no stored float value - the plate moved and took in new ground - start from the terrain.
++		std::vector<float> next(current);
++
++		const int sectorUnits = max(1, metrics.sectorUnits);
++		const int sectorsPerSide = max(1, m_bakeRectSize / sectorUnits);
++
++		for (int sx = 0; sx < sectorsPerSide; ++sx)
++		{
++			for (int sy = 0; sy < sectorsPerSide; ++sy)
++			{
++				const int ux0 = sx * sectorUnits;
++				const int uy0 = sy * sectorUnits;
++				const int ux1 = min(ux0 + sectorUnits, dim - 1);
++				const int uy1 = min(uy0 + sectorUnits, dim - 1);
++
++				float fMin = FLT_MAX, fMax = -FLT_MAX;
++				for (int ux = ux0; ux <= ux1; ++ux)
++				{
++					for (int uy = uy0; uy <= uy1; ++uy)
++					{
++						const float z = current[(size_t)ux * dim + uy];
++						fMin = min(fMin, z);
++						fMax = max(fMax, z);
++					}
++				}
++
++				// Same shape as m_bakeProbeTolerance, but per sector: a height that only came back changed by
++				// the sector's own 12 bit round trip is the ground WE wrote, a real sculpt is not.
++				const float tolerance = max(0.002f, TerrainQuantStep(fMin, fMax) * 4.f);
++
++				for (int ux = ux0; ux <= ux1; ++ux)
++				{
++					for (int uy = uy0; uy <= uy1; ++uy)
++					{
++						const int px = m_bakeRectX1 + ux - m_bakeBaselineX1;
++						const int py = m_bakeRectY1 + uy - m_bakeBaselineY1;
++						if (px < 0 || px >= priorDim || py < 0 || py >= priorDim)
++							continue;   // outside the stored rect: the terrain reading already stands
++
++						const size_t index = (size_t)ux * dim + uy;
++						const float prior = m_bakeBaseline[(size_t)px * priorDim + py];
++
++						if (fabs_tpl(current[index] - prior) <= tolerance)
++						{
++							next[index] = prior;   // keep the float; re-reading it is what ratchets the ground down
++							++keptCells;
++						}
++						else
++						{
++							++adoptedCells;   // a genuine edit under the plate: what is there now IS the ground
++						}
++					}
++				}
++			}
++		}
++
++		m_bakeBaseline.swap(next);
++	}
++
++	m_bakeBaselineX1 = m_bakeRectX1;
++	m_bakeBaselineY1 = m_bakeRectY1;
++	m_bakeBaselineSize = m_bakeRectSize;
++
++	if (GetPlateDebugLevel() >= 2)
++	{
++		LogBakeBaselineDrift(adoptedCells, keptCells);
++	}
++}
++
++void CTerrainPlateComponent::LogBakeBaselineDrift(int adoptedCells, int keptCells)
++{
++	const int refDim = m_bakeBaselineFirstSize + 1;
++
++	if (m_bakeBaselineFirstSize <= 0 || (int)m_bakeBaselineFirst.size() != refDim * refDim)
++	{
++		m_bakeBaselineFirst = m_bakeBaseline;
++		m_bakeBaselineFirstX1 = m_bakeBaselineX1;
++		m_bakeBaselineFirstY1 = m_bakeBaselineY1;
++		m_bakeBaselineFirstSize = m_bakeBaselineSize;
++
++		CryLog("TerrainPlate '%s': baseline drift reference taken over units (%d,%d)+%d",
++		       GetPlateName(), m_bakeBaselineX1, m_bakeBaselineY1, m_bakeBaselineSize);
++		return;
++	}
++
++	const int dim = m_bakeRectSize + 1;
++	float maxDrift = 0.f;
++	int comparedCells = 0;
++
++	for (int ux = 0; ux < dim; ++ux)
++	{
++		for (int uy = 0; uy < dim; ++uy)
++		{
++			const int px = m_bakeRectX1 + ux - m_bakeBaselineFirstX1;
++			const int py = m_bakeRectY1 + uy - m_bakeBaselineFirstY1;
++			if (px < 0 || px >= refDim || py < 0 || py >= refDim)
++				continue;
++
++			maxDrift = max(maxDrift, fabs_tpl(m_bakeBaseline[(size_t)ux * dim + uy]
++			                                  - m_bakeBaselineFirst[(size_t)px * refDim + py]));
++			++comparedCells;
++		}
++	}
++
++	CryLog("TerrainPlate '%s': baseline drift %.4f mm over %d shared cells (%d kept, %d adopted from the terrain)",
++	       GetPlateName(), maxDrift * 1000.f, comparedCells, keptCells, adoptedCells);
+ }
+ 
+ void CTerrainPlateComponent::ComputeBakeBlock(const SBakeTerrainMetrics& metrics, const Matrix34& worldTM,
+@@ -3130,6 +3250,10 @@ void CTerrainPlateComponent::OnCommitted()
+ 	if (!m_bakeResult.empty())
+ 	{
+ 		m_bakeBaseline = m_bakeResult;
++		// m_bakeResult is the live rect's block, so the baseline's own rect follows it. @see RefreshBakeBaseline.
++		m_bakeBaselineX1 = m_bakeRectX1;
++		m_bakeBaselineY1 = m_bakeRectY1;
++		m_bakeBaselineSize = m_bakeRectSize;
+ 	}
+ 
+ 	// The disarm proper. m_bBakeApplied false makes the teardown a no-op, so deleting a committed plate leaves
+@@ -3343,7 +3467,9 @@ void CTerrainPlateComponent::ApplyBake()
+ 	m_bakeRectY1 = y1;
+ 	m_bakeRectSize = size;
+ 
+-	CaptureBakeBaseline(metrics);
++	// NOT a fresh read of the terrain: RestoreBakeBaseline has just written the stored baseline back, and a
++	// height that goes through SetTerrainElevation and comes back out is lower than it went in.
++	RefreshBakeBaseline(metrics);
+ 
+ 	int cellsWritten = 0;
+ 	float minDelta = 0.f, maxDelta = 0.f;
+diff --git a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
+index 6bcd3152..d31f24ed 100644
+--- a/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
++++ b/Code/CryPlugins/CryDefaultEntities/Module/DefaultComponents/Geometry/TerrainPlateComponent.h
+@@ -579,9 +579,14 @@ protected:
+ 	//! Sector aligned square footprint of the plate, in terrain units. False when the plate cannot be
+ 	//! baked (no terrain, degenerate transform, or a footprint too large to build a block for).
+ 	bool  ComputeBakeRect(const SBakeTerrainMetrics& metrics, const Matrix34& worldTM, int& outX1, int& outY1, int& outSize) const;
+-	//! Reads the terrain heights over the current rect into m_bakeBaseline. The terrain must hold the
+-	//! original ground at this point (@see RestoreBakeBaseline).
+-	void  CaptureBakeBaseline(const SBakeTerrainMetrics& metrics);
++	//! Brings m_bakeBaseline onto the current rect WITHOUT re-reading ground this plate wrote itself. A
++	//! height never survives a write/read round trip through the 12 bit sector encoding, so re-capturing
++	//! on every rebuild ratchets the stored ground downwards; cells whose terrain still matches the stored
++	//! float keep that float, only genuinely changed and brand new cells are read from the terrain.
++	void  RefreshBakeBaseline(const SBakeTerrainMetrics& metrics);
++	//! e_TerrainPlateDebug >= 2 only: max drift of the baseline against its very first capture. Zero drift
++	//! with no adopted cells is the invariant RefreshBakeBaseline exists to hold.
++	void  LogBakeBaselineDrift(int adoptedCells, int keptCells);
+ 	//! Builds m_bakeResult from m_bakeBaseline and the plate surface. Reports what it changed.
+ 	void  ComputeBakeBlock(const SBakeTerrainMetrics& metrics, const Matrix34& worldTM, int& outCellsWritten, float& outMinDelta, float& outMaxDelta);
+ 	//! Second pass of ComputeBakeBlock: the per plate Bake Offset, scaled by each cell's relief over the
+@@ -805,6 +810,16 @@ protected:
+ 	//! world X and uy along world Y, the order SetTerrainElevation itself uses.
+ 	std::vector<float>       m_bakeBaseline;   //!< the original ground, restored on any change
+ 	std::vector<float>       m_bakeResult;     //!< what the last bake actually wrote
++	//! The rect m_bakeBaseline was captured over. Usually the live rect, but it is kept separately so a
++	//! move can carry the overlapping cells' float values over instead of re-reading them. Size 0 = none.
++	int                      m_bakeBaselineX1 = 0;
++	int                      m_bakeBaselineY1 = 0;
++	int                      m_bakeBaselineSize = 0;
++	//! e_TerrainPlateDebug >= 2 only: the first baseline this plate ever captured, and its rect.
++	std::vector<float>       m_bakeBaselineFirst;
++	int                      m_bakeBaselineFirstX1 = 0;
++	int                      m_bakeBaselineFirstY1 = 0;
++	int                      m_bakeBaselineFirstSize = 0;
+ 	std::vector<SBakeProbe>  m_bakeProbes;
+ 	//! e_TerrainPlateBakeEpsilon / e_TerrainPlateBakeSlopeCorrect as the live bake used them. A cvar
+ 	//! change does not move the terrain, so the probes cannot see it; PollBake compares these instead.
+-- 
+2.47.1.windows.1
+
