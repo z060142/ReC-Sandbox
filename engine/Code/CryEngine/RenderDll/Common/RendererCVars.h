@@ -655,6 +655,29 @@ public:
 	static float CV_r_ssdoAmountAmbient;
 	static float CV_r_ssdoAmountReflection;
 
+	static int   CV_r_LPV;
+	static int   CV_r_LPVGridSize;
+	static float CV_r_LPVSize;
+	static int   CV_r_LPVCascades;
+	static float CV_r_LPVCascadeScale;
+	static int   CV_r_LPVIterations;
+	static float CV_r_LPVIntensity;
+	static float CV_r_LPVInjectionBias;
+	static int   CV_r_LPVRSMSamples;
+	static float CV_r_LPVTemporalAlpha;
+	static float CV_r_LPVSecondaryBounce;
+	static float CV_r_LPVOcclusion;
+	static float CV_r_LPVSkyLight;
+	static float CV_r_LPVMaxIrradiance;
+	static float CV_r_LPVSpecular;
+	static float CV_r_LPVTranslucentBrightness;
+	static float CV_r_LPVPointLights;
+	static float CV_r_LPVRsmMinCasterSize;
+	static float CV_r_LPVRsmClipRange;
+	static float CV_r_LPVHeightMapOcclusion;
+	static int   CV_r_LPVUpdateInterval;
+	static int   CV_r_LPVDebug;
+
 	static int   CV_r_CustomResMaxSize;
 	static int   CV_r_CustomResWidth;
 	static int   CV_r_CustomResHeight;

@@ -1,0 +1,467 @@
+From b4974c0f3fe06ec8a90d3032affa7c8d5fe6ed61 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Tue, 11 Aug 2026 11:22:45 +0800
+Subject: [PATCH 178/206] feat: LPV geometry volume occlusion and sky light
+ injection
+
+- Geometry Volume (r_LPVOcclusion, default 1): RSM surfels accumulate a
+  directional blocking potential per cell (accumulator widened 16 -> 20
+  ints, additive cosine-lobe x face-coverage, self-normalizing), resolved
+  into a dedicated 3D texture and applied as midpoint transmittance during
+  propagation. First iteration runs unoccluded so light can leave the
+  source cell. Suppresses light bleeding through walls/floors.
+- Sky light (r_LPVSkyLight, default 0.25): cells passing a sun-visibility
+  test against the RSM depth (open-sky proxy) receive a downward cosine
+  lobe of sky colour. Interiors only get it through propagation via
+  openings, attenuated by the GV - AO-like ambient. Energy is decoupled
+  from r_LPVIntensity (value = target irradiance in sky-colour units on
+  an upward-facing outdoor surface).
+- r_LPVDebug 12: GV blocking potential surface mosaic.
+- Docs: 05 v1.2 section, INDEX status refresh.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Tu9cj9ax1mqCV93HVfCfpW
+---
+ .../RenderDll/Common/RendererCVars.cpp        |  15 ++-
+ .../RenderDll/Common/RendererCVars.h          |   2 +
+ .../XRenderD3D9/GraphicsPipeline/LPV.cpp      |  74 ++++++++++++-
+ .../XRenderD3D9/GraphicsPipeline/LPV.h        |  12 ++-
+ Engine/Shaders/HWScripts/CryFX/LPV.cfi        | 101 +++++++++++++++++-
+ 5 files changed, 191 insertions(+), 13 deletions(-)
+
+diff --git a/Code/CryEngine/RenderDll/Common/RendererCVars.cpp b/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
+index ed8ea8d0..2c72e5db 100644
+--- a/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
++++ b/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
+@@ -421,6 +421,8 @@ float CRendererCVars::CV_r_LPVInjectionBias;
+ int   CRendererCVars::CV_r_LPVRSMSamples;
+ float CRendererCVars::CV_r_LPVTemporalAlpha;
+ float CRendererCVars::CV_r_LPVSecondaryBounce;
++float CRendererCVars::CV_r_LPVOcclusion;
++float CRendererCVars::CV_r_LPVSkyLight;
+ int   CRendererCVars::CV_r_LPVUpdateInterval;
+ int   CRendererCVars::CV_r_LPVDebug;
+ 
+@@ -2253,6 +2255,16 @@ void CRendererCVars::InitCVars()
+ 	               "Gain of the multi bounce feedback (grid cells with registered surfaces re-emit the\n"
+ 	               "indirect light they received in the previous relight, SVOGI style). 0 disables it.\n"
+ 	               "The loop stays stable roughly while gain * scene albedo * 0.25 < 1, i.e. up to ~10.\n");
++	REGISTER_CVAR3("r_LPVOcclusion", CV_r_LPVOcclusion, 1.0f, VF_NULL,
++	               "Strength of the geometry volume occlusion: RSM surfels register a directional blocking\n"
++	               "potential per cell and the propagation attenuates the light flowing through blocked cell\n"
++	               "faces, which suppresses light bleeding through walls and floors.\n"
++	               "1 means a fully covered, perpendicular cell face blocks completely. 0 disables the GV.\n");
++	REGISTER_CVAR3("r_LPVSkyLight", CV_r_LPVSkyLight, 0.25f, VF_NULL,
++	               "Sky light ambient injected into grid cells that pass the sun visibility test against the\n"
++	               "RSM depth (a proxy for open sky). The value is the target irradiance on an upward facing\n"
++	               "outdoor surface in units of the sky colour, independent of r_LPVIntensity.\n"
++	               "Interiors receive it only through propagation via openings. 0 disables the sky light.\n");
+ 	REGISTER_CVAR3("r_LPVTemporalAlpha", CV_r_LPVTemporalAlpha, 0.15f, VF_NULL,
+ 	               "Weight of the current frame in the temporal accumulation of the LPV grid [0.01, 1].\n"
+ 	               "Lower values are more stable but react slower, 1 disables the accumulation.\n");
+@@ -2271,7 +2283,8 @@ void CRendererCVars::InitCVars()
+ 	               "10 - 3D probe spheres: a small shaded ball at every grid cell, coloured by the cell\n"
+ 	               "     energy and depth tested against the scene (drawn directly into the HDR target,\n"
+ 	               "     no r_ShowRenderTarget needed)\n"
+-	               "11 - probe spheres and surface mosaic combined (alignment check)\n");
++	               "11 - probe spheres and surface mosaic combined (alignment check)\n"
++	               "12 - geometry volume blocking potential (L0 magnitude) projected onto the scene surfaces\n");
+ 
+ 	REGISTER_CVAR3("r_DepthOfField", CV_r_dof, DOF_DEFAULT_VAL, VF_NULL,
+ 	               "Enables depth of field.\n"
+diff --git a/Code/CryEngine/RenderDll/Common/RendererCVars.h b/Code/CryEngine/RenderDll/Common/RendererCVars.h
+index 1110343c..c167d599 100644
+--- a/Code/CryEngine/RenderDll/Common/RendererCVars.h
++++ b/Code/CryEngine/RenderDll/Common/RendererCVars.h
+@@ -666,6 +666,8 @@ public:
+ 	static int   CV_r_LPVRSMSamples;
+ 	static float CV_r_LPVTemporalAlpha;
+ 	static float CV_r_LPVSecondaryBounce;
++	static float CV_r_LPVOcclusion;
++	static float CV_r_LPVSkyLight;
+ 	static int   CV_r_LPVUpdateInterval;
+ 	static int   CV_r_LPVDebug;
+ 
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.cpp
+index 66f754a1..c774bff0 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.cpp
+@@ -64,6 +64,7 @@ CLPVStage::CLPVStage(CGraphicsPipeline& graphicsPipeline)
+ 	, m_bResultValid(false)
+ {
+ 	m_rsmToWorld.SetIdentity();
++	m_worldToRsm.SetIdentity();
+ 
+ 	for (auto& pass : m_passPropagate)
+ 	{
+@@ -129,6 +130,10 @@ void CLPVStage::Init()
+ 		}
+ 	}
+ 
++	CRY_ASSERT(m_pGridGV == nullptr);
++	std::string gvName = "$LPVGridGV" + m_graphicsPipeline.GetUniqueIdentifierName();
++	m_pGridGV = CTexture::GetOrCreateTextureObjectPtr(gvName.c_str(), 0, 0, 0, eTT_3D, uavFlags, LPVGridFormat);
++
+ 	CRY_ASSERT(m_pIrradiance == nullptr);
+ 	std::string texName = "$LPVIrradiance" + m_graphicsPipeline.GetUniqueIdentifierName();
+ 	m_pIrradiance = CTexture::GetOrCreateTextureObjectPtr(texName.c_str(), 0, 0, 1, eTT_2D, uavFlags, LPVIrradianceFormat);
+@@ -169,6 +174,7 @@ void CLPVStage::ResizeGrid(int32 gridSize)
+ 		for (auto& pTex : gridSet)
+ 			createTexture3D(pTex);
+ 	}
++	createTexture3D(m_pGridGV);
+ 
+ 	const uint32 elementCount = gridSize * gridSize * gridSize * AccumulatorStride;
+ 	if (elementCount != m_injectionBuffer.GetElementCount() || m_injectionBuffer.GetDevBuffer() == nullptr)
+@@ -424,6 +430,7 @@ bool CLPVStage::UpdateFrameParameters(const ShadowMapFrustum& frustum, const CTe
+ 
+ 	Matrix44A worldToRsm = shadowsSetup.ShadowMat;
+ 
++	m_worldToRsm = worldToRsm;
+ 	m_rsmToWorld = worldToRsm.GetInverted();
+ 
+ 	if (CRendererCVars::CV_r_LPVDebug > 0)
+@@ -593,7 +600,7 @@ void CLPVStage::Execute()
+ 	{
+ 		ExecuteClear(commandList);
+ 		ExecuteInject(commandList, pFrustum->pDepthTex, pRsmColor, pRsmNormal);
+-		ExecuteResolve(commandList);
++		ExecuteResolve(commandList, pFrustum->pDepthTex);
+ 		ExecutePropagate(commandList);
+ 		ExecuteTemporal(commandList);
+ 
+@@ -674,8 +681,27 @@ void CLPVStage::ExecuteInject(const SScopedComputeCommandList& commandList, CTex
+ 	pass.BeginConstantUpdate();
+ 	SetGridConstants(pass);
+ 
++	// Geometry volume blocking potential of one sampled RSM texel: the fraction of a cell face its
++	// world space footprint covers. The surfels of a wall crossing a cell then sum to ~1 with plain
++	// additive accumulation (total surfel area / face area), no max blending or count normalization
++	// needed. The inverse is only defined up to a projective scale, dehomogenize before measuring
++	// (same pitfall as the screen inject area weight).
++	float gvBlocking = 0.0f;
++	if (CRendererCVars::CV_r_LPVOcclusion > 0.0f)
++	{
++		Vec4 rsmCorner0 = m_rsmToWorld * Vec4(0.0f, 0.0f, 0.5f, 1.0f);
++		Vec4 rsmCorner1 = m_rsmToWorld * Vec4(1.0f, 0.0f, 0.5f, 1.0f);
++		if (fabsf(rsmCorner0.w) > 1e-12f)
++			rsmCorner0 = rsmCorner0 / rsmCorner0.w;
++		if (fabsf(rsmCorner1.w) > 1e-12f)
++			rsmCorner1 = rsmCorner1 / rsmCorner1.w;
++		const Vec3 rsmSpan = Vec3(rsmCorner1.x - rsmCorner0.x, rsmCorner1.y - rsmCorner0.y, rsmCorner1.z - rsmCorner0.z);
++		const float rsmTexelSize = rsmSpan.GetLength() / (float)m_rsmSampleCount;
++		gvBlocking = min(1.0f, (rsmTexelSize * rsmTexelSize) / (m_cellSize * m_cellSize));
++	}
++
+ 	static CCryNameR paramRsm("LPVRsmParams");
+-	pass.SetConstant(paramRsm, Vec4((float)m_rsmSampleCount, (float)m_rsmSampleStride, CRendererCVars::CV_r_LPVInjectionBias, 0.0f));
++	pass.SetConstant(paramRsm, Vec4((float)m_rsmSampleCount, (float)m_rsmSampleStride, CRendererCVars::CV_r_LPVInjectionBias, gvBlocking));
+ 
+ 	static CCryNameR paramRsmSize("LPVRsmSize");
+ 	pass.SetConstant(paramRsmSize, Vec4((float)m_rsmSize, 1.0f / (float)m_rsmSize, (float)CRendererCVars::CV_r_LPVDebug, 0.0f));
+@@ -769,22 +795,25 @@ void CLPVStage::ExecuteInjectScreen(const SScopedComputeCommandList& commandList
+ 	pass.Execute(commandList);
+ }
+ 
+-void CLPVStage::ExecuteResolve(const SScopedComputeCommandList& commandList)
++void CLPVStage::ExecuteResolve(const SScopedComputeCommandList& commandList, CTexture* pRsmDepth)
+ {
+ 	auto& pass = m_passResolve;
+ 
+-	if (pass.IsDirty(m_gridSize, m_accIndex))
++	if (pass.IsDirty(m_gridSize, m_accIndex, pRsmDepth->GetID()))
+ 	{
+ 		static CCryNameTSCRC techName("LPVResolve");
+ 		pass.SetTechnique(CShaderMan::s_shDeferredShading, techName, 0);
+ 		pass.SetOutputUAV(0, m_pGridSH[0][0]);
+ 		pass.SetOutputUAV(1, m_pGridSH[0][1]);
+ 		pass.SetOutputUAV(2, m_pGridSH[0][2]);
++		pass.SetOutputUAV(3, m_pGridGV);
+ 		pass.SetBuffer(0, &m_injectionBuffer);
+ 		// Previous frame accumulated grid: ExecuteResolve runs before ExecuteTemporal flips the index.
+ 		pass.SetTexture(1, m_pGridAcc[m_accIndex][0]);
+ 		pass.SetTexture(2, m_pGridAcc[m_accIndex][1]);
+ 		pass.SetTexture(3, m_pGridAcc[m_accIndex][2]);
++		// RSM depth for the sky visibility test (open sky proxy: the cell can see the sun).
++		pass.SetTexture(4, pRsmDepth);
+ 	}
+ 
+ 	pass.BeginConstantUpdate();
+@@ -811,6 +840,33 @@ void CLPVStage::ExecuteResolve(const SScopedComputeCommandList& commandList)
+ 	static CCryNameR paramResolve2("LPVResolveParams2");
+ 	pass.SetConstant(paramResolve2, Vec4(deltaCells.x, deltaCells.y, deltaCells.z, bounceGain));
+ 
++	static CCryNameR paramRsmSize("LPVRsmSize");
++	pass.SetConstant(paramRsmSize, Vec4((float)m_rsmSize, 1.0f / (float)m_rsmSize, (float)CRendererCVars::CV_r_LPVDebug, 0.0f));
++
++	static CCryNameR paramSunDir("LPVSunDir");
++	const Vec3 sunDir = RenderView()->GetSunLightDirection();
++	pass.SetConstant(paramSunDir, Vec4(sunDir.x, sunDir.y, sunDir.z, 0.0f));
++
++	static CCryNameR paramWorldToRsm("LPVWorldToRsm");
++	pass.SetConstant(paramWorldToRsm, m_worldToRsm);
++
++	// Sky light, premultiplied so that r_LPVSkyLight is the irradiance an upward facing outdoor
++	// surface ends up with in units of the sky colour, independent of the display intensity:
++	// the apply pass computes dot(cosineLobe(down) * sky, cosineLobe(down)) * intensity, and
++	// dot(cosineLobe(d), cosineLobe(d)) = (ZH_COS0 * SH_C0)^2 + (ZH_COS1 * SH_C1)^2 = 0.3125.
++	Vec3 skyPremult(ZERO);
++	const float skyGain = max(0.0f, CRendererCVars::CV_r_LPVSkyLight);
++	if (skyGain > 0.0f && gEnv->p3DEngine)
++	{
++		const Vec3 skyColor = gEnv->p3DEngine->GetSkyColor();
++		const float shTransfer = 0.3125f;
++		const float displayIntensity = max(1.0f, CRendererCVars::CV_r_LPVIntensity);
++		skyPremult = skyColor * (skyGain / (shTransfer * displayIntensity));
++	}
++
++	static CCryNameR paramSky("LPVSkyColor");
++	pass.SetConstant(paramSky, Vec4(skyPremult.x, skyPremult.y, skyPremult.z, skyGain > 0.0f ? 1.0f : 0.0f));
++
+ 	const uint32 dispatchSize = lpvDispatchSize(m_gridSize, LPVGridTileSize);
+ 	pass.SetDispatchSize(dispatchSize, dispatchSize, dispatchSize);
+ 	pass.PrepareResourcesForUse(commandList);
+@@ -857,11 +913,21 @@ void CLPVStage::ExecutePropagate(const SScopedComputeCommandList& commandList)
+ 			pass.SetTexture(3, pSumSrc0);
+ 			pass.SetTexture(4, pSumSrc1);
+ 			pass.SetTexture(5, pSumSrc2);
++			pass.SetTexture(6, m_pGridGV);
+ 		}
+ 
+ 		pass.BeginConstantUpdate();
+ 		SetGridConstants(pass);
+ 
++		// Occlusion strength, pre-divided by the SH transfer of a perpendicular fully covered face:
++		// dot(cosineLobe(n), cone90(n)) = ZH_COS0*SH_C0*ZH_CONE0*SH_C0 + ZH_COS1*SH_C1*ZH_CONE1*SH_C1
++		// = 0.10194, so r_LPVOcclusion 1 blocks such a face completely. The first iteration runs
++		// unoccluded: the VPLs are biased into the cells of their own walls, the GV of those walls
++		// must not swallow the light before it leaves the source cell.
++		static CCryNameR paramProp("LPVPropParams");
++		const float occStrength = (i == 0) ? 0.0f : max(0.0f, CRendererCVars::CV_r_LPVOcclusion) / 0.10194f;
++		pass.SetConstant(paramProp, Vec4(occStrength, 0.0f, 0.0f, 0.0f));
++
+ 		pass.SetDispatchSize(dispatchSize, dispatchSize, dispatchSize);
+ 		pass.PrepareResourcesForUse(commandList);
+ 		pass.Execute(commandList);
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.h b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.h
+index 5e1f5842..05e778a0 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.h
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.h
+@@ -19,8 +19,9 @@ public:
+ 	// Number of spectral channels (R/G/B), each one storing 4 SH L1 coefficients.
+ 	static const int32 SHChannelNum = 3;
+ 	// Number of ints per grid cell in the injection accumulator:
+-	// 3 channels * 4 SH coefficients + average surface albedo (RGB) + surfel count.
+-	static const int32 AccumulatorStride = SHChannelNum * 4 + 4;
++	// 3 channels * 4 SH coefficients + average surface albedo (RGB) + surfel count
++	// + geometry volume blocking potential (4 SH coefficients).
++	static const int32 AccumulatorStride = SHChannelNum * 4 + 4 + 4;
+ 	// Fixed point scale used by the injection accumulator (SH L1 coefficients can be negative).
+ 	static const int32 AccumulatorFixedPointScale = 4096;
+ 	// Upper bound for the RSM sample grid used by the injection pass.
+@@ -85,7 +86,7 @@ private:
+ 	void ExecuteClear(const SScopedComputeCommandList& commandList);
+ 	void ExecuteInject(const SScopedComputeCommandList& commandList, CTexture* pRsmDepth, CTexture* pRsmColor, CTexture* pRsmNormal);
+ 	void ExecuteInjectScreen(const SScopedComputeCommandList& commandList);
+-	void ExecuteResolve(const SScopedComputeCommandList& commandList);
++	void ExecuteResolve(const SScopedComputeCommandList& commandList, CTexture* pRsmDepth);
+ 	void ExecutePropagate(const SScopedComputeCommandList& commandList);
+ 	void ExecuteTemporal(const SScopedComputeCommandList& commandList);
+ 	void ExecuteApply(const SScopedComputeCommandList& commandList, CTexture* pRsmDepth);
+@@ -101,6 +102,9 @@ private:
+ 	_smart_ptr<CTexture> m_pGridSum[2][SHChannelNum];
+ 	// Temporal accumulation ping-pong pair (exponential moving average of the propagated grid).
+ 	_smart_ptr<CTexture> m_pGridAcc[2][SHChannelNum];
++	// Geometry volume: per cell directional blocking potential (SH L1, achromatic), resolved from the
++	// injection accumulator and read by the propagation to attenuate flux through blocked cell faces.
++	_smart_ptr<CTexture> m_pGridGV;
+ 	// Screen space output (irradiance, never pre-multiplied with albedo).
+ 	_smart_ptr<CTexture> m_pIrradiance;
+ 	// Sun RSM owned by LPV (only used when SVOGI is not providing one).
+@@ -124,6 +128,8 @@ private:
+ 	CRenderPrimitive     m_primDebugProbes;
+ 
+ 	Matrix44A            m_rsmToWorld;
++	// Forward transform (world -> RSM texture space), used by the sky visibility test in the resolve.
++	Matrix44A            m_worldToRsm;
+ 	Vec3                 m_gridOrigin;
+ 	float                m_cellSize;
+ 	int32                m_gridSize;
+diff --git a/Engine/Shaders/HWScripts/CryFX/LPV.cfi b/Engine/Shaders/HWScripts/CryFX/LPV.cfi
+index 960e852e..758e046d 100644
+--- a/Engine/Shaders/HWScripts/CryFX/LPV.cfi
++++ b/Engine/Shaders/HWScripts/CryFX/LPV.cfi
+@@ -43,6 +43,12 @@ float4 LPVFrustumLB;
+ float4 LPVFrustumRB;
+ // RSM texture space (u, v, depth, 1) -> world space
+ float4x4 LPVRsmToWorld;
++// World space -> RSM texture space (u, v, depth, w), used by the sky visibility test in the resolve
++float4x4 LPVWorldToRsm;
++// x: geometry volume occlusion strength (pre-divided by the aligned SH transfer, 0 disables)
++float4 LPVPropParams;
++// rgb: sky colour premultiplied with r_LPVSkyLight and the SH normalization, w: > 0 enables
++float4 LPVSkyColor;
+ 
+ // SH basis constants: 1 / (2 * sqrt(PI)) and sqrt(3) / (2 * sqrt(PI))
+ #define LPV_SH_C0     0.2820947918f
+@@ -98,10 +104,13 @@ float4 LPVSanitize(float4 v)
+ }
+ 
+ // Linear index of the first accumulator element of a cell.
+-// Layout: 12 SH coefficients (3 channels * 4), average surface albedo (RGB), surfel count.
+-#define LPV_ACCUM_STRIDE  16u
++// Layout: 12 SH coefficients (3 channels * 4), average surface albedo (RGB), surfel count,
++// geometry volume blocking potential (4 SH coefficients).
++// Must match CLPVStage::AccumulatorStride.
++#define LPV_ACCUM_STRIDE  20u
+ #define LPV_ACCUM_ALBEDO  12u
+ #define LPV_ACCUM_COUNT   15u
++#define LPV_ACCUM_GV      16u
+ 
+ uint LPVCellBase(uint3 cell, uint gridSize)
+ {
+@@ -217,6 +226,17 @@ void LPVInjectCS(uint3 DTid : SV_DispatchThreadID)
+ 			InterlockedAdd(LPVInjectionUAV[surfBase + LPV_ACCUM_ALBEDO + 1u], (int)floor(albedo.g * LPV_FP_SCALE + 0.5f));
+ 			InterlockedAdd(LPVInjectionUAV[surfBase + LPV_ACCUM_ALBEDO + 2u], (int)floor(albedo.b * LPV_FP_SCALE + 0.5f));
+ 			InterlockedAdd(LPVInjectionUAV[surfBase + LPV_ACCUM_COUNT], 1);
++
++			// Geometry volume: every surfel registers a directional blocking potential (cosine lobe
++			// around the surface normal, scaled by the fraction of a cell face its footprint covers,
++			// LPVRsmParams.w). The surfels of a wall crossing the cell sum to ~1 with plain additive
++			// accumulation, independent of the sun facing - geometry blocks from both sides.
++			if (LPVRsmParams.w > 0.0f)
++			{
++				const float4 gvSH = LPVCosineLobe(normal) * LPVRsmParams.w;
++				[unroll] for (uint g = 0; g < 4; ++g)
++					InterlockedAdd(LPVInjectionUAV[surfBase + LPV_ACCUM_GV + g], (int)floor(gvSH[g] * LPV_FP_SCALE + 0.5f));
++			}
+ 		}
+ 	}
+ 
+@@ -348,10 +368,13 @@ Buffer<int> LPVInjectionSRV : register(t0);
+ Texture3D<float4> LPVResolvePrevR : register(t1);
+ Texture3D<float4> LPVResolvePrevG : register(t2);
+ Texture3D<float4> LPVResolvePrevB : register(t3);
++// RSM depth, used as the open sky proxy of the sky light injection (can the cell see the sun).
++Texture2D<float>  LPVResolveRsmDepth : register(t4);
+ 
+ RWTexture3D<float4> LPVResolveOutR : register(u0);
+ RWTexture3D<float4> LPVResolveOutG : register(u1);
+ RWTexture3D<float4> LPVResolveOutB : register(u2);
++RWTexture3D<float4> LPVResolveOutGV : register(u3);
+ 
+ [numthreads(LPV_GRID_TILE_SIZE, LPV_GRID_TILE_SIZE, LPV_GRID_TILE_SIZE)]
+ void LPVResolveCS(uint3 DTid : SV_DispatchThreadID)
+@@ -401,6 +424,45 @@ void LPVResolveCS(uint3 DTid : SV_DispatchThreadID)
+ 		}
+ 	}
+ 
++	// Geometry volume: plain fixed point decode of the accumulated blocking potential.
++	float4 gv = 0;
++	[unroll] for (uint g = 0; g < 4; ++g)
++		gv[g] = (float)LPVInjectionSRV[base + LPV_ACCUM_GV + g] * LPV_FP_INV_SCALE;
++	LPVResolveOutGV[DTid] = gv;
++
++	// Sky light: cells that can see the sun (RSM depth test, one cell towards the sun as a robust
++	// bias independent of the RSM depth scaling) count as open sky and receive a downward cosine
++	// lobe of sky colour. Interiors fail the test and only receive sky through the propagation via
++	// openings, attenuated by the geometry volume - which is what produces the AO-like ambient.
++	// Skipped in the staged injection debug modes (4..7) to keep their probes clean.
++	const int resolveDebugMode = (int)LPVRsmSize.z;
++	if (LPVSkyColor.w > 0.0f && !(resolveDebugMode >= 4 && resolveDebugMode <= 7))
++	{
++		const float3 cellCenter = LPVGridParams.xyz + ((float3)DTid + 0.5f) * LPVGridParams.w;
++		const float3 samplePos = cellCenter + LPVSunDir.xyz * LPVGridParams.w;
++
++		float4 rsmH = mul(LPVWorldToRsm, float4(samplePos, 1.0f));
++		rsmH /= (abs(rsmH.w) > 1e-12f) ? rsmH.w : 1.0f;
++
++		// Outside the RSM coverage there is no occluder information, treat as visible.
++		bool skyVisible = true;
++		if (all(rsmH.xy >= 0.0f) && all(rsmH.xy <= 1.0f))
++		{
++			const int2 rsmTexel = clamp((int2)(rsmH.xy * LPVRsmSize.x), 0, (int)LPVRsmSize.x - 1);
++			const float storedDepth = LPVResolveRsmDepth.Load(int3(rsmTexel, 0)).x;
++			skyVisible = (rsmH.z <= storedDepth);
++		}
++
++		if (skyVisible)
++		{
++			// The sky flux travels into the lower hemisphere.
++			const float4 skySH = LPVCosineLobe(float3(0.0f, 0.0f, -1.0f));
++			shR += skySH * LPVSkyColor.r;
++			shG += skySH * LPVSkyColor.g;
++			shB += skySH * LPVSkyColor.b;
++		}
++	}
++
+ 	LPVResolveOutR[DTid] = shR;
+ 	LPVResolveOutG[DTid] = shG;
+ 	LPVResolveOutB[DTid] = shB;
+@@ -424,6 +486,8 @@ Texture3D<float4> LPVPropSrcB : register(t2);
+ Texture3D<float4> LPVPropSumSrcR : register(t3);
+ Texture3D<float4> LPVPropSumSrcG : register(t4);
+ Texture3D<float4> LPVPropSumSrcB : register(t5);
++// Geometry volume: directional blocking potential per cell (resolved by LPVResolve).
++Texture3D<float4> LPVPropGV : register(t6);
+ 
+ RWTexture3D<float4> LPVPropDstR : register(u0);
+ RWTexture3D<float4> LPVPropDstG : register(u1);
+@@ -459,6 +523,9 @@ void LPVPropagateCS(uint3 DTid : SV_DispatchThreadID)
+ 	float4 dstG = (float4)0.0f;
+ 	float4 dstB = (float4)0.0f;
+ 
++	const float occStrength = LPVPropParams.x;
++	const float4 gvSelf = (occStrength > 0.0f) ? LPVPropGV.Load(int4(cell, 0)) : (float4)0.0f;
++
+ 	[unroll] for (int i = 0; i < 6; ++i)
+ 	{
+ 		const int3 offset = neighbourOffset[i];
+@@ -475,10 +542,21 @@ void LPVPropagateCS(uint3 DTid : SV_DispatchThreadID)
+ 		// Direction the light travels when it moves from the neighbour into the current cell.
+ 		const float4 cone = LPVCone90(-(float3)offset);
+ 
++		// Geometry volume occlusion: blocking potential halfway between the two cells, evaluated in
++		// the direction of travel. abs(): a surfel blocks from both of its sides. The strength is 0
++		// for the first iteration (see the CPU side comment) and pre-scaled so that a fully covered
++		// perpendicular face reaches zero transmittance at r_LPVOcclusion 1.
++		float transmittance = 1.0f;
++		if (occStrength > 0.0f)
++		{
++			const float4 gvMid = 0.5f * (gvSelf + LPVPropGV.Load(int4(neighbour, 0)));
++			transmittance = saturate(1.0f - abs(dot(gvMid, cone)) * occStrength);
++		}
++
+ 		float3 incident;
+-		incident.r = max(0.0f, dot(srcR, cone));
+-		incident.g = max(0.0f, dot(srcG, cone));
+-		incident.b = max(0.0f, dot(srcB, cone));
++		incident.r = max(0.0f, dot(srcR, cone)) * transmittance;
++		incident.g = max(0.0f, dot(srcG, cone)) * transmittance;
++		incident.b = max(0.0f, dot(srcB, cone)) * transmittance;
+ 
+ 		dstR += cone * incident.r;
+ 		dstG += cone * incident.g;
+@@ -644,6 +722,19 @@ void LPVApplyCS(uint3 DTid : SV_DispatchThreadID)
+ 			LPVIrradianceUAV[pixelCoord] = float4(accumL0, 1.0f);
+ 			return;
+ 		}
++		// Debug mode 12: geometry volume blocking potential (L0 magnitude) as a surface mosaic.
++		// White = fully blocking cell, black = free space. Read from the injection accumulator, so
++		// this shows exactly what the propagation occlusion works with.
++		if (debugMode == 12)
++		{
++			const int gvGridSize = (int)LPVGridParams2.x;
++			const int3 gvCell = clamp((int3)(gridUV * gvGridSize), 0, gvGridSize - 1);
++			const uint gvBase = LPVCellBase((uint3)gvCell, (uint)gvGridSize);
++			const float gvL0 = abs((float)LPVApplyAccum[gvBase + LPV_ACCUM_GV]) * LPV_FP_INV_SCALE;
++			// The L0 of a fully covered face is ZH_COS0 * SH_C0 = 0.25, normalize so that it shows as 1.
++			LPVIrradianceUAV[pixelCoord] = float4((gvL0 * 4.0f).xxx, 1.0f);
++			return;
++		}
+ 
+ 		// Debug mode 9: probe visualization. Point sampled per cell L0 energy of the accumulated grid
+ 		// projected onto the scene surfaces (blocky = one colour per cell) with darkened cell borders,
+-- 
+2.47.1.windows.1
+

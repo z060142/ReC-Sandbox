@@ -2739,6 +2739,9 @@ void CRenderView::SShadows::CreateFrustumGroups()
 		case ShadowMapFrustum::e_HeightMapAO:
 			m_frustumsByType[eShadowFrustumRenderType_HeightmapAO].push_back(&fr);
 			break;
+		case ShadowMapFrustum::e_LPVRsm:
+			m_frustumsByType[eShadowFrustumRenderType_LPVRsm].push_back(&fr);
+			break;
 		case ShadowMapFrustum::e_Nearest:
 		case ShadowMapFrustum::e_PerObject:
 			if (fr.pFrustum->ShouldSample())

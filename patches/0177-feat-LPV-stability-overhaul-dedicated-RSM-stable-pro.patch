@@ -1,0 +1,2389 @@
+From 5f2610f40c6b4409a49f827b95912e747533b40f Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Tue, 11 Aug 2026 11:01:36 +0800
+Subject: [PATCH 177/206] feat: LPV stability overhaul - dedicated RSM, stable
+ propagation, debug views
+
+Major stability work on the resurrected Light Propagation Volumes:
+
+- Dedicated sun RSM view (e_LPVRsm frustum, r_LPVDedicatedRSM): fitted to
+  the LPV volume, camera orientation independent caster collection via
+  volume overlap membership instead of traversal marking, fixed traversal
+  bit, well conditioned virtual light distance.
+- Gather-only propagation with explicit running sum (CE3 scheme), replacing
+  the compounding variant that amplified checkerboard modes.
+- Temporal accumulation with integer cell reprojection, relight gating
+  (heartbeat r_LPVUpdateInterval), SVOGI style cell albedo secondary bounce.
+- Fix D3D11 SRV hazard: the deferred decal pass leaves scene normals bound
+  as render target, silently nulling the apply pass SRV whenever a decal is
+  visible - the screen space apply now runs after ShadowMask (LPV APPLY),
+  right before the tiled shading combine.
+- Fix pre-existing engine bugs: 64-bit frustum mask wiped by 32-bit BIT()
+  in UpdateCullMask; cascade swallow loop consuming unrelated cached passes.
+- Debug suite r_LPVDebug 1-11: CPU state logs, per-object cull/submission
+  tracing, staged injection probes, surface mosaic, instanced probe spheres.
+- Full case file of the display flicker investigation in
+  investigations/gi_lpv/07_flicker_case_file.md.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Tu9cj9ax1mqCV93HVfCfpW
+---
+ Code/CryEngine/Cry3DEngine/LightEntity.cpp    |  57 +-
+ Code/CryEngine/Cry3DEngine/LightEntity.h      |   2 +
+ Code/CryEngine/Cry3DEngine/ObjectsTree.cpp    | 131 ++++-
+ Code/CryEngine/Cry3DEngine/ShadowCache.cpp    | 312 +++++++++-
+ Code/CryEngine/Cry3DEngine/ShadowCache.h      |  35 ++
+ .../CryEngine/RenderDll/Common/RenderView.cpp |   3 +
+ Code/CryEngine/RenderDll/Common/RenderView.h  |   1 +
+ .../RenderDll/Common/RendererCVars.cpp        |  46 +-
+ .../RenderDll/Common/RendererCVars.h          |   3 +
+ .../RenderDll/Common/Shadow_Renderer.h        |   6 +-
+ .../XRenderD3D9/GraphicsPipeline/LPV.cpp      | 531 ++++++++++++++++--
+ .../XRenderD3D9/GraphicsPipeline/LPV.h        |  51 +-
+ .../GraphicsPipeline/ShadowMap.cpp            |  22 +-
+ .../StandardGraphicsPipeline.cpp              |  18 +
+ Engine/Shaders/HWScripts/CryFX/LPV.cfi        | 327 ++++++++++-
+ 15 files changed, 1455 insertions(+), 90 deletions(-)
+
+diff --git a/Code/CryEngine/Cry3DEngine/LightEntity.cpp b/Code/CryEngine/Cry3DEngine/LightEntity.cpp
+index 0f7c175f..181335e7 100644
+--- a/Code/CryEngine/Cry3DEngine/LightEntity.cpp
++++ b/Code/CryEngine/Cry3DEngine/LightEntity.cpp
+@@ -227,6 +227,7 @@ void CLightEntity::UpdateGSMLightSourceShadowFrustum(const SRenderingPassInfo& p
+ 
+ 	static ICVar* pHeightMapAOVar = GetConsole()->GetCVar("r_HeightMapAO");
+ 	const bool isHeightMapAOEnabled = Get3DEngine()->m_bHeightMapAoEnabled && pHeightMapAOVar && pHeightMapAOVar->GetIVal() > 0;
++	const bool isLPVRsmEnabled = (m_light.m_Flags & DLF_SUN) && IsLPVRsmEnabled();
+ 
+ 	int nDynamicLodCount = nMaxLodCount;
+ 	int nCachedLodCount = 0;
+@@ -244,7 +245,10 @@ void CLightEntity::UpdateGSMLightSourceShadowFrustum(const SRenderingPassInfo& p
+ 				++nCachedLodCount;
+ 		}
+ 
+-		nCachedLodCount = min(nCachedLodCount, isHeightMapAOEnabled ? MAX_GSM_CACHED_LODS_NUM - 1 : MAX_GSM_CACHED_LODS_NUM);
++		// Every consumer of the shadow cache generation marking needs its own slot in
++		// IRenderNode::m_shadowCacheLastRendered, so reserve one for each pseudo cascade.
++		const int nReservedCacheLods = (isHeightMapAOEnabled ? 1 : 0) + (isLPVRsmEnabled ? 1 : 0);
++		nCachedLodCount = clamp_tpl(nCachedLodCount, 0, MAX_GSM_CACHED_LODS_NUM - nReservedCacheLods);
+ 	}
+ 
+ 	InitEntityShadowMapInfoStructure(nDynamicLodCount, nCachedLodCount);
+@@ -259,6 +263,7 @@ void CLightEntity::UpdateGSMLightSourceShadowFrustum(const SRenderingPassInfo& p
+ 	if (m_light.m_Flags & DLF_SUN)
+ 	{
+ 		nNextLod += UpdateGSMLightSourceCachedShadowFrustum(nDynamicLodCount, nCachedLodCount, isHeightMapAOEnabled, fDistFromView, fRadiusLastLod, passInfo);
++		nNextLod += UpdateGSMLightSourceLPVRsmFrustum(nNextLod, nCachedLodCount + (isHeightMapAOEnabled ? 1 : 0), isLPVRsmEnabled, passInfo);
+ 		nNextLod += UpdateGSMLightSourceNearestShadowFrustum(nNextLod, passInfo);
+ 	}
+ 
+@@ -443,6 +448,55 @@ int CLightEntity::UpdateGSMLightSourceCachedShadowFrustum(int nFirstLod, int nLo
+ 	return nLod;
+ }
+ 
++bool CLightEntity::IsLPVRsmEnabled()
++{
++	static ICVar* pLPV = GetConsole()->GetCVar("r_LPV");
++	static ICVar* pLPVDedicatedRSM = GetConsole()->GetCVar("r_LPVDedicatedRSM");
++
++	if (!pLPV || !pLPVDedicatedRSM || pLPV->GetIVal() <= 0 || pLPVDedicatedRSM->GetIVal() <= 0)
++		return false;
++
++#ifdef FEATURE_SVO_GI
++	// SVOGI owns the single sun RSM pass slot while it is active, LPV steps aside completely.
++	if (GetCVars()->e_svoTI_Apply && GetCVars()->e_svoTI_InjectionMultiplier)
++		return false;
++#endif
++
++	return true;
++}
++
++int CLightEntity::UpdateGSMLightSourceLPVRsmFrustum(int nFrustumIndex, int nCacheLod, bool isLPVRsmEnabled, const SRenderingPassInfo& passInfo)
++{
++	CRY_ASSERT(nFrustumIndex >= 0);
++
++	if (nFrustumIndex < 0 || nFrustumIndex >= MAX_GSM_LODS_NUM || nCacheLod < 0 || nCacheLod >= MAX_GSM_CACHED_LODS_NUM)
++		return 0;
++
++	ShadowMapFrustumPtr& pFr = m_pShadowMapInfo->pGSM[nFrustumIndex];
++
++	if (!isLPVRsmEnabled)
++	{
++		// Make sure a frustum left over from a previous frame is not picked up as a regular cascade by
++		// the "free not used frustums" fixup at the end of UpdateGSMLightSourceShadowFrustum().
++		if (pFr && pFr->m_eFrustumType == ShadowMapFrustum::e_LPVRsm)
++		{
++			pFr->ClearUpdates(~0u);
++			pFr->ClearSamples(~0u);
++		}
++
++		return 0;
++	}
++
++	CRY_ASSERT(!pFr || !pFr->pOnePassShadowView);
++
++	ShadowCacheGenerator shadowCache(this, ShadowMapFrustum::ShadowCacheData::eFullUpdate);
++	shadowCache.InitLPVRsmFrustum(pFr, nFrustumIndex, nCacheLod, passInfo);
++
++	CollectShadowCascadeForOnePassTraversal(pFr);
++
++	return 1;
++}
++
+ int CLightEntity::UpdateGSMLightSourceNearestShadowFrustum(int nFrustumIndex, const SRenderingPassInfo& passInfo)
+ {
+ 	CRY_ASSERT(nFrustumIndex >= 0 && nFrustumIndex < MAX_GSM_LODS_NUM);
+@@ -474,6 +528,7 @@ bool CLightEntity::IsOnePassTraversalFrustum(const ShadowMapFrustum* pFr)
+ 	  pFr->m_eFrustumType == ShadowMapFrustum::e_PerObject ||
+ 	  pFr->m_eFrustumType == ShadowMapFrustum::e_GsmCached ||
+ 	  pFr->m_eFrustumType == ShadowMapFrustum::e_HeightMapAO ||
++	  pFr->m_eFrustumType == ShadowMapFrustum::e_LPVRsm ||
+ 	  pFr->m_eFrustumType == ShadowMapFrustum::e_GsmDynamic ||
+ 	  pFr->m_eFrustumType == ShadowMapFrustum::e_GsmDynamicDistance);
+ }
+diff --git a/Code/CryEngine/Cry3DEngine/LightEntity.h b/Code/CryEngine/Cry3DEngine/LightEntity.h
+index dad0b50b..43d0e93b 100644
+--- a/Code/CryEngine/Cry3DEngine/LightEntity.h
++++ b/Code/CryEngine/Cry3DEngine/LightEntity.h
+@@ -73,7 +73,9 @@ public:
+ 	void                                 UpdateGSMLightSourceShadowFrustum(const SRenderingPassInfo& passInfo);
+ 	int                                  UpdateGSMLightSourceDynamicShadowFrustum(int nDynamicLodCount, int nDistanceLodCount, float& fDistanceFromViewLastDynamicLod, float& fGSMBoxSizeLastDynamicLod, bool bFadeLastCascade, const SRenderingPassInfo& passInfo);
+ 	int                                  UpdateGSMLightSourceCachedShadowFrustum(int nFirstLod, int nLodCount, bool isHeightMapAOEnabled, float& fDistFromViewDynamicLod, float fRadiusDynamicLod, const SRenderingPassInfo& passInfo);
++	int                                  UpdateGSMLightSourceLPVRsmFrustum(int nFrustumIndex, int nCacheLod, bool isLPVRsmEnabled, const SRenderingPassInfo& passInfo);
+ 	int                                  UpdateGSMLightSourceNearestShadowFrustum(int nFrustumIndex, const SRenderingPassInfo& passInfo);
++	static bool                          IsLPVRsmEnabled();
+ 	bool                                 ProcessFrustum(int nLod, float fCamBoxSize, float fDistanceFromView, PodArray<struct SPlaneObject>& lstCastersHull, const SRenderingPassInfo& passInfo);
+ 	void                                 CollectShadowCascadeForOnePassTraversal(ShadowMapFrustum* pFr);
+ 	static bool                          IsOnePassTraversalFrustum(const ShadowMapFrustum* pFr);
+diff --git a/Code/CryEngine/Cry3DEngine/ObjectsTree.cpp b/Code/CryEngine/Cry3DEngine/ObjectsTree.cpp
+index c81fcc1e..756dea24 100644
+--- a/Code/CryEngine/Cry3DEngine/ObjectsTree.cpp
++++ b/Code/CryEngine/Cry3DEngine/ObjectsTree.cpp
+@@ -603,6 +603,49 @@ bool IsAABBInsideHull(const SPlaneObject* pHullPlanes, int nPlanesNum, const AAB
+ bool IsSphereInsideHull(const SPlaneObject* pHullPlanes, int nPlanesNum, const Sphere& objSphere);
+ 
+ // single function for all possible culling types, used for octree nodes and for objects
++// Debug instrumentation (r_LPVDebug >= 2): name every object that had the LPV RSM pass bit removed
++// by UpdateCullMask, so deterministic view dependent losses can be attributed to concrete objects.
++static void LpvDebugLogRsmCulledObject(IRenderNode* pObj, FrustumMaskType maskBefore, FrustumMaskType maskAfter, float fEntDistance, const SRenderingPassInfo& passInfo)
++{
++	static ICVar* pLPVDebug = gEnv->pConsole->GetCVar("r_LPVDebug");
++	if (!pLPVDebug || pLPVDebug->GetIVal() < 2)
++		return;
++
++	const std::vector<SRenderingPassInfo>* shadowPasses = passInfo.GetShadowPasses();
++	if (!shadowPasses)
++		return;
++
++	for (uint32 n = 0, passId = 1; n < (uint32)shadowPasses->size(); ++n, ++passId)
++	{
++		const ShadowMapFrustum* pFr = shadowPasses->at(n).GetIRenderView()->GetShadowFrustumOwner();
++		if (pFr && pFr->m_eFrustumType == ShadowMapFrustum::e_LPVRsm)
++		{
++			if ((maskBefore & FMBIT(passId)) != 0 && (maskAfter & FMBIT(passId)) == 0)
++			{
++				// cap the log volume per frame
++				static uint32 lastFrame = 0;
++				static int logsThisFrame = 0;
++				if (lastFrame != passInfo.GetMainFrameID())
++				{
++					lastFrame = passInfo.GetMainFrameID();
++					logsThisFrame = 0;
++				}
++				if (++logsThisFrame <= 20)
++				{
++					const Vec3 c = pObj->GetBBox().GetCenter();
++					CryLog("LPV debug: culled from RSM: '%s' (%s) dist %.1f maxViewDist %.1f markedThisFrame %d cascadeBits 0x%x pos (%.0f, %.0f, %.0f)",
++					       pObj->GetName(), pObj->GetEntityClassName(),
++					       fEntDistance, pObj->m_fWSMaxViewDist,
++					       (int)(pObj->m_onePassTraversalFrameId == passInfo.GetMainFrameID()),
++					       pObj->m_onePassTraversalShadowCascades,
++					       c.x, c.y, c.z);
++				}
++			}
++			return;
++		}
++	}
++}
++
+ FrustumMaskType COctreeNode::UpdateCullMask(uint32 onePassTraversalFrameId, uint32 onePassTraversalShadowCascades, const IRenderNode::RenderFlagsType renderFlags, const SRenderingPassInfo& passInfo, const AABB& nodeBox, const float nodeDistance, const float nodeMaxViewDistance,
+                                             const bool bTestCoverageBuffer, bool& bCompletelyInMainFrustum, OcclusionTestClient* occlusionTestClient, FrustumMaskType passCullMask)
+ {
+@@ -652,9 +695,23 @@ FrustumMaskType COctreeNode::UpdateCullMask(uint32 onePassTraversalFrameId, uint
+ 		// test sun shadows hull. for cached shadows also nodes outside hull need to be rendered
+ 		if (onePassTraversalFrameId != passInfo.GetMainFrameID() && !IsAABBInsideHull(CLightEntity::GetCastersHull().GetElements(), CLightEntity::GetCastersHull().Count(), nodeBox))
+ 		{
+-			passCullMask &= kPassCullMainMask;   // cull all except main view
++			// The LPV RSM pass is exempt: its caster set is defined by the volume box (tested below),
++			// not by the camera swept hull, otherwise the RSM contents follow the camera orientation.
++			FrustumMaskType keepMask = kPassCullMainMask;
++			for (uint32 n = 0, passId = n + 1, l = (uint32)shadowPasses->size(); n < l; ++n, ++passId)
++			{
++				const ShadowMapFrustum* pFr = shadowPasses->at(n).GetIRenderView()->GetShadowFrustumOwner();
++				if (pFr && pFr->m_eFrustumType == ShadowMapFrustum::e_LPVRsm)
++				{
++					keepMask |= FMBIT(passId);
++					break;
++				}
++			}
++
++			passCullMask &= keepMask;   // cull all except main view (and the LPV RSM)
+ 		}
+-		else
++
++		if ((passCullMask & ~kPassCullMainMask) != 0)
+ 		{
+ 			// test shadow frustums
+ 			for (uint32 n = 0, passId = n + 1, l = (uint32)shadowPasses->size(); n < l; ++n, ++passId)
+@@ -668,12 +725,28 @@ FrustumMaskType COctreeNode::UpdateCullMask(uint32 onePassTraversalFrameId, uint
+ 				const SRenderingPassInfo& shadowPass = shadowPasses->at(n);
+ 				const ShadowMapFrustum* pFr = shadowPass.GetIRenderView()->GetShadowFrustumOwner();
+ 
++				if (pFr->m_eFrustumType == ShadowMapFrustum::e_LPVRsm)
++				{
++					// Membership in the LPV RSM is a pure volume test: everything overlapping the caster
++					// box (the volume swept towards the sun) belongs in it, independent of the traversal
++					// marking. The marking based path misses whole object categories that the shadow
++					// cache collection cannot register (merged meshes, characters/CGA vehicles), which
++					// then popped in and out with the camera dependent per-object culling paths.
++					if (!Overlap::AABB_AABB(nodeBox, pFr->aabbCasters))
++					{
++						CryInterlockedIncrement((volatile int*)&ShadowCacheGenerator::s_lpvRsmCullBit);
++						passCullMask &= ~FMBIT(passId);
++					}
++
++					continue;
++				}
++
+ 				if (pFr->IsCached() || pFr->m_eFrustumType == ShadowMapFrustum::e_PerObject)
+ 				{
+ 					// cull casters not marked for shadow cache sliced update
+ 					if (onePassTraversalFrameId != passInfo.GetMainFrameID() || (onePassTraversalShadowCascades & BIT(pFr->nShadowMapLod)) == 0)
+ 					{
+-						passCullMask &= ~BIT(passId);
++						passCullMask &= ~FMBIT(passId);
+ 					}
+ 
+ 					continue;
+@@ -701,12 +774,21 @@ FrustumMaskType COctreeNode::UpdateCullMask(uint32 onePassTraversalFrameId, uint
+ 
+ 							++n, ++passId;
+ 
++							// The LPV RSM is not a coarser cascade of the same hierarchy but an independent view
++							// fitted to the light propagation volume. A caster being fully covered by a sun cascade
++							// says nothing about whether it belongs into the RSM, and culling it here would make the
++							// RSM contents depend on the camera orientation again.
++							if (pFr->m_eFrustumType == ShadowMapFrustum::e_LPVRsm)
++							{
++								continue;
++							}
++
+ #ifdef FEATURE_SVO_GI
+ 							// do not cull render into RSM cascade
+ 							if (!GetCVars()->e_svoTI_Apply || !GetCVars()->e_svoTI_InjectionMultiplier || (pFr->nShadowMapLod != GetCVars()->e_svoTI_GsmCascadeLod))
+ #endif
+ 							{
+-								passCullMask &= ~BIT(passId);
++								passCullMask &= ~FMBIT(passId);
+ 							}
+ 						}
+ 					}
+@@ -715,7 +797,7 @@ FrustumMaskType COctreeNode::UpdateCullMask(uint32 onePassTraversalFrameId, uint
+ 				else
+ 				{
+ 					// mark as not visible
+-					passCullMask &= ~BIT(passId);
++					passCullMask &= ~FMBIT(passId);
+ 				}
+ 			}
+ 		}
+@@ -1409,8 +1491,15 @@ bool COctreeNode::GetShadowCastersTimeSliced(IRenderNode* pIgnoreNode, ShadowMap
+ 
+ 						if (bCanRender)
+ 						{
+-							// mark the object to be rendered into shadow map
+-							COctreeNode::SetTraversalFrameId(pObj, passInfo.GetMainFrameID(), pFrustum->nShadowMapLod);
++							// mark the object to be rendered into shadow map. The LPV RSM uses a fixed
++							// marking bit, its nShadowMapLod is an unstable slot index (see ShadowCache.h).
++							const int markLod = (pFrustum->m_eFrustumType == ShadowMapFrustum::e_LPVRsm)
++							                    ? ShadowCacheGenerator::kLPVRsmTraversalLod
++							                    : pFrustum->nShadowMapLod;
++							COctreeNode::SetTraversalFrameId(pObj, passInfo.GetMainFrameID(), markLod);
++
++							if (pFrustum->m_eFrustumType == ShadowMapFrustum::e_LPVRsm)
++								CryInterlockedIncrement((volatile int*)&ShadowCacheGenerator::s_lpvRsmCasterCount);
+ 						}
+ 					}
+ 				}
+@@ -2642,6 +2731,8 @@ void COctreeNode::RenderVegetations(TDoublyLinkedList<IRenderNode>* lstObjects,
+ 		bool bObjectCompletelyInFrustum = bOcNodeCompletelyInFrustum;
+ 		const auto objCullMask = UpdateCullMask(pObj->m_onePassTraversalFrameId, pObj->m_onePassTraversalShadowCascades, pObj->m_dwRndFlags, passInfo, objBox, fEntDistance, pObj->m_fWSMaxViewDist, bCheckPerObjectOcclusion, bObjectCompletelyInFrustum, nullptr, passCullMask);
+ 
++		LpvDebugLogRsmCulledObject(pObj, passCullMask, objCullMask, fEntDistance, passInfo);
++
+ 		if (objCullMask != 0)
+ 		{
+ 			if ((objCullMask & kPassCullMainMask) != 0)
+@@ -2756,6 +2847,28 @@ void COctreeNode::RenderObjectIntoShadowViews(const SRenderingPassInfo& passInfo
+ 					continue;
+ 			}
+ 
++			if (pFr->m_eFrustumType == ShadowMapFrustum::e_LPVRsm)
++			{
++				// The RSM feeds the light propagation volume, so its contents have to be identical no
++				// matter where the camera looks: a flickering caster set makes the injected VPLs and with
++				// them the propagated GI flicker. Reaching this point only means the object is inside the
++				// volume; whether it emits any geometry is then decided by its own Render() implementation,
++				// and several node types answer that from main view only state (merged mesh render mesh
++				// lifetime, character skinning, particle state). Those are excluded consistently instead of
++				// being allowed to pop in and out of the RSM.
++				if (!ShadowCacheGenerator::IsStableRsmCaster(pObj->GetRenderNodeType()))
++				{
++					CryInterlockedIncrement((volatile int*)&ShadowCacheGenerator::s_lpvRsmTypeSkipped);
++					continue;
++				}
++
++				CryInterlockedIncrement((volatile int*)&ShadowCacheGenerator::s_lpvRsmSubmitted);
++
++				static ICVar* pLPVDebugCVar = gEnv->pConsole->GetCVar("r_LPVDebug");
++				if (pLPVDebugCVar && pLPVDebugCVar->GetIVal() >= 3)
++					ShadowCacheGenerator::LpvDebugRecordSubmission(pObj, passInfoShadow.GetMainFrameID());
++			}
++
+ 			Get3DEngine()->RenderRenderNode_ShadowPass(pObj, passInfoShadow);
+ 		}
+ 	}
+@@ -2847,6 +2960,8 @@ void COctreeNode::RenderLights(TDoublyLinkedList<IRenderNode>* lstObjects, const
+ 		bool bObjectCompletelyInFrustum = bOcNodeCompletelyInFrustum;
+ 		const auto objCullMask = UpdateCullMask(pObj->m_onePassTraversalFrameId, pObj->m_onePassTraversalShadowCascades, pObj->m_dwRndFlags, passInfo, objBox, fEntDistance, pObj->m_fWSMaxViewDist, true, bObjectCompletelyInFrustum, nullptr, passCullMask);
+ 
++		LpvDebugLogRsmCulledObject(pObj, passCullMask, objCullMask, fEntDistance, passInfo);
++
+ 		if (objCullMask != 0 /*&& pObj->IsVisible(objBox, fEntDistance, passInfo)*/)
+ 		{
+ 			if (pObj->CanExecuteRenderAsJob() || !bOcclusionCullerInUse)
+@@ -2885,6 +3000,8 @@ void COctreeNode::RenderCommonObjects(TDoublyLinkedList<IRenderNode>* lstObjects
+ 		bool bObjectCompletelyInFrustum = bOcNodeCompletelyInFrustum;
+ 		const auto objCullMask = UpdateCullMask(pObj->m_onePassTraversalFrameId, pObj->m_onePassTraversalShadowCascades, pObj->m_dwRndFlags, passInfo, objBox, fEntDistance, pObj->m_fWSMaxViewDist, true, bObjectCompletelyInFrustum, nullptr, passCullMask);
+ 
++		LpvDebugLogRsmCulledObject(pObj, passCullMask, objCullMask, fEntDistance, passInfo);
++
+ 		if (objCullMask != 0)
+ 		{
+ 			if ((objCullMask & kPassCullMainMask) != 0)
+diff --git a/Code/CryEngine/Cry3DEngine/ShadowCache.cpp b/Code/CryEngine/Cry3DEngine/ShadowCache.cpp
+index dd514b93..56176ab3 100644
+--- a/Code/CryEngine/Cry3DEngine/ShadowCache.cpp
++++ b/Code/CryEngine/Cry3DEngine/ShadowCache.cpp
+@@ -5,6 +5,8 @@
+ #include "LightEntity.h"
+ #include "VisAreas.h"
+ 
++#include <unordered_map>
++
+ const float ShadowCacheGenerator::AO_FRUSTUM_SLOPE_BIAS = 0.5f;
+ int ShadowCacheGenerator::m_cacheGenerationId = 0;
+ 
+@@ -174,14 +176,19 @@ void ShadowCacheGenerator::InitCachedFrustum(ShadowMapFrustumPtr& pFr, ShadowMap
+ 		pFr->FrustumPlanes[1] = pDynamicFrustum->FrustumPlanes[1];
+ 	}
+ 
+-	const bool bExcludeDynamicDistanceShadows = GetCVars()->e_DynamicDistanceShadows != 0;
+ 	const bool bUseCastersHull = (nUpdateStrategy == ShadowMapFrustum::ShadowCacheData::eFullUpdateTimesliced);
+ 	const int maxNodesPerFrame = (nUpdateStrategy == ShadowMapFrustum::ShadowCacheData::eIncrementalUpdate)
+ 	                             ? GetCVars()->e_ShadowsCacheMaxNodesPerFrame * GetRenderer()->GetActiveGPUCount()
+ 	                             : std::numeric_limits<int>::max();
+ 
++	CollectCastersForCachedFrustum(pFr, bUseCastersHull ? &m_pLightEntity->GetCastersHull() : nullptr, maxNodesPerFrame, passInfo);
++}
++
++void ShadowCacheGenerator::CollectCastersForCachedFrustum(ShadowMapFrustumPtr& pFr, const PodArray<SPlaneObject>* pCastersHull, int maxNodesPerFrame, const SRenderingPassInfo& passInfo)
++{
++	const bool bExcludeDynamicDistanceShadows = GetCVars()->e_DynamicDistanceShadows != 0;
++
+ 	IRenderNode* pCastingException = static_cast<CLightEntity*>(m_pLightEntity->GetLightProperties().m_pOwner)->GetCastingException();
+-	auto pCastersHull = bUseCastersHull ? &m_pLightEntity->GetCastersHull() : nullptr;
+ 
+ 	auto jobLambda = [=]()
+ 	{
+@@ -190,7 +197,7 @@ void ShadowCacheGenerator::InitCachedFrustum(ShadowMapFrustumPtr& pFr, ShadowMap
+ 
+ 		AddTerrainCastersToFrustum(pFr, passInfo);
+ 	};
+-	
++
+ 	if (GetCVars()->e_ShadowsCacheJobs)
+ 	{
+ 		DECLARE_LAMBDA_JOB("job:shadows:MakeStaticShadowCastersList", TMakeStaticShadowCastersListJob);
+@@ -273,6 +280,294 @@ void ShadowCacheGenerator::InitHeightMapAOFrustum(ShadowMapFrustumPtr& pFr, int
+ 	InitCachedFrustum(pFr, nUpdateStrategy, nLod, nLod - nFirstStaticLod, nTexRes, lightPos, projectionBoundsLS, passInfo);
+ }
+ 
++AABB ShadowCacheGenerator::GetLPVBox(const SRenderingPassInfo& passInfo)
++{
++	static ICVar* pLPVSize = gEnv->pConsole->GetCVar("r_LPVSize");
++	static ICVar* pLPVGridSize = gEnv->pConsole->GetCVar("r_LPVGridSize");
++
++	const float extent = max(1.0f, pLPVSize ? pLPVSize->GetFVal() : 96.0f);
++
++	// Same clamping as CLPVStage::GetValidGridSize().
++	int32 gridSize = pLPVGridSize ? pLPVGridSize->GetIVal() : 48;
++	gridSize = clamp_tpl(gridSize, 8, 64);
++	gridSize = gridSize - (gridSize % 4);
++
++	const float cellSize = extent / (float)gridSize;
++	const float halfExtent = extent * 0.5f;
++
++	// CLPVStage snaps the grid origin to whole cells, so the box centre is the snapped camera position.
++	const Vec3 camPos = passInfo.GetCamera().GetPosition();
++	const Vec3 centre(floorf(camPos.x / cellSize) * cellSize,
++	                  floorf(camPos.y / cellSize) * cellSize,
++	                  floorf(camPos.z / cellSize) * cellSize);
++
++	return AABB(centre - Vec3(halfExtent), centre + Vec3(halfExtent));
++}
++
++volatile int ShadowCacheGenerator::s_lpvRsmCasterCount = 0;
++
++namespace
++{
++CryCriticalSection s_lpvSubmissionLock;
++std::unordered_map<const IRenderNode*, std::pair<string, uint32>> s_lpvSubmissions;
++}
++
++void ShadowCacheGenerator::LpvDebugRecordSubmission(IRenderNode* pObj, uint32 mainFrameId)
++{
++	AUTO_LOCK(s_lpvSubmissionLock);
++
++	auto it = s_lpvSubmissions.find(pObj);
++	if (it == s_lpvSubmissions.end())
++	{
++		CryLog("LPV debug: RSM submission appeared: '%s' (%s)", pObj->GetName(), pObj->GetEntityClassName());
++		s_lpvSubmissions[pObj] = std::make_pair(string().Format("'%s' (%s)", pObj->GetName(), pObj->GetEntityClassName()), mainFrameId);
++	}
++	else
++	{
++		it->second.second = mainFrameId;
++	}
++}
++
++void ShadowCacheGenerator::LpvDebugFlushSubmissions(uint32 mainFrameId, const AABB& casterBox)
++{
++	AUTO_LOCK(s_lpvSubmissionLock);
++
++	for (auto it = s_lpvSubmissions.begin(); it != s_lpvSubmissions.end(); )
++	{
++		// submitted two frames ago but not refreshed during the last completed frame -> dropped
++		if (it->second.second + 1 < mainFrameId)
++		{
++			// Interrogate the object at the moment of the drop: distinguishes "traversal never reached
++			// it" (still inside the box, still renderable) from legitimate exits. Debug only, the node
++			// could in theory be deleted between frames.
++			const IRenderNode* pObj = it->first;
++			const AABB box = pObj->GetBBox();
++			CryLog("LPV debug: RSM submission dropped: %s (last frame %u, now %u) | inBox %d renderable %d hidden %d castShadows %d marked %d maxViewDist %.0f pos (%.0f, %.0f, %.0f)",
++			       it->second.first.c_str(), it->second.second, mainFrameId,
++			       (int)Overlap::AABB_AABB(box, casterBox),
++			       (int)pObj->IsRenderable(),
++			       (int)((pObj->GetRndFlags() & ERF_HIDDEN) != 0),
++			       (int)((pObj->GetRndFlags() & ERF_CASTSHADOWMAPS) != 0),
++			       (int)(pObj->m_onePassTraversalFrameId + 1 >= mainFrameId),
++			       pObj->m_fWSMaxViewDist,
++			       box.GetCenter().x, box.GetCenter().y, box.GetCenter().z);
++			it = s_lpvSubmissions.erase(it);
++		}
++		else
++		{
++			++it;
++		}
++	}
++}
++volatile int ShadowCacheGenerator::s_lpvRsmCullFrameId = 0;
++volatile int ShadowCacheGenerator::s_lpvRsmCullBit = 0;
++volatile int ShadowCacheGenerator::s_lpvRsmSubmitted = 0;
++volatile int ShadowCacheGenerator::s_lpvRsmTypeSkipped = 0;
++
++bool ShadowCacheGenerator::IsStableRsmCaster(EERType type)
++{
++	switch (type)
++	{
++	// Merged meshes drop their dynamic render mesh on every frame they were not drawn in the general
++	// pass (CMergedMeshesManager::Update) and choose static/dynamic render mode plus lod from the main
++	// camera in CMergedMeshRenderNode::Render, so their shadow output follows the main view.
++	case eERType_MergedMesh:
++	case eERType_MergedMeshInstance:
++	// Characters (CGA/CHR) and geom caches are skinned and streamed on main view visibility.
++	case eERType_Character:
++	case eERType_GeomCache:
++	// Not meaningful bounce sources, and inherently unstable frame to frame.
++	case eERType_ParticleEmitter:
++	case eERType_WaterVolume:
++	case eERType_WaterWave:
++	// Coplanar overlays on top of terrain/brush geometry. In the RSM they z-fight with the surface
++	// underneath and the draw order decides the albedo/depth winner per texel - the order is not
++	// deterministic across RSM renders, so the injected flux of whole patches (e.g. pavement slabs)
++	// jumps between two states from one relight to the next. Excluding them makes the underlying
++	// geometry win deterministically at the cost of losing the overlay tint in the bounce.
++	case eERType_Road:
++	case eERType_Decal:
++		return false;
++
++	default:
++		return true;
++	}
++}
++
++void ShadowCacheGenerator::InitLPVRsmFrustum(ShadowMapFrustumPtr& pFr, int nLod, int nCacheLod, const SRenderingPassInfo& passInfo)
++{
++	FUNCTION_PROFILER_3DENGINE;
++
++	// Caster count of the previous frame collection (the job may run async), logged on change.
++	static ICVar* pLPVDebug = gEnv->pConsole->GetCVar("r_LPVDebug");
++	if (pLPVDebug && pLPVDebug->GetIVal() > 0)
++	{
++		const int count = CryInterlockedExchange((volatile LONG*)&s_lpvRsmCasterCount, 0);
++		static int lastCount = -1;
++		if (count != lastCount)
++		{
++			CryLog("LPV debug: octree collection marked %d -> %d casters for the RSM", lastCount, count);
++			lastCount = count;
++		}
++
++		if (pLPVDebug->GetIVal() >= 3)
++			LpvDebugFlushSubmissions((uint32)passInfo.GetMainFrameID(), GetLPVBox(passInfo));
++
++		const int cullFrame = CryInterlockedExchange((volatile LONG*)&s_lpvRsmCullFrameId, 0);
++		const int cullBit = CryInterlockedExchange((volatile LONG*)&s_lpvRsmCullBit, 0);
++		static int lastCullFrame = -1;
++		static int lastCullBit = -1;
++		if (cullFrame != lastCullFrame || cullBit != lastCullBit)
++		{
++			CryLog("LPV debug: RSM pass culled in UpdateCullMask: staleFrameId %d -> %d, missingCascadeBit %d -> %d",
++			       lastCullFrame, cullFrame, lastCullBit, cullBit);
++			lastCullFrame = cullFrame;
++			lastCullBit = cullBit;
++		}
++
++		// The number that actually matters: how many objects were handed to the RSM shadow view.
++		// It has to stay constant while the camera only rotates.
++		const int submitted = CryInterlockedExchange((volatile LONG*)&s_lpvRsmSubmitted, 0);
++		const int typeSkipped = CryInterlockedExchange((volatile LONG*)&s_lpvRsmTypeSkipped, 0);
++		static int lastSubmitted = -1;
++		static int lastTypeSkipped = -1;
++		if (submitted != lastSubmitted || typeSkipped != lastTypeSkipped)
++		{
++			CryLog("LPV debug: RSM submitted objects %d -> %d, skipped by unstable node type %d -> %d",
++			       lastSubmitted, submitted, lastTypeSkipped, typeSkipped);
++			lastSubmitted = submitted;
++			lastTypeSkipped = typeSkipped;
++		}
++	}
++
++	if (!pFr)
++		pFr = new ShadowMapFrustum;
++
++	if (!pFr->pShadowCacheData)
++		pFr->pShadowCacheData = std::make_shared<ShadowMapFrustum::ShadowCacheData>();
++
++	static ICVar* pLPVRsmSamples = gEnv->pConsole->GetCVar("r_LPVRSMSamples");
++
++	const SRenderLight& light = m_pLightEntity->GetLightProperties();
++	const AABB lpvBox = GetLPVBox(passInfo);
++	const Vec3 boxCentre = lpvBox.GetCenter();
++	const float halfExtent = lpvBox.GetSize().x * 0.5f;
++
++	const int nTexRes = pLPVRsmSamples ? clamp_tpl(pLPVRsmSamples->GetIVal(), 64, 1024) : 1024;
++
++	// Light space basis, has to match mathMatrixLookAt() so the snapping below happens in the very
++	// same space the projection is built in later on (CShadowUtils::GetShadowMatrixOrtho).
++	Vec3 vLightSrcRelPos = light.m_Origin - passInfo.GetCamera().GetPosition();
++	const Vec3 zAxis = vLightSrcRelPos.GetNormalized();
++	const Vec3 up = (fabsf(zAxis.Dot(Vec3(0.0f, 0.0f, 1.0f))) > 0.9995f) ? Vec3(0.0f, 1.0f, 0.0f) : Vec3(0.0f, 0.0f, 1.0f);
++	const Vec3 xAxis = up.Cross(zAxis).GetNormalized();
++	const Vec3 yAxis = zAxis.Cross(xAxis);
++
++	// Footprint of the volume as seen from the sun: project the 8 corners onto the light space axes.
++	float halfWidth = 0.0f;
++	float halfDepth = 0.0f;
++	for (int i = 0; i < 8; ++i)
++	{
++		const Vec3 corner(((i & 1) ? lpvBox.max.x : lpvBox.min.x) - boxCentre.x,
++		                  ((i & 2) ? lpvBox.max.y : lpvBox.min.y) - boxCentre.y,
++		                  ((i & 4) ? lpvBox.max.z : lpvBox.min.z) - boxCentre.z);
++
++		halfWidth = max(halfWidth, max(fabsf(corner.Dot(xAxis)), fabsf(corner.Dot(yAxis))));
++		halfDepth = max(halfDepth, fabsf(corner.Dot(zAxis)));
++	}
++
++	// Quantize the footprint so that the world size of an RSM texel only changes in coarse steps.
++	// Without this the texel grid the projection is snapped to would drift with the sun direction.
++	const float quantum = max(0.01f, halfExtent * 0.125f);
++	halfWidth = ceilf(halfWidth / quantum) * quantum;
++
++	const float texelSize = (2.0f * halfWidth) / (float)nTexRes;
++
++	// Snap the projection centre to whole texels in light space, plus one texel of slack so the volume
++	// stays fully covered after the snap.
++	Vec3 vProjTranslation = boxCentre;
++	vProjTranslation -= xAxis * (boxCentre.Dot(xAxis) - floorf(boxCentre.Dot(xAxis) / texelSize) * texelSize);
++	vProjTranslation -= yAxis * (boxCentre.Dot(yAxis) - floorf(boxCentre.Dot(yAxis) / texelSize) * texelSize);
++	halfWidth += texelSize;
++
++	// Everything between the sun and the volume can throw light into it, so extend the near plane.
++	const float casterRange = max(Get3DEngine()->m_fSunClipPlaneRange, 2.0f * halfExtent);
++
++	// Virtual light distance instead of the astronomic distance to the real sun light origin: with
++	// fDist ~1e6 the resulting projection (near ~= far ~= 1e6, FOV ~0.01 deg) is so ill conditioned
++	// that the fp32 inversion in CLPVStage::UpdateFrameParameters degenerates and the VPLs land at
++	// garbage positions. 10km keeps the direction parallax below ~0.5 degrees over the volume while
++	// the matrix stays well conditioned. Only the direction of vLightSrcRelPos is kept.
++	const float fDist = max(10000.0f, 40.0f * halfWidth);
++	vLightSrcRelPos = zAxis * fDist;
++
++	pFr->m_eFrustumType = ShadowMapFrustum::e_LPVRsm;
++	pFr->RequestUpdates(1);
++	pFr->RequestSamples(1);
++	pFr->bIncrementalUpdate = false;
++	pFr->bIsMGPUCopy = false;
++	pFr->bUseShadowsPool = false;
++	pFr->bOmniDirectionalShadow = false;
++	pFr->bBlendFrustum = false;
++	pFr->fBlendVal = 1.0f;
++	pFr->fShadowFadingDist = 0.0f;
++	pFr->nShadowPoolUpdateRate = 0;
++	pFr->pShadowCacheData->Reset(GetNextGenerationID());
++
++	CRY_ASSERT(light.m_pOwner);
++	pFr->pLightOwner = light.m_pOwner;
++	pFr->m_Flags = light.m_Flags;
++	pFr->nUpdateFrameId = passInfo.GetFrameID();
++	pFr->nShadowMapLod = nLod;
++	pFr->nShadowCacheLod = nCacheLod;
++	pFr->nTexSize = nTexRes;
++	pFr->fRadius = light.m_fRadius;
++
++	pFr->vProjTranslation = vProjTranslation;
++	pFr->vLightSrcRelPos = vLightSrcRelPos;
++
++	// The renderer builds the (very narrow) perspective projection from these, exactly like for a sun
++	// cascade, so the RSM depth encoding stays identical to the cascade based path.
++	pFr->fFOV = (float)RAD2DEG(atan_tpl(halfWidth / max(fDist, 1.0f))) * 2.0f;
++	pFr->fProjRatio = 1.0f;
++	pFr->fNearDist = fDist - halfDepth - casterRange;
++	pFr->fFarDist = fDist + halfDepth;
++	pFr->fRendNear = pFr->fNearDist;
++
++	if (pFr->fFarDist > light.m_fRadius)
++		pFr->fFarDist = light.m_fRadius;
++	if (pFr->fNearDist < pFr->fFarDist * 0.005f)
++		pFr->fNearDist = pFr->fFarDist * 0.005f;
++
++	pFr->fFrustrumSize = 1.0f / max(0.001f, 2.0f * halfWidth);
++	pFr->fWidthS = pFr->fWidthT = 1.0f;
++	pFr->fBlurS = pFr->fBlurT = 0.0f;
++
++	// No depth bias at all: the RSM is never used for a shadow comparison, its depth is inverted back
++	// into world space to place the virtual point lights, and any bias would displace them.
++	pFr->fDepthConstBias = 0.0f;
++	pFr->fDepthSlopeBias = 0.0f;
++	pFr->fDepthTestBias = 0.0f;
++	pFr->fDepthBiasClamp = 0.0f;
++
++	// Caster box: the volume swept towards the sun, so occluders above it are collected as well.
++	pFr->aabbCasters = lpvBox;
++	pFr->aabbCasters.Add(AABB(lpvBox.min + zAxis * casterRange, lpvBox.max + zAxis * casterRange));
++
++	// Culling camera, only used by the generic frustum code paths (the caster collection below is what
++	// actually feeds this frustum).
++	CCamera& frustumCam = pFr->FrustumPlanes[0] = CCamera();
++	Matrix34A mat = Matrix33::CreateRotationVDir(-zAxis);
++	mat.SetTranslation(pFr->vLightSrcRelPos + pFr->vProjTranslation);
++	frustumCam.SetMatrixNoUpdate(mat);
++	frustumCam.SetFrustum(256, 256, max(0.0001f, pFr->fFOV * (gf_PI / 180.0f)), pFr->fNearDist, pFr->fFarDist);
++	pFr->FrustumPlanes[1] = frustumCam;
++
++	// Independent octree query over aabbCasters. This is the whole point of the dedicated view: the
++	// caster set does not depend on the main camera orientation at all.
++	CollectCastersForCachedFrustum(pFr, nullptr, std::numeric_limits<int>::max(), passInfo);
++}
++
+ void ShadowCacheGenerator::GetCasterBox(AABB& BBoxWS, AABB& BBoxLS, float fRadius, const Matrix34& matView, const SRenderingPassInfo& passInfo)
+ {
+ 	AABB projectionBoundsLS;
+@@ -329,7 +624,10 @@ void ShadowCacheGenerator::AddTerrainCastersToFrustum(ShadowMapFrustum* pFr, con
+ {
+ 	FUNCTION_PROFILER_3DENGINE;
+ 
+-	if ((Get3DEngine()->m_bSunShadowsFromTerrain || pFr->m_eFrustumType == ShadowMapFrustum::e_HeightMapAO) && !pFr->bIsMGPUCopy)
++	// The LPV RSM always wants the terrain: it is the main source of indirect bounce outdoors.
++	if ((Get3DEngine()->m_bSunShadowsFromTerrain
++	     || pFr->m_eFrustumType == ShadowMapFrustum::e_HeightMapAO
++	     || pFr->m_eFrustumType == ShadowMapFrustum::e_LPVRsm) && !pFr->bIsMGPUCopy)
+ 	{
+ 		PodArray<CTerrainNode*> lstTerrainNodes;
+ 		GetTerrain()->IntersectWithBox(pFr->aabbCasters, &lstTerrainNodes);
+@@ -345,7 +643,11 @@ void ShadowCacheGenerator::AddTerrainCastersToFrustum(ShadowMapFrustum* pFr, con
+ 			if (!pFr->NodeRequiresShadowCacheUpdate(pNode))
+ 				continue;
+ 
+-			pNode->SetTraversalFrameId(passInfo.GetMainFrameID(), pFr->nShadowMapLod);
++			// The LPV RSM marks with its fixed bit, see kLPVRsmTraversalLod.
++			const int markLod = (pFr->m_eFrustumType == ShadowMapFrustum::e_LPVRsm)
++			                    ? kLPVRsmTraversalLod
++			                    : pFr->nShadowMapLod;
++			pNode->SetTraversalFrameId(passInfo.GetMainFrameID(), markLod);
+ 		}
+ 	}
+ }
+diff --git a/Code/CryEngine/Cry3DEngine/ShadowCache.h b/Code/CryEngine/Cry3DEngine/ShadowCache.h
+index 8f3e3b50..d28e1b3f 100644
+--- a/Code/CryEngine/Cry3DEngine/ShadowCache.h
++++ b/Code/CryEngine/Cry3DEngine/ShadowCache.h
+@@ -17,6 +17,40 @@ public:
+ 
+ 	void InitShadowFrustum(ShadowMapFrustumPtr& pFr, int nLod, int nFirstStaticLod, float fDistFromViewDynamicLod, float fRadiusDynamicLod, const SRenderingPassInfo& passInfo);
+ 	void InitHeightMapAOFrustum(ShadowMapFrustumPtr& pFr, int nLod, int nFirstStaticLod, const SRenderingPassInfo& passInfo);
++	void InitLPVRsmFrustum(ShadowMapFrustumPtr& pFr, int nLod, int nCacheLod, const SRenderingPassInfo& passInfo);
++
++	// World space box the light propagation volume covers this frame. Has to stay in sync with
++	// CLPVStage::UpdateFrameParameters(), which derives the grid origin the very same way.
++	static AABB GetLPVBox(const SRenderingPassInfo& passInfo);
++
++	// Debug instrumentation: number of casters marked for the LPV RSM frustum by the octree
++	// collection (incremented in COctreeNode::GetShadowCastersTimeSliced, read + reset once per
++	// frame in InitLPVRsmFrustum when the LPV debug cvar is set).
++	static volatile int s_lpvRsmCasterCount;
++	// Nodes/objects culled from the LPV RSM pass in COctreeNode::UpdateCullMask, split by reason:
++	// stale traversal frame id vs missing cascade bit.
++	static volatile int s_lpvRsmCullFrameId;
++	static volatile int s_lpvRsmCullBit;
++	// Objects that actually reached RenderRenderNode_ShadowPass for the RSM, and the ones dropped
++	// there because their render node type submits geometry based on main view only state.
++	static volatile int s_lpvRsmSubmitted;
++	static volatile int s_lpvRsmTypeSkipped;
++
++	// True for render node types whose shadow submission is deterministic with respect to the main
++	// camera. See COctreeNode::RenderObjectIntoShadowViews for why the others are excluded.
++	static bool IsStableRsmCaster(EERType type);
++
++	// Debug instrumentation (r_LPVDebug >= 3): per object submission tracking at the final RSM
++	// submission point. Flush (once per frame) names every object that was submitted in the previous
++	// cycle but not refreshed since - the definitive list of what actually pops out of the RSM.
++	static void LpvDebugRecordSubmission(IRenderNode* pObj, uint32 mainFrameId);
++	static void LpvDebugFlushSubmissions(uint32 mainFrameId, const AABB& casterBox);
++
++	// Fixed traversal-marking bit of the LPV RSM in IRenderNode::m_onePassTraversalShadowCascades.
++	// The frustum's nShadowMapLod is a slot index that moves around when the dynamic cascade line-up
++	// changes from frame to frame, so marking with BIT(nShadowMapLod) both drifts and collides with
++	// the bits of the real cascades. The marking and the cull mask check use this constant instead.
++	static const int kLPVRsmTraversalLod = 30;
+ 
+ private:
+ 	static const int    MAX_RENDERNODES_PER_FRAME = 50;
+@@ -25,6 +59,7 @@ private:
+ 	static int   m_cacheGenerationId;
+ 
+ 	void         InitCachedFrustum(ShadowMapFrustumPtr& pFr, ShadowMapFrustum::ShadowCacheData::eUpdateStrategy nUpdateStrategy, int nLod, int cacheLod, int nTexSize, const Vec3& vLightPos, const AABB& projectionBoundsLS, const SRenderingPassInfo& passInfo);
++	void         CollectCastersForCachedFrustum(ShadowMapFrustumPtr& pFr, const PodArray<struct SPlaneObject>* pCastersHull, int maxNodesPerFrame, const SRenderingPassInfo& passInfo);
+ 	void         AddTerrainCastersToFrustum(ShadowMapFrustum* pFr, const SRenderingPassInfo& passInfo);
+ 
+ 	void         GetCasterBox(AABB& BBoxWS, AABB& BBoxLS, float fRadius, const Matrix34& matView, const SRenderingPassInfo& passInfo);
+diff --git a/Code/CryEngine/RenderDll/Common/RenderView.cpp b/Code/CryEngine/RenderDll/Common/RenderView.cpp
+index 6fb4ee23..0ec93588 100644
+--- a/Code/CryEngine/RenderDll/Common/RenderView.cpp
++++ b/Code/CryEngine/RenderDll/Common/RenderView.cpp
+@@ -2739,6 +2739,9 @@ void CRenderView::SShadows::CreateFrustumGroups()
+ 		case ShadowMapFrustum::e_HeightMapAO:
+ 			m_frustumsByType[eShadowFrustumRenderType_HeightmapAO].push_back(&fr);
+ 			break;
++		case ShadowMapFrustum::e_LPVRsm:
++			m_frustumsByType[eShadowFrustumRenderType_LPVRsm].push_back(&fr);
++			break;
+ 		case ShadowMapFrustum::e_Nearest:
+ 		case ShadowMapFrustum::e_PerObject:
+ 			if (fr.pFrustum->ShouldSample())
+diff --git a/Code/CryEngine/RenderDll/Common/RenderView.h b/Code/CryEngine/RenderDll/Common/RenderView.h
+index 3958c9ca..68468bc1 100644
+--- a/Code/CryEngine/RenderDll/Common/RenderView.h
++++ b/Code/CryEngine/RenderDll/Common/RenderView.h
+@@ -100,6 +100,7 @@ public:
+ 		eShadowFrustumRenderType_SunDynamic  = 2,
+ 		eShadowFrustumRenderType_LocalLight  = 3,
+ 		eShadowFrustumRenderType_Custom      = 4,
++		eShadowFrustumRenderType_LPVRsm      = 5,
+ 
+ 		eShadowFrustumRenderType_Count,
+ 		eShadowFrustumRenderType_First = eShadowFrustumRenderType_SunCached
+diff --git a/Code/CryEngine/RenderDll/Common/RendererCVars.cpp b/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
+index 3c63edfc..ed8ea8d0 100644
+--- a/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
++++ b/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
+@@ -415,10 +415,13 @@ int CRendererCVars::CV_r_LPVGridSize;
+ float CRendererCVars::CV_r_LPVSize;
+ int CRendererCVars::CV_r_LPVIterations;
+ float CRendererCVars::CV_r_LPVIntensity;
++int CRendererCVars::CV_r_LPVDedicatedRSM;
+ int CRendererCVars::CV_r_LPVCascadeLod;
+ float CRendererCVars::CV_r_LPVInjectionBias;
+ int   CRendererCVars::CV_r_LPVRSMSamples;
+ float CRendererCVars::CV_r_LPVTemporalAlpha;
++float CRendererCVars::CV_r_LPVSecondaryBounce;
++int   CRendererCVars::CV_r_LPVUpdateInterval;
+ int   CRendererCVars::CV_r_LPVDebug;
+ 
+ int CRendererCVars::CV_r_dof;
+@@ -2223,31 +2226,52 @@ void CRendererCVars::InitCVars()
+ 	               "Enables Light Propagation Volumes dynamic global illumination (sun only, single cascade).\n"
+ 	               "Has no effect while SVOGI (Total Illumination) is active.\n"
+ 	               "Usage: r_LPV [0/1]\n");
+-	REGISTER_CVAR3("r_LPVGridSize", CV_r_LPVGridSize, 32, VF_NULL,
++	REGISTER_CVAR3("r_LPVGridSize", CV_r_LPVGridSize, 48, VF_NULL,
+ 	               "Number of Light Propagation Volumes cells per axis. Clamped to [8, 64] and rounded down to a multiple of 4.\n");
+-	REGISTER_CVAR3("r_LPVSize", CV_r_LPVSize, 64.0f, VF_NULL,
++	REGISTER_CVAR3("r_LPVSize", CV_r_LPVSize, 96.0f, VF_NULL,
+ 	               "World space extent in meters of the Light Propagation Volumes grid.\n");
+-	REGISTER_CVAR3("r_LPVIterations", CV_r_LPVIterations, 8, VF_NULL,
++	REGISTER_CVAR3("r_LPVIterations", CV_r_LPVIterations, 24, VF_NULL,
+ 	               "Number of Light Propagation Volumes propagation iterations.\n"
+ 	               "The light travel distance is roughly iterations * (r_LPVSize / r_LPVGridSize).\n");
+-	REGISTER_CVAR3("r_LPVIntensity", CV_r_LPVIntensity, 1.0f, VF_NULL,
+-	               "Intensity multiplier of the Light Propagation Volumes indirect diffuse.\n");
+-	REGISTER_CVAR3("r_LPVCascadeLod", CV_r_LPVCascadeLod, 2, VF_NULL,
+-	               "Index of the sun shadow cascade used as reflective shadow map source for Light Propagation Volumes.\n");
++	REGISTER_CVAR3("r_LPVIntensity", CV_r_LPVIntensity, 150.0f, VF_NULL,
++	               "Intensity multiplier of the Light Propagation Volumes indirect diffuse.\n"
++	               "The internal energy scale is uncalibrated, useful values are in the 50 - 400 range.\n");
++	REGISTER_CVAR3("r_LPVDedicatedRSM", CV_r_LPVDedicatedRSM, 1, VF_NULL,
++	               "Render a dedicated sun reflective shadow map fitted to the Light Propagation Volumes box\n"
++	               "instead of borrowing the sun shadow cascade selected by r_LPVCascadeLod.\n"
++	               "The dedicated view is independent of the camera orientation, which removes the GI popping\n"
++	               "caused by the view fitted cascades. Set to 0 to fall back to the cascade based path.\n");
++	REGISTER_CVAR3("r_LPVCascadeLod", CV_r_LPVCascadeLod, 3, VF_NULL,
++	               "Index of the sun shadow cascade used as reflective shadow map source for Light Propagation\n"
++	               "Volumes. Only used when r_LPVDedicatedRSM is 0.\n");
+ 	REGISTER_CVAR3("r_LPVInjectionBias", CV_r_LPVInjectionBias, 0.5f, VF_NULL,
+ 	               "Offset in cells applied to injected virtual point lights, reduces self illumination and thin wall bleeding.\n");
+-	REGISTER_CVAR3("r_LPVRSMSamples", CV_r_LPVRSMSamples, 512, VF_NULL,
++	REGISTER_CVAR3("r_LPVRSMSamples", CV_r_LPVRSMSamples, 1024, VF_NULL,
+ 	               "Side length of the RSM sample grid used by the injection pass, clamped to [64, 1024].\n"
+ 	               "Higher values reduce injection flicker from thin geometry at some GPU cost.\n");
++	REGISTER_CVAR3("r_LPVSecondaryBounce", CV_r_LPVSecondaryBounce, 2.0f, VF_NULL,
++	               "Gain of the multi bounce feedback (grid cells with registered surfaces re-emit the\n"
++	               "indirect light they received in the previous relight, SVOGI style). 0 disables it.\n"
++	               "The loop stays stable roughly while gain * scene albedo * 0.25 < 1, i.e. up to ~10.\n");
+ 	REGISTER_CVAR3("r_LPVTemporalAlpha", CV_r_LPVTemporalAlpha, 0.15f, VF_NULL,
+ 	               "Weight of the current frame in the temporal accumulation of the LPV grid [0.01, 1].\n"
+ 	               "Lower values are more stable but react slower, 1 disables the accumulation.\n");
++	REGISTER_CVAR3("r_LPVUpdateInterval", CV_r_LPVUpdateInterval, 10, VF_NULL,
++	               "Heartbeat interval in frames for the LPV relight (injection + propagation).\n"
++	               "Between heartbeats the grid is frozen unless the volume moves to a new cell, the sun\n"
++	               "changes or an LPV cvar changes - a frozen grid cannot flicker. 0 relights every frame.\n");
+ 	REGISTER_CVAR3("r_LPVDebug", CV_r_LPVDebug, 0, VF_NULL,
+ 	               "Debug output of the LPV apply pass, view with r_ShowRenderTarget LPVIrradiance.\n"
+ 	               "0 - off (regular irradiance)\n"
+-	               "1 - grid space position of the shaded pixel (frac)\n"
+-	               "2 - raw L0 magnitude of the sampled SH grid (ignores receiver lobe, fade and intensity)\n"
+-	               "3 - volume edge fade factor\n");
++	               "1 - grid space position of the shaded pixel (frac), plus per frame CPU logs\n"
++	               "2 - raw L0 magnitude of the sampled SH grid, plus per object cull logs\n"
++	               "3 - volume edge fade factor, plus RSM submission diff logs\n"
++	               "4..8 - staged injection pipeline probes (see LPV.cfi)\n"
++	               "9 - surface mosaic: per cell L0 energy projected onto the scene surfaces\n"
++	               "10 - 3D probe spheres: a small shaded ball at every grid cell, coloured by the cell\n"
++	               "     energy and depth tested against the scene (drawn directly into the HDR target,\n"
++	               "     no r_ShowRenderTarget needed)\n"
++	               "11 - probe spheres and surface mosaic combined (alignment check)\n");
+ 
+ 	REGISTER_CVAR3("r_DepthOfField", CV_r_dof, DOF_DEFAULT_VAL, VF_NULL,
+ 	               "Enables depth of field.\n"
+diff --git a/Code/CryEngine/RenderDll/Common/RendererCVars.h b/Code/CryEngine/RenderDll/Common/RendererCVars.h
+index 08a51fe7..1110343c 100644
+--- a/Code/CryEngine/RenderDll/Common/RendererCVars.h
++++ b/Code/CryEngine/RenderDll/Common/RendererCVars.h
+@@ -660,10 +660,13 @@ public:
+ 	static float CV_r_LPVSize;
+ 	static int   CV_r_LPVIterations;
+ 	static float CV_r_LPVIntensity;
++	static int   CV_r_LPVDedicatedRSM;
+ 	static int   CV_r_LPVCascadeLod;
+ 	static float CV_r_LPVInjectionBias;
+ 	static int   CV_r_LPVRSMSamples;
+ 	static float CV_r_LPVTemporalAlpha;
++	static float CV_r_LPVSecondaryBounce;
++	static int   CV_r_LPVUpdateInterval;
+ 	static int   CV_r_LPVDebug;
+ 
+ 	static int   CV_r_CustomResMaxSize;
+diff --git a/Code/CryEngine/RenderDll/Common/Shadow_Renderer.h b/Code/CryEngine/RenderDll/Common/Shadow_Renderer.h
+index 3ee77d61..41fab931 100644
+--- a/Code/CryEngine/RenderDll/Common/Shadow_Renderer.h
++++ b/Code/CryEngine/RenderDll/Common/Shadow_Renderer.h
+@@ -39,6 +39,7 @@ struct ShadowMapFrustum : public CMultiThreadRefCount
+ 		e_HeightMapAO        = 3,
+ 		e_Nearest            = 4,
+ 		e_PerObject          = 5,
++		e_LPVRsm             = 6, // reflective shadow map fitted to the light propagation volume, see CLPVStage
+ 
+ 		e_NumTypes
+ 	};
+@@ -299,7 +300,10 @@ public:
+ 	inline size_t GetCasterNum(int side) const { return nSideDrawnWithN[side]; }
+ 	inline size_t GetCasterNum() const { size_t n = 0; for (int nS = 0; nS < OMNI_SIDES_NUM; nS++) n += nSideDrawnWithN[nS]; return n; }
+ 
+-	inline bool IsCached() const { return m_eFrustumType == e_GsmCached || m_eFrustumType == e_HeightMapAO; }
++	// NOTE: e_LPVRsm is "cached" in the sense that its casters are collected by an independent octree
++	// query (ShadowCacheGenerator) instead of the camera driven one-pass traversal. Its contents are
++	// still fully rebuilt every frame.
++	inline bool IsCached() const { return m_eFrustumType == e_GsmCached || m_eFrustumType == e_HeightMapAO || m_eFrustumType == e_LPVRsm; }
+ 	inline bool IsDynamicGsmCascade() const { return (m_Flags & DLF_SUN) && (m_eFrustumType == e_GsmDynamic || m_eFrustumType == e_GsmDynamicDistance); }
+ 
+ 	// --------------------------------------------------------
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.cpp
+index 1d27123c..66f754a1 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.cpp
+@@ -25,6 +25,15 @@ uint32 lpvDispatchSize(int32 size, int32 tileSize)
+ {
+ 	return (uint32)((size / tileSize) + ((size % tileSize) > 0 ? 1 : 0));
+ }
++
++// Has to match CShadowMapStage::GetShadowTexFormat(ePass_DirectionalLightRSM), otherwise the render
++// pass of the pre-allocated RSM pass group is incompatible with the dedicated depth target.
++ETEX_Format lpvRsmDepthFormat()
++{
++	return CRendererResources::s_hwTexFormatSupport.GetClosestFormatSupported(
++	  CRendererCVars::CV_r_shadowtexformat == 0 ? eTF_D32F :
++	  (CRendererCVars::CV_r_shadowtexformat == 1 ? eTF_D16 : eTF_D24S8));
++}
+ }
+ 
+ CLPVStage::CLPVStage(CGraphicsPipeline& graphicsPipeline)
+@@ -32,8 +41,10 @@ CLPVStage::CLPVStage(CGraphicsPipeline& graphicsPipeline)
+ 	, m_pIrradiance(nullptr)
+ 	, m_pRsmColor(nullptr)
+ 	, m_pRsmNormal(nullptr)
++	, m_pRsmDepth(nullptr)
+ 	, m_passClear(&graphicsPipeline, CComputeRenderPass::eFlags_ReflectConstantBuffersFromShader)
+ 	, m_passInject(&graphicsPipeline, CComputeRenderPass::eFlags_ReflectConstantBuffersFromShader)
++	, m_passInjectScreen(&graphicsPipeline, CComputeRenderPass::eFlags_ReflectConstantBuffersFromShader)
+ 	, m_passResolve(&graphicsPipeline, CComputeRenderPass::eFlags_ReflectConstantBuffersFromShader)
+ 	, m_passApply(&graphicsPipeline, CComputeRenderPass::eFlags_ReflectConstantBuffersFromShader)
+ 	, m_gridOrigin(ZERO)
+@@ -45,6 +56,10 @@ CLPVStage::CLPVStage(CGraphicsPipeline& graphicsPipeline)
+ 	, m_finalGridIndex(0)
+ 	, m_accIndex(0)
+ 	, m_prevGridOrigin(ZERO)
++	, m_lastSunDir(ZERO)
++	, m_lastSunColor(ZERO)
++	, m_framesSinceRelight(0)
++	, m_bForceRelight(true)
+ 	, m_bHistoryValid(false)
+ 	, m_bResultValid(false)
+ {
+@@ -64,8 +79,11 @@ CLPVStage::CLPVStage(CGraphicsPipeline& graphicsPipeline)
+ 
+ 	for (auto& gridSet : m_pGridSH)
+ 		std::fill(std::begin(gridSet), std::end(gridSet), nullptr);
++	for (auto& gridSet : m_pGridSum)
++		std::fill(std::begin(gridSet), std::end(gridSet), nullptr);
+ 	for (auto& gridSet : m_pGridAcc)
+ 		std::fill(std::begin(gridSet), std::end(gridSet), nullptr);
++	std::fill(std::begin(m_pFinalGrid), std::end(m_pFinalGrid), nullptr);
+ 
+ 	// The RSM texture objects have to exist before CShadowMapStage::Init() runs, which happens before
+ 	// CLPVStage::Init(). The device resources are created on demand in GetRsmColorMap()/GetRsmNormalMap().
+@@ -101,6 +119,10 @@ void CLPVStage::Init()
+ 			std::string texName = "$LPVGridSH" + std::to_string(i) + std::to_string(c) + m_graphicsPipeline.GetUniqueIdentifierName();
+ 			m_pGridSH[i][c] = CTexture::GetOrCreateTextureObjectPtr(texName.c_str(), 0, 0, 0, eTT_3D, uavFlags, LPVGridFormat);
+ 
++			CRY_ASSERT(m_pGridSum[i][c] == nullptr);
++			texName = "$LPVGridSum" + std::to_string(i) + std::to_string(c) + m_graphicsPipeline.GetUniqueIdentifierName();
++			m_pGridSum[i][c] = CTexture::GetOrCreateTextureObjectPtr(texName.c_str(), 0, 0, 0, eTT_3D, uavFlags, LPVGridFormat);
++
+ 			CRY_ASSERT(m_pGridAcc[i][c] == nullptr);
+ 			texName = "$LPVGridAcc" + std::to_string(i) + std::to_string(c) + m_graphicsPipeline.GetUniqueIdentifierName();
+ 			m_pGridAcc[i][c] = CTexture::GetOrCreateTextureObjectPtr(texName.c_str(), 0, 0, 0, eTT_3D, uavFlags, LPVGridFormat);
+@@ -137,6 +159,11 @@ void CLPVStage::ResizeGrid(int32 gridSize)
+ 		for (auto& pTex : gridSet)
+ 			createTexture3D(pTex);
+ 	}
++	for (auto& gridSet : m_pGridSum)
++	{
++		for (auto& pTex : gridSet)
++			createTexture3D(pTex);
++	}
+ 	for (auto& gridSet : m_pGridAcc)
+ 	{
+ 		for (auto& pTex : gridSet)
+@@ -179,6 +206,16 @@ void CLPVStage::OnCVarsChanged(const CCVarUpdateRecorder& cvarUpdater)
+ 		if (gridSize != m_gridSize)
+ 			ResizeGrid(gridSize);
+ 	}
++
++	// Any LPV parameter change invalidates the frozen grid of the relight gating.
++	for (const auto& record : cvarUpdater.GetCVars())
++	{
++		if (strncmp(record.name, "r_LPV", 5) == 0)
++		{
++			m_bForceRelight = true;
++			break;
++		}
++	}
+ }
+ 
+ CTexture* CLPVStage::GetIrradianceRT() const
+@@ -198,18 +235,29 @@ bool CLPVStage::IsSvoProvidingRsm() const
+ #endif
+ }
+ 
++bool CLPVStage::IsDedicatedRsmEnabled()
++{
++	return CRendererCVars::CV_r_LPV > 0 && CRendererCVars::CV_r_LPVDedicatedRSM > 0;
++}
++
+ bool CLPVStage::IsRsmFrustum(const ShadowMapFrustum& rFr) const
+ {
+-	if (CRendererCVars::CV_r_LPV <= 0 || IsSvoProvidingRsm())
++	if (CRendererCVars::CV_r_LPV <= 0 || IsSvoProvidingRsm() || rFr.nShadowMapSize <= 0)
+ 		return false;
+ 
+-	// Directional sun cascades only, the local light / shadow pool RSM path stays owned by SVOGI.
+-	// IsDynamicGsmCascade() also accepts e_GsmDynamicDistance, which cascades become when the
+-	// shadow cascade cache (r_ShadowsCache) is enabled.
++	if (IsDedicatedRsmEnabled())
++	{
++		// Dedicated view, fitted to the volume itself and set up by Cry3DEngine
++		// (ShadowCacheGenerator::InitLPVRsmFrustum). Independent of the camera orientation.
++		return rFr.m_eFrustumType == ShadowMapFrustum::e_LPVRsm;
++	}
++
++	// Fallback path: borrow a sun shadow cascade as the RSM. Directional sun cascades only, the local
++	// light / shadow pool RSM path stays owned by SVOGI. IsDynamicGsmCascade() also accepts
++	// e_GsmDynamicDistance, which cascades become when the shadow cascade cache (r_ShadowsCache) is on.
+ 	return !rFr.bUseShadowsPool
+ 	       && rFr.IsDynamicGsmCascade()
+-	       && rFr.nShadowMapLod == CRendererCVars::CV_r_LPVCascadeLod
+-	       && rFr.nShadowMapSize > 0;
++	       && rFr.nShadowMapLod == CRendererCVars::CV_r_LPVCascadeLod;
+ }
+ 
+ void CLPVStage::CheckCreateUpdateRsmTarget(_smart_ptr<CTexture>& pTex, int32 size, const char* szName)
+@@ -270,12 +318,65 @@ CTexture* CLPVStage::GetRsmNormalMap(const ShadowMapFrustum& rFr, bool bCheckUpd
+ 	return CTexture::IsTextureExist(m_pRsmNormal) ? m_pRsmNormal.get() : nullptr;
+ }
+ 
++CTexture* CLPVStage::GetRsmDepthMap(const ShadowMapFrustum& rFr, bool bCheckUpdate)
++{
++	// Only the dedicated view owns its depth target, the cascade fallback renders into the depth map
++	// of the borrowed cascade.
++	if (rFr.m_eFrustumType != ShadowMapFrustum::e_LPVRsm || !IsRsmFrustum(rFr))
++		return nullptr;
++
++	if (bCheckUpdate)
++	{
++		const int32 size = rFr.nShadowMapSize;
++		const ETEX_Format depthFormat = lpvRsmDepthFormat();
++
++		if (!m_pRsmDepth)
++		{
++			const std::string texName = "$LPV_SUN_RSM_DEPTH" + m_graphicsPipeline.GetUniqueIdentifierName();
++			m_pRsmDepth = CTexture::GetOrCreateDepthStencilPtr(texName.c_str(), size, size, Clr_FarPlane, eTT_2D, FT_DONT_STREAM, depthFormat);
++		}
++
++		if (m_pRsmDepth && (!CTexture::IsTextureExist(m_pRsmDepth) || m_pRsmDepth->Invalidate(size, size, depthFormat)))
++			m_pRsmDepth->CreateDepthStencil(depthFormat, Clr_FarPlane);
++	}
++
++	return CTexture::IsTextureExist(m_pRsmDepth) ? m_pRsmDepth.get() : nullptr;
++}
++
+ const ShadowMapFrustum* CLPVStage::FindRsmFrustum() const
+ {
+ 	const CRenderView* pRenderView = RenderView();
+ 	if (!pRenderView)
+ 		return nullptr;
+ 
++	if (IsDedicatedRsmEnabled())
++	{
++		for (const auto& pFrustumToRender : pRenderView->GetShadowFrustumsByType(CRenderView::eShadowFrustumRenderType_LPVRsm))
++		{
++			const ShadowMapFrustum* pFrustum = pFrustumToRender->pFrustum;
++			if (pFrustum && pFrustum->m_eFrustumType == ShadowMapFrustum::e_LPVRsm)
++			{
++				if (CRendererCVars::CV_r_LPVDebug > 0 && pFrustumToRender->pShadowsView)
++				{
++					// Render item count of the RSM shadow view, logged on change: tells whether casters
++					// disappear on the submission side (count drops) or in the collection (count stable
++					// while the 3DEngine side count drops).
++					const size_t itemCount = reinterpret_cast<CRenderView*>(pFrustumToRender->pShadowsView.get())->GetRenderItems(ERenderListID(0)).size();
++					static size_t lastItemCount = ~size_t(0);
++					if (itemCount != lastItemCount)
++					{
++						CryLog("LPV debug: RSM shadow view render items %u -> %u", (uint32)lastItemCount, (uint32)itemCount);
++						lastItemCount = itemCount;
++					}
++				}
++
++				return pFrustum;
++			}
++		}
++
++		return nullptr;
++	}
++
+ 	for (const auto& pFrustumToRender : pRenderView->GetShadowFrustumsByType(CRenderView::eShadowFrustumRenderType_SunDynamic))
+ 	{
+ 		const ShadowMapFrustum* pFrustum = pFrustumToRender->pFrustum;
+@@ -292,7 +393,7 @@ bool CLPVStage::UpdateFrameParameters(const ShadowMapFrustum& frustum, const CTe
+ 		return false;
+ 
+ 	// The injection pass reads depth, albedo and normal at the same texel, so all three RSM targets
+-	// have to share the resolution of the cascade.
++	// have to share the resolution of the RSM view.
+ 	m_rsmSize = pRsmColor->GetWidth();
+ 	if (m_rsmSize <= 0 || m_rsmSize != frustum.pDepthTex->GetWidth())
+ 		return false;
+@@ -312,8 +413,10 @@ bool CLPVStage::UpdateFrameParameters(const ShadowMapFrustum& frustum, const CTe
+ 	m_gridOrigin.z = floorf(camPos.z / m_cellSize) * m_cellSize - halfExtent;
+ 
+ 	// Build the RSM texture space -> world space transform used to place the VPLs.
+-	// ConfigShadowTexgen() returns world -> (u, v, z, w). For the orthographic sun cascades the depth
+-	// buffer stores the raw clip space z of exactly this matrix, so it inverts directly.
++	// ConfigShadowTexgen() returns world -> (u, v, z, w). The dedicated RSM view is built by the very
++	// same renderer code path as the sun cascades (CShadowUtils::GetShadowMatrixOrtho), so this works
++	// unchanged for both: the depth buffer stores the clip space z of exactly this matrix (w / fFarDist
++	// is ~1 for these sun frustums), so it inverts directly.
+ 	// Do NOT scale the z row by RecpFarDist: fFarDist of the sun frustums is the (astronomic) distance
+ 	// to the sun light source, the scale would make the matrix numerically singular. SVOGI applies that
+ 	// scale but never reconstructs positions from RSM depth, so it is harmless there.
+@@ -330,14 +433,23 @@ bool CLPVStage::UpdateFrameParameters(const ShadowMapFrustum& frustum, const CTe
+ 		const Vec4 rsmCenter(0.5f, 0.5f, 0.5f, 1.0f);
+ 		const Vec4 worldH = m_rsmToWorld * rsmCenter;
+ 		const Vec3 world = Vec3(worldH.x, worldH.y, worldH.z) / worldH.w;
+-		const Vec4 roundtripH = worldToRsm * Vec4(world, 1.0f);
++		// Homogeneous matrices are only defined up to scale, so both results have to be dehomogenized
++		// before they are compared (the first version of this log line skipped the divide and made a
++		// perfectly fine projective inverse look broken).
++		Vec4 roundtripH = worldToRsm * Vec4(world, 1.0f);
++		if (fabsf(roundtripH.w) > 1e-12f)
++			roundtripH = roundtripH / roundtripH.w;
+ 		const Vec3 camPos = GetCurrentViewInfo().cameraOrigin;
+-		CryLog("LPV debug: rsm(0.5,0.5,0.5) -> world (%.1f, %.1f, %.1f) w=%.3f | roundtrip (%.3f, %.3f, %.3f) | cam (%.1f, %.1f, %.1f) | gridOrigin (%.1f, %.1f, %.1f) ext %.1f | RecpFarDist %.5f | lod %d",
++		CryLog("LPV debug: rsm(0.5,0.5,0.5) -> world (%.1f, %.1f, %.1f) w=%.3f | roundtrip (%.3f, %.3f, %.3f) | cam (%.1f, %.1f, %.1f) | gridOrigin (%.1f, %.1f, %.1f) ext %.1f | RecpFarDist %.5f | lod %d | frustumType %d (LPVRsm=%d) | rsmSize %d | depthTex %s dedicated %d",
+ 		       world.x, world.y, world.z, worldH.w,
+ 		       roundtripH.x, roundtripH.y, roundtripH.z,
+ 		       camPos.x, camPos.y, camPos.z,
+ 		       m_gridOrigin.x, m_gridOrigin.y, m_gridOrigin.z, extent,
+-		       shadowsSetup.RecpFarDist, frustum.nShadowMapLod);
++		       shadowsSetup.RecpFarDist, frustum.nShadowMapLod,
++		       (int)frustum.m_eFrustumType, (int)ShadowMapFrustum::e_LPVRsm,
++		       m_rsmSize,
++		       frustum.pDepthTex ? frustum.pDepthTex->GetName() : "null",
++		       IsDedicatedRsmEnabled() ? 1 : 0);
+ 	}
+ 
+ 	return true;
+@@ -354,51 +466,174 @@ void CLPVStage::SetGridConstants(CComputeRenderPass& pass)
+ 	pass.SetConstant(paramGrid2, Vec4(fGridSize, 1.0f / fGridSize, 1.0f / m_cellSize, fGridSize * m_cellSize));
+ }
+ 
++// Debug instrumentation: log on which frames (and why) the whole LPV execution bails out. A single
++// bailed frame makes GetIrradianceRT() return null and the entire GI contribution disappears from
++// the tiled shading combine for that frame - visible as a full-frame dark flicker.
++static void LpvDebugLogExecuteState(int reason)
++{
++	if (CRendererCVars::CV_r_LPVDebug <= 0)
++		return;
++
++	static int lastReason = -1;
++	if (reason != lastReason)
++	{
++		static const char* const reasonNames[] =
++		{
++			"ok", "svo active", "no shader", "no textures", "no injection buffer",
++			"no rsm frustum", "no rsm targets", "frame parameters failed"
++		};
++		CryLog("LPV debug: execute state %s -> %s",
++		       (lastReason >= 0 && lastReason < 8) ? reasonNames[lastReason] : "startup",
++		       reasonNames[reason]);
++		lastReason = reason;
++	}
++}
++
+ void CLPVStage::Execute()
+ {
+ 	FUNCTION_PROFILER_RENDERER();
+ 
++	// Never run for recursive views (e.g. water reflections): they would overwrite the shared
++	// irradiance target and the frozen grid state with the recursion camera, and the main view
++	// combine would alternate between the correct and the recursion result. Do not touch
++	// m_bResultValid here - the main view result stays valid.
++	if (RenderView() && RenderView()->IsRecursive())
++		return;
++
++	if (CRendererCVars::CV_r_LPVDebug > 0)
++	{
++		// Identity of the executing view, logged on change: two interleaving identities would mean a
++		// second view runs the LPV and clobbers the shared output.
++		const CRenderView* pView = RenderView();
++		static const void* pLastView = nullptr;
++		static int lastViewportWidth = -1;
++		if ((const void*)pView != pLastView || (pView && pView->GetViewport().width != lastViewportWidth))
++		{
++			CryLog("LPV debug: executing on view %p viewport %dx%d",
++			       (const void*)pView,
++			       pView ? pView->GetViewport().width : -1,
++			       pView ? pView->GetViewport().height : -1);
++			pLastView = (const void*)pView;
++			lastViewportWidth = pView ? pView->GetViewport().width : -1;
++		}
++	}
++
+ 	m_bResultValid = false;
+ 
+ 	// SVOGI owns the GI combine point and the sun RSM slot, LPV steps aside completely while it is active.
+ 	if (IsSvoProvidingRsm())
++	{
++		LpvDebugLogExecuteState(1);
+ 		return;
++	}
+ 
+ 	if (!CShaderMan::s_shDeferredShading)
++	{
++		LpvDebugLogExecuteState(2);
+ 		return;
++	}
+ 
+ 	if (m_gridSize <= 0 || !CTexture::IsTextureExist(m_pIrradiance) || !CTexture::IsTextureExist(m_pGridSH[0][0]))
++	{
++		LpvDebugLogExecuteState(3);
+ 		return;
++	}
+ 
+ 	if (!m_injectionBuffer.IsAvailable())
++	{
++		LpvDebugLogExecuteState(4);
+ 		return;
++	}
+ 
+ 	const ShadowMapFrustum* pFrustum = FindRsmFrustum();
+ 	if (!pFrustum)
++	{
++		LpvDebugLogExecuteState(5);
+ 		return;
++	}
+ 
+ 	CTexture* pRsmColor = GetRsmColorMap(*pFrustum);
+ 	CTexture* pRsmNormal = GetRsmNormalMap(*pFrustum);
+ 	if (!pRsmColor || !pRsmNormal)
++	{
++		LpvDebugLogExecuteState(6);
+ 		return;
++	}
+ 
+ 	if (!UpdateFrameParameters(*pFrustum, pRsmColor))
++	{
++		LpvDebugLogExecuteState(7);
+ 		return;
++	}
++
++	LpvDebugLogExecuteState(0);
+ 
+ 	PROFILE_LABEL_SCOPE("LPV");
+ 
+ 	const bool bAsynchronous = false;
+ 	SScopedComputeCommandList commandList(bAsynchronous);
+ 
+-	ExecuteClear(commandList);
+-	ExecuteInject(commandList, pFrustum->pDepthTex, pRsmColor, pRsmNormal);
+-	ExecuteResolve(commandList);
+-	ExecutePropagate(commandList);
+-	ExecuteTemporal(commandList);
+-	ExecuteApply(commandList, pFrustum->pDepthTex);
++	// Relight gating: the injection inputs are fully discretized (cell snapped volume, texel snapped
++	// RSM), so between discrete changes a re-injection can only add noise (terrain LOD changes, draw
++	// order dependent z-fighting in the RSM, view dependent screen space VPLs). The grid is world
++	// anchored, so a frozen grid stays exactly correct for a static scene while the camera moves or
++	// rotates within the current cell.
++	const Vec3 sunDir = RenderView()->GetSunLightDirection();
++	const Vec4 sunColor = RenderView()->GetSunLightColor();
++	const int32 interval = max(0, CRendererCVars::CV_r_LPVUpdateInterval);
++
++	bool bRelight = m_bForceRelight || !m_bHistoryValid;
++	bRelight |= !m_gridOrigin.IsEquivalent(m_prevGridOrigin, 1e-3f);
++	bRelight |= sunDir.Dot(m_lastSunDir) < 0.99995f;
++	bRelight |= (fabsf(sunColor.x - m_lastSunColor.x) + fabsf(sunColor.y - m_lastSunColor.y) + fabsf(sunColor.z - m_lastSunColor.z)) > 0.01f;
++	bRelight |= (interval > 0) && (++m_framesSinceRelight >= interval);
++	bRelight |= (interval == 0);
++
++	if (bRelight)
++	{
++		ExecuteClear(commandList);
++		ExecuteInject(commandList, pFrustum->pDepthTex, pRsmColor, pRsmNormal);
++		ExecuteResolve(commandList);
++		ExecutePropagate(commandList);
++		ExecuteTemporal(commandList);
++
++		m_prevGridOrigin = m_gridOrigin;
++		m_lastSunDir = sunDir;
++		m_lastSunColor = sunColor;
++		m_framesSinceRelight = 0;
++		m_bForceRelight = false;
++		m_bHistoryValid = true;
++	}
++	else
++	{
++		// The frozen accumulation grid is anchored at the origin of the last relight.
++		m_gridOrigin = m_prevGridOrigin;
++	}
++
++	// The screen space apply runs later in the pipeline (ExecuteApplyToScreen), see LPV.h.
++	m_pApplyRsmDepth = pFrustum->pDepthTex;
++	m_bGridReadyForApply = true;
++}
++
++void CLPVStage::ExecuteApplyToScreen()
++{
++	FUNCTION_PROFILER_RENDERER();
++
++	if (!m_bGridReadyForApply)
++		return;
++
++	m_bGridReadyForApply = false;
++
++	if (!m_pApplyRsmDepth || !CTexture::IsTextureExist(m_pIrradiance))
++		return;
++
++	PROFILE_LABEL_SCOPE("LPV APPLY");
++
++	const bool bAsynchronous = false;
++	SScopedComputeCommandList commandList(bAsynchronous);
++
++	ExecuteApply(commandList, m_pApplyRsmDepth);
+ 
+-	m_prevGridOrigin = m_gridOrigin;
+-	m_bHistoryValid = true;
+ 	m_bResultValid = true;
+ }
+ 
+@@ -451,7 +686,7 @@ void CLPVStage::ExecuteInject(const SScopedComputeCommandList& commandList, CTex
+ 
+ 	static CCryNameR paramSunColor("LPVSunColor");
+ 	const Vec4 sunColor = RenderView()->GetSunLightColor();
+-	pass.SetConstant(paramSunColor, Vec4(sunColor.x, sunColor.y, sunColor.z, 0.0f));
++	pass.SetConstant(paramSunColor, Vec4(sunColor.x, sunColor.y, sunColor.z, CRendererCVars::CV_r_LPVIntensity));
+ 
+ 	static CCryNameR paramRsmToWorld("LPVRsmToWorld");
+ 	pass.SetConstant(paramRsmToWorld, m_rsmToWorld);
+@@ -462,11 +697,83 @@ void CLPVStage::ExecuteInject(const SScopedComputeCommandList& commandList, CTex
+ 	pass.Execute(commandList);
+ }
+ 
++void CLPVStage::ExecuteInjectScreen(const SScopedComputeCommandList& commandList)
++{
++	auto& pass = m_passInjectScreen;
++
++	CTexture* pDepth = m_graphicsPipelineResources.m_pTexLinearDepth;
++	CTexture* pNormals = m_graphicsPipelineResources.m_pTexSceneNormalsMap;
++	CTexture* pDiffuse = m_graphicsPipelineResources.m_pTexSceneDiffuse;
++
++	if (!CTexture::IsTextureExist(pDepth) || !CTexture::IsTextureExist(pNormals)
++	    || !CTexture::IsTextureExist(pDiffuse) || !CTexture::IsTextureExist(m_pIrradiance))
++		return;
++
++	const int32 screenWidth = m_pIrradiance->GetWidth();
++	const int32 screenHeight = m_pIrradiance->GetHeight();
++	const int32 pixelStep = 3;
++	const int32 samplesX = (screenWidth + pixelStep - 1) / pixelStep;
++	const int32 samplesY = (screenHeight + pixelStep - 1) / pixelStep;
++
++	if (pass.IsDirty(m_gridSize, screenWidth, screenHeight, pDiffuse->GetID()))
++	{
++		static CCryNameTSCRC techName("LPVInjectScreen");
++		pass.SetTechnique(CShaderMan::s_shDeferredShading, techName, 0);
++		pass.SetOutputUAV(0, &m_injectionBuffer);
++		pass.SetTexture(0, pDepth);
++		pass.SetTexture(1, pNormals);
++		pass.SetTexture(2, pDiffuse);
++		pass.SetTexture(3, m_pIrradiance);
++	}
++
++	pass.SetInlineConstantBuffer(eConstantBufferShaderSlot_PerView, m_graphicsPipeline.GetMainViewConstantBuffer());
++
++	pass.BeginConstantUpdate();
++	SetGridConstants(pass);
++
++	// Area of one screen VPL relative to one RSM texel so that the shared surfel weight in
++	// LPVResolve stays correct for both injection sources. The depth dependent part (linearDepth^2)
++	// is applied in the shader.
++	// The inverse is only defined up to a projective scale, both corners have to be dehomogenized
++	// before the span is measured (skipping the divide made the texel size garbage and silently
++	// zeroed the whole secondary bounce).
++	Vec4 rsmCorner0 = m_rsmToWorld * Vec4(0.0f, 0.0f, 0.5f, 1.0f);
++	Vec4 rsmCorner1 = m_rsmToWorld * Vec4(1.0f, 0.0f, 0.5f, 1.0f);
++	if (fabsf(rsmCorner0.w) > 1e-12f)
++		rsmCorner0 = rsmCorner0 / rsmCorner0.w;
++	if (fabsf(rsmCorner1.w) > 1e-12f)
++		rsmCorner1 = rsmCorner1 / rsmCorner1.w;
++	const Vec3 rsmSpan = Vec3(rsmCorner1.x - rsmCorner0.x, rsmCorner1.y - rsmCorner0.y, rsmCorner1.z - rsmCorner0.z);
++	const float rsmTexelSize = rsmSpan.GetLength() / (float)m_rsmSampleCount;
++
++	const CCamera& camera = RenderView()->GetCamera(CCamera::eEye_Left);
++	const float farDist = camera.GetFarPlane();
++	const float tanHalfFov = tanf(camera.GetFov() * 0.5f);
++	const float screenVplSize = (2.0f * tanHalfFov * farDist * (float)pixelStep) / (float)screenHeight;
++
++	float areaWeight = 0.0f;
++	if (rsmTexelSize > 1e-4f)
++		areaWeight = (screenVplSize * screenVplSize) / (rsmTexelSize * rsmTexelSize);
++
++	const float gain = max(0.0f, CRendererCVars::CV_r_LPVSecondaryBounce);
++	const float biasMeters = CRendererCVars::CV_r_LPVInjectionBias * m_cellSize;
++
++	static CCryNameR paramScreen("LPVScreenInjectParams");
++	pass.SetConstant(paramScreen, Vec4((float)pixelStep, (float)samplesX, (float)samplesY, gain));
++
++	static CCryNameR paramScreen2("LPVScreenInjectParams2");
++	pass.SetConstant(paramScreen2, Vec4(areaWeight, (float)screenWidth, (float)screenHeight, biasMeters));
++
++	pass.SetDispatchSize(lpvDispatchSize(samplesX, LPVInjectTileSize), lpvDispatchSize(samplesY, LPVInjectTileSize), 1);
++	pass.PrepareResourcesForUse(commandList);
++	pass.Execute(commandList);
++}
++
+ void CLPVStage::ExecuteResolve(const SScopedComputeCommandList& commandList)
+ {
+ 	auto& pass = m_passResolve;
+ 
+-	if (pass.IsDirty(m_gridSize))
++	if (pass.IsDirty(m_gridSize, m_accIndex))
+ 	{
+ 		static CCryNameTSCRC techName("LPVResolve");
+ 		pass.SetTechnique(CShaderMan::s_shDeferredShading, techName, 0);
+@@ -474,6 +781,10 @@ void CLPVStage::ExecuteResolve(const SScopedComputeCommandList& commandList)
+ 		pass.SetOutputUAV(1, m_pGridSH[0][1]);
+ 		pass.SetOutputUAV(2, m_pGridSH[0][2]);
+ 		pass.SetBuffer(0, &m_injectionBuffer);
++		// Previous frame accumulated grid: ExecuteResolve runs before ExecuteTemporal flips the index.
++		pass.SetTexture(1, m_pGridAcc[m_accIndex][0]);
++		pass.SetTexture(2, m_pGridAcc[m_accIndex][1]);
++		pass.SetTexture(3, m_pGridAcc[m_accIndex][2]);
+ 	}
+ 
+ 	pass.BeginConstantUpdate();
+@@ -488,6 +799,18 @@ void CLPVStage::ExecuteResolve(const SScopedComputeCommandList& commandList)
+ 	static CCryNameR paramResolve("LPVResolveParams");
+ 	pass.SetConstant(paramResolve, Vec4(injectionWeight, 0.0f, 0.0f, 0.0f));
+ 
++	// Secondary bounce feedback constants: cell offset into the previous accumulation grid (both
++	// origins are cell snapped) and the gain. The feedback operates entirely in raw grid units - do
++	// NOT scale it by the display intensity, that puts the loop gain far above 1 and the grid energy
++	// explodes exponentially within seconds.
++	Vec3 deltaCells(ZERO);
++	if (m_bHistoryValid)
++		deltaCells = (m_gridOrigin - m_prevGridOrigin) / m_cellSize;
++	const float bounceGain = m_bHistoryValid ? max(0.0f, CRendererCVars::CV_r_LPVSecondaryBounce) : 0.0f;
++
++	static CCryNameR paramResolve2("LPVResolveParams2");
++	pass.SetConstant(paramResolve2, Vec4(deltaCells.x, deltaCells.y, deltaCells.z, bounceGain));
++
+ 	const uint32 dispatchSize = lpvDispatchSize(m_gridSize, LPVGridTileSize);
+ 	pass.SetDispatchSize(dispatchSize, dispatchSize, dispatchSize);
+ 	pass.PrepareResourcesForUse(commandList);
+@@ -499,25 +822,41 @@ void CLPVStage::ExecutePropagate(const SScopedComputeCommandList& commandList)
+ 	const int32 iterations = clamp_tpl<int32>(CRendererCVars::CV_r_LPVIterations, 0, 32);
+ 	const uint32 dispatchSize = lpvDispatchSize(m_gridSize, LPVGridTileSize);
+ 
+-	// LPVResolve wrote into set 0, every iteration ping-pongs between the two sets.
+-	m_finalGridIndex = iterations & 1;
++	// CryEngine 3 scheme: every iteration gathers from the neighbours only (a decaying diffusion,
++	// stable for any iteration count) and adds its result to an explicit running sum. The compounding
++	// "self + gathered" variant used before amplified checkerboard modes exponentially.
++	for (int32 c = 0; c < SHChannelNum; ++c)
++		m_pFinalGrid[c] = m_pGridSH[0][c].get();
+ 
+ 	for (int32 i = 0; i < iterations; ++i)
+ 	{
+-		const int32 src = i & 1;
+-		const int32 dst = 1 - src;
+-		auto& pass = m_passPropagate[src];
++		const int32 propSrc = i & 1;
++		const int32 propDst = 1 - propSrc;
++		const int32 sumDst = i & 1;
++
++		// pass 0: first iteration (sum seed = resolve output), pass 1/2: odd/even iterations
++		auto& pass = m_passPropagate[(i == 0) ? 0 : (1 + (i & 1))];
+ 
+ 		if (pass.IsDirty(m_gridSize))
+ 		{
+ 			static CCryNameTSCRC techName("LPVPropagate");
+ 			pass.SetTechnique(CShaderMan::s_shDeferredShading, techName, 0);
+-			pass.SetOutputUAV(0, m_pGridSH[dst][0]);
+-			pass.SetOutputUAV(1, m_pGridSH[dst][1]);
+-			pass.SetOutputUAV(2, m_pGridSH[dst][2]);
+-			pass.SetTexture(0, m_pGridSH[src][0]);
+-			pass.SetTexture(1, m_pGridSH[src][1]);
+-			pass.SetTexture(2, m_pGridSH[src][2]);
++			pass.SetOutputUAV(0, m_pGridSH[propDst][0]);
++			pass.SetOutputUAV(1, m_pGridSH[propDst][1]);
++			pass.SetOutputUAV(2, m_pGridSH[propDst][2]);
++			pass.SetOutputUAV(3, m_pGridSum[sumDst][0]);
++			pass.SetOutputUAV(4, m_pGridSum[sumDst][1]);
++			pass.SetOutputUAV(5, m_pGridSum[sumDst][2]);
++			pass.SetTexture(0, m_pGridSH[propSrc][0]);
++			pass.SetTexture(1, m_pGridSH[propSrc][1]);
++			pass.SetTexture(2, m_pGridSH[propSrc][2]);
++			// the running sum starts as the un-propagated injection result
++			CTexture* pSumSrc0 = (i == 0) ? m_pGridSH[0][0].get() : m_pGridSum[1 - sumDst][0].get();
++			CTexture* pSumSrc1 = (i == 0) ? m_pGridSH[0][1].get() : m_pGridSum[1 - sumDst][1].get();
++			CTexture* pSumSrc2 = (i == 0) ? m_pGridSH[0][2].get() : m_pGridSum[1 - sumDst][2].get();
++			pass.SetTexture(3, pSumSrc0);
++			pass.SetTexture(4, pSumSrc1);
++			pass.SetTexture(5, pSumSrc2);
+ 		}
+ 
+ 		pass.BeginConstantUpdate();
+@@ -526,7 +865,12 @@ void CLPVStage::ExecutePropagate(const SScopedComputeCommandList& commandList)
+ 		pass.SetDispatchSize(dispatchSize, dispatchSize, dispatchSize);
+ 		pass.PrepareResourcesForUse(commandList);
+ 		pass.Execute(commandList);
++
++		for (int32 c = 0; c < SHChannelNum; ++c)
++			m_pFinalGrid[c] = m_pGridSum[sumDst][c].get();
+ 	}
++
++	m_finalGridIndex = 0;
+ }
+ 
+ void CLPVStage::ExecuteTemporal(const SScopedComputeCommandList& commandList)
+@@ -545,16 +889,18 @@ void CLPVStage::ExecuteTemporal(const SScopedComputeCommandList& commandList)
+ 	const int32 dst = 1 - m_accIndex;
+ 	auto& pass = m_passTemporal[src];
+ 
+-	if (pass.IsDirty(m_gridSize, m_finalGridIndex))
++	CRY_ASSERT(m_pFinalGrid[0] && m_pFinalGrid[1] && m_pFinalGrid[2]);
++
++	if (pass.IsDirty(m_gridSize, m_pFinalGrid[0]->GetID()))
+ 	{
+ 		static CCryNameTSCRC techName("LPVTemporal");
+ 		pass.SetTechnique(CShaderMan::s_shDeferredShading, techName, 0);
+ 		pass.SetOutputUAV(0, m_pGridAcc[dst][0]);
+ 		pass.SetOutputUAV(1, m_pGridAcc[dst][1]);
+ 		pass.SetOutputUAV(2, m_pGridAcc[dst][2]);
+-		pass.SetTexture(0, m_pGridSH[m_finalGridIndex][0]);
+-		pass.SetTexture(1, m_pGridSH[m_finalGridIndex][1]);
+-		pass.SetTexture(2, m_pGridSH[m_finalGridIndex][2]);
++		pass.SetTexture(0, m_pFinalGrid[0]);
++		pass.SetTexture(1, m_pFinalGrid[1]);
++		pass.SetTexture(2, m_pFinalGrid[2]);
+ 		pass.SetTexture(3, m_pGridAcc[src][0]);
+ 		pass.SetTexture(4, m_pGridAcc[src][1]);
+ 		pass.SetTexture(5, m_pGridAcc[src][2]);
+@@ -581,13 +927,23 @@ void CLPVStage::ExecuteApply(const SScopedComputeCommandList& commandList, CText
+ 	const int32 screenWidth = m_pIrradiance->GetWidth();
+ 	const int32 screenHeight = m_pIrradiance->GetHeight();
+ 
+-	if (pass.IsDirty(m_gridSize, screenWidth, screenHeight, m_accIndex, pRsmDepth->GetID()))
++	// The linear depth and especially the scene normals texture are NOT stable objects: the deferred
++	// decal handling swaps the normals resource depending on whether decals are visible in the
++	// current view, which is a binary function of the camera pose. A binding cached inside the
++	// IsDirty block then reads the stale buffer whenever the swap state differs from bind time -
++	// the receiver lobe and the normal offset sample corrupt, and the applied GI flips between a
++	// correct and a broken state at deterministic camera poses. Keying the bindings on the texture
++	// IDs rebinds on every swap.
++	CTexture* pLinearDepth = m_graphicsPipelineResources.m_pTexLinearDepth;
++	CTexture* pSceneNormals = m_graphicsPipelineResources.m_pTexSceneNormalsMap;
++
++	if (pass.IsDirty(m_gridSize, screenWidth, screenHeight, m_accIndex, pRsmDepth->GetID(), pLinearDepth->GetID(), pSceneNormals->GetID()))
+ 	{
+ 		static CCryNameTSCRC techName("LPVApply");
+ 		pass.SetTechnique(CShaderMan::s_shDeferredShading, techName, 0);
+ 		pass.SetOutputUAV(0, m_pIrradiance);
+-		pass.SetTexture(0, m_graphicsPipelineResources.m_pTexLinearDepth);
+-		pass.SetTexture(1, m_graphicsPipelineResources.m_pTexSceneNormalsMap);
++		pass.SetTexture(0, pLinearDepth);
++		pass.SetTexture(1, pSceneNormals);
+ 		pass.SetTexture(2, m_pGridAcc[m_accIndex][0]);
+ 		pass.SetTexture(3, m_pGridAcc[m_accIndex][1]);
+ 		pass.SetTexture(4, m_pGridAcc[m_accIndex][2]);
+@@ -606,6 +962,25 @@ void CLPVStage::ExecuteApply(const SScopedComputeCommandList& commandList, CText
+ 	const float fScreenHeight = (float)screenHeight;
+ 	pass.SetConstant(paramScreenSize, Vec4(fScreenWidth, fScreenHeight, 1.0f / fScreenWidth, 1.0f / fScreenHeight));
+ 
++	// Explicit view ray reconstruction, see LPV.cfi. m_frustumCorners are the world space corner rays
++	// of the camera frustum, the same data the engine uses for its WPOS fullscreen reconstruction.
++	// (An attempt to derive the rays by NDC unprojection instead produced clearly wrong results, so
++	// the mirrored-vertex-ordering suspicion about m_frustumCorners is likely wrong - see the case
++	// file 07_flicker_case_file.md.)
++	const SRenderViewInfo& viewInfo = GetCurrentViewInfo();
++
++	static CCryNameR paramCamPos("LPVCamPos");
++	pass.SetConstant(paramCamPos, Vec4(viewInfo.cameraOrigin, 0.0f));
++
++	static CCryNameR paramFrustumLT("LPVFrustumLT");
++	pass.SetConstant(paramFrustumLT, Vec4(viewInfo.m_frustumCorners[SRenderViewInfo::eFrustum_LT], 0.0f));
++	static CCryNameR paramFrustumRT("LPVFrustumRT");
++	pass.SetConstant(paramFrustumRT, Vec4(viewInfo.m_frustumCorners[SRenderViewInfo::eFrustum_RT], 0.0f));
++	static CCryNameR paramFrustumLB("LPVFrustumLB");
++	pass.SetConstant(paramFrustumLB, Vec4(viewInfo.m_frustumCorners[SRenderViewInfo::eFrustum_LB], 0.0f));
++	static CCryNameR paramFrustumRB("LPVFrustumRB");
++	pass.SetConstant(paramFrustumRB, Vec4(viewInfo.m_frustumCorners[SRenderViewInfo::eFrustum_RB], 0.0f));
++
+ 	static CCryNameR paramApply("LPVApplyParams");
+ 	pass.SetConstant(paramApply, Vec4(CRendererCVars::CV_r_LPVIntensity, (float)CRendererCVars::CV_r_LPVDebug, 0.0f, 0.0f));
+ 
+@@ -616,3 +991,79 @@ void CLPVStage::ExecuteApply(const SScopedComputeCommandList& commandList, CText
+ 	pass.PrepareResourcesForUse(commandList);
+ 	pass.Execute(commandList);
+ }
++
++void CLPVStage::ExecuteDebugProbes(CTexture* pColorTarget, CTexture* pDepthTarget)
++{
++	// m_bResultValid also covers the grid transform and the accumulation index: they are only up to
++	// date when Execute() ran all the way through for this frame.
++	// 10 = probe balls only, 11 = balls + surface mosaic (the mosaic branch lives in LPVApplyCS)
++	if ((CRendererCVars::CV_r_LPVDebug != 10 && CRendererCVars::CV_r_LPVDebug != 11) || !m_bResultValid || m_gridSize <= 0)
++		return;
++
++	if (!CShaderMan::s_shDeferredShading)
++		return;
++
++	if (!CTexture::IsTextureExist(pColorTarget) || !CTexture::IsTextureExist(pDepthTarget))
++		return;
++
++	CTexture* pGridR = m_pGridAcc[m_accIndex][0];
++	CTexture* pGridG = m_pGridAcc[m_accIndex][1];
++	CTexture* pGridB = m_pGridAcc[m_accIndex][2];
++	if (!CTexture::IsTextureExist(pGridR) || !CTexture::IsTextureExist(pGridG) || !CTexture::IsTextureExist(pGridB))
++		return;
++
++	CRenderView* pRenderView = RenderView();
++	if (!pRenderView)
++		return;
++
++	PROFILE_LABEL_SCOPE("LPV_DEBUG_PROBES");
++
++	auto& pass = m_passDebugProbes;
++	auto& prim = m_primDebugProbes;
++
++	pass.SetRenderTarget(0, pColorTarget);
++	pass.SetDepthTarget(pDepthTarget);
++	pass.SetViewport(pRenderView->GetViewport());
++	pass.BeginAddingPrimitives();
++
++	static CCryNameTSCRC techName("LPVDebugProbes");
++	prim.SetFlags(CRenderPrimitive::eFlags_ReflectShaderConstants);
++	prim.SetTechnique(CShaderMan::s_shDeferredShading, techName, 0);
++	// Reverse depth is always on in this pipeline: test against the opaque scene, never write depth.
++	prim.SetRenderState(GS_DEPTHFUNC_GEQUAL);
++	prim.SetCullMode(eCULL_None);
++	prim.SetTexture(0, pGridR);
++	prim.SetTexture(1, pGridG);
++	prim.SetTexture(2, pGridB);
++
++	// One instanced impostor quad per cell. The vertex stream stays empty (the vertex shader builds
++	// the quad from SV_VertexID), and ePrim_Custom is required so that CRenderPrimitive::Compile()
++	// does not overwrite the instance count with the shared primitive geometry cache.
++	prim.SetCustomVertexStream(~0u, EDefaultInputLayouts::Empty, 0);
++	prim.SetDrawInfo(eptTriangleStrip, 0, 0, 4, (uint32)(m_gridSize * m_gridSize * m_gridSize));
++	prim.SetInlineConstantBuffer(eConstantBufferShaderSlot_PerView, m_graphicsPipeline.GetMainViewConstantBuffer(), EShaderStage_Vertex);
++	prim.Compile(pass);
++
++	auto& constantManager = prim.GetConstantManager();
++	constantManager.BeginNamedConstantUpdate();
++
++	static CCryNameR paramGrid("LPVGridParams");
++	static CCryNameR paramGrid2("LPVGridParams2");
++	static CCryNameR paramProbe("LPVProbeParams");
++
++	const float fGridSize = (float)m_gridSize;
++	const Vec4 gridParams(m_gridOrigin.x, m_gridOrigin.y, m_gridOrigin.z, m_cellSize);
++	const Vec4 gridParams2(fGridSize, 1.0f / fGridSize, 1.0f / m_cellSize, fGridSize * m_cellSize);
++	// x: probe radius, y: colour scale, z: floor that keeps unlit probes visible as dark grey balls.
++	const Vec4 probeParams(m_cellSize * 0.1f, CRendererCVars::CV_r_LPVIntensity, 0.05f, 0.0f);
++
++	constantManager.SetNamedConstant(paramGrid, gridParams, eHWSC_Vertex);
++	constantManager.SetNamedConstant(paramGrid2, gridParams2, eHWSC_Vertex);
++	constantManager.SetNamedConstant(paramProbe, probeParams, eHWSC_Vertex);
++	constantManager.SetNamedConstant(paramProbe, probeParams, eHWSC_Pixel);
++
++	constantManager.EndNamedConstantUpdate(&pass.GetViewport(), pRenderView);
++
++	pass.AddPrimitive(&prim);
++	pass.Execute();
++}
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.h b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.h
+index ee2e4b1c..5e1f5842 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.h
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.h
+@@ -4,6 +4,7 @@
+ 
+ #include "Common/GraphicsPipelineStage.h"
+ #include "Common/ComputeRenderPass.h"
++#include "Common/PrimitiveRenderPass.h"
+ 
+ struct ShadowMapFrustum;
+ 
+@@ -17,8 +18,9 @@ public:
+ 
+ 	// Number of spectral channels (R/G/B), each one storing 4 SH L1 coefficients.
+ 	static const int32 SHChannelNum = 3;
+-	// Number of ints per grid cell in the injection accumulator (3 channels * 4 coefficients).
+-	static const int32 AccumulatorStride = SHChannelNum * 4;
++	// Number of ints per grid cell in the injection accumulator:
++	// 3 channels * 4 SH coefficients + average surface albedo (RGB) + surfel count.
++	static const int32 AccumulatorStride = SHChannelNum * 4 + 4;
+ 	// Fixed point scale used by the injection accumulator (SH L1 coefficients can be negative).
+ 	static const int32 AccumulatorFixedPointScale = 4096;
+ 	// Upper bound for the RSM sample grid used by the injection pass.
+@@ -38,11 +40,29 @@ public:
+ 
+ 	void Execute();
+ 
++	// Screen space apply, split out of Execute(): it reads the scene normals as SRV, and at the
++	// Execute() position in the pipeline the deferred decal pass may still have them bound as a
++	// render target - on D3D11 the runtime then silently nulls the SRV and the shader reads zero
++	// normals whenever a decal is visible (a binary function of the camera pose). Called right
++	// before the tiled shading combine, after ClipVolumes/ShadowMask have rebound the OM.
++	void ExecuteApplyToScreen();
++
++	// 3D probe visualization (r_LPVDebug 10). Has to run after the opaque scene has been shaded,
++	// otherwise the tiled shading overwrites the probes - so this is not part of Execute().
++	void ExecuteDebugProbes(CTexture* pColorTarget, CTexture* pDepthTarget);
++
+ 	// RSM provider, mirrors CSvoRenderer::GetRsmColorMap()/GetRsmNormlMap(). Returns nullptr when LPV
+ 	// does not want to own the sun RSM for the given frustum.
+ 	CTexture* GetRsmColorMap(const ShadowMapFrustum& rFr, bool bCheckUpdate = false);
+ 	CTexture* GetRsmNormalMap(const ShadowMapFrustum& rFr, bool bCheckUpdate = false);
+ 
++	// Depth target of the dedicated RSM view. The cascade based fallback path renders into the depth
++	// map of the borrowed cascade instead, so this returns nullptr there.
++	CTexture* GetRsmDepthMap(const ShadowMapFrustum& rFr, bool bCheckUpdate = false);
++
++	// True while the sun RSM is rendered from a dedicated view fitted to the volume (r_LPVDedicatedRSM).
++	static bool IsDedicatedRsmEnabled();
++
+ 	// Texture objects handed to CShadowMapStage::Init() before any device resource exists.
+ 	CTexture* GetRsmColorTexture() const  { return m_pRsmColor.get(); }
+ 	CTexture* GetRsmNormalTexture() const { return m_pRsmNormal.get(); }
+@@ -64,6 +84,7 @@ private:
+ 
+ 	void ExecuteClear(const SScopedComputeCommandList& commandList);
+ 	void ExecuteInject(const SScopedComputeCommandList& commandList, CTexture* pRsmDepth, CTexture* pRsmColor, CTexture* pRsmNormal);
++	void ExecuteInjectScreen(const SScopedComputeCommandList& commandList);
+ 	void ExecuteResolve(const SScopedComputeCommandList& commandList);
+ 	void ExecutePropagate(const SScopedComputeCommandList& commandList);
+ 	void ExecuteTemporal(const SScopedComputeCommandList& commandList);
+@@ -74,6 +95,10 @@ private:
+ private:
+ 	// Propagation ping-pong pair, each entry holds the R/G/B SH textures of one iteration.
+ 	_smart_ptr<CTexture> m_pGridSH[2][SHChannelNum];
++	// Running propagation sum ping-pong pair (CryEngine 3 scheme: every iteration gathers only from
++	// the neighbours and the results are summed explicitly - the compounding "self + gathered"
++	// variant amplifies checkerboard modes exponentially with the iteration count).
++	_smart_ptr<CTexture> m_pGridSum[2][SHChannelNum];
+ 	// Temporal accumulation ping-pong pair (exponential moving average of the propagated grid).
+ 	_smart_ptr<CTexture> m_pGridAcc[2][SHChannelNum];
+ 	// Screen space output (irradiance, never pre-multiplied with albedo).
+@@ -81,16 +106,23 @@ private:
+ 	// Sun RSM owned by LPV (only used when SVOGI is not providing one).
+ 	_smart_ptr<CTexture> m_pRsmColor;
+ 	_smart_ptr<CTexture> m_pRsmNormal;
++	// Depth target of the dedicated RSM view (r_LPVDedicatedRSM), unused by the cascade fallback.
++	_smart_ptr<CTexture> m_pRsmDepth;
+ 
+ 	CGpuBuffer           m_injectionBuffer;
+ 
+ 	CComputeRenderPass   m_passClear;
+ 	CComputeRenderPass   m_passInject;
++	CComputeRenderPass   m_passInjectScreen;
+ 	CComputeRenderPass   m_passResolve;
+-	CComputeRenderPass   m_passPropagate[2];
++	CComputeRenderPass   m_passPropagate[3]; // first iteration / odd / even bindings
+ 	CComputeRenderPass   m_passTemporal[2];
+ 	CComputeRenderPass   m_passApply;
+ 
++	// Debug probe spheres, one instanced impostor quad per grid cell.
++	CPrimitiveRenderPass m_passDebugProbes;
++	CRenderPrimitive     m_primDebugProbes;
++
+ 	Matrix44A            m_rsmToWorld;
+ 	Vec3                 m_gridOrigin;
+ 	float                m_cellSize;
+@@ -100,10 +132,23 @@ private:
+ 	int32                m_rsmSampleStride;
+ 	// Index of the ping-pong set holding the propagation result of the current frame.
+ 	int32                m_finalGridIndex;
++	// Textures holding the final propagated result of the last relight (points into m_pGridSum, or
++	// m_pGridSH[0] when the iteration count is zero).
++	CTexture*            m_pFinalGrid[SHChannelNum];
+ 	// Index of the accumulation set holding the temporal result of the current frame.
+ 	int32                m_accIndex;
+ 	// Grid origin of the previous frame, used for the integer cell reprojection of the accumulation.
+ 	Vec3                 m_prevGridOrigin;
++	// RSM depth of the frame's Execute(), consumed by the deferred ExecuteApplyToScreen().
++	CTexture*            m_pApplyRsmDepth = nullptr;
++	// Set by Execute() when the grid is ready, consumed (and reset) by ExecuteApplyToScreen().
++	bool                 m_bGridReadyForApply = false;
++	// Relight gating state: the grid is only re-injected on discrete input changes or on the heartbeat
++	// interval, a frozen grid stays exactly correct for a static scene and cannot flicker.
++	Vec3                 m_lastSunDir;
++	Vec4                 m_lastSunColor;
++	int32                m_framesSinceRelight;
++	bool                 m_bForceRelight;
+ 	bool                 m_bHistoryValid;
+ 	bool                 m_bResultValid;
+ };
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ShadowMap.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ShadowMap.cpp
+index 675fb94a..db3745f4 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ShadowMap.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ShadowMap.cpp
+@@ -692,7 +692,8 @@ void CShadowMapStage::PreparePassIDForFrustum(const SShadowFrustumToRender& frus
+ 	}
+ 	else
+ #endif
+-	if (frustumRenderType == CRenderView::eShadowFrustumRenderType_SunDynamic && IsLPVRsmFrustum(frustum))
++	if ((frustumRenderType == CRenderView::eShadowFrustumRenderType_SunDynamic
++	     || frustumRenderType == CRenderView::eShadowFrustumRenderType_LPVRsm) && IsLPVRsmFrustum(frustum))
+ 	{
+ 		passID = ePass_DirectionalLightRSM;
+ 		cry_sprintf(profileLabel, "SUN FRUSTUM (LPV RSM) %i", frustum.nShadowMapLod);
+@@ -720,6 +721,14 @@ void CShadowMapStage::PreparePassIDForFrustum(const SShadowFrustumToRender& frus
+ 				cry_sprintf(profileLabel, "HEIGHTMAP AO");
+ 			}
+ 			break;
++		case CRenderView::eShadowFrustumRenderType_LPVRsm:
++			{
++				// The LPV stage did not claim the frustum (stage not registered in this pipeline, or SVOGI
++				// took the RSM slot). PrepareOutputsForPass() finds no depth target and drops the pass.
++				passID = ePass_DirectionalLight;
++				cry_sprintf(profileLabel, "SUN FRUSTUM (LPV RSM UNCLAIMED)");
++			}
++			break;
+ 		case CRenderView::eShadowFrustumRenderType_Custom:
+ 			{
+ 				passID = ePass_DirectionalLight;
+@@ -874,8 +883,17 @@ _smart_ptr<CTexture> CShadowMapStage::PrepareOutputsForFrustumWithCaching(const
+ 
+ 			pDepthTarget = heightMapAO->GetHeightMapAODepthTex(0);
+ 		}
++		else if (frustum.m_eFrustumType == ShadowMapFrustum::eFrustumType::e_LPVRsm)
++		{
++			// Owned by the LPV stage, which also owns the matching albedo/normal targets.
++			if (auto* pLPVStage = m_graphicsPipeline.GetStage<CLPVStage>())
++				pDepthTarget = pLPVStage->GetRsmDepthMap(frustum, true);
++
++			if (!pDepthTarget)
++				return nullptr;
++		}
+ 
+-		// Cover the case, that when a full update was requested and no objects are rendered into it, the depth-map doesn't contain previous data	
++		// Cover the case, that when a full update was requested and no objects are rendered into it, the depth-map doesn't contain previous data
+ 		const bool bPreviousContents = frustum.bIncrementalUpdate && !pDepthTarget->IsDiscarded();
+ 		clearMode = bPreviousContents ? CShadowMapPass::eClearMode_None : CShadowMapPass::eClearMode_Fill;
+ 	}
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/StandardGraphicsPipeline.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/StandardGraphicsPipeline.cpp
+index e3fc38e2..8df4d511 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/StandardGraphicsPipeline.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/StandardGraphicsPipeline.cpp
+@@ -519,6 +519,16 @@ void CStandardGraphicsPipeline::Execute()
+ 				GetStage<CShadowMaskStage>()->Prepare();
+ 				GetStage<CShadowMaskStage>()->Execute();
+ 
++				// Light Propagation Volumes screen space apply: deferred to this point so that the
++				// graphics passes above have rebound the OM - at the earlier grid update position the
++				// deferred decal pass may still have the scene normals bound as render target, which
++				// on D3D11 silently nulls the compute SRV (see CLPVStage::ExecuteApplyToScreen).
++				if (auto* pLPVStage = GetStage<CLPVStage>())
++				{
++					if (pLPVStage->IsStageActive(m_renderingFlags))
++						pLPVStage->ExecuteApplyToScreen();
++				}
++
+ 				GetStage<CTiledShadingStage>()->Execute();
+ 
+ 				if (GetStage<CScreenSpaceSSSStage>()->IsStageActive(m_renderingFlags))
+@@ -536,6 +546,14 @@ void CStandardGraphicsPipeline::Execute()
+ 				GetStage<CSkyStage>()->Execute(m_pipelineResources.m_pTexHDRTarget, pZTexture);
+ 		}
+ 
++		// Light Propagation Volumes debug probe spheres (r_LPVDebug 10). Drawn after the opaque scene
++		// has been shaded, otherwise the tiled shading would overwrite them.
++		if (auto* pLPVStage = GetStage<CLPVStage>())
++		{
++			if (pLPVStage->IsStageActive(m_renderingFlags))
++				pLPVStage->ExecuteDebugProbes(m_pipelineResources.m_pTexHDRTarget, pZTexture);
++		}
++
+ 		// Deferred ocean caustics
+ 		if (GetStage<CWaterStage>()->IsDeferredOceanCausticsEnabled())
+ 			GetStage<CWaterStage>()->ExecuteDeferredOceanCaustics();
+diff --git a/Engine/Shaders/HWScripts/CryFX/LPV.cfi b/Engine/Shaders/HWScripts/CryFX/LPV.cfi
+index a3bba755..960e852e 100644
+--- a/Engine/Shaders/HWScripts/CryFX/LPV.cfi
++++ b/Engine/Shaders/HWScripts/CryFX/LPV.cfi
+@@ -26,12 +26,21 @@ float4 LPVRsmParams;
+ float4 LPVRsmSize;
+ // xyz: normalized direction towards the sun
+ float4 LPVSunDir;
+-// rgb: sun colour
++// rgb: sun colour, w: intensity calibration for the secondary bounce feedback
+ float4 LPVSunColor;
+ // x: GI intensity multiplier, y: debug mode (0 off, 1 grid uv, 2 raw L0, 3 edge fade)
+ float4 LPVApplyParams;
+ // xy: screen size, zw: 1 / screen size
+ float4 LPVScreenSize;
++// Explicit view ray reconstruction for the apply pass: camera origin and the world space frustum
++// corner rays (scaled so that ray * normalizedLinearDepth spans the full depth range), uploaded
++// from SRenderViewInfo. CV_ScreenToWorldBasis proved unreliable from a compute pass - the sampled
++// volume followed the camera orientation, cells popped in on one side and out on the other.
++float4 LPVCamPos;
++float4 LPVFrustumLT;
++float4 LPVFrustumRT;
++float4 LPVFrustumLB;
++float4 LPVFrustumRB;
+ // RSM texture space (u, v, depth, 1) -> world space
+ float4x4 LPVRsmToWorld;
+ 
+@@ -79,10 +88,24 @@ float4 LPVCone90(float3 dir)
+ 	return LPVProjectZH(dir, float2(LPV_ZH_CONE0, LPV_ZH_CONE1));
+ }
+ 
++// Replaces NaN with 0 and clamps against fp16 overflow. Applied to the persistent accumulation
++// state: a diverged bounce feedback (INF -> NaN through the signed SH dot products) would otherwise
++// poison whole regions, which the tonemapper displays as black patches.
++float4 LPVSanitize(float4 v)
++{
++	v = (v == v) ? v : (float4)0.0f;
++	return clamp(v, -60000.0f, 60000.0f);
++}
++
+ // Linear index of the first accumulator element of a cell.
++// Layout: 12 SH coefficients (3 channels * 4), average surface albedo (RGB), surfel count.
++#define LPV_ACCUM_STRIDE  16u
++#define LPV_ACCUM_ALBEDO  12u
++#define LPV_ACCUM_COUNT   15u
++
+ uint LPVCellBase(uint3 cell, uint gridSize)
+ {
+-	return ((cell.z * gridSize + cell.y) * gridSize + cell.x) * 12u;
++	return ((cell.z * gridSize + cell.y) * gridSize + cell.x) * LPV_ACCUM_STRIDE;
+ }
+ 
+ //////////////////////////////////////////////////////////////////////////////////////////
+@@ -100,7 +123,7 @@ void LPVClearCS(uint3 DTid : SV_DispatchThreadID)
+ 
+ 	const uint base = LPVCellBase(DTid, gridSize);
+ 
+-	[unroll] for (uint i = 0; i < 12; ++i)
++	[unroll] for (uint i = 0; i < LPV_ACCUM_STRIDE; ++i)
+ 		LPVInjectionUAV[base + i] = 0;
+ }
+ 
+@@ -120,6 +143,13 @@ Texture2D<float>  LPVRsmDepth  : register(t0);
+ Texture2D<float4> LPVRsmColor  : register(t1);
+ Texture2D<float4> LPVRsmNormal : register(t2);
+ 
++// Previous frame accumulated grid, sampled at the VPL position for the secondary bounce feedback.
++Texture3D<float4> LPVInjectPrevR : register(t3);
++Texture3D<float4> LPVInjectPrevG : register(t4);
++Texture3D<float4> LPVInjectPrevB : register(t5);
++
++SamplerState LPVInjectSampler : register(s0);
++
+ [numthreads(LPV_INJECT_TILE_SIZE, LPV_INJECT_TILE_SIZE, 1)]
+ void LPVInjectCS(uint3 DTid : SV_DispatchThreadID)
+ {
+@@ -132,7 +162,7 @@ void LPVInjectCS(uint3 DTid : SV_DispatchThreadID)
+ 	// Debug modes 5/6: bypass the RSM and the matrix entirely, flood the whole grid with unit flux.
+ 	// The dispatch is 2D, so every xy thread fills a full z column to cover the volume.
+ 	// If the resolved grid stays black in this mode the accumulator/atomics/resolve chain is broken.
+-	if (debugMode >= 5)
++	if (debugMode == 5 || debugMode == 6)
+ 	{
+ 		const uint dbgGridSize = (uint)LPVGridParams2.x;
+ 		if (DTid.x >= dbgGridSize || DTid.y >= dbgGridSize)
+@@ -168,16 +198,33 @@ void LPVInjectCS(uint3 DTid : SV_DispatchThreadID)
+ 		return;
+ 	normal = (normalLenSq < 1e-4f) ? float3(0.0f, 0.0f, 1.0f) : normal * rsqrt(normalLenSq);
+ 
+-	const float3 dirToLight = LPVSunDir.xyz;
+-	const float ndotl = debugBypass ? 1.0f : saturate(dot(normal, dirToLight));
+-	if (ndotl <= 0.0f)
+-		return;
+-
+ 	const float2 uv = ((float2)texel + 0.5f) * LPVRsmSize.y;
+ 	const float4 worldPosH = mul(LPVRsmToWorld, float4(uv, depth, 1.0f));
+ 	const float3 worldPos = worldPosH.xyz / worldPosH.w;
+ 
+ 	const float3 albedo = LPVRsmColor.Load(int3(texel, 0)).rgb;
++	const int gridSize = (int)LPVGridParams2.x;
++
++	// Surface cache for the SVOGI style secondary bounce: every valid surfel registers its albedo in
++	// the cell it lives in (independent of the sun facing), LPVResolve turns the average albedo plus
++	// the previous frame grid into re-emitted light.
++	{
++		const int3 surfCell = (int3)floor((worldPos - LPVGridParams.xyz) * LPVGridParams2.z);
++		if (all(surfCell >= 0) && all(surfCell < gridSize))
++		{
++			const uint surfBase = LPVCellBase((uint3)surfCell, (uint)gridSize);
++			InterlockedAdd(LPVInjectionUAV[surfBase + LPV_ACCUM_ALBEDO + 0u], (int)floor(albedo.r * LPV_FP_SCALE + 0.5f));
++			InterlockedAdd(LPVInjectionUAV[surfBase + LPV_ACCUM_ALBEDO + 1u], (int)floor(albedo.g * LPV_FP_SCALE + 0.5f));
++			InterlockedAdd(LPVInjectionUAV[surfBase + LPV_ACCUM_ALBEDO + 2u], (int)floor(albedo.b * LPV_FP_SCALE + 0.5f));
++			InterlockedAdd(LPVInjectionUAV[surfBase + LPV_ACCUM_COUNT], 1);
++		}
++	}
++
++	const float3 dirToLight = LPVSunDir.xyz;
++	const float ndotl = debugBypass ? 1.0f : saturate(dot(normal, dirToLight));
++	if (ndotl <= 0.0f)
++		return;
++
+ 	// The surfel weight is deliberately NOT applied here: with high sample counts it shrinks the
+ 	// per VPL contribution below the fixed point resolution and the smaller G/B channels of the warm
+ 	// sun colour quantize to zero (visible as a red tint). LPVResolve applies it in float instead.
+@@ -188,7 +235,6 @@ void LPVInjectCS(uint3 DTid : SV_DispatchThreadID)
+ 	const float bias = LPVRsmParams.z * LPVGridParams.w;
+ 	const float3 injectPos = worldPos + (normal + dirToLight) * bias;
+ 
+-	const int gridSize = (int)LPVGridParams2.x;
+ 	const int3 cell = (int3)floor((injectPos - LPVGridParams.xyz) * LPVGridParams2.z);
+ 	if (cell.x < 0 || cell.y < 0 || cell.z < 0 || cell.x >= gridSize || cell.y >= gridSize || cell.z >= gridSize)
+ 		return;
+@@ -213,15 +259,96 @@ technique LPVInject
+ 	}
+ }
+ 
++//////////////////////////////////////////////////////////////////////////////////////////
++// LPVInjectScreen
++//////////////////////////////////////////////////////////////////////////////////////////
++
++// Secondary bounce VPLs from the camera GBuffer: every visible pixel that received indirect light
++// last frame re-emits it. Unlike the RSM (which only contains sun visible surfaces) this covers the
++// shadowed receivers, so the bounce actually reaches the dark parts of the scene.
++
++// x: pixel step, y: samples x, z: samples y, w: feedback gain
++float4 LPVScreenInjectParams;
++// x: area weight factor (multiplied by linearDepth^2), y: screen width, z: screen height, w: injection bias in meters
++float4 LPVScreenInjectParams2;
++
++Texture2D<float>  LPVScreenInjDepth   : register(t0);
++Texture2D<float4> LPVScreenInjNormals : register(t1);
++Texture2D<float4> LPVScreenInjDiffuse : register(t2);
++Texture2D<float4> LPVScreenInjPrevIrr : register(t3);
++
++[numthreads(LPV_INJECT_TILE_SIZE, LPV_INJECT_TILE_SIZE, 1)]
++void LPVInjectScreenCS(uint3 DTid : SV_DispatchThreadID)
++{
++	if (DTid.x >= (uint)LPVScreenInjectParams.y || DTid.y >= (uint)LPVScreenInjectParams.z)
++		return;
++
++	const uint step = max(1u, (uint)LPVScreenInjectParams.x);
++	const uint2 pixel = DTid.xy * step + (step >> 1u);
++	if (pixel.x >= (uint)LPVScreenInjectParams2.y || pixel.y >= (uint)LPVScreenInjectParams2.z)
++		return;
++
++	const float linearDepth = LPVScreenInjDepth.Load(int3(pixel, 0)).x;
++	if (linearDepth >= 1.0f)
++		return;
++
++	const float3 prevIrradiance = LPVScreenInjPrevIrr.Load(int3(pixel, 0)).rgb;
++	if (dot(prevIrradiance, (float3)1.0f) < 1e-5f)
++		return;
++
++	const float3 normal = DecodeGBufferNormal(LPVScreenInjNormals.Load(int3(pixel, 0)));
++	const float3 albedo = LPVScreenInjDiffuse.Load(int3(pixel, 0)).rgb;
++	const float3 worldPos = ReconstructWorldPos((int2)pixel, linearDepth, false);
++
++	// Area compensation: a screen pixel covers linearDepth^2 * factor times the area of an RSM texel,
++	// the shared surfel weight in LPVResolve assumes RSM texel footprints.
++	const float areaWeight = LPVScreenInjectParams2.x * linearDepth * linearDepth;
++
++	const float3 flux = albedo * prevIrradiance * (LPVScreenInjectParams.w * areaWeight);
++
++	const float3 injectPos = worldPos + normal * LPVScreenInjectParams2.w;
++
++	const int gridSize = (int)LPVGridParams2.x;
++	const int3 cell = (int3)floor((injectPos - LPVGridParams.xyz) * LPVGridParams2.z);
++	if (cell.x < 0 || cell.y < 0 || cell.z < 0 || cell.x >= gridSize || cell.y >= gridSize || cell.z >= gridSize)
++		return;
++
++	const float4 sh = LPVCosineLobe(normal);
++	const uint base = LPVCellBase((uint3)cell, (uint)gridSize);
++
++	[unroll] for (uint k = 0; k < 4; ++k)
++	{
++		InterlockedAdd(LPVInjectionUAV[base + 0u + k], (int)floor(sh[k] * flux.r * LPV_FP_SCALE + 0.5f));
++		InterlockedAdd(LPVInjectionUAV[base + 4u + k], (int)floor(sh[k] * flux.g * LPV_FP_SCALE + 0.5f));
++		InterlockedAdd(LPVInjectionUAV[base + 8u + k], (int)floor(sh[k] * flux.b * LPV_FP_SCALE + 0.5f));
++	}
++}
++
++technique LPVInjectScreen
++{
++	pass p0
++	{
++		ComputeShader = LPVInjectScreenCS();
++	}
++}
++
+ //////////////////////////////////////////////////////////////////////////////////////////
+ // LPVResolve
+ //////////////////////////////////////////////////////////////////////////////////////////
+ 
+ // x: surfel weight (applied here in float instead of pre-quantization in the inject pass)
+ float4 LPVResolveParams;
++// xyz: cell offset into the previous frame accumulation grid, w: secondary bounce gain (already
++// multiplied with the intensity calibration, 0 disables the feedback)
++float4 LPVResolveParams2;
+ 
+ Buffer<int> LPVInjectionSRV : register(t0);
+ 
++// Previous frame accumulated grid, the source of the SVOGI style re-emission feedback.
++Texture3D<float4> LPVResolvePrevR : register(t1);
++Texture3D<float4> LPVResolvePrevG : register(t2);
++Texture3D<float4> LPVResolvePrevB : register(t3);
++
+ RWTexture3D<float4> LPVResolveOutR : register(u0);
+ RWTexture3D<float4> LPVResolveOutG : register(u1);
+ RWTexture3D<float4> LPVResolveOutB : register(u2);
+@@ -248,6 +375,32 @@ void LPVResolveCS(uint3 DTid : SV_DispatchThreadID)
+ 		shB[k] = (float)LPVInjectionSRV[base + 8u + k] * weight;
+ 	}
+ 
++	// SVOGI style secondary bounce: the surfaces registered in this cell re-emit the indirect light
++	// the cell received last frame (previous accumulated grid, average albedo from the surface cache).
++	// The emission is isotropic (L0 only), the propagation spreads it into the neighbourhood.
++	const float bounceGain = LPVResolveParams2.w;
++	const int surfelCount = LPVInjectionSRV[base + LPV_ACCUM_COUNT];
++	if (bounceGain > 0.0f && surfelCount > 0)
++	{
++		const int3 prevCell = (int3)DTid + (int3)round(LPVResolveParams2.xyz);
++		if (all(prevCell >= 0) && all(prevCell < (int)gridSize))
++		{
++			const float invCount = LPV_FP_INV_SCALE / (float)surfelCount;
++			const float3 cellAlbedo = float3((float)LPVInjectionSRV[base + LPV_ACCUM_ALBEDO + 0u],
++			                                 (float)LPVInjectionSRV[base + LPV_ACCUM_ALBEDO + 1u],
++			                                 (float)LPVInjectionSRV[base + LPV_ACCUM_ALBEDO + 2u]) * invCount;
++
++			const float3 prevAmbient = float3(max(0.0f, LPVResolvePrevR.Load(int4(prevCell, 0)).x),
++			                                  max(0.0f, LPVResolvePrevG.Load(int4(prevCell, 0)).x),
++			                                  max(0.0f, LPVResolvePrevB.Load(int4(prevCell, 0)).x));
++
++			const float3 emission = cellAlbedo * prevAmbient * bounceGain;
++			shR.x += emission.r * LPV_SH_C0;
++			shG.x += emission.g * LPV_SH_C0;
++			shB.x += emission.b * LPV_SH_C0;
++		}
++	}
++
+ 	LPVResolveOutR[DTid] = shR;
+ 	LPVResolveOutG[DTid] = shG;
+ 	LPVResolveOutB[DTid] = shB;
+@@ -268,10 +421,16 @@ technique LPVResolve
+ Texture3D<float4> LPVPropSrcR : register(t0);
+ Texture3D<float4> LPVPropSrcG : register(t1);
+ Texture3D<float4> LPVPropSrcB : register(t2);
++Texture3D<float4> LPVPropSumSrcR : register(t3);
++Texture3D<float4> LPVPropSumSrcG : register(t4);
++Texture3D<float4> LPVPropSumSrcB : register(t5);
+ 
+ RWTexture3D<float4> LPVPropDstR : register(u0);
+ RWTexture3D<float4> LPVPropDstG : register(u1);
+ RWTexture3D<float4> LPVPropDstB : register(u2);
++RWTexture3D<float4> LPVPropSumDstR : register(u3);
++RWTexture3D<float4> LPVPropSumDstG : register(u4);
++RWTexture3D<float4> LPVPropSumDstB : register(u5);
+ 
+ [numthreads(LPV_GRID_TILE_SIZE, LPV_GRID_TILE_SIZE, LPV_GRID_TILE_SIZE)]
+ void LPVPropagateCS(uint3 DTid : SV_DispatchThreadID)
+@@ -292,11 +451,13 @@ void LPVPropagateCS(uint3 DTid : SV_DispatchThreadID)
+ 	if (cell.x >= gridSize || cell.y >= gridSize || cell.z >= gridSize)
+ 		return;
+ 
+-	// Self + gathered variant: the destination keeps the source cell content so that the light
+-	// accumulates over the iterations without an extra accumulation texture set.
+-	float4 dstR = LPVPropSrcR.Load(int4(cell, 0));
+-	float4 dstG = LPVPropSrcG.Load(int4(cell, 0));
+-	float4 dstB = LPVPropSrcB.Load(int4(cell, 0));
++	// Gather-only propagation (CryEngine 3 scheme): the destination holds only the light arriving
++	// from the neighbours this iteration - a decaying diffusion that is stable for any iteration
++	// count. The total is kept in an explicit running sum. The previous "self + gathered" variant
++	// compounded the operator and blew up checkerboard modes exponentially with the iteration count.
++	float4 dstR = (float4)0.0f;
++	float4 dstG = (float4)0.0f;
++	float4 dstB = (float4)0.0f;
+ 
+ 	[unroll] for (int i = 0; i < 6; ++i)
+ 	{
+@@ -327,6 +488,10 @@ void LPVPropagateCS(uint3 DTid : SV_DispatchThreadID)
+ 	LPVPropDstR[DTid] = dstR;
+ 	LPVPropDstG[DTid] = dstG;
+ 	LPVPropDstB[DTid] = dstB;
++
++	LPVPropSumDstR[DTid] = LPVSanitize(LPVPropSumSrcR.Load(int4(cell, 0)) + dstR);
++	LPVPropSumDstG[DTid] = LPVSanitize(LPVPropSumSrcG.Load(int4(cell, 0)) + dstG);
++	LPVPropSumDstB[DTid] = LPVSanitize(LPVPropSumSrcB.Load(int4(cell, 0)) + dstB);
+ }
+ 
+ technique LPVPropagate
+@@ -390,9 +555,9 @@ void LPVTemporalCS(uint3 DTid : SV_DispatchThreadID)
+ 		alpha = 1.0f;
+ 	}
+ 
+-	LPVTempOutR[DTid] = lerp(prevR, curR, alpha);
+-	LPVTempOutG[DTid] = lerp(prevG, curG, alpha);
+-	LPVTempOutB[DTid] = lerp(prevB, curB, alpha);
++	LPVTempOutR[DTid] = LPVSanitize(lerp(prevR, curR, alpha));
++	LPVTempOutG[DTid] = LPVSanitize(lerp(prevG, curG, alpha));
++	LPVTempOutB[DTid] = LPVSanitize(lerp(prevB, curB, alpha));
+ }
+ 
+ technique LPVTemporal
+@@ -444,7 +609,11 @@ void LPVApplyCS(uint3 DTid : SV_DispatchThreadID)
+ 	[branch] if (linearDepth < 1.0f)
+ 	{
+ 		const float3 normal = DecodeGBufferNormal(LPVSceneNormals.Load(int3(pixelCoord, 0)));
+-		const float3 worldPos = ReconstructWorldPos((int2)pixelCoord, linearDepth, false);
++
++		const float2 screenUV = ((float2)pixelCoord + 0.5f) * LPVScreenSize.zw;
++		const float3 viewRay = lerp(lerp(LPVFrustumLT.xyz, LPVFrustumRT.xyz, screenUV.x),
++		                            lerp(LPVFrustumLB.xyz, LPVFrustumRB.xyz, screenUV.x), screenUV.y);
++		const float3 worldPos = LPVCamPos.xyz + viewRay * linearDepth;
+ 
+ 		// Receiver side offset along the surface normal (half a cell): moves the sample point away
+ 		// from the wall so that the trilinear lookup does not pick up cells on the far side of thin
+@@ -476,7 +645,36 @@ void LPVApplyCS(uint3 DTid : SV_DispatchThreadID)
+ 			return;
+ 		}
+ 
+-		if (debugMode == 2 || debugMode >= 4)
++		// Debug mode 9: probe visualization. Point sampled per cell L0 energy of the accumulated grid
++		// projected onto the scene surfaces (blocky = one colour per cell) with darkened cell borders,
++		// scaled by r_LPVIntensity. Flickering probes and their spatial distribution become directly
++		// visible. View with r_ShowRenderTarget LPVIrradiance.
++		// Mode 9: surface projection (mosaic) only. Mode 11: mosaic + probe balls combined, so the
++		// two can be checked against each other - both derive from the same grid, the mosaic must
++		// interlock with the ball lattice exactly. Mode 10 is balls only (handled in the C++ call
++		// site of the probe pass, no branch here).
++		if (debugMode == 9 || debugMode == 11)
++		{
++			const int dbgGridSize = (int)LPVGridParams2.x;
++			const float3 cellF = saturate(gridUV) * (float)dbgGridSize;
++			const int3 dbgCell = clamp((int3)floor(cellF), 0, dbgGridSize - 1);
++
++			const float4 pr = LPVGridR.Load(int4(dbgCell, 0));
++			const float4 pg = LPVGridG.Load(int4(dbgCell, 0));
++			const float4 pb = LPVGridB.Load(int4(dbgCell, 0));
++
++			float3 probeCol = float3(max(0.0f, pr.x), max(0.0f, pg.x), max(0.0f, pb.x)) * LPVApplyParams.x;
++
++			// darken the cell borders so the grid structure is readable
++			const float3 fracPos = frac(cellF);
++			const float edgeDist = min(min(min(fracPos.x, 1.0f - fracPos.x), min(fracPos.y, 1.0f - fracPos.y)), min(fracPos.z, 1.0f - fracPos.z));
++			probeCol *= (edgeDist < 0.04f) ? 0.15f : 1.0f;
++
++			LPVIrradianceUAV[pixelCoord] = float4(probeCol, 1.0f);
++			return;
++		}
++
++		if (debugMode == 2 || (debugMode >= 4 && debugMode <= 7))
+ 		{
+ 			const float4 dbgR = LPVGridR.SampleLevel(LPVGridSampler, saturate(gridUV), 0);
+ 			const float4 dbgG = LPVGridG.SampleLevel(LPVGridSampler, saturate(gridUV), 0);
+@@ -519,3 +717,92 @@ technique LPVApply
+ 		ComputeShader = LPVApplyCS();
+ 	}
+ }
++
++//////////////////////////////////////////////////////////////////////////////////////////
++// LPVDebugProbes
++//////////////////////////////////////////////////////////////////////////////////////////
++
++// 3D probe visualization (r_LPVDebug 10): one camera facing impostor quad per grid cell, drawn as a
++// single instanced draw of gridSize^3 instances. The pixel shader turns the quad into a shaded ball
++// (discard outside the unit disc, fake sphere normal from the impostor coordinates) coloured by the
++// L0 coefficient of the accumulated grid. The pass renders into the HDR target with the scene depth
++// buffer bound, so the lattice is occluded by the geometry in front of it.
++
++// x: probe radius in meters, y: colour scale (r_LPVIntensity), z: unlit floor, w: unused
++float4 LPVProbeParams;
++
++Texture3D<float4> LPVProbeGridR : register(t0);
++Texture3D<float4> LPVProbeGridG : register(t1);
++Texture3D<float4> LPVProbeGridB : register(t2);
++
++struct v2fLPVProbe
++{
++	float4                HPosition   : SV_POSITION;
++	float2                ImpostorUV  : TEXCOORD0;
++	nointerpolation uint3 Cell        : TEXCOORD1;
++};
++
++v2fLPVProbe LPVDebugProbesVS(uint vertexId : SV_VertexID, uint instanceId : SV_InstanceID)
++{
++	v2fLPVProbe OUT = (v2fLPVProbe)0;
++
++	const uint gridSize = (uint)LPVGridParams2.x;
++	const uint3 cell = uint3(instanceId % gridSize,
++	                         (instanceId / gridSize) % gridSize,
++	                         instanceId / (gridSize * gridSize));
++
++	const float3 cellCenter = LPVGridParams.xyz + ((float3)cell + 0.5f) * LPVGridParams.w;
++
++	// Triangle strip corners: 0 = (-1,-1), 1 = (1,-1), 2 = (-1,1), 3 = (1,1).
++	const float2 corner = float2((vertexId & 1u) ? 1.0f : -1.0f, (vertexId & 2u) ? 1.0f : -1.0f);
++
++	const float radius = LPVProbeParams.x;
++	const float3 worldPos = cellCenter
++	                      + CV_CameraRightVector.xyz * (corner.x * radius)
++	                      + CV_CameraUpVector.xyz * (corner.y * radius);
++
++	OUT.HPosition = mul(CV_ViewProjMatr, float4(worldPos, 1.0f));
++	OUT.ImpostorUV = corner;
++	OUT.Cell = cell;
++
++	return OUT;
++}
++
++pixout_fp LPVDebugProbesPS(v2fLPVProbe IN)
++{
++	pixout_fp OUT = (pixout_fp)0;
++
++	const float radiusSq = dot(IN.ImpostorUV, IN.ImpostorUV);
++	clip(1.0f - radiusSq);
++
++	// Fake sphere normal of the impostor, only used to shade the ball.
++	const float3 normal = float3(IN.ImpostorUV, sqrt(saturate(1.0f - radiusSq)));
++
++	const int3 cell = (int3)IN.Cell;
++	float3 probe = float3(max(0.0f, LPVProbeGridR.Load(int4(cell, 0)).x),
++	                      max(0.0f, LPVProbeGridG.Load(int4(cell, 0)).x),
++	                      max(0.0f, LPVProbeGridB.Load(int4(cell, 0)).x));
++
++	// The floor keeps cells without any energy visible as dark grey balls, so that the full lattice
++	// (and not only the lit part of it) can be observed.
++	probe = probe * LPVProbeParams.y + LPVProbeParams.z;
++
++	const float shade = saturate(dot(normal, normalize(float3(0.3f, 0.3f, 1.0f)))) * 0.75f + 0.25f;
++
++	OUT.Color = float4(probe * shade, 1.0f);
++
++	return OUT;
++}
++
++technique LPVDebugProbes
++{
++	pass p0
++	{
++		VertexShader = LPVDebugProbesVS();
++		PixelShader = LPVDebugProbesPS();
++
++		ZEnable = true;
++		ZWriteEnable = false;
++		CullMode = None;
++	}
++}
+-- 
+2.47.1.windows.1
+

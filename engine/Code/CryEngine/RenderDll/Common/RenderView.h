@@ -100,6 +100,7 @@ public:
 		eShadowFrustumRenderType_SunDynamic  = 2,
 		eShadowFrustumRenderType_LocalLight  = 3,
 		eShadowFrustumRenderType_Custom      = 4,
+		eShadowFrustumRenderType_LPVRsm      = 5,
 
 		eShadowFrustumRenderType_Count,
 		eShadowFrustumRenderType_First = eShadowFrustumRenderType_SunCached

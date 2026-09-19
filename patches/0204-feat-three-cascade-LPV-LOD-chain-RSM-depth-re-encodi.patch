@@ -1,0 +1,790 @@
+From c02118a7d6e1aa6952dd1a2364a2308236bfb082 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Thu, 13 Aug 2026 13:38:51 +0800
+Subject: [PATCH 204/206] feat: three-cascade LPV LOD chain + RSM depth
+ re-encoding + SH de-ringing
+
+Root-cause fixes (investigations/gi_lpv/10, 11):
+- RSM depth encoding: the depth buffer stores LINEAR (Z-n)/(F-n) while
+  the projective inverse expects z_ndc - the mismatch stretched all
+  content along the sun axis proportionally to the depth range
+  (~17-35 m at r_LPVRsmClipRange 700; user-diagnosed). Every consumer
+  (inject, resolve sky test, debug 8) now converts via LPVRsmDepthRange
+  pinned with the matrices. The caster-collection sweep also follows the
+  clip range so near/far occlusion honesty matches.
+- SH L1 ringing: a pure cosine lobe evaluates negative against an
+  opposing receiver and ate the co-stored ambient (black discs around
+  sun patches). LPVEvalReceiver scales only the negative directional
+  term by 0.25 = A0^2/A1^2 - pure lobe lands at exactly zero, aligned
+  response and wall-leak cancellation unchanged.
+
+Cascade LOD chain (user design):
+- MaxCascadeNum 3, r_LPVCascadeScale is now the PER STEP ratio
+  (default 3: 96 / 288 / 864 m), RSM resolution halves per cascade
+  (1024 / 512 / 256), chained blend weights with a 30% fade band,
+  far-cascade iteration halving removed (energy consistency at seams).
+- Height map AO damps the coarse cascades indoors
+  (r_LPVHeightMapOcclusion): their 6 / 18 m cells cannot resolve walls.
+- Guards: cache-lod reservation underflow (enabling height map AO
+  poisoned nCachedLodCount and killed the sun shadows), RSM MRT size
+  mismatch during level switches drops the pass for one frame.
+- Debug 13 / 14 / 15: mid raw / near-vs-mid energy compare / outer raw.
+- Defaults from the user's three-scene sweet spot: bounce 0.15,
+  sky 0.15, MaxIrradiance 3, Occlusion 10.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Tu9cj9ax1mqCV93HVfCfpW
+---
+ Code/CryEngine/Cry3DEngine/LightEntity.cpp    |  25 ++-
+ Code/CryEngine/Cry3DEngine/ShadowCache.cpp    |  21 +-
+ .../RenderDll/Common/RendererCVars.cpp        |  30 ++-
+ .../RenderDll/Common/RendererCVars.h          |   1 +
+ .../XRenderD3D9/GraphicsPipeline/LPV.cpp      |  85 ++++++--
+ .../XRenderD3D9/GraphicsPipeline/LPV.h        |  11 +-
+ .../GraphicsPipeline/ShadowMap.cpp            |  21 +-
+ Engine/Shaders/HWScripts/CryFX/LPV.cfi        | 196 ++++++++++++++++--
+ 8 files changed, 327 insertions(+), 63 deletions(-)
+
+diff --git a/Code/CryEngine/Cry3DEngine/LightEntity.cpp b/Code/CryEngine/Cry3DEngine/LightEntity.cpp
+index 3bb54c99..b60cce76 100644
+--- a/Code/CryEngine/Cry3DEngine/LightEntity.cpp
++++ b/Code/CryEngine/Cry3DEngine/LightEntity.cpp
+@@ -245,9 +245,15 @@ void CLightEntity::UpdateGSMLightSourceShadowFrustum(const SRenderingPassInfo& p
+ 				++nCachedLodCount;
+ 		}
+ 
+-		// Every consumer of the shadow cache generation marking needs its own slot in
+-		// IRenderNode::m_shadowCacheLastRendered, so reserve one for each pseudo cascade.
+-		const int nReservedCacheLods = (isHeightMapAOEnabled ? 1 : 0) + nLPVRsmCascades;
++		// Every consumer of the shadow cache generation marking wants its own slot in
++		// IRenderNode::m_shadowCacheLastRendered, so reserve one for each pseudo cascade. The
++		// reservation can exceed MAX_GSM_CACHED_LODS_NUM (height map AO + 3 LPV cascades = 4):
++		// cap it, otherwise the clamp upper bound goes NEGATIVE and the poisoned nCachedLodCount
++		// corrupts the dynamic cascade count (observed: enabling height map AO killed the sun
++		// shadows). The overflowing consumers share the last slot, which is harmless for the LPV
++		// RSM - it resets its cache generation every frame (eFullUpdate), a shared slot only ever
++		// re-marks a node, it can never wrongly skip one.
++		const int nReservedCacheLods = min((isHeightMapAOEnabled ? 1 : 0) + nLPVRsmCascades, (int)MAX_GSM_CACHED_LODS_NUM);
+ 		nCachedLodCount = clamp_tpl(nCachedLodCount, 0, MAX_GSM_CACHED_LODS_NUM - nReservedCacheLods);
+ 	}
+ 
+@@ -470,7 +476,7 @@ int CLightEntity::GetLPVRsmCascadeCount()
+ 		return 0;
+ 
+ 	static ICVar* pLPVCascades = GetConsole()->GetCVar("r_LPVCascades");
+-	return clamp_tpl(pLPVCascades ? pLPVCascades->GetIVal() : 1, 1, 2);
++	return clamp_tpl(pLPVCascades ? pLPVCascades->GetIVal() : 1, 1, 3);
+ }
+ 
+ int CLightEntity::UpdateGSMLightSourceLPVRsmFrustum(int nFrustumIndex, int nCacheLod, int nCascadeCount, const SRenderingPassInfo& passInfo)
+@@ -480,14 +486,17 @@ int CLightEntity::UpdateGSMLightSourceLPVRsmFrustum(int nFrustumIndex, int nCach
+ 	int nInitialized = 0;
+ 
+ 	// Per-cascade RSM views, exactly like the cascaded shadow maps: each LPV cascade gets its own
+-	// sun view fitted to its own volume. Both slots are always visited so a cascade that got
++	// sun view fitted to its own volume. Every slot is always visited so a cascade that got
+ 	// disabled leaves no stale frustum behind.
+-	for (int nCascade = 0; nCascade < 2; ++nCascade)
++	for (int nCascade = 0; nCascade < 3; ++nCascade)
+ 	{
+ 		const int nSlot = nFrustumIndex + nInitialized;
+-		const int nCascadeCacheLod = nCacheLod + nCascade;
++		// Cache lods can run out of MAX_GSM_CACHED_LODS_NUM headroom - clamp instead of dropping
++		// the cascade: the slot only feeds the terrain update bookkeeping, and the LPV RSM resets
++		// its generation every frame (eFullUpdate), so shared slots stay permissive.
++		const int nCascadeCacheLod = min(nCacheLod + nCascade, MAX_GSM_CACHED_LODS_NUM - 1);
+ 
+-		if (nSlot < 0 || nSlot >= MAX_GSM_LODS_NUM || nCascadeCacheLod < 0 || nCascadeCacheLod >= MAX_GSM_CACHED_LODS_NUM)
++		if (nSlot < 0 || nSlot >= MAX_GSM_LODS_NUM || nCascadeCacheLod < 0)
+ 			continue;
+ 
+ 		ShadowMapFrustumPtr& pFr = m_pShadowMapInfo->pGSM[nSlot];
+diff --git a/Code/CryEngine/Cry3DEngine/ShadowCache.cpp b/Code/CryEngine/Cry3DEngine/ShadowCache.cpp
+index d285ae1e..046541ba 100644
+--- a/Code/CryEngine/Cry3DEngine/ShadowCache.cpp
++++ b/Code/CryEngine/Cry3DEngine/ShadowCache.cpp
+@@ -286,9 +286,12 @@ AABB ShadowCacheGenerator::GetLPVBox(const SRenderingPassInfo& passInfo, int nCa
+ 
+ 	// Every cascade owns its own RSM fitted to its own volume, like the cascaded shadow maps: the
+ 	// texel-to-cell ratio and the caster sweep stay scale-invariant per cascade.
++	// r_LPVCascadeScale is the PER STEP ratio between adjacent cascades - has to stay in sync
++	// with CLPVStage::UpdateCascadeParameters().
+ 	float extent = max(1.0f, pLPVSize ? pLPVSize->GetFVal() : 96.0f);
+-	if (nCascade > 0)
+-		extent *= max(1.0f, pLPVCascadeScale ? pLPVCascadeScale->GetFVal() : 4.0f);
++	const float scaleStep = max(1.0f, pLPVCascadeScale ? pLPVCascadeScale->GetFVal() : 3.0f);
++	for (int i = 0; i < nCascade; ++i)
++		extent *= scaleStep;
+ 
+ 	// Same clamping as CLPVStage::GetValidGridSize().
+ 	int32 gridSize = pLPVGridSize ? pLPVGridSize->GetIVal() : 48;
+@@ -354,7 +357,12 @@ void ShadowCacheGenerator::InitLPVRsmFrustum(ShadowMapFrustumPtr& pFr, int nLod,
+ 	const Vec3 boxCentre = lpvBox.GetCenter();
+ 	const float halfExtent = lpvBox.GetSize().x * 0.5f;
+ 
+-	const int nTexRes = pLPVRsmSamples ? clamp_tpl(pLPVRsmSamples->GetIVal(), 64, 1024) : 1024;
++	// Resolution LOD: every further cascade halves the RSM resolution (1024 / 512 / 256 with the
++	// default) - the volume grows by r_LPVCascadeScale per step, the cells grow with it, so a
++	// lower texel density still leaves several surfels per cell face while the injection dispatch
++	// and the caster render shrink quadratically.
++	int nTexRes = pLPVRsmSamples ? clamp_tpl(pLPVRsmSamples->GetIVal(), 64, 1024) : 1024;
++	nTexRes = max(256, nTexRes >> nCascade);
+ 
+ 	// Light space basis, has to match mathMatrixLookAt() so the snapping below happens in the very
+ 	// same space the projection is built in later on (CShadowUtils::GetShadowMatrixOrtho).
+@@ -464,8 +472,13 @@ void ShadowCacheGenerator::InitLPVRsmFrustum(ShadowMapFrustumPtr& pFr, int nLod,
+ 	pFr->fDepthBiasClamp = 0.0f;
+ 
+ 	// Caster box: the volume swept towards the sun, so occluders above it are collected as well.
++	// The sweep has to reach as far as the clip range renders: with a clip range beyond the caster
++	// sweep, occluders between the two distances would be inside the rendered depth range but never
++	// collected as members. The small near cascade then misses the distant hills / tree lines that
++	// the big far cascade naturally contains, the near volume over-injects in genuinely shadowed
++	// terrain and the cascade boundary shows up as a hard brightness step.
+ 	pFr->aabbCasters = lpvBox;
+-	pFr->aabbCasters.Add(AABB(lpvBox.min + zAxis * casterRange, lpvBox.max + zAxis * casterRange));
++	pFr->aabbCasters.Add(AABB(lpvBox.min + zAxis * clipRange, lpvBox.max + zAxis * clipRange));
+ 
+ 	// Culling camera, only used by the generic frustum code paths (the caster collection below is what
+ 	// actually feeds this frustum).
+diff --git a/Code/CryEngine/RenderDll/Common/RendererCVars.cpp b/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
+index a97fe294..f307217c 100644
+--- a/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
++++ b/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
+@@ -428,6 +428,7 @@ float CRendererCVars::CV_r_LPVSpecular;
+ float CRendererCVars::CV_r_LPVPointLights;
+ float CRendererCVars::CV_r_LPVRsmMinCasterSize;
+ float CRendererCVars::CV_r_LPVRsmClipRange;
++float CRendererCVars::CV_r_LPVHeightMapOcclusion;
+ int   CRendererCVars::CV_r_LPVUpdateInterval;
+ int   CRendererCVars::CV_r_LPVDebug;
+ 
+@@ -2237,12 +2238,14 @@ void CRendererCVars::InitCVars()
+ 	               "Number of Light Propagation Volumes cells per axis. Clamped to [8, 64] and rounded down to a multiple of 4.\n");
+ 	REGISTER_CVAR3("r_LPVSize", CV_r_LPVSize, 96.0f, VF_NULL,
+ 	               "World space extent in meters of the Light Propagation Volumes grid.\n");
+-	REGISTER_CVAR3("r_LPVCascades", CV_r_LPVCascades, 2, VF_NULL,
+-	               "Number of nested Light Propagation Volumes cascades [1, 2]. Cascade 0 is the detail\n"
+-	               "volume (r_LPVSize), cascade 1 covers r_LPVCascadeScale times the extent at the same\n"
+-	               "grid resolution - distant GI instead of a hard cutoff at the volume edge.\n");
+-	REGISTER_CVAR3("r_LPVCascadeScale", CV_r_LPVCascadeScale, 4.0f, VF_NULL,
+-	               "Extent multiplier of the far Light Propagation Volumes cascade relative to r_LPVSize.\n");
++	REGISTER_CVAR3("r_LPVCascades", CV_r_LPVCascades, 3, VF_NULL,
++	               "Number of nested Light Propagation Volumes cascades [1, 3]. Cascade 0 is the detail\n"
++	               "volume (r_LPVSize), every further cascade covers r_LPVCascadeScale times the extent\n"
++	               "of the previous one at the same grid resolution (96 / 288 / 864 m with the defaults)\n"
++	               "- an LOD chain like the cascaded shadow maps instead of a hard cutoff.\n");
++	REGISTER_CVAR3("r_LPVCascadeScale", CV_r_LPVCascadeScale, 3.0f, VF_NULL,
++	               "PER STEP extent multiplier between adjacent Light Propagation Volumes cascades.\n"
++	               "Smaller steps mean a smaller quality jump at each cascade boundary.\n");
+ 	REGISTER_CVAR3("r_LPVIterations", CV_r_LPVIterations, 24, VF_NULL,
+ 	               "Number of Light Propagation Volumes propagation iterations.\n"
+ 	               "The light travel distance is roughly iterations * (r_LPVSize / r_LPVGridSize).\n");
+@@ -2258,6 +2261,13 @@ void CRendererCVars::InitCVars()
+ 	               "RSM, which keeps it lit at grazing sun elevations (at the cost of some wrongly sunlit\n"
+ 	               "injection in genuinely shadowed areas). Larger values render the sun-ward geometry fully\n"
+ 	               "for honest occlusion - expect a much darker volume when the sun is low.\n");
++	REGISTER_CVAR3("r_LPVHeightMapOcclusion", CV_r_LPVHeightMapOcclusion, 1.0f, VF_NULL,
++	               "Strength [0, 1] of the height map AO damping applied to the COARSE LPV cascades\n"
++	               "(cascade 1 and 2). Their 6 / 18 m cells barely resolve walls, so interiors gain\n"
++	               "leaked outdoor light - the height map AO mask (openness to the sky) is a cheap\n"
++	               "proxy for 'under a roof' that suppresses exactly that. Requires r_HeightMapAO > 0,\n"
++	               "silently inactive otherwise. The near cascade keeps its real geometry volume\n"
++	               "occlusion and is never damped.\n");
+ 	REGISTER_CVAR3("r_LPVRsmMinCasterSize", CV_r_LPVRsmMinCasterSize, 0.5f, VF_NULL,
+ 	               "Objects with a bounding radius below this (meters) are skipped by the LPV RSM render:\n"
+ 	               "sub-texel props cannot produce meaningful bounce surfels, they only cost draw calls.\n"
+@@ -2265,17 +2275,17 @@ void CRendererCVars::InitCVars()
+ 	REGISTER_CVAR3("r_LPVRSMSamples", CV_r_LPVRSMSamples, 1024, VF_NULL,
+ 	               "Side length of the RSM sample grid used by the injection pass, clamped to [64, 1024].\n"
+ 	               "Higher values reduce injection flicker from thin geometry at some GPU cost.\n");
+-	REGISTER_CVAR3("r_LPVSecondaryBounce", CV_r_LPVSecondaryBounce, 0.2f, VF_NULL,
++	REGISTER_CVAR3("r_LPVSecondaryBounce", CV_r_LPVSecondaryBounce, 0.15f, VF_NULL,
+ 	               "Feedback loop gain of the multi bounce (grid cells with registered surfaces re-emit\n"
+ 	               "the indirect light they received in the previous relight, SVOGI style). 0 disables it.\n"
+ 	               "1 = a physical single bounce: the cell re-emits exactly the irradiance it received,\n"
+ 	               "which is marginally stable on white scenes - stay below ~1, watch for runaway above.\n");
+-	REGISTER_CVAR3("r_LPVOcclusion", CV_r_LPVOcclusion, 1.0f, VF_NULL,
++	REGISTER_CVAR3("r_LPVOcclusion", CV_r_LPVOcclusion, 10.0f, VF_NULL,
+ 	               "Strength of the geometry volume occlusion: RSM surfels register a directional blocking\n"
+ 	               "potential per cell and the propagation attenuates the light flowing through blocked cell\n"
+ 	               "faces, which suppresses light bleeding through walls and floors.\n"
+ 	               "1 means a fully covered, perpendicular cell face blocks completely. 0 disables the GV.\n");
+-	REGISTER_CVAR3("r_LPVSkyLight", CV_r_LPVSkyLight, 0.2f, VF_NULL,
++	REGISTER_CVAR3("r_LPVSkyLight", CV_r_LPVSkyLight, 0.15f, VF_NULL,
+ 	               "Sky light ambient injected into grid cells that pass the sun visibility test against the\n"
+ 	               "RSM depth (a proxy for open sky). 1 gives an upward facing outdoor surface an irradiance\n"
+ 	               "of 0.2 x the sun luminance (in the sky hue), independent of r_LPVIntensity - the level's\n"
+@@ -2292,7 +2302,7 @@ void CRendererCVars::InitCVars()
+ 	               "vector, the same approximation CryEngine 3 shipped. Gives metals and wet surfaces a\n"
+ 	               "broad indirect reflection - the SH grid is too coarse for sharp mirror images.\n"
+ 	               "Scales on top of r_LPVIntensity. 0 disables the march and the screen target.\n");
+-	REGISTER_CVAR3("r_LPVMaxIrradiance", CV_r_LPVMaxIrradiance, 4.0f, VF_NULL,
++	REGISTER_CVAR3("r_LPVMaxIrradiance", CV_r_LPVMaxIrradiance, 3.0f, VF_NULL,
+ 	               "Soft luminance rolloff (Reinhard) of the applied LPV irradiance after r_LPVIntensity.\n"
+ 	               "Dim indirect light stays linear while hot spots (sun facing white walls, outdoor one\n"
+ 	               "bounce paths) are compressed towards this ceiling - lets a high intensity brighten\n"
+diff --git a/Code/CryEngine/RenderDll/Common/RendererCVars.h b/Code/CryEngine/RenderDll/Common/RendererCVars.h
+index 484e18ba..14f1532f 100644
+--- a/Code/CryEngine/RenderDll/Common/RendererCVars.h
++++ b/Code/CryEngine/RenderDll/Common/RendererCVars.h
+@@ -673,6 +673,7 @@ public:
+ 	static float CV_r_LPVPointLights;
+ 	static float CV_r_LPVRsmMinCasterSize;
+ 	static float CV_r_LPVRsmClipRange;
++	static float CV_r_LPVHeightMapOcclusion;
+ 	static int   CV_r_LPVUpdateInterval;
+ 	static int   CV_r_LPVDebug;
+ 
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.cpp
+index f544f2a9..661c2c96 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.cpp
+@@ -4,6 +4,7 @@
+ #include "LPV.h"
+ 
+ #include "D3DPostProcess.h"
++#include "HeightMapAO.h"
+ #include "Common/RenderView.h"
+ 
+ #if defined(FEATURE_SVO_GI)
+@@ -487,6 +488,15 @@ bool CLPVStage::UpdateFrameParameters(SCascade& cascade, const ShadowMapFrustum&
+ 	cascade.worldToRsm = worldToRsm;
+ 	cascade.rsmToWorld = worldToRsm.GetInverted();
+ 
++	// Depth range of the view, pinned together with the matrices: the RSM depth buffer stores a
++	// LINEAR normalized depth ((Z - near) / (far - near), CommonShadowGenPass.cfi divides the clip
++	// z by fFarDist), the matrix pair above works in post-divide z_ndc. The shaders convert between
++	// the two encodings via LPVRsmDepthRange - without the conversion the reconstruction is exact
++	// only at the range ends and stretches along the sun axis with an error that grows with the
++	// depth range (sub-cell at r_LPVRsmClipRange 0, tens of meters at 700).
++	cascade.rsmNearDist = frustum.fNearDist;
++	cascade.rsmFarDist = frustum.fFarDist;
++
+ 	// World size of one sampled RSM texel. The inverse is only defined up to a projective scale,
+ 	// dehomogenize before measuring. Used by the injection weight (surfel footprint / cascade cell
+ 	// footprint) and the geometry volume blocking potential.
+@@ -531,9 +541,12 @@ bool CLPVStage::UpdateFrameParameters(SCascade& cascade, const ShadowMapFrustum&
+ void CLPVStage::UpdateCascadeParameters(SCascade& cascade, int32 cascadeIndex)
+ {
+ 	// Volume extent, snapped to whole cells to avoid sampling discontinuities while the camera moves.
++	// r_LPVCascadeScale is the PER STEP ratio between adjacent cascades (96 / 288 / 864 with the
++	// defaults) - has to stay in sync with ShadowCacheGenerator::GetLPVBox().
+ 	float extent = max(1.0f, CRendererCVars::CV_r_LPVSize);
+-	if (cascadeIndex > 0)
+-		extent *= max(1.0f, CRendererCVars::CV_r_LPVCascadeScale);
++	const float scaleStep = max(1.0f, CRendererCVars::CV_r_LPVCascadeScale);
++	for (int32 i = 0; i < cascadeIndex; ++i)
++		extent *= scaleStep;
+ 
+ 	cascade.cellSize = extent / (float)m_gridSize;
+ 
+@@ -880,6 +893,10 @@ void CLPVStage::ExecuteInject(SCascade& cascade, const SScopedComputeCommandList
+ 	static CCryNameR paramRsmToWorld("LPVRsmToWorld");
+ 	pass.SetConstant(paramRsmToWorld, cascade.rsmToWorld);
+ 
++	static CCryNameR paramDepthRange("LPVRsmDepthRange");
++	const float depthSpan = max(1e-3f, cascade.rsmFarDist - cascade.rsmNearDist);
++	pass.SetConstant(paramDepthRange, Vec4(cascade.rsmNearDist, cascade.rsmFarDist, depthSpan, 1.0f / depthSpan));
++
+ 	const uint32 dispatchSize = lpvDispatchSize(cascade.rsmSampleCount, LPVInjectTileSize);
+ 	pass.SetDispatchSize(dispatchSize, dispatchSize, 1);
+ 	pass.PrepareResourcesForUse(commandList);
+@@ -949,6 +966,10 @@ void CLPVStage::ExecuteResolve(SCascade& cascade, const SScopedComputeCommandLis
+ 	static CCryNameR paramWorldToRsm("LPVWorldToRsm");
+ 	pass.SetConstant(paramWorldToRsm, cascade.worldToRsm);
+ 
++	static CCryNameR paramDepthRange("LPVRsmDepthRange");
++	const float depthSpan = max(1e-3f, cascade.rsmFarDist - cascade.rsmNearDist);
++	pass.SetConstant(paramDepthRange, Vec4(cascade.rsmNearDist, cascade.rsmFarDist, depthSpan, 1.0f / depthSpan));
++
+ 	// Sky light, premultiplied so that r_LPVSkyLight 1 gives an upward facing outdoor surface an
+ 	// irradiance of 0.2 x the sun luminance (in the sky hue), independent of the display intensity.
+ 	// The luminance is anchored to the sun instead of the raw TOD sky colour: levels that drive
+@@ -1004,11 +1025,10 @@ void CLPVStage::ExecuteResolve(SCascade& cascade, const SScopedComputeCommandLis
+ 
+ void CLPVStage::ExecutePropagate(SCascade& cascade, const SScopedComputeCommandList& commandList)
+ {
+-	int32 iterations = clamp_tpl<int32>(CRendererCVars::CV_r_LPVIterations, 0, 32);
+-	// The far cascade cells are r_LPVCascadeScale times larger, half the iterations already travel
+-	// twice the near cascade's world distance - full count would only burn GPU time.
+-	if (&cascade != &m_cascades[0])
+-		iterations = max(iterations / 2, min(iterations, 8));
++	// Same iteration count for every cascade: a reduced count on the far cascades saved GPU time
++	// but made their accumulated energy systematically lower than the near cascade's - visible as
++	// a brightness step at the cascade boundaries. Energy consistency across the seams wins.
++	const int32 iterations = clamp_tpl<int32>(CRendererCVars::CV_r_LPVIterations, 0, 32);
+ 
+ 	const uint32 dispatchSize = lpvDispatchSize(m_gridSize, LPVGridTileSize);
+ 
+@@ -1144,16 +1164,28 @@ void CLPVStage::ExecuteApply(const SScopedComputeCommandList& commandList, CText
+ 	const int32 screenHeight = m_pIrradiance->GetHeight();
+ 
+ 	SCascade& nearCascade = m_cascades[0];
+-	SCascade& farCascade = m_cascades[1];
+-	const bool bFarActive = m_activeCascadeCount > 1 && farCascade.bHistoryValid;
++	SCascade& midCascade = m_cascades[1];
++	SCascade& outerCascade = m_cascades[2];
++	const bool bMidActive = m_activeCascadeCount > 1 && midCascade.bHistoryValid;
++	const bool bOuterActive = m_activeCascadeCount > 2 && outerCascade.bHistoryValid;
+ 
+ 	// The linear depth and the scene normals are not stable texture objects, key the bindings on
+ 	// their IDs so a swap rebinds.
+ 	CTexture* pLinearDepth = m_graphicsPipelineResources.m_pTexLinearDepth;
+ 	CTexture* pSceneNormals = m_graphicsPipelineResources.m_pTexSceneNormalsMap;
+ 
+-	if (pass.IsDirty(m_gridSize, screenWidth, screenHeight, nearCascade.accIndex, farCascade.accIndex,
+-	                 m_activeCascadeCount, pRsmDepth->GetID(), pLinearDepth->GetID(), pSceneNormals->GetID()))
++	// Height map AO mask (openness to the sky), used to damp the coarse cascades indoors. Falls
++	// back to the white texture whenever the stage did not run this frame - a natural no-op.
++	CTexture* pHeightMapAO = CRendererResources::s_ptexWhite;
++	if (auto* pHmaoStage = m_graphicsPipeline.GetStage<CHeightMapAOStage>())
++	{
++		if (pHmaoStage->IsValid())
++			pHeightMapAO = pHmaoStage->GetHeightMapAOTex();
++	}
++
++	if (pass.IsDirty(m_gridSize, screenWidth, screenHeight, nearCascade.accIndex, midCascade.accIndex,
++	                 outerCascade.accIndex, m_activeCascadeCount, pRsmDepth->GetID(), pLinearDepth->GetID(),
++	                 pSceneNormals->GetID(), pHeightMapAO->GetID()))
+ 	{
+ 		static CCryNameTSCRC techName("LPVApply");
+ 		pass.SetTechnique(CShaderMan::s_shDeferredShading, techName, 0);
+@@ -1166,9 +1198,13 @@ void CLPVStage::ExecuteApply(const SScopedComputeCommandList& commandList, CText
+ 		pass.SetTexture(4, nearCascade.pGridAcc[nearCascade.accIndex][2]);
+ 		pass.SetBuffer(5, &nearCascade.injectionBuffer);
+ 		pass.SetTexture(6, pRsmDepth);
+-		pass.SetTexture(7, farCascade.pGridAcc[farCascade.accIndex][0]);
+-		pass.SetTexture(8, farCascade.pGridAcc[farCascade.accIndex][1]);
+-		pass.SetTexture(9, farCascade.pGridAcc[farCascade.accIndex][2]);
++		pass.SetTexture(7, midCascade.pGridAcc[midCascade.accIndex][0]);
++		pass.SetTexture(8, midCascade.pGridAcc[midCascade.accIndex][1]);
++		pass.SetTexture(9, midCascade.pGridAcc[midCascade.accIndex][2]);
++		pass.SetTexture(10, outerCascade.pGridAcc[outerCascade.accIndex][0]);
++		pass.SetTexture(11, outerCascade.pGridAcc[outerCascade.accIndex][1]);
++		pass.SetTexture(12, outerCascade.pGridAcc[outerCascade.accIndex][2]);
++		pass.SetTexture(13, pHeightMapAO);
+ 		pass.SetSampler(0, EDefaultSamplerStates::TrilinearClamp);
+ 	}
+ 
+@@ -1177,11 +1213,23 @@ void CLPVStage::ExecuteApply(const SScopedComputeCommandList& commandList, CText
+ 	pass.BeginConstantUpdate();
+ 	SetGridConstants(pass, nearCascade);
+ 
+-	// Far cascade volume, w of the second constant doubles as the enable flag.
++	// Far cascade volumes, y of the second constant doubles as the enable flag.
+ 	static CCryNameR paramFar("LPVGridParamsFar");
+-	pass.SetConstant(paramFar, Vec4(farCascade.gridOrigin.x, farCascade.gridOrigin.y, farCascade.gridOrigin.z, farCascade.cellSize));
++	pass.SetConstant(paramFar, Vec4(midCascade.gridOrigin.x, midCascade.gridOrigin.y, midCascade.gridOrigin.z, midCascade.cellSize));
+ 	static CCryNameR paramFar2("LPVGridParams2Far");
+-	pass.SetConstant(paramFar2, Vec4((float)m_gridSize * farCascade.cellSize, bFarActive ? 1.0f : 0.0f, 0.0f, 0.0f));
++	pass.SetConstant(paramFar2, Vec4((float)m_gridSize * midCascade.cellSize, bMidActive ? 1.0f : 0.0f, 0.0f, 0.0f));
++
++	static CCryNameR paramOuter("LPVGridParamsFar2");
++	pass.SetConstant(paramOuter, Vec4(outerCascade.gridOrigin.x, outerCascade.gridOrigin.y, outerCascade.gridOrigin.z, outerCascade.cellSize));
++	static CCryNameR paramOuter2("LPVGridParams2Far2");
++	pass.SetConstant(paramOuter2, Vec4((float)m_gridSize * outerCascade.cellSize, bOuterActive ? 1.0f : 0.0f, 0.0f, 0.0f));
++
++	// x: height map AO damping strength for the coarse cascades (0 disables the sampling).
++	static CCryNameR paramHmao("LPVHmaoParams");
++	const float hmaoStrength = (pHeightMapAO != CRendererResources::s_ptexWhite)
++	                           ? clamp_tpl(CRendererCVars::CV_r_LPVHeightMapOcclusion, 0.0f, 1.0f)
++	                           : 0.0f;
++	pass.SetConstant(paramHmao, Vec4(hmaoStrength, 0.0f, 0.0f, 0.0f));
+ 
+ 	static CCryNameR paramScreenSize("LPVScreenSize");
+ 	const float fScreenWidth = (float)screenWidth;
+@@ -1220,6 +1268,9 @@ void CLPVStage::ExecuteApply(const SScopedComputeCommandList& commandList, CText
+ 	pass.SetConstant(paramRsmToWorldApply, nearRsm.rsmToWorld);
+ 	static CCryNameR paramWorldToRsmApply("LPVWorldToRsm");
+ 	pass.SetConstant(paramWorldToRsmApply, nearRsm.worldToRsm);
++	static CCryNameR paramDepthRangeApply("LPVRsmDepthRange");
++	const float depthSpanApply = max(1e-3f, nearRsm.rsmFarDist - nearRsm.rsmNearDist);
++	pass.SetConstant(paramDepthRangeApply, Vec4(nearRsm.rsmNearDist, nearRsm.rsmFarDist, depthSpanApply, 1.0f / depthSpanApply));
+ 
+ 	pass.SetDispatchSize(lpvDispatchSize(screenWidth, LPVApplyTileSize), lpvDispatchSize(screenHeight, LPVApplyTileSize), 1);
+ 	pass.PrepareResourcesForUse(commandList);
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.h b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.h
+index 07ce2811..f54b76f0 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.h
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.h
+@@ -27,9 +27,10 @@ public:
+ 	static const int32 AccumulatorFixedPointScale = 4096;
+ 	// Upper bound for the RSM sample grid used by the injection pass.
+ 	static const int32 MaxRsmSampleCount = 1024;
+-	// Nested cascades: cascade 0 is the detail volume (r_LPVSize), cascade 1 covers
+-	// r_LPVCascadeScale times the extent at the same grid resolution.
+-	static const int32 MaxCascadeNum = 2;
++	// Nested cascades: cascade 0 is the detail volume (r_LPVSize), every further cascade covers
++	// r_LPVCascadeScale times the extent of the previous one at the same grid resolution
++	// (LOD chain like the cascaded shadow maps - range up, resolution down).
++	static const int32 MaxCascadeNum = 3;
+ 	// Upper bound for the local lights injected after the propagation (CE3 LPVPostinjectLight
+ 	// equivalent, folded into the temporal pass). Must match LPV_MAX_POINT_LIGHTS in LPV.cfi.
+ 	static const int32 MaxPointLights = 16;
+@@ -134,6 +135,10 @@ private:
+ 		// RSM view state, pinned at RSM render time so matrices and content always agree.
+ 		Matrix44A            rsmToWorld;
+ 		Matrix44A            worldToRsm;
++		// Depth range of the pinned RSM view: the depth buffer stores (Z - near) / (far - near)
++		// (linear), the matrices work in z_ndc - the shaders convert via these (LPVRsmDepthRange).
++		float                rsmNearDist = 1.0f;
++		float                rsmFarDist = 2.0f;
+ 		float                rsmTexelSize = 0.0f;
+ 		int32                rsmSize = 0;
+ 		int32                rsmSampleCount = 0;
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ShadowMap.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ShadowMap.cpp
+index 359cf711..c4089708 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ShadowMap.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ShadowMap.cpp
+@@ -176,7 +176,7 @@ void CShadowMapStage::Init()
+ 			m_ShadowMapPasses[ePass_DirectionalLight      ].Init(this,  8, pDummyDL,           nullptr,            nullptr);
+ 			m_ShadowMapPasses[ePass_DirectionalLightCached].Init(this,  8, pDummyDLC,          nullptr,            nullptr);
+ 			m_ShadowMapPasses[ePass_LocalLight            ].Init(this, 16, pDummyLL,           nullptr,            nullptr);
+-			m_ShadowMapPasses[ePass_DirectionalLightRSM   ].Init(this,  2, pDummyRsmDepth,     m_pRsmColorTex,     m_pRsmNormalTex);
++			m_ShadowMapPasses[ePass_DirectionalLightRSM   ].Init(this,  3, pDummyRsmDepth,     m_pRsmColorTex,     m_pRsmNormalTex);
+ 			m_ShadowMapPasses[ePass_LocalLightRSM         ].Init(this,  1, pDummyRsmPoolDepth, m_pRsmPoolColorTex, m_pRsmPoolNormalTex);
+ 			// *INDENT-ON*
+ 		}
+@@ -814,8 +814,10 @@ bool CShadowMapStage::PrepareOutputsForPass(const SShadowFrustumToRender& frustu
+ 	{
+ 		if (auto* pLPVStage = m_graphicsPipeline.GetStage<CLPVStage>())
+ 		{
+-			colorTargets[0] = pLPVStage->GetRsmColorMap(frustum);
+-			colorTargets[1] = pLPVStage->GetRsmNormalMap(frustum);
++			// bCheckUpdate: resize the albedo/normal targets to the frustum size right here, so a
++			// late size change still converges before the pass is assembled.
++			colorTargets[0] = pLPVStage->GetRsmColorMap(frustum, true);
++			colorTargets[1] = pLPVStage->GetRsmNormalMap(frustum, true);
+ 		}
+ 	}
+ 
+@@ -823,6 +825,19 @@ bool CShadowMapStage::PrepareOutputsForPass(const SShadowFrustumToRender& frustu
+ 	if (!pDepthTarget || !pDepthTarget->GetDevTexture())
+ 		return false;
+ 
++	// Per-cascade RSM resolutions: never hand the device pass mismatched target sizes (assert in
++	// CDeviceRenderPass::UpdatePassImpl). During level switches the recreation order of the
++	// depth/albedo/normal triplet is not atomic - drop the pass for that frame instead, the next
++	// prepare settles on consistent sizes.
++	if (frustum.m_eFrustumType == ShadowMapFrustum::e_LPVRsm)
++	{
++		if (!colorTargets[0] || !colorTargets[1])
++			return false;
++		if (colorTargets[0]->GetWidth() != pDepthTarget->GetWidth() || colorTargets[0]->GetHeight() != pDepthTarget->GetHeight()
++		    || colorTargets[1]->GetWidth() != pDepthTarget->GetWidth() || colorTargets[1]->GetHeight() != pDepthTarget->GetHeight())
++			return false;
++	}
++
+ 	// now apply to pass
+ 	targetPass.m_pClearDepthMapProvider = pClearDepthMapProvider;
+ 	targetPass.m_clearMode = clearMode;
+diff --git a/Engine/Shaders/HWScripts/CryFX/LPV.cfi b/Engine/Shaders/HWScripts/CryFX/LPV.cfi
+index 19a4f7c3..6f5c86e6 100644
+--- a/Engine/Shaders/HWScripts/CryFX/LPV.cfi
++++ b/Engine/Shaders/HWScripts/CryFX/LPV.cfi
+@@ -47,6 +47,12 @@ float4 LPVFrustumRB;
+ float4x4 LPVRsmToWorld;
+ // World space -> RSM texture space (u, v, depth, w), used by the sky visibility test in the resolve
+ float4x4 LPVWorldToRsm;
++// Depth range of the RSM view this cascade injects from, pinned together with the matrices:
++// x = fNearDist, y = fFarDist, z = fFarDist - fNearDist, w = 1 / (fFarDist - fNearDist).
++// The RSM depth buffer stores a LINEAR normalized depth (z_clip / fFarDist = (Z - n) / (F - n),
++// see CommonShadowGenPass.cfi), while the projective matrix pair works in post-divide z_ndc =
++// z_clip / w. The two encodings agree only at the range ends; every consumer has to convert.
++float4 LPVRsmDepthRange;
+ // x: geometry volume occlusion strength (pre-divided by the aligned SH transfer, 0 disables)
+ float4 LPVPropParams;
+ // rgb: sky colour premultiplied with r_LPVSkyLight and the SH normalization, w: > 0 enables
+@@ -96,6 +102,23 @@ float4 LPVCone90(float3 dir)
+ 	return LPVProjectZH(dir, float2(LPV_ZH_CONE0, LPV_ZH_CONE1));
+ }
+ 
++// Receiver evaluation with one-sided de-ringing. L1 truncation makes a pure injected cosine
++// lobe evaluate NEGATIVE against an opposing receiver (iso 0.0625 + dir 0.25 * cos: -0.1875 at
++// the opposite pole, where the true value is zero), and because a cell stores the SUM of all
++// its lobes that negative term eats the co-stored sky light / bounce energy before the final
++// clamp - visible as big black halos around bright bounce patches (sun spots on a floor; the
++// halo only clears once the ambient exceeds ~2.4x the patch energy, which is why it shrank
++// under an overdriven secondary bounce and re-grew with the feedback). Scaling only the
++// NEGATIVE directional term by 0.25 (= A0^2 / A1^2 of the cosine lobe pair - the value that
++// puts a pure lobe at exactly ZERO on the opposite pole) keeps the aligned response and the
++// wall-leak cancellation untouched while the ambient share of the cell passes through.
++float LPVEvalReceiver(float4 sh, float4 receiver)
++{
++	const float iso = sh.x * receiver.x;
++	const float dir = dot(sh.yzw, receiver.yzw);
++	return max(0.0f, iso + ((dir < 0.0f) ? 0.25f * dir : dir));
++}
++
+ // Plain SH direction basis, used to evaluate a stored SH radiance distribution in a direction.
+ float4 LPVDirSH(float3 dir)
+ {
+@@ -216,8 +239,14 @@ void LPVInjectCS(uint3 DTid : SV_DispatchThreadID)
+ 		return;
+ 	normal = (normalLenSq < 1e-4f) ? float3(0.0f, 0.0f, 1.0f) : normal * rsqrt(normalLenSq);
+ 
++	// Re-encode the LINEAR stored depth into the z_ndc the projective inverse expects (see the
++	// LPVRsmDepthRange comment). Feeding the linear value directly is exact only at the two range
++	// ends and stretches everything in between along the sun axis - the error grows quadratically
++	// with the depth range: invisible at r_LPVRsmClipRange 0 (~0.5 m), tens of meters at 700.
++	const float depthNdc = LPVRsmDepthRange.y * depth / (LPVRsmDepthRange.x + depth * LPVRsmDepthRange.z);
++
+ 	const float2 uv = ((float2)texel + 0.5f) * LPVRsmSize.y;
+-	const float4 worldPosH = mul(LPVRsmToWorld, float4(uv, depth, 1.0f));
++	const float4 worldPosH = mul(LPVRsmToWorld, float4(uv, depthNdc, 1.0f));
+ 	const float3 worldPos = worldPosH.xyz / worldPosH.w;
+ 
+ 	const float3 albedo = LPVRsmColor.Load(int3(texel, 0)).rgb;
+@@ -510,6 +539,9 @@ void LPVResolveCS(uint3 DTid : SV_DispatchThreadID)
+ 			const float3 samplePos = cellCenter + float3(0.0f, 0.0f, (float)s * 2.0f * LPVGridParams.w);
+ 
+ 			float4 rsmH = mul(LPVWorldToRsm, float4(samplePos, 1.0f));
++			// w of the projective transform is the view depth along the sun axis - keep it before
++			// the divide, the depth comparison below runs in the LINEAR stored encoding.
++			const float rsmViewDepth = rsmH.w;
+ 			rsmH /= (abs(rsmH.w) > 1e-12f) ? rsmH.w : 1.0f;
+ 
+ 			// Outside the RSM coverage there is no occluder information, treat as visible.
+@@ -517,7 +549,10 @@ void LPVResolveCS(uint3 DTid : SV_DispatchThreadID)
+ 			{
+ 				const int2 rsmTexel = clamp((int2)(rsmH.xy * LPVRsmSize.x), 0, (int)LPVRsmSize.x - 1);
+ 				const float storedDepth = LPVResolveRsmDepth.Load(int3(rsmTexel, 0)).x;
+-				skyVisible = (rsmH.z <= storedDepth);
++				// storedDepth is linear (Z - n) / (F - n); convert the sample the same way instead
++				// of comparing the hyperbolic z_ndc against it (see the LPVRsmDepthRange comment).
++				const float sampleLinear = (rsmViewDepth - LPVRsmDepthRange.x) * LPVRsmDepthRange.w;
++				skyVisible = (sampleLinear <= storedDepth);
+ 			}
+ 		}
+ 
+@@ -814,15 +849,27 @@ Texture3D<float4> LPVGridG        : register(t3);
+ Texture3D<float4> LPVGridB        : register(t4);
+ Buffer<int>       LPVApplyAccum   : register(t5);
+ Texture2D<float>  LPVApplyRsmDepth : register(t6);
+-// Far cascade accumulated grid (nested cascades).
++// Cascade 1 (mid) accumulated grid (nested cascades).
+ Texture3D<float4> LPVGridFarR     : register(t7);
+ Texture3D<float4> LPVGridFarG     : register(t8);
+ Texture3D<float4> LPVGridFarB     : register(t9);
++// Cascade 2 (outer) accumulated grid.
++Texture3D<float4> LPVGridFar2R    : register(t10);
++Texture3D<float4> LPVGridFar2G    : register(t11);
++Texture3D<float4> LPVGridFar2B    : register(t12);
++// Height map AO mask (r = openness to the sky at max depth, g = at min depth; 1 = open).
++// White texture whenever the height map AO stage did not run.
++Texture2D<float2> LPVHeightMapAO  : register(t13);
+ 
+ // xyz: world space origin of the far cascade, w: far cascade cell size in meters
+ float4 LPVGridParamsFar;
+ // x: world space extent of the far cascade, y: > 0 when the far cascade is active
+ float4 LPVGridParams2Far;
++// Cascade 2 (outer) volume, same layout as the Far pair.
++float4 LPVGridParamsFar2;
++float4 LPVGridParams2Far2;
++// x: height map AO damping strength for the coarse cascades (0 = sampling disabled).
++float4 LPVHmaoParams;
+ 
+ SamplerState LPVGridSampler : register(s0);
+ 
+@@ -854,7 +901,9 @@ void LPVApplyCS(uint3 DTid : SV_DispatchThreadID)
+ 		// Green: this texel reconstructs into the near volume.
+ 		if (rsmDepth < 1.0f)
+ 		{
+-			const float4 rsmWorldH = mul(LPVRsmToWorld, float4(rsmUV, rsmDepth, 1.0f));
++			// Same linear -> z_ndc re-encoding as the inject pass (see LPVRsmDepthRange).
++			const float rsmDepthNdc = LPVRsmDepthRange.y * rsmDepth / (LPVRsmDepthRange.x + rsmDepth * LPVRsmDepthRange.z);
++			const float4 rsmWorldH = mul(LPVRsmToWorld, float4(rsmUV, rsmDepthNdc, 1.0f));
+ 			const float3 rsmWorld = rsmWorldH.xyz / rsmWorldH.w;
+ 			const float3 volUV = (rsmWorld - LPVGridParams.xyz) / LPVGridParams2.w;
+ 			if (all(volUV >= 0.0f) && all(volUV <= 1.0f))
+@@ -894,10 +943,12 @@ void LPVApplyCS(uint3 DTid : SV_DispatchThreadID)
+ 
+ 		const float3 gridUV = (samplePos - LPVGridParams.xyz) / LPVGridParams2.w;
+ 
+-		// Fade out over the outer 10% of the volume so that the boundary is not a hard edge.
++		// Fade out over the outer 30% of the volume so that the boundary is not a hard edge: the
++		// hand-over to the coarser far cascade needs a wide ramp, a 10% band read as a line whenever
++		// the two cascades disagreed even slightly.
+ 		const float3 centered = abs(gridUV - 0.5f) * 2.0f;
+ 		const float edge = max(centered.x, max(centered.y, centered.z));
+-		const float fade = 1.0f - smoothstep(0.8f, 1.0f, edge);
++		const float fade = 1.0f - smoothstep(0.7f, 1.0f, edge);
+ 
+ 		if (debugMode == 1)
+ 		{
+@@ -932,6 +983,71 @@ void LPVApplyCS(uint3 DTid : SV_DispatchThreadID)
+ 			return;
+ 		}
+ 
++		// Debug mode 13: far cascade raw L0 sampled on every surface, ignoring the near volume and
++		// the fade bands. Bright regions have to sit at the same world positions at any
++		// r_LPVCascadeScale (only blockier with bigger cells) - if they move, the far RSM content
++		// and its matrices disagree.
++		if (debugMode == 13)
++		{
++			float3 dbgFar = (float3)0.0f;
++			if (LPVGridParams2Far.y > 0.5f)
++			{
++				const float3 uvFar = saturate((worldPos - LPVGridParamsFar.xyz) / LPVGridParams2Far.x);
++				const float4 fR = LPVGridFarR.SampleLevel(LPVGridSampler, uvFar, 0);
++				const float4 fG = LPVGridFarG.SampleLevel(LPVGridSampler, uvFar, 0);
++				const float4 fB = LPVGridFarB.SampleLevel(LPVGridSampler, uvFar, 0);
++				dbgFar = float3(abs(fR.x), abs(fG.x), abs(fB.x)) * LPVApplyParams.x;
++			}
++			LPVIrradianceUAV[pixelCoord] = float4(dbgFar, 1.0f);
++			return;
++		}
++
++		// Debug mode 15: like 13 for the OUTER cascade (cascade 2).
++		if (debugMode == 15)
++		{
++			float3 dbgFar2 = (float3)0.0f;
++			if (LPVGridParams2Far2.y > 0.5f)
++			{
++				const float3 uvFar2 = saturate((worldPos - LPVGridParamsFar2.xyz) / LPVGridParams2Far2.x);
++				const float4 f2R = LPVGridFar2R.SampleLevel(LPVGridSampler, uvFar2, 0);
++				const float4 f2G = LPVGridFar2G.SampleLevel(LPVGridSampler, uvFar2, 0);
++				const float4 f2B = LPVGridFar2B.SampleLevel(LPVGridSampler, uvFar2, 0);
++				dbgFar2 = float3(abs(f2R.x), abs(f2G.x), abs(f2B.x)) * LPVApplyParams.x;
++			}
++			LPVIrradianceUAV[pixelCoord] = float4(dbgFar2, 1.0f);
++			return;
++		}
++
++		// Debug mode 14: near/far energy comparison. R = near cascade L0 luminance, G = far cascade
++		// L0 luminance (both x intensity). Inside the overlap the hue reads as calibration:
++		// yellow = matched, red = near brighter (e.g. dishonest occlusion), green = far brighter.
++		if (debugMode == 14)
++		{
++			const float3 lumW = float3(0.2126f, 0.7152f, 0.0722f);
++			float lumNear = 0.0f;
++			if (all(abs(gridUV - 0.5f) <= 0.5f))
++			{
++				const float4 nR = LPVGridR.SampleLevel(LPVGridSampler, gridUV, 0);
++				const float4 nG = LPVGridG.SampleLevel(LPVGridSampler, gridUV, 0);
++				const float4 nB = LPVGridB.SampleLevel(LPVGridSampler, gridUV, 0);
++				lumNear = dot(float3(abs(nR.x), abs(nG.x), abs(nB.x)), lumW);
++			}
++			float lumFar = 0.0f;
++			if (LPVGridParams2Far.y > 0.5f)
++			{
++				const float3 uvFar = (worldPos - LPVGridParamsFar.xyz) / LPVGridParams2Far.x;
++				if (all(abs(uvFar - 0.5f) <= 0.5f))
++				{
++					const float4 fR = LPVGridFarR.SampleLevel(LPVGridSampler, uvFar, 0);
++					const float4 fG = LPVGridFarG.SampleLevel(LPVGridSampler, uvFar, 0);
++					const float4 fB = LPVGridFarB.SampleLevel(LPVGridSampler, uvFar, 0);
++					lumFar = dot(float3(abs(fR.x), abs(fG.x), abs(fB.x)), lumW);
++				}
++			}
++			LPVIrradianceUAV[pixelCoord] = float4(lumNear * LPVApplyParams.x, lumFar * LPVApplyParams.x, 0.0f, 1.0f);
++			return;
++		}
++
+ 		// Debug mode 9: probe visualization. Point sampled per cell L0 energy of the accumulated grid
+ 		// projected onto the scene surfaces (blocky = one colour per cell) with darkened cell borders,
+ 		// scaled by r_LPVIntensity. Flickering probes and their spatial distribution become directly
+@@ -987,23 +1103,38 @@ void LPVApplyCS(uint3 DTid : SV_DispatchThreadID)
+ 			const float4 shG = LPVGridG.SampleLevel(LPVGridSampler, gridUV, 0);
+ 			const float4 shB = LPVGridB.SampleLevel(LPVGridSampler, gridUV, 0);
+ 
+-			giNear.r = max(0.0f, dot(shR, receiver));
+-			giNear.g = max(0.0f, dot(shG, receiver));
+-			giNear.b = max(0.0f, dot(shB, receiver));
++			giNear.r = LPVEvalReceiver(shR, receiver);
++			giNear.g = LPVEvalReceiver(shG, receiver);
++			giNear.b = LPVEvalReceiver(shB, receiver);
+ 		}
+ 
+ 		irradiance = giNear * fade;
+ 
+-		// Far cascade: same lookup in the coarse volume, blended in over the near fade band and
+-		// beyond the near volume - distant geometry gets coarse GI instead of a hard cutoff.
+-		[branch] if (LPVGridParams2Far.y > 0.5f && fade < 1.0f)
++		// Cascade LOD chain: each coarser volume fills whatever blend weight the finer volumes left
++		// over (w_i = fade_i * prod(1 - fade_j, j < i)), so the hand-over is a gradient, never a
++		// step, and beyond the last volume the GI fades to zero.
++		float wRest = 1.0f - fade;
++
++		// Coarse-cascade leak damping: the 6 / 18 m cells of the mid / outer cascades barely
++		// resolve walls, so interiors gain leaked outdoor light no matter what the geometry
++		// volume does. The height map AO mask (openness to the sky) is a cheap "under a roof"
++		// proxy that suppresses exactly that contribution. The near cascade keeps its real
++		// geometry volume occlusion and is never damped.
++		float hmaoDamp = 1.0f;
++		[branch] if (LPVHmaoParams.x > 0.0f && wRest > 0.0f)
++		{
++			const float2 hmao = LPVHeightMapAO.SampleLevel(LPVGridSampler, screenUV, 0).rg;
++			hmaoDamp = lerp(1.0f, min(hmao.r, hmao.g), LPVHmaoParams.x);
++		}
++
++		[branch] if (LPVGridParams2Far.y > 0.5f && wRest > 0.0f)
+ 		{
+ 			const float3 samplePosFar = worldPos + normal * (LPVGridParamsFar.w * 0.5f);
+ 			const float3 gridUVFar = (samplePosFar - LPVGridParamsFar.xyz) / LPVGridParams2Far.x;
+ 
+ 			const float3 centeredFar = abs(gridUVFar - 0.5f) * 2.0f;
+ 			const float edgeFar = max(centeredFar.x, max(centeredFar.y, centeredFar.z));
+-			const float fadeFar = 1.0f - smoothstep(0.8f, 1.0f, edgeFar);
++			const float fadeFar = 1.0f - smoothstep(0.7f, 1.0f, edgeFar);
+ 
+ 			[branch] if (fadeFar > 0.0f)
+ 			{
+@@ -1012,11 +1143,37 @@ void LPVApplyCS(uint3 DTid : SV_DispatchThreadID)
+ 				const float4 shBFar = LPVGridFarB.SampleLevel(LPVGridSampler, gridUVFar, 0);
+ 
+ 				float3 giFar;
+-				giFar.r = max(0.0f, dot(shRFar, receiver));
+-				giFar.g = max(0.0f, dot(shGFar, receiver));
+-				giFar.b = max(0.0f, dot(shBFar, receiver));
++				giFar.r = LPVEvalReceiver(shRFar, receiver);
++				giFar.g = LPVEvalReceiver(shGFar, receiver);
++				giFar.b = LPVEvalReceiver(shBFar, receiver);
++
++				irradiance += giFar * fadeFar * wRest * hmaoDamp;
++			}
++
++			wRest *= (1.0f - fadeFar);
++		}
++
++		[branch] if (LPVGridParams2Far2.y > 0.5f && wRest > 0.0f)
++		{
++			const float3 samplePosFar2 = worldPos + normal * (LPVGridParamsFar2.w * 0.5f);
++			const float3 gridUVFar2 = (samplePosFar2 - LPVGridParamsFar2.xyz) / LPVGridParams2Far2.x;
++
++			const float3 centeredFar2 = abs(gridUVFar2 - 0.5f) * 2.0f;
++			const float edgeFar2 = max(centeredFar2.x, max(centeredFar2.y, centeredFar2.z));
++			const float fadeFar2 = 1.0f - smoothstep(0.7f, 1.0f, edgeFar2);
++
++			[branch] if (fadeFar2 > 0.0f)
++			{
++				const float4 shRFar2 = LPVGridFar2R.SampleLevel(LPVGridSampler, gridUVFar2, 0);
++				const float4 shGFar2 = LPVGridFar2G.SampleLevel(LPVGridSampler, gridUVFar2, 0);
++				const float4 shBFar2 = LPVGridFar2B.SampleLevel(LPVGridSampler, gridUVFar2, 0);
++
++				float3 giFar2;
++				giFar2.r = LPVEvalReceiver(shRFar2, receiver);
++				giFar2.g = LPVEvalReceiver(shGFar2, receiver);
++				giFar2.b = LPVEvalReceiver(shBFar2, receiver);
+ 
+-				irradiance += giFar * fadeFar * (1.0f - fade);
++				irradiance += giFar2 * fadeFar2 * wRest * hmaoDamp;
+ 			}
+ 		}
+ 
+@@ -1045,7 +1202,10 @@ void LPVApplyCS(uint3 DTid : SV_DispatchThreadID)
+ 				specular.b += max(0.0f, dot(LPVGridB.SampleLevel(LPVGridSampler, marchUV, 0), reflEval)) * stepWeight;
+ 			}
+ 
+-			specular *= fade * LPVApplyParams.x * LPVApplyParams.w;
++			// Normalize the march to a weighted AVERAGE (the plain sum of the 1/s^2 step weights
++			// overshot the intended radiance by 36%).
++			const float marchNorm = 1.0f / (1.0f + 0.25f + 1.0f / 9.0f);
++			specular *= fade * LPVApplyParams.x * LPVApplyParams.w * marchNorm;
+ 		}
+ 
+ 		// Soft highlight rolloff (Reinhard on luminance): the dim indirect response stays
+-- 
+2.47.1.windows.1
+

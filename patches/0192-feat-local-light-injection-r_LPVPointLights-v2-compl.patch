@@ -1,0 +1,247 @@
+From 736b7b390f8343a43302da2dcd024b80a2fb15e0 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Wed, 12 Aug 2026 03:19:50 +0800
+Subject: [PATCH 192/206] feat: local light injection (r_LPVPointLights) - v2
+ complete
+
+CE3 LPVPostinjectLight equivalent: up to 16 deferred point lights add an
+outward flowing lobe (60% radial cosine + 40% isotropic) with quadratic
+distance falloff to the final grid - no bounce, no propagation, a cheap
+local ambient glow that follows the scene's real lights into the GI.
+
+Folded into the temporal pass (injected before the EMA blend, so the
+accumulation history stays consistent): a separate pass would need a
+typed RGBA16F UAV read-modify-write, which is an optional hardware
+feature on D3D11. The light set is hashed (quarter-meter position /
+coarse colour quantization) into the relight criteria, so moving or
+toggled lights re-light immediately while static ones cost nothing.
+Gain is decoupled from r_LPVIntensity like the sky light: 1 gives a
+surface at the light centre roughly the light colour as ambient.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Tu9cj9ax1mqCV93HVfCfpW
+---
+ .../RenderDll/Common/RendererCVars.cpp        |  7 +++
+ .../RenderDll/Common/RendererCVars.h          |  1 +
+ .../XRenderD3D9/GraphicsPipeline/LPV.cpp      | 52 +++++++++++++++++++
+ .../XRenderD3D9/GraphicsPipeline/LPV.h        |  8 +++
+ Engine/Shaders/HWScripts/CryFX/LPV.cfi        | 46 ++++++++++++++--
+ 5 files changed, 111 insertions(+), 3 deletions(-)
+
+diff --git a/Code/CryEngine/RenderDll/Common/RendererCVars.cpp b/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
+index 43dacddf..a006c502 100644
+--- a/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
++++ b/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
+@@ -425,6 +425,7 @@ float CRendererCVars::CV_r_LPVOcclusion;
+ float CRendererCVars::CV_r_LPVSkyLight;
+ float CRendererCVars::CV_r_LPVMaxIrradiance;
+ float CRendererCVars::CV_r_LPVSpecular;
++float CRendererCVars::CV_r_LPVPointLights;
+ int   CRendererCVars::CV_r_LPVUpdateInterval;
+ int   CRendererCVars::CV_r_LPVDebug;
+ 
+@@ -2268,6 +2269,12 @@ void CRendererCVars::InitCVars()
+ 	               "of 0.2 x the sun luminance (in the sky hue), independent of r_LPVIntensity - the level's\n"
+ 	               "TOD sky colour only contributes the hue, so the feature works on probe-lit levels too.\n"
+ 	               "Interiors receive it only through propagation via openings. 0 disables the sky light.\n");
++	REGISTER_CVAR3("r_LPVPointLights", CV_r_LPVPointLights, 1.0f, VF_NULL,
++	               "Gain of the local light injection: deferred point lights add an outward flowing lobe\n"
++	               "to the LPV grid (up to 16 lights, quadratic falloff, no bounce and no propagation) -\n"
++	               "a cheap local ambient glow that follows the scene's real lights into the GI.\n"
++	               "1 gives a surface at the light centre an ambient of roughly the light colour,\n"
++	               "independent of r_LPVIntensity. 0 disables the injection.\n");
+ 	REGISTER_CVAR3("r_LPVSpecular", CV_r_LPVSpecular, 1.0f, VF_NULL,
+ 	               "Gain of the LPV specular GI: a short voxel march (3 cells) along the reflected eye\n"
+ 	               "vector, the same approximation CryEngine 3 shipped. Gives metals and wet surfaces a\n"
+diff --git a/Code/CryEngine/RenderDll/Common/RendererCVars.h b/Code/CryEngine/RenderDll/Common/RendererCVars.h
+index 194b514d..b574559f 100644
+--- a/Code/CryEngine/RenderDll/Common/RendererCVars.h
++++ b/Code/CryEngine/RenderDll/Common/RendererCVars.h
+@@ -670,6 +670,7 @@ public:
+ 	static float CV_r_LPVSkyLight;
+ 	static float CV_r_LPVMaxIrradiance;
+ 	static float CV_r_LPVSpecular;
++	static float CV_r_LPVPointLights;
+ 	static int   CV_r_LPVUpdateInterval;
+ 	static int   CV_r_LPVDebug;
+ 
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.cpp
+index 79c60703..0c0eaa1f 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.cpp
+@@ -575,11 +575,46 @@ void CLPVStage::Execute()
+ 	const Vec4 sunColor = RenderView()->GetSunLightColor();
+ 	const int32 interval = max(0, CRendererCVars::CV_r_LPVUpdateInterval);
+ 
++	// Local lights of the frame (CE3 LPVPostinjectLight equivalent): every deferred point light
++	// adds an outward flowing lobe to the final grid inside the temporal pass - a cheap local
++	// ambient glow that follows the scene's real lights into the GI (no bounce, no propagation).
++	m_lightCount = 0;
++	uint32 lightsHash = 0;
++	if (CRendererCVars::CV_r_LPVPointLights > 0.0f)
++	{
++		const float sceneScale = gcpRendD3D->m_fAdaptedSceneScaleLBuffer;
++		const auto& deferredLights = RenderView()->GetLightsArray(eDLT_DeferredLight);
++		for (auto itr = deferredLights.begin(); itr != deferredLights.end() && m_lightCount < MaxPointLights; ++itr)
++		{
++			const SRenderLight& light = *itr;
++			if (light.m_Flags & (DLF_FAKE | DLF_VOLUMETRIC_FOG_ONLY | DLF_SUN))
++				continue;
++			const Vec3 pos = light.GetPosition();
++			const float radius = light.m_fRadius;
++			if (radius <= 0.01f)
++				continue;
++
++			m_lightPos[m_lightCount] = Vec4(pos, radius);
++			m_lightColor[m_lightCount] = Vec4(light.m_Color.r * sceneScale, light.m_Color.g * sceneScale, light.m_Color.b * sceneScale, 0.0f);
++			++m_lightCount;
++
++			// Quarter meter / coarse colour quantization: moving or recoloured lights trigger a
++			// relight, camera-noise sized changes do not.
++			lightsHash = lightsHash * 397u
++			             + (uint32)(int32)(pos.x * 4.0f) * 31u
++			             + (uint32)(int32)(pos.y * 4.0f) * 17u
++			             + (uint32)(int32)(pos.z * 4.0f) * 7u
++			             + (uint32)(int32)(light.m_Color.r * 8.0f + light.m_Color.g * 64.0f + light.m_Color.b * 512.0f);
++		}
++		lightsHash += (uint32)m_lightCount * 2654435761u;
++	}
++
+ 	bool bRelightAll = m_bForceRelight;
+ 	bRelightAll |= sunDir.Dot(m_lastSunDir) < 0.99995f;
+ 	bRelightAll |= (fabsf(sunColor.x - m_lastSunColor.x) + fabsf(sunColor.y - m_lastSunColor.y) + fabsf(sunColor.z - m_lastSunColor.z)) > 0.01f;
+ 	bRelightAll |= (interval > 0) && (++m_framesSinceRelight >= interval);
+ 	bRelightAll |= (interval == 0);
++	bRelightAll |= (lightsHash != m_lastLightsHash);
+ 
+ 	bool bAnyRelight = false;
+ 	for (int32 i = 0; i < cascadeCount; ++i)
+@@ -616,6 +651,7 @@ void CLPVStage::Execute()
+ 		m_lastSunColor = sunColor;
+ 		m_framesSinceRelight = 0;
+ 		m_bForceRelight = false;
++		m_lastLightsHash = lightsHash;
+ 	}
+ 
+ 	// The screen space apply runs later in the pipeline (ExecuteApplyToScreen), see LPV.h.
+@@ -950,6 +986,22 @@ void CLPVStage::ExecuteTemporal(SCascade& cascade, const SScopedComputeCommandLi
+ 	static CCryNameR paramTemporal("LPVTemporalParams");
+ 	pass.SetConstant(paramTemporal, Vec4(deltaCells.x, deltaCells.y, deltaCells.z, effectiveAlpha));
+ 
++	// Local light injection, folded into this pass (a separate pass would need a typed RGBA16F UAV
++	// read-modify-write, which is an optional feature on D3D11). Same display intensity decoupling
++	// as the sky light, 0.25 is the iso receiver transfer: r_LPVPointLights 1 gives a surface at
++	// the light centre an ambient of roughly the light colour.
++	const float displayIntensity = max(1.0f, CRendererCVars::CV_r_LPVIntensity);
++	const float lightPremult = max(0.0f, CRendererCVars::CV_r_LPVPointLights) / (0.25f * displayIntensity);
++
++	static CCryNameR paramLights("LPVLightParams");
++	pass.SetConstant(paramLights, Vec4((float)m_lightCount, lightPremult, 0.0f, 0.0f));
++
++	static CCryNameR paramLightPos("LPVLightPos");
++	pass.SetConstantArray(paramLightPos, m_lightPos, MaxPointLights);
++
++	static CCryNameR paramLightColor("LPVLightColor");
++	pass.SetConstantArray(paramLightColor, m_lightColor, MaxPointLights);
++
+ 	const uint32 dispatchSize = lpvDispatchSize(m_gridSize, LPVGridTileSize);
+ 	pass.SetDispatchSize(dispatchSize, dispatchSize, dispatchSize);
+ 	pass.PrepareResourcesForUse(commandList);
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.h b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.h
+index 0e09487c..9f78fa20 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.h
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.h
+@@ -30,6 +30,9 @@ public:
+ 	// Nested cascades: cascade 0 is the detail volume (r_LPVSize), cascade 1 covers
+ 	// r_LPVCascadeScale times the extent at the same grid resolution.
+ 	static const int32 MaxCascadeNum = 2;
++	// Upper bound for the local lights injected after the propagation (CE3 LPVPostinjectLight
++	// equivalent, folded into the temporal pass). Must match LPV_MAX_POINT_LIGHTS in LPV.cfi.
++	static const int32 MaxPointLights = 16;
+ 
+ public:
+ 	CLPVStage(CGraphicsPipeline& graphicsPipeline);
+@@ -163,11 +166,16 @@ private:
+ 	bool                 m_bGridReadyForApply = false;
+ 	// Number of cascades that ran in the frame's Execute(), consumed by ExecuteApplyToScreen().
+ 	int32                m_activeCascadeCount = 1;
++	// Local lights of the frame (gathered in Execute, injected by the temporal pass).
++	Vec4                 m_lightPos[MaxPointLights];
++	Vec4                 m_lightColor[MaxPointLights];
++	int32                m_lightCount = 0;
+ 	// Relight gating state: the grid is only re-injected on discrete input changes or on the heartbeat
+ 	// interval, a frozen grid stays exactly correct for a static scene and cannot flicker.
+ 	Vec3                 m_lastSunDir;
+ 	Vec4                 m_lastSunColor;
+ 	int32                m_framesSinceRelight;
+ 	bool                 m_bForceRelight;
++	uint32               m_lastLightsHash = 0;
+ 	bool                 m_bResultValid;
+ };
+diff --git a/Engine/Shaders/HWScripts/CryFX/LPV.cfi b/Engine/Shaders/HWScripts/CryFX/LPV.cfi
+index 808a56bb..358139a3 100644
+--- a/Engine/Shaders/HWScripts/CryFX/LPV.cfi
++++ b/Engine/Shaders/HWScripts/CryFX/LPV.cfi
+@@ -691,6 +691,16 @@ technique LPVPropagate
+ // w: blend weight of the current frame (1 = no history)
+ float4 LPVTemporalParams;
+ 
++// Local light injection (CE3 LPVPostinjectLight equivalent), folded into the temporal pass: a
++// separate pass would need a typed RGBA16F UAV read-modify-write, an optional feature on D3D11.
++#define LPV_MAX_POINT_LIGHTS 16
++// x: light count, y: gain (premultiplied with the display intensity compensation)
++float4 LPVLightParams;
++// xyz: world position, w: radius
++float4 LPVLightPos[LPV_MAX_POINT_LIGHTS];
++// rgb: colour (scene scaled)
++float4 LPVLightColor[LPV_MAX_POINT_LIGHTS];
++
+ Texture3D<float4> LPVTempCurR  : register(t0);
+ Texture3D<float4> LPVTempCurG  : register(t1);
+ Texture3D<float4> LPVTempCurB  : register(t2);
+@@ -710,9 +720,39 @@ void LPVTemporalCS(uint3 DTid : SV_DispatchThreadID)
+ 	if (cell.x >= gridSize || cell.y >= gridSize || cell.z >= gridSize)
+ 		return;
+ 
+-	const float4 curR = LPVTempCurR.Load(int4(cell, 0));
+-	const float4 curG = LPVTempCurG.Load(int4(cell, 0));
+-	const float4 curB = LPVTempCurB.Load(int4(cell, 0));
++	float4 curR = LPVTempCurR.Load(int4(cell, 0));
++	float4 curG = LPVTempCurG.Load(int4(cell, 0));
++	float4 curB = LPVTempCurB.Load(int4(cell, 0));
++
++	// Local light injection: every deferred point light adds an outward flowing lobe with a
++	// quadratic distance falloff before the accumulation blend, so the history stays consistent.
++	// No bounce and no propagation - a cheap local ambient glow around the scene's real lights.
++	const int lightCount = min((int)LPVLightParams.x, LPV_MAX_POINT_LIGHTS);
++	if (lightCount > 0)
++	{
++		const float3 cellCenter = LPVGridParams.xyz + ((float3)cell + 0.5f) * LPVGridParams.w;
++
++		for (int i = 0; i < lightCount; ++i)
++		{
++			const float3 toCell = cellCenter - LPVLightPos[i].xyz;
++			const float dist = length(toCell);
++			const float radius = max(LPVLightPos[i].w, 1e-3f);
++			if (dist >= radius)
++				continue;
++
++			const float falloff = 1.0f - dist / radius;
++			const float atten = falloff * falloff * LPVLightParams.y;
++
++			// The light flows outward: 60% radial cosine lobe + 40% isotropic (a pure lobe is
++			// degenerate in the cell containing the light itself).
++			const float3 dirOut = (dist > 1e-3f) ? toCell / dist : float3(0.0f, 0.0f, 1.0f);
++			const float4 sh = LPVCosineLobe(dirOut) * 0.6f + float4(LPV_SH_C0 * 0.4f, 0.0f, 0.0f, 0.0f);
++
++			curR += sh * (LPVLightColor[i].r * atten);
++			curG += sh * (LPVLightColor[i].g * atten);
++			curB += sh * (LPVLightColor[i].b * atten);
++		}
++	}
+ 
+ 	float alpha = LPVTemporalParams.w;
+ 
+-- 
+2.47.1.windows.1
+

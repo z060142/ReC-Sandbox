@@ -227,6 +227,7 @@ void CLightEntity::UpdateGSMLightSourceShadowFrustum(const SRenderingPassInfo& p
 
 	static ICVar* pHeightMapAOVar = GetConsole()->GetCVar("r_HeightMapAO");
 	const bool isHeightMapAOEnabled = Get3DEngine()->m_bHeightMapAoEnabled && pHeightMapAOVar && pHeightMapAOVar->GetIVal() > 0;
+	const int nLPVRsmCascades = (m_light.m_Flags & DLF_SUN) ? GetLPVRsmCascadeCount() : 0;
 
 	int nDynamicLodCount = nMaxLodCount;
 	int nCachedLodCount = 0;
@@ -244,7 +245,16 @@ void CLightEntity::UpdateGSMLightSourceShadowFrustum(const SRenderingPassInfo& p
 				++nCachedLodCount;
 		}
 
-		nCachedLodCount = min(nCachedLodCount, isHeightMapAOEnabled ? MAX_GSM_CACHED_LODS_NUM - 1 : MAX_GSM_CACHED_LODS_NUM);
+		// Every consumer of the shadow cache generation marking wants its own slot in
+		// IRenderNode::m_shadowCacheLastRendered, so reserve one for each pseudo cascade. The
+		// reservation can exceed MAX_GSM_CACHED_LODS_NUM (height map AO + 3 LPV cascades = 4):
+		// cap it, otherwise the clamp upper bound goes NEGATIVE and the poisoned nCachedLodCount
+		// corrupts the dynamic cascade count (observed: enabling height map AO killed the sun
+		// shadows). The overflowing consumers share the last slot, which is harmless for the LPV
+		// RSM - it resets its cache generation every frame (eFullUpdate), a shared slot only ever
+		// re-marks a node, it can never wrongly skip one.
+		const int nReservedCacheLods = min((isHeightMapAOEnabled ? 1 : 0) + nLPVRsmCascades, (int)MAX_GSM_CACHED_LODS_NUM);
+		nCachedLodCount = clamp_tpl(nCachedLodCount, 0, MAX_GSM_CACHED_LODS_NUM - nReservedCacheLods);
 	}
 
 	InitEntityShadowMapInfoStructure(nDynamicLodCount, nCachedLodCount);
@@ -259,6 +269,7 @@ void CLightEntity::UpdateGSMLightSourceShadowFrustum(const SRenderingPassInfo& p
 	if (m_light.m_Flags & DLF_SUN)
 	{
 		nNextLod += UpdateGSMLightSourceCachedShadowFrustum(nDynamicLodCount, nCachedLodCount, isHeightMapAOEnabled, fDistFromView, fRadiusLastLod, passInfo);
+		nNextLod += UpdateGSMLightSourceLPVRsmFrustum(nNextLod, nCachedLodCount + (isHeightMapAOEnabled ? 1 : 0), nLPVRsmCascades, passInfo);
 		nNextLod += UpdateGSMLightSourceNearestShadowFrustum(nNextLod, passInfo);
 	}
 
@@ -443,6 +454,78 @@ int CLightEntity::UpdateGSMLightSourceCachedShadowFrustum(int nFirstLod, int nLo
 	return nLod;
 }
 
+bool CLightEntity::IsLPVRsmEnabled()
+{
+	static ICVar* pLPV = GetConsole()->GetCVar("r_LPV");
+
+	if (!pLPV || pLPV->GetIVal() <= 0)
+		return false;
+
+#ifdef FEATURE_SVO_GI
+	// SVOGI owns the single sun RSM pass slot while it is active, LPV steps aside completely.
+	if (GetCVars()->e_svoTI_Apply && GetCVars()->e_svoTI_InjectionMultiplier)
+		return false;
+#endif
+
+	return true;
+}
+
+int CLightEntity::GetLPVRsmCascadeCount()
+{
+	if (!IsLPVRsmEnabled())
+		return 0;
+
+	static ICVar* pLPVCascades = GetConsole()->GetCVar("r_LPVCascades");
+	return clamp_tpl(pLPVCascades ? pLPVCascades->GetIVal() : 1, 1, 3);
+}
+
+int CLightEntity::UpdateGSMLightSourceLPVRsmFrustum(int nFrustumIndex, int nCacheLod, int nCascadeCount, const SRenderingPassInfo& passInfo)
+{
+	CRY_ASSERT(nFrustumIndex >= 0);
+
+	int nInitialized = 0;
+
+	// Per-cascade RSM views, exactly like the cascaded shadow maps: each LPV cascade gets its own
+	// sun view fitted to its own volume. Every slot is always visited so a cascade that got
+	// disabled leaves no stale frustum behind.
+	for (int nCascade = 0; nCascade < 3; ++nCascade)
+	{
+		const int nSlot = nFrustumIndex + nInitialized;
+		// Cache lods can run out of MAX_GSM_CACHED_LODS_NUM headroom - clamp instead of dropping
+		// the cascade: the slot only feeds the terrain update bookkeeping, and the LPV RSM resets
+		// its generation every frame (eFullUpdate), so shared slots stay permissive.
+		const int nCascadeCacheLod = min(nCacheLod + nCascade, MAX_GSM_CACHED_LODS_NUM - 1);
+
+		if (nSlot < 0 || nSlot >= MAX_GSM_LODS_NUM || nCascadeCacheLod < 0)
+			continue;
+
+		ShadowMapFrustumPtr& pFr = m_pShadowMapInfo->pGSM[nSlot];
+
+		if (nCascade >= nCascadeCount)
+		{
+			// Make sure a frustum left over from a previous frame is not picked up as a regular cascade
+			// by the "free not used frustums" fixup at the end of UpdateGSMLightSourceShadowFrustum().
+			if (pFr && pFr->m_eFrustumType == ShadowMapFrustum::e_LPVRsm)
+			{
+				pFr->ClearUpdates(~0u);
+				pFr->ClearSamples(~0u);
+			}
+
+			continue;
+		}
+
+		CRY_ASSERT(!pFr || !pFr->pOnePassShadowView);
+
+		ShadowCacheGenerator shadowCache(this, ShadowMapFrustum::ShadowCacheData::eFullUpdate);
+		shadowCache.InitLPVRsmFrustum(pFr, nSlot, nCascadeCacheLod, nCascade, passInfo);
+
+		CollectShadowCascadeForOnePassTraversal(pFr);
+		++nInitialized;
+	}
+
+	return nInitialized;
+}
+
 int CLightEntity::UpdateGSMLightSourceNearestShadowFrustum(int nFrustumIndex, const SRenderingPassInfo& passInfo)
 {
 	CRY_ASSERT(nFrustumIndex >= 0 && nFrustumIndex < MAX_GSM_LODS_NUM);
@@ -474,6 +557,7 @@ bool CLightEntity::IsOnePassTraversalFrustum(const ShadowMapFrustum* pFr)
 	  pFr->m_eFrustumType == ShadowMapFrustum::e_PerObject ||
 	  pFr->m_eFrustumType == ShadowMapFrustum::e_GsmCached ||
 	  pFr->m_eFrustumType == ShadowMapFrustum::e_HeightMapAO ||
+	  pFr->m_eFrustumType == ShadowMapFrustum::e_LPVRsm ||
 	  pFr->m_eFrustumType == ShadowMapFrustum::e_GsmDynamic ||
 	  pFr->m_eFrustumType == ShadowMapFrustum::e_GsmDynamicDistance);
 }
@@ -1788,8 +1872,18 @@ void CLightEntity::UpdateCastShadowFlag(float fDistance, const SRenderingPassInf
 		m_light.m_Flags &= ~DLF_CASTSHADOW_MAPS;
 
 #if defined(FEATURE_SVO_GI)
+	// DLF_USE_FOR_SVOGI marks the light for whichever GI system is active. SVOGI keeps its
+	// original voxelization rules; the LPV has no static/dynamic split, so under LPV both
+	// Static and Dynamic mean "feed the volume" while None and HideIfGiIsActive stay out
+	// (the filtered GetGIMode() already maps HideIfGiIsActive to eGM_None).
 	IRenderNode::EGIMode eVoxMode = GetGIMode();
-	if (eVoxMode == IRenderNode::eGM_DynamicVoxelization || (eVoxMode == IRenderNode::eGM_StaticVoxelization && !GetCVars()->e_svoTI_IntegrationMode && !(m_light.m_Flags & DLF_SUN)))
+	bool bUseForGI;
+	if (IsLPVRsmEnabled())
+		bUseForGI = (eVoxMode == IRenderNode::eGM_StaticVoxelization || eVoxMode == IRenderNode::eGM_DynamicVoxelization) && !(m_light.m_Flags & DLF_SUN);
+	else
+		bUseForGI = eVoxMode == IRenderNode::eGM_DynamicVoxelization || (eVoxMode == IRenderNode::eGM_StaticVoxelization && !GetCVars()->e_svoTI_IntegrationMode && !(m_light.m_Flags & DLF_SUN));
+
+	if (bUseForGI)
 		m_light.m_Flags |= DLF_USE_FOR_SVOGI;
 	else
 		m_light.m_Flags &= ~DLF_USE_FOR_SVOGI;
@@ -1930,7 +2024,8 @@ void CLightEntity::Render(const SRendParams& rParams, const SRenderingPassInfo& 
 #if defined(FEATURE_SVO_GI)
 	if (GetCVars()->e_svoTI_SkipNonGILights && GetCVars()->e_svoTI_Apply && !GetGIMode())
 		return;
-	if (GetCVars()->e_svoTI_Apply && (IRenderNode::GetGIMode() == eGM_HideIfGiIsActive))
+	// "Hide if GI is Active" responds to whichever GI system is running - SVOGI or LPV.
+	if ((GetCVars()->e_svoTI_Apply || IsLPVRsmEnabled()) && (IRenderNode::GetGIMode() == eGM_HideIfGiIsActive))
 		return;
 #endif
 

@@ -13,6 +13,7 @@
 #include "GraphicsPipeline/ClipVolumes.h"
 #include "GraphicsPipeline/TiledShading.h"
 #include "GraphicsPipeline/ShadowMap.h"
+#include "GraphicsPipeline/LPV.h"
 
 struct SPerPassConstantBuffer
 {
@@ -681,6 +682,14 @@ bool CSceneForwardStage::UpdatePerPassResources(bool bOnInit, bool bShadowMask, 
 		{
 			pSVOGIStage->FillForwardParams(cb->cbSVOGI, pSVOGIStage->IsActive());
 		}
+
+		// LPV feeds the forward GI slot whenever SVOGI does not: integration mode 3 selects the same
+		// additive ApplyGI branch the deferred combine uses (%_RT_SAMPLE6 there, this cbuffer here).
+		if (auto* pLPVStage = m_graphicsPipeline.GetStage<CLPVStage>())
+		{
+			if (cb->cbSVOGI.IntegrationMode.y < 0.0f && pLPVStage->GetIrradianceRT())
+				cb->cbSVOGI.IntegrationMode.y = 3.0f;
+		}
 #endif
 
 		m_pPerPassCB->UpdateBuffer(cb, cbSize);
@@ -808,8 +817,22 @@ bool CSceneForwardStage::UpdatePerPassResources(bool bOnInit, bool bShadowMask, 
 #if defined(FEATURE_SVO_GI)
 			if (bOnInit || !CSvoRenderer::GetInstance()->IsActive() || !CSvoRenderer::GetInstance()->GetSpecularFinRT())
 			{
-				resources.SetTexture(46, CRendererResources::s_ptexBlack, EDefaultResourceViews::Default, EShaderStage_AllWithoutCompute);
-				resources.SetTexture(47, CRendererResources::s_ptexBlack, EDefaultResourceViews::Default, EShaderStage_AllWithoutCompute);
+				// The LPV screen space irradiance/specular take the GI slots when SVOGI leaves them empty.
+				CTexture* pFwdGiDiffuse = CRendererResources::s_ptexBlack;
+				CTexture* pFwdGiSpecular = CRendererResources::s_ptexBlack;
+				if (!bOnInit)
+				{
+					if (auto* pLPVStage = m_graphicsPipeline.GetStage<CLPVStage>())
+					{
+						if (CTexture* pLpvIrradiance = pLPVStage->GetIrradianceRT())
+							pFwdGiDiffuse = pLpvIrradiance;
+						if (CTexture* pLpvSpecular = pLPVStage->GetSpecularRT())
+							pFwdGiSpecular = pLpvSpecular;
+					}
+				}
+
+				resources.SetTexture(46, pFwdGiDiffuse, EDefaultResourceViews::Default, EShaderStage_AllWithoutCompute);
+				resources.SetTexture(47, pFwdGiSpecular, EDefaultResourceViews::Default, EShaderStage_AllWithoutCompute);
 			}
 			else
 			{

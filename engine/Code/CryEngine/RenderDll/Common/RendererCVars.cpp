@@ -410,6 +410,29 @@ float CRendererCVars::CV_r_ssdoAmountDirect;
 float CRendererCVars::CV_r_ssdoAmountAmbient;
 float CRendererCVars::CV_r_ssdoAmountReflection;
 
+int CRendererCVars::CV_r_LPV;
+int CRendererCVars::CV_r_LPVGridSize;
+float CRendererCVars::CV_r_LPVSize;
+int CRendererCVars::CV_r_LPVCascades;
+float CRendererCVars::CV_r_LPVCascadeScale;
+int CRendererCVars::CV_r_LPVIterations;
+float CRendererCVars::CV_r_LPVIntensity;
+float CRendererCVars::CV_r_LPVInjectionBias;
+int   CRendererCVars::CV_r_LPVRSMSamples;
+float CRendererCVars::CV_r_LPVTemporalAlpha;
+float CRendererCVars::CV_r_LPVSecondaryBounce;
+float CRendererCVars::CV_r_LPVOcclusion;
+float CRendererCVars::CV_r_LPVSkyLight;
+float CRendererCVars::CV_r_LPVMaxIrradiance;
+float CRendererCVars::CV_r_LPVSpecular;
+float CRendererCVars::CV_r_LPVTranslucentBrightness;
+float CRendererCVars::CV_r_LPVPointLights;
+float CRendererCVars::CV_r_LPVRsmMinCasterSize;
+float CRendererCVars::CV_r_LPVRsmClipRange;
+float CRendererCVars::CV_r_LPVHeightMapOcclusion;
+int   CRendererCVars::CV_r_LPVUpdateInterval;
+int   CRendererCVars::CV_r_LPVDebug;
+
 int CRendererCVars::CV_r_dof;
 int CRendererCVars::CV_r_DofMode;
 int CRendererCVars::CV_r_DofBokehQuality;
@@ -2207,6 +2230,111 @@ void CRendererCVars::InitCVars()
 	REGISTER_CVAR3("r_ssdoAmountDirect", CV_r_ssdoAmountDirect, 2.0f, VF_NULL, "Strength of occlusion applied to light sources");
 	REGISTER_CVAR3("r_ssdoAmountAmbient", CV_r_ssdoAmountAmbient, 1.0f, VF_NULL, "Strength of occlusion applied to probe irradiance");
 	REGISTER_CVAR3("r_ssdoAmountReflection", CV_r_ssdoAmountReflection, 1.5f, VF_NULL, "Strength of occlusion applied to probe specular");
+
+	REGISTER_CVAR3("r_LPV", CV_r_LPV, 0, VF_NULL,
+	               "Enables Light Propagation Volumes dynamic global illumination (sun only, single cascade).\n"
+	               "Has no effect while SVOGI (Total Illumination) is active.\n"
+	               "Usage: r_LPV [0/1]\n");
+	REGISTER_CVAR3("r_LPVGridSize", CV_r_LPVGridSize, 48, VF_NULL,
+	               "Number of Light Propagation Volumes cells per axis. Clamped to [8, 64] and rounded down to a multiple of 4.\n");
+	REGISTER_CVAR3("r_LPVSize", CV_r_LPVSize, 96.0f, VF_NULL,
+	               "World space extent in meters of the Light Propagation Volumes grid.\n");
+	REGISTER_CVAR3("r_LPVCascades", CV_r_LPVCascades, 3, VF_NULL,
+	               "Number of nested Light Propagation Volumes cascades [1, 3]. Cascade 0 is the detail\n"
+	               "volume (r_LPVSize), every further cascade covers r_LPVCascadeScale times the extent\n"
+	               "of the previous one at the same grid resolution (96 / 288 / 864 m with the defaults)\n"
+	               "- an LOD chain like the cascaded shadow maps instead of a hard cutoff.\n");
+	REGISTER_CVAR3("r_LPVCascadeScale", CV_r_LPVCascadeScale, 3.0f, VF_NULL,
+	               "PER STEP extent multiplier between adjacent Light Propagation Volumes cascades.\n"
+	               "Smaller steps mean a smaller quality jump at each cascade boundary.\n");
+	REGISTER_CVAR3("r_LPVIterations", CV_r_LPVIterations, 24, VF_NULL,
+	               "Number of Light Propagation Volumes propagation iterations.\n"
+	               "The light travel distance is roughly iterations * (r_LPVSize / r_LPVGridSize).\n");
+	REGISTER_CVAR3("r_LPVIntensity", CV_r_LPVIntensity, 100.0f, VF_NULL,
+	               "Intensity multiplier of the Light Propagation Volumes indirect diffuse.\n"
+	               "Useful values are in the 1 - 20 range. (Before the energy conserving propagation\n"
+	               "this defaulted to 150 - the old operator lost ~90% of the energy per cell step.)\n");
+	REGISTER_CVAR3("r_LPVInjectionBias", CV_r_LPVInjectionBias, 0.5f, VF_NULL,
+	               "Offset in cells applied to injected virtual point lights, reduces self illumination and thin wall bleeding.\n");
+	REGISTER_CVAR3("r_LPVRsmClipRange", CV_r_LPVRsmClipRange, 700.0f, VF_NULL,
+	               "Sun-ward clip range in meters of the LPV RSM view. 0 (default) clips everything beyond\n"
+	               "the caster collection sweep: distant tree lines / hills do not occlude the volume in the\n"
+	               "RSM, which keeps it lit at grazing sun elevations (at the cost of some wrongly sunlit\n"
+	               "injection in genuinely shadowed areas). Larger values render the sun-ward geometry fully\n"
+	               "for honest occlusion - expect a much darker volume when the sun is low.\n");
+	REGISTER_CVAR3("r_LPVHeightMapOcclusion", CV_r_LPVHeightMapOcclusion, 1.0f, VF_NULL,
+	               "Strength [0, 1] of the height map AO damping applied to the COARSE LPV cascades\n"
+	               "(cascade 1 and 2). Their 6 / 18 m cells barely resolve walls, so interiors gain\n"
+	               "leaked outdoor light - the height map AO mask (openness to the sky) is a cheap\n"
+	               "proxy for 'under a roof' that suppresses exactly that. Requires r_HeightMapAO > 0,\n"
+	               "silently inactive otherwise. The near cascade keeps its real geometry volume\n"
+	               "occlusion and is never damped.\n");
+	REGISTER_CVAR3("r_LPVRsmMinCasterSize", CV_r_LPVRsmMinCasterSize, 0.5f, VF_NULL,
+	               "Objects with a bounding radius below this (meters) are skipped by the LPV RSM render:\n"
+	               "sub-texel props cannot produce meaningful bounce surfels, they only cost draw calls.\n"
+	               "Raise to thin the RSM caster set further (1-2 removes most small clutter), 0 disables.\n");
+	REGISTER_CVAR3("r_LPVRSMSamples", CV_r_LPVRSMSamples, 1024, VF_NULL,
+	               "Side length of the RSM sample grid used by the injection pass, clamped to [64, 1024].\n"
+	               "Higher values reduce injection flicker from thin geometry at some GPU cost.\n");
+	REGISTER_CVAR3("r_LPVSecondaryBounce", CV_r_LPVSecondaryBounce, 0.15f, VF_NULL,
+	               "Feedback loop gain of the multi bounce (grid cells with registered surfaces re-emit\n"
+	               "the indirect light they received in the previous relight, SVOGI style). 0 disables it.\n"
+	               "1 = a physical single bounce: the cell re-emits exactly the irradiance it received,\n"
+	               "which is marginally stable on white scenes - stay below ~1, watch for runaway above.\n");
+	REGISTER_CVAR3("r_LPVOcclusion", CV_r_LPVOcclusion, 10.0f, VF_NULL,
+	               "Strength of the geometry volume occlusion: RSM surfels register a directional blocking\n"
+	               "potential per cell and the propagation attenuates the light flowing through blocked cell\n"
+	               "faces, which suppresses light bleeding through walls and floors.\n"
+	               "1 means a fully covered, perpendicular cell face blocks completely. 0 disables the GV.\n");
+	REGISTER_CVAR3("r_LPVSkyLight", CV_r_LPVSkyLight, 0.15f, VF_NULL,
+	               "Sky light ambient injected into grid cells that pass the sun visibility test against the\n"
+	               "RSM depth (a proxy for open sky). 1 gives an upward facing outdoor surface an irradiance\n"
+	               "of 0.2 x the sun luminance (in the sky hue), independent of r_LPVIntensity - the level's\n"
+	               "TOD sky colour only contributes the hue, so the feature works on probe-lit levels too.\n"
+	               "Interiors receive it only through propagation via openings. 0 disables the sky light.\n");
+	REGISTER_CVAR3("r_LPVPointLights", CV_r_LPVPointLights, 1.0f, VF_NULL,
+	               "Gain of the local light injection: deferred point lights add an outward flowing lobe\n"
+	               "to the LPV grid (up to 16 lights, quadratic falloff, no bounce and no propagation) -\n"
+	               "a cheap local ambient glow that follows the scene's real lights into the GI.\n"
+	               "1 gives a surface at the light centre an ambient of roughly the light colour,\n"
+	               "independent of r_LPVIntensity. 0 disables the injection.\n");
+	REGISTER_CVAR3("r_LPVSpecular", CV_r_LPVSpecular, 1.0f, VF_NULL,
+	               "Gain of the LPV specular GI: a short voxel march (3 cells) along the reflected eye\n"
+	               "vector, the same approximation CryEngine 3 shipped. Gives metals and wet surfaces a\n"
+	               "broad indirect reflection - the SH grid is too coarse for sharp mirror images.\n"
+	               "Scales on top of r_LPVIntensity. 0 disables the march and the screen target.\n");
+	REGISTER_CVAR3("r_LPVTranslucentBrightness", CV_r_LPVTranslucentBrightness, 1.0f, VF_NULL,
+	               "Multiplier of the LPV indirect diffuse on translucent surfaces (vegetation using the\n"
+	               "transmittance lighting model), same as e_svoTI_TranslucentBrightness of SVOGI: the\n"
+	               "gain is blended in by the G-buffer transmittance, opaque surfaces are unaffected.\n"
+	               "Applied before the r_LPVMaxIrradiance rolloff.\n"
+	               "1 - neutral (default), > 1 brighter, < 1 darker\n"
+	               "0 - off (switch, same result as 1)\n");
+	REGISTER_CVAR3("r_LPVMaxIrradiance",CV_r_LPVMaxIrradiance, 3.0f, VF_NULL,
+	               "Soft luminance rolloff (Reinhard) of the applied LPV irradiance after r_LPVIntensity.\n"
+	               "Dim indirect light stays linear while hot spots (sun facing white walls, outdoor one\n"
+	               "bounce paths) are compressed towards this ceiling - lets a high intensity brighten\n"
+	               "interiors without overexposing outdoors. 0 disables the rolloff.\n");
+	REGISTER_CVAR3("r_LPVTemporalAlpha", CV_r_LPVTemporalAlpha, 0.15f, VF_NULL,
+	               "Weight of the current frame in the temporal accumulation of the LPV grid [0.01, 1].\n"
+	               "Lower values are more stable but react slower, 1 disables the accumulation.\n");
+	REGISTER_CVAR3("r_LPVUpdateInterval", CV_r_LPVUpdateInterval, 10, VF_NULL,
+	               "Heartbeat interval in frames for the LPV relight (injection + propagation).\n"
+	               "Between heartbeats the grid is frozen unless the volume moves to a new cell, the sun\n"
+	               "changes or an LPV cvar changes - a frozen grid cannot flicker. 0 relights every frame.\n");
+	REGISTER_CVAR3("r_LPVDebug", CV_r_LPVDebug, 0, VF_NULL,
+	               "Debug output of the LPV apply pass, view with r_ShowRenderTarget LPVIrradiance.\n"
+	               "0 - off (regular irradiance)\n"
+	               "1 - grid space position of the shaded pixel (frac), plus per frame CPU logs\n"
+	               "2 - raw L0 magnitude of the sampled SH grid\n"
+	               "3 - volume edge fade factor\n"
+	               "4..8 - staged injection pipeline probes (see LPV.cfi)\n"
+	               "9 - surface mosaic: per cell L0 energy projected onto the scene surfaces\n"
+	               "10 - 3D probe spheres: a small shaded ball at every grid cell, coloured by the cell\n"
+	               "     energy and depth tested against the scene (drawn directly into the HDR target,\n"
+	               "     no r_ShowRenderTarget needed)\n"
+	               "11 - probe spheres and surface mosaic combined (alignment check)\n"
+	               "12 - geometry volume blocking potential (L0 magnitude) projected onto the scene surfaces\n");
 
 	REGISTER_CVAR3("r_DepthOfField", CV_r_dof, DOF_DEFAULT_VAL, VF_NULL,
 	               "Enables depth of field.\n"

@@ -53,6 +53,7 @@ enum EGraphicsPipelineStage
 	eStage_MobileComposition,
 	eStage_OmniCamera,
 	eStage_DebugRenderTargets,
+	eStage_LPV,
 
 	eStage_Count
 };

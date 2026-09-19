@@ -1,0 +1,206 @@
+From 5eab73badb7ef38020ac266b8145974ebe461d8e Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Tue, 11 Aug 2026 18:05:45 +0800
+Subject: [PATCH 180/206] fix: sky light sun-anchored luminance, bounce gain
+ normalization, irradiance rolloff
+
+First-round feedback fixes (all three renderers rebuilt):
+
+- Sky light was invisible (0 vs 1000 indistinguishable): the level drives
+  its ambient through environment probes, so the TOD GetSkyColor() is
+  near black and scaled to nothing. The sky luminance is now anchored to
+  the sun (r_LPVSkyLight 1 = 0.2 x sun luminance on an upward facing
+  outdoor surface); the TOD sky colour only contributes the hue, with a
+  neutral cool fallback when black. The injected lobe is now 60% downward
+  cosine + 40% isotropic so it can actually enter interiors through
+  vertical openings (windows) - a pure downward lobe barely propagates
+  sideways.
+- r_LPVSecondaryBounce is now directly the feedback loop gain: the SH
+  round trip constant 0.0705 is folded in. Empirical confirmation: the
+  user-found equilibrium at raw gain 13 maps to 13 x 0.0705 = 0.92, i.e.
+  loop gain ~1. New default 0.5 (old 13 -> new 0.92, old 5 -> new 0.35).
+- New r_LPVMaxIrradiance (default 4): Reinhard luminance rolloff on the
+  applied irradiance - interiors can be driven with a high intensity
+  without overexposing outdoor single-bounce paths and white walls.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Tu9cj9ax1mqCV93HVfCfpW
+---
+ .../RenderDll/Common/RendererCVars.cpp        | 23 ++++++++-----
+ .../RenderDll/Common/RendererCVars.h          |  1 +
+ .../XRenderD3D9/GraphicsPipeline/LPV.cpp      | 32 ++++++++++++++-----
+ Engine/Shaders/HWScripts/CryFX/LPV.cfi        | 21 ++++++++++--
+ 4 files changed, 58 insertions(+), 19 deletions(-)
+
+diff --git a/Code/CryEngine/RenderDll/Common/RendererCVars.cpp b/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
+index a6eea7dc..d34cfe29 100644
+--- a/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
++++ b/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
+@@ -423,6 +423,7 @@ float CRendererCVars::CV_r_LPVTemporalAlpha;
+ float CRendererCVars::CV_r_LPVSecondaryBounce;
+ float CRendererCVars::CV_r_LPVOcclusion;
+ float CRendererCVars::CV_r_LPVSkyLight;
++float CRendererCVars::CV_r_LPVMaxIrradiance;
+ int   CRendererCVars::CV_r_LPVUpdateInterval;
+ int   CRendererCVars::CV_r_LPVDebug;
+ 
+@@ -2252,21 +2253,27 @@ void CRendererCVars::InitCVars()
+ 	REGISTER_CVAR3("r_LPVRSMSamples", CV_r_LPVRSMSamples, 1024, VF_NULL,
+ 	               "Side length of the RSM sample grid used by the injection pass, clamped to [64, 1024].\n"
+ 	               "Higher values reduce injection flicker from thin geometry at some GPU cost.\n");
+-	REGISTER_CVAR3("r_LPVSecondaryBounce", CV_r_LPVSecondaryBounce, 0.25f, VF_NULL,
+-	               "Gain of the multi bounce feedback (grid cells with registered surfaces re-emit the\n"
+-	               "indirect light they received in the previous relight, SVOGI style). 0 disables it.\n"
+-	               "The energy conserving propagation feeds this loop much harder than the old operator\n"
+-	               "did - raise carefully and watch for runaway brightening over a few seconds.\n");
++	REGISTER_CVAR3("r_LPVSecondaryBounce", CV_r_LPVSecondaryBounce, 0.5f, VF_NULL,
++	               "Feedback loop gain of the multi bounce (grid cells with registered surfaces re-emit\n"
++	               "the indirect light they received in the previous relight, SVOGI style). 0 disables it.\n"
++	               "1 = a physical single bounce: the cell re-emits exactly the irradiance it received,\n"
++	               "which is marginally stable on white scenes - stay below ~1, watch for runaway above.\n");
+ 	REGISTER_CVAR3("r_LPVOcclusion", CV_r_LPVOcclusion, 1.0f, VF_NULL,
+ 	               "Strength of the geometry volume occlusion: RSM surfels register a directional blocking\n"
+ 	               "potential per cell and the propagation attenuates the light flowing through blocked cell\n"
+ 	               "faces, which suppresses light bleeding through walls and floors.\n"
+ 	               "1 means a fully covered, perpendicular cell face blocks completely. 0 disables the GV.\n");
+-	REGISTER_CVAR3("r_LPVSkyLight", CV_r_LPVSkyLight, 0.25f, VF_NULL,
++	REGISTER_CVAR3("r_LPVSkyLight", CV_r_LPVSkyLight, 0.5f, VF_NULL,
+ 	               "Sky light ambient injected into grid cells that pass the sun visibility test against the\n"
+-	               "RSM depth (a proxy for open sky). The value is the target irradiance on an upward facing\n"
+-	               "outdoor surface in units of the sky colour, independent of r_LPVIntensity.\n"
++	               "RSM depth (a proxy for open sky). 1 gives an upward facing outdoor surface an irradiance\n"
++	               "of 0.2 x the sun luminance (in the sky hue), independent of r_LPVIntensity - the level's\n"
++	               "TOD sky colour only contributes the hue, so the feature works on probe-lit levels too.\n"
+ 	               "Interiors receive it only through propagation via openings. 0 disables the sky light.\n");
++	REGISTER_CVAR3("r_LPVMaxIrradiance", CV_r_LPVMaxIrradiance, 4.0f, VF_NULL,
++	               "Soft luminance rolloff (Reinhard) of the applied LPV irradiance after r_LPVIntensity.\n"
++	               "Dim indirect light stays linear while hot spots (sun facing white walls, outdoor one\n"
++	               "bounce paths) are compressed towards this ceiling - lets a high intensity brighten\n"
++	               "interiors without overexposing outdoors. 0 disables the rolloff.\n");
+ 	REGISTER_CVAR3("r_LPVTemporalAlpha", CV_r_LPVTemporalAlpha, 0.15f, VF_NULL,
+ 	               "Weight of the current frame in the temporal accumulation of the LPV grid [0.01, 1].\n"
+ 	               "Lower values are more stable but react slower, 1 disables the accumulation.\n");
+diff --git a/Code/CryEngine/RenderDll/Common/RendererCVars.h b/Code/CryEngine/RenderDll/Common/RendererCVars.h
+index c167d599..7365683f 100644
+--- a/Code/CryEngine/RenderDll/Common/RendererCVars.h
++++ b/Code/CryEngine/RenderDll/Common/RendererCVars.h
+@@ -668,6 +668,7 @@ public:
+ 	static float CV_r_LPVSecondaryBounce;
+ 	static float CV_r_LPVOcclusion;
+ 	static float CV_r_LPVSkyLight;
++	static float CV_r_LPVMaxIrradiance;
+ 	static int   CV_r_LPVUpdateInterval;
+ 	static int   CV_r_LPVDebug;
+ 
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.cpp
+index cce75f95..482101ac 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.cpp
+@@ -847,7 +847,12 @@ void CLPVStage::ExecuteResolve(const SScopedComputeCommandList& commandList, CTe
+ 	Vec3 deltaCells(ZERO);
+ 	if (m_bHistoryValid)
+ 		deltaCells = (m_gridOrigin - m_prevGridOrigin) / m_cellSize;
+-	const float bounceGain = m_bHistoryValid ? max(0.0f, CRendererCVars::CV_r_LPVSecondaryBounce) : 0.0f;
++	// Normalized so that r_LPVSecondaryBounce is directly the feedback loop gain: 0.0705 is the
++	// SH round trip of one feedback step (iso receiver transfer 0.25 x emission projection C0),
++	// so a cvar value of 1 re-emits exactly the irradiance the cell received (a physical single
++	// bounce, marginally stable on white scenes). Empirically confirmed: the pre-normalization
++	// equilibrium was found at a raw gain of ~13, and 13 x 0.0705 = 0.92 - right at loop gain 1.
++	const float bounceGain = m_bHistoryValid ? max(0.0f, CRendererCVars::CV_r_LPVSecondaryBounce) / 0.0705f : 0.0f;
+ 
+ 	static CCryNameR paramResolve2("LPVResolveParams2");
+ 	pass.SetConstant(paramResolve2, Vec4(deltaCells.x, deltaCells.y, deltaCells.z, bounceGain));
+@@ -862,18 +867,28 @@ void CLPVStage::ExecuteResolve(const SScopedComputeCommandList& commandList, CTe
+ 	static CCryNameR paramWorldToRsm("LPVWorldToRsm");
+ 	pass.SetConstant(paramWorldToRsm, m_worldToRsm);
+ 
+-	// Sky light, premultiplied so that r_LPVSkyLight is the irradiance an upward facing outdoor
+-	// surface ends up with in units of the sky colour, independent of the display intensity:
+-	// the apply pass computes dot(cosineLobe(down) * sky, cosineLobe(down)) * intensity, and
+-	// dot(cosineLobe(d), cosineLobe(d)) = (ZH_COS0 * SH_C0)^2 + (ZH_COS1 * SH_C1)^2 = 0.3125.
++	// Sky light, premultiplied so that r_LPVSkyLight 1 gives an upward facing outdoor surface an
++	// irradiance of 0.2 x the sun luminance (in the sky hue), independent of the display intensity.
++	// The luminance is anchored to the sun instead of the raw TOD sky colour: levels that drive
++	// their ambient through environment probes can have a near black GetSkyColor(), which silently
++	// disabled the whole feature (observed: r_LPVSkyLight 0 vs 1000 indistinguishable). shTransfer
++	// is the apply side SH transfer of the injected lobe mix (0.6 x downward cosine lobe self dot
++	// 0.3125 + 0.4 x isotropic transfer 0.0705 = 0.2157).
+ 	Vec3 skyPremult(ZERO);
+ 	const float skyGain = max(0.0f, CRendererCVars::CV_r_LPVSkyLight);
+ 	if (skyGain > 0.0f && gEnv->p3DEngine)
+ 	{
++		const Vec3 lumWeights(0.2126f, 0.7152f, 0.0722f);
+ 		const Vec3 skyColor = gEnv->p3DEngine->GetSkyColor();
+-		const float shTransfer = 0.3125f;
++		const Vec4 sunColor = RenderView()->GetSunLightColor();
++		const float lumSky = skyColor.Dot(lumWeights);
++		const float lumSun = Vec3(sunColor.x, sunColor.y, sunColor.z).Dot(lumWeights);
++		// Hue of the TOD sky, normalized to unit luminance; neutral cool fallback when it is black.
++		const Vec3 tint = (lumSky > 1e-4f) ? skyColor / lumSky : Vec3(0.6f, 0.8f, 1.0f) / 0.7719f;
++		const Vec3 skyEffective = tint * (lumSun * 0.2f);
++		const float shTransfer = 0.2157f;
+ 		const float displayIntensity = max(1.0f, CRendererCVars::CV_r_LPVIntensity);
+-		skyPremult = skyColor * (skyGain / (shTransfer * displayIntensity));
++		skyPremult = skyEffective * (skyGain / (shTransfer * displayIntensity));
+ 	}
+ 
+ 	if (CRendererCVars::CV_r_LPVDebug > 0)
+@@ -1073,7 +1088,8 @@ void CLPVStage::ExecuteApply(const SScopedComputeCommandList& commandList, CText
+ 	pass.SetConstant(paramFrustumRB, Vec4(viewInfo.m_frustumCorners[SRenderViewInfo::eFrustum_RB], 0.0f));
+ 
+ 	static CCryNameR paramApply("LPVApplyParams");
+-	pass.SetConstant(paramApply, Vec4(CRendererCVars::CV_r_LPVIntensity, (float)CRendererCVars::CV_r_LPVDebug, 0.0f, 0.0f));
++	pass.SetConstant(paramApply, Vec4(CRendererCVars::CV_r_LPVIntensity, (float)CRendererCVars::CV_r_LPVDebug,
++	                                  max(0.0f, CRendererCVars::CV_r_LPVMaxIrradiance), 0.0f));
+ 
+ 	static CCryNameR paramRsmSizeApply("LPVRsmSize");
+ 	pass.SetConstant(paramRsmSizeApply, Vec4((float)m_rsmSize, 1.0f / (float)m_rsmSize, (float)CRendererCVars::CV_r_LPVDebug, 0.0f));
+diff --git a/Engine/Shaders/HWScripts/CryFX/LPV.cfi b/Engine/Shaders/HWScripts/CryFX/LPV.cfi
+index e67c2cd3..6c39f3a2 100644
+--- a/Engine/Shaders/HWScripts/CryFX/LPV.cfi
++++ b/Engine/Shaders/HWScripts/CryFX/LPV.cfi
+@@ -28,7 +28,8 @@ float4 LPVRsmSize;
+ float4 LPVSunDir;
+ // rgb: sun colour, w: intensity calibration for the secondary bounce feedback
+ float4 LPVSunColor;
+-// x: GI intensity multiplier, y: debug mode (0 off, 1 grid uv, 2 raw L0, 3 edge fade)
++// x: GI intensity multiplier, y: debug mode (0 off, 1 grid uv, 2 raw L0, 3 edge fade),
++// z: soft luminance rolloff ceiling of the applied irradiance (0 disables)
+ float4 LPVApplyParams;
+ // xy: screen size, zw: 1 / screen size
+ float4 LPVScreenSize;
+@@ -461,8 +462,11 @@ void LPVResolveCS(uint3 DTid : SV_DispatchThreadID)
+ 
+ 		if (skyVisible)
+ 		{
+-			// The sky flux travels into the lower hemisphere.
+-			const float4 skySH = LPVCosineLobe(float3(0.0f, 0.0f, -1.0f));
++			// 60% downward cosine lobe (sky flux travels into the lower hemisphere) + 40% isotropic:
++			// a pure downward lobe barely propagates sideways, so almost nothing entered interiors
++			// through vertical openings like windows. The CPU side shTransfer accounts for this mix.
++			const float4 skySH = LPVCosineLobe(float3(0.0f, 0.0f, -1.0f)) * 0.6f
++			                   + float4(LPV_SH_C0 * 0.4f, 0.0f, 0.0f, 0.0f);
+ 			shR += skySH * LPVSkyColor.r;
+ 			shG += skySH * LPVSkyColor.g;
+ 			shB += skySH * LPVSkyColor.b;
+@@ -827,6 +831,17 @@ void LPVApplyCS(uint3 DTid : SV_DispatchThreadID)
+ 			irradiance.b = max(0.0f, dot(shB, receiver));
+ 
+ 			irradiance *= fade * LPVApplyParams.x;
++
++			// Soft highlight rolloff (Reinhard on luminance): the dim indirect response stays
++			// linear while hot spots (sun facing white walls, outdoor single bounce paths) are
++			// compressed towards the r_LPVMaxIrradiance ceiling - a high intensity can brighten
++			// the interiors without overexposing the outdoors.
++			const float maxIrradiance = LPVApplyParams.z;
++			[branch] if (maxIrradiance > 0.0f)
++			{
++				const float lum = dot(irradiance, float3(0.2126f, 0.7152f, 0.0722f));
++				irradiance *= maxIrradiance / (maxIrradiance + lum);
++			}
+ 		}
+ 	}
+ 
+-- 
+2.47.1.windows.1
+

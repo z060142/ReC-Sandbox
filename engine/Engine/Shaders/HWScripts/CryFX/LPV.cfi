@@ -1,0 +1,1336 @@
+// Copyright 2016-2021 Crytek GmbH / Crytek Group. All rights reserved.
+
+// Light Propagation Volumes (single cascade, sun only).
+//
+// Pass order (driven by CLPVStage, GraphicsPipeline/LPV.cpp):
+//   LPVClear     -> zero the fixed point injection accumulator
+//   LPVInject    -> scatter the RSM texels (VPLs) into the accumulator
+//   LPVResolve   -> convert the accumulator into the RGB SH L1 grid textures
+//   LPVPropagate -> iterative 6 neighbour gather, ping-pong between two grid sets
+//   LPVApply     -> full resolution screen space irradiance
+//
+// SH conventions follow the CryEngine 3 LPV shaders: 2 band (L0 + L1) spherical harmonics,
+// one float4 per colour channel, three volume textures per grid set.
+
+//////////////////////////////////////////////////////////////////////////////////////////
+// Constants
+//////////////////////////////////////////////////////////////////////////////////////////
+
+// xyz: world space origin of the grid (corner of cell 0,0,0), w: cell size in meters
+float4 LPVGridParams;
+// x: cells per axis, y: 1 / cells per axis, z: 1 / cell size, w: world space extent of the grid
+float4 LPVGridParams2;
+// x: RSM samples per axis, y: RSM texel stride, z: injection bias in cells, w: surfel weight
+float4 LPVRsmParams;
+// x: RSM resolution, y: 1 / RSM resolution, z: debug mode
+float4 LPVRsmSize;
+// xyz: normalized direction towards the sun
+float4 LPVSunDir;
+// rgb: sun colour, w: intensity calibration for the secondary bounce feedback
+float4 LPVSunColor;
+// x: GI intensity multiplier, y: debug mode (0 off, 1 grid uv, 2 raw L0, 3 edge fade),
+// z: soft luminance rolloff ceiling of the applied irradiance (0 disables),
+// w: specular GI gain (0 disables the reflection march)
+float4 LPVApplyParams;
+// xy: screen size, zw: 1 / screen size
+float4 LPVScreenSize;
+// Explicit view ray reconstruction for the apply pass: camera origin and the world space frustum
+// corner rays (scaled so that ray * normalizedLinearDepth spans the full depth range), uploaded
+// from SRenderViewInfo. CV_ScreenToWorldBasis proved unreliable from a compute pass - the sampled
+// volume followed the camera orientation, cells popped in on one side and out on the other.
+float4 LPVCamPos;
+float4 LPVFrustumLT;
+float4 LPVFrustumRT;
+float4 LPVFrustumLB;
+float4 LPVFrustumRB;
+// RSM texture space (u, v, depth, 1) -> world space
+float4x4 LPVRsmToWorld;
+// World space -> RSM texture space (u, v, depth, w), used by the sky visibility test in the resolve
+float4x4 LPVWorldToRsm;
+// Depth range of the RSM view this cascade injects from, pinned together with the matrices:
+// x = fNearDist, y = fFarDist, z = fFarDist - fNearDist, w = 1 / (fFarDist - fNearDist).
+// The RSM depth buffer stores a LINEAR normalized depth (z_clip / fFarDist = (Z - n) / (F - n),
+// see CommonShadowGenPass.cfi), while the projective matrix pair works in post-divide z_ndc =
+// z_clip / w. The two encodings agree only at the range ends; every consumer has to convert.
+float4 LPVRsmDepthRange;
+// x: geometry volume occlusion strength (pre-divided by the aligned SH transfer, 0 disables)
+float4 LPVPropParams;
+// rgb: sky colour premultiplied with r_LPVSkyLight and the SH normalization, w: > 0 enables
+float4 LPVSkyColor;
+
+// SH basis constants: 1 / (2 * sqrt(PI)) and sqrt(3) / (2 * sqrt(PI))
+#define LPV_SH_C0     0.2820947918f
+#define LPV_SH_C1     0.4886025119f
+
+// Zonal harmonics of a clamped cosine lobe: sqrt(PI) / 2 and sqrt(PI / 3)
+#define LPV_ZH_COS0   0.8862269255f
+#define LPV_ZH_COS1   1.0233267079f
+
+// Zonal harmonics of a 90 degree aperture cone: 0.5 * (1 - cos(45)) and 0.75 * sin(45)^2
+#define LPV_ZH_CONE0  0.1464466094f
+#define LPV_ZH_CONE1  0.375f
+
+// Fixed point scale of the injection accumulator, must match CLPVStage::AccumulatorFixedPointScale
+#define LPV_FP_SCALE      4096.0f
+#define LPV_FP_INV_SCALE  (1.0f / LPV_FP_SCALE)
+
+// Thread group sizes, must match the constants in GraphicsPipeline/LPV.cpp
+#define LPV_GRID_TILE_SIZE    4
+#define LPV_INJECT_TILE_SIZE  8
+#define LPV_APPLY_TILE_SIZE   8
+
+//////////////////////////////////////////////////////////////////////////////////////////
+// SH helpers
+//////////////////////////////////////////////////////////////////////////////////////////
+
+// Rotates a zonal harmonics pair towards 'dir' and folds in the SH basis constants.
+float4 LPVProjectZH(float3 dir, float2 zh)
+{
+	return float4( zh.x * LPV_SH_C0,
+	              -zh.y * LPV_SH_C1 * dir.y,
+	               zh.y * LPV_SH_C1 * dir.z,
+	              -zh.y * LPV_SH_C1 * dir.x);
+}
+
+float4 LPVCosineLobe(float3 dir)
+{
+	return LPVProjectZH(dir, float2(LPV_ZH_COS0, LPV_ZH_COS1));
+}
+
+float4 LPVCone90(float3 dir)
+{
+	return LPVProjectZH(dir, float2(LPV_ZH_CONE0, LPV_ZH_CONE1));
+}
+
+// Receiver evaluation with one-sided de-ringing. L1 truncation makes a pure injected cosine
+// lobe evaluate NEGATIVE against an opposing receiver (iso 0.0625 + dir 0.25 * cos: -0.1875 at
+// the opposite pole, where the true value is zero), and because a cell stores the SUM of all
+// its lobes that negative term eats the co-stored sky light / bounce energy before the final
+// clamp - visible as big black halos around bright bounce patches (sun spots on a floor; the
+// halo only clears once the ambient exceeds ~2.4x the patch energy, which is why it shrank
+// under an overdriven secondary bounce and re-grew with the feedback). Scaling only the
+// NEGATIVE directional term by 0.25 (= A0^2 / A1^2 of the cosine lobe pair - the value that
+// puts a pure lobe at exactly ZERO on the opposite pole) keeps the aligned response and the
+// wall-leak cancellation untouched while the ambient share of the cell passes through.
+float LPVEvalReceiver(float4 sh, float4 receiver)
+{
+	const float iso = sh.x * receiver.x;
+	const float dir = dot(sh.yzw, receiver.yzw);
+	return max(0.0f, iso + ((dir < 0.0f) ? 0.25f * dir : dir));
+}
+
+// Plain SH direction basis, used to evaluate a stored SH radiance distribution in a direction.
+float4 LPVDirSH(float3 dir)
+{
+	return LPVProjectZH(dir, float2(1.0f, 1.0f));
+}
+
+// Replaces NaN with 0 and clamps against fp16 overflow. Applied to the persistent accumulation
+// state: a diverged bounce feedback (INF -> NaN through the signed SH dot products) would otherwise
+// poison whole regions, which the tonemapper displays as black patches.
+float4 LPVSanitize(float4 v)
+{
+	v = (v == v) ? v : (float4)0.0f;
+	return clamp(v, -60000.0f, 60000.0f);
+}
+
+// Linear index of the first accumulator element of a cell.
+// Layout: 12 SH coefficients (3 channels * 4), average surface albedo (RGB), surfel count,
+// geometry volume blocking potential (4 SH coefficients), average surface normal (xyz), 1 pad.
+// Must match CLPVStage::AccumulatorStride.
+#define LPV_ACCUM_STRIDE  24u
+#define LPV_ACCUM_ALBEDO  12u
+#define LPV_ACCUM_COUNT   15u
+#define LPV_ACCUM_GV      16u
+#define LPV_ACCUM_NORMAL  20u
+
+uint LPVCellBase(uint3 cell, uint gridSize)
+{
+	return ((cell.z * gridSize + cell.y) * gridSize + cell.x) * LPV_ACCUM_STRIDE;
+}
+
+//////////////////////////////////////////////////////////////////////////////////////////
+// LPVClear
+//////////////////////////////////////////////////////////////////////////////////////////
+
+RWBuffer<int> LPVInjectionUAV : register(u0);
+
+[numthreads(LPV_GRID_TILE_SIZE, LPV_GRID_TILE_SIZE, LPV_GRID_TILE_SIZE)]
+void LPVClearCS(uint3 DTid : SV_DispatchThreadID)
+{
+	const uint gridSize = (uint)LPVGridParams2.x;
+	if (DTid.x >= gridSize || DTid.y >= gridSize || DTid.z >= gridSize)
+		return;
+
+	const uint base = LPVCellBase(DTid, gridSize);
+
+	[unroll] for (uint i = 0; i < LPV_ACCUM_STRIDE; ++i)
+		LPVInjectionUAV[base + i] = 0;
+}
+
+technique LPVClear
+{
+	pass p0
+	{
+		ComputeShader = LPVClearCS();
+	}
+}
+
+//////////////////////////////////////////////////////////////////////////////////////////
+// LPVInject
+//////////////////////////////////////////////////////////////////////////////////////////
+
+Texture2D<float>  LPVRsmDepth  : register(t0);
+Texture2D<float4> LPVRsmColor  : register(t1);
+Texture2D<float4> LPVRsmNormal : register(t2);
+
+// Previous frame accumulated grid, sampled at the VPL position for the secondary bounce feedback.
+Texture3D<float4> LPVInjectPrevR : register(t3);
+Texture3D<float4> LPVInjectPrevG : register(t4);
+Texture3D<float4> LPVInjectPrevB : register(t5);
+
+SamplerState LPVInjectSampler : register(s0);
+
+[numthreads(LPV_INJECT_TILE_SIZE, LPV_INJECT_TILE_SIZE, 1)]
+void LPVInjectCS(uint3 DTid : SV_DispatchThreadID)
+{
+	const uint sampleCount = (uint)LPVRsmParams.x;
+	if (DTid.x >= sampleCount || DTid.y >= sampleCount)
+		return;
+
+	const int debugMode = (int)LPVRsmSize.z;
+
+	// Debug modes 5/6: bypass the RSM and the matrix entirely, flood the whole grid with unit flux.
+	// The dispatch is 2D, so every xy thread fills a full z column to cover the volume.
+	// If the resolved grid stays black in this mode the accumulator/atomics/resolve chain is broken.
+	if (debugMode == 5 || debugMode == 6)
+	{
+		const uint dbgGridSize = (uint)LPVGridParams2.x;
+		if (DTid.x >= dbgGridSize || DTid.y >= dbgGridSize)
+			return;
+
+		const int dbgValue = (int)(LPV_SH_C0 * LPV_FP_SCALE);
+		for (uint z = 0; z < dbgGridSize; ++z)
+		{
+			const uint dbgBase = LPVCellBase(uint3(DTid.xy, z), dbgGridSize);
+			InterlockedAdd(LPVInjectionUAV[dbgBase + 0u], dbgValue);
+			InterlockedAdd(LPVInjectionUAV[dbgBase + 4u], dbgValue);
+			InterlockedAdd(LPVInjectionUAV[dbgBase + 8u], dbgValue);
+		}
+		return;
+	}
+
+	const uint stride = max(1u, (uint)LPVRsmParams.y);
+	const uint2 texel = DTid.xy * stride + (stride >> 1u);
+
+	// Debug mode 4: keep the matrix path but disable all the rejection tests.
+	// Debug mode 7: like mode 4, but with the depth forced to the middle of the sun frustum,
+	// separating "matrix is wrong" from "depth texture reads zero/garbage".
+	const bool debugBypass = (debugMode == 4 || debugMode == 7);
+
+	// Sun cascades store a linear normalized depth, the far plane clear value is 1
+	const float depth = (debugMode == 7) ? 0.5f : LPVRsmDepth.Load(int3(texel, 0)).x;
+	if (!debugBypass && depth >= 1.0f)
+		return;
+
+	float3 normal = LPVRsmNormal.Load(int3(texel, 0)).xyz * 2.0f - 1.0f;
+	const float normalLenSq = dot(normal, normal);
+	if (!debugBypass && normalLenSq < 1e-4f)
+		return;
+	normal = (normalLenSq < 1e-4f) ? float3(0.0f, 0.0f, 1.0f) : normal * rsqrt(normalLenSq);
+
+	// Re-encode the LINEAR stored depth into the z_ndc the projective inverse expects (see the
+	// LPVRsmDepthRange comment). Feeding the linear value directly is exact only at the two range
+	// ends and stretches everything in between along the sun axis - the error grows quadratically
+	// with the depth range: invisible at r_LPVRsmClipRange 0 (~0.5 m), tens of meters at 700.
+	const float depthNdc = LPVRsmDepthRange.y * depth / (LPVRsmDepthRange.x + depth * LPVRsmDepthRange.z);
+
+	const float2 uv = ((float2)texel + 0.5f) * LPVRsmSize.y;
+	const float4 worldPosH = mul(LPVRsmToWorld, float4(uv, depthNdc, 1.0f));
+	const float3 worldPos = worldPosH.xyz / worldPosH.w;
+
+	const float3 albedo = LPVRsmColor.Load(int3(texel, 0)).rgb;
+	const int gridSize = (int)LPVGridParams2.x;
+
+	// Surface cache for the SVOGI style secondary bounce: every valid surfel registers its albedo
+	// and its normal in the cell it lives in (independent of the sun facing), LPVResolve turns the
+	// average albedo plus the previous frame grid into re-emitted light along the average normal.
+	const int3 surfCell = (int3)floor((worldPos - LPVGridParams.xyz) * LPVGridParams2.z);
+	if (all(surfCell >= 0) && all(surfCell < gridSize))
+	{
+		const uint surfBase = LPVCellBase((uint3)surfCell, (uint)gridSize);
+		InterlockedAdd(LPVInjectionUAV[surfBase + LPV_ACCUM_ALBEDO + 0u], (int)floor(albedo.r * LPV_FP_SCALE + 0.5f));
+		InterlockedAdd(LPVInjectionUAV[surfBase + LPV_ACCUM_ALBEDO + 1u], (int)floor(albedo.g * LPV_FP_SCALE + 0.5f));
+		InterlockedAdd(LPVInjectionUAV[surfBase + LPV_ACCUM_ALBEDO + 2u], (int)floor(albedo.b * LPV_FP_SCALE + 0.5f));
+		InterlockedAdd(LPVInjectionUAV[surfBase + LPV_ACCUM_COUNT], 1);
+
+		// Average surface normal of the cell, used to direct the bounce re-emission: an isotropic
+		// re-emission sends half of the energy straight through the surface it came from (a sunlit
+		// roof turned the interior ceiling into a light panel).
+		InterlockedAdd(LPVInjectionUAV[surfBase + LPV_ACCUM_NORMAL + 0u], (int)floor(normal.x * LPV_FP_SCALE + 0.5f));
+		InterlockedAdd(LPVInjectionUAV[surfBase + LPV_ACCUM_NORMAL + 1u], (int)floor(normal.y * LPV_FP_SCALE + 0.5f));
+		InterlockedAdd(LPVInjectionUAV[surfBase + LPV_ACCUM_NORMAL + 2u], (int)floor(normal.z * LPV_FP_SCALE + 0.5f));
+
+		// Geometry volume: every surfel registers a directional blocking potential (cosine lobe
+		// around the surface normal, scaled by the fraction of a cell face its footprint covers,
+		// LPVRsmParams.w). The surfels of a wall crossing the cell sum to ~1 with plain additive
+		// accumulation, independent of the sun facing - geometry blocks from both sides.
+		if (LPVRsmParams.w > 0.0f)
+		{
+			const float4 gvSH = LPVCosineLobe(normal) * LPVRsmParams.w;
+			[unroll] for (uint g = 0; g < 4; ++g)
+				InterlockedAdd(LPVInjectionUAV[surfBase + LPV_ACCUM_GV + g], (int)floor(gvSH[g] * LPV_FP_SCALE + 0.5f));
+		}
+	}
+
+	const float3 dirToLight = LPVSunDir.xyz;
+	const float ndotl = debugBypass ? 1.0f : saturate(dot(normal, dirToLight));
+	if (ndotl <= 0.0f)
+		return;
+
+	// The surfel weight is deliberately NOT applied here: with high sample counts it shrinks the
+	// per VPL contribution below the fixed point resolution and the smaller G/B channels of the warm
+	// sun colour quantize to zero (visible as a red tint). LPVResolve applies it in float instead.
+	const float3 flux = debugBypass ? (float3)1.0f : albedo * LPVSunColor.rgb * ndotl;
+
+	// Offset the VPL along the surface normal and towards the light to reduce self illumination
+	// and thin wall bleeding.
+	const float bias = LPVRsmParams.z * LPVGridParams.w;
+	const float3 injectPos = worldPos + (normal + dirToLight) * bias;
+
+	int3 cell = (int3)floor((injectPos - LPVGridParams.xyz) * LPVGridParams2.z);
+
+	// The VPL must never share a cell with its own surfel: when the surface sits in the sun-ward
+	// half of its cell the fixed bias is not enough to cross the cell boundary, the flux then sits
+	// inside the wall cell and the receivers on the far side pick it up directly through the
+	// trilinear lookup (the ceiling of a sunlit roof lit up through the roof). Push one more cell
+	// along the dominant normal axis in that case.
+	if (all(cell == surfCell))
+	{
+		const float3 absNormal = abs(normal);
+		int3 push = int3(0, 0, 0);
+		if (absNormal.x >= absNormal.y && absNormal.x >= absNormal.z)
+			push.x = (normal.x >= 0.0f) ? 1 : -1;
+		else if (absNormal.y >= absNormal.z)
+			push.y = (normal.y >= 0.0f) ? 1 : -1;
+		else
+			push.z = (normal.z >= 0.0f) ? 1 : -1;
+		cell += push;
+	}
+
+	if (cell.x < 0 || cell.y < 0 || cell.z < 0 || cell.x >= gridSize || cell.y >= gridSize || cell.z >= gridSize)
+		return;
+
+	const float4 sh = LPVCosineLobe(normal);
+	const uint base = LPVCellBase((uint3)cell, (uint)gridSize);
+
+	[unroll] for (uint k = 0; k < 4; ++k)
+	{
+		// floor(x + 0.5) rounds instead of truncating, keeping the quantization bias symmetric.
+		InterlockedAdd(LPVInjectionUAV[base + 0u + k], (int)floor(sh[k] * flux.r * LPV_FP_SCALE + 0.5f));
+		InterlockedAdd(LPVInjectionUAV[base + 4u + k], (int)floor(sh[k] * flux.g * LPV_FP_SCALE + 0.5f));
+		InterlockedAdd(LPVInjectionUAV[base + 8u + k], (int)floor(sh[k] * flux.b * LPV_FP_SCALE + 0.5f));
+	}
+}
+
+technique LPVInject
+{
+	pass p0
+	{
+		ComputeShader = LPVInjectCS();
+	}
+}
+
+//////////////////////////////////////////////////////////////////////////////////////////
+// LPVInjectScreen
+//////////////////////////////////////////////////////////////////////////////////////////
+
+// Secondary bounce VPLs from the camera GBuffer: every visible pixel that received indirect light
+// last frame re-emits it. Unlike the RSM (which only contains sun visible surfaces) this covers the
+// shadowed receivers, so the bounce actually reaches the dark parts of the scene.
+
+// x: pixel step, y: samples x, z: samples y, w: feedback gain
+float4 LPVScreenInjectParams;
+// x: area weight factor (multiplied by linearDepth^2), y: screen width, z: screen height, w: injection bias in meters
+float4 LPVScreenInjectParams2;
+
+Texture2D<float>  LPVScreenInjDepth   : register(t0);
+Texture2D<float4> LPVScreenInjNormals : register(t1);
+Texture2D<float4> LPVScreenInjDiffuse : register(t2);
+Texture2D<float4> LPVScreenInjPrevIrr : register(t3);
+
+[numthreads(LPV_INJECT_TILE_SIZE, LPV_INJECT_TILE_SIZE, 1)]
+void LPVInjectScreenCS(uint3 DTid : SV_DispatchThreadID)
+{
+	if (DTid.x >= (uint)LPVScreenInjectParams.y || DTid.y >= (uint)LPVScreenInjectParams.z)
+		return;
+
+	const uint step = max(1u, (uint)LPVScreenInjectParams.x);
+	const uint2 pixel = DTid.xy * step + (step >> 1u);
+	if (pixel.x >= (uint)LPVScreenInjectParams2.y || pixel.y >= (uint)LPVScreenInjectParams2.z)
+		return;
+
+	const float linearDepth = LPVScreenInjDepth.Load(int3(pixel, 0)).x;
+	if (linearDepth >= 1.0f)
+		return;
+
+	const float3 prevIrradiance = LPVScreenInjPrevIrr.Load(int3(pixel, 0)).rgb;
+	if (dot(prevIrradiance, (float3)1.0f) < 1e-5f)
+		return;
+
+	const float3 normal = DecodeGBufferNormal(LPVScreenInjNormals.Load(int3(pixel, 0)));
+	const float3 albedo = LPVScreenInjDiffuse.Load(int3(pixel, 0)).rgb;
+	const float3 worldPos = ReconstructWorldPos((int2)pixel, linearDepth, false);
+
+	// Area compensation: a screen pixel covers linearDepth^2 * factor times the area of an RSM texel,
+	// the shared surfel weight in LPVResolve assumes RSM texel footprints.
+	const float areaWeight = LPVScreenInjectParams2.x * linearDepth * linearDepth;
+
+	const float3 flux = albedo * prevIrradiance * (LPVScreenInjectParams.w * areaWeight);
+
+	const float3 injectPos = worldPos + normal * LPVScreenInjectParams2.w;
+
+	const int gridSize = (int)LPVGridParams2.x;
+	const int3 cell = (int3)floor((injectPos - LPVGridParams.xyz) * LPVGridParams2.z);
+	if (cell.x < 0 || cell.y < 0 || cell.z < 0 || cell.x >= gridSize || cell.y >= gridSize || cell.z >= gridSize)
+		return;
+
+	const float4 sh = LPVCosineLobe(normal);
+	const uint base = LPVCellBase((uint3)cell, (uint)gridSize);
+
+	[unroll] for (uint k = 0; k < 4; ++k)
+	{
+		InterlockedAdd(LPVInjectionUAV[base + 0u + k], (int)floor(sh[k] * flux.r * LPV_FP_SCALE + 0.5f));
+		InterlockedAdd(LPVInjectionUAV[base + 4u + k], (int)floor(sh[k] * flux.g * LPV_FP_SCALE + 0.5f));
+		InterlockedAdd(LPVInjectionUAV[base + 8u + k], (int)floor(sh[k] * flux.b * LPV_FP_SCALE + 0.5f));
+	}
+}
+
+technique LPVInjectScreen
+{
+	pass p0
+	{
+		ComputeShader = LPVInjectScreenCS();
+	}
+}
+
+//////////////////////////////////////////////////////////////////////////////////////////
+// LPVResolve
+//////////////////////////////////////////////////////////////////////////////////////////
+
+// x: surfel weight (applied here in float instead of pre-quantization in the inject pass)
+float4 LPVResolveParams;
+// xyz: cell offset into the previous frame accumulation grid, w: secondary bounce gain (already
+// multiplied with the intensity calibration, 0 disables the feedback)
+float4 LPVResolveParams2;
+
+Buffer<int> LPVInjectionSRV : register(t0);
+
+// Previous frame accumulated grid, the source of the SVOGI style re-emission feedback.
+Texture3D<float4> LPVResolvePrevR : register(t1);
+Texture3D<float4> LPVResolvePrevG : register(t2);
+Texture3D<float4> LPVResolvePrevB : register(t3);
+// RSM depth, used as the open sky proxy of the sky light injection (can the cell see the sun).
+Texture2D<float>  LPVResolveRsmDepth : register(t4);
+
+RWTexture3D<float4> LPVResolveOutR : register(u0);
+RWTexture3D<float4> LPVResolveOutG : register(u1);
+RWTexture3D<float4> LPVResolveOutB : register(u2);
+RWTexture3D<float4> LPVResolveOutGV : register(u3);
+
+[numthreads(LPV_GRID_TILE_SIZE, LPV_GRID_TILE_SIZE, LPV_GRID_TILE_SIZE)]
+void LPVResolveCS(uint3 DTid : SV_DispatchThreadID)
+{
+	const uint gridSize = (uint)LPVGridParams2.x;
+	if (DTid.x >= gridSize || DTid.y >= gridSize || DTid.z >= gridSize)
+		return;
+
+	const uint base = LPVCellBase(DTid, gridSize);
+
+	float4 shR = 0;
+	float4 shG = 0;
+	float4 shB = 0;
+
+	const float weight = LPVResolveParams.x * LPV_FP_INV_SCALE;
+
+	[unroll] for (uint k = 0; k < 4; ++k)
+	{
+		shR[k] = (float)LPVInjectionSRV[base + 0u + k] * weight;
+		shG[k] = (float)LPVInjectionSRV[base + 4u + k] * weight;
+		shB[k] = (float)LPVInjectionSRV[base + 8u + k] * weight;
+	}
+
+	// SVOGI style secondary bounce: the surfaces registered in this cell re-emit the indirect light
+	// the cell received last frame (previous accumulated grid, average albedo from the surface cache).
+	// The emission is isotropic (L0 only), the propagation spreads it into the neighbourhood.
+	const float bounceGain = LPVResolveParams2.w;
+	const int surfelCount = LPVInjectionSRV[base + LPV_ACCUM_COUNT];
+	if (bounceGain > 0.0f && surfelCount > 0)
+	{
+		const int3 prevCell = (int3)DTid + (int3)round(LPVResolveParams2.xyz);
+		if (all(prevCell >= 0) && all(prevCell < (int)gridSize))
+		{
+			const float invCount = LPV_FP_INV_SCALE / (float)surfelCount;
+			const float3 cellAlbedo = float3((float)LPVInjectionSRV[base + LPV_ACCUM_ALBEDO + 0u],
+			                                 (float)LPVInjectionSRV[base + LPV_ACCUM_ALBEDO + 1u],
+			                                 (float)LPVInjectionSRV[base + LPV_ACCUM_ALBEDO + 2u]) * invCount;
+
+			const float3 prevAmbient = float3(max(0.0f, LPVResolvePrevR.Load(int4(prevCell, 0)).x),
+			                                  max(0.0f, LPVResolvePrevG.Load(int4(prevCell, 0)).x),
+			                                  max(0.0f, LPVResolvePrevB.Load(int4(prevCell, 0)).x));
+
+			const float3 emission = cellAlbedo * prevAmbient * bounceGain;
+
+			// Re-emit along the average surface normal of the cell instead of isotropically: the
+			// isotropic L0 emission sent half of the energy straight through the emitting surface
+			// (a sunlit roof lit the interior ceiling below it). Cells with incoherent normals
+			// (corners, thin double sided walls) fall back to a weak isotropic term.
+			const float3 nSum = float3((float)LPVInjectionSRV[base + LPV_ACCUM_NORMAL + 0u],
+			                           (float)LPVInjectionSRV[base + LPV_ACCUM_NORMAL + 1u],
+			                           (float)LPVInjectionSRV[base + LPV_ACCUM_NORMAL + 2u]);
+			const float nLen = length(nSum);
+			const float4 emissionSH = (nLen > 0.5f * LPV_FP_SCALE)
+			                        ? LPVCosineLobe(nSum / nLen)
+			                        : float4(LPV_SH_C0 * 0.5f, 0.0f, 0.0f, 0.0f);
+
+			shR += emissionSH * emission.r;
+			shG += emissionSH * emission.g;
+			shB += emissionSH * emission.b;
+		}
+	}
+
+	// Geometry volume: plain fixed point decode of the accumulated blocking potential.
+	float4 gv = 0;
+	[unroll] for (uint g = 0; g < 4; ++g)
+		gv[g] = (float)LPVInjectionSRV[base + LPV_ACCUM_GV + g] * LPV_FP_INV_SCALE;
+	LPVResolveOutGV[DTid] = gv;
+
+	// Sky light: cells that can see the sun (RSM depth test, one cell towards the sun as a robust
+	// bias independent of the RSM depth scaling) count as open sky and receive a downward cosine
+	// lobe of sky colour. Interiors fail the test and only receive sky through the propagation via
+	// openings, attenuated by the geometry volume - which is what produces the AO-like ambient.
+	// Skipped in the staged injection debug modes (4..7) to keep their probes clean.
+	// Only cells WITHOUT registered surfaces receive sky: a cell containing the roof of an enclosed
+	// building is sun visible from above, and injecting sky into it turns the interior ceiling into
+	// a light panel (the receivers sample their own cell). Surface receivers get the sky from the
+	// empty cell on their front side instead - the apply pass offsets the sample point half a cell
+	// along the surface normal, which lands above the ground outdoors and below the roof indoors.
+	const int resolveDebugMode = (int)LPVRsmSize.z;
+	if (LPVSkyColor.w > 0.0f && surfelCount == 0 && !(resolveDebugMode >= 4 && resolveDebugMode <= 7))
+	{
+		// Cell centre without any sun-ward bias: a bias jumps past occluder surfaces that live in
+		// the same cell (that was the ceiling light panel bug).
+		const float3 cellCenter = LPVGridParams.xyz + ((float3)DTid + 0.5f) * LPVGridParams.w;
+
+		// "Sun visible" alone is a broken open sky proxy indoors: every cell inside a sun shaft
+		// entering through a window sees the sun, which injected sky light columns into interiors
+		// (observed as sky-lit cells against the ceiling). Three combined conditions:
+		//   1. the cell above must be free of surfels (sky access requires an open cell above -
+		//      also kills the layer directly below any roof),
+		//   2. the cell centre must see the sun,
+		//   3. the point two cells straight up must see the sun (a shaft is tilted along the sun
+		//      direction, a vertical offset exits it; a genuinely outdoor cell stays visible).
+		const uint gridSizeU = gridSize;
+		const uint aboveBase = LPVCellBase(uint3(DTid.x, DTid.y, min(DTid.z + 1u, gridSizeU - 1u)), gridSizeU);
+		bool skyVisible = (LPVInjectionSRV[aboveBase + LPV_ACCUM_COUNT] == 0);
+
+		for (uint s = 0; s < 2 && skyVisible; ++s)
+		{
+			const float3 samplePos = cellCenter + float3(0.0f, 0.0f, (float)s * 2.0f * LPVGridParams.w);
+
+			float4 rsmH = mul(LPVWorldToRsm, float4(samplePos, 1.0f));
+			// w of the projective transform is the view depth along the sun axis - keep it before
+			// the divide, the depth comparison below runs in the LINEAR stored encoding.
+			const float rsmViewDepth = rsmH.w;
+			rsmH /= (abs(rsmH.w) > 1e-12f) ? rsmH.w : 1.0f;
+
+			// Outside the RSM coverage there is no occluder information, treat as visible.
+			if (all(rsmH.xy >= 0.0f) && all(rsmH.xy <= 1.0f))
+			{
+				const int2 rsmTexel = clamp((int2)(rsmH.xy * LPVRsmSize.x), 0, (int)LPVRsmSize.x - 1);
+				const float storedDepth = LPVResolveRsmDepth.Load(int3(rsmTexel, 0)).x;
+				// storedDepth is linear (Z - n) / (F - n); convert the sample the same way instead
+				// of comparing the hyperbolic z_ndc against it (see the LPVRsmDepthRange comment).
+				const float sampleLinear = (rsmViewDepth - LPVRsmDepthRange.x) * LPVRsmDepthRange.w;
+				skyVisible = (sampleLinear <= storedDepth);
+			}
+		}
+
+		if (skyVisible)
+		{
+			// 60% downward cosine lobe (sky flux travels into the lower hemisphere) + 40% isotropic:
+			// a pure downward lobe barely propagates sideways, so almost nothing entered interiors
+			// through vertical openings like windows. The CPU side shTransfer accounts for this mix.
+			const float4 skySH = LPVCosineLobe(float3(0.0f, 0.0f, -1.0f)) * 0.6f
+			                   + float4(LPV_SH_C0 * 0.4f, 0.0f, 0.0f, 0.0f);
+			shR += skySH * LPVSkyColor.r;
+			shG += skySH * LPVSkyColor.g;
+			shB += skySH * LPVSkyColor.b;
+		}
+	}
+
+	LPVResolveOutR[DTid] = shR;
+	LPVResolveOutG[DTid] = shG;
+	LPVResolveOutB[DTid] = shB;
+}
+
+technique LPVResolve
+{
+	pass p0
+	{
+		ComputeShader = LPVResolveCS();
+	}
+}
+
+//////////////////////////////////////////////////////////////////////////////////////////
+// LPVPropagate
+//////////////////////////////////////////////////////////////////////////////////////////
+
+Texture3D<float4> LPVPropSrcR : register(t0);
+Texture3D<float4> LPVPropSrcG : register(t1);
+Texture3D<float4> LPVPropSrcB : register(t2);
+Texture3D<float4> LPVPropSumSrcR : register(t3);
+Texture3D<float4> LPVPropSumSrcG : register(t4);
+Texture3D<float4> LPVPropSumSrcB : register(t5);
+// Geometry volume: directional blocking potential per cell (resolved by LPVResolve).
+Texture3D<float4> LPVPropGV : register(t6);
+
+RWTexture3D<float4> LPVPropDstR : register(u0);
+RWTexture3D<float4> LPVPropDstG : register(u1);
+RWTexture3D<float4> LPVPropDstB : register(u2);
+RWTexture3D<float4> LPVPropSumDstR : register(u3);
+RWTexture3D<float4> LPVPropSumDstG : register(u4);
+RWTexture3D<float4> LPVPropSumDstB : register(u5);
+
+[numthreads(LPV_GRID_TILE_SIZE, LPV_GRID_TILE_SIZE, LPV_GRID_TILE_SIZE)]
+void LPVPropagateCS(uint3 DTid : SV_DispatchThreadID)
+{
+	// Axial "cross" stencil, no diagonal neighbours (Kaplanyan, SIGGRAPH 2009, appendix C).
+	static const int3 neighbourOffset[6] =
+	{
+		int3( 1,  0,  0),
+		int3(-1,  0,  0),
+		int3( 0,  1,  0),
+		int3( 0, -1,  0),
+		int3( 0,  0,  1),
+		int3( 0,  0, -1),
+	};
+
+	const int gridSize = (int)LPVGridParams2.x;
+	const int3 cell = (int3)DTid;
+	if (cell.x >= gridSize || cell.y >= gridSize || cell.z >= gridSize)
+		return;
+
+	// Gather-only propagation with the face solid angle reprojection of Kaplanyan & Dachsbacher
+	// (I3D 2010): the flux of each neighbour is evaluated towards the five faces of the current
+	// cell (the face shared with the neighbour is excluded), weighted by the real solid angle the
+	// face subtends from the neighbour centre, and deposited as a cosine lobe around the face
+	// normal. The five faces of all six neighbours partition the sphere, so the operator is energy
+	// conserving (total transfer ~0.9 per step) - unlike the previous cone90 SH dot variant, which
+	// lost ~90% per step and needed r_LPVIntensity ~150 to compensate. The destination holds only
+	// the light arriving this iteration (stable for any iteration count), the total is kept in an
+	// explicit running sum.
+	float4 dstR = (float4)0.0f;
+	float4 dstG = (float4)0.0f;
+	float4 dstB = (float4)0.0f;
+
+	// Solid angles (steradians) of the far face and of one side face of the destination cell as
+	// seen from the neighbour cell centre.
+	const float faceSolidAngleFar  = 0.4006696846f;
+	const float faceSolidAngleSide = 0.4234413544f;
+
+	const float occStrength = LPVPropParams.x;
+	const float4 gvSelf = (occStrength > 0.0f) ? LPVPropGV.Load(int4(cell, 0)) : (float4)0.0f;
+
+	[unroll] for (int i = 0; i < 6; ++i)
+	{
+		const int3 offset = neighbourOffset[i];
+		const int3 neighbour = cell + offset;
+
+		if (neighbour.x < 0 || neighbour.y < 0 || neighbour.z < 0 ||
+		    neighbour.x >= gridSize || neighbour.y >= gridSize || neighbour.z >= gridSize)
+			continue;
+
+		const float4 srcR = LPVPropSrcR.Load(int4(neighbour, 0));
+		const float4 srcG = LPVPropSrcG.Load(int4(neighbour, 0));
+		const float4 srcB = LPVPropSrcB.Load(int4(neighbour, 0));
+
+		// Geometry volume occlusion, evaluated in the direction of travel (90 degree cone as the
+		// directional window). abs(): a surfel blocks from both of its sides. Pre-scaled so that a
+		// fully covered perpendicular face reaches zero transmittance at r_LPVOcclusion 1.
+		// First iteration (LPVPropParams.y): gate with the DESTINATION cell GV only - the source
+		// cell's own geometry must never block its light from leaving (VPLs and the bounce
+		// re-emission live right next to their walls), but the receiving cell's geometry always
+		// applies. The previous blanket first-iteration exemption granted every wall one free
+		// crossing, which is why raising r_LPVOcclusion only hardened the leak edges.
+		float transmittance = 1.0f;
+		if (occStrength > 0.0f)
+		{
+			const float4 gvGate = (LPVPropParams.y > 0.5f)
+			                    ? gvSelf
+			                    : 0.5f * (gvSelf + LPVPropGV.Load(int4(neighbour, 0)));
+			const float4 travelCone = LPVCone90(-(float3)offset);
+			transmittance = saturate(1.0f - abs(dot(gvGate, travelCone)) * occStrength);
+		}
+
+		[unroll] for (int f = 0; f < 6; ++f)
+		{
+			const int3 faceNormalI = neighbourOffset[f];
+			// alignment of the face normal with the neighbour offset: 1 = the shared face (skip),
+			// -1 = the far face, 0 = one of the four side faces
+			const int alignment = faceNormalI.x * offset.x + faceNormalI.y * offset.y + faceNormalI.z * offset.z;
+			if (alignment == 1)
+				continue;
+
+			const float solidAngle = (alignment == -1) ? faceSolidAngleFar : faceSolidAngleSide;
+
+			// Direction from the neighbour centre towards the face centre of the current cell
+			// (cell size 1: face centre = 0.5 * normal, neighbour centre = offset).
+			const float3 evalDir = normalize(0.5f * (float3)faceNormalI - (float3)offset);
+			const float4 dirSH = LPVDirSH(evalDir);
+
+			float3 flux;
+			flux.r = max(0.0f, dot(srcR, dirSH)) * solidAngle * transmittance;
+			flux.g = max(0.0f, dot(srcG, dirSH)) * solidAngle * transmittance;
+			flux.b = max(0.0f, dot(srcB, dirSH)) * solidAngle * transmittance;
+
+			const float4 faceLobe = LPVCosineLobe((float3)faceNormalI);
+			dstR += faceLobe * flux.r;
+			dstG += faceLobe * flux.g;
+			dstB += faceLobe * flux.b;
+		}
+	}
+
+	LPVPropDstR[DTid] = dstR;
+	LPVPropDstG[DTid] = dstG;
+	LPVPropDstB[DTid] = dstB;
+
+	LPVPropSumDstR[DTid] = LPVSanitize(LPVPropSumSrcR.Load(int4(cell, 0)) + dstR);
+	LPVPropSumDstG[DTid] = LPVSanitize(LPVPropSumSrcG.Load(int4(cell, 0)) + dstG);
+	LPVPropSumDstB[DTid] = LPVSanitize(LPVPropSumSrcB.Load(int4(cell, 0)) + dstB);
+}
+
+technique LPVPropagate
+{
+	pass p0
+	{
+		ComputeShader = LPVPropagateCS();
+	}
+}
+
+//////////////////////////////////////////////////////////////////////////////////////////
+// LPVTemporal
+//////////////////////////////////////////////////////////////////////////////////////////
+
+// xyz: cell offset into the previous frame grid (integer, both origins are cell snapped),
+// w: blend weight of the current frame (1 = no history)
+float4 LPVTemporalParams;
+
+// Local light injection (CE3 LPVPostinjectLight equivalent), folded into the temporal pass: a
+// separate pass would need a typed RGBA16F UAV read-modify-write, an optional feature on D3D11.
+#define LPV_MAX_POINT_LIGHTS 16
+// x: light count, y: gain (premultiplied with the display intensity compensation)
+float4 LPVLightParams;
+// xyz: world position, w: radius
+float4 LPVLightPos[LPV_MAX_POINT_LIGHTS];
+// rgb: colour (scene scaled)
+float4 LPVLightColor[LPV_MAX_POINT_LIGHTS];
+// xyz: emission direction (projector axis / area light normal), w: cos of the outer cone
+// half-angle (projector), 0 (area light hemisphere) or -1.5 (omnidirectional point light)
+float4 LPVLightDir[LPV_MAX_POINT_LIGHTS];
+
+Texture3D<float4> LPVTempCurR  : register(t0);
+Texture3D<float4> LPVTempCurG  : register(t1);
+Texture3D<float4> LPVTempCurB  : register(t2);
+Texture3D<float4> LPVTempPrevR : register(t3);
+Texture3D<float4> LPVTempPrevG : register(t4);
+Texture3D<float4> LPVTempPrevB : register(t5);
+
+RWTexture3D<float4> LPVTempOutR : register(u0);
+RWTexture3D<float4> LPVTempOutG : register(u1);
+RWTexture3D<float4> LPVTempOutB : register(u2);
+
+[numthreads(LPV_GRID_TILE_SIZE, LPV_GRID_TILE_SIZE, LPV_GRID_TILE_SIZE)]
+void LPVTemporalCS(uint3 DTid : SV_DispatchThreadID)
+{
+	const int gridSize = (int)LPVGridParams2.x;
+	const int3 cell = (int3)DTid;
+	if (cell.x >= gridSize || cell.y >= gridSize || cell.z >= gridSize)
+		return;
+
+	float4 curR = LPVTempCurR.Load(int4(cell, 0));
+	float4 curG = LPVTempCurG.Load(int4(cell, 0));
+	float4 curB = LPVTempCurB.Load(int4(cell, 0));
+
+	// Local light injection: every deferred point light adds an outward flowing lobe with a
+	// quadratic distance falloff before the accumulation blend, so the history stays consistent.
+	// No bounce and no propagation - a cheap local ambient glow around the scene's real lights.
+	const int lightCount = min((int)LPVLightParams.x, LPV_MAX_POINT_LIGHTS);
+	if (lightCount > 0)
+	{
+		const float3 cellCenter = LPVGridParams.xyz + ((float3)cell + 0.5f) * LPVGridParams.w;
+
+		for (int i = 0; i < lightCount; ++i)
+		{
+			const float3 toCell = cellCenter - LPVLightPos[i].xyz;
+			const float dist = length(toCell);
+			const float radius = max(LPVLightPos[i].w, 1e-3f);
+			if (dist >= radius)
+				continue;
+
+			const float3 dirOut = (dist > 1e-3f) ? toCell / dist : float3(0.0f, 0.0f, 1.0f);
+
+			// Cone gate: projectors only emit into their frustum cone, area lights into the
+			// hemisphere in front of the plane; -1.5 (point lights) always passes. Soft edge over
+			// the outer part of the cone.
+			float coneWeight = 1.0f;
+			const float cosOuter = LPVLightDir[i].w;
+			if (cosOuter > -1.0f)
+			{
+				const float cosAngle = dot(dirOut, LPVLightDir[i].xyz);
+				coneWeight = smoothstep(cosOuter, lerp(cosOuter, 1.0f, 0.35f), cosAngle);
+			}
+			if (coneWeight <= 0.0f)
+				continue;
+
+			const float falloff = 1.0f - dist / radius;
+			const float atten = falloff * falloff * coneWeight * LPVLightParams.y;
+			const float4 sh = LPVCosineLobe(dirOut) * 0.6f + float4(LPV_SH_C0 * 0.4f, 0.0f, 0.0f, 0.0f);
+
+			curR += sh * (LPVLightColor[i].r * atten);
+			curG += sh * (LPVLightColor[i].g * atten);
+			curB += sh * (LPVLightColor[i].b * atten);
+		}
+	}
+
+	float alpha = LPVTemporalParams.w;
+
+	// Same world position in the previous frame grid, an integer shift because of the cell snapping.
+	const int3 prevCell = cell + (int3)round(LPVTemporalParams.xyz);
+
+	float4 prevR = curR;
+	float4 prevG = curG;
+	float4 prevB = curB;
+
+	if (prevCell.x >= 0 && prevCell.y >= 0 && prevCell.z >= 0 &&
+	    prevCell.x < gridSize && prevCell.y < gridSize && prevCell.z < gridSize)
+	{
+		prevR = LPVTempPrevR.Load(int4(prevCell, 0));
+		prevG = LPVTempPrevG.Load(int4(prevCell, 0));
+		prevB = LPVTempPrevB.Load(int4(prevCell, 0));
+	}
+	else
+	{
+		// No history outside the previous volume.
+		alpha = 1.0f;
+	}
+
+	LPVTempOutR[DTid] = LPVSanitize(lerp(prevR, curR, alpha));
+	LPVTempOutG[DTid] = LPVSanitize(lerp(prevG, curG, alpha));
+	LPVTempOutB[DTid] = LPVSanitize(lerp(prevB, curB, alpha));
+}
+
+technique LPVTemporal
+{
+	pass p0
+	{
+		ComputeShader = LPVTemporalCS();
+	}
+}
+
+//////////////////////////////////////////////////////////////////////////////////////////
+// LPVApply
+//////////////////////////////////////////////////////////////////////////////////////////
+
+Texture2D<float>  LPVSceneDepth   : register(t0);
+Texture2D<float4> LPVSceneNormals : register(t1);
+Texture3D<float4> LPVGridR        : register(t2);
+Texture3D<float4> LPVGridG        : register(t3);
+Texture3D<float4> LPVGridB        : register(t4);
+Buffer<int>       LPVApplyAccum   : register(t5);
+Texture2D<float>  LPVApplyRsmDepth : register(t6);
+// Cascade 1 (mid) accumulated grid (nested cascades).
+Texture3D<float4> LPVGridFarR     : register(t7);
+Texture3D<float4> LPVGridFarG     : register(t8);
+Texture3D<float4> LPVGridFarB     : register(t9);
+// Cascade 2 (outer) accumulated grid.
+Texture3D<float4> LPVGridFar2R    : register(t10);
+Texture3D<float4> LPVGridFar2G    : register(t11);
+Texture3D<float4> LPVGridFar2B    : register(t12);
+// Height map AO mask (r = openness to the sky at max depth, g = at min depth; 1 = open).
+// White texture whenever the height map AO stage did not run.
+Texture2D<float2> LPVHeightMapAO  : register(t13);
+
+// xyz: world space origin of the far cascade, w: far cascade cell size in meters
+float4 LPVGridParamsFar;
+// x: world space extent of the far cascade, y: > 0 when the far cascade is active
+float4 LPVGridParams2Far;
+// Cascade 2 (outer) volume, same layout as the Far pair.
+float4 LPVGridParamsFar2;
+float4 LPVGridParams2Far2;
+// x: height map AO damping strength for the coarse cascades (0 = sampling disabled).
+// y: translucent surface irradiance gain (r_LPVTranslucentBrightness, 0 = disabled).
+float4 LPVHmaoParams;
+
+SamplerState LPVGridSampler : register(s0);
+
+RWTexture2D<float4> LPVIrradianceUAV : register(u0);
+RWTexture2D<float4> LPVSpecularUAV   : register(u1);
+
+[numthreads(LPV_APPLY_TILE_SIZE, LPV_APPLY_TILE_SIZE, 1)]
+void LPVApplyCS(uint3 DTid : SV_DispatchThreadID)
+{
+	const uint2 pixelCoord = DTid.xy;
+	if (pixelCoord.x >= (uint)LPVScreenSize.x || pixelCoord.y >= (uint)LPVScreenSize.y)
+		return;
+
+	// Debug mode 8: show the raw RSM depth exactly as the inject pass reads it, overlaid with the
+	// alignment probes for the content-vs-matrix investigation:
+	//   r = depth, b = 1 where cleared (>= 1)
+	//   g = 1 where the RECONSTRUCTED world position of the texel lies inside the near volume -
+	//       exactly the texels the near cascade injection can use. Their shape has to match the
+	//       geometry rendered around the volume, otherwise content and matrix disagree.
+	//   red crosshair = where the reconstruction matrix places the camera inside the RSM.
+	if ((int)LPVApplyParams.y == 8)
+	{
+		const float2 rsmUV = ((float2)pixelCoord + 0.5f) * LPVScreenSize.zw;
+		const uint2 rsmTexel = (uint2)(rsmUV * LPVRsmSize.x);
+		const float rsmDepth = LPVApplyRsmDepth.Load(int3(rsmTexel, 0)).x;
+
+		float4 col = float4(rsmDepth, 0.0f, (rsmDepth >= 1.0f) ? 1.0f : 0.0f, 1.0f);
+
+		// Green: this texel reconstructs into the near volume.
+		if (rsmDepth < 1.0f)
+		{
+			// Same linear -> z_ndc re-encoding as the inject pass (see LPVRsmDepthRange).
+			const float rsmDepthNdc = LPVRsmDepthRange.y * rsmDepth / (LPVRsmDepthRange.x + rsmDepth * LPVRsmDepthRange.z);
+			const float4 rsmWorldH = mul(LPVRsmToWorld, float4(rsmUV, rsmDepthNdc, 1.0f));
+			const float3 rsmWorld = rsmWorldH.xyz / rsmWorldH.w;
+			const float3 volUV = (rsmWorld - LPVGridParams.xyz) / LPVGridParams2.w;
+			if (all(volUV >= 0.0f) && all(volUV <= 1.0f))
+				col.g = 1.0f;
+		}
+
+		// Red crosshair: the camera through the forward matrix.
+		float4 camH = mul(LPVWorldToRsm, float4(LPVCamPos.xyz, 1.0f));
+		camH /= (abs(camH.w) > 1e-12f) ? camH.w : 1.0f;
+		const float2 dist = abs(rsmUV - camH.xy);
+		if ((dist.x < 0.002f && dist.y < 0.03f) || (dist.y < 0.002f && dist.x < 0.03f))
+			col = float4(1.0f, 0.0f, 0.0f, 1.0f);
+
+		LPVIrradianceUAV[pixelCoord] = col;
+		return;
+	}
+
+	float3 irradiance = 0;
+	float3 specular = 0;
+
+	const float linearDepth = LPVSceneDepth.Load(int3(pixelCoord, 0)).x;
+	const int debugMode = (int)LPVApplyParams.y;
+
+	[branch] if (linearDepth < 1.0f)
+	{
+		const float4 gbufferA = LPVSceneNormals.Load(int3(pixelCoord, 0));
+		const float3 normal = DecodeGBufferNormal(gbufferA);
+
+		const float2 screenUV = ((float2)pixelCoord + 0.5f) * LPVScreenSize.zw;
+		const float3 viewRay = lerp(lerp(LPVFrustumLT.xyz, LPVFrustumRT.xyz, screenUV.x),
+		                            lerp(LPVFrustumLB.xyz, LPVFrustumRB.xyz, screenUV.x), screenUV.y);
+		const float3 worldPos = LPVCamPos.xyz + viewRay * linearDepth;
+
+		// Receiver side offset along the surface normal (half a cell): moves the sample point away
+		// from the wall so that the trilinear lookup does not pick up cells on the far side of thin
+		// geometry (CryEngine 3 shipped the same trick, see 04_ce3_shader_reconstruction.md).
+		const float3 samplePos = worldPos + normal * (LPVGridParams.w * 0.5f);
+
+		const float3 gridUV = (samplePos - LPVGridParams.xyz) / LPVGridParams2.w;
+
+		// Fade out over the outer 30% of the volume so that the boundary is not a hard edge: the
+		// hand-over to the coarser far cascade needs a wide ramp, a 10% band read as a line whenever
+		// the two cascades disagreed even slightly.
+		const float3 centered = abs(gridUV - 0.5f) * 2.0f;
+		const float edge = max(centered.x, max(centered.y, centered.z));
+		const float fade = 1.0f - smoothstep(0.7f, 1.0f, edge);
+
+		if (debugMode == 1)
+		{
+			LPVIrradianceUAV[pixelCoord] = float4(frac(gridUV), 1.0f);
+			return;
+		}
+		// Debug mode 6: read the injection accumulator directly, bypassing resolve/propagate/textures.
+		if (debugMode == 6)
+		{
+			const int accumGridSize = (int)LPVGridParams2.x;
+			const int3 accumCell = clamp((int3)(gridUV * accumGridSize), 0, accumGridSize - 1);
+			const uint accumBase = LPVCellBase((uint3)accumCell, (uint)accumGridSize);
+			const float3 accumL0 = float3(abs((float)LPVApplyAccum[accumBase + 0u]),
+			                              abs((float)LPVApplyAccum[accumBase + 4u]),
+			                              abs((float)LPVApplyAccum[accumBase + 8u])) * LPV_FP_INV_SCALE;
+			// Scaled by the display intensity: the raw accumulator units are far below 8 bit
+			// visibility, un-scaled screenshots of this mode were unreadable black.
+			LPVIrradianceUAV[pixelCoord] = float4(accumL0 * LPVApplyParams.x, 1.0f);
+			return;
+		}
+		// Debug mode 12: geometry volume blocking potential (L0 magnitude) as a surface mosaic.
+		// White = fully blocking cell, black = free space. Read from the injection accumulator, so
+		// this shows exactly what the propagation occlusion works with.
+		if (debugMode == 12)
+		{
+			const int gvGridSize = (int)LPVGridParams2.x;
+			const int3 gvCell = clamp((int3)(gridUV * gvGridSize), 0, gvGridSize - 1);
+			const uint gvBase = LPVCellBase((uint3)gvCell, (uint)gvGridSize);
+			const float gvL0 = abs((float)LPVApplyAccum[gvBase + LPV_ACCUM_GV]) * LPV_FP_INV_SCALE;
+			// The L0 of a fully covered face is ZH_COS0 * SH_C0 = 0.25, normalize so that it shows as 1.
+			LPVIrradianceUAV[pixelCoord] = float4((gvL0 * 4.0f).xxx, 1.0f);
+			return;
+		}
+
+		// Debug mode 13: far cascade raw L0 sampled on every surface, ignoring the near volume and
+		// the fade bands. Bright regions have to sit at the same world positions at any
+		// r_LPVCascadeScale (only blockier with bigger cells) - if they move, the far RSM content
+		// and its matrices disagree.
+		if (debugMode == 13)
+		{
+			float3 dbgFar = (float3)0.0f;
+			if (LPVGridParams2Far.y > 0.5f)
+			{
+				const float3 uvFar = saturate((worldPos - LPVGridParamsFar.xyz) / LPVGridParams2Far.x);
+				const float4 fR = LPVGridFarR.SampleLevel(LPVGridSampler, uvFar, 0);
+				const float4 fG = LPVGridFarG.SampleLevel(LPVGridSampler, uvFar, 0);
+				const float4 fB = LPVGridFarB.SampleLevel(LPVGridSampler, uvFar, 0);
+				dbgFar = float3(abs(fR.x), abs(fG.x), abs(fB.x)) * LPVApplyParams.x;
+			}
+			LPVIrradianceUAV[pixelCoord] = float4(dbgFar, 1.0f);
+			return;
+		}
+
+		// Debug mode 15: like 13 for the OUTER cascade (cascade 2).
+		if (debugMode == 15)
+		{
+			float3 dbgFar2 = (float3)0.0f;
+			if (LPVGridParams2Far2.y > 0.5f)
+			{
+				const float3 uvFar2 = saturate((worldPos - LPVGridParamsFar2.xyz) / LPVGridParams2Far2.x);
+				const float4 f2R = LPVGridFar2R.SampleLevel(LPVGridSampler, uvFar2, 0);
+				const float4 f2G = LPVGridFar2G.SampleLevel(LPVGridSampler, uvFar2, 0);
+				const float4 f2B = LPVGridFar2B.SampleLevel(LPVGridSampler, uvFar2, 0);
+				dbgFar2 = float3(abs(f2R.x), abs(f2G.x), abs(f2B.x)) * LPVApplyParams.x;
+			}
+			LPVIrradianceUAV[pixelCoord] = float4(dbgFar2, 1.0f);
+			return;
+		}
+
+		// Debug mode 14: near/far energy comparison. R = near cascade L0 luminance, G = far cascade
+		// L0 luminance (both x intensity). Inside the overlap the hue reads as calibration:
+		// yellow = matched, red = near brighter (e.g. dishonest occlusion), green = far brighter.
+		if (debugMode == 14)
+		{
+			const float3 lumW = float3(0.2126f, 0.7152f, 0.0722f);
+			float lumNear = 0.0f;
+			if (all(abs(gridUV - 0.5f) <= 0.5f))
+			{
+				const float4 nR = LPVGridR.SampleLevel(LPVGridSampler, gridUV, 0);
+				const float4 nG = LPVGridG.SampleLevel(LPVGridSampler, gridUV, 0);
+				const float4 nB = LPVGridB.SampleLevel(LPVGridSampler, gridUV, 0);
+				lumNear = dot(float3(abs(nR.x), abs(nG.x), abs(nB.x)), lumW);
+			}
+			float lumFar = 0.0f;
+			if (LPVGridParams2Far.y > 0.5f)
+			{
+				const float3 uvFar = (worldPos - LPVGridParamsFar.xyz) / LPVGridParams2Far.x;
+				if (all(abs(uvFar - 0.5f) <= 0.5f))
+				{
+					const float4 fR = LPVGridFarR.SampleLevel(LPVGridSampler, uvFar, 0);
+					const float4 fG = LPVGridFarG.SampleLevel(LPVGridSampler, uvFar, 0);
+					const float4 fB = LPVGridFarB.SampleLevel(LPVGridSampler, uvFar, 0);
+					lumFar = dot(float3(abs(fR.x), abs(fG.x), abs(fB.x)), lumW);
+				}
+			}
+			LPVIrradianceUAV[pixelCoord] = float4(lumNear * LPVApplyParams.x, lumFar * LPVApplyParams.x, 0.0f, 1.0f);
+			return;
+		}
+
+		// Debug mode 9: probe visualization. Point sampled per cell L0 energy of the accumulated grid
+		// projected onto the scene surfaces (blocky = one colour per cell) with darkened cell borders,
+		// scaled by r_LPVIntensity. Flickering probes and their spatial distribution become directly
+		// visible. View with r_ShowRenderTarget LPVIrradiance.
+		// Mode 9: surface projection (mosaic) only. Mode 11: mosaic + probe balls combined, so the
+		// two can be checked against each other - both derive from the same grid, the mosaic must
+		// interlock with the ball lattice exactly. Mode 10 is balls only (handled in the C++ call
+		// site of the probe pass, no branch here).
+		if (debugMode == 9 || debugMode == 11)
+		{
+			const int dbgGridSize = (int)LPVGridParams2.x;
+			const float3 cellF = saturate(gridUV) * (float)dbgGridSize;
+			const int3 dbgCell = clamp((int3)floor(cellF), 0, dbgGridSize - 1);
+
+			const float4 pr = LPVGridR.Load(int4(dbgCell, 0));
+			const float4 pg = LPVGridG.Load(int4(dbgCell, 0));
+			const float4 pb = LPVGridB.Load(int4(dbgCell, 0));
+
+			float3 probeCol = float3(max(0.0f, pr.x), max(0.0f, pg.x), max(0.0f, pb.x)) * LPVApplyParams.x;
+
+			// darken the cell borders so the grid structure is readable
+			const float3 fracPos = frac(cellF);
+			const float edgeDist = min(min(min(fracPos.x, 1.0f - fracPos.x), min(fracPos.y, 1.0f - fracPos.y)), min(fracPos.z, 1.0f - fracPos.z));
+			probeCol *= (edgeDist < 0.04f) ? 0.15f : 1.0f;
+
+			LPVIrradianceUAV[pixelCoord] = float4(probeCol, 1.0f);
+			return;
+		}
+
+		if (debugMode == 2 || (debugMode >= 4 && debugMode <= 7))
+		{
+			const float4 dbgR = LPVGridR.SampleLevel(LPVGridSampler, saturate(gridUV), 0);
+			const float4 dbgG = LPVGridG.SampleLevel(LPVGridSampler, saturate(gridUV), 0);
+			const float4 dbgB = LPVGridB.SampleLevel(LPVGridSampler, saturate(gridUV), 0);
+			// Scaled by the display intensity, see the mode 6 comment.
+			LPVIrradianceUAV[pixelCoord] = float4(float3(abs(dbgR.x), abs(dbgG.x), abs(dbgB.x)) * LPVApplyParams.x, 1.0f);
+			return;
+		}
+		if (debugMode == 3)
+		{
+			LPVIrradianceUAV[pixelCoord] = float4(fade.xxx, 1.0f);
+			return;
+		}
+
+		// The stored SH describes the direction the light flows in, so the receiver lobe points
+		// against the surface normal.
+		const float4 receiver = LPVCosineLobe(-normal);
+
+		float3 giNear = 0;
+		[branch] if (fade > 0.0f)
+		{
+			const float4 shR = LPVGridR.SampleLevel(LPVGridSampler, gridUV, 0);
+			const float4 shG = LPVGridG.SampleLevel(LPVGridSampler, gridUV, 0);
+			const float4 shB = LPVGridB.SampleLevel(LPVGridSampler, gridUV, 0);
+
+			giNear.r = LPVEvalReceiver(shR, receiver);
+			giNear.g = LPVEvalReceiver(shG, receiver);
+			giNear.b = LPVEvalReceiver(shB, receiver);
+		}
+
+		irradiance = giNear * fade;
+
+		// Cascade LOD chain: each coarser volume fills whatever blend weight the finer volumes left
+		// over (w_i = fade_i * prod(1 - fade_j, j < i)), so the hand-over is a gradient, never a
+		// step, and beyond the last volume the GI fades to zero.
+		float wRest = 1.0f - fade;
+
+		// Coarse-cascade leak damping: the 6 / 18 m cells of the mid / outer cascades barely
+		// resolve walls, so interiors gain leaked outdoor light no matter what the geometry
+		// volume does. The height map AO mask (openness to the sky) is a cheap "under a roof"
+		// proxy that suppresses exactly that contribution. The near cascade keeps its real
+		// geometry volume occlusion and is never damped.
+		float hmaoDamp = 1.0f;
+		[branch] if (LPVHmaoParams.x > 0.0f && wRest > 0.0f)
+		{
+			const float2 hmao = LPVHeightMapAO.SampleLevel(LPVGridSampler, screenUV, 0).rg;
+			hmaoDamp = lerp(1.0f, min(hmao.r, hmao.g), LPVHmaoParams.x);
+		}
+
+		[branch] if (LPVGridParams2Far.y > 0.5f && wRest > 0.0f)
+		{
+			const float3 samplePosFar = worldPos + normal * (LPVGridParamsFar.w * 0.5f);
+			const float3 gridUVFar = (samplePosFar - LPVGridParamsFar.xyz) / LPVGridParams2Far.x;
+
+			const float3 centeredFar = abs(gridUVFar - 0.5f) * 2.0f;
+			const float edgeFar = max(centeredFar.x, max(centeredFar.y, centeredFar.z));
+			const float fadeFar = 1.0f - smoothstep(0.7f, 1.0f, edgeFar);
+
+			[branch] if (fadeFar > 0.0f)
+			{
+				const float4 shRFar = LPVGridFarR.SampleLevel(LPVGridSampler, gridUVFar, 0);
+				const float4 shGFar = LPVGridFarG.SampleLevel(LPVGridSampler, gridUVFar, 0);
+				const float4 shBFar = LPVGridFarB.SampleLevel(LPVGridSampler, gridUVFar, 0);
+
+				float3 giFar;
+				giFar.r = LPVEvalReceiver(shRFar, receiver);
+				giFar.g = LPVEvalReceiver(shGFar, receiver);
+				giFar.b = LPVEvalReceiver(shBFar, receiver);
+
+				irradiance += giFar * fadeFar * wRest * hmaoDamp;
+			}
+
+			wRest *= (1.0f - fadeFar);
+		}
+
+		[branch] if (LPVGridParams2Far2.y > 0.5f && wRest > 0.0f)
+		{
+			const float3 samplePosFar2 = worldPos + normal * (LPVGridParamsFar2.w * 0.5f);
+			const float3 gridUVFar2 = (samplePosFar2 - LPVGridParamsFar2.xyz) / LPVGridParams2Far2.x;
+
+			const float3 centeredFar2 = abs(gridUVFar2 - 0.5f) * 2.0f;
+			const float edgeFar2 = max(centeredFar2.x, max(centeredFar2.y, centeredFar2.z));
+			const float fadeFar2 = 1.0f - smoothstep(0.7f, 1.0f, edgeFar2);
+
+			[branch] if (fadeFar2 > 0.0f)
+			{
+				const float4 shRFar2 = LPVGridFar2R.SampleLevel(LPVGridSampler, gridUVFar2, 0);
+				const float4 shGFar2 = LPVGridFar2G.SampleLevel(LPVGridSampler, gridUVFar2, 0);
+				const float4 shBFar2 = LPVGridFar2B.SampleLevel(LPVGridSampler, gridUVFar2, 0);
+
+				float3 giFar2;
+				giFar2.r = LPVEvalReceiver(shRFar2, receiver);
+				giFar2.g = LPVEvalReceiver(shGFar2, receiver);
+				giFar2.b = LPVEvalReceiver(shBFar2, receiver);
+
+				irradiance += giFar2 * fadeFar2 * wRest * hmaoDamp;
+			}
+		}
+
+		irradiance *= LPVApplyParams.x;
+
+		// Translucent brightness (port of SVOGI's e_svoTI_TranslucentBrightness, see the
+		// SvoParamsInject.w use in Total_Illumination.cfx): vegetation with the transmittance
+		// lighting model gets its indirect diffuse scaled, blended in by the transmittance.
+		[branch] if (LPVHmaoParams.y > 0.0f)
+		{
+			const float transmittance = saturate(DecodeGBufferTransmittanceLum(gbufferA));
+			irradiance *= lerp(1.0f, LPVHmaoParams.y, saturate(transmittance * 8.0f));
+		}
+
+		// Specular GI: short voxel march along the reflected eye vector in the near cascade
+		// (CryEngine 3 shipped the same approximation: a few cells, inverse square falloff,
+		// averaged). The L1 SH grid is far too coarse for mirror images - this gives metals and
+		// wet surfaces a broad directional bounce instead of nothing.
+		[branch] if (LPVApplyParams.w > 0.0f && fade > 0.0f)
+		{
+			const float3 reflDir = reflect(normalize(viewRay), normal);
+			// Radiance travelling from the march point towards the surface.
+			const float4 reflEval = LPVDirSH(-reflDir);
+
+			[unroll] for (int s = 1; s <= 3; ++s)
+			{
+				const float3 marchPos = samplePos + reflDir * ((float)s * LPVGridParams.w);
+				const float3 marchUV = (marchPos - LPVGridParams.xyz) / LPVGridParams2.w;
+				if (any(marchUV < 0.0f) || any(marchUV > 1.0f))
+					break;
+
+				const float stepWeight = 1.0f / (float)(s * s);
+				specular.r += max(0.0f, dot(LPVGridR.SampleLevel(LPVGridSampler, marchUV, 0), reflEval)) * stepWeight;
+				specular.g += max(0.0f, dot(LPVGridG.SampleLevel(LPVGridSampler, marchUV, 0), reflEval)) * stepWeight;
+				specular.b += max(0.0f, dot(LPVGridB.SampleLevel(LPVGridSampler, marchUV, 0), reflEval)) * stepWeight;
+			}
+
+			// Normalize the march to a weighted AVERAGE (the plain sum of the 1/s^2 step weights
+			// overshot the intended radiance by 36%).
+			const float marchNorm = 1.0f / (1.0f + 0.25f + 1.0f / 9.0f);
+			specular *= fade * LPVApplyParams.x * LPVApplyParams.w * marchNorm;
+		}
+
+		// Soft highlight rolloff (Reinhard on luminance): the dim indirect response stays
+		// linear while hot spots (sun facing white walls, outdoor single bounce paths) are
+		// compressed towards the r_LPVMaxIrradiance ceiling - a high intensity can brighten
+		// the interiors without overexposing the outdoors.
+		const float maxIrradiance = LPVApplyParams.z;
+		[branch] if (maxIrradiance > 0.0f)
+		{
+			const float3 lumWeights = float3(0.2126f, 0.7152f, 0.0722f);
+			irradiance *= maxIrradiance / (maxIrradiance + dot(irradiance, lumWeights));
+			specular *= maxIrradiance / (maxIrradiance + dot(specular, lumWeights));
+		}
+	}
+
+	// Irradiance only, TiledShading.cfi multiplies with the surface albedo (and the specular with
+	// the surface reflectance).
+	LPVIrradianceUAV[pixelCoord] = float4(irradiance, 1.0f);
+	LPVSpecularUAV[pixelCoord] = float4(specular, 1.0f);
+}
+
+technique LPVApply
+{
+	pass p0
+	{
+		ComputeShader = LPVApplyCS();
+	}
+}
+
+//////////////////////////////////////////////////////////////////////////////////////////
+// LPVDebugProbes
+//////////////////////////////////////////////////////////////////////////////////////////
+
+// 3D probe visualization (r_LPVDebug 10): one camera facing impostor quad per grid cell, drawn as a
+// single instanced draw of gridSize^3 instances. The pixel shader turns the quad into a shaded ball
+// (discard outside the unit disc, fake sphere normal from the impostor coordinates) coloured by the
+// L0 coefficient of the accumulated grid. The pass renders into the HDR target with the scene depth
+// buffer bound, so the lattice is occluded by the geometry in front of it.
+
+// x: probe radius in meters, y: colour scale (r_LPVIntensity), z: unlit floor, w: unused
+float4 LPVProbeParams;
+
+Texture3D<float4> LPVProbeGridR : register(t0);
+Texture3D<float4> LPVProbeGridG : register(t1);
+Texture3D<float4> LPVProbeGridB : register(t2);
+
+struct v2fLPVProbe
+{
+	float4                HPosition   : SV_POSITION;
+	float2                ImpostorUV  : TEXCOORD0;
+	nointerpolation uint3 Cell        : TEXCOORD1;
+};
+
+v2fLPVProbe LPVDebugProbesVS(uint vertexId : SV_VertexID, uint instanceId : SV_InstanceID)
+{
+	v2fLPVProbe OUT = (v2fLPVProbe)0;
+
+	const uint gridSize = (uint)LPVGridParams2.x;
+	const uint3 cell = uint3(instanceId % gridSize,
+	                         (instanceId / gridSize) % gridSize,
+	                         instanceId / (gridSize * gridSize));
+
+	const float3 cellCenter = LPVGridParams.xyz + ((float3)cell + 0.5f) * LPVGridParams.w;
+
+	// Triangle strip corners: 0 = (-1,-1), 1 = (1,-1), 2 = (-1,1), 3 = (1,1).
+	const float2 corner = float2((vertexId & 1u) ? 1.0f : -1.0f, (vertexId & 2u) ? 1.0f : -1.0f);
+
+	const float radius = LPVProbeParams.x;
+	const float3 worldPos = cellCenter
+	                      + CV_CameraRightVector.xyz * (corner.x * radius)
+	                      + CV_CameraUpVector.xyz * (corner.y * radius);
+
+	OUT.HPosition = mul(CV_ViewProjMatr, float4(worldPos, 1.0f));
+	OUT.ImpostorUV = corner;
+	OUT.Cell = cell;
+
+	return OUT;
+}
+
+pixout_fp LPVDebugProbesPS(v2fLPVProbe IN)
+{
+	pixout_fp OUT = (pixout_fp)0;
+
+	const float radiusSq = dot(IN.ImpostorUV, IN.ImpostorUV);
+	clip(1.0f - radiusSq);
+
+	// Fake sphere normal of the impostor, only used to shade the ball.
+	const float3 normal = float3(IN.ImpostorUV, sqrt(saturate(1.0f - radiusSq)));
+
+	const int3 cell = (int3)IN.Cell;
+	float3 probe = float3(max(0.0f, LPVProbeGridR.Load(int4(cell, 0)).x),
+	                      max(0.0f, LPVProbeGridG.Load(int4(cell, 0)).x),
+	                      max(0.0f, LPVProbeGridB.Load(int4(cell, 0)).x));
+
+	// The floor keeps cells without any energy visible as dark grey balls, so that the full lattice
+	// (and not only the lit part of it) can be observed.
+	probe = probe * LPVProbeParams.y + LPVProbeParams.z;
+
+	const float shade = saturate(dot(normal, normalize(float3(0.3f, 0.3f, 1.0f)))) * 0.75f + 0.25f;
+
+	OUT.Color = float4(probe * shade, 1.0f);
+
+	return OUT;
+}
+
+technique LPVDebugProbes
+{
+	pass p0
+	{
+		VertexShader = LPVDebugProbesVS();
+		PixelShader = LPVDebugProbesPS();
+
+		ZEnable = true;
+		ZWriteEnable = false;
+		CullMode = None;
+	}
+}

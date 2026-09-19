@@ -1,0 +1,236 @@
+From 8fa60dbf11fbff5121ae133c309cb4ba70834b0a Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Tue, 11 Aug 2026 19:39:38 +0800
+Subject: [PATCH 182/206] fix: close the three wall-leak channels (roof light
+ panel case)
+
+User experiment (sun-blocking box over the roof killed the bright
+ceiling; probe balls showed real energy in interior cells) pinned the
+leak to three stacked holes, all closed:
+
+- Isotropic bounce re-emission: the surface cache stored no normal, so a
+  sunlit roof cell re-emitted half of its energy straight down into the
+  interior. Accumulator widened 20 -> 24 ints/cell (average surface
+  normal + pad); re-emission is now a cosine lobe along the average
+  normal, with a weak isotropic fallback for incoherent-normal cells.
+- Blanket first-iteration occlusion exemption: meant to let VPLs leave
+  their own wall cells, it effectively granted every wall one free
+  crossing - which is why r_LPVOcclusion 100 only hardened the leak
+  edges. The first iteration now gates with the destination cell GV
+  (the source cell never blocks its own exit, the receiving cell always
+  applies); later iterations keep the midpoint average.
+- VPL landing inside its own wall cell: with the surface in the sun-ward
+  half of the cell the fixed 0.5-cell bias does not cross the boundary,
+  so flux sat inside the roof cell where far-side receivers pick it up
+  via the trilinear lookup. If the VPL cell equals the surfel cell it is
+  now pushed one more cell along the dominant normal axis.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Tu9cj9ax1mqCV93HVfCfpW
+---
+ .../XRenderD3D9/GraphicsPipeline/LPV.cpp      |  10 +-
+ .../XRenderD3D9/GraphicsPipeline/LPV.h        |   5 +-
+ Engine/Shaders/HWScripts/CryFX/LPV.cfi        | 111 ++++++++++++------
+ 3 files changed, 85 insertions(+), 41 deletions(-)
+
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.cpp
+index 6ce8f33d..e8a11ab5 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.cpp
+@@ -968,12 +968,12 @@ void CLPVStage::ExecutePropagate(const SScopedComputeCommandList& commandList)
+ 
+ 		// Occlusion strength, pre-divided by the SH transfer of a perpendicular fully covered face:
+ 		// dot(cosineLobe(n), cone90(n)) = ZH_COS0*SH_C0*ZH_CONE0*SH_C0 + ZH_COS1*SH_C1*ZH_CONE1*SH_C1
+-		// = 0.10194, so r_LPVOcclusion 1 blocks such a face completely. The first iteration runs
+-		// unoccluded: the VPLs are biased into the cells of their own walls, the GV of those walls
+-		// must not swallow the light before it leaves the source cell.
++		// = 0.10194, so r_LPVOcclusion 1 blocks such a face completely. y flags the first iteration:
++		// it gates with the destination cell GV only (see the shader comment) instead of running
++		// unoccluded - the blanket exemption used before gave every wall one free crossing.
+ 		static CCryNameR paramProp("LPVPropParams");
+-		const float occStrength = (i == 0) ? 0.0f : max(0.0f, CRendererCVars::CV_r_LPVOcclusion) / 0.10194f;
+-		pass.SetConstant(paramProp, Vec4(occStrength, 0.0f, 0.0f, 0.0f));
++		const float occStrength = max(0.0f, CRendererCVars::CV_r_LPVOcclusion) / 0.10194f;
++		pass.SetConstant(paramProp, Vec4(occStrength, (i == 0) ? 1.0f : 0.0f, 0.0f, 0.0f));
+ 
+ 		pass.SetDispatchSize(dispatchSize, dispatchSize, dispatchSize);
+ 		pass.PrepareResourcesForUse(commandList);
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.h b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.h
+index 05e778a0..8239d171 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.h
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.h
+@@ -20,8 +20,9 @@ public:
+ 	static const int32 SHChannelNum = 3;
+ 	// Number of ints per grid cell in the injection accumulator:
+ 	// 3 channels * 4 SH coefficients + average surface albedo (RGB) + surfel count
+-	// + geometry volume blocking potential (4 SH coefficients).
+-	static const int32 AccumulatorStride = SHChannelNum * 4 + 4 + 4;
++	// + geometry volume blocking potential (4 SH coefficients)
++	// + average surface normal (xyz) + one pad element.
++	static const int32 AccumulatorStride = SHChannelNum * 4 + 4 + 4 + 4;
+ 	// Fixed point scale used by the injection accumulator (SH L1 coefficients can be negative).
+ 	static const int32 AccumulatorFixedPointScale = 4096;
+ 	// Upper bound for the RSM sample grid used by the injection pass.
+diff --git a/Engine/Shaders/HWScripts/CryFX/LPV.cfi b/Engine/Shaders/HWScripts/CryFX/LPV.cfi
+index de46bafb..cd4de95c 100644
+--- a/Engine/Shaders/HWScripts/CryFX/LPV.cfi
++++ b/Engine/Shaders/HWScripts/CryFX/LPV.cfi
+@@ -112,12 +112,13 @@ float4 LPVSanitize(float4 v)
+ 
+ // Linear index of the first accumulator element of a cell.
+ // Layout: 12 SH coefficients (3 channels * 4), average surface albedo (RGB), surfel count,
+-// geometry volume blocking potential (4 SH coefficients).
++// geometry volume blocking potential (4 SH coefficients), average surface normal (xyz), 1 pad.
+ // Must match CLPVStage::AccumulatorStride.
+-#define LPV_ACCUM_STRIDE  20u
++#define LPV_ACCUM_STRIDE  24u
+ #define LPV_ACCUM_ALBEDO  12u
+ #define LPV_ACCUM_COUNT   15u
+ #define LPV_ACCUM_GV      16u
++#define LPV_ACCUM_NORMAL  20u
+ 
+ uint LPVCellBase(uint3 cell, uint gridSize)
+ {
+@@ -221,29 +222,34 @@ void LPVInjectCS(uint3 DTid : SV_DispatchThreadID)
+ 	const float3 albedo = LPVRsmColor.Load(int3(texel, 0)).rgb;
+ 	const int gridSize = (int)LPVGridParams2.x;
+ 
+-	// Surface cache for the SVOGI style secondary bounce: every valid surfel registers its albedo in
+-	// the cell it lives in (independent of the sun facing), LPVResolve turns the average albedo plus
+-	// the previous frame grid into re-emitted light.
++	// Surface cache for the SVOGI style secondary bounce: every valid surfel registers its albedo
++	// and its normal in the cell it lives in (independent of the sun facing), LPVResolve turns the
++	// average albedo plus the previous frame grid into re-emitted light along the average normal.
++	const int3 surfCell = (int3)floor((worldPos - LPVGridParams.xyz) * LPVGridParams2.z);
++	if (all(surfCell >= 0) && all(surfCell < gridSize))
+ 	{
+-		const int3 surfCell = (int3)floor((worldPos - LPVGridParams.xyz) * LPVGridParams2.z);
+-		if (all(surfCell >= 0) && all(surfCell < gridSize))
++		const uint surfBase = LPVCellBase((uint3)surfCell, (uint)gridSize);
++		InterlockedAdd(LPVInjectionUAV[surfBase + LPV_ACCUM_ALBEDO + 0u], (int)floor(albedo.r * LPV_FP_SCALE + 0.5f));
++		InterlockedAdd(LPVInjectionUAV[surfBase + LPV_ACCUM_ALBEDO + 1u], (int)floor(albedo.g * LPV_FP_SCALE + 0.5f));
++		InterlockedAdd(LPVInjectionUAV[surfBase + LPV_ACCUM_ALBEDO + 2u], (int)floor(albedo.b * LPV_FP_SCALE + 0.5f));
++		InterlockedAdd(LPVInjectionUAV[surfBase + LPV_ACCUM_COUNT], 1);
++
++		// Average surface normal of the cell, used to direct the bounce re-emission: an isotropic
++		// re-emission sends half of the energy straight through the surface it came from (a sunlit
++		// roof turned the interior ceiling into a light panel).
++		InterlockedAdd(LPVInjectionUAV[surfBase + LPV_ACCUM_NORMAL + 0u], (int)floor(normal.x * LPV_FP_SCALE + 0.5f));
++		InterlockedAdd(LPVInjectionUAV[surfBase + LPV_ACCUM_NORMAL + 1u], (int)floor(normal.y * LPV_FP_SCALE + 0.5f));
++		InterlockedAdd(LPVInjectionUAV[surfBase + LPV_ACCUM_NORMAL + 2u], (int)floor(normal.z * LPV_FP_SCALE + 0.5f));
++
++		// Geometry volume: every surfel registers a directional blocking potential (cosine lobe
++		// around the surface normal, scaled by the fraction of a cell face its footprint covers,
++		// LPVRsmParams.w). The surfels of a wall crossing the cell sum to ~1 with plain additive
++		// accumulation, independent of the sun facing - geometry blocks from both sides.
++		if (LPVRsmParams.w > 0.0f)
+ 		{
+-			const uint surfBase = LPVCellBase((uint3)surfCell, (uint)gridSize);
+-			InterlockedAdd(LPVInjectionUAV[surfBase + LPV_ACCUM_ALBEDO + 0u], (int)floor(albedo.r * LPV_FP_SCALE + 0.5f));
+-			InterlockedAdd(LPVInjectionUAV[surfBase + LPV_ACCUM_ALBEDO + 1u], (int)floor(albedo.g * LPV_FP_SCALE + 0.5f));
+-			InterlockedAdd(LPVInjectionUAV[surfBase + LPV_ACCUM_ALBEDO + 2u], (int)floor(albedo.b * LPV_FP_SCALE + 0.5f));
+-			InterlockedAdd(LPVInjectionUAV[surfBase + LPV_ACCUM_COUNT], 1);
+-
+-			// Geometry volume: every surfel registers a directional blocking potential (cosine lobe
+-			// around the surface normal, scaled by the fraction of a cell face its footprint covers,
+-			// LPVRsmParams.w). The surfels of a wall crossing the cell sum to ~1 with plain additive
+-			// accumulation, independent of the sun facing - geometry blocks from both sides.
+-			if (LPVRsmParams.w > 0.0f)
+-			{
+-				const float4 gvSH = LPVCosineLobe(normal) * LPVRsmParams.w;
+-				[unroll] for (uint g = 0; g < 4; ++g)
+-					InterlockedAdd(LPVInjectionUAV[surfBase + LPV_ACCUM_GV + g], (int)floor(gvSH[g] * LPV_FP_SCALE + 0.5f));
+-			}
++			const float4 gvSH = LPVCosineLobe(normal) * LPVRsmParams.w;
++			[unroll] for (uint g = 0; g < 4; ++g)
++				InterlockedAdd(LPVInjectionUAV[surfBase + LPV_ACCUM_GV + g], (int)floor(gvSH[g] * LPV_FP_SCALE + 0.5f));
+ 		}
+ 	}
+ 
+@@ -262,7 +268,26 @@ void LPVInjectCS(uint3 DTid : SV_DispatchThreadID)
+ 	const float bias = LPVRsmParams.z * LPVGridParams.w;
+ 	const float3 injectPos = worldPos + (normal + dirToLight) * bias;
+ 
+-	const int3 cell = (int3)floor((injectPos - LPVGridParams.xyz) * LPVGridParams2.z);
++	int3 cell = (int3)floor((injectPos - LPVGridParams.xyz) * LPVGridParams2.z);
++
++	// The VPL must never share a cell with its own surfel: when the surface sits in the sun-ward
++	// half of its cell the fixed bias is not enough to cross the cell boundary, the flux then sits
++	// inside the wall cell and the receivers on the far side pick it up directly through the
++	// trilinear lookup (the ceiling of a sunlit roof lit up through the roof). Push one more cell
++	// along the dominant normal axis in that case.
++	if (all(cell == surfCell))
++	{
++		const float3 absNormal = abs(normal);
++		int3 push = int3(0, 0, 0);
++		if (absNormal.x >= absNormal.y && absNormal.x >= absNormal.z)
++			push.x = (normal.x >= 0.0f) ? 1 : -1;
++		else if (absNormal.y >= absNormal.z)
++			push.y = (normal.y >= 0.0f) ? 1 : -1;
++		else
++			push.z = (normal.z >= 0.0f) ? 1 : -1;
++		cell += push;
++	}
++
+ 	if (cell.x < 0 || cell.y < 0 || cell.z < 0 || cell.x >= gridSize || cell.y >= gridSize || cell.z >= gridSize)
+ 		return;
+ 
+@@ -425,9 +450,22 @@ void LPVResolveCS(uint3 DTid : SV_DispatchThreadID)
+ 			                                  max(0.0f, LPVResolvePrevB.Load(int4(prevCell, 0)).x));
+ 
+ 			const float3 emission = cellAlbedo * prevAmbient * bounceGain;
+-			shR.x += emission.r * LPV_SH_C0;
+-			shG.x += emission.g * LPV_SH_C0;
+-			shB.x += emission.b * LPV_SH_C0;
++
++			// Re-emit along the average surface normal of the cell instead of isotropically: the
++			// isotropic L0 emission sent half of the energy straight through the emitting surface
++			// (a sunlit roof lit the interior ceiling below it). Cells with incoherent normals
++			// (corners, thin double sided walls) fall back to a weak isotropic term.
++			const float3 nSum = float3((float)LPVInjectionSRV[base + LPV_ACCUM_NORMAL + 0u],
++			                           (float)LPVInjectionSRV[base + LPV_ACCUM_NORMAL + 1u],
++			                           (float)LPVInjectionSRV[base + LPV_ACCUM_NORMAL + 2u]);
++			const float nLen = length(nSum);
++			const float4 emissionSH = (nLen > 0.5f * LPV_FP_SCALE)
++			                        ? LPVCosineLobe(nSum / nLen)
++			                        : float4(LPV_SH_C0 * 0.5f, 0.0f, 0.0f, 0.0f);
++
++			shR += emissionSH * emission.r;
++			shG += emissionSH * emission.g;
++			shB += emissionSH * emission.b;
+ 		}
+ 	}
+ 
+@@ -565,17 +603,22 @@ void LPVPropagateCS(uint3 DTid : SV_DispatchThreadID)
+ 		const float4 srcG = LPVPropSrcG.Load(int4(neighbour, 0));
+ 		const float4 srcB = LPVPropSrcB.Load(int4(neighbour, 0));
+ 
+-		// Geometry volume occlusion: blocking potential halfway between the two cells, evaluated
+-		// in the direction of travel (90 degree cone as the directional window). abs(): a surfel
+-		// blocks from both of its sides. The strength is 0 for the first iteration (see the CPU
+-		// side comment) and pre-scaled so that a fully covered perpendicular face reaches zero
+-		// transmittance at r_LPVOcclusion 1.
++		// Geometry volume occlusion, evaluated in the direction of travel (90 degree cone as the
++		// directional window). abs(): a surfel blocks from both of its sides. Pre-scaled so that a
++		// fully covered perpendicular face reaches zero transmittance at r_LPVOcclusion 1.
++		// First iteration (LPVPropParams.y): gate with the DESTINATION cell GV only - the source
++		// cell's own geometry must never block its light from leaving (VPLs and the bounce
++		// re-emission live right next to their walls), but the receiving cell's geometry always
++		// applies. The previous blanket first-iteration exemption granted every wall one free
++		// crossing, which is why raising r_LPVOcclusion only hardened the leak edges.
+ 		float transmittance = 1.0f;
+ 		if (occStrength > 0.0f)
+ 		{
+-			const float4 gvMid = 0.5f * (gvSelf + LPVPropGV.Load(int4(neighbour, 0)));
++			const float4 gvGate = (LPVPropParams.y > 0.5f)
++			                    ? gvSelf
++			                    : 0.5f * (gvSelf + LPVPropGV.Load(int4(neighbour, 0)));
+ 			const float4 travelCone = LPVCone90(-(float3)offset);
+-			transmittance = saturate(1.0f - abs(dot(gvMid, travelCone)) * occStrength);
++			transmittance = saturate(1.0f - abs(dot(gvGate, travelCone)) * occStrength);
+ 		}
+ 
+ 		[unroll] for (int f = 0; f < 6; ++f)
+-- 
+2.47.1.windows.1
+

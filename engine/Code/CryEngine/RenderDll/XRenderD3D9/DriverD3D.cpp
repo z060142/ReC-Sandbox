@@ -566,8 +566,10 @@ void CD3D9Renderer::CalculateResolutions(int displayWidthRequested, int displayH
 	const int nMaxResolutionX = std::max(GetMaxCustomResSize(m_MaxTextureSize), *pOutputWidth);
 	const int nMaxResolutionY = std::max(GetMaxCustomResSize(m_MaxTextureSize), *pOutputHeight);
 
+	// NOTE: the second loop decremented nSSSamplesX (copy-paste), which never terminates when the
+	// supersampled height exceeds the maximum resolution.
 	int nSSSamplesX = pDC->m_nSSSamplesX; do { *pRenderWidth  = *pOutputWidth  * nSSSamplesX; --nSSSamplesX; } while (*pRenderWidth  > nMaxResolutionX);
-	int nSSSamplesY = pDC->m_nSSSamplesY; do { *pRenderHeight = *pOutputHeight * nSSSamplesY; --nSSSamplesX; } while (*pRenderHeight > nMaxResolutionY);
+	int nSSSamplesY = pDC->m_nSSSamplesY; do { *pRenderHeight = *pOutputHeight * nSSSamplesY; --nSSSamplesY; } while (*pRenderHeight > nMaxResolutionY);
 }
 
 void CD3D9Renderer::HandleDisplayPropertyChanges(std::shared_ptr<CGraphicsPipeline> pActiveGraphicsPipeline)
@@ -1299,14 +1301,20 @@ void CD3D9Renderer::ResolveSupersampledRendering(std::shared_ptr<CGraphicsPipeli
 
 	// TODO: respect CRenderDisplayContext::GetViewport() instead of using full resolution
 	// NOTE: DownscalePass only supports whole factors of scaling, only SS resolve is possible here
+	// Use the resolution of the pipeline being resolved: CRendererResources::s_renderWidth/Height
+	// only track the main viewport (HandleDisplayPropertyChanges gates the global resize on
+	// IsMainViewport()), so with several editor viewports of different sizes the globals belong to
+	// another context and the modulo check fired on every secondary viewport.
+	const Vec2i renderResolution = pActiveGraphicsPipeline->GetRenderResolution();
+
 	CRY_ASSERT(
-		(CRendererResources::s_renderWidth  % pOutput->GetOutputResolution()[0]) == 0 &&
-		(CRendererResources::s_renderHeight % pOutput->GetOutputResolution()[1]) == 0);
+		(renderResolution.x % pOutput->GetOutputResolution()[0]) == 0 &&
+		(renderResolution.y % pOutput->GetOutputResolution()[1]) == 0);
 
 	pActiveGraphicsPipeline->m_DownscalePass->Execute(
 		pRenderView->GetColorTarget(),
 		pOutput->GetColorTarget(),
-		CRendererResources::s_renderWidth, CRendererResources::s_renderHeight,
+		renderResolution.x, renderResolution.y,
 		pOutput->GetOutputResolution()[0], pOutput->GetOutputResolution()[1],
 		eFilter);
 }

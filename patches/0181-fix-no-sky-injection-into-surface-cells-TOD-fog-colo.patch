@@ -1,0 +1,84 @@
+From 2d00ff0785799c1bf3f6db75b1e574324e991b79 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Tue, 11 Aug 2026 18:31:06 +0800
+Subject: [PATCH 181/206] fix: no sky injection into surface cells, TOD fog
+ colour as sky hue fallback
+
+- The ceiling turned into a light panel: the sky visibility test biased
+  its sample point one cell towards the sun, jumping past the roof
+  surface living in the same cell, so roof cells counted as open sky and
+  the interior ceiling receivers sampled their own lit cell. Sky is now
+  injected only into cells without registered surfels (the roof cell is
+  excluded; surface receivers get the sky from the empty cell on their
+  front side via the half-cell normal offset of the apply pass), and the
+  visibility sample uses the unbiased cell centre.
+- Sky hue chain: TOD sky colour -> TOD fog colour 2 -> TOD fog colour ->
+  neutral fallback. On probe driven levels the sky colour is black and
+  the hue silently fell to the neutral constant, which is why no TOD
+  adjustment had any visible effect.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Tu9cj9ax1mqCV93HVfCfpW
+---
+ .../XRenderD3D9/GraphicsPipeline/LPV.cpp          | 15 +++++++++++----
+ Engine/Shaders/HWScripts/CryFX/LPV.cfi            | 12 +++++++++---
+ 2 files changed, 20 insertions(+), 7 deletions(-)
+
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.cpp
+index 482101ac..6ce8f33d 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.cpp
+@@ -879,12 +879,19 @@ void CLPVStage::ExecuteResolve(const SScopedComputeCommandList& commandList, CTe
+ 	if (skyGain > 0.0f && gEnv->p3DEngine)
+ 	{
+ 		const Vec3 lumWeights(0.2126f, 0.7152f, 0.0722f);
+-		const Vec3 skyColor = gEnv->p3DEngine->GetSkyColor();
++		// Hue source chain: TOD sky colour, then the TOD fog colours. On probe driven levels the
++		// sky colour is often black - without the fog fallback the hue silently dropped to the
++		// neutral constant and no TOD adjustment had any visible effect.
++		Vec3 hueSource = gEnv->p3DEngine->GetSkyColor();
++		if (hueSource.Dot(lumWeights) < 1e-4f)
++			gEnv->p3DEngine->GetGlobalParameter(E3DPARAM_FOG_COLOR2, hueSource);
++		if (hueSource.Dot(lumWeights) < 1e-4f)
++			gEnv->p3DEngine->GetGlobalParameter(E3DPARAM_FOG_COLOR, hueSource);
+ 		const Vec4 sunColor = RenderView()->GetSunLightColor();
+-		const float lumSky = skyColor.Dot(lumWeights);
++		const float lumSky = hueSource.Dot(lumWeights);
+ 		const float lumSun = Vec3(sunColor.x, sunColor.y, sunColor.z).Dot(lumWeights);
+-		// Hue of the TOD sky, normalized to unit luminance; neutral cool fallback when it is black.
+-		const Vec3 tint = (lumSky > 1e-4f) ? skyColor / lumSky : Vec3(0.6f, 0.8f, 1.0f) / 0.7719f;
++		// Normalized to unit luminance; neutral cool fallback when every source is black.
++		const Vec3 tint = (lumSky > 1e-4f) ? hueSource / lumSky : Vec3(0.6f, 0.8f, 1.0f) / 0.7719f;
+ 		const Vec3 skyEffective = tint * (lumSun * 0.2f);
+ 		const float shTransfer = 0.2157f;
+ 		const float displayIntensity = max(1.0f, CRendererCVars::CV_r_LPVIntensity);
+diff --git a/Engine/Shaders/HWScripts/CryFX/LPV.cfi b/Engine/Shaders/HWScripts/CryFX/LPV.cfi
+index 6c39f3a2..de46bafb 100644
+--- a/Engine/Shaders/HWScripts/CryFX/LPV.cfi
++++ b/Engine/Shaders/HWScripts/CryFX/LPV.cfi
+@@ -442,13 +442,19 @@ void LPVResolveCS(uint3 DTid : SV_DispatchThreadID)
+ 	// lobe of sky colour. Interiors fail the test and only receive sky through the propagation via
+ 	// openings, attenuated by the geometry volume - which is what produces the AO-like ambient.
+ 	// Skipped in the staged injection debug modes (4..7) to keep their probes clean.
++	// Only cells WITHOUT registered surfaces receive sky: a cell containing the roof of an enclosed
++	// building is sun visible from above, and injecting sky into it turns the interior ceiling into
++	// a light panel (the receivers sample their own cell). Surface receivers get the sky from the
++	// empty cell on their front side instead - the apply pass offsets the sample point half a cell
++	// along the surface normal, which lands above the ground outdoors and below the roof indoors.
+ 	const int resolveDebugMode = (int)LPVRsmSize.z;
+-	if (LPVSkyColor.w > 0.0f && !(resolveDebugMode >= 4 && resolveDebugMode <= 7))
++	if (LPVSkyColor.w > 0.0f && surfelCount == 0 && !(resolveDebugMode >= 4 && resolveDebugMode <= 7))
+ 	{
++		// Cell centre without any sun-ward bias: a bias jumps past occluder surfaces that live in
++		// the same cell (that was the ceiling light panel bug).
+ 		const float3 cellCenter = LPVGridParams.xyz + ((float3)DTid + 0.5f) * LPVGridParams.w;
+-		const float3 samplePos = cellCenter + LPVSunDir.xyz * LPVGridParams.w;
+ 
+-		float4 rsmH = mul(LPVWorldToRsm, float4(samplePos, 1.0f));
++		float4 rsmH = mul(LPVWorldToRsm, float4(cellCenter, 1.0f));
+ 		rsmH /= (abs(rsmH.w) > 1e-12f) ? rsmH.w : 1.0f;
+ 
+ 		// Outside the RSM coverage there is no occluder information, treat as visible.
+-- 
+2.47.1.windows.1
+

@@ -1,0 +1,232 @@
+From 596f2ca8bcb6ac61a9f96a726e40162d925d3060 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Tue, 11 Aug 2026 11:42:52 +0800
+Subject: [PATCH 179/206] fix: energy conserving LPV propagation (Kaplanyan
+ face solid angles)
+
+First test of GV occlusion + sky light showed no visible effect. Root
+cause of all three symptoms: the cone90 SH-dot propagation transferred
+only ~10% of the energy per cell step (aligned transfer 0.102), which is
+also why r_LPVIntensity needed to be ~150. Sky light decayed to ~1% two
+cells past a doorway, and the energy the GV occlusion intercepted was
+negligible to begin with. (Outdoors the deferred ambient already applies
+1.0 x GetSkyColor via ClipVolumes, so the LPV sky term is inherently an
+interior feature.)
+
+- Propagation now reprojects each neighbour's flux through the five
+  faces of the destination cell weighted by their real solid angles
+  (far 0.4007 sr, side 0.4234 sr) and deposits cosine lobes around the
+  face normals. The 5 faces of all 6 neighbours partition the sphere:
+  ~0.9 total transfer per step, isotropic fields survive (~89%/step vs
+  ~1% before).
+- Defaults rescaled: r_LPVIntensity 150 -> 5, r_LPVSecondaryBounce
+  2.0 -> 0.25 (the conserving operator feeds the feedback loop much
+  harder). All previous tuning is invalidated.
+- r_LPVDebug 1 now logs the GV blocking potential per surfel and the
+  sky colour/premult for input validation.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Tu9cj9ax1mqCV93HVfCfpW
+---
+ .../RenderDll/Common/RendererCVars.cpp        | 10 ++-
+ .../XRenderD3D9/GraphicsPipeline/LPV.cpp      | 27 ++++++-
+ Engine/Shaders/HWScripts/CryFX/LPV.cfi        | 73 ++++++++++++++-----
+ 3 files changed, 85 insertions(+), 25 deletions(-)
+
+diff --git a/Code/CryEngine/RenderDll/Common/RendererCVars.cpp b/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
+index 2c72e5db..a6eea7dc 100644
+--- a/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
++++ b/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
+@@ -2235,9 +2235,10 @@ void CRendererCVars::InitCVars()
+ 	REGISTER_CVAR3("r_LPVIterations", CV_r_LPVIterations, 24, VF_NULL,
+ 	               "Number of Light Propagation Volumes propagation iterations.\n"
+ 	               "The light travel distance is roughly iterations * (r_LPVSize / r_LPVGridSize).\n");
+-	REGISTER_CVAR3("r_LPVIntensity", CV_r_LPVIntensity, 150.0f, VF_NULL,
++	REGISTER_CVAR3("r_LPVIntensity", CV_r_LPVIntensity, 5.0f, VF_NULL,
+ 	               "Intensity multiplier of the Light Propagation Volumes indirect diffuse.\n"
+-	               "The internal energy scale is uncalibrated, useful values are in the 50 - 400 range.\n");
++	               "Useful values are in the 1 - 20 range. (Before the energy conserving propagation\n"
++	               "this defaulted to 150 - the old operator lost ~90% of the energy per cell step.)\n");
+ 	REGISTER_CVAR3("r_LPVDedicatedRSM", CV_r_LPVDedicatedRSM, 1, VF_NULL,
+ 	               "Render a dedicated sun reflective shadow map fitted to the Light Propagation Volumes box\n"
+ 	               "instead of borrowing the sun shadow cascade selected by r_LPVCascadeLod.\n"
+@@ -2251,10 +2252,11 @@ void CRendererCVars::InitCVars()
+ 	REGISTER_CVAR3("r_LPVRSMSamples", CV_r_LPVRSMSamples, 1024, VF_NULL,
+ 	               "Side length of the RSM sample grid used by the injection pass, clamped to [64, 1024].\n"
+ 	               "Higher values reduce injection flicker from thin geometry at some GPU cost.\n");
+-	REGISTER_CVAR3("r_LPVSecondaryBounce", CV_r_LPVSecondaryBounce, 2.0f, VF_NULL,
++	REGISTER_CVAR3("r_LPVSecondaryBounce", CV_r_LPVSecondaryBounce, 0.25f, VF_NULL,
+ 	               "Gain of the multi bounce feedback (grid cells with registered surfaces re-emit the\n"
+ 	               "indirect light they received in the previous relight, SVOGI style). 0 disables it.\n"
+-	               "The loop stays stable roughly while gain * scene albedo * 0.25 < 1, i.e. up to ~10.\n");
++	               "The energy conserving propagation feeds this loop much harder than the old operator\n"
++	               "did - raise carefully and watch for runaway brightening over a few seconds.\n");
+ 	REGISTER_CVAR3("r_LPVOcclusion", CV_r_LPVOcclusion, 1.0f, VF_NULL,
+ 	               "Strength of the geometry volume occlusion: RSM surfels register a directional blocking\n"
+ 	               "potential per cell and the propagation attenuates the light flowing through blocked cell\n"
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.cpp
+index c774bff0..cce75f95 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.cpp
+@@ -687,6 +687,7 @@ void CLPVStage::ExecuteInject(const SScopedComputeCommandList& commandList, CTex
+ 	// needed. The inverse is only defined up to a projective scale, dehomogenize before measuring
+ 	// (same pitfall as the screen inject area weight).
+ 	float gvBlocking = 0.0f;
++	float rsmTexelSize = 0.0f;
+ 	if (CRendererCVars::CV_r_LPVOcclusion > 0.0f)
+ 	{
+ 		Vec4 rsmCorner0 = m_rsmToWorld * Vec4(0.0f, 0.0f, 0.5f, 1.0f);
+@@ -696,10 +697,21 @@ void CLPVStage::ExecuteInject(const SScopedComputeCommandList& commandList, CTex
+ 		if (fabsf(rsmCorner1.w) > 1e-12f)
+ 			rsmCorner1 = rsmCorner1 / rsmCorner1.w;
+ 		const Vec3 rsmSpan = Vec3(rsmCorner1.x - rsmCorner0.x, rsmCorner1.y - rsmCorner0.y, rsmCorner1.z - rsmCorner0.z);
+-		const float rsmTexelSize = rsmSpan.GetLength() / (float)m_rsmSampleCount;
++		rsmTexelSize = rsmSpan.GetLength() / (float)m_rsmSampleCount;
+ 		gvBlocking = min(1.0f, (rsmTexelSize * rsmTexelSize) / (m_cellSize * m_cellSize));
+ 	}
+ 
++	if (CRendererCVars::CV_r_LPVDebug > 0)
++	{
++		static float lastBlocking = -1.0f;
++		if (fabsf(gvBlocking - lastBlocking) > 1e-6f)
++		{
++			CryLog("LPV debug: GV blocking potential per surfel %.6f (rsm texel %.3f m, cell %.3f m)",
++			       gvBlocking, rsmTexelSize, m_cellSize);
++			lastBlocking = gvBlocking;
++		}
++	}
++
+ 	static CCryNameR paramRsm("LPVRsmParams");
+ 	pass.SetConstant(paramRsm, Vec4((float)m_rsmSampleCount, (float)m_rsmSampleStride, CRendererCVars::CV_r_LPVInjectionBias, gvBlocking));
+ 
+@@ -864,6 +876,19 @@ void CLPVStage::ExecuteResolve(const SScopedComputeCommandList& commandList, CTe
+ 		skyPremult = skyColor * (skyGain / (shTransfer * displayIntensity));
+ 	}
+ 
++	if (CRendererCVars::CV_r_LPVDebug > 0)
++	{
++		static float lastSkyGain = -1.0f;
++		if (fabsf(skyGain - lastSkyGain) > 1e-4f)
++		{
++			const Vec3 skyColorLog = gEnv->p3DEngine ? gEnv->p3DEngine->GetSkyColor() : Vec3(ZERO);
++			CryLog("LPV debug: sky colour (%.3f, %.3f, %.3f) gain %.3f premult (%.5f, %.5f, %.5f)",
++			       skyColorLog.x, skyColorLog.y, skyColorLog.z, skyGain,
++			       skyPremult.x, skyPremult.y, skyPremult.z);
++			lastSkyGain = skyGain;
++		}
++	}
++
+ 	static CCryNameR paramSky("LPVSkyColor");
+ 	pass.SetConstant(paramSky, Vec4(skyPremult.x, skyPremult.y, skyPremult.z, skyGain > 0.0f ? 1.0f : 0.0f));
+ 
+diff --git a/Engine/Shaders/HWScripts/CryFX/LPV.cfi b/Engine/Shaders/HWScripts/CryFX/LPV.cfi
+index 758e046d..e67c2cd3 100644
+--- a/Engine/Shaders/HWScripts/CryFX/LPV.cfi
++++ b/Engine/Shaders/HWScripts/CryFX/LPV.cfi
+@@ -94,6 +94,12 @@ float4 LPVCone90(float3 dir)
+ 	return LPVProjectZH(dir, float2(LPV_ZH_CONE0, LPV_ZH_CONE1));
+ }
+ 
++// Plain SH direction basis, used to evaluate a stored SH radiance distribution in a direction.
++float4 LPVDirSH(float3 dir)
++{
++	return LPVProjectZH(dir, float2(1.0f, 1.0f));
++}
++
+ // Replaces NaN with 0 and clamps against fp16 overflow. Applied to the persistent accumulation
+ // state: a diverged bounce feedback (INF -> NaN through the signed SH dot products) would otherwise
+ // poison whole regions, which the tonemapper displays as black patches.
+@@ -515,14 +521,24 @@ void LPVPropagateCS(uint3 DTid : SV_DispatchThreadID)
+ 	if (cell.x >= gridSize || cell.y >= gridSize || cell.z >= gridSize)
+ 		return;
+ 
+-	// Gather-only propagation (CryEngine 3 scheme): the destination holds only the light arriving
+-	// from the neighbours this iteration - a decaying diffusion that is stable for any iteration
+-	// count. The total is kept in an explicit running sum. The previous "self + gathered" variant
+-	// compounded the operator and blew up checkerboard modes exponentially with the iteration count.
++	// Gather-only propagation with the face solid angle reprojection of Kaplanyan & Dachsbacher
++	// (I3D 2010): the flux of each neighbour is evaluated towards the five faces of the current
++	// cell (the face shared with the neighbour is excluded), weighted by the real solid angle the
++	// face subtends from the neighbour centre, and deposited as a cosine lobe around the face
++	// normal. The five faces of all six neighbours partition the sphere, so the operator is energy
++	// conserving (total transfer ~0.9 per step) - unlike the previous cone90 SH dot variant, which
++	// lost ~90% per step and needed r_LPVIntensity ~150 to compensate. The destination holds only
++	// the light arriving this iteration (stable for any iteration count), the total is kept in an
++	// explicit running sum.
+ 	float4 dstR = (float4)0.0f;
+ 	float4 dstG = (float4)0.0f;
+ 	float4 dstB = (float4)0.0f;
+ 
++	// Solid angles (steradians) of the far face and of one side face of the destination cell as
++	// seen from the neighbour cell centre.
++	const float faceSolidAngleFar  = 0.4006696846f;
++	const float faceSolidAngleSide = 0.4234413544f;
++
+ 	const float occStrength = LPVPropParams.x;
+ 	const float4 gvSelf = (occStrength > 0.0f) ? LPVPropGV.Load(int4(cell, 0)) : (float4)0.0f;
+ 
+@@ -539,28 +555,45 @@ void LPVPropagateCS(uint3 DTid : SV_DispatchThreadID)
+ 		const float4 srcG = LPVPropSrcG.Load(int4(neighbour, 0));
+ 		const float4 srcB = LPVPropSrcB.Load(int4(neighbour, 0));
+ 
+-		// Direction the light travels when it moves from the neighbour into the current cell.
+-		const float4 cone = LPVCone90(-(float3)offset);
+-
+-		// Geometry volume occlusion: blocking potential halfway between the two cells, evaluated in
+-		// the direction of travel. abs(): a surfel blocks from both of its sides. The strength is 0
+-		// for the first iteration (see the CPU side comment) and pre-scaled so that a fully covered
+-		// perpendicular face reaches zero transmittance at r_LPVOcclusion 1.
++		// Geometry volume occlusion: blocking potential halfway between the two cells, evaluated
++		// in the direction of travel (90 degree cone as the directional window). abs(): a surfel
++		// blocks from both of its sides. The strength is 0 for the first iteration (see the CPU
++		// side comment) and pre-scaled so that a fully covered perpendicular face reaches zero
++		// transmittance at r_LPVOcclusion 1.
+ 		float transmittance = 1.0f;
+ 		if (occStrength > 0.0f)
+ 		{
+ 			const float4 gvMid = 0.5f * (gvSelf + LPVPropGV.Load(int4(neighbour, 0)));
+-			transmittance = saturate(1.0f - abs(dot(gvMid, cone)) * occStrength);
++			const float4 travelCone = LPVCone90(-(float3)offset);
++			transmittance = saturate(1.0f - abs(dot(gvMid, travelCone)) * occStrength);
+ 		}
+ 
+-		float3 incident;
+-		incident.r = max(0.0f, dot(srcR, cone)) * transmittance;
+-		incident.g = max(0.0f, dot(srcG, cone)) * transmittance;
+-		incident.b = max(0.0f, dot(srcB, cone)) * transmittance;
+-
+-		dstR += cone * incident.r;
+-		dstG += cone * incident.g;
+-		dstB += cone * incident.b;
++		[unroll] for (int f = 0; f < 6; ++f)
++		{
++			const int3 faceNormalI = neighbourOffset[f];
++			// alignment of the face normal with the neighbour offset: 1 = the shared face (skip),
++			// -1 = the far face, 0 = one of the four side faces
++			const int alignment = faceNormalI.x * offset.x + faceNormalI.y * offset.y + faceNormalI.z * offset.z;
++			if (alignment == 1)
++				continue;
++
++			const float solidAngle = (alignment == -1) ? faceSolidAngleFar : faceSolidAngleSide;
++
++			// Direction from the neighbour centre towards the face centre of the current cell
++			// (cell size 1: face centre = 0.5 * normal, neighbour centre = offset).
++			const float3 evalDir = normalize(0.5f * (float3)faceNormalI - (float3)offset);
++			const float4 dirSH = LPVDirSH(evalDir);
++
++			float3 flux;
++			flux.r = max(0.0f, dot(srcR, dirSH)) * solidAngle * transmittance;
++			flux.g = max(0.0f, dot(srcG, dirSH)) * solidAngle * transmittance;
++			flux.b = max(0.0f, dot(srcB, dirSH)) * solidAngle * transmittance;
++
++			const float4 faceLobe = LPVCosineLobe((float3)faceNormalI);
++			dstR += faceLobe * flux.r;
++			dstG += faceLobe * flux.g;
++			dstB += faceLobe * flux.b;
++		}
+ 	}
+ 
+ 	LPVPropDstR[DTid] = dstR;
+-- 
+2.47.1.windows.1
+

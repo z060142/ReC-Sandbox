@@ -1,0 +1,104 @@
+From 81f12a2943d9b8ab6c62133d0b9de253176a698c Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Thu, 13 Aug 2026 14:36:50 +0800
+Subject: [PATCH 205/206] feat: Light entity GI Mode drives LPV participation
+
+The per-light GI Mode (designed for SVOGI) now applies to whichever GI
+system is active. Under LPV: Static and Dynamic both mean "feed the
+volume" (the LPV has no voxelization split), None stays out, and
+"Hide if GI is Active" hides the light exactly like it does under
+SVOGI. CLightEntity translates the mode into DLF_USE_FOR_SVOGI, the
+LPV local-light loop gates on the flag, and toggling the mode changes
+the light-set hash so a relight triggers immediately. r_LPVDebug 1
+logs the deferred light set with per-light gate verdicts.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Tu9cj9ax1mqCV93HVfCfpW
+---
+ Code/CryEngine/Cry3DEngine/LightEntity.cpp    | 15 ++++++++--
+ .../XRenderD3D9/GraphicsPipeline/LPV.cpp      | 28 +++++++++++++++++++
+ 2 files changed, 41 insertions(+), 2 deletions(-)
+
+diff --git a/Code/CryEngine/Cry3DEngine/LightEntity.cpp b/Code/CryEngine/Cry3DEngine/LightEntity.cpp
+index b60cce76..a2ba2f34 100644
+--- a/Code/CryEngine/Cry3DEngine/LightEntity.cpp
++++ b/Code/CryEngine/Cry3DEngine/LightEntity.cpp
+@@ -1872,8 +1872,18 @@ void CLightEntity::UpdateCastShadowFlag(float fDistance, const SRenderingPassInf
+ 		m_light.m_Flags &= ~DLF_CASTSHADOW_MAPS;
+ 
+ #if defined(FEATURE_SVO_GI)
++	// DLF_USE_FOR_SVOGI marks the light for whichever GI system is active. SVOGI keeps its
++	// original voxelization rules; the LPV has no static/dynamic split, so under LPV both
++	// Static and Dynamic mean "feed the volume" while None and HideIfGiIsActive stay out
++	// (the filtered GetGIMode() already maps HideIfGiIsActive to eGM_None).
+ 	IRenderNode::EGIMode eVoxMode = GetGIMode();
+-	if (eVoxMode == IRenderNode::eGM_DynamicVoxelization || (eVoxMode == IRenderNode::eGM_StaticVoxelization && !GetCVars()->e_svoTI_IntegrationMode && !(m_light.m_Flags & DLF_SUN)))
++	bool bUseForGI;
++	if (IsLPVRsmEnabled())
++		bUseForGI = (eVoxMode == IRenderNode::eGM_StaticVoxelization || eVoxMode == IRenderNode::eGM_DynamicVoxelization) && !(m_light.m_Flags & DLF_SUN);
++	else
++		bUseForGI = eVoxMode == IRenderNode::eGM_DynamicVoxelization || (eVoxMode == IRenderNode::eGM_StaticVoxelization && !GetCVars()->e_svoTI_IntegrationMode && !(m_light.m_Flags & DLF_SUN));
++
++	if (bUseForGI)
+ 		m_light.m_Flags |= DLF_USE_FOR_SVOGI;
+ 	else
+ 		m_light.m_Flags &= ~DLF_USE_FOR_SVOGI;
+@@ -2014,7 +2024,8 @@ void CLightEntity::Render(const SRendParams& rParams, const SRenderingPassInfo&
+ #if defined(FEATURE_SVO_GI)
+ 	if (GetCVars()->e_svoTI_SkipNonGILights && GetCVars()->e_svoTI_Apply && !GetGIMode())
+ 		return;
+-	if (GetCVars()->e_svoTI_Apply && (IRenderNode::GetGIMode() == eGM_HideIfGiIsActive))
++	// "Hide if GI is Active" responds to whichever GI system is running - SVOGI or LPV.
++	if ((GetCVars()->e_svoTI_Apply || IsLPVRsmEnabled()) && (IRenderNode::GetGIMode() == eGM_HideIfGiIsActive))
+ 		return;
+ #endif
+ 
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.cpp
+index 661c2c96..777ab891 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.cpp
+@@ -659,6 +659,12 @@ void CLPVStage::Execute()
+ 			const SRenderLight& light = *itr;
+ 			if (light.m_Flags & (DLF_FAKE | DLF_VOLUMETRIC_FOG_ONLY | DLF_SUN))
+ 				continue;
++
++			// GI Mode gate (Light entity property): only lights whose GI Mode is Static or
++			// Dynamic feed the LPV. CLightEntity translates the mode into DLF_USE_FOR_SVOGI
++			// for whichever GI system is active; None and HideIfGiIsActive never set it.
++			if (!(light.m_Flags & DLF_USE_FOR_SVOGI))
++				continue;
+ 			const Vec3 pos = light.GetPosition();
+ 
+ 			const bool bProjector = (light.m_Flags & DLF_PROJECT) != 0;
+@@ -702,6 +708,28 @@ void CLPVStage::Execute()
+ 			             + (uint32)(int32)(light.m_Color.r * 8.0f + light.m_Color.g * 64.0f + light.m_Color.b * 512.0f);
+ 		}
+ 		lightsHash += (uint32)m_lightCount * 2654435761u;
++
++		// GI Mode gate diagnostics: list the deferred light set and the gate verdicts whenever the
++		// set changes, so a "light does not feed the LPV" report can be split into "flag never
++		// reached the renderer" vs "gate logic wrong" at a glance.
++		if (CRendererCVars::CV_r_LPVDebug > 0)
++		{
++			static uint32 sLastLightLogSig = 0xFFFFFFFFu;
++			const uint32 logSig = lightsHash * 31u + (uint32)deferredLights.size();
++			if (logSig != sLastLightLogSig)
++			{
++				sLastLightLogSig = logSig;
++				CryLog("LPV debug: deferred lights %d, passed GI gate %d", (int)deferredLights.size(), m_lightCount);
++				int32 logged = 0;
++				for (auto itr = deferredLights.begin(); itr != deferredLights.end() && logged < 8; ++itr, ++logged)
++				{
++					const SRenderLight& dbgLight = *itr;
++					CryLog("LPV debug:   light '%s' flags 0x%08x giFlag %d radius %.1f",
++					       dbgLight.m_sName ? dbgLight.m_sName : "?", (uint32)dbgLight.m_Flags,
++					       (dbgLight.m_Flags & DLF_USE_FOR_SVOGI) ? 1 : 0, dbgLight.m_fRadius);
++				}
++			}
++		}
+ 	}
+ 
+ 	bool bRelightAll = m_bForceRelight;
+-- 
+2.47.1.windows.1
+

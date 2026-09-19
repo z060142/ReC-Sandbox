@@ -81,6 +81,19 @@ untouched and the stock path is byte-identical. Deploy note: the repository's
 or the grain technique's runtime flag stays masked off and the grain block never compiles. Full spec:
 `engine/Code/CryPlugins/CinematicCamera/FilmGrainSpec.md`.
 
+### Light Propagation Volumes
+
+Cheap dynamic global illumination brought back into the deferred pipeline (`r_LPV 1`, off by
+default, stock path byte-identical when off). Sun light is injected from dedicated reflective
+shadow maps, one per cascade, into up to three nested spherical-harmonics cascades around the
+camera, propagated with energy-conserving face solid angles, occluded by a geometry volume and the
+height map, and applied as indirect diffuse to deferred and forward geometry, with an optional
+specular term (`r_LPVSpecular`) and sky light injection through open sky. Local lights can inject
+too (`r_LPVPointLights`), and every Light entity carries a GI Mode that decides whether it takes
+part. Temporal filtering keeps the volume stable while the camera moves; the history is dropped on
+any `r_LPV*` change. Debug views under `r_LPVDebug`. Shader: `engine/Engine/Shaders/HWScripts/CryFX/LPV.cfi`,
+renderer stage `GraphicsPipeline/LPV.{h,cpp}`. The related loose `RunTime.ext` rule above applies.
+
 ## Status
 
 - Verified on a physically lit interior and on the sample airfield in daylight.

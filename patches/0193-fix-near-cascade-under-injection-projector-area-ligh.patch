@@ -1,0 +1,356 @@
+From c9a68833ca26ad766807d1ee351a2a38045c65a4 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Wed, 12 Aug 2026 05:47:56 +0800
+Subject: [PATCH 193/206] fix: near cascade under-injection, projector/area
+ lights, cost overhaul
+
+- Near cascade lost its GI with r_LPVCascadeScale > 1: the injection
+  weight (gridSize/sampleCount)^2 silently assumed RSM span == volume
+  span; with the RSM sized to the far cascade every surfel represents
+  scale^2 more area and the near cascade was under-injected by 16x at
+  scale 4. The weight now uses the MEASURED RSM texel size against the
+  cascade cell size (also reused for the GV blocking potential).
+- Local light injection handles projectors (emission gated to the
+  frustum cone around the light X axis, soft edge) and area lights
+  (hemisphere in front of the plane, radius extended by the area size).
+- Cost overhaul (reported as more expensive than SVOGI): the RSM was
+  re-rendered every frame (600+ casters, like an extra shadow cascade)
+  and every crossed cell re-ran the full relight chain while moving.
+  Now the RSM shadow pass only exists on the frames the LPV will
+  relight on (CShadowMapStage asks WantsRsmRender(), same predicate as
+  the relight gate; the stage injects from its own persistent depth
+  target since the shadow prep stomps frustum.pDepthTex with the far
+  plane on dropped frames), cell crossings no longer trigger relights
+  (the frozen grid stays anchored and the heartbeat catches up; only a
+  teleport sized jump forces one), and the far cascade runs half the
+  propagation iterations (its cells are 4x larger). Static camera cost
+  is now near zero, moving cost ~1/r_LPVUpdateInterval of before.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Tu9cj9ax1mqCV93HVfCfpW
+---
+ .../XRenderD3D9/GraphicsPipeline/LPV.cpp      | 135 ++++++++++++++----
+ .../XRenderD3D9/GraphicsPipeline/LPV.h        |  14 ++
+ .../GraphicsPipeline/ShadowMap.cpp            |  17 ++-
+ 3 files changed, 137 insertions(+), 29 deletions(-)
+
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.cpp
+index 0c0eaa1f..891df13f 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.cpp
+@@ -260,6 +260,36 @@ CTexture* CLPVStage::GetSpecularRT() const
+ 	        && m_bResultValid && CTexture::IsTextureExist(m_pSpecular)) ? m_pSpecular.get() : nullptr;
+ }
+ 
++bool CLPVStage::WantsRsmRender()
++{
++	if (m_bForceRelight)
++		return true;
++
++	const int32 cascadeCount = GetActiveCascadeCount();
++	for (int32 i = 0; i < cascadeCount; ++i)
++	{
++		if (!m_cascades[i].bHistoryValid)
++			return true;
++	}
++
++	const int32 interval = max(0, CRendererCVars::CV_r_LPVUpdateInterval);
++	if (interval == 0 || m_framesSinceRelight + 1 >= interval)
++		return true;
++
++	// Same sun change thresholds as the relight gate in Execute().
++	if (CRenderView* pRenderView = RenderView())
++	{
++		const Vec3 sunDir = pRenderView->GetSunLightDirection();
++		const Vec4 sunColor = pRenderView->GetSunLightColor();
++		if (sunDir.Dot(m_lastSunDir) < 0.99995f)
++			return true;
++		if ((fabsf(sunColor.x - m_lastSunColor.x) + fabsf(sunColor.y - m_lastSunColor.y) + fabsf(sunColor.z - m_lastSunColor.z)) > 0.01f)
++			return true;
++	}
++
++	return false;
++}
++
+ bool CLPVStage::IsSvoProvidingRsm() const
+ {
+ #if defined(FEATURE_SVO_GI)
+@@ -394,13 +424,16 @@ const ShadowMapFrustum* CLPVStage::FindRsmFrustum() const
+ 
+ bool CLPVStage::UpdateFrameParameters(const ShadowMapFrustum& frustum, const CTexture* pRsmColor)
+ {
+-	if (!CTexture::IsTextureExist(frustum.pDepthTex))
++	// Use the stage's own persistent depth target, NOT frustum.pDepthTex: on the frames the RSM
++	// pass is dropped (WantsRsmRender() gating) the shadow prep stomps the frustum pointer with
++	// the empty far plane texture, while our texture still holds the last rendered RSM.
++	if (!CTexture::IsTextureExist(m_pRsmDepth))
+ 		return false;
+ 
+ 	// The injection pass reads depth, albedo and normal at the same texel, so all three RSM targets
+ 	// have to share the resolution of the RSM view.
+ 	m_rsmSize = pRsmColor->GetWidth();
+-	if (m_rsmSize <= 0 || m_rsmSize != frustum.pDepthTex->GetWidth())
++	if (m_rsmSize <= 0 || m_rsmSize != m_pRsmDepth->GetWidth())
+ 		return false;
+ 
+ 	const int32 wantedSamples = clamp_tpl(CRendererCVars::CV_r_LPVRSMSamples, 64, MaxRsmSampleCount);
+@@ -421,6 +454,20 @@ bool CLPVStage::UpdateFrameParameters(const ShadowMapFrustum& frustum, const CTe
+ 	m_worldToRsm = worldToRsm;
+ 	m_rsmToWorld = worldToRsm.GetInverted();
+ 
++	// World size of one sampled RSM texel. The inverse is only defined up to a projective scale,
++	// dehomogenize before measuring. Used by the injection weight (surfel footprint / cascade cell
++	// footprint) and the geometry volume blocking potential.
++	{
++		Vec4 rsmCorner0 = m_rsmToWorld * Vec4(0.0f, 0.0f, 0.5f, 1.0f);
++		Vec4 rsmCorner1 = m_rsmToWorld * Vec4(1.0f, 0.0f, 0.5f, 1.0f);
++		if (fabsf(rsmCorner0.w) > 1e-12f)
++			rsmCorner0 = rsmCorner0 / rsmCorner0.w;
++		if (fabsf(rsmCorner1.w) > 1e-12f)
++			rsmCorner1 = rsmCorner1 / rsmCorner1.w;
++		const Vec3 rsmSpan = Vec3(rsmCorner1.x - rsmCorner0.x, rsmCorner1.y - rsmCorner0.y, rsmCorner1.z - rsmCorner0.z);
++		m_rsmTexelSize = rsmSpan.GetLength() / (float)m_rsmSampleCount;
++	}
++
+ 	if (CRendererCVars::CV_r_LPVDebug > 0)
+ 	{
+ 		// CPU side sanity check of the matrix chain: the RSM centre at mid depth has to land in the
+@@ -442,7 +489,7 @@ bool CLPVStage::UpdateFrameParameters(const ShadowMapFrustum& frustum, const CTe
+ 		       shadowsSetup.RecpFarDist, frustum.nShadowMapLod,
+ 		       (int)frustum.m_eFrustumType, (int)ShadowMapFrustum::e_LPVRsm,
+ 		       m_rsmSize,
+-		       frustum.pDepthTex ? frustum.pDepthTex->GetName() : "null");
++		       m_pRsmDepth ? m_pRsmDepth->GetName() : "null");
+ 	}
+ 
+ 	return true;
+@@ -590,12 +637,35 @@ void CLPVStage::Execute()
+ 			if (light.m_Flags & (DLF_FAKE | DLF_VOLUMETRIC_FOG_ONLY | DLF_SUN))
+ 				continue;
+ 			const Vec3 pos = light.GetPosition();
+-			const float radius = light.m_fRadius;
++
++			const bool bProjector = (light.m_Flags & DLF_PROJECT) != 0;
++			const bool bArea = (light.m_Flags & DLF_AREA) != 0;
++
++			// Emission direction (the light's forward X axis) and cone gate: projectors emit into
++			// their frustum cone, area lights into the hemisphere in front of the plane, point
++			// lights omnidirectionally (-1.5 disables the gate in the shader).
++			Vec3 dir(0.0f, 0.0f, 1.0f);
++			float cosOuter = -1.5f;
++			if (bProjector)
++			{
++				dir = light.m_ObjMatrix.GetColumn0().GetNormalized();
++				cosOuter = cosf(DEG2RAD(clamp_tpl(light.m_fLightFrustumAngle, 1.0f, 89.9f)));
++			}
++			else if (bArea)
++			{
++				dir = light.m_ObjMatrix.GetColumn0().GetNormalized();
++				cosOuter = 0.0f;
++			}
++
++			float radius = light.m_fRadius;
++			if (bArea)
++				radius += max(light.m_fAreaWidth, light.m_fAreaHeight) * 0.5f;
+ 			if (radius <= 0.01f)
+ 				continue;
+ 
+ 			m_lightPos[m_lightCount] = Vec4(pos, radius);
+ 			m_lightColor[m_lightCount] = Vec4(light.m_Color.r * sceneScale, light.m_Color.g * sceneScale, light.m_Color.b * sceneScale, 0.0f);
++			m_lightDir[m_lightCount] = Vec4(dir, cosOuter);
+ 			++m_lightCount;
+ 
+ 			// Quarter meter / coarse colour quantization: moving or recoloured lights trigger a
+@@ -604,6 +674,8 @@ void CLPVStage::Execute()
+ 			             + (uint32)(int32)(pos.x * 4.0f) * 31u
+ 			             + (uint32)(int32)(pos.y * 4.0f) * 17u
+ 			             + (uint32)(int32)(pos.z * 4.0f) * 7u
++			             + (uint32)(int32)(dir.x * 8.0f + dir.y * 32.0f + dir.z * 128.0f) * 3u
++			             + (uint32)(int32)(cosOuter * 16.0f) * 13u
+ 			             + (uint32)(int32)(light.m_Color.r * 8.0f + light.m_Color.g * 64.0f + light.m_Color.b * 512.0f);
+ 		}
+ 		lightsHash += (uint32)m_lightCount * 2654435761u;
+@@ -624,13 +696,19 @@ void CLPVStage::Execute()
+ 		UpdateCascadeParameters(cascade, i);
+ 
+ 		bool bRelight = bRelightAll || !cascade.bHistoryValid;
+-		bRelight |= !cascade.gridOrigin.IsEquivalent(cascade.prevGridOrigin, 1e-3f);
++		// A cell crossing does NOT trigger a relight anymore: the frozen grid stays anchored at its
++		// old origin (which the apply reads, so it remains exactly correct) and the heartbeat
++		// catches up - relighting on every crossed cell made the full chain run every few frames
++		// while moving, which together with the per-frame RSM render pushed the cost above SVOGI.
++		// Only a teleport sized jump (a quarter of the volume) forces an immediate relight.
++		const float teleportDistSq = sqr(cascade.cellSize * (float)m_gridSize * 0.25f);
++		bRelight |= (cascade.gridOrigin - cascade.prevGridOrigin).GetLengthSquared() > teleportDistSq;
+ 
+ 		if (bRelight)
+ 		{
+ 			ExecuteClear(cascade, commandList);
+-			ExecuteInject(cascade, commandList, pFrustum->pDepthTex, pRsmColor, pRsmNormal);
+-			ExecuteResolve(cascade, commandList, pFrustum->pDepthTex);
++			ExecuteInject(cascade, commandList, m_pRsmDepth, pRsmColor, pRsmNormal);
++			ExecuteResolve(cascade, commandList, m_pRsmDepth);
+ 			ExecutePropagate(cascade, commandList);
+ 			ExecuteTemporal(cascade, commandList);
+ 
+@@ -655,7 +733,7 @@ void CLPVStage::Execute()
+ 	}
+ 
+ 	// The screen space apply runs later in the pipeline (ExecuteApplyToScreen), see LPV.h.
+-	m_pApplyRsmDepth = pFrustum->pDepthTex;
++	m_pApplyRsmDepth = m_pRsmDepth;
+ 	m_bGridReadyForApply = true;
+ }
+ 
+@@ -721,21 +799,10 @@ void CLPVStage::ExecuteInject(SCascade& cascade, const SScopedComputeCommandList
+ 	// Geometry volume blocking potential of one sampled RSM texel: the fraction of a cell face its
+ 	// world space footprint covers. The surfels of a wall crossing a cell then sum to ~1 with plain
+ 	// additive accumulation (total surfel area / face area), no max blending or count normalization
+-	// needed. The inverse is only defined up to a projective scale, dehomogenize before measuring.
++	// needed.
+ 	float gvBlocking = 0.0f;
+-	float rsmTexelSize = 0.0f;
+ 	if (CRendererCVars::CV_r_LPVOcclusion > 0.0f)
+-	{
+-		Vec4 rsmCorner0 = m_rsmToWorld * Vec4(0.0f, 0.0f, 0.5f, 1.0f);
+-		Vec4 rsmCorner1 = m_rsmToWorld * Vec4(1.0f, 0.0f, 0.5f, 1.0f);
+-		if (fabsf(rsmCorner0.w) > 1e-12f)
+-			rsmCorner0 = rsmCorner0 / rsmCorner0.w;
+-		if (fabsf(rsmCorner1.w) > 1e-12f)
+-			rsmCorner1 = rsmCorner1 / rsmCorner1.w;
+-		const Vec3 rsmSpan = Vec3(rsmCorner1.x - rsmCorner0.x, rsmCorner1.y - rsmCorner0.y, rsmCorner1.z - rsmCorner0.z);
+-		rsmTexelSize = rsmSpan.GetLength() / (float)m_rsmSampleCount;
+-		gvBlocking = min(1.0f, (rsmTexelSize * rsmTexelSize) / (cascade.cellSize * cascade.cellSize));
+-	}
++		gvBlocking = min(1.0f, (m_rsmTexelSize * m_rsmTexelSize) / (cascade.cellSize * cascade.cellSize));
+ 
+ 	if (CRendererCVars::CV_r_LPVDebug > 0 && &cascade == &m_cascades[0])
+ 	{
+@@ -743,7 +810,7 @@ void CLPVStage::ExecuteInject(SCascade& cascade, const SScopedComputeCommandList
+ 		if (fabsf(gvBlocking - lastBlocking) > 1e-6f)
+ 		{
+ 			CryLog("LPV debug: GV blocking potential per surfel %.6f (rsm texel %.3f m, cell %.3f m)",
+-			       gvBlocking, rsmTexelSize, cascade.cellSize);
++			       gvBlocking, m_rsmTexelSize, cascade.cellSize);
+ 			lastBlocking = gvBlocking;
+ 		}
+ 	}
+@@ -795,11 +862,17 @@ void CLPVStage::ExecuteResolve(SCascade& cascade, const SScopedComputeCommandLis
+ 	pass.BeginConstantUpdate();
+ 	SetGridConstants(pass, cascade);
+ 
+-	// The surfel weight compensates for the different footprints of an RSM texel and a grid cell.
+-	// It is applied here in float instead of pre-quantization in the inject pass, otherwise high
+-	// sample counts push the per VPL contribution below the fixed point resolution.
++	// The surfel weight compensates for the different footprints of an RSM texel and a grid cell:
++	// surfel area / cell face area, using the MEASURED RSM texel size. The old shortcut
++	// (gridSize / sampleCount)^2 silently assumed RSM span == volume span - with nested cascades
++	// the RSM spans the far volume and the near cascade was under-injected by the span ratio
++	// squared (observed: r_LPVCascadeScale 4 lost almost all near GI, scale 1 was normal).
++	// Applied here in float instead of pre-quantization in the inject pass, otherwise high sample
++	// counts push the per VPL contribution below the fixed point resolution.
+ 	const float fSampleCount = (float)m_rsmSampleCount;
+-	const float injectionWeight = ((float)m_gridSize * (float)m_gridSize) / (fSampleCount * fSampleCount);
++	const float injectionWeight = (m_rsmTexelSize > 1e-4f)
++	                              ? (m_rsmTexelSize * m_rsmTexelSize) / (cascade.cellSize * cascade.cellSize)
++	                              : ((float)m_gridSize * (float)m_gridSize) / (fSampleCount * fSampleCount);
+ 
+ 	static CCryNameR paramResolve("LPVResolveParams");
+ 	pass.SetConstant(paramResolve, Vec4(injectionWeight, 0.0f, 0.0f, 0.0f));
+@@ -886,7 +959,12 @@ void CLPVStage::ExecuteResolve(SCascade& cascade, const SScopedComputeCommandLis
+ 
+ void CLPVStage::ExecutePropagate(SCascade& cascade, const SScopedComputeCommandList& commandList)
+ {
+-	const int32 iterations = clamp_tpl<int32>(CRendererCVars::CV_r_LPVIterations, 0, 32);
++	int32 iterations = clamp_tpl<int32>(CRendererCVars::CV_r_LPVIterations, 0, 32);
++	// The far cascade cells are r_LPVCascadeScale times larger, half the iterations already travel
++	// twice the near cascade's world distance - full count would only burn GPU time.
++	if (&cascade != &m_cascades[0])
++		iterations = max(iterations / 2, min(iterations, 8));
++
+ 	const uint32 dispatchSize = lpvDispatchSize(m_gridSize, LPVGridTileSize);
+ 
+ 	// Gather-only propagation with an explicit running sum (see LPV.cfi for the face solid angle
+@@ -1002,6 +1080,9 @@ void CLPVStage::ExecuteTemporal(SCascade& cascade, const SScopedComputeCommandLi
+ 	static CCryNameR paramLightColor("LPVLightColor");
+ 	pass.SetConstantArray(paramLightColor, m_lightColor, MaxPointLights);
+ 
++	static CCryNameR paramLightDir("LPVLightDir");
++	pass.SetConstantArray(paramLightDir, m_lightDir, MaxPointLights);
++
+ 	const uint32 dispatchSize = lpvDispatchSize(m_gridSize, LPVGridTileSize);
+ 	pass.SetDispatchSize(dispatchSize, dispatchSize, dispatchSize);
+ 	pass.PrepareResourcesForUse(commandList);
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.h b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.h
+index 9f78fa20..15394468 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.h
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.h
+@@ -71,6 +71,12 @@ public:
+ 	CTexture* GetRsmColorTexture() const  { return m_pRsmColor.get(); }
+ 	CTexture* GetRsmNormalTexture() const { return m_pRsmNormal.get(); }
+ 
++	// True when the next Execute() will relight the grids, queried by CShadowMapStage during the
++	// shadow prep of the same frame: on every other frame the RSM shadow pass is dropped entirely
++	// (the casters are static between relights, re-rendering the RSM only burns GPU time - it was
++	// the single largest per-frame cost of the stage).
++	bool WantsRsmRender();
++
+ 	// GI combine, mirrors CSvoRenderer::GetDiffuseFinRT(). Only valid after a successful Execute().
+ 	CTexture* GetIrradianceRT() const;
+ 
+@@ -169,7 +175,15 @@ private:
+ 	// Local lights of the frame (gathered in Execute, injected by the temporal pass).
+ 	Vec4                 m_lightPos[MaxPointLights];
+ 	Vec4                 m_lightColor[MaxPointLights];
++	// xyz: emission direction (projector axis / area light normal), w: cos outer cone half-angle
++	// (-1.5 marks an omnidirectional point light).
++	Vec4                 m_lightDir[MaxPointLights];
+ 	int32                m_lightCount = 0;
++	// World size of one sampled RSM texel, measured through the RSM matrix. The injection weight
++	// has to compare the surfel footprint against the CASCADE cell size: with nested cascades the
++	// RSM spans the far volume, the old gridSize/sampleCount shortcut assumed RSM span == volume
++	// span and under-injected the near cascade by the span ratio squared.
++	float                m_rsmTexelSize = 0.0f;
+ 	// Relight gating state: the grid is only re-injected on discrete input changes or on the heartbeat
+ 	// interval, a frozen grid stays exactly correct for a static scene and cannot flicker.
+ 	Vec3                 m_lastSunDir;
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ShadowMap.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ShadowMap.cpp
+index 380f30db..6ae44a3c 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ShadowMap.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ShadowMap.cpp
+@@ -667,7 +667,15 @@ void CShadowMapStage::PrepareShadowPasses(SShadowFrustumToRender& frustumToRende
+ bool CShadowMapStage::IsLPVRsmFrustum(const ShadowMapFrustum& frustum) const
+ {
+ 	if (auto* pLPVStage = m_graphicsPipeline.GetStage<CLPVStage>())
++	{
++		// The RSM is only rendered on the frames the LPV will actually relight on (heartbeat, sun
++		// change, invalid history) - on every other frame the pass is dropped and the LPV keeps
++		// injecting from the last rendered RSM, whose casters are static between relights.
++		if (!pLPVStage->WantsRsmRender())
++			return false;
++
+ 		return pLPVStage->GetRsmColorMap(frustum, true) && pLPVStage->GetRsmNormalMap(frustum, true);
++	}
+ 
+ 	return false;
+ }
+@@ -884,9 +892,14 @@ _smart_ptr<CTexture> CShadowMapStage::PrepareOutputsForFrustumWithCaching(const
+ 		}
+ 		else if (frustum.m_eFrustumType == ShadowMapFrustum::eFrustumType::e_LPVRsm)
+ 		{
+-			// Owned by the LPV stage, which also owns the matching albedo/normal targets.
++			// Owned by the LPV stage, which also owns the matching albedo/normal targets. No depth
++			// target on the frames the LPV does not relight on - that drops the whole pass (the LPV
++			// keeps injecting from the last rendered RSM, it holds the textures itself).
+ 			if (auto* pLPVStage = m_graphicsPipeline.GetStage<CLPVStage>())
+-				pDepthTarget = pLPVStage->GetRsmDepthMap(frustum, true);
++			{
++				if (pLPVStage->WantsRsmRender())
++					pDepthTarget = pLPVStage->GetRsmDepthMap(frustum, true);
++			}
+ 
+ 			if (!pDepthTarget)
+ 				return nullptr;
+-- 
+2.47.1.windows.1
+

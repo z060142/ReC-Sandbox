@@ -1,11 +1,42 @@
 ﻿# Sync manifest
 
 Baseline : main @ a34100a9 (pristine CRYENGINE 5.7.1)
-Dev      : dev @ 6003e211
-Synced   : 2026-09-11 10:42
+Dev      : dev @ 5fe1e575
+Synced   : 2026-09-19 23:38
 
 ## Commits (newest first)
 
+- 5fe1e575 feat: r_LPVTranslucentBrightness scales LPV indirect diffuse on vegetation
+- 81f12a29 feat: Light entity GI Mode drives LPV participation
+- c02118a7 feat: three-cascade LPV LOD chain + RSM depth re-encoding + SH de-ringing
+- dc854b0a fix: LPV specular drowned cubemap reflections in white haze
+- d7258cb6 fix: far cascade RSM lost every caster outside the camera hull
+- cde29ac8 feat: per-cascade RSM views (cascaded shadow maps scheme)
+- 05ebea60 tune: user-picked defaults - intensity 100, bounce 0.2, sky 0.2, clip range 700
+- 0d892c5c fix: sun-ward RSM occlusion becomes a knob (r_LPVRsmClipRange, default 0)
+- 3770100a fix: RSM near-plane pancaking erased the volume content at larger cascade scales
+- b241de93 debug: RSM alignment probes in debug mode 8
+- 626cbc26 debug: intensity-scale the LPV debug modes 2 and 6
+- 09764ed3 perf: LPV RSM draw calls - decouple re-render from heartbeat, cull tiny casters
+- bfc88161 fix: shader side cone gate for projector/area light injection
+- c9a68833 fix: near cascade under-injection, projector/area lights, cost overhaul
+- 736b7b39 feat: local light injection (r_LPVPointLights) - v2 complete
+- ab72685b feat: nested LPV cascades (r_LPVCascades) - v2 item 2
+- 93107a75 feat: LPV specular GI (r_LPVSpecular) - v2 item 1
+- 27cd96a3 fix: two stock supersampling bugs (editor assert, clamp loop)
+- c6f2554e feat: LPV indirect diffuse for forward rendered geometry
+- e7bfa87e refactor: strip the flicker-hunt debug instrumentation from Cry3DEngine
+- d3173303 refactor: remove the cascade-borrow RSM fallback path
+- a10a926b fix: assert dialog on maps with black sky and fog colour 2
+- cc58e5c8 fix: drop temporal history on any r_LPV cvar change
+- ad0456ff fix: sun shafts no longer count as open sky for the sky light injection
+- 8fa60dbf fix: close the three wall-leak channels (roof light panel case)
+- 2d00ff07 fix: no sky injection into surface cells, TOD fog colour as sky hue fallback
+- 5eab73ba fix: sky light sun-anchored luminance, bounce gain normalization, irradiance rolloff
+- 596f2ca8 fix: energy conserving LPV propagation (Kaplanyan face solid angles)
+- b4974c0f feat: LPV geometry volume occlusion and sky light injection
+- 5f2610f4 feat: LPV stability overhaul - dedicated RSM, stable propagation, debug views
+- 36c8d0c4 feat: resurrect Light Propagation Volumes as cheap dynamic GI (r_LPV)
 - 6003e211 docs: the film grain ships as G0 + G1; plates and EXR metadata are parked, and the docs say so
 - 65c9ba67 fix: a moving camera dragged the picture over a static speckle layer - DSNU is a residual
 - ab5dd01c fix: structured sensor noise was orders of magnitude too loud, and the integration exponent goes to 0
@@ -189,7 +220,11 @@ Synced   : 2026-09-11 10:42
 - M	Code/CryEngine/Cry3DEngine/3dEngine.cpp
 - M	Code/CryEngine/Cry3DEngine/3dEngine.h
 - M	Code/CryEngine/Cry3DEngine/LightEntity.cpp
+- M	Code/CryEngine/Cry3DEngine/LightEntity.h
+- M	Code/CryEngine/Cry3DEngine/ObjectsTree.cpp
 - M	Code/CryEngine/Cry3DEngine/SVO/SceneTree.cpp
+- M	Code/CryEngine/Cry3DEngine/ShadowCache.cpp
+- M	Code/CryEngine/Cry3DEngine/ShadowCache.h
 - M	Code/CryEngine/Cry3DEngine/SkyLightManager.cpp
 - M	Code/CryEngine/Cry3DEngine/TimeOfDay.cpp
 - M	Code/CryEngine/Cry3DEngine/cvars.cpp
@@ -210,6 +245,7 @@ Synced   : 2026-09-11 10:42
 - M	Code/CryEngine/RenderDll/Common/RendererCVars.h
 - M	Code/CryEngine/RenderDll/Common/RendererResources.cpp
 - M	Code/CryEngine/RenderDll/Common/RendererResources.h
+- M	Code/CryEngine/RenderDll/Common/Shadow_Renderer.h
 - A	Code/CryEngine/RenderDll/Common/Textures/Image/ExrImage.cpp
 - A	Code/CryEngine/RenderDll/Common/Textures/Image/ExrImage.h
 - M	Code/CryEngine/RenderDll/Common/Textures/Texture.h
@@ -232,6 +268,8 @@ Synced   : 2026-09-11 10:42
 - M	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DepthOfField.h
 - A	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DiffractionKernel.cpp
 - A	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/DiffractionKernel.h
+- A	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.cpp
+- A	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.h
 - M	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LensOptics.cpp
 - M	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/MotionBlur.cpp
 - M	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/PostAA.cpp
@@ -241,6 +279,8 @@ Synced   : 2026-09-11 10:42
 - M	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/SceneForward.cpp
 - A	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/SceneReferredExport.cpp
 - A	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/SceneReferredExport.h
+- M	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ShadowMap.cpp
+- M	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ShadowMap.h
 - M	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Sky.cpp
 - M	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Sky.h
 - M	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/Snow.cpp
@@ -249,6 +289,7 @@ Synced   : 2026-09-11 10:42
 - M	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/SunShafts.cpp
 - M	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/SunShafts.h
 - M	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/TiledLightVolumes.cpp
+- M	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/TiledShading.cpp
 - M	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.cpp
 - M	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ToneMapping.h
 - M	Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/VolumetricClouds.cpp
@@ -368,6 +409,7 @@ Synced   : 2026-09-11 10:42
 - M	Engine/Shaders/CMakeLists.txt
 - M	Engine/Shaders/HWScripts/CryFX/Clouds.cfx
 - M	Engine/Shaders/HWScripts/CryFX/CommonMath.cfi
+- M	Engine/Shaders/HWScripts/CryFX/DeferredShading.cfx
 - M	Engine/Shaders/HWScripts/CryFX/DepthOfField.cfx
 - M	Engine/Shaders/HWScripts/CryFX/Eye.cfx
 - M	Engine/Shaders/HWScripts/CryFX/FXConstantDefs.cfi
@@ -376,6 +418,7 @@ Synced   : 2026-09-11 10:42
 - M	Engine/Shaders/HWScripts/CryFX/HDRPostProcess.cfx
 - M	Engine/Shaders/HWScripts/CryFX/Hair.cfx
 - M	Engine/Shaders/HWScripts/CryFX/Illum.cfx
+- A	Engine/Shaders/HWScripts/CryFX/LPV.cfi
 - M	Engine/Shaders/HWScripts/CryFX/LightVolumes.cfi
 - M	Engine/Shaders/HWScripts/CryFX/MobileComposition.cfx
 - M	Engine/Shaders/HWScripts/CryFX/MultiLayeredMaterials.cfx

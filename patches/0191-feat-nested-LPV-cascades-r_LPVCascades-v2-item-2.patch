@@ -1,0 +1,1272 @@
+From ab72685b2a4966204a781cdc94ff5054aea717fe Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Wed, 12 Aug 2026 03:13:14 +0800
+Subject: [PATCH 191/206] feat: nested LPV cascades (r_LPVCascades) - v2 item 2
+
+Two nested volumes instead of a hard GI cutoff at the volume edge:
+cascade 0 is the detail volume (r_LPVSize), cascade 1 covers
+r_LPVCascadeScale (default 4) times the extent at the same grid
+resolution.
+
+- Both cascades inject from the single shared RSM; the only 3DEngine
+  change is GetLPVBox() sizing the RSM box to the far cascade.
+- All per-volume state moved into SCascade (textures, injection buffer,
+  pass objects, origin/cell/accumulation/history); the relight chain
+  runs per cascade with the cascade's own constants - every compute
+  shader is shared unchanged, only the screen space apply reads both
+  volumes and blends them over the near fade band (the far lookup uses
+  its own half-cell normal offset).
+- Relight gating shares the sun/heartbeat criteria, the origin-changed
+  criterion is per cascade.
+- Removed the dead screen space injection pass (unused since the bounce
+  moved to the SVOGI style surface cache).
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Tu9cj9ax1mqCV93HVfCfpW
+---
+ Code/CryEngine/Cry3DEngine/ShadowCache.cpp    |   7 +-
+ .../RenderDll/Common/RendererCVars.cpp        |   8 +
+ .../RenderDll/Common/RendererCVars.h          |   2 +
+ .../XRenderD3D9/GraphicsPipeline/LPV.cpp      | 521 ++++++++----------
+ .../XRenderD3D9/GraphicsPipeline/LPV.h        |  90 +--
+ Engine/Shaders/HWScripts/CryFX/LPV.cfi        | 116 ++--
+ 6 files changed, 373 insertions(+), 371 deletions(-)
+
+diff --git a/Code/CryEngine/Cry3DEngine/ShadowCache.cpp b/Code/CryEngine/Cry3DEngine/ShadowCache.cpp
+index 62d729f7..2a0007ee 100644
+--- a/Code/CryEngine/Cry3DEngine/ShadowCache.cpp
++++ b/Code/CryEngine/Cry3DEngine/ShadowCache.cpp
+@@ -282,8 +282,13 @@ AABB ShadowCacheGenerator::GetLPVBox(const SRenderingPassInfo& passInfo)
+ {
+ 	static ICVar* pLPVSize = gEnv->pConsole->GetCVar("r_LPVSize");
+ 	static ICVar* pLPVGridSize = gEnv->pConsole->GetCVar("r_LPVGridSize");
++	static ICVar* pLPVCascades = gEnv->pConsole->GetCVar("r_LPVCascades");
++	static ICVar* pLPVCascadeScale = gEnv->pConsole->GetCVar("r_LPVCascadeScale");
+ 
+-	const float extent = max(1.0f, pLPVSize ? pLPVSize->GetFVal() : 96.0f);
++	// The RSM has to cover the largest cascade: the far cascade extent is size * scale.
++	float extent = max(1.0f, pLPVSize ? pLPVSize->GetFVal() : 96.0f);
++	if (pLPVCascades && pLPVCascades->GetIVal() > 1)
++		extent *= max(1.0f, pLPVCascadeScale ? pLPVCascadeScale->GetFVal() : 4.0f);
+ 
+ 	// Same clamping as CLPVStage::GetValidGridSize().
+ 	int32 gridSize = pLPVGridSize ? pLPVGridSize->GetIVal() : 48;
+diff --git a/Code/CryEngine/RenderDll/Common/RendererCVars.cpp b/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
+index 34e74108..43dacddf 100644
+--- a/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
++++ b/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
+@@ -413,6 +413,8 @@ float CRendererCVars::CV_r_ssdoAmountReflection;
+ int CRendererCVars::CV_r_LPV;
+ int CRendererCVars::CV_r_LPVGridSize;
+ float CRendererCVars::CV_r_LPVSize;
++int CRendererCVars::CV_r_LPVCascades;
++float CRendererCVars::CV_r_LPVCascadeScale;
+ int CRendererCVars::CV_r_LPVIterations;
+ float CRendererCVars::CV_r_LPVIntensity;
+ float CRendererCVars::CV_r_LPVInjectionBias;
+@@ -2232,6 +2234,12 @@ void CRendererCVars::InitCVars()
+ 	               "Number of Light Propagation Volumes cells per axis. Clamped to [8, 64] and rounded down to a multiple of 4.\n");
+ 	REGISTER_CVAR3("r_LPVSize", CV_r_LPVSize, 96.0f, VF_NULL,
+ 	               "World space extent in meters of the Light Propagation Volumes grid.\n");
++	REGISTER_CVAR3("r_LPVCascades", CV_r_LPVCascades, 2, VF_NULL,
++	               "Number of nested Light Propagation Volumes cascades [1, 2]. Cascade 0 is the detail\n"
++	               "volume (r_LPVSize), cascade 1 covers r_LPVCascadeScale times the extent at the same\n"
++	               "grid resolution - distant GI instead of a hard cutoff at the volume edge.\n");
++	REGISTER_CVAR3("r_LPVCascadeScale", CV_r_LPVCascadeScale, 4.0f, VF_NULL,
++	               "Extent multiplier of the far Light Propagation Volumes cascade relative to r_LPVSize.\n");
+ 	REGISTER_CVAR3("r_LPVIterations", CV_r_LPVIterations, 24, VF_NULL,
+ 	               "Number of Light Propagation Volumes propagation iterations.\n"
+ 	               "The light travel distance is roughly iterations * (r_LPVSize / r_LPVGridSize).\n");
+diff --git a/Code/CryEngine/RenderDll/Common/RendererCVars.h b/Code/CryEngine/RenderDll/Common/RendererCVars.h
+index d5b09be2..194b514d 100644
+--- a/Code/CryEngine/RenderDll/Common/RendererCVars.h
++++ b/Code/CryEngine/RenderDll/Common/RendererCVars.h
+@@ -658,6 +658,8 @@ public:
+ 	static int   CV_r_LPV;
+ 	static int   CV_r_LPVGridSize;
+ 	static float CV_r_LPVSize;
++	static int   CV_r_LPVCascades;
++	static float CV_r_LPVCascadeScale;
+ 	static int   CV_r_LPVIterations;
+ 	static float CV_r_LPVIntensity;
+ 	static float CV_r_LPVInjectionBias;
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.cpp
+index 4ad7e871..79c60703 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.cpp
+@@ -42,50 +42,37 @@ CLPVStage::CLPVStage(CGraphicsPipeline& graphicsPipeline)
+ 	, m_pRsmColor(nullptr)
+ 	, m_pRsmNormal(nullptr)
+ 	, m_pRsmDepth(nullptr)
+-	, m_passClear(&graphicsPipeline, CComputeRenderPass::eFlags_ReflectConstantBuffersFromShader)
+-	, m_passInject(&graphicsPipeline, CComputeRenderPass::eFlags_ReflectConstantBuffersFromShader)
+-	, m_passInjectScreen(&graphicsPipeline, CComputeRenderPass::eFlags_ReflectConstantBuffersFromShader)
+-	, m_passResolve(&graphicsPipeline, CComputeRenderPass::eFlags_ReflectConstantBuffersFromShader)
+ 	, m_passApply(&graphicsPipeline, CComputeRenderPass::eFlags_ReflectConstantBuffersFromShader)
+-	, m_gridOrigin(ZERO)
+-	, m_cellSize(1.0f)
+ 	, m_gridSize(0)
+ 	, m_rsmSize(0)
+ 	, m_rsmSampleCount(0)
+ 	, m_rsmSampleStride(1)
+-	, m_finalGridIndex(0)
+-	, m_accIndex(0)
+-	, m_prevGridOrigin(ZERO)
+ 	, m_lastSunDir(ZERO)
+ 	, m_lastSunColor(ZERO)
+ 	, m_framesSinceRelight(0)
+ 	, m_bForceRelight(true)
+-	, m_bHistoryValid(false)
+ 	, m_bResultValid(false)
+ {
+ 	m_rsmToWorld.SetIdentity();
+ 	m_worldToRsm.SetIdentity();
+ 
+-	for (auto& pass : m_passPropagate)
++	for (auto& cascade : m_cascades)
+ 	{
+-		pass.SetFlags(CComputeRenderPass::eFlags_ReflectConstantBuffersFromShader);
+-		pass.SetGraphicsPipeline(&graphicsPipeline);
+-	}
++		auto configurePass = [&graphicsPipeline](CComputeRenderPass& pass)
++		{
++			pass.SetFlags(CComputeRenderPass::eFlags_ReflectConstantBuffersFromShader);
++			pass.SetGraphicsPipeline(&graphicsPipeline);
++		};
+ 
+-	for (auto& pass : m_passTemporal)
+-	{
+-		pass.SetFlags(CComputeRenderPass::eFlags_ReflectConstantBuffersFromShader);
+-		pass.SetGraphicsPipeline(&graphicsPipeline);
++		configurePass(cascade.passClear);
++		configurePass(cascade.passInject);
++		configurePass(cascade.passResolve);
++		for (auto& pass : cascade.passPropagate)
++			configurePass(pass);
++		for (auto& pass : cascade.passTemporal)
++			configurePass(pass);
+ 	}
+ 
+-	for (auto& gridSet : m_pGridSH)
+-		std::fill(std::begin(gridSet), std::end(gridSet), nullptr);
+-	for (auto& gridSet : m_pGridSum)
+-		std::fill(std::begin(gridSet), std::end(gridSet), nullptr);
+-	for (auto& gridSet : m_pGridAcc)
+-		std::fill(std::begin(gridSet), std::end(gridSet), nullptr);
+-	std::fill(std::begin(m_pFinalGrid), std::end(m_pFinalGrid), nullptr);
+-
+ 	// The RSM texture objects have to exist before CShadowMapStage::Init() runs, which happens before
+ 	// CLPVStage::Init(). The device resources are created on demand in GetRsmColorMap()/GetRsmNormalMap().
+ 	std::string texName = "LPV_SUN_RSM_COLOR" + m_graphicsPipeline.GetUniqueIdentifierName();
+@@ -106,33 +93,44 @@ int32 CLPVStage::GetValidGridSize()
+ 	return size;
+ }
+ 
++int32 CLPVStage::GetActiveCascadeCount()
++{
++	return clamp_tpl<int32>(CRendererCVars::CV_r_LPVCascades, 1, MaxCascadeNum);
++}
++
+ void CLPVStage::Init()
+ {
+ 	const uint32 commonFlags = FT_NOMIPS | FT_DONT_STREAM;
+ 	const uint32 uavFlags = commonFlags | FT_USAGE_UNORDERED_ACCESS;
+ 
+ 	// Only create the texture objects here, the device resources are allocated by ResizeGrid()/Resize().
+-	for (int32 i = 0; i < 2; ++i)
++	for (int32 n = 0; n < MaxCascadeNum; ++n)
+ 	{
+-		for (int32 c = 0; c < SHChannelNum; ++c)
++		SCascade& cascade = m_cascades[n];
++		const std::string suffix = "C" + std::to_string(n) + m_graphicsPipeline.GetUniqueIdentifierName();
++
++		for (int32 i = 0; i < 2; ++i)
+ 		{
+-			CRY_ASSERT(m_pGridSH[i][c] == nullptr);
+-			std::string texName = "$LPVGridSH" + std::to_string(i) + std::to_string(c) + m_graphicsPipeline.GetUniqueIdentifierName();
+-			m_pGridSH[i][c] = CTexture::GetOrCreateTextureObjectPtr(texName.c_str(), 0, 0, 0, eTT_3D, uavFlags, LPVGridFormat);
++			for (int32 c = 0; c < SHChannelNum; ++c)
++			{
++				CRY_ASSERT(cascade.pGridSH[i][c] == nullptr);
++				std::string texName = "$LPVGridSH" + std::to_string(i) + std::to_string(c) + suffix;
++				cascade.pGridSH[i][c] = CTexture::GetOrCreateTextureObjectPtr(texName.c_str(), 0, 0, 0, eTT_3D, uavFlags, LPVGridFormat);
+ 
+-			CRY_ASSERT(m_pGridSum[i][c] == nullptr);
+-			texName = "$LPVGridSum" + std::to_string(i) + std::to_string(c) + m_graphicsPipeline.GetUniqueIdentifierName();
+-			m_pGridSum[i][c] = CTexture::GetOrCreateTextureObjectPtr(texName.c_str(), 0, 0, 0, eTT_3D, uavFlags, LPVGridFormat);
++				CRY_ASSERT(cascade.pGridSum[i][c] == nullptr);
++				texName = "$LPVGridSum" + std::to_string(i) + std::to_string(c) + suffix;
++				cascade.pGridSum[i][c] = CTexture::GetOrCreateTextureObjectPtr(texName.c_str(), 0, 0, 0, eTT_3D, uavFlags, LPVGridFormat);
+ 
+-			CRY_ASSERT(m_pGridAcc[i][c] == nullptr);
+-			texName = "$LPVGridAcc" + std::to_string(i) + std::to_string(c) + m_graphicsPipeline.GetUniqueIdentifierName();
+-			m_pGridAcc[i][c] = CTexture::GetOrCreateTextureObjectPtr(texName.c_str(), 0, 0, 0, eTT_3D, uavFlags, LPVGridFormat);
++				CRY_ASSERT(cascade.pGridAcc[i][c] == nullptr);
++				texName = "$LPVGridAcc" + std::to_string(i) + std::to_string(c) + suffix;
++				cascade.pGridAcc[i][c] = CTexture::GetOrCreateTextureObjectPtr(texName.c_str(), 0, 0, 0, eTT_3D, uavFlags, LPVGridFormat);
++			}
+ 		}
+-	}
+ 
+-	CRY_ASSERT(m_pGridGV == nullptr);
+-	std::string gvName = "$LPVGridGV" + m_graphicsPipeline.GetUniqueIdentifierName();
+-	m_pGridGV = CTexture::GetOrCreateTextureObjectPtr(gvName.c_str(), 0, 0, 0, eTT_3D, uavFlags, LPVGridFormat);
++		CRY_ASSERT(cascade.pGridGV == nullptr);
++		std::string gvName = "$LPVGridGV" + suffix;
++		cascade.pGridGV = CTexture::GetOrCreateTextureObjectPtr(gvName.c_str(), 0, 0, 0, eTT_3D, uavFlags, LPVGridFormat);
++	}
+ 
+ 	CRY_ASSERT(m_pIrradiance == nullptr);
+ 	std::string texName = "$LPVIrradiance" + m_graphicsPipeline.GetUniqueIdentifierName();
+@@ -163,32 +161,36 @@ void CLPVStage::ResizeGrid(int32 gridSize)
+ 		}
+ 	};
+ 
+-	for (auto& gridSet : m_pGridSH)
++	for (auto& cascade : m_cascades)
+ 	{
+-		for (auto& pTex : gridSet)
+-			createTexture3D(pTex);
+-	}
+-	for (auto& gridSet : m_pGridSum)
+-	{
+-		for (auto& pTex : gridSet)
+-			createTexture3D(pTex);
+-	}
+-	for (auto& gridSet : m_pGridAcc)
+-	{
+-		for (auto& pTex : gridSet)
+-			createTexture3D(pTex);
+-	}
+-	createTexture3D(m_pGridGV);
++		for (auto& gridSet : cascade.pGridSH)
++		{
++			for (auto& pTex : gridSet)
++				createTexture3D(pTex);
++		}
++		for (auto& gridSet : cascade.pGridSum)
++		{
++			for (auto& pTex : gridSet)
++				createTexture3D(pTex);
++		}
++		for (auto& gridSet : cascade.pGridAcc)
++		{
++			for (auto& pTex : gridSet)
++				createTexture3D(pTex);
++		}
++		createTexture3D(cascade.pGridGV);
+ 
+-	const uint32 elementCount = gridSize * gridSize * gridSize * AccumulatorStride;
+-	if (elementCount != m_injectionBuffer.GetElementCount() || m_injectionBuffer.GetDevBuffer() == nullptr)
+-	{
+-		m_injectionBuffer.Create(elementCount, sizeof(int32), DXGI_FORMAT_R32_SINT,
+-		                         CDeviceObjectFactory::BIND_SHADER_RESOURCE | CDeviceObjectFactory::BIND_UNORDERED_ACCESS, nullptr);
++		const uint32 elementCount = gridSize * gridSize * gridSize * AccumulatorStride;
++		if (elementCount != cascade.injectionBuffer.GetElementCount() || cascade.injectionBuffer.GetDevBuffer() == nullptr)
++		{
++			cascade.injectionBuffer.Create(elementCount, sizeof(int32), DXGI_FORMAT_R32_SINT,
++			                               CDeviceObjectFactory::BIND_SHADER_RESOURCE | CDeviceObjectFactory::BIND_UNORDERED_ACCESS, nullptr);
++		}
++
++		cascade.bHistoryValid = false;
+ 	}
+ 
+ 	m_gridSize = gridSize;
+-	m_bHistoryValid = false;
+ 	m_bResultValid = false;
+ }
+ 
+@@ -237,7 +239,8 @@ void CLPVStage::OnCVarsChanged(const CCVarUpdateRecorder& cvarUpdater)
+ 		if (strncmp(record.name, "r_LPV", 5) == 0)
+ 		{
+ 			m_bForceRelight = true;
+-			m_bHistoryValid = false;
++			for (auto& cascade : m_cascades)
++				cascade.bHistoryValid = false;
+ 			break;
+ 		}
+ 	}
+@@ -404,21 +407,10 @@ bool CLPVStage::UpdateFrameParameters(const ShadowMapFrustum& frustum, const CTe
+ 	m_rsmSampleStride = max(1, m_rsmSize / wantedSamples);
+ 	m_rsmSampleCount = max(1, m_rsmSize / m_rsmSampleStride);
+ 
+-	// Volume extent, snapped to whole cells to avoid sampling discontinuities while the camera moves.
+-	const float extent = max(1.0f, CRendererCVars::CV_r_LPVSize);
+-	m_cellSize = extent / (float)m_gridSize;
+-
+-	const Vec3 camPos = GetCurrentViewInfo().cameraOrigin;
+-	const float halfExtent = extent * 0.5f;
+-	m_gridOrigin.x = floorf(camPos.x / m_cellSize) * m_cellSize - halfExtent;
+-	m_gridOrigin.y = floorf(camPos.y / m_cellSize) * m_cellSize - halfExtent;
+-	m_gridOrigin.z = floorf(camPos.z / m_cellSize) * m_cellSize - halfExtent;
+-
+ 	// Build the RSM texture space -> world space transform used to place the VPLs.
+ 	// ConfigShadowTexgen() returns world -> (u, v, z, w). The dedicated RSM view is built by the very
+-	// same renderer code path as the sun cascades (CShadowUtils::GetShadowMatrixOrtho), so this works
+-	// unchanged for both: the depth buffer stores the clip space z of exactly this matrix (w / fFarDist
+-	// is ~1 for these sun frustums), so it inverts directly.
++	// same renderer code path as the sun cascades (CShadowUtils::GetShadowMatrixOrtho), so the depth
++	// buffer stores the clip space z of exactly this matrix and it inverts directly.
+ 	// Do NOT scale the z row by RecpFarDist: fFarDist of the sun frustums is the (astronomic) distance
+ 	// to the sun light source, the scale would make the matrix numerically singular. SVOGI applies that
+ 	// scale but never reconstructs positions from RSM depth, so it is harmless there.
+@@ -432,7 +424,7 @@ bool CLPVStage::UpdateFrameParameters(const ShadowMapFrustum& frustum, const CTe
+ 	if (CRendererCVars::CV_r_LPVDebug > 0)
+ 	{
+ 		// CPU side sanity check of the matrix chain: the RSM centre at mid depth has to land in the
+-		// vicinity of the cascade (and the camera), and the roundtrip has to reproduce the input.
++		// vicinity of the volume (and the camera), and the roundtrip has to reproduce the input.
+ 		const Vec4 rsmCenter(0.5f, 0.5f, 0.5f, 1.0f);
+ 		const Vec4 worldH = m_rsmToWorld * rsmCenter;
+ 		const Vec3 world = Vec3(worldH.x, worldH.y, worldH.z) / worldH.w;
+@@ -443,11 +435,10 @@ bool CLPVStage::UpdateFrameParameters(const ShadowMapFrustum& frustum, const CTe
+ 		if (fabsf(roundtripH.w) > 1e-12f)
+ 			roundtripH = roundtripH / roundtripH.w;
+ 		const Vec3 camPos = GetCurrentViewInfo().cameraOrigin;
+-		CryLog("LPV debug: rsm(0.5,0.5,0.5) -> world (%.1f, %.1f, %.1f) w=%.3f | roundtrip (%.3f, %.3f, %.3f) | cam (%.1f, %.1f, %.1f) | gridOrigin (%.1f, %.1f, %.1f) ext %.1f | RecpFarDist %.5f | lod %d | frustumType %d (LPVRsm=%d) | rsmSize %d | depthTex %s",
++		CryLog("LPV debug: rsm(0.5,0.5,0.5) -> world (%.1f, %.1f, %.1f) w=%.3f | roundtrip (%.3f, %.3f, %.3f) | cam (%.1f, %.1f, %.1f) | RecpFarDist %.5f | lod %d | frustumType %d (LPVRsm=%d) | rsmSize %d | depthTex %s",
+ 		       world.x, world.y, world.z, worldH.w,
+ 		       roundtripH.x, roundtripH.y, roundtripH.z,
+ 		       camPos.x, camPos.y, camPos.z,
+-		       m_gridOrigin.x, m_gridOrigin.y, m_gridOrigin.z, extent,
+ 		       shadowsSetup.RecpFarDist, frustum.nShadowMapLod,
+ 		       (int)frustum.m_eFrustumType, (int)ShadowMapFrustum::e_LPVRsm,
+ 		       m_rsmSize,
+@@ -457,15 +448,31 @@ bool CLPVStage::UpdateFrameParameters(const ShadowMapFrustum& frustum, const CTe
+ 	return true;
+ }
+ 
+-void CLPVStage::SetGridConstants(CComputeRenderPass& pass)
++void CLPVStage::UpdateCascadeParameters(SCascade& cascade, int32 cascadeIndex)
++{
++	// Volume extent, snapped to whole cells to avoid sampling discontinuities while the camera moves.
++	float extent = max(1.0f, CRendererCVars::CV_r_LPVSize);
++	if (cascadeIndex > 0)
++		extent *= max(1.0f, CRendererCVars::CV_r_LPVCascadeScale);
++
++	cascade.cellSize = extent / (float)m_gridSize;
++
++	const Vec3 camPos = GetCurrentViewInfo().cameraOrigin;
++	const float halfExtent = extent * 0.5f;
++	cascade.gridOrigin.x = floorf(camPos.x / cascade.cellSize) * cascade.cellSize - halfExtent;
++	cascade.gridOrigin.y = floorf(camPos.y / cascade.cellSize) * cascade.cellSize - halfExtent;
++	cascade.gridOrigin.z = floorf(camPos.z / cascade.cellSize) * cascade.cellSize - halfExtent;
++}
++
++void CLPVStage::SetGridConstants(CComputeRenderPass& pass, const SCascade& cascade)
+ {
+ 	static CCryNameR paramGrid("LPVGridParams");
+ 	static CCryNameR paramGrid2("LPVGridParams2");
+ 
+ 	const float fGridSize = (float)m_gridSize;
+ 
+-	pass.SetConstant(paramGrid, Vec4(m_gridOrigin.x, m_gridOrigin.y, m_gridOrigin.z, m_cellSize));
+-	pass.SetConstant(paramGrid2, Vec4(fGridSize, 1.0f / fGridSize, 1.0f / m_cellSize, fGridSize * m_cellSize));
++	pass.SetConstant(paramGrid, Vec4(cascade.gridOrigin.x, cascade.gridOrigin.y, cascade.gridOrigin.z, cascade.cellSize));
++	pass.SetConstant(paramGrid2, Vec4(fGridSize, 1.0f / fGridSize, 1.0f / cascade.cellSize, fGridSize * cascade.cellSize));
+ }
+ 
+ // Debug instrumentation: log on which frames (and why) the whole LPV execution bails out. A single
+@@ -502,24 +509,6 @@ void CLPVStage::Execute()
+ 	if (RenderView() && RenderView()->IsRecursive())
+ 		return;
+ 
+-	if (CRendererCVars::CV_r_LPVDebug > 0)
+-	{
+-		// Identity of the executing view, logged on change: two interleaving identities would mean a
+-		// second view runs the LPV and clobbers the shared output.
+-		const CRenderView* pView = RenderView();
+-		static const void* pLastView = nullptr;
+-		static int lastViewportWidth = -1;
+-		if ((const void*)pView != pLastView || (pView && pView->GetViewport().width != lastViewportWidth))
+-		{
+-			CryLog("LPV debug: executing on view %p viewport %dx%d",
+-			       (const void*)pView,
+-			       pView ? pView->GetViewport().width : -1,
+-			       pView ? pView->GetViewport().height : -1);
+-			pLastView = (const void*)pView;
+-			lastViewportWidth = pView ? pView->GetViewport().width : -1;
+-		}
+-	}
+-
+ 	m_bResultValid = false;
+ 
+ 	// SVOGI owns the GI combine point and the sun RSM slot, LPV steps aside completely while it is active.
+@@ -535,13 +524,13 @@ void CLPVStage::Execute()
+ 		return;
+ 	}
+ 
+-	if (m_gridSize <= 0 || !CTexture::IsTextureExist(m_pIrradiance) || !CTexture::IsTextureExist(m_pGridSH[0][0]))
++	if (m_gridSize <= 0 || !CTexture::IsTextureExist(m_pIrradiance) || !CTexture::IsTextureExist(m_cascades[0].pGridSH[0][0]))
+ 	{
+ 		LpvDebugLogExecuteState(3);
+ 		return;
+ 	}
+ 
+-	if (!m_injectionBuffer.IsAvailable())
++	if (!m_cascades[0].injectionBuffer.IsAvailable())
+ 	{
+ 		LpvDebugLogExecuteState(4);
+ 		return;
+@@ -575,41 +564,58 @@ void CLPVStage::Execute()
+ 	const bool bAsynchronous = false;
+ 	SScopedComputeCommandList commandList(bAsynchronous);
+ 
+-	// Relight gating: the injection inputs are fully discretized (cell snapped volume, texel snapped
+-	// RSM), so between discrete changes a re-injection can only add noise (terrain LOD changes, draw
+-	// order dependent z-fighting in the RSM, view dependent screen space VPLs). The grid is world
++	const int32 cascadeCount = GetActiveCascadeCount();
++	m_activeCascadeCount = cascadeCount;
++
++	// Relight gating: the injection inputs are fully discretized (cell snapped volumes, texel snapped
++	// RSM), so between discrete changes a re-injection can only add noise. The grids are world
+ 	// anchored, so a frozen grid stays exactly correct for a static scene while the camera moves or
+ 	// rotates within the current cell.
+ 	const Vec3 sunDir = RenderView()->GetSunLightDirection();
+ 	const Vec4 sunColor = RenderView()->GetSunLightColor();
+ 	const int32 interval = max(0, CRendererCVars::CV_r_LPVUpdateInterval);
+ 
+-	bool bRelight = m_bForceRelight || !m_bHistoryValid;
+-	bRelight |= !m_gridOrigin.IsEquivalent(m_prevGridOrigin, 1e-3f);
+-	bRelight |= sunDir.Dot(m_lastSunDir) < 0.99995f;
+-	bRelight |= (fabsf(sunColor.x - m_lastSunColor.x) + fabsf(sunColor.y - m_lastSunColor.y) + fabsf(sunColor.z - m_lastSunColor.z)) > 0.01f;
+-	bRelight |= (interval > 0) && (++m_framesSinceRelight >= interval);
+-	bRelight |= (interval == 0);
++	bool bRelightAll = m_bForceRelight;
++	bRelightAll |= sunDir.Dot(m_lastSunDir) < 0.99995f;
++	bRelightAll |= (fabsf(sunColor.x - m_lastSunColor.x) + fabsf(sunColor.y - m_lastSunColor.y) + fabsf(sunColor.z - m_lastSunColor.z)) > 0.01f;
++	bRelightAll |= (interval > 0) && (++m_framesSinceRelight >= interval);
++	bRelightAll |= (interval == 0);
+ 
+-	if (bRelight)
++	bool bAnyRelight = false;
++	for (int32 i = 0; i < cascadeCount; ++i)
+ 	{
+-		ExecuteClear(commandList);
+-		ExecuteInject(commandList, pFrustum->pDepthTex, pRsmColor, pRsmNormal);
+-		ExecuteResolve(commandList, pFrustum->pDepthTex);
+-		ExecutePropagate(commandList);
+-		ExecuteTemporal(commandList);
++		SCascade& cascade = m_cascades[i];
+ 
+-		m_prevGridOrigin = m_gridOrigin;
++		UpdateCascadeParameters(cascade, i);
++
++		bool bRelight = bRelightAll || !cascade.bHistoryValid;
++		bRelight |= !cascade.gridOrigin.IsEquivalent(cascade.prevGridOrigin, 1e-3f);
++
++		if (bRelight)
++		{
++			ExecuteClear(cascade, commandList);
++			ExecuteInject(cascade, commandList, pFrustum->pDepthTex, pRsmColor, pRsmNormal);
++			ExecuteResolve(cascade, commandList, pFrustum->pDepthTex);
++			ExecutePropagate(cascade, commandList);
++			ExecuteTemporal(cascade, commandList);
++
++			cascade.prevGridOrigin = cascade.gridOrigin;
++			cascade.bHistoryValid = true;
++			bAnyRelight = true;
++		}
++		else
++		{
++			// The frozen accumulation grid is anchored at the origin of the last relight.
++			cascade.gridOrigin = cascade.prevGridOrigin;
++		}
++	}
++
++	if (bAnyRelight)
++	{
+ 		m_lastSunDir = sunDir;
+ 		m_lastSunColor = sunColor;
+ 		m_framesSinceRelight = 0;
+ 		m_bForceRelight = false;
+-		m_bHistoryValid = true;
+-	}
+-	else
+-	{
+-		// The frozen accumulation grid is anchored at the origin of the last relight.
+-		m_gridOrigin = m_prevGridOrigin;
+ 	}
+ 
+ 	// The screen space apply runs later in the pipeline (ExecuteApplyToScreen), see LPV.h.
+@@ -639,19 +645,19 @@ void CLPVStage::ExecuteApplyToScreen()
+ 	m_bResultValid = true;
+ }
+ 
+-void CLPVStage::ExecuteClear(const SScopedComputeCommandList& commandList)
++void CLPVStage::ExecuteClear(SCascade& cascade, const SScopedComputeCommandList& commandList)
+ {
+-	auto& pass = m_passClear;
++	auto& pass = cascade.passClear;
+ 
+ 	if (pass.IsDirty(m_gridSize))
+ 	{
+ 		static CCryNameTSCRC techName("LPVClear");
+ 		pass.SetTechnique(CShaderMan::s_shDeferredShading, techName, 0);
+-		pass.SetOutputUAV(0, &m_injectionBuffer);
++		pass.SetOutputUAV(0, &cascade.injectionBuffer);
+ 	}
+ 
+ 	pass.BeginConstantUpdate();
+-	SetGridConstants(pass);
++	SetGridConstants(pass, cascade);
+ 
+ 	const uint32 dispatchSize = lpvDispatchSize(m_gridSize, LPVGridTileSize);
+ 	pass.SetDispatchSize(dispatchSize, dispatchSize, dispatchSize);
+@@ -659,28 +665,27 @@ void CLPVStage::ExecuteClear(const SScopedComputeCommandList& commandList)
+ 	pass.Execute(commandList);
+ }
+ 
+-void CLPVStage::ExecuteInject(const SScopedComputeCommandList& commandList, CTexture* pRsmDepth, CTexture* pRsmColor, CTexture* pRsmNormal)
++void CLPVStage::ExecuteInject(SCascade& cascade, const SScopedComputeCommandList& commandList, CTexture* pRsmDepth, CTexture* pRsmColor, CTexture* pRsmNormal)
+ {
+-	auto& pass = m_passInject;
++	auto& pass = cascade.passInject;
+ 
+ 	if (pass.IsDirty(m_gridSize, pRsmColor->GetID(), pRsmNormal->GetID(), pRsmDepth->GetID()))
+ 	{
+ 		static CCryNameTSCRC techName("LPVInject");
+ 		pass.SetTechnique(CShaderMan::s_shDeferredShading, techName, 0);
+-		pass.SetOutputUAV(0, &m_injectionBuffer);
++		pass.SetOutputUAV(0, &cascade.injectionBuffer);
+ 		pass.SetTexture(0, pRsmDepth);
+ 		pass.SetTexture(1, pRsmColor);
+ 		pass.SetTexture(2, pRsmNormal);
+ 	}
+ 
+ 	pass.BeginConstantUpdate();
+-	SetGridConstants(pass);
++	SetGridConstants(pass, cascade);
+ 
+ 	// Geometry volume blocking potential of one sampled RSM texel: the fraction of a cell face its
+ 	// world space footprint covers. The surfels of a wall crossing a cell then sum to ~1 with plain
+ 	// additive accumulation (total surfel area / face area), no max blending or count normalization
+-	// needed. The inverse is only defined up to a projective scale, dehomogenize before measuring
+-	// (same pitfall as the screen inject area weight).
++	// needed. The inverse is only defined up to a projective scale, dehomogenize before measuring.
+ 	float gvBlocking = 0.0f;
+ 	float rsmTexelSize = 0.0f;
+ 	if (CRendererCVars::CV_r_LPVOcclusion > 0.0f)
+@@ -693,16 +698,16 @@ void CLPVStage::ExecuteInject(const SScopedComputeCommandList& commandList, CTex
+ 			rsmCorner1 = rsmCorner1 / rsmCorner1.w;
+ 		const Vec3 rsmSpan = Vec3(rsmCorner1.x - rsmCorner0.x, rsmCorner1.y - rsmCorner0.y, rsmCorner1.z - rsmCorner0.z);
+ 		rsmTexelSize = rsmSpan.GetLength() / (float)m_rsmSampleCount;
+-		gvBlocking = min(1.0f, (rsmTexelSize * rsmTexelSize) / (m_cellSize * m_cellSize));
++		gvBlocking = min(1.0f, (rsmTexelSize * rsmTexelSize) / (cascade.cellSize * cascade.cellSize));
+ 	}
+ 
+-	if (CRendererCVars::CV_r_LPVDebug > 0)
++	if (CRendererCVars::CV_r_LPVDebug > 0 && &cascade == &m_cascades[0])
+ 	{
+ 		static float lastBlocking = -1.0f;
+ 		if (fabsf(gvBlocking - lastBlocking) > 1e-6f)
+ 		{
+ 			CryLog("LPV debug: GV blocking potential per surfel %.6f (rsm texel %.3f m, cell %.3f m)",
+-			       gvBlocking, rsmTexelSize, m_cellSize);
++			       gvBlocking, rsmTexelSize, cascade.cellSize);
+ 			lastBlocking = gvBlocking;
+ 		}
+ 	}
+@@ -730,101 +735,29 @@ void CLPVStage::ExecuteInject(const SScopedComputeCommandList& commandList, CTex
+ 	pass.Execute(commandList);
+ }
+ 
+-void CLPVStage::ExecuteInjectScreen(const SScopedComputeCommandList& commandList)
+-{
+-	auto& pass = m_passInjectScreen;
+-
+-	CTexture* pDepth = m_graphicsPipelineResources.m_pTexLinearDepth;
+-	CTexture* pNormals = m_graphicsPipelineResources.m_pTexSceneNormalsMap;
+-	CTexture* pDiffuse = m_graphicsPipelineResources.m_pTexSceneDiffuse;
+-
+-	if (!CTexture::IsTextureExist(pDepth) || !CTexture::IsTextureExist(pNormals)
+-	    || !CTexture::IsTextureExist(pDiffuse) || !CTexture::IsTextureExist(m_pIrradiance))
+-		return;
+-
+-	const int32 screenWidth = m_pIrradiance->GetWidth();
+-	const int32 screenHeight = m_pIrradiance->GetHeight();
+-	const int32 pixelStep = 3;
+-	const int32 samplesX = (screenWidth + pixelStep - 1) / pixelStep;
+-	const int32 samplesY = (screenHeight + pixelStep - 1) / pixelStep;
+-
+-	if (pass.IsDirty(m_gridSize, screenWidth, screenHeight, pDiffuse->GetID()))
+-	{
+-		static CCryNameTSCRC techName("LPVInjectScreen");
+-		pass.SetTechnique(CShaderMan::s_shDeferredShading, techName, 0);
+-		pass.SetOutputUAV(0, &m_injectionBuffer);
+-		pass.SetTexture(0, pDepth);
+-		pass.SetTexture(1, pNormals);
+-		pass.SetTexture(2, pDiffuse);
+-		pass.SetTexture(3, m_pIrradiance);
+-	}
+-
+-	pass.SetInlineConstantBuffer(eConstantBufferShaderSlot_PerView, m_graphicsPipeline.GetMainViewConstantBuffer());
+-
+-	pass.BeginConstantUpdate();
+-	SetGridConstants(pass);
+-
+-	// Area of one screen VPL relative to one RSM texel so that the shared surfel weight in
+-	// LPVResolve stays correct for both injection sources. The depth dependent part (linearDepth^2)
+-	// is applied in the shader.
+-	// The inverse is only defined up to a projective scale, both corners have to be dehomogenized
+-	// before the span is measured (skipping the divide made the texel size garbage and silently
+-	// zeroed the whole secondary bounce).
+-	Vec4 rsmCorner0 = m_rsmToWorld * Vec4(0.0f, 0.0f, 0.5f, 1.0f);
+-	Vec4 rsmCorner1 = m_rsmToWorld * Vec4(1.0f, 0.0f, 0.5f, 1.0f);
+-	if (fabsf(rsmCorner0.w) > 1e-12f)
+-		rsmCorner0 = rsmCorner0 / rsmCorner0.w;
+-	if (fabsf(rsmCorner1.w) > 1e-12f)
+-		rsmCorner1 = rsmCorner1 / rsmCorner1.w;
+-	const Vec3 rsmSpan = Vec3(rsmCorner1.x - rsmCorner0.x, rsmCorner1.y - rsmCorner0.y, rsmCorner1.z - rsmCorner0.z);
+-	const float rsmTexelSize = rsmSpan.GetLength() / (float)m_rsmSampleCount;
+-
+-	const CCamera& camera = RenderView()->GetCamera(CCamera::eEye_Left);
+-	const float farDist = camera.GetFarPlane();
+-	const float tanHalfFov = tanf(camera.GetFov() * 0.5f);
+-	const float screenVplSize = (2.0f * tanHalfFov * farDist * (float)pixelStep) / (float)screenHeight;
+-
+-	float areaWeight = 0.0f;
+-	if (rsmTexelSize > 1e-4f)
+-		areaWeight = (screenVplSize * screenVplSize) / (rsmTexelSize * rsmTexelSize);
+-
+-	const float gain = max(0.0f, CRendererCVars::CV_r_LPVSecondaryBounce);
+-	const float biasMeters = CRendererCVars::CV_r_LPVInjectionBias * m_cellSize;
+-
+-	static CCryNameR paramScreen("LPVScreenInjectParams");
+-	pass.SetConstant(paramScreen, Vec4((float)pixelStep, (float)samplesX, (float)samplesY, gain));
+-
+-	static CCryNameR paramScreen2("LPVScreenInjectParams2");
+-	pass.SetConstant(paramScreen2, Vec4(areaWeight, (float)screenWidth, (float)screenHeight, biasMeters));
+-
+-	pass.SetDispatchSize(lpvDispatchSize(samplesX, LPVInjectTileSize), lpvDispatchSize(samplesY, LPVInjectTileSize), 1);
+-	pass.PrepareResourcesForUse(commandList);
+-	pass.Execute(commandList);
+-}
+-
+-void CLPVStage::ExecuteResolve(const SScopedComputeCommandList& commandList, CTexture* pRsmDepth)
++void CLPVStage::ExecuteResolve(SCascade& cascade, const SScopedComputeCommandList& commandList, CTexture* pRsmDepth)
+ {
+-	auto& pass = m_passResolve;
++	auto& pass = cascade.passResolve;
+ 
+-	if (pass.IsDirty(m_gridSize, m_accIndex, pRsmDepth->GetID()))
++	if (pass.IsDirty(m_gridSize, cascade.accIndex, pRsmDepth->GetID()))
+ 	{
+ 		static CCryNameTSCRC techName("LPVResolve");
+ 		pass.SetTechnique(CShaderMan::s_shDeferredShading, techName, 0);
+-		pass.SetOutputUAV(0, m_pGridSH[0][0]);
+-		pass.SetOutputUAV(1, m_pGridSH[0][1]);
+-		pass.SetOutputUAV(2, m_pGridSH[0][2]);
+-		pass.SetOutputUAV(3, m_pGridGV);
+-		pass.SetBuffer(0, &m_injectionBuffer);
++		pass.SetOutputUAV(0, cascade.pGridSH[0][0]);
++		pass.SetOutputUAV(1, cascade.pGridSH[0][1]);
++		pass.SetOutputUAV(2, cascade.pGridSH[0][2]);
++		pass.SetOutputUAV(3, cascade.pGridGV);
++		pass.SetBuffer(0, &cascade.injectionBuffer);
+ 		// Previous frame accumulated grid: ExecuteResolve runs before ExecuteTemporal flips the index.
+-		pass.SetTexture(1, m_pGridAcc[m_accIndex][0]);
+-		pass.SetTexture(2, m_pGridAcc[m_accIndex][1]);
+-		pass.SetTexture(3, m_pGridAcc[m_accIndex][2]);
++		pass.SetTexture(1, cascade.pGridAcc[cascade.accIndex][0]);
++		pass.SetTexture(2, cascade.pGridAcc[cascade.accIndex][1]);
++		pass.SetTexture(3, cascade.pGridAcc[cascade.accIndex][2]);
+ 		// RSM depth for the sky visibility test (open sky proxy: the cell can see the sun).
+ 		pass.SetTexture(4, pRsmDepth);
+ 	}
+ 
+ 	pass.BeginConstantUpdate();
+-	SetGridConstants(pass);
++	SetGridConstants(pass, cascade);
+ 
+ 	// The surfel weight compensates for the different footprints of an RSM texel and a grid cell.
+ 	// It is applied here in float instead of pre-quantization in the inject pass, otherwise high
+@@ -840,14 +773,14 @@ void CLPVStage::ExecuteResolve(const SScopedComputeCommandList& commandList, CTe
+ 	// NOT scale it by the display intensity, that puts the loop gain far above 1 and the grid energy
+ 	// explodes exponentially within seconds.
+ 	Vec3 deltaCells(ZERO);
+-	if (m_bHistoryValid)
+-		deltaCells = (m_gridOrigin - m_prevGridOrigin) / m_cellSize;
++	if (cascade.bHistoryValid)
++		deltaCells = (cascade.gridOrigin - cascade.prevGridOrigin) / cascade.cellSize;
+ 	// Normalized so that r_LPVSecondaryBounce is directly the feedback loop gain: 0.0705 is the
+ 	// SH round trip of one feedback step (iso receiver transfer 0.25 x emission projection C0),
+ 	// so a cvar value of 1 re-emits exactly the irradiance the cell received (a physical single
+ 	// bounce, marginally stable on white scenes). Empirically confirmed: the pre-normalization
+ 	// equilibrium was found at a raw gain of ~13, and 13 x 0.0705 = 0.92 - right at loop gain 1.
+-	const float bounceGain = m_bHistoryValid ? max(0.0f, CRendererCVars::CV_r_LPVSecondaryBounce) / 0.0705f : 0.0f;
++	const float bounceGain = cascade.bHistoryValid ? max(0.0f, CRendererCVars::CV_r_LPVSecondaryBounce) / 0.0705f : 0.0f;
+ 
+ 	static CCryNameR paramResolve2("LPVResolveParams2");
+ 	pass.SetConstant(paramResolve2, Vec4(deltaCells.x, deltaCells.y, deltaCells.z, bounceGain));
+@@ -893,7 +826,7 @@ void CLPVStage::ExecuteResolve(const SScopedComputeCommandList& commandList, CTe
+ 		skyPremult = skyEffective * (skyGain / (shTransfer * displayIntensity));
+ 	}
+ 
+-	if (CRendererCVars::CV_r_LPVDebug > 0)
++	if (CRendererCVars::CV_r_LPVDebug > 0 && &cascade == &m_cascades[0])
+ 	{
+ 		static float lastSkyGain = -1.0f;
+ 		if (fabsf(skyGain - lastSkyGain) > 1e-4f)
+@@ -915,16 +848,15 @@ void CLPVStage::ExecuteResolve(const SScopedComputeCommandList& commandList, CTe
+ 	pass.Execute(commandList);
+ }
+ 
+-void CLPVStage::ExecutePropagate(const SScopedComputeCommandList& commandList)
++void CLPVStage::ExecutePropagate(SCascade& cascade, const SScopedComputeCommandList& commandList)
+ {
+ 	const int32 iterations = clamp_tpl<int32>(CRendererCVars::CV_r_LPVIterations, 0, 32);
+ 	const uint32 dispatchSize = lpvDispatchSize(m_gridSize, LPVGridTileSize);
+ 
+-	// CryEngine 3 scheme: every iteration gathers from the neighbours only (a decaying diffusion,
+-	// stable for any iteration count) and adds its result to an explicit running sum. The compounding
+-	// "self + gathered" variant used before amplified checkerboard modes exponentially.
++	// Gather-only propagation with an explicit running sum (see LPV.cfi for the face solid angle
++	// reprojection details).
+ 	for (int32 c = 0; c < SHChannelNum; ++c)
+-		m_pFinalGrid[c] = m_pGridSH[0][c].get();
++		cascade.pFinalGrid[c] = cascade.pGridSH[0][c].get();
+ 
+ 	for (int32 i = 0; i < iterations; ++i)
+ 	{
+@@ -933,33 +865,33 @@ void CLPVStage::ExecutePropagate(const SScopedComputeCommandList& commandList)
+ 		const int32 sumDst = i & 1;
+ 
+ 		// pass 0: first iteration (sum seed = resolve output), pass 1/2: odd/even iterations
+-		auto& pass = m_passPropagate[(i == 0) ? 0 : (1 + (i & 1))];
++		auto& pass = cascade.passPropagate[(i == 0) ? 0 : (1 + (i & 1))];
+ 
+ 		if (pass.IsDirty(m_gridSize))
+ 		{
+ 			static CCryNameTSCRC techName("LPVPropagate");
+ 			pass.SetTechnique(CShaderMan::s_shDeferredShading, techName, 0);
+-			pass.SetOutputUAV(0, m_pGridSH[propDst][0]);
+-			pass.SetOutputUAV(1, m_pGridSH[propDst][1]);
+-			pass.SetOutputUAV(2, m_pGridSH[propDst][2]);
+-			pass.SetOutputUAV(3, m_pGridSum[sumDst][0]);
+-			pass.SetOutputUAV(4, m_pGridSum[sumDst][1]);
+-			pass.SetOutputUAV(5, m_pGridSum[sumDst][2]);
+-			pass.SetTexture(0, m_pGridSH[propSrc][0]);
+-			pass.SetTexture(1, m_pGridSH[propSrc][1]);
+-			pass.SetTexture(2, m_pGridSH[propSrc][2]);
++			pass.SetOutputUAV(0, cascade.pGridSH[propDst][0]);
++			pass.SetOutputUAV(1, cascade.pGridSH[propDst][1]);
++			pass.SetOutputUAV(2, cascade.pGridSH[propDst][2]);
++			pass.SetOutputUAV(3, cascade.pGridSum[sumDst][0]);
++			pass.SetOutputUAV(4, cascade.pGridSum[sumDst][1]);
++			pass.SetOutputUAV(5, cascade.pGridSum[sumDst][2]);
++			pass.SetTexture(0, cascade.pGridSH[propSrc][0]);
++			pass.SetTexture(1, cascade.pGridSH[propSrc][1]);
++			pass.SetTexture(2, cascade.pGridSH[propSrc][2]);
+ 			// the running sum starts as the un-propagated injection result
+-			CTexture* pSumSrc0 = (i == 0) ? m_pGridSH[0][0].get() : m_pGridSum[1 - sumDst][0].get();
+-			CTexture* pSumSrc1 = (i == 0) ? m_pGridSH[0][1].get() : m_pGridSum[1 - sumDst][1].get();
+-			CTexture* pSumSrc2 = (i == 0) ? m_pGridSH[0][2].get() : m_pGridSum[1 - sumDst][2].get();
++			CTexture* pSumSrc0 = (i == 0) ? cascade.pGridSH[0][0].get() : cascade.pGridSum[1 - sumDst][0].get();
++			CTexture* pSumSrc1 = (i == 0) ? cascade.pGridSH[0][1].get() : cascade.pGridSum[1 - sumDst][1].get();
++			CTexture* pSumSrc2 = (i == 0) ? cascade.pGridSH[0][2].get() : cascade.pGridSum[1 - sumDst][2].get();
+ 			pass.SetTexture(3, pSumSrc0);
+ 			pass.SetTexture(4, pSumSrc1);
+ 			pass.SetTexture(5, pSumSrc2);
+-			pass.SetTexture(6, m_pGridGV);
++			pass.SetTexture(6, cascade.pGridGV);
+ 		}
+ 
+ 		pass.BeginConstantUpdate();
+-		SetGridConstants(pass);
++		SetGridConstants(pass, cascade);
+ 
+ 		// Occlusion strength, pre-divided by the SH transfer of a perpendicular fully covered face:
+ 		// dot(cosineLobe(n), cone90(n)) = ZH_COS0*SH_C0*ZH_CONE0*SH_C0 + ZH_COS1*SH_C1*ZH_CONE1*SH_C1
+@@ -975,47 +907,45 @@ void CLPVStage::ExecutePropagate(const SScopedComputeCommandList& commandList)
+ 		pass.Execute(commandList);
+ 
+ 		for (int32 c = 0; c < SHChannelNum; ++c)
+-			m_pFinalGrid[c] = m_pGridSum[sumDst][c].get();
++			cascade.pFinalGrid[c] = cascade.pGridSum[sumDst][c].get();
+ 	}
+-
+-	m_finalGridIndex = 0;
+ }
+ 
+-void CLPVStage::ExecuteTemporal(const SScopedComputeCommandList& commandList)
++void CLPVStage::ExecuteTemporal(SCascade& cascade, const SScopedComputeCommandList& commandList)
+ {
+ 	const float alpha = clamp_tpl(CRendererCVars::CV_r_LPVTemporalAlpha, 0.01f, 1.0f);
+ 
+ 	// The reprojection is a pure integer cell shift because both origins are snapped to the cell size.
+ 	Vec3 deltaCells(ZERO);
+-	if (m_bHistoryValid)
+-		deltaCells = (m_gridOrigin - m_prevGridOrigin) / m_cellSize;
++	if (cascade.bHistoryValid)
++		deltaCells = (cascade.gridOrigin - cascade.prevGridOrigin) / cascade.cellSize;
+ 
+ 	// Blend weight 1 (or no usable history) means the accumulator is a plain copy of the current frame.
+-	const float effectiveAlpha = m_bHistoryValid ? alpha : 1.0f;
++	const float effectiveAlpha = cascade.bHistoryValid ? alpha : 1.0f;
+ 
+-	const int32 src = m_accIndex;
+-	const int32 dst = 1 - m_accIndex;
+-	auto& pass = m_passTemporal[src];
++	const int32 src = cascade.accIndex;
++	const int32 dst = 1 - cascade.accIndex;
++	auto& pass = cascade.passTemporal[src];
+ 
+-	CRY_ASSERT(m_pFinalGrid[0] && m_pFinalGrid[1] && m_pFinalGrid[2]);
++	CRY_ASSERT(cascade.pFinalGrid[0] && cascade.pFinalGrid[1] && cascade.pFinalGrid[2]);
+ 
+-	if (pass.IsDirty(m_gridSize, m_pFinalGrid[0]->GetID()))
++	if (pass.IsDirty(m_gridSize, cascade.pFinalGrid[0]->GetID()))
+ 	{
+ 		static CCryNameTSCRC techName("LPVTemporal");
+ 		pass.SetTechnique(CShaderMan::s_shDeferredShading, techName, 0);
+-		pass.SetOutputUAV(0, m_pGridAcc[dst][0]);
+-		pass.SetOutputUAV(1, m_pGridAcc[dst][1]);
+-		pass.SetOutputUAV(2, m_pGridAcc[dst][2]);
+-		pass.SetTexture(0, m_pFinalGrid[0]);
+-		pass.SetTexture(1, m_pFinalGrid[1]);
+-		pass.SetTexture(2, m_pFinalGrid[2]);
+-		pass.SetTexture(3, m_pGridAcc[src][0]);
+-		pass.SetTexture(4, m_pGridAcc[src][1]);
+-		pass.SetTexture(5, m_pGridAcc[src][2]);
++		pass.SetOutputUAV(0, cascade.pGridAcc[dst][0]);
++		pass.SetOutputUAV(1, cascade.pGridAcc[dst][1]);
++		pass.SetOutputUAV(2, cascade.pGridAcc[dst][2]);
++		pass.SetTexture(0, cascade.pFinalGrid[0]);
++		pass.SetTexture(1, cascade.pFinalGrid[1]);
++		pass.SetTexture(2, cascade.pFinalGrid[2]);
++		pass.SetTexture(3, cascade.pGridAcc[src][0]);
++		pass.SetTexture(4, cascade.pGridAcc[src][1]);
++		pass.SetTexture(5, cascade.pGridAcc[src][2]);
+ 	}
+ 
+ 	pass.BeginConstantUpdate();
+-	SetGridConstants(pass);
++	SetGridConstants(pass, cascade);
+ 
+ 	static CCryNameR paramTemporal("LPVTemporalParams");
+ 	pass.SetConstant(paramTemporal, Vec4(deltaCells.x, deltaCells.y, deltaCells.z, effectiveAlpha));
+@@ -1025,7 +955,7 @@ void CLPVStage::ExecuteTemporal(const SScopedComputeCommandList& commandList)
+ 	pass.PrepareResourcesForUse(commandList);
+ 	pass.Execute(commandList);
+ 
+-	m_accIndex = dst;
++	cascade.accIndex = dst;
+ }
+ 
+ void CLPVStage::ExecuteApply(const SScopedComputeCommandList& commandList, CTexture* pRsmDepth)
+@@ -1035,17 +965,17 @@ void CLPVStage::ExecuteApply(const SScopedComputeCommandList& commandList, CText
+ 	const int32 screenWidth = m_pIrradiance->GetWidth();
+ 	const int32 screenHeight = m_pIrradiance->GetHeight();
+ 
+-	// The linear depth and especially the scene normals texture are NOT stable objects: the deferred
+-	// decal handling swaps the normals resource depending on whether decals are visible in the
+-	// current view, which is a binary function of the camera pose. A binding cached inside the
+-	// IsDirty block then reads the stale buffer whenever the swap state differs from bind time -
+-	// the receiver lobe and the normal offset sample corrupt, and the applied GI flips between a
+-	// correct and a broken state at deterministic camera poses. Keying the bindings on the texture
+-	// IDs rebinds on every swap.
++	SCascade& nearCascade = m_cascades[0];
++	SCascade& farCascade = m_cascades[1];
++	const bool bFarActive = m_activeCascadeCount > 1 && farCascade.bHistoryValid;
++
++	// The linear depth and the scene normals are not stable texture objects, key the bindings on
++	// their IDs so a swap rebinds.
+ 	CTexture* pLinearDepth = m_graphicsPipelineResources.m_pTexLinearDepth;
+ 	CTexture* pSceneNormals = m_graphicsPipelineResources.m_pTexSceneNormalsMap;
+ 
+-	if (pass.IsDirty(m_gridSize, screenWidth, screenHeight, m_accIndex, pRsmDepth->GetID(), pLinearDepth->GetID(), pSceneNormals->GetID()))
++	if (pass.IsDirty(m_gridSize, screenWidth, screenHeight, nearCascade.accIndex, farCascade.accIndex,
++	                 m_activeCascadeCount, pRsmDepth->GetID(), pLinearDepth->GetID(), pSceneNormals->GetID()))
+ 	{
+ 		static CCryNameTSCRC techName("LPVApply");
+ 		pass.SetTechnique(CShaderMan::s_shDeferredShading, techName, 0);
+@@ -1053,18 +983,27 @@ void CLPVStage::ExecuteApply(const SScopedComputeCommandList& commandList, CText
+ 		pass.SetOutputUAV(1, m_pSpecular);
+ 		pass.SetTexture(0, pLinearDepth);
+ 		pass.SetTexture(1, pSceneNormals);
+-		pass.SetTexture(2, m_pGridAcc[m_accIndex][0]);
+-		pass.SetTexture(3, m_pGridAcc[m_accIndex][1]);
+-		pass.SetTexture(4, m_pGridAcc[m_accIndex][2]);
+-		pass.SetBuffer(5, &m_injectionBuffer);
++		pass.SetTexture(2, nearCascade.pGridAcc[nearCascade.accIndex][0]);
++		pass.SetTexture(3, nearCascade.pGridAcc[nearCascade.accIndex][1]);
++		pass.SetTexture(4, nearCascade.pGridAcc[nearCascade.accIndex][2]);
++		pass.SetBuffer(5, &nearCascade.injectionBuffer);
+ 		pass.SetTexture(6, pRsmDepth);
++		pass.SetTexture(7, farCascade.pGridAcc[farCascade.accIndex][0]);
++		pass.SetTexture(8, farCascade.pGridAcc[farCascade.accIndex][1]);
++		pass.SetTexture(9, farCascade.pGridAcc[farCascade.accIndex][2]);
+ 		pass.SetSampler(0, EDefaultSamplerStates::TrilinearClamp);
+ 	}
+ 
+ 	pass.SetInlineConstantBuffer(eConstantBufferShaderSlot_PerView, m_graphicsPipeline.GetMainViewConstantBuffer());
+ 
+ 	pass.BeginConstantUpdate();
+-	SetGridConstants(pass);
++	SetGridConstants(pass, nearCascade);
++
++	// Far cascade volume, w of the second constant doubles as the enable flag.
++	static CCryNameR paramFar("LPVGridParamsFar");
++	pass.SetConstant(paramFar, Vec4(farCascade.gridOrigin.x, farCascade.gridOrigin.y, farCascade.gridOrigin.z, farCascade.cellSize));
++	static CCryNameR paramFar2("LPVGridParams2Far");
++	pass.SetConstant(paramFar2, Vec4((float)m_gridSize * farCascade.cellSize, bFarActive ? 1.0f : 0.0f, 0.0f, 0.0f));
+ 
+ 	static CCryNameR paramScreenSize("LPVScreenSize");
+ 	const float fScreenWidth = (float)screenWidth;
+@@ -1073,9 +1012,6 @@ void CLPVStage::ExecuteApply(const SScopedComputeCommandList& commandList, CText
+ 
+ 	// Explicit view ray reconstruction, see LPV.cfi. m_frustumCorners are the world space corner rays
+ 	// of the camera frustum, the same data the engine uses for its WPOS fullscreen reconstruction.
+-	// (An attempt to derive the rays by NDC unprojection instead produced clearly wrong results, so
+-	// the mirrored-vertex-ordering suspicion about m_frustumCorners is likely wrong - see the case
+-	// file 07_flicker_case_file.md.)
+ 	const SRenderViewInfo& viewInfo = GetCurrentViewInfo();
+ 
+ 	static CCryNameR paramCamPos("LPVCamPos");
+@@ -1107,7 +1043,8 @@ void CLPVStage::ExecuteDebugProbes(CTexture* pColorTarget, CTexture* pDepthTarge
+ {
+ 	// m_bResultValid also covers the grid transform and the accumulation index: they are only up to
+ 	// date when Execute() ran all the way through for this frame.
+-	// 10 = probe balls only, 11 = balls + surface mosaic (the mosaic branch lives in LPVApplyCS)
++	// 10 = probe balls only, 11 = balls + surface mosaic (the mosaic branch lives in LPVApplyCS).
++	// The balls visualize the near cascade.
+ 	if ((CRendererCVars::CV_r_LPVDebug != 10 && CRendererCVars::CV_r_LPVDebug != 11) || !m_bResultValid || m_gridSize <= 0)
+ 		return;
+ 
+@@ -1117,9 +1054,11 @@ void CLPVStage::ExecuteDebugProbes(CTexture* pColorTarget, CTexture* pDepthTarge
+ 	if (!CTexture::IsTextureExist(pColorTarget) || !CTexture::IsTextureExist(pDepthTarget))
+ 		return;
+ 
+-	CTexture* pGridR = m_pGridAcc[m_accIndex][0];
+-	CTexture* pGridG = m_pGridAcc[m_accIndex][1];
+-	CTexture* pGridB = m_pGridAcc[m_accIndex][2];
++	SCascade& cascade = m_cascades[0];
++
++	CTexture* pGridR = cascade.pGridAcc[cascade.accIndex][0];
++	CTexture* pGridG = cascade.pGridAcc[cascade.accIndex][1];
++	CTexture* pGridB = cascade.pGridAcc[cascade.accIndex][2];
+ 	if (!CTexture::IsTextureExist(pGridR) || !CTexture::IsTextureExist(pGridG) || !CTexture::IsTextureExist(pGridB))
+ 		return;
+ 
+@@ -1163,10 +1102,10 @@ void CLPVStage::ExecuteDebugProbes(CTexture* pColorTarget, CTexture* pDepthTarge
+ 	static CCryNameR paramProbe("LPVProbeParams");
+ 
+ 	const float fGridSize = (float)m_gridSize;
+-	const Vec4 gridParams(m_gridOrigin.x, m_gridOrigin.y, m_gridOrigin.z, m_cellSize);
+-	const Vec4 gridParams2(fGridSize, 1.0f / fGridSize, 1.0f / m_cellSize, fGridSize * m_cellSize);
++	const Vec4 gridParams(cascade.gridOrigin.x, cascade.gridOrigin.y, cascade.gridOrigin.z, cascade.cellSize);
++	const Vec4 gridParams2(fGridSize, 1.0f / fGridSize, 1.0f / cascade.cellSize, fGridSize * cascade.cellSize);
+ 	// x: probe radius, y: colour scale, z: floor that keeps unlit probes visible as dark grey balls.
+-	const Vec4 probeParams(m_cellSize * 0.1f, CRendererCVars::CV_r_LPVIntensity, 0.05f, 0.0f);
++	const Vec4 probeParams(cascade.cellSize * 0.1f, CRendererCVars::CV_r_LPVIntensity, 0.05f, 0.0f);
+ 
+ 	constantManager.SetNamedConstant(paramGrid, gridParams, eHWSC_Vertex);
+ 	constantManager.SetNamedConstant(paramGrid2, gridParams2, eHWSC_Vertex);
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.h b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.h
+index 5fe04b87..0e09487c 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.h
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.h
+@@ -8,7 +8,7 @@
+ 
+ struct ShadowMapFrustum;
+ 
+-// Light Propagation Volumes (single cascade, sun only).
++// Light Propagation Volumes (nested cascades, sun only).
+ // Pipeline: sun RSM -> compute scatter injection into an int accumulator -> resolve to SH grid ->
+ //           iterative 6-neighbour gather propagation -> full resolution screen space irradiance.
+ class CLPVStage : public CGraphicsPipelineStage
+@@ -27,6 +27,9 @@ public:
+ 	static const int32 AccumulatorFixedPointScale = 4096;
+ 	// Upper bound for the RSM sample grid used by the injection pass.
+ 	static const int32 MaxRsmSampleCount = 1024;
++	// Nested cascades: cascade 0 is the detail volume (r_LPVSize), cascade 1 covers
++	// r_LPVCascadeScale times the extent at the same grid resolution.
++	static const int32 MaxCascadeNum = 2;
+ 
+ public:
+ 	CLPVStage(CGraphicsPipeline& graphicsPipeline);
+@@ -73,7 +76,41 @@ public:
+ 	CTexture* GetSpecularRT() const;
+ 
+ private:
++	// All state that exists once per cascade. The compute shaders are shared - every pass runs per
++	// cascade with the cascade's own constants, only the screen space apply reads both volumes.
++	struct SCascade
++	{
++		// Propagation ping-pong pair, each entry holds the R/G/B SH textures of one iteration.
++		_smart_ptr<CTexture> pGridSH[2][SHChannelNum];
++		// Running propagation sum ping-pong pair (gather-only scheme, explicit sum).
++		_smart_ptr<CTexture> pGridSum[2][SHChannelNum];
++		// Temporal accumulation ping-pong pair (exponential moving average of the propagated grid).
++		_smart_ptr<CTexture> pGridAcc[2][SHChannelNum];
++		// Geometry volume: per cell directional blocking potential (SH L1, achromatic).
++		_smart_ptr<CTexture> pGridGV;
++
++		CGpuBuffer           injectionBuffer;
++
++		CComputeRenderPass   passClear;
++		CComputeRenderPass   passInject;
++		CComputeRenderPass   passResolve;
++		CComputeRenderPass   passPropagate[3]; // first iteration / odd / even bindings
++		CComputeRenderPass   passTemporal[2];
++
++		Vec3                 gridOrigin = Vec3(ZERO);
++		// Grid origin of the previous relight, used for the integer cell reprojection.
++		Vec3                 prevGridOrigin = Vec3(ZERO);
++		float                cellSize = 1.0f;
++		// Index of the accumulation set holding the temporal result of the current frame.
++		int32                accIndex = 0;
++		// Textures holding the final propagated result of the last relight (points into pGridSum,
++		// or pGridSH[0] when the iteration count is zero).
++		CTexture*            pFinalGrid[SHChannelNum] = { nullptr, nullptr, nullptr };
++		bool                 bHistoryValid = false;
++	};
++
+ 	static int32 GetValidGridSize();
++	static int32 GetActiveCascadeCount();
+ 
+ 	bool IsSvoProvidingRsm() const;
+ 	bool IsRsmFrustum(const ShadowMapFrustum& rFr) const;
+@@ -83,29 +120,20 @@ private:
+ 
+ 	const ShadowMapFrustum* FindRsmFrustum() const;
+ 	bool                    UpdateFrameParameters(const ShadowMapFrustum& frustum, const CTexture* pRsmColor);
++	void                    UpdateCascadeParameters(SCascade& cascade, int32 cascadeIndex);
+ 
+-	void ExecuteClear(const SScopedComputeCommandList& commandList);
+-	void ExecuteInject(const SScopedComputeCommandList& commandList, CTexture* pRsmDepth, CTexture* pRsmColor, CTexture* pRsmNormal);
+-	void ExecuteInjectScreen(const SScopedComputeCommandList& commandList);
+-	void ExecuteResolve(const SScopedComputeCommandList& commandList, CTexture* pRsmDepth);
+-	void ExecutePropagate(const SScopedComputeCommandList& commandList);
+-	void ExecuteTemporal(const SScopedComputeCommandList& commandList);
++	void ExecuteClear(SCascade& cascade, const SScopedComputeCommandList& commandList);
++	void ExecuteInject(SCascade& cascade, const SScopedComputeCommandList& commandList, CTexture* pRsmDepth, CTexture* pRsmColor, CTexture* pRsmNormal);
++	void ExecuteResolve(SCascade& cascade, const SScopedComputeCommandList& commandList, CTexture* pRsmDepth);
++	void ExecutePropagate(SCascade& cascade, const SScopedComputeCommandList& commandList);
++	void ExecuteTemporal(SCascade& cascade, const SScopedComputeCommandList& commandList);
+ 	void ExecuteApply(const SScopedComputeCommandList& commandList, CTexture* pRsmDepth);
+ 
+-	void SetGridConstants(CComputeRenderPass& pass);
++	void SetGridConstants(CComputeRenderPass& pass, const SCascade& cascade);
+ 
+ private:
+-	// Propagation ping-pong pair, each entry holds the R/G/B SH textures of one iteration.
+-	_smart_ptr<CTexture> m_pGridSH[2][SHChannelNum];
+-	// Running propagation sum ping-pong pair (CryEngine 3 scheme: every iteration gathers only from
+-	// the neighbours and the results are summed explicitly - the compounding "self + gathered"
+-	// variant amplifies checkerboard modes exponentially with the iteration count).
+-	_smart_ptr<CTexture> m_pGridSum[2][SHChannelNum];
+-	// Temporal accumulation ping-pong pair (exponential moving average of the propagated grid).
+-	_smart_ptr<CTexture> m_pGridAcc[2][SHChannelNum];
+-	// Geometry volume: per cell directional blocking potential (SH L1, achromatic), resolved from the
+-	// injection accumulator and read by the propagation to attenuate flux through blocked cell faces.
+-	_smart_ptr<CTexture> m_pGridGV;
++	SCascade             m_cascades[MaxCascadeNum];
++
+ 	// Screen space output (irradiance, never pre-multiplied with albedo).
+ 	_smart_ptr<CTexture> m_pIrradiance;
+ 	// Screen space specular GI output (radiance along the reflected eye vector).
+@@ -116,48 +144,30 @@ private:
+ 	// Depth target of the dedicated RSM view.
+ 	_smart_ptr<CTexture> m_pRsmDepth;
+ 
+-	CGpuBuffer           m_injectionBuffer;
+-
+-	CComputeRenderPass   m_passClear;
+-	CComputeRenderPass   m_passInject;
+-	CComputeRenderPass   m_passInjectScreen;
+-	CComputeRenderPass   m_passResolve;
+-	CComputeRenderPass   m_passPropagate[3]; // first iteration / odd / even bindings
+-	CComputeRenderPass   m_passTemporal[2];
+ 	CComputeRenderPass   m_passApply;
+ 
+-	// Debug probe spheres, one instanced impostor quad per grid cell.
++	// Debug probe spheres, one instanced impostor quad per grid cell (near cascade only).
+ 	CPrimitiveRenderPass m_passDebugProbes;
+ 	CRenderPrimitive     m_primDebugProbes;
+ 
+ 	Matrix44A            m_rsmToWorld;
+ 	// Forward transform (world -> RSM texture space), used by the sky visibility test in the resolve.
+ 	Matrix44A            m_worldToRsm;
+-	Vec3                 m_gridOrigin;
+-	float                m_cellSize;
+ 	int32                m_gridSize;
+ 	int32                m_rsmSize;
+ 	int32                m_rsmSampleCount;
+ 	int32                m_rsmSampleStride;
+-	// Index of the ping-pong set holding the propagation result of the current frame.
+-	int32                m_finalGridIndex;
+-	// Textures holding the final propagated result of the last relight (points into m_pGridSum, or
+-	// m_pGridSH[0] when the iteration count is zero).
+-	CTexture*            m_pFinalGrid[SHChannelNum];
+-	// Index of the accumulation set holding the temporal result of the current frame.
+-	int32                m_accIndex;
+-	// Grid origin of the previous frame, used for the integer cell reprojection of the accumulation.
+-	Vec3                 m_prevGridOrigin;
+ 	// RSM depth of the frame's Execute(), consumed by the deferred ExecuteApplyToScreen().
+ 	CTexture*            m_pApplyRsmDepth = nullptr;
+ 	// Set by Execute() when the grid is ready, consumed (and reset) by ExecuteApplyToScreen().
+ 	bool                 m_bGridReadyForApply = false;
++	// Number of cascades that ran in the frame's Execute(), consumed by ExecuteApplyToScreen().
++	int32                m_activeCascadeCount = 1;
+ 	// Relight gating state: the grid is only re-injected on discrete input changes or on the heartbeat
+ 	// interval, a frozen grid stays exactly correct for a static scene and cannot flicker.
+ 	Vec3                 m_lastSunDir;
+ 	Vec4                 m_lastSunColor;
+ 	int32                m_framesSinceRelight;
+ 	bool                 m_bForceRelight;
+-	bool                 m_bHistoryValid;
+ 	bool                 m_bResultValid;
+ };
+diff --git a/Engine/Shaders/HWScripts/CryFX/LPV.cfi b/Engine/Shaders/HWScripts/CryFX/LPV.cfi
+index 83400711..808a56bb 100644
+--- a/Engine/Shaders/HWScripts/CryFX/LPV.cfi
++++ b/Engine/Shaders/HWScripts/CryFX/LPV.cfi
+@@ -760,6 +760,15 @@ Texture3D<float4> LPVGridG        : register(t3);
+ Texture3D<float4> LPVGridB        : register(t4);
+ Buffer<int>       LPVApplyAccum   : register(t5);
+ Texture2D<float>  LPVApplyRsmDepth : register(t6);
++// Far cascade accumulated grid (nested cascades).
++Texture3D<float4> LPVGridFarR     : register(t7);
++Texture3D<float4> LPVGridFarG     : register(t8);
++Texture3D<float4> LPVGridFarB     : register(t9);
++
++// xyz: world space origin of the far cascade, w: far cascade cell size in meters
++float4 LPVGridParamsFar;
++// x: world space extent of the far cascade, y: > 0 when the far cascade is active
++float4 LPVGridParams2Far;
+ 
+ SamplerState LPVGridSampler : register(s0);
+ 
+@@ -884,59 +893,88 @@ void LPVApplyCS(uint3 DTid : SV_DispatchThreadID)
+ 			return;
+ 		}
+ 
++		// The stored SH describes the direction the light flows in, so the receiver lobe points
++		// against the surface normal.
++		const float4 receiver = LPVCosineLobe(-normal);
++
++		float3 giNear = 0;
+ 		[branch] if (fade > 0.0f)
+ 		{
+ 			const float4 shR = LPVGridR.SampleLevel(LPVGridSampler, gridUV, 0);
+ 			const float4 shG = LPVGridG.SampleLevel(LPVGridSampler, gridUV, 0);
+ 			const float4 shB = LPVGridB.SampleLevel(LPVGridSampler, gridUV, 0);
+ 
+-			// The stored SH describes the direction the light flows in, so the receiver lobe points
+-			// against the surface normal.
+-			const float4 receiver = LPVCosineLobe(-normal);
++			giNear.r = max(0.0f, dot(shR, receiver));
++			giNear.g = max(0.0f, dot(shG, receiver));
++			giNear.b = max(0.0f, dot(shB, receiver));
++		}
++
++		irradiance = giNear * fade;
+ 
+-			irradiance.r = max(0.0f, dot(shR, receiver));
+-			irradiance.g = max(0.0f, dot(shG, receiver));
+-			irradiance.b = max(0.0f, dot(shB, receiver));
++		// Far cascade: same lookup in the coarse volume, blended in over the near fade band and
++		// beyond the near volume - distant geometry gets coarse GI instead of a hard cutoff.
++		[branch] if (LPVGridParams2Far.y > 0.5f && fade < 1.0f)
++		{
++			const float3 samplePosFar = worldPos + normal * (LPVGridParamsFar.w * 0.5f);
++			const float3 gridUVFar = (samplePosFar - LPVGridParamsFar.xyz) / LPVGridParams2Far.x;
+ 
+-			irradiance *= fade * LPVApplyParams.x;
++			const float3 centeredFar = abs(gridUVFar - 0.5f) * 2.0f;
++			const float edgeFar = max(centeredFar.x, max(centeredFar.y, centeredFar.z));
++			const float fadeFar = 1.0f - smoothstep(0.8f, 1.0f, edgeFar);
+ 
+-			// Specular GI: short voxel march along the reflected eye vector (CryEngine 3 shipped
+-			// the same approximation: a few cells, inverse square falloff, averaged). The L1 SH
+-			// grid is far too coarse for mirror images - this gives metals and wet surfaces a
+-			// broad directional bounce instead of nothing.
+-			[branch] if (LPVApplyParams.w > 0.0f)
++			[branch] if (fadeFar > 0.0f)
+ 			{
+-				const float3 reflDir = reflect(normalize(viewRay), normal);
+-				// Radiance travelling from the march point towards the surface.
+-				const float4 reflEval = LPVDirSH(-reflDir);
+-
+-				[unroll] for (int s = 1; s <= 3; ++s)
+-				{
+-					const float3 marchPos = samplePos + reflDir * ((float)s * LPVGridParams.w);
+-					const float3 marchUV = (marchPos - LPVGridParams.xyz) / LPVGridParams2.w;
+-					if (any(marchUV < 0.0f) || any(marchUV > 1.0f))
+-						break;
+-
+-					const float stepWeight = 1.0f / (float)(s * s);
+-					specular.r += max(0.0f, dot(LPVGridR.SampleLevel(LPVGridSampler, marchUV, 0), reflEval)) * stepWeight;
+-					specular.g += max(0.0f, dot(LPVGridG.SampleLevel(LPVGridSampler, marchUV, 0), reflEval)) * stepWeight;
+-					specular.b += max(0.0f, dot(LPVGridB.SampleLevel(LPVGridSampler, marchUV, 0), reflEval)) * stepWeight;
+-				}
+-
+-				specular *= fade * LPVApplyParams.x * LPVApplyParams.w;
++				const float4 shRFar = LPVGridFarR.SampleLevel(LPVGridSampler, gridUVFar, 0);
++				const float4 shGFar = LPVGridFarG.SampleLevel(LPVGridSampler, gridUVFar, 0);
++				const float4 shBFar = LPVGridFarB.SampleLevel(LPVGridSampler, gridUVFar, 0);
++
++				float3 giFar;
++				giFar.r = max(0.0f, dot(shRFar, receiver));
++				giFar.g = max(0.0f, dot(shGFar, receiver));
++				giFar.b = max(0.0f, dot(shBFar, receiver));
++
++				irradiance += giFar * fadeFar * (1.0f - fade);
+ 			}
++		}
+ 
+-			// Soft highlight rolloff (Reinhard on luminance): the dim indirect response stays
+-			// linear while hot spots (sun facing white walls, outdoor single bounce paths) are
+-			// compressed towards the r_LPVMaxIrradiance ceiling - a high intensity can brighten
+-			// the interiors without overexposing the outdoors.
+-			const float maxIrradiance = LPVApplyParams.z;
+-			[branch] if (maxIrradiance > 0.0f)
++		irradiance *= LPVApplyParams.x;
++
++		// Specular GI: short voxel march along the reflected eye vector in the near cascade
++		// (CryEngine 3 shipped the same approximation: a few cells, inverse square falloff,
++		// averaged). The L1 SH grid is far too coarse for mirror images - this gives metals and
++		// wet surfaces a broad directional bounce instead of nothing.
++		[branch] if (LPVApplyParams.w > 0.0f && fade > 0.0f)
++		{
++			const float3 reflDir = reflect(normalize(viewRay), normal);
++			// Radiance travelling from the march point towards the surface.
++			const float4 reflEval = LPVDirSH(-reflDir);
++
++			[unroll] for (int s = 1; s <= 3; ++s)
+ 			{
+-				const float3 lumWeights = float3(0.2126f, 0.7152f, 0.0722f);
+-				irradiance *= maxIrradiance / (maxIrradiance + dot(irradiance, lumWeights));
+-				specular *= maxIrradiance / (maxIrradiance + dot(specular, lumWeights));
++				const float3 marchPos = samplePos + reflDir * ((float)s * LPVGridParams.w);
++				const float3 marchUV = (marchPos - LPVGridParams.xyz) / LPVGridParams2.w;
++				if (any(marchUV < 0.0f) || any(marchUV > 1.0f))
++					break;
++
++				const float stepWeight = 1.0f / (float)(s * s);
++				specular.r += max(0.0f, dot(LPVGridR.SampleLevel(LPVGridSampler, marchUV, 0), reflEval)) * stepWeight;
++				specular.g += max(0.0f, dot(LPVGridG.SampleLevel(LPVGridSampler, marchUV, 0), reflEval)) * stepWeight;
++				specular.b += max(0.0f, dot(LPVGridB.SampleLevel(LPVGridSampler, marchUV, 0), reflEval)) * stepWeight;
+ 			}
++
++			specular *= fade * LPVApplyParams.x * LPVApplyParams.w;
++		}
++
++		// Soft highlight rolloff (Reinhard on luminance): the dim indirect response stays
++		// linear while hot spots (sun facing white walls, outdoor single bounce paths) are
++		// compressed towards the r_LPVMaxIrradiance ceiling - a high intensity can brighten
++		// the interiors without overexposing the outdoors.
++		const float maxIrradiance = LPVApplyParams.z;
++		[branch] if (maxIrradiance > 0.0f)
++		{
++			const float3 lumWeights = float3(0.2126f, 0.7152f, 0.0722f);
++			irradiance *= maxIrradiance / (maxIrradiance + dot(irradiance, lumWeights));
++			specular *= maxIrradiance / (maxIrradiance + dot(specular, lumWeights));
+ 		}
+ 	}
+ 
+-- 
+2.47.1.windows.1
+

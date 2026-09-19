@@ -1,0 +1,121 @@
+From 5fe1e5755adf9eb8a8b8e1007d23c5d21b2fe0eb Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Wed, 16 Sep 2026 23:23:47 +0800
+Subject: [PATCH 206/206] feat: r_LPVTranslucentBrightness scales LPV indirect
+ diffuse on vegetation
+
+Port of SVOGI's e_svoTI_TranslucentBrightness: the apply pass reads the
+G-buffer transmittance and multiplies the irradiance by
+lerp(1, gain, saturate(transmittance * 8)), before the r_LPVMaxIrradiance
+rolloff. Opaque surfaces and specular are unaffected. Default 1 (neutral),
+0 switches it off; both skip the shader branch.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ Code/CryEngine/RenderDll/Common/RendererCVars.cpp   | 10 +++++++++-
+ Code/CryEngine/RenderDll/Common/RendererCVars.h     |  1 +
+ .../RenderDll/XRenderD3D9/GraphicsPipeline/LPV.cpp  |  5 ++++-
+ Engine/Shaders/HWScripts/CryFX/LPV.cfi              | 13 ++++++++++++-
+ 4 files changed, 26 insertions(+), 3 deletions(-)
+
+diff --git a/Code/CryEngine/RenderDll/Common/RendererCVars.cpp b/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
+index f307217c..f23d27ec 100644
+--- a/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
++++ b/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
+@@ -425,6 +425,7 @@ float CRendererCVars::CV_r_LPVOcclusion;
+ float CRendererCVars::CV_r_LPVSkyLight;
+ float CRendererCVars::CV_r_LPVMaxIrradiance;
+ float CRendererCVars::CV_r_LPVSpecular;
++float CRendererCVars::CV_r_LPVTranslucentBrightness;
+ float CRendererCVars::CV_r_LPVPointLights;
+ float CRendererCVars::CV_r_LPVRsmMinCasterSize;
+ float CRendererCVars::CV_r_LPVRsmClipRange;
+@@ -2302,7 +2303,14 @@ void CRendererCVars::InitCVars()
+ 	               "vector, the same approximation CryEngine 3 shipped. Gives metals and wet surfaces a\n"
+ 	               "broad indirect reflection - the SH grid is too coarse for sharp mirror images.\n"
+ 	               "Scales on top of r_LPVIntensity. 0 disables the march and the screen target.\n");
+-	REGISTER_CVAR3("r_LPVMaxIrradiance", CV_r_LPVMaxIrradiance, 3.0f, VF_NULL,
++	REGISTER_CVAR3("r_LPVTranslucentBrightness", CV_r_LPVTranslucentBrightness, 1.0f, VF_NULL,
++	               "Multiplier of the LPV indirect diffuse on translucent surfaces (vegetation using the\n"
++	               "transmittance lighting model), same as e_svoTI_TranslucentBrightness of SVOGI: the\n"
++	               "gain is blended in by the G-buffer transmittance, opaque surfaces are unaffected.\n"
++	               "Applied before the r_LPVMaxIrradiance rolloff.\n"
++	               "1 - neutral (default), > 1 brighter, < 1 darker\n"
++	               "0 - off (switch, same result as 1)\n");
++	REGISTER_CVAR3("r_LPVMaxIrradiance",CV_r_LPVMaxIrradiance, 3.0f, VF_NULL,
+ 	               "Soft luminance rolloff (Reinhard) of the applied LPV irradiance after r_LPVIntensity.\n"
+ 	               "Dim indirect light stays linear while hot spots (sun facing white walls, outdoor one\n"
+ 	               "bounce paths) are compressed towards this ceiling - lets a high intensity brighten\n"
+diff --git a/Code/CryEngine/RenderDll/Common/RendererCVars.h b/Code/CryEngine/RenderDll/Common/RendererCVars.h
+index 14f1532f..bdc76471 100644
+--- a/Code/CryEngine/RenderDll/Common/RendererCVars.h
++++ b/Code/CryEngine/RenderDll/Common/RendererCVars.h
+@@ -670,6 +670,7 @@ public:
+ 	static float CV_r_LPVSkyLight;
+ 	static float CV_r_LPVMaxIrradiance;
+ 	static float CV_r_LPVSpecular;
++	static float CV_r_LPVTranslucentBrightness;
+ 	static float CV_r_LPVPointLights;
+ 	static float CV_r_LPVRsmMinCasterSize;
+ 	static float CV_r_LPVRsmClipRange;
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.cpp
+index 777ab891..ebd9f563 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.cpp
+@@ -1253,11 +1253,14 @@ void CLPVStage::ExecuteApply(const SScopedComputeCommandList& commandList, CText
+ 	pass.SetConstant(paramOuter2, Vec4((float)m_gridSize * outerCascade.cellSize, bOuterActive ? 1.0f : 0.0f, 0.0f, 0.0f));
+ 
+ 	// x: height map AO damping strength for the coarse cascades (0 disables the sampling).
++	// y: translucent surface irradiance gain (r_LPVTranslucentBrightness). 0 = off; the neutral 1 is
++	//    sent as 0 as well so that the default skips the shader branch.
+ 	static CCryNameR paramHmao("LPVHmaoParams");
+ 	const float hmaoStrength = (pHeightMapAO != CRendererResources::s_ptexWhite)
+ 	                           ? clamp_tpl(CRendererCVars::CV_r_LPVHeightMapOcclusion, 0.0f, 1.0f)
+ 	                           : 0.0f;
+-	pass.SetConstant(paramHmao, Vec4(hmaoStrength, 0.0f, 0.0f, 0.0f));
++	const float translucentGain = max(0.0f, CRendererCVars::CV_r_LPVTranslucentBrightness);
++	pass.SetConstant(paramHmao, Vec4(hmaoStrength, (translucentGain != 1.0f) ? translucentGain : 0.0f, 0.0f, 0.0f));
+ 
+ 	static CCryNameR paramScreenSize("LPVScreenSize");
+ 	const float fScreenWidth = (float)screenWidth;
+diff --git a/Engine/Shaders/HWScripts/CryFX/LPV.cfi b/Engine/Shaders/HWScripts/CryFX/LPV.cfi
+index 6f5c86e6..fdc84699 100644
+--- a/Engine/Shaders/HWScripts/CryFX/LPV.cfi
++++ b/Engine/Shaders/HWScripts/CryFX/LPV.cfi
+@@ -869,6 +869,7 @@ float4 LPVGridParams2Far;
+ float4 LPVGridParamsFar2;
+ float4 LPVGridParams2Far2;
+ // x: height map AO damping strength for the coarse cascades (0 = sampling disabled).
++// y: translucent surface irradiance gain (r_LPVTranslucentBrightness, 0 = disabled).
+ float4 LPVHmaoParams;
+ 
+ SamplerState LPVGridSampler : register(s0);
+@@ -929,7 +930,8 @@ void LPVApplyCS(uint3 DTid : SV_DispatchThreadID)
+ 
+ 	[branch] if (linearDepth < 1.0f)
+ 	{
+-		const float3 normal = DecodeGBufferNormal(LPVSceneNormals.Load(int3(pixelCoord, 0)));
++		const float4 gbufferA = LPVSceneNormals.Load(int3(pixelCoord, 0));
++		const float3 normal = DecodeGBufferNormal(gbufferA);
+ 
+ 		const float2 screenUV = ((float2)pixelCoord + 0.5f) * LPVScreenSize.zw;
+ 		const float3 viewRay = lerp(lerp(LPVFrustumLT.xyz, LPVFrustumRT.xyz, screenUV.x),
+@@ -1179,6 +1181,15 @@ void LPVApplyCS(uint3 DTid : SV_DispatchThreadID)
+ 
+ 		irradiance *= LPVApplyParams.x;
+ 
++		// Translucent brightness (port of SVOGI's e_svoTI_TranslucentBrightness, see the
++		// SvoParamsInject.w use in Total_Illumination.cfx): vegetation with the transmittance
++		// lighting model gets its indirect diffuse scaled, blended in by the transmittance.
++		[branch] if (LPVHmaoParams.y > 0.0f)
++		{
++			const float transmittance = saturate(DecodeGBufferTransmittanceLum(gbufferA));
++			irradiance *= lerp(1.0f, LPVHmaoParams.y, saturate(transmittance * 8.0f));
++		}
++
+ 		// Specular GI: short voxel march along the reflected eye vector in the near cascade
+ 		// (CryEngine 3 shipped the same approximation: a few cells, inverse square falloff,
+ 		// averaged). The L1 SH grid is far too coarse for mirror images - this gives metals and
+-- 
+2.47.1.windows.1
+

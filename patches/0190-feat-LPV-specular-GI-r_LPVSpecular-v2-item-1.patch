@@ -1,0 +1,302 @@
+From 93107a75dd6d52b6553d6ea4cae6ca616df4a537 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Wed, 12 Aug 2026 03:01:43 +0800
+Subject: [PATCH 190/206] feat: LPV specular GI (r_LPVSpecular) - v2 item 1
+
+Short voxel march along the reflected eye vector in the apply pass,
+the same approximation CryEngine 3 shipped: 3 cells, inverse square
+step weighting, radiance evaluated towards the surface via the SH
+direction basis. Output goes to a second screen target ($LPVSpecular)
+through the fade / intensity / MaxIrradiance chain, and plugs into the
+engine specular GI sockets: TiledShading slot 11 for deferred (ApplyGI
+mode 3 adds spec x surface reflectance) and forward slot 47 (same mode
+3 branch, automatic). r_LPVSpecular 0 binds the black texture and skips
+the march entirely.
+
+The L1 SH grid is too coarse for mirror images - this gives metals and
+wet surfaces a broad directional indirect reflection, sharp reflections
+remain SSR/probe territory.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Tu9cj9ax1mqCV93HVfCfpW
+---
+ .../RenderDll/Common/RendererCVars.cpp        |  6 +++
+ .../RenderDll/Common/RendererCVars.h          |  1 +
+ .../XRenderD3D9/GraphicsPipeline/LPV.cpp      | 23 ++++++++++-
+ .../XRenderD3D9/GraphicsPipeline/LPV.h        |  6 +++
+ .../GraphicsPipeline/SceneForward.cpp         |  7 +++-
+ .../GraphicsPipeline/TiledShading.cpp         |  5 ++-
+ Engine/Shaders/HWScripts/CryFX/LPV.cfi        | 40 +++++++++++++++++--
+ .../Shaders/HWScripts/CryFX/TiledShading.cfi  |  3 ++
+ 8 files changed, 83 insertions(+), 8 deletions(-)
+
+diff --git a/Code/CryEngine/RenderDll/Common/RendererCVars.cpp b/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
+index 2690f2cb..34e74108 100644
+--- a/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
++++ b/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
+@@ -422,6 +422,7 @@ float CRendererCVars::CV_r_LPVSecondaryBounce;
+ float CRendererCVars::CV_r_LPVOcclusion;
+ float CRendererCVars::CV_r_LPVSkyLight;
+ float CRendererCVars::CV_r_LPVMaxIrradiance;
++float CRendererCVars::CV_r_LPVSpecular;
+ int   CRendererCVars::CV_r_LPVUpdateInterval;
+ int   CRendererCVars::CV_r_LPVDebug;
+ 
+@@ -2259,6 +2260,11 @@ void CRendererCVars::InitCVars()
+ 	               "of 0.2 x the sun luminance (in the sky hue), independent of r_LPVIntensity - the level's\n"
+ 	               "TOD sky colour only contributes the hue, so the feature works on probe-lit levels too.\n"
+ 	               "Interiors receive it only through propagation via openings. 0 disables the sky light.\n");
++	REGISTER_CVAR3("r_LPVSpecular", CV_r_LPVSpecular, 1.0f, VF_NULL,
++	               "Gain of the LPV specular GI: a short voxel march (3 cells) along the reflected eye\n"
++	               "vector, the same approximation CryEngine 3 shipped. Gives metals and wet surfaces a\n"
++	               "broad indirect reflection - the SH grid is too coarse for sharp mirror images.\n"
++	               "Scales on top of r_LPVIntensity. 0 disables the march and the screen target.\n");
+ 	REGISTER_CVAR3("r_LPVMaxIrradiance", CV_r_LPVMaxIrradiance, 4.0f, VF_NULL,
+ 	               "Soft luminance rolloff (Reinhard) of the applied LPV irradiance after r_LPVIntensity.\n"
+ 	               "Dim indirect light stays linear while hot spots (sun facing white walls, outdoor one\n"
+diff --git a/Code/CryEngine/RenderDll/Common/RendererCVars.h b/Code/CryEngine/RenderDll/Common/RendererCVars.h
+index 67ac76d2..d5b09be2 100644
+--- a/Code/CryEngine/RenderDll/Common/RendererCVars.h
++++ b/Code/CryEngine/RenderDll/Common/RendererCVars.h
+@@ -667,6 +667,7 @@ public:
+ 	static float CV_r_LPVOcclusion;
+ 	static float CV_r_LPVSkyLight;
+ 	static float CV_r_LPVMaxIrradiance;
++	static float CV_r_LPVSpecular;
+ 	static int   CV_r_LPVUpdateInterval;
+ 	static int   CV_r_LPVDebug;
+ 
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.cpp
+index fb54c90e..4ad7e871 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.cpp
+@@ -138,6 +138,10 @@ void CLPVStage::Init()
+ 	std::string texName = "$LPVIrradiance" + m_graphicsPipeline.GetUniqueIdentifierName();
+ 	m_pIrradiance = CTexture::GetOrCreateTextureObjectPtr(texName.c_str(), 0, 0, 1, eTT_2D, uavFlags, LPVIrradianceFormat);
+ 
++	CRY_ASSERT(m_pSpecular == nullptr);
++	texName = "$LPVSpecular" + m_graphicsPipeline.GetUniqueIdentifierName();
++	m_pSpecular = CTexture::GetOrCreateTextureObjectPtr(texName.c_str(), 0, 0, 1, eTT_2D, uavFlags, LPVIrradianceFormat);
++
+ 	ResizeGrid(GetValidGridSize());
+ }
+ 
+@@ -201,6 +205,15 @@ void CLPVStage::Resize(int renderWidth, int renderHeight)
+ 			CryFatalError("Couldn't allocate texture.");
+ 	}
+ 
++	if (m_pSpecular != nullptr
++	    && (!CTexture::IsTextureExist(m_pSpecular)
++	        || m_pSpecular->Invalidate(renderWidth, renderHeight, LPVIrradianceFormat)))
++	{
++		m_pSpecular->Create2DTexture(renderWidth, renderHeight, 1, uavFlags, nullptr, LPVIrradianceFormat);
++		if (m_pSpecular->GetFlags() & FT_FAILED)
++			CryFatalError("Couldn't allocate texture.");
++	}
++
+ 	m_bResultValid = false;
+ }
+ 
+@@ -238,6 +251,12 @@ CTexture* CLPVStage::GetIrradianceRT() const
+ 	return (CRendererCVars::CV_r_LPV > 0 && m_bResultValid && CTexture::IsTextureExist(m_pIrradiance)) ? m_pIrradiance.get() : nullptr;
+ }
+ 
++CTexture* CLPVStage::GetSpecularRT() const
++{
++	return (CRendererCVars::CV_r_LPV > 0 && CRendererCVars::CV_r_LPVSpecular > 0.0f
++	        && m_bResultValid && CTexture::IsTextureExist(m_pSpecular)) ? m_pSpecular.get() : nullptr;
++}
++
+ bool CLPVStage::IsSvoProvidingRsm() const
+ {
+ #if defined(FEATURE_SVO_GI)
+@@ -1031,6 +1050,7 @@ void CLPVStage::ExecuteApply(const SScopedComputeCommandList& commandList, CText
+ 		static CCryNameTSCRC techName("LPVApply");
+ 		pass.SetTechnique(CShaderMan::s_shDeferredShading, techName, 0);
+ 		pass.SetOutputUAV(0, m_pIrradiance);
++		pass.SetOutputUAV(1, m_pSpecular);
+ 		pass.SetTexture(0, pLinearDepth);
+ 		pass.SetTexture(1, pSceneNormals);
+ 		pass.SetTexture(2, m_pGridAcc[m_accIndex][0]);
+@@ -1072,7 +1092,8 @@ void CLPVStage::ExecuteApply(const SScopedComputeCommandList& commandList, CText
+ 
+ 	static CCryNameR paramApply("LPVApplyParams");
+ 	pass.SetConstant(paramApply, Vec4(CRendererCVars::CV_r_LPVIntensity, (float)CRendererCVars::CV_r_LPVDebug,
+-	                                  max(0.0f, CRendererCVars::CV_r_LPVMaxIrradiance), 0.0f));
++	                                  max(0.0f, CRendererCVars::CV_r_LPVMaxIrradiance),
++	                                  max(0.0f, CRendererCVars::CV_r_LPVSpecular)));
+ 
+ 	static CCryNameR paramRsmSizeApply("LPVRsmSize");
+ 	pass.SetConstant(paramRsmSizeApply, Vec4((float)m_rsmSize, 1.0f / (float)m_rsmSize, (float)CRendererCVars::CV_r_LPVDebug, 0.0f));
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.h b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.h
+index 028f4a48..5fe04b87 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.h
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.h
+@@ -68,6 +68,10 @@ public:
+ 	// GI combine, mirrors CSvoRenderer::GetDiffuseFinRT(). Only valid after a successful Execute().
+ 	CTexture* GetIrradianceRT() const;
+ 
++	// Specular GI (short voxel march along the reflected eye vector), mirrors
++	// CSvoRenderer::GetSpecularFinRT(). Null while r_LPVSpecular is 0.
++	CTexture* GetSpecularRT() const;
++
+ private:
+ 	static int32 GetValidGridSize();
+ 
+@@ -104,6 +108,8 @@ private:
+ 	_smart_ptr<CTexture> m_pGridGV;
+ 	// Screen space output (irradiance, never pre-multiplied with albedo).
+ 	_smart_ptr<CTexture> m_pIrradiance;
++	// Screen space specular GI output (radiance along the reflected eye vector).
++	_smart_ptr<CTexture> m_pSpecular;
+ 	// Sun RSM owned by LPV (only used when SVOGI is not providing one).
+ 	_smart_ptr<CTexture> m_pRsmColor;
+ 	_smart_ptr<CTexture> m_pRsmNormal;
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/SceneForward.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/SceneForward.cpp
+index fedb2a6e..836fa5b4 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/SceneForward.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/SceneForward.cpp
+@@ -817,19 +817,22 @@ bool CSceneForwardStage::UpdatePerPassResources(bool bOnInit, bool bShadowMask,
+ #if defined(FEATURE_SVO_GI)
+ 			if (bOnInit || !CSvoRenderer::GetInstance()->IsActive() || !CSvoRenderer::GetInstance()->GetSpecularFinRT())
+ 			{
+-				// The LPV screen space irradiance takes the diffuse GI slot when SVOGI leaves it empty.
++				// The LPV screen space irradiance/specular take the GI slots when SVOGI leaves them empty.
+ 				CTexture* pFwdGiDiffuse = CRendererResources::s_ptexBlack;
++				CTexture* pFwdGiSpecular = CRendererResources::s_ptexBlack;
+ 				if (!bOnInit)
+ 				{
+ 					if (auto* pLPVStage = m_graphicsPipeline.GetStage<CLPVStage>())
+ 					{
+ 						if (CTexture* pLpvIrradiance = pLPVStage->GetIrradianceRT())
+ 							pFwdGiDiffuse = pLpvIrradiance;
++						if (CTexture* pLpvSpecular = pLPVStage->GetSpecularRT())
++							pFwdGiSpecular = pLpvSpecular;
+ 					}
+ 				}
+ 
+ 				resources.SetTexture(46, pFwdGiDiffuse, EDefaultResourceViews::Default, EShaderStage_AllWithoutCompute);
+-				resources.SetTexture(47, CRendererResources::s_ptexBlack, EDefaultResourceViews::Default, EShaderStage_AllWithoutCompute);
++				resources.SetTexture(47, pFwdGiSpecular, EDefaultResourceViews::Default, EShaderStage_AllWithoutCompute);
+ 			}
+ 			else
+ 			{
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/TiledShading.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/TiledShading.cpp
+index d09bd6a0..8c474b15 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/TiledShading.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/TiledShading.cpp
+@@ -120,9 +120,12 @@ void CTiledShadingStage::Execute()
+ 		{
+ 			if (CTexture* pLPVIrradiance = pLPVStage->GetIrradianceRT())
+ 			{
+-				// GI adds to the diffuse accumulation (nIntegrMode 3)
++				// GI adds to the diffuse (and optionally specular) accumulation (nIntegrMode 3)
+ 				pTexGiDiff = pLPVIrradiance;
+ 				rtFlags |= g_HWSR_MaskBit[HWSR_SAMPLE6];
++
++				if (CTexture* pLPVSpecular = pLPVStage->GetSpecularRT())
++					pTexGiSpec = pLPVSpecular;
+ 			}
+ 		}
+ 	}
+diff --git a/Engine/Shaders/HWScripts/CryFX/LPV.cfi b/Engine/Shaders/HWScripts/CryFX/LPV.cfi
+index 9b88c3ed..83400711 100644
+--- a/Engine/Shaders/HWScripts/CryFX/LPV.cfi
++++ b/Engine/Shaders/HWScripts/CryFX/LPV.cfi
+@@ -29,7 +29,8 @@ float4 LPVSunDir;
+ // rgb: sun colour, w: intensity calibration for the secondary bounce feedback
+ float4 LPVSunColor;
+ // x: GI intensity multiplier, y: debug mode (0 off, 1 grid uv, 2 raw L0, 3 edge fade),
+-// z: soft luminance rolloff ceiling of the applied irradiance (0 disables)
++// z: soft luminance rolloff ceiling of the applied irradiance (0 disables),
++// w: specular GI gain (0 disables the reflection march)
+ float4 LPVApplyParams;
+ // xy: screen size, zw: 1 / screen size
+ float4 LPVScreenSize;
+@@ -763,6 +764,7 @@ Texture2D<float>  LPVApplyRsmDepth : register(t6);
+ SamplerState LPVGridSampler : register(s0);
+ 
+ RWTexture2D<float4> LPVIrradianceUAV : register(u0);
++RWTexture2D<float4> LPVSpecularUAV   : register(u1);
+ 
+ [numthreads(LPV_APPLY_TILE_SIZE, LPV_APPLY_TILE_SIZE, 1)]
+ void LPVApplyCS(uint3 DTid : SV_DispatchThreadID)
+@@ -782,6 +784,7 @@ void LPVApplyCS(uint3 DTid : SV_DispatchThreadID)
+ 	}
+ 
+ 	float3 irradiance = 0;
++	float3 specular = 0;
+ 
+ 	const float linearDepth = LPVSceneDepth.Load(int3(pixelCoord, 0)).x;
+ 	const int debugMode = (int)LPVApplyParams.y;
+@@ -897,6 +900,32 @@ void LPVApplyCS(uint3 DTid : SV_DispatchThreadID)
+ 
+ 			irradiance *= fade * LPVApplyParams.x;
+ 
++			// Specular GI: short voxel march along the reflected eye vector (CryEngine 3 shipped
++			// the same approximation: a few cells, inverse square falloff, averaged). The L1 SH
++			// grid is far too coarse for mirror images - this gives metals and wet surfaces a
++			// broad directional bounce instead of nothing.
++			[branch] if (LPVApplyParams.w > 0.0f)
++			{
++				const float3 reflDir = reflect(normalize(viewRay), normal);
++				// Radiance travelling from the march point towards the surface.
++				const float4 reflEval = LPVDirSH(-reflDir);
++
++				[unroll] for (int s = 1; s <= 3; ++s)
++				{
++					const float3 marchPos = samplePos + reflDir * ((float)s * LPVGridParams.w);
++					const float3 marchUV = (marchPos - LPVGridParams.xyz) / LPVGridParams2.w;
++					if (any(marchUV < 0.0f) || any(marchUV > 1.0f))
++						break;
++
++					const float stepWeight = 1.0f / (float)(s * s);
++					specular.r += max(0.0f, dot(LPVGridR.SampleLevel(LPVGridSampler, marchUV, 0), reflEval)) * stepWeight;
++					specular.g += max(0.0f, dot(LPVGridG.SampleLevel(LPVGridSampler, marchUV, 0), reflEval)) * stepWeight;
++					specular.b += max(0.0f, dot(LPVGridB.SampleLevel(LPVGridSampler, marchUV, 0), reflEval)) * stepWeight;
++				}
++
++				specular *= fade * LPVApplyParams.x * LPVApplyParams.w;
++			}
++
+ 			// Soft highlight rolloff (Reinhard on luminance): the dim indirect response stays
+ 			// linear while hot spots (sun facing white walls, outdoor single bounce paths) are
+ 			// compressed towards the r_LPVMaxIrradiance ceiling - a high intensity can brighten
+@@ -904,14 +933,17 @@ void LPVApplyCS(uint3 DTid : SV_DispatchThreadID)
+ 			const float maxIrradiance = LPVApplyParams.z;
+ 			[branch] if (maxIrradiance > 0.0f)
+ 			{
+-				const float lum = dot(irradiance, float3(0.2126f, 0.7152f, 0.0722f));
+-				irradiance *= maxIrradiance / (maxIrradiance + lum);
++				const float3 lumWeights = float3(0.2126f, 0.7152f, 0.0722f);
++				irradiance *= maxIrradiance / (maxIrradiance + dot(irradiance, lumWeights));
++				specular *= maxIrradiance / (maxIrradiance + dot(specular, lumWeights));
+ 			}
+ 		}
+ 	}
+ 
+-	// Irradiance only, TiledShading.cfi multiplies with the surface albedo.
++	// Irradiance only, TiledShading.cfi multiplies with the surface albedo (and the specular with
++	// the surface reflectance).
+ 	LPVIrradianceUAV[pixelCoord] = float4(irradiance, 1.0f);
++	LPVSpecularUAV[pixelCoord] = float4(specular, 1.0f);
+ }
+ 
+ technique LPVApply
+diff --git a/Engine/Shaders/HWScripts/CryFX/TiledShading.cfi b/Engine/Shaders/HWScripts/CryFX/TiledShading.cfi
+index 1044ae07..e9271399 100644
+--- a/Engine/Shaders/HWScripts/CryFX/TiledShading.cfi
++++ b/Engine/Shaders/HWScripts/CryFX/TiledShading.cfi
+@@ -142,6 +142,9 @@ void ApplyGI(inout float3 specularAcc, inout float3 diffuseAcc, float3 diffuseFo
+ 	else if(nIntegrMode == 3) // Additive GI mode (Light Propagation Volumes)
+ 	{
+ 		diffuseAcc += TexGiDiffuse[pixelCoord].rgb;
++		// Reflected-ray march radiance, modulated by the surface reflectance. Black when
++		// r_LPVSpecular is 0 (the slot then holds the black texture).
++		specularAcc += TexGiSpecular[pixelCoord].rgb * surfSpecCol;
+ 	}
+ }
+ #endif
+-- 
+2.47.1.windows.1
+

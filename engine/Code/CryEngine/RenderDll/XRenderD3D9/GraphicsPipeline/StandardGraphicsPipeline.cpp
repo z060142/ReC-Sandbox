@@ -40,6 +40,7 @@
 #include "OmniCamera.h"
 #include "TiledLightVolumes.h"
 #include "DebugRenderTargets.h"
+#include "LPV.h"
 
 #include "Common/TypedConstantBuffer.h"
 #include "Common/Textures/TextureHelpers.h"
@@ -90,6 +91,7 @@ void CStandardGraphicsPipeline::Init()
 	RegisterStage<CSceneDepthStage>();
 	RegisterStage<COmniCameraStage>();
 	RegisterStage<CVolumetricFogStage>();
+	RegisterStage<CLPVStage>();
 
 	// Register and initialize all common stages
 	CGraphicsPipeline::Init();
@@ -470,6 +472,13 @@ void CStandardGraphicsPipeline::Execute()
 #endif
 		}
 
+		// Light Propagation Volumes
+		if (auto* pLPVStage = GetStage<CLPVStage>())
+		{
+			if (pLPVStage->IsStageActive(m_renderingFlags))
+				pLPVStage->Execute();
+		}
+
 		// Screen Space Reflections
 		if (GetStage<CScreenSpaceReflectionsStage>()->IsStageActive(m_renderingFlags))
 			GetStage<CScreenSpaceReflectionsStage>()->Execute();
@@ -510,6 +519,16 @@ void CStandardGraphicsPipeline::Execute()
 				GetStage<CShadowMaskStage>()->Prepare();
 				GetStage<CShadowMaskStage>()->Execute();
 
+				// Light Propagation Volumes screen space apply: deferred to this point so that the
+				// graphics passes above have rebound the OM - at the earlier grid update position the
+				// deferred decal pass may still have the scene normals bound as render target, which
+				// on D3D11 silently nulls the compute SRV (see CLPVStage::ExecuteApplyToScreen).
+				if (auto* pLPVStage = GetStage<CLPVStage>())
+				{
+					if (pLPVStage->IsStageActive(m_renderingFlags))
+						pLPVStage->ExecuteApplyToScreen();
+				}
+
 				GetStage<CTiledShadingStage>()->Execute();
 
 				if (GetStage<CScreenSpaceSSSStage>()->IsStageActive(m_renderingFlags))
@@ -525,6 +544,14 @@ void CStandardGraphicsPipeline::Execute()
 			// Opaque forward passes
 			if (GetStage<CSkyStage>()->IsStageActive(m_renderingFlags))
 				GetStage<CSkyStage>()->Execute(m_pipelineResources.m_pTexHDRTarget, pZTexture);
+		}
+
+		// Light Propagation Volumes debug probe spheres (r_LPVDebug 10). Drawn after the opaque scene
+		// has been shaded, otherwise the tiled shading would overwrite them.
+		if (auto* pLPVStage = GetStage<CLPVStage>())
+		{
+			if (pLPVStage->IsStageActive(m_renderingFlags))
+				pLPVStage->ExecuteDebugProbes(m_pipelineResources.m_pTexHDRTarget, pZTexture);
 		}
 
 		// Deferred ocean caustics

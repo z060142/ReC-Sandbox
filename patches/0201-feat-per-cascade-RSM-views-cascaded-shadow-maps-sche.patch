@@ -1,0 +1,1003 @@
+From cde29ac8b18c3fb9a19c51f6dc090ae76dbe2052 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Thu, 13 Aug 2026 00:55:30 +0800
+Subject: [PATCH 201/206] feat: per-cascade RSM views (cascaded shadow maps
+ scheme)
+
+User-proposed and correct: instead of one shared RSM stretched to the
+far cascade, every LPV cascade now owns a sun RSM view fitted to its
+own volume - the texel-to-cell ratio and the caster sweep become
+scale-invariant per cascade, which removes the entire class of shared-
+RSM pathologies (near-cascade texel coarsening, sweep-box growth
+feeding the pancake/occlusion instabilities).
+
+- ShadowMapFrustum gains nLpvCascadeIndex; CLightEntity mounts one
+  frustum per active LPV cascade (each takes a GSM slot and a cache-lod
+  slot; note HMAO + two LPV cascades saturate MAX_GSM_CACHED_LODS_NUM).
+- ShadowCache::InitLPVRsmFrustum/GetLPVBox are cascade-indexed; the
+  shared-RSM far-sizing logic is gone.
+- All RSM state in the renderer (color/normal/depth targets, matrices,
+  texel size, re-render gating) moved into SCascade and routed per
+  frustum; the RSM pass pool holds two passes; each cascade re-renders
+  on its own camera anchor (the far cascade's bigger cells re-render
+  less often).
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Tu9cj9ax1mqCV93HVfCfpW
+---
+ Code/CryEngine/Cry3DEngine/LightEntity.cpp    |  65 ++--
+ Code/CryEngine/Cry3DEngine/LightEntity.h      |   3 +-
+ Code/CryEngine/Cry3DEngine/ShadowCache.cpp    |  13 +-
+ Code/CryEngine/Cry3DEngine/ShadowCache.h      |   8 +-
+ .../RenderDll/Common/Shadow_Renderer.h        |   1 +
+ .../XRenderD3D9/GraphicsPipeline/LPV.cpp      | 294 ++++++++++--------
+ .../XRenderD3D9/GraphicsPipeline/LPV.h        |  81 +++--
+ .../GraphicsPipeline/ShadowMap.cpp            |  14 +-
+ 8 files changed, 260 insertions(+), 219 deletions(-)
+
+diff --git a/Code/CryEngine/Cry3DEngine/LightEntity.cpp b/Code/CryEngine/Cry3DEngine/LightEntity.cpp
+index 1d022987..3bb54c99 100644
+--- a/Code/CryEngine/Cry3DEngine/LightEntity.cpp
++++ b/Code/CryEngine/Cry3DEngine/LightEntity.cpp
+@@ -227,7 +227,7 @@ void CLightEntity::UpdateGSMLightSourceShadowFrustum(const SRenderingPassInfo& p
+ 
+ 	static ICVar* pHeightMapAOVar = GetConsole()->GetCVar("r_HeightMapAO");
+ 	const bool isHeightMapAOEnabled = Get3DEngine()->m_bHeightMapAoEnabled && pHeightMapAOVar && pHeightMapAOVar->GetIVal() > 0;
+-	const bool isLPVRsmEnabled = (m_light.m_Flags & DLF_SUN) && IsLPVRsmEnabled();
++	const int nLPVRsmCascades = (m_light.m_Flags & DLF_SUN) ? GetLPVRsmCascadeCount() : 0;
+ 
+ 	int nDynamicLodCount = nMaxLodCount;
+ 	int nCachedLodCount = 0;
+@@ -247,7 +247,7 @@ void CLightEntity::UpdateGSMLightSourceShadowFrustum(const SRenderingPassInfo& p
+ 
+ 		// Every consumer of the shadow cache generation marking needs its own slot in
+ 		// IRenderNode::m_shadowCacheLastRendered, so reserve one for each pseudo cascade.
+-		const int nReservedCacheLods = (isHeightMapAOEnabled ? 1 : 0) + (isLPVRsmEnabled ? 1 : 0);
++		const int nReservedCacheLods = (isHeightMapAOEnabled ? 1 : 0) + nLPVRsmCascades;
+ 		nCachedLodCount = clamp_tpl(nCachedLodCount, 0, MAX_GSM_CACHED_LODS_NUM - nReservedCacheLods);
+ 	}
+ 
+@@ -263,7 +263,7 @@ void CLightEntity::UpdateGSMLightSourceShadowFrustum(const SRenderingPassInfo& p
+ 	if (m_light.m_Flags & DLF_SUN)
+ 	{
+ 		nNextLod += UpdateGSMLightSourceCachedShadowFrustum(nDynamicLodCount, nCachedLodCount, isHeightMapAOEnabled, fDistFromView, fRadiusLastLod, passInfo);
+-		nNextLod += UpdateGSMLightSourceLPVRsmFrustum(nNextLod, nCachedLodCount + (isHeightMapAOEnabled ? 1 : 0), isLPVRsmEnabled, passInfo);
++		nNextLod += UpdateGSMLightSourceLPVRsmFrustum(nNextLod, nCachedLodCount + (isHeightMapAOEnabled ? 1 : 0), nLPVRsmCascades, passInfo);
+ 		nNextLod += UpdateGSMLightSourceNearestShadowFrustum(nNextLod, passInfo);
+ 	}
+ 
+@@ -464,36 +464,57 @@ bool CLightEntity::IsLPVRsmEnabled()
+ 	return true;
+ }
+ 
+-int CLightEntity::UpdateGSMLightSourceLPVRsmFrustum(int nFrustumIndex, int nCacheLod, bool isLPVRsmEnabled, const SRenderingPassInfo& passInfo)
++int CLightEntity::GetLPVRsmCascadeCount()
+ {
+-	CRY_ASSERT(nFrustumIndex >= 0);
+-
+-	if (nFrustumIndex < 0 || nFrustumIndex >= MAX_GSM_LODS_NUM || nCacheLod < 0 || nCacheLod >= MAX_GSM_CACHED_LODS_NUM)
++	if (!IsLPVRsmEnabled())
+ 		return 0;
+ 
+-	ShadowMapFrustumPtr& pFr = m_pShadowMapInfo->pGSM[nFrustumIndex];
++	static ICVar* pLPVCascades = GetConsole()->GetCVar("r_LPVCascades");
++	return clamp_tpl(pLPVCascades ? pLPVCascades->GetIVal() : 1, 1, 2);
++}
+ 
+-	if (!isLPVRsmEnabled)
++int CLightEntity::UpdateGSMLightSourceLPVRsmFrustum(int nFrustumIndex, int nCacheLod, int nCascadeCount, const SRenderingPassInfo& passInfo)
++{
++	CRY_ASSERT(nFrustumIndex >= 0);
++
++	int nInitialized = 0;
++
++	// Per-cascade RSM views, exactly like the cascaded shadow maps: each LPV cascade gets its own
++	// sun view fitted to its own volume. Both slots are always visited so a cascade that got
++	// disabled leaves no stale frustum behind.
++	for (int nCascade = 0; nCascade < 2; ++nCascade)
+ 	{
+-		// Make sure a frustum left over from a previous frame is not picked up as a regular cascade by
+-		// the "free not used frustums" fixup at the end of UpdateGSMLightSourceShadowFrustum().
+-		if (pFr && pFr->m_eFrustumType == ShadowMapFrustum::e_LPVRsm)
++		const int nSlot = nFrustumIndex + nInitialized;
++		const int nCascadeCacheLod = nCacheLod + nCascade;
++
++		if (nSlot < 0 || nSlot >= MAX_GSM_LODS_NUM || nCascadeCacheLod < 0 || nCascadeCacheLod >= MAX_GSM_CACHED_LODS_NUM)
++			continue;
++
++		ShadowMapFrustumPtr& pFr = m_pShadowMapInfo->pGSM[nSlot];
++
++		if (nCascade >= nCascadeCount)
+ 		{
+-			pFr->ClearUpdates(~0u);
+-			pFr->ClearSamples(~0u);
+-		}
++			// Make sure a frustum left over from a previous frame is not picked up as a regular cascade
++			// by the "free not used frustums" fixup at the end of UpdateGSMLightSourceShadowFrustum().
++			if (pFr && pFr->m_eFrustumType == ShadowMapFrustum::e_LPVRsm)
++			{
++				pFr->ClearUpdates(~0u);
++				pFr->ClearSamples(~0u);
++			}
+ 
+-		return 0;
+-	}
++			continue;
++		}
+ 
+-	CRY_ASSERT(!pFr || !pFr->pOnePassShadowView);
++		CRY_ASSERT(!pFr || !pFr->pOnePassShadowView);
+ 
+-	ShadowCacheGenerator shadowCache(this, ShadowMapFrustum::ShadowCacheData::eFullUpdate);
+-	shadowCache.InitLPVRsmFrustum(pFr, nFrustumIndex, nCacheLod, passInfo);
++		ShadowCacheGenerator shadowCache(this, ShadowMapFrustum::ShadowCacheData::eFullUpdate);
++		shadowCache.InitLPVRsmFrustum(pFr, nSlot, nCascadeCacheLod, nCascade, passInfo);
+ 
+-	CollectShadowCascadeForOnePassTraversal(pFr);
++		CollectShadowCascadeForOnePassTraversal(pFr);
++		++nInitialized;
++	}
+ 
+-	return 1;
++	return nInitialized;
+ }
+ 
+ int CLightEntity::UpdateGSMLightSourceNearestShadowFrustum(int nFrustumIndex, const SRenderingPassInfo& passInfo)
+diff --git a/Code/CryEngine/Cry3DEngine/LightEntity.h b/Code/CryEngine/Cry3DEngine/LightEntity.h
+index 43d0e93b..d387ab68 100644
+--- a/Code/CryEngine/Cry3DEngine/LightEntity.h
++++ b/Code/CryEngine/Cry3DEngine/LightEntity.h
+@@ -73,7 +73,8 @@ public:
+ 	void                                 UpdateGSMLightSourceShadowFrustum(const SRenderingPassInfo& passInfo);
+ 	int                                  UpdateGSMLightSourceDynamicShadowFrustum(int nDynamicLodCount, int nDistanceLodCount, float& fDistanceFromViewLastDynamicLod, float& fGSMBoxSizeLastDynamicLod, bool bFadeLastCascade, const SRenderingPassInfo& passInfo);
+ 	int                                  UpdateGSMLightSourceCachedShadowFrustum(int nFirstLod, int nLodCount, bool isHeightMapAOEnabled, float& fDistFromViewDynamicLod, float fRadiusDynamicLod, const SRenderingPassInfo& passInfo);
+-	int                                  UpdateGSMLightSourceLPVRsmFrustum(int nFrustumIndex, int nCacheLod, bool isLPVRsmEnabled, const SRenderingPassInfo& passInfo);
++	int                                  UpdateGSMLightSourceLPVRsmFrustum(int nFrustumIndex, int nCacheLod, int nCascadeCount, const SRenderingPassInfo& passInfo);
++	static int                           GetLPVRsmCascadeCount();
+ 	int                                  UpdateGSMLightSourceNearestShadowFrustum(int nFrustumIndex, const SRenderingPassInfo& passInfo);
+ 	static bool                          IsLPVRsmEnabled();
+ 	bool                                 ProcessFrustum(int nLod, float fCamBoxSize, float fDistanceFromView, PodArray<struct SPlaneObject>& lstCastersHull, const SRenderingPassInfo& passInfo);
+diff --git a/Code/CryEngine/Cry3DEngine/ShadowCache.cpp b/Code/CryEngine/Cry3DEngine/ShadowCache.cpp
+index b3581839..d285ae1e 100644
+--- a/Code/CryEngine/Cry3DEngine/ShadowCache.cpp
++++ b/Code/CryEngine/Cry3DEngine/ShadowCache.cpp
+@@ -278,16 +278,16 @@ void ShadowCacheGenerator::InitHeightMapAOFrustum(ShadowMapFrustumPtr& pFr, int
+ 	InitCachedFrustum(pFr, nUpdateStrategy, nLod, nLod - nFirstStaticLod, nTexRes, lightPos, projectionBoundsLS, passInfo);
+ }
+ 
+-AABB ShadowCacheGenerator::GetLPVBox(const SRenderingPassInfo& passInfo)
++AABB ShadowCacheGenerator::GetLPVBox(const SRenderingPassInfo& passInfo, int nCascade)
+ {
+ 	static ICVar* pLPVSize = gEnv->pConsole->GetCVar("r_LPVSize");
+ 	static ICVar* pLPVGridSize = gEnv->pConsole->GetCVar("r_LPVGridSize");
+-	static ICVar* pLPVCascades = gEnv->pConsole->GetCVar("r_LPVCascades");
+ 	static ICVar* pLPVCascadeScale = gEnv->pConsole->GetCVar("r_LPVCascadeScale");
+ 
+-	// The RSM has to cover the largest cascade: the far cascade extent is size * scale.
++	// Every cascade owns its own RSM fitted to its own volume, like the cascaded shadow maps: the
++	// texel-to-cell ratio and the caster sweep stay scale-invariant per cascade.
+ 	float extent = max(1.0f, pLPVSize ? pLPVSize->GetFVal() : 96.0f);
+-	if (pLPVCascades && pLPVCascades->GetIVal() > 1)
++	if (nCascade > 0)
+ 		extent *= max(1.0f, pLPVCascadeScale ? pLPVCascadeScale->GetFVal() : 4.0f);
+ 
+ 	// Same clamping as CLPVStage::GetValidGridSize().
+@@ -337,7 +337,7 @@ bool ShadowCacheGenerator::IsStableRsmCaster(EERType type)
+ 	}
+ }
+ 
+-void ShadowCacheGenerator::InitLPVRsmFrustum(ShadowMapFrustumPtr& pFr, int nLod, int nCacheLod, const SRenderingPassInfo& passInfo)
++void ShadowCacheGenerator::InitLPVRsmFrustum(ShadowMapFrustumPtr& pFr, int nLod, int nCacheLod, int nCascade, const SRenderingPassInfo& passInfo)
+ {
+ 	FUNCTION_PROFILER_3DENGINE;
+ 
+@@ -350,7 +350,7 @@ void ShadowCacheGenerator::InitLPVRsmFrustum(ShadowMapFrustumPtr& pFr, int nLod,
+ 	static ICVar* pLPVRsmSamples = gEnv->pConsole->GetCVar("r_LPVRSMSamples");
+ 
+ 	const SRenderLight& light = m_pLightEntity->GetLightProperties();
+-	const AABB lpvBox = GetLPVBox(passInfo);
++	const AABB lpvBox = GetLPVBox(passInfo, nCascade);
+ 	const Vec3 boxCentre = lpvBox.GetCenter();
+ 	const float halfExtent = lpvBox.GetSize().x * 0.5f;
+ 
+@@ -432,6 +432,7 @@ void ShadowCacheGenerator::InitLPVRsmFrustum(ShadowMapFrustumPtr& pFr, int nLod,
+ 	pFr->nUpdateFrameId = passInfo.GetFrameID();
+ 	pFr->nShadowMapLod = nLod;
+ 	pFr->nShadowCacheLod = nCacheLod;
++	pFr->nLpvCascadeIndex = (uint8)nCascade;
+ 	pFr->nTexSize = nTexRes;
+ 	pFr->fRadius = light.m_fRadius;
+ 
+diff --git a/Code/CryEngine/Cry3DEngine/ShadowCache.h b/Code/CryEngine/Cry3DEngine/ShadowCache.h
+index 6de85b22..f40e797b 100644
+--- a/Code/CryEngine/Cry3DEngine/ShadowCache.h
++++ b/Code/CryEngine/Cry3DEngine/ShadowCache.h
+@@ -17,11 +17,11 @@ public:
+ 
+ 	void InitShadowFrustum(ShadowMapFrustumPtr& pFr, int nLod, int nFirstStaticLod, float fDistFromViewDynamicLod, float fRadiusDynamicLod, const SRenderingPassInfo& passInfo);
+ 	void InitHeightMapAOFrustum(ShadowMapFrustumPtr& pFr, int nLod, int nFirstStaticLod, const SRenderingPassInfo& passInfo);
+-	void InitLPVRsmFrustum(ShadowMapFrustumPtr& pFr, int nLod, int nCacheLod, const SRenderingPassInfo& passInfo);
++	void InitLPVRsmFrustum(ShadowMapFrustumPtr& pFr, int nLod, int nCacheLod, int nCascade, const SRenderingPassInfo& passInfo);
+ 
+-	// World space box the light propagation volume covers this frame. Has to stay in sync with
+-	// CLPVStage::UpdateFrameParameters(), which derives the grid origin the very same way.
+-	static AABB GetLPVBox(const SRenderingPassInfo& passInfo);
++	// World space box the given light propagation volume cascade covers this frame. Has to stay in
++	// sync with CLPVStage::UpdateCascadeParameters(), which derives the grid origin the very same way.
++	static AABB GetLPVBox(const SRenderingPassInfo& passInfo, int nCascade);
+ 
+ 	// True for render node types whose shadow submission is deterministic with respect to the main
+ 	// camera. See COctreeNode::RenderObjectIntoShadowViews for why the others are excluded.
+diff --git a/Code/CryEngine/RenderDll/Common/Shadow_Renderer.h b/Code/CryEngine/RenderDll/Common/Shadow_Renderer.h
+index 41fab931..3f4119ac 100644
+--- a/Code/CryEngine/RenderDll/Common/Shadow_Renderer.h
++++ b/Code/CryEngine/RenderDll/Common/Shadow_Renderer.h
+@@ -153,6 +153,7 @@ public:
+ 	IRenderViewPtr                  pOnePassShadowView;           // if one-pass octree traversal is used this view is allocated and filled by 3DEngine
+ 	int                             nShadowMapLod;                // currently use as GSMLod, can be used as cubemap side, -1 means this variable is not used
+ 	int                             nShadowCacheLod;
++	uint8                           nLpvCascadeIndex = 0;         // e_LPVRsm only: which LPV cascade this RSM view feeds
+ 	uint32                          m_Flags;
+ 
+ 	// Render view that is used to accumulate items for this frustum.
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.cpp
+index 70e736b6..f544f2a9 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.cpp
+@@ -39,25 +39,18 @@ ETEX_Format lpvRsmDepthFormat()
+ CLPVStage::CLPVStage(CGraphicsPipeline& graphicsPipeline)
+ 	: CGraphicsPipelineStage(graphicsPipeline)
+ 	, m_pIrradiance(nullptr)
+-	, m_pRsmColor(nullptr)
+-	, m_pRsmNormal(nullptr)
+-	, m_pRsmDepth(nullptr)
+ 	, m_passApply(&graphicsPipeline, CComputeRenderPass::eFlags_ReflectConstantBuffersFromShader)
+ 	, m_gridSize(0)
+-	, m_rsmSize(0)
+-	, m_rsmSampleCount(0)
+-	, m_rsmSampleStride(1)
+ 	, m_lastSunDir(ZERO)
+ 	, m_lastSunColor(ZERO)
+ 	, m_framesSinceRelight(0)
+ 	, m_bForceRelight(true)
+ 	, m_bResultValid(false)
+ {
+-	m_rsmToWorld.SetIdentity();
+-	m_worldToRsm.SetIdentity();
+-
+-	for (auto& cascade : m_cascades)
++	for (int32 n = 0; n < MaxCascadeNum; ++n)
+ 	{
++		SCascade& cascade = m_cascades[n];
++
+ 		auto configurePass = [&graphicsPipeline](CComputeRenderPass& pass)
+ 		{
+ 			pass.SetFlags(CComputeRenderPass::eFlags_ReflectConstantBuffersFromShader);
+@@ -71,15 +64,44 @@ CLPVStage::CLPVStage(CGraphicsPipeline& graphicsPipeline)
+ 			configurePass(pass);
+ 		for (auto& pass : cascade.passTemporal)
+ 			configurePass(pass);
++
++		cascade.rsmToWorld.SetIdentity();
++		cascade.worldToRsm.SetIdentity();
++
++		// The RSM texture objects have to exist before CShadowMapStage::Init() runs, which happens
++		// before CLPVStage::Init(). The device resources are created on demand in GetRsmColorMap().
++		const std::string suffix = std::to_string(n) + m_graphicsPipeline.GetUniqueIdentifierName();
++		std::string texName = "LPV_SUN_RSM_COLOR" + suffix;
++		cascade.pRsmColor = CTexture::GetOrCreateTextureObjectPtr(texName.c_str(), 0, 0, 1, eTT_2D, FT_STATE_CLAMP, LPVRsmFormat);
++
++		texName = "LPV_SUN_RSM_NORMAL" + suffix;
++		cascade.pRsmNormal = CTexture::GetOrCreateTextureObjectPtr(texName.c_str(), 0, 0, 1, eTT_2D, FT_STATE_CLAMP, LPVRsmFormat);
+ 	}
++}
++
++CTexture* CLPVStage::GetRsmColorTexture() const
++{
++	return m_cascades[0].pRsmColor.get();
++}
++
++CTexture* CLPVStage::GetRsmNormalTexture() const
++{
++	return m_cascades[0].pRsmNormal.get();
++}
++
++CLPVStage::SCascade& CLPVStage::CascadeForFrustum(const ShadowMapFrustum& rFr)
++{
++	return m_cascades[min<int32>(rFr.nLpvCascadeIndex, MaxCascadeNum - 1)];
++}
+ 
+-	// The RSM texture objects have to exist before CShadowMapStage::Init() runs, which happens before
+-	// CLPVStage::Init(). The device resources are created on demand in GetRsmColorMap()/GetRsmNormalMap().
+-	std::string texName = "LPV_SUN_RSM_COLOR" + m_graphicsPipeline.GetUniqueIdentifierName();
+-	m_pRsmColor = CTexture::GetOrCreateTextureObjectPtr(texName.c_str(), 0, 0, 1, eTT_2D, FT_STATE_CLAMP, LPVRsmFormat);
++const CLPVStage::SCascade& CLPVStage::CascadeForFrustum(const ShadowMapFrustum& rFr) const
++{
++	return m_cascades[min<int32>(rFr.nLpvCascadeIndex, MaxCascadeNum - 1)];
++}
+ 
+-	texName = "LPV_SUN_RSM_NORMAL" + m_graphicsPipeline.GetUniqueIdentifierName();
+-	m_pRsmNormal = CTexture::GetOrCreateTextureObjectPtr(texName.c_str(), 0, 0, 1, eTT_2D, FT_STATE_CLAMP, LPVRsmFormat);
++void CLPVStage::NotifyRsmRender(const ShadowMapFrustum& rFr)
++{
++	CascadeForFrustum(rFr).bRsmRenderedThisFrame = true;
+ }
+ 
+ int32 CLPVStage::GetValidGridSize()
+@@ -260,17 +282,12 @@ CTexture* CLPVStage::GetSpecularRT() const
+ 	        && m_bResultValid && CTexture::IsTextureExist(m_pSpecular)) ? m_pSpecular.get() : nullptr;
+ }
+ 
+-bool CLPVStage::WantsRsmRender()
++bool CLPVStage::WantsRsmRender(const ShadowMapFrustum& rFr)
+ {
+-	if (m_bForceRelight)
+-		return true;
++	SCascade& cascade = CascadeForFrustum(rFr);
+ 
+-	const int32 cascadeCount = GetActiveCascadeCount();
+-	for (int32 i = 0; i < cascadeCount; ++i)
+-	{
+-		if (!m_cascades[i].bHistoryValid)
+-			return true;
+-	}
++	if (m_bForceRelight || !cascade.bHistoryValid)
++		return true;
+ 
+ 	// Same sun change thresholds as the relight gate in Execute().
+ 	if (CRenderView* pRenderView = RenderView())
+@@ -282,19 +299,19 @@ bool CLPVStage::WantsRsmRender()
+ 		if ((fabsf(sunColor.x - m_lastSunColor.x) + fabsf(sunColor.y - m_lastSunColor.y) + fabsf(sunColor.z - m_lastSunColor.z)) > 0.01f)
+ 			return true;
+ 
+-		// Camera anchor: the RSM box follows the camera, but the far-cascade sized content keeps
+-		// covering the (much smaller) volume for small movements - re-render only past ~2 near
+-		// cells. A stationary camera never re-renders from this criterion.
+-		const float nearCellSize = max(1.0f, CRendererCVars::CV_r_LPVSize) / (float)max(1, m_gridSize);
++		// Camera anchor: the RSM view is camera anchored, but the content keeps covering the volume
++		// for small movements - re-render only past ~2 cells of THIS cascade (the far cascade's
++		// bigger cells re-render less often). A stationary camera never re-renders from this
++		// criterion.
+ 		const Vec3 camPos = pRenderView->GetCamera(CCamera::eEye_Left).GetPosition();
+-		if ((camPos - m_rsmRenderCamPos).GetLengthSquared() > sqr(2.0f * nearCellSize))
++		if ((camPos - cascade.rsmRenderCamPos).GetLengthSquared() > sqr(2.0f * max(0.01f, cascade.cellSize)))
+ 			return true;
+ 	}
+ 
+ 	// Slow content-refresh fallback (doors opening, parked vehicles, streamed geometry): four
+ 	// relight heartbeats. With r_LPVUpdateInterval 0 the RSM refreshes every frame.
+ 	const int32 interval = max(0, CRendererCVars::CV_r_LPVUpdateInterval);
+-	if (interval == 0 || m_framesSinceRsmRender >= interval * 4)
++	if (interval == 0 || cascade.framesSinceRsmRender >= interval * 4)
+ 		return true;
+ 
+ 	return false;
+@@ -349,13 +366,15 @@ CTexture* CLPVStage::GetRsmColorMap(const ShadowMapFrustum& rFr, bool bCheckUpda
+ 	if (!IsRsmFrustum(rFr))
+ 		return nullptr;
+ 
++	SCascade& cascade = CascadeForFrustum(rFr);
++
+ 	if (bCheckUpdate)
+ 	{
+-		const std::string texName = "LPV_SUN_RSM_COLOR" + m_graphicsPipeline.GetUniqueIdentifierName();
+-		CheckCreateUpdateRsmTarget(m_pRsmColor, rFr.nShadowMapSize, texName.c_str());
++		const std::string texName = "LPV_SUN_RSM_COLOR" + std::to_string(rFr.nLpvCascadeIndex) + m_graphicsPipeline.GetUniqueIdentifierName();
++		CheckCreateUpdateRsmTarget(cascade.pRsmColor, rFr.nShadowMapSize, texName.c_str());
+ 	}
+ 
+-	return CTexture::IsTextureExist(m_pRsmColor) ? m_pRsmColor.get() : nullptr;
++	return CTexture::IsTextureExist(cascade.pRsmColor) ? cascade.pRsmColor.get() : nullptr;
+ }
+ 
+ CTexture* CLPVStage::GetRsmNormalMap(const ShadowMapFrustum& rFr, bool bCheckUpdate)
+@@ -368,13 +387,15 @@ CTexture* CLPVStage::GetRsmNormalMap(const ShadowMapFrustum& rFr, bool bCheckUpd
+ 	if (!IsRsmFrustum(rFr))
+ 		return nullptr;
+ 
++	SCascade& cascade = CascadeForFrustum(rFr);
++
+ 	if (bCheckUpdate)
+ 	{
+-		const std::string texName = "LPV_SUN_RSM_NORMAL" + m_graphicsPipeline.GetUniqueIdentifierName();
+-		CheckCreateUpdateRsmTarget(m_pRsmNormal, rFr.nShadowMapSize, texName.c_str());
++		const std::string texName = "LPV_SUN_RSM_NORMAL" + std::to_string(rFr.nLpvCascadeIndex) + m_graphicsPipeline.GetUniqueIdentifierName();
++		CheckCreateUpdateRsmTarget(cascade.pRsmNormal, rFr.nShadowMapSize, texName.c_str());
+ 	}
+ 
+-	return CTexture::IsTextureExist(m_pRsmNormal) ? m_pRsmNormal.get() : nullptr;
++	return CTexture::IsTextureExist(cascade.pRsmNormal) ? cascade.pRsmNormal.get() : nullptr;
+ }
+ 
+ CTexture* CLPVStage::GetRsmDepthMap(const ShadowMapFrustum& rFr, bool bCheckUpdate)
+@@ -382,25 +403,27 @@ CTexture* CLPVStage::GetRsmDepthMap(const ShadowMapFrustum& rFr, bool bCheckUpda
+ 	if (!IsRsmFrustum(rFr))
+ 		return nullptr;
+ 
++	SCascade& cascade = CascadeForFrustum(rFr);
++
+ 	if (bCheckUpdate)
+ 	{
+ 		const int32 size = rFr.nShadowMapSize;
+ 		const ETEX_Format depthFormat = lpvRsmDepthFormat();
+ 
+-		if (!m_pRsmDepth)
++		if (!cascade.pRsmDepth)
+ 		{
+-			const std::string texName = "$LPV_SUN_RSM_DEPTH" + m_graphicsPipeline.GetUniqueIdentifierName();
+-			m_pRsmDepth = CTexture::GetOrCreateDepthStencilPtr(texName.c_str(), size, size, Clr_FarPlane, eTT_2D, FT_DONT_STREAM, depthFormat);
++			const std::string texName = "$LPV_SUN_RSM_DEPTH" + std::to_string(rFr.nLpvCascadeIndex) + m_graphicsPipeline.GetUniqueIdentifierName();
++			cascade.pRsmDepth = CTexture::GetOrCreateDepthStencilPtr(texName.c_str(), size, size, Clr_FarPlane, eTT_2D, FT_DONT_STREAM, depthFormat);
+ 		}
+ 
+-		if (m_pRsmDepth && (!CTexture::IsTextureExist(m_pRsmDepth) || m_pRsmDepth->Invalidate(size, size, depthFormat)))
+-			m_pRsmDepth->CreateDepthStencil(depthFormat, Clr_FarPlane);
++		if (cascade.pRsmDepth && (!CTexture::IsTextureExist(cascade.pRsmDepth) || cascade.pRsmDepth->Invalidate(size, size, depthFormat)))
++			cascade.pRsmDepth->CreateDepthStencil(depthFormat, Clr_FarPlane);
+ 	}
+ 
+-	return CTexture::IsTextureExist(m_pRsmDepth) ? m_pRsmDepth.get() : nullptr;
++	return CTexture::IsTextureExist(cascade.pRsmDepth) ? cascade.pRsmDepth.get() : nullptr;
+ }
+ 
+-const ShadowMapFrustum* CLPVStage::FindRsmFrustum() const
++const ShadowMapFrustum* CLPVStage::FindRsmFrustum(int32 cascadeIndex) const
+ {
+ 	const CRenderView* pRenderView = RenderView();
+ 	if (!pRenderView)
+@@ -409,9 +432,9 @@ const ShadowMapFrustum* CLPVStage::FindRsmFrustum() const
+ 	for (const auto& pFrustumToRender : pRenderView->GetShadowFrustumsByType(CRenderView::eShadowFrustumRenderType_LPVRsm))
+ 	{
+ 		const ShadowMapFrustum* pFrustum = pFrustumToRender->pFrustum;
+-		if (pFrustum && pFrustum->m_eFrustumType == ShadowMapFrustum::e_LPVRsm)
++		if (pFrustum && pFrustum->m_eFrustumType == ShadowMapFrustum::e_LPVRsm && (int32)pFrustum->nLpvCascadeIndex == cascadeIndex)
+ 		{
+-			if (CRendererCVars::CV_r_LPVDebug > 0 && pFrustumToRender->pShadowsView)
++			if (CRendererCVars::CV_r_LPVDebug > 0 && cascadeIndex == 0 && pFrustumToRender->pShadowsView)
+ 			{
+ 				// Render item count of the RSM shadow view, logged on change: tells whether casters
+ 				// disappear on the submission side (count drops) or in the collection (count stable
+@@ -432,23 +455,23 @@ const ShadowMapFrustum* CLPVStage::FindRsmFrustum() const
+ 	return nullptr;
+ }
+ 
+-bool CLPVStage::UpdateFrameParameters(const ShadowMapFrustum& frustum, const CTexture* pRsmColor)
++bool CLPVStage::UpdateFrameParameters(SCascade& cascade, const ShadowMapFrustum& frustum, const CTexture* pRsmColor)
+ {
+-	// Use the stage's own persistent depth target, NOT frustum.pDepthTex: on the frames the RSM
++	// Use the cascade's own persistent depth target, NOT frustum.pDepthTex: on the frames the RSM
+ 	// pass is dropped (WantsRsmRender() gating) the shadow prep stomps the frustum pointer with
+ 	// the empty far plane texture, while our texture still holds the last rendered RSM.
+-	if (!CTexture::IsTextureExist(m_pRsmDepth))
++	if (!CTexture::IsTextureExist(cascade.pRsmDepth))
+ 		return false;
+ 
+ 	// The injection pass reads depth, albedo and normal at the same texel, so all three RSM targets
+ 	// have to share the resolution of the RSM view.
+-	m_rsmSize = pRsmColor->GetWidth();
+-	if (m_rsmSize <= 0 || m_rsmSize != m_pRsmDepth->GetWidth())
++	cascade.rsmSize = pRsmColor->GetWidth();
++	if (cascade.rsmSize <= 0 || cascade.rsmSize != cascade.pRsmDepth->GetWidth())
+ 		return false;
+ 
+ 	const int32 wantedSamples = clamp_tpl(CRendererCVars::CV_r_LPVRSMSamples, 64, MaxRsmSampleCount);
+-	m_rsmSampleStride = max(1, m_rsmSize / wantedSamples);
+-	m_rsmSampleCount = max(1, m_rsmSize / m_rsmSampleStride);
++	cascade.rsmSampleStride = max(1, cascade.rsmSize / wantedSamples);
++	cascade.rsmSampleCount = max(1, cascade.rsmSize / cascade.rsmSampleStride);
+ 
+ 	// Build the RSM texture space -> world space transform used to place the VPLs.
+ 	// ConfigShadowTexgen() returns world -> (u, v, z, w). The dedicated RSM view is built by the very
+@@ -461,29 +484,29 @@ bool CLPVStage::UpdateFrameParameters(const ShadowMapFrustum& frustum, const CTe
+ 
+ 	Matrix44A worldToRsm = shadowsSetup.ShadowMat;
+ 
+-	m_worldToRsm = worldToRsm;
+-	m_rsmToWorld = worldToRsm.GetInverted();
++	cascade.worldToRsm = worldToRsm;
++	cascade.rsmToWorld = worldToRsm.GetInverted();
+ 
+ 	// World size of one sampled RSM texel. The inverse is only defined up to a projective scale,
+ 	// dehomogenize before measuring. Used by the injection weight (surfel footprint / cascade cell
+ 	// footprint) and the geometry volume blocking potential.
+ 	{
+-		Vec4 rsmCorner0 = m_rsmToWorld * Vec4(0.0f, 0.0f, 0.5f, 1.0f);
+-		Vec4 rsmCorner1 = m_rsmToWorld * Vec4(1.0f, 0.0f, 0.5f, 1.0f);
++		Vec4 rsmCorner0 = cascade.rsmToWorld * Vec4(0.0f, 0.0f, 0.5f, 1.0f);
++		Vec4 rsmCorner1 = cascade.rsmToWorld * Vec4(1.0f, 0.0f, 0.5f, 1.0f);
+ 		if (fabsf(rsmCorner0.w) > 1e-12f)
+ 			rsmCorner0 = rsmCorner0 / rsmCorner0.w;
+ 		if (fabsf(rsmCorner1.w) > 1e-12f)
+ 			rsmCorner1 = rsmCorner1 / rsmCorner1.w;
+ 		const Vec3 rsmSpan = Vec3(rsmCorner1.x - rsmCorner0.x, rsmCorner1.y - rsmCorner0.y, rsmCorner1.z - rsmCorner0.z);
+-		m_rsmTexelSize = rsmSpan.GetLength() / (float)m_rsmSampleCount;
++		cascade.rsmTexelSize = rsmSpan.GetLength() / (float)cascade.rsmSampleCount;
+ 	}
+ 
+-	if (CRendererCVars::CV_r_LPVDebug > 0)
++	if (CRendererCVars::CV_r_LPVDebug > 0 && &cascade == &m_cascades[0])
+ 	{
+ 		// CPU side sanity check of the matrix chain: the RSM centre at mid depth has to land in the
+ 		// vicinity of the volume (and the camera), and the roundtrip has to reproduce the input.
+ 		const Vec4 rsmCenter(0.5f, 0.5f, 0.5f, 1.0f);
+-		const Vec4 worldH = m_rsmToWorld * rsmCenter;
++		const Vec4 worldH = cascade.rsmToWorld * rsmCenter;
+ 		const Vec3 world = Vec3(worldH.x, worldH.y, worldH.z) / worldH.w;
+ 		// Homogeneous matrices are only defined up to scale, so both results have to be dehomogenized
+ 		// before they are compared (the first version of this log line skipped the divide and made a
+@@ -498,8 +521,8 @@ bool CLPVStage::UpdateFrameParameters(const ShadowMapFrustum& frustum, const CTe
+ 		       camPos.x, camPos.y, camPos.z,
+ 		       shadowsSetup.RecpFarDist, frustum.nShadowMapLod,
+ 		       (int)frustum.m_eFrustumType, (int)ShadowMapFrustum::e_LPVRsm,
+-		       m_rsmSize,
+-		       m_pRsmDepth ? m_pRsmDepth->GetName() : "null");
++		       cascade.rsmSize,
++		       cascade.pRsmDepth ? cascade.pRsmDepth->GetName() : "null");
+ 	}
+ 
+ 	return true;
+@@ -593,49 +616,6 @@ void CLPVStage::Execute()
+ 		return;
+ 	}
+ 
+-	const ShadowMapFrustum* pFrustum = FindRsmFrustum();
+-	if (!pFrustum)
+-	{
+-		LpvDebugLogExecuteState(5);
+-		return;
+-	}
+-
+-	CTexture* pRsmColor = GetRsmColorMap(*pFrustum);
+-	CTexture* pRsmNormal = GetRsmNormalMap(*pFrustum);
+-	if (!pRsmColor || !pRsmNormal)
+-	{
+-		LpvDebugLogExecuteState(6);
+-		return;
+-	}
+-
+-	++m_framesSinceRsmRender;
+-
+-	if (m_bRsmRenderedThisFrame)
+-	{
+-		m_bRsmRenderedThisFrame = false;
+-
+-		// Pin the injection matrices to the freshly rendered content. On the frames the RSM pass
+-		// is dropped the frustum keeps moving with the camera, so recomputing the matrices there
+-		// would make them disagree with the stored texels - matrices and content have to snapshot
+-		// together.
+-		if (!UpdateFrameParameters(*pFrustum, pRsmColor))
+-		{
+-			LpvDebugLogExecuteState(7);
+-			return;
+-		}
+-
+-		m_rsmRenderCamPos = GetCurrentViewInfo().cameraOrigin;
+-		m_framesSinceRsmRender = 0;
+-	}
+-	else if (m_rsmSize <= 0 || !CTexture::IsTextureExist(m_pRsmDepth))
+-	{
+-		// No RSM has ever been rendered (stage just enabled) - nothing to inject from yet.
+-		LpvDebugLogExecuteState(7);
+-		return;
+-	}
+-
+-	LpvDebugLogExecuteState(0);
+-
+ 	PROFILE_LABEL_SCOPE("LPV");
+ 
+ 	const bool bAsynchronous = false;
+@@ -725,20 +705,55 @@ void CLPVStage::Execute()
+ 
+ 		UpdateCascadeParameters(cascade, i);
+ 
++		// Every cascade owns its own RSM view (cascaded shadow maps scheme).
++		const ShadowMapFrustum* pFrustum = FindRsmFrustum(i);
++		CTexture* pRsmColor = pFrustum ? GetRsmColorMap(*pFrustum) : nullptr;
++		CTexture* pRsmNormal = pFrustum ? GetRsmNormalMap(*pFrustum) : nullptr;
++
++		if (i == 0 && (!pFrustum || !pRsmColor || !pRsmNormal))
++			LpvDebugLogExecuteState(pFrustum ? 6 : 5);
++
++		++cascade.framesSinceRsmRender;
++
++		if (cascade.bRsmRenderedThisFrame)
++		{
++			cascade.bRsmRenderedThisFrame = false;
++
++			// Pin the injection matrices to the freshly rendered content. On the frames the RSM
++			// pass is dropped the frustum keeps moving with the camera, so recomputing the
++			// matrices there would make them disagree with the stored texels - matrices and
++			// content have to snapshot together.
++			if (pFrustum && pRsmColor && pRsmNormal && UpdateFrameParameters(cascade, *pFrustum, pRsmColor))
++			{
++				cascade.rsmRenderCamPos = GetCurrentViewInfo().cameraOrigin;
++				cascade.framesSinceRsmRender = 0;
++			}
++		}
++
++		// No RSM has ever been rendered for this cascade - nothing to inject from yet.
++		if (cascade.rsmSize <= 0 || !CTexture::IsTextureExist(cascade.pRsmDepth) || !CTexture::IsTextureExist(cascade.pRsmColor) || !CTexture::IsTextureExist(cascade.pRsmNormal))
++		{
++			if (i == 0)
++				LpvDebugLogExecuteState(7);
++			continue;
++		}
++
++		if (i == 0)
++			LpvDebugLogExecuteState(0);
++
+ 		bool bRelight = bRelightAll || !cascade.bHistoryValid;
+ 		// A cell crossing does NOT trigger a relight anymore: the frozen grid stays anchored at its
+ 		// old origin (which the apply reads, so it remains exactly correct) and the heartbeat
+-		// catches up - relighting on every crossed cell made the full chain run every few frames
+-		// while moving, which together with the per-frame RSM render pushed the cost above SVOGI.
+-		// Only a teleport sized jump (a quarter of the volume) forces an immediate relight.
++		// catches up. Only a teleport sized jump (a quarter of the volume) forces an immediate
++		// relight.
+ 		const float teleportDistSq = sqr(cascade.cellSize * (float)m_gridSize * 0.25f);
+ 		bRelight |= (cascade.gridOrigin - cascade.prevGridOrigin).GetLengthSquared() > teleportDistSq;
+ 
+ 		if (bRelight)
+ 		{
+ 			ExecuteClear(cascade, commandList);
+-			ExecuteInject(cascade, commandList, m_pRsmDepth, pRsmColor, pRsmNormal);
+-			ExecuteResolve(cascade, commandList, m_pRsmDepth);
++			ExecuteInject(cascade, commandList);
++			ExecuteResolve(cascade, commandList);
+ 			ExecutePropagate(cascade, commandList);
+ 			ExecuteTemporal(cascade, commandList);
+ 
+@@ -763,8 +778,11 @@ void CLPVStage::Execute()
+ 	}
+ 
+ 	// The screen space apply runs later in the pipeline (ExecuteApplyToScreen), see LPV.h.
+-	m_pApplyRsmDepth = m_pRsmDepth;
+-	m_bGridReadyForApply = true;
++	if (m_cascades[0].bHistoryValid && CTexture::IsTextureExist(m_cascades[0].pRsmDepth))
++	{
++		m_pApplyRsmDepth = m_cascades[0].pRsmDepth;
++		m_bGridReadyForApply = true;
++	}
+ }
+ 
+ void CLPVStage::ExecuteApplyToScreen()
+@@ -809,18 +827,18 @@ void CLPVStage::ExecuteClear(SCascade& cascade, const SScopedComputeCommandList&
+ 	pass.Execute(commandList);
+ }
+ 
+-void CLPVStage::ExecuteInject(SCascade& cascade, const SScopedComputeCommandList& commandList, CTexture* pRsmDepth, CTexture* pRsmColor, CTexture* pRsmNormal)
++void CLPVStage::ExecuteInject(SCascade& cascade, const SScopedComputeCommandList& commandList)
+ {
+ 	auto& pass = cascade.passInject;
+ 
+-	if (pass.IsDirty(m_gridSize, pRsmColor->GetID(), pRsmNormal->GetID(), pRsmDepth->GetID()))
++	if (pass.IsDirty(m_gridSize, cascade.pRsmColor->GetID(), cascade.pRsmNormal->GetID(), cascade.pRsmDepth->GetID()))
+ 	{
+ 		static CCryNameTSCRC techName("LPVInject");
+ 		pass.SetTechnique(CShaderMan::s_shDeferredShading, techName, 0);
+ 		pass.SetOutputUAV(0, &cascade.injectionBuffer);
+-		pass.SetTexture(0, pRsmDepth);
+-		pass.SetTexture(1, pRsmColor);
+-		pass.SetTexture(2, pRsmNormal);
++		pass.SetTexture(0, cascade.pRsmDepth);
++		pass.SetTexture(1, cascade.pRsmColor);
++		pass.SetTexture(2, cascade.pRsmNormal);
+ 	}
+ 
+ 	pass.BeginConstantUpdate();
+@@ -832,7 +850,7 @@ void CLPVStage::ExecuteInject(SCascade& cascade, const SScopedComputeCommandList
+ 	// needed.
+ 	float gvBlocking = 0.0f;
+ 	if (CRendererCVars::CV_r_LPVOcclusion > 0.0f)
+-		gvBlocking = min(1.0f, (m_rsmTexelSize * m_rsmTexelSize) / (cascade.cellSize * cascade.cellSize));
++		gvBlocking = min(1.0f, (cascade.rsmTexelSize * cascade.rsmTexelSize) / (cascade.cellSize * cascade.cellSize));
+ 
+ 	if (CRendererCVars::CV_r_LPVDebug > 0 && &cascade == &m_cascades[0])
+ 	{
+@@ -840,16 +858,16 @@ void CLPVStage::ExecuteInject(SCascade& cascade, const SScopedComputeCommandList
+ 		if (fabsf(gvBlocking - lastBlocking) > 1e-6f)
+ 		{
+ 			CryLog("LPV debug: GV blocking potential per surfel %.6f (rsm texel %.3f m, cell %.3f m)",
+-			       gvBlocking, m_rsmTexelSize, cascade.cellSize);
++			       gvBlocking, cascade.rsmTexelSize, cascade.cellSize);
+ 			lastBlocking = gvBlocking;
+ 		}
+ 	}
+ 
+ 	static CCryNameR paramRsm("LPVRsmParams");
+-	pass.SetConstant(paramRsm, Vec4((float)m_rsmSampleCount, (float)m_rsmSampleStride, CRendererCVars::CV_r_LPVInjectionBias, gvBlocking));
++	pass.SetConstant(paramRsm, Vec4((float)cascade.rsmSampleCount, (float)cascade.rsmSampleStride, CRendererCVars::CV_r_LPVInjectionBias, gvBlocking));
+ 
+ 	static CCryNameR paramRsmSize("LPVRsmSize");
+-	pass.SetConstant(paramRsmSize, Vec4((float)m_rsmSize, 1.0f / (float)m_rsmSize, (float)CRendererCVars::CV_r_LPVDebug, 0.0f));
++	pass.SetConstant(paramRsmSize, Vec4((float)cascade.rsmSize, 1.0f / (float)cascade.rsmSize, (float)CRendererCVars::CV_r_LPVDebug, 0.0f));
+ 
+ 	static CCryNameR paramSunDir("LPVSunDir");
+ 	const Vec3 sunDir = RenderView()->GetSunLightDirection();
+@@ -860,19 +878,19 @@ void CLPVStage::ExecuteInject(SCascade& cascade, const SScopedComputeCommandList
+ 	pass.SetConstant(paramSunColor, Vec4(sunColor.x, sunColor.y, sunColor.z, CRendererCVars::CV_r_LPVIntensity));
+ 
+ 	static CCryNameR paramRsmToWorld("LPVRsmToWorld");
+-	pass.SetConstant(paramRsmToWorld, m_rsmToWorld);
++	pass.SetConstant(paramRsmToWorld, cascade.rsmToWorld);
+ 
+-	const uint32 dispatchSize = lpvDispatchSize(m_rsmSampleCount, LPVInjectTileSize);
++	const uint32 dispatchSize = lpvDispatchSize(cascade.rsmSampleCount, LPVInjectTileSize);
+ 	pass.SetDispatchSize(dispatchSize, dispatchSize, 1);
+ 	pass.PrepareResourcesForUse(commandList);
+ 	pass.Execute(commandList);
+ }
+ 
+-void CLPVStage::ExecuteResolve(SCascade& cascade, const SScopedComputeCommandList& commandList, CTexture* pRsmDepth)
++void CLPVStage::ExecuteResolve(SCascade& cascade, const SScopedComputeCommandList& commandList)
+ {
+ 	auto& pass = cascade.passResolve;
+ 
+-	if (pass.IsDirty(m_gridSize, cascade.accIndex, pRsmDepth->GetID()))
++	if (pass.IsDirty(m_gridSize, cascade.accIndex, cascade.pRsmDepth->GetID()))
+ 	{
+ 		static CCryNameTSCRC techName("LPVResolve");
+ 		pass.SetTechnique(CShaderMan::s_shDeferredShading, techName, 0);
+@@ -886,22 +904,19 @@ void CLPVStage::ExecuteResolve(SCascade& cascade, const SScopedComputeCommandLis
+ 		pass.SetTexture(2, cascade.pGridAcc[cascade.accIndex][1]);
+ 		pass.SetTexture(3, cascade.pGridAcc[cascade.accIndex][2]);
+ 		// RSM depth for the sky visibility test (open sky proxy: the cell can see the sun).
+-		pass.SetTexture(4, pRsmDepth);
++		pass.SetTexture(4, cascade.pRsmDepth);
+ 	}
+ 
+ 	pass.BeginConstantUpdate();
+ 	SetGridConstants(pass, cascade);
+ 
+ 	// The surfel weight compensates for the different footprints of an RSM texel and a grid cell:
+-	// surfel area / cell face area, using the MEASURED RSM texel size. The old shortcut
+-	// (gridSize / sampleCount)^2 silently assumed RSM span == volume span - with nested cascades
+-	// the RSM spans the far volume and the near cascade was under-injected by the span ratio
+-	// squared (observed: r_LPVCascadeScale 4 lost almost all near GI, scale 1 was normal).
++	// surfel area / cell face area, using the MEASURED RSM texel size of this cascade's own view.
+ 	// Applied here in float instead of pre-quantization in the inject pass, otherwise high sample
+ 	// counts push the per VPL contribution below the fixed point resolution.
+-	const float fSampleCount = (float)m_rsmSampleCount;
+-	const float injectionWeight = (m_rsmTexelSize > 1e-4f)
+-	                              ? (m_rsmTexelSize * m_rsmTexelSize) / (cascade.cellSize * cascade.cellSize)
++	const float fSampleCount = (float)cascade.rsmSampleCount;
++	const float injectionWeight = (cascade.rsmTexelSize > 1e-4f)
++	                              ? (cascade.rsmTexelSize * cascade.rsmTexelSize) / (cascade.cellSize * cascade.cellSize)
+ 	                              : ((float)m_gridSize * (float)m_gridSize) / (fSampleCount * fSampleCount);
+ 
+ 	static CCryNameR paramResolve("LPVResolveParams");
+@@ -925,14 +940,14 @@ void CLPVStage::ExecuteResolve(SCascade& cascade, const SScopedComputeCommandLis
+ 	pass.SetConstant(paramResolve2, Vec4(deltaCells.x, deltaCells.y, deltaCells.z, bounceGain));
+ 
+ 	static CCryNameR paramRsmSize("LPVRsmSize");
+-	pass.SetConstant(paramRsmSize, Vec4((float)m_rsmSize, 1.0f / (float)m_rsmSize, (float)CRendererCVars::CV_r_LPVDebug, 0.0f));
++	pass.SetConstant(paramRsmSize, Vec4((float)cascade.rsmSize, 1.0f / (float)cascade.rsmSize, (float)CRendererCVars::CV_r_LPVDebug, 0.0f));
+ 
+ 	static CCryNameR paramSunDir("LPVSunDir");
+ 	const Vec3 sunDir = RenderView()->GetSunLightDirection();
+ 	pass.SetConstant(paramSunDir, Vec4(sunDir.x, sunDir.y, sunDir.z, 0.0f));
+ 
+ 	static CCryNameR paramWorldToRsm("LPVWorldToRsm");
+-	pass.SetConstant(paramWorldToRsm, m_worldToRsm);
++	pass.SetConstant(paramWorldToRsm, cascade.worldToRsm);
+ 
+ 	// Sky light, premultiplied so that r_LPVSkyLight 1 gives an upward facing outdoor surface an
+ 	// irradiance of 0.2 x the sun luminance (in the sky hue), independent of the display intensity.
+@@ -1194,14 +1209,17 @@ void CLPVStage::ExecuteApply(const SScopedComputeCommandList& commandList, CText
+ 	                                  max(0.0f, CRendererCVars::CV_r_LPVMaxIrradiance),
+ 	                                  max(0.0f, CRendererCVars::CV_r_LPVSpecular)));
+ 
++	// The apply pass debug views (mode 8) inspect the near cascade's RSM.
++	const SCascade& nearRsm = m_cascades[0];
++
+ 	static CCryNameR paramRsmSizeApply("LPVRsmSize");
+-	pass.SetConstant(paramRsmSizeApply, Vec4((float)m_rsmSize, 1.0f / (float)m_rsmSize, (float)CRendererCVars::CV_r_LPVDebug, 0.0f));
++	pass.SetConstant(paramRsmSizeApply, Vec4((float)nearRsm.rsmSize, 1.0f / (float)max(1, nearRsm.rsmSize), (float)CRendererCVars::CV_r_LPVDebug, 0.0f));
+ 
+ 	// Alignment probes of debug mode 8 (content vs matrix investigation).
+ 	static CCryNameR paramRsmToWorldApply("LPVRsmToWorld");
+-	pass.SetConstant(paramRsmToWorldApply, m_rsmToWorld);
++	pass.SetConstant(paramRsmToWorldApply, nearRsm.rsmToWorld);
+ 	static CCryNameR paramWorldToRsmApply("LPVWorldToRsm");
+-	pass.SetConstant(paramWorldToRsmApply, m_worldToRsm);
++	pass.SetConstant(paramWorldToRsmApply, nearRsm.worldToRsm);
+ 
+ 	pass.SetDispatchSize(lpvDispatchSize(screenWidth, LPVApplyTileSize), lpvDispatchSize(screenHeight, LPVApplyTileSize), 1);
+ 	pass.PrepareResourcesForUse(commandList);
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.h b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.h
+index 349abd0d..07ce2811 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.h
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.h
+@@ -60,29 +60,31 @@ public:
+ 	void ExecuteDebugProbes(CTexture* pColorTarget, CTexture* pDepthTarget);
+ 
+ 	// RSM provider, mirrors CSvoRenderer::GetRsmColorMap()/GetRsmNormlMap(). Returns nullptr when LPV
+-	// does not want to own the sun RSM for the given frustum.
++	// does not want to own the sun RSM for the given frustum. Every LPV cascade owns its own RSM
++	// view fitted to its own volume (like the cascaded shadow maps), routed by
++	// ShadowMapFrustum::nLpvCascadeIndex.
+ 	CTexture* GetRsmColorMap(const ShadowMapFrustum& rFr, bool bCheckUpdate = false);
+ 	CTexture* GetRsmNormalMap(const ShadowMapFrustum& rFr, bool bCheckUpdate = false);
+ 
+ 	// Depth target of the dedicated RSM view.
+ 	CTexture* GetRsmDepthMap(const ShadowMapFrustum& rFr, bool bCheckUpdate = false);
+ 
+-	// Texture objects handed to CShadowMapStage::Init() before any device resource exists.
+-	CTexture* GetRsmColorTexture() const  { return m_pRsmColor.get(); }
+-	CTexture* GetRsmNormalTexture() const { return m_pRsmNormal.get(); }
++	// Texture objects handed to CShadowMapStage::Init() before any device resource exists (the pass
++	// group defaults; the actual per-frustum targets are routed per cascade at pass preparation).
++	CTexture* GetRsmColorTexture() const;
++	CTexture* GetRsmNormalTexture() const;
+ 
+-	// True when the RSM content actually needs a re-render, queried by CShadowMapStage during the
+-	// shadow prep: on every other frame the RSM shadow pass is dropped entirely and the LPV keeps
+-	// injecting from the last rendered RSM through the matrices stored at its render time. The RSM
+-	// re-render is DECOUPLED from the relight heartbeat: a stationary camera with a static sun
+-	// re-renders nothing at all (the ~600 caster draw calls were the entire draw call footprint of
+-	// the stage), re-renders trigger on sun changes, camera movement past a small anchor distance,
+-	// invalid history, and a slow content-refresh fallback.
+-	bool WantsRsmRender();
++	// True when the RSM content of the given cascade actually needs a re-render, queried by
++	// CShadowMapStage during the shadow prep: on every other frame that cascade's RSM pass is
++	// dropped entirely and the LPV keeps injecting from the last rendered RSM through the matrices
++	// stored at its render time. Re-renders trigger on sun changes, camera movement past a small
++	// anchor distance (per cascade: the far cascade's bigger cells re-render less often), invalid
++	// history, and a slow content-refresh fallback.
++	bool WantsRsmRender(const ShadowMapFrustum& rFr);
+ 
+ 	// Called by CShadowMapStage when it actually hands out the RSM depth target for this frame -
+ 	// the same frame's Execute() then re-pins the injection matrices to the fresh content.
+-	void NotifyRsmRender() { m_bRsmRenderedThisFrame = true; }
++	void NotifyRsmRender(const ShadowMapFrustum& rFr);
+ 
+ 	// GI combine, mirrors CSvoRenderer::GetDiffuseFinRT(). Only valid after a successful Execute().
+ 	CTexture* GetIrradianceRT() const;
+@@ -105,6 +107,11 @@ private:
+ 		// Geometry volume: per cell directional blocking potential (SH L1, achromatic).
+ 		_smart_ptr<CTexture> pGridGV;
+ 
++		// The cascade's own sun RSM, fitted to the cascade volume.
++		_smart_ptr<CTexture> pRsmColor;
++		_smart_ptr<CTexture> pRsmNormal;
++		_smart_ptr<CTexture> pRsmDepth;
++
+ 		CGpuBuffer           injectionBuffer;
+ 
+ 		CComputeRenderPass   passClear;
+@@ -123,6 +130,18 @@ private:
+ 		// or pGridSH[0] when the iteration count is zero).
+ 		CTexture*            pFinalGrid[SHChannelNum] = { nullptr, nullptr, nullptr };
+ 		bool                 bHistoryValid = false;
++
++		// RSM view state, pinned at RSM render time so matrices and content always agree.
++		Matrix44A            rsmToWorld;
++		Matrix44A            worldToRsm;
++		float                rsmTexelSize = 0.0f;
++		int32                rsmSize = 0;
++		int32                rsmSampleCount = 0;
++		int32                rsmSampleStride = 1;
++		// RSM re-render gating.
++		Vec3                 rsmRenderCamPos = Vec3(-1e9f);
++		int32                framesSinceRsmRender = 1000000;
++		bool                 bRsmRenderedThisFrame = false;
+ 	};
+ 
+ 	static int32 GetValidGridSize();
+@@ -131,16 +150,19 @@ private:
+ 	bool IsSvoProvidingRsm() const;
+ 	bool IsRsmFrustum(const ShadowMapFrustum& rFr) const;
+ 
++	SCascade&       CascadeForFrustum(const ShadowMapFrustum& rFr);
++	const SCascade& CascadeForFrustum(const ShadowMapFrustum& rFr) const;
++
+ 	void ResizeGrid(int32 gridSize);
+ 	void CheckCreateUpdateRsmTarget(_smart_ptr<CTexture>& pTex, int32 size, const char* szName);
+ 
+-	const ShadowMapFrustum* FindRsmFrustum() const;
+-	bool                    UpdateFrameParameters(const ShadowMapFrustum& frustum, const CTexture* pRsmColor);
++	const ShadowMapFrustum* FindRsmFrustum(int32 cascadeIndex) const;
++	bool                    UpdateFrameParameters(SCascade& cascade, const ShadowMapFrustum& frustum, const CTexture* pRsmColor);
+ 	void                    UpdateCascadeParameters(SCascade& cascade, int32 cascadeIndex);
+ 
+ 	void ExecuteClear(SCascade& cascade, const SScopedComputeCommandList& commandList);
+-	void ExecuteInject(SCascade& cascade, const SScopedComputeCommandList& commandList, CTexture* pRsmDepth, CTexture* pRsmColor, CTexture* pRsmNormal);
+-	void ExecuteResolve(SCascade& cascade, const SScopedComputeCommandList& commandList, CTexture* pRsmDepth);
++	void ExecuteInject(SCascade& cascade, const SScopedComputeCommandList& commandList);
++	void ExecuteResolve(SCascade& cascade, const SScopedComputeCommandList& commandList);
+ 	void ExecutePropagate(SCascade& cascade, const SScopedComputeCommandList& commandList);
+ 	void ExecuteTemporal(SCascade& cascade, const SScopedComputeCommandList& commandList);
+ 	void ExecuteApply(const SScopedComputeCommandList& commandList, CTexture* pRsmDepth);
+@@ -154,11 +176,6 @@ private:
+ 	_smart_ptr<CTexture> m_pIrradiance;
+ 	// Screen space specular GI output (radiance along the reflected eye vector).
+ 	_smart_ptr<CTexture> m_pSpecular;
+-	// Sun RSM owned by LPV (only used when SVOGI is not providing one).
+-	_smart_ptr<CTexture> m_pRsmColor;
+-	_smart_ptr<CTexture> m_pRsmNormal;
+-	// Depth target of the dedicated RSM view.
+-	_smart_ptr<CTexture> m_pRsmDepth;
+ 
+ 	CComputeRenderPass   m_passApply;
+ 
+@@ -166,22 +183,9 @@ private:
+ 	CPrimitiveRenderPass m_passDebugProbes;
+ 	CRenderPrimitive     m_primDebugProbes;
+ 
+-	Matrix44A            m_rsmToWorld;
+-	// Forward transform (world -> RSM texture space), used by the sky visibility test in the resolve.
+-	Matrix44A            m_worldToRsm;
+ 	int32                m_gridSize;
+-	int32                m_rsmSize;
+-	int32                m_rsmSampleCount;
+-	int32                m_rsmSampleStride;
+-	// RSM depth of the frame's Execute(), consumed by the deferred ExecuteApplyToScreen().
++	// RSM depth of the frame's Execute() (near cascade), consumed by ExecuteApplyToScreen().
+ 	CTexture*            m_pApplyRsmDepth = nullptr;
+-	// Set by CShadowMapStage when the RSM pass renders this frame, consumed by Execute().
+-	bool                 m_bRsmRenderedThisFrame = false;
+-	// Camera anchor of the last RSM render: moving past ~2 near cells re-renders (the RSM box is
+-	// camera anchored, the old content keeps covering the volume for small movements).
+-	Vec3                 m_rsmRenderCamPos = Vec3(-1e9f);
+-	// Frames since the last RSM render, drives the slow content-refresh fallback.
+-	int32                m_framesSinceRsmRender = 1000000;
+ 	// Set by Execute() when the grid is ready, consumed (and reset) by ExecuteApplyToScreen().
+ 	bool                 m_bGridReadyForApply = false;
+ 	// Number of cascades that ran in the frame's Execute(), consumed by ExecuteApplyToScreen().
+@@ -193,11 +197,6 @@ private:
+ 	// (-1.5 marks an omnidirectional point light).
+ 	Vec4                 m_lightDir[MaxPointLights];
+ 	int32                m_lightCount = 0;
+-	// World size of one sampled RSM texel, measured through the RSM matrix. The injection weight
+-	// has to compare the surfel footprint against the CASCADE cell size: with nested cascades the
+-	// RSM spans the far volume, the old gridSize/sampleCount shortcut assumed RSM span == volume
+-	// span and under-injected the near cascade by the span ratio squared.
+-	float                m_rsmTexelSize = 0.0f;
+ 	// Relight gating state: the grid is only re-injected on discrete input changes or on the heartbeat
+ 	// interval, a frozen grid stays exactly correct for a static scene and cannot flicker.
+ 	Vec3                 m_lastSunDir;
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ShadowMap.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ShadowMap.cpp
+index 46e810b1..359cf711 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ShadowMap.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ShadowMap.cpp
+@@ -176,7 +176,7 @@ void CShadowMapStage::Init()
+ 			m_ShadowMapPasses[ePass_DirectionalLight      ].Init(this,  8, pDummyDL,           nullptr,            nullptr);
+ 			m_ShadowMapPasses[ePass_DirectionalLightCached].Init(this,  8, pDummyDLC,          nullptr,            nullptr);
+ 			m_ShadowMapPasses[ePass_LocalLight            ].Init(this, 16, pDummyLL,           nullptr,            nullptr);
+-			m_ShadowMapPasses[ePass_DirectionalLightRSM   ].Init(this,  1, pDummyRsmDepth,     m_pRsmColorTex,     m_pRsmNormalTex);
++			m_ShadowMapPasses[ePass_DirectionalLightRSM   ].Init(this,  2, pDummyRsmDepth,     m_pRsmColorTex,     m_pRsmNormalTex);
+ 			m_ShadowMapPasses[ePass_LocalLightRSM         ].Init(this,  1, pDummyRsmPoolDepth, m_pRsmPoolColorTex, m_pRsmPoolNormalTex);
+ 			// *INDENT-ON*
+ 		}
+@@ -668,10 +668,10 @@ bool CShadowMapStage::IsLPVRsmFrustum(const ShadowMapFrustum& frustum) const
+ {
+ 	if (auto* pLPVStage = m_graphicsPipeline.GetStage<CLPVStage>())
+ 	{
+-		// The RSM is only rendered on the frames the LPV will actually relight on (heartbeat, sun
+-		// change, invalid history) - on every other frame the pass is dropped and the LPV keeps
+-		// injecting from the last rendered RSM, whose casters are static between relights.
+-		if (!pLPVStage->WantsRsmRender())
++		// The RSM is only rendered on the frames the LPV will actually re-consume it (sun change,
++		// camera anchor moved, invalid history, content-refresh fallback) - on every other frame
++		// the pass is dropped and the LPV keeps injecting from the last rendered RSM.
++		if (!pLPVStage->WantsRsmRender(frustum))
+ 			return false;
+ 
+ 		return pLPVStage->GetRsmColorMap(frustum, true) && pLPVStage->GetRsmNormalMap(frustum, true);
+@@ -897,11 +897,11 @@ _smart_ptr<CTexture> CShadowMapStage::PrepareOutputsForFrustumWithCaching(const
+ 			// keeps injecting from the last rendered RSM, it holds the textures itself).
+ 			if (auto* pLPVStage = m_graphicsPipeline.GetStage<CLPVStage>())
+ 			{
+-				if (pLPVStage->WantsRsmRender())
++				if (pLPVStage->WantsRsmRender(frustum))
+ 				{
+ 					pDepthTarget = pLPVStage->GetRsmDepthMap(frustum, true);
+ 					if (pDepthTarget)
+-						pLPVStage->NotifyRsmRender();
++						pLPVStage->NotifyRsmRender(frustum);
+ 				}
+ 			}
+ 
+-- 
+2.47.1.windows.1
+

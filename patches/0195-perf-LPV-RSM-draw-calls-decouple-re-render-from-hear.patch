@@ -1,0 +1,220 @@
+From 09764ed38089ebd234ba3e82a2d642fe26c73ce7 Mon Sep 17 00:00:00 2001
+From: z060142 <z060142@yahoo.com.tw>
+Date: Wed, 12 Aug 2026 06:21:40 +0800
+Subject: [PATCH 195/206] perf: LPV RSM draw calls - decouple re-render from
+ heartbeat, cull tiny casters
+
+The RSM shadow pass is the only draw call source of the LPV stage
+(~600+ casters per render). Two reductions plus one correctness fix:
+
+- RSM re-render is now decoupled from the relight heartbeat: it only
+  happens on sun changes, camera movement past ~2 near cells, invalid
+  history, or a slow content-refresh fallback (4 heartbeats, catches
+  doors/vehicles/streaming). A stationary camera renders ZERO RSM draw
+  calls while the grid keeps relighting (bounce feedback) from the last
+  rendered RSM.
+- Correctness fix this depends on: the injection matrices are now
+  pinned at RSM render time (NotifyRsmRender -> UpdateFrameParameters
+  only on render frames). Previously they were recomputed every frame
+  from the camera-following frustum, so any relight on a frame without
+  an RSM render would have injected with matrices disagreeing with the
+  stored texels.
+- r_LPVRsmMinCasterSize (default 0.5m): objects with a smaller bounding
+  radius are skipped by the RSM render - sub-texel props cannot produce
+  meaningful bounce surfels, they only cost draw calls.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Tu9cj9ax1mqCV93HVfCfpW
+---
+ Code/CryEngine/Cry3DEngine/ObjectsTree.cpp    |  9 +++++
+ .../RenderDll/Common/RendererCVars.cpp        |  5 +++
+ .../RenderDll/Common/RendererCVars.h          |  1 +
+ .../XRenderD3D9/GraphicsPipeline/LPV.cpp      | 40 ++++++++++++++++---
+ .../XRenderD3D9/GraphicsPipeline/LPV.h        | 22 ++++++++--
+ .../GraphicsPipeline/ShadowMap.cpp            |  4 ++
+ 6 files changed, 72 insertions(+), 9 deletions(-)
+
+diff --git a/Code/CryEngine/Cry3DEngine/ObjectsTree.cpp b/Code/CryEngine/Cry3DEngine/ObjectsTree.cpp
+index f5b3133e..f79a0270 100644
+--- a/Code/CryEngine/Cry3DEngine/ObjectsTree.cpp
++++ b/Code/CryEngine/Cry3DEngine/ObjectsTree.cpp
+@@ -2809,6 +2809,15 @@ void COctreeNode::RenderObjectIntoShadowViews(const SRenderingPassInfo& passInfo
+ 				// being allowed to pop in and out of the RSM.
+ 				if (!ShadowCacheGenerator::IsStableRsmCaster(pObj->GetRenderNodeType()))
+ 					continue;
++
++				// Sub-texel casters cannot produce meaningful bounce surfels, they only cost a draw
++				// call per RSM render - the single draw call source of the LPV stage.
++				static ICVar* pMinCasterSize = gEnv->pConsole->GetCVar("r_LPVRsmMinCasterSize");
++				if (pMinCasterSize && pMinCasterSize->GetFVal() > 0.0f)
++				{
++					if (pObj->GetBBox().GetRadius() < pMinCasterSize->GetFVal())
++						continue;
++				}
+ 			}
+ 
+ 			Get3DEngine()->RenderRenderNode_ShadowPass(pObj, passInfoShadow);
+diff --git a/Code/CryEngine/RenderDll/Common/RendererCVars.cpp b/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
+index a006c502..05aeca8f 100644
+--- a/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
++++ b/Code/CryEngine/RenderDll/Common/RendererCVars.cpp
+@@ -426,6 +426,7 @@ float CRendererCVars::CV_r_LPVSkyLight;
+ float CRendererCVars::CV_r_LPVMaxIrradiance;
+ float CRendererCVars::CV_r_LPVSpecular;
+ float CRendererCVars::CV_r_LPVPointLights;
++float CRendererCVars::CV_r_LPVRsmMinCasterSize;
+ int   CRendererCVars::CV_r_LPVUpdateInterval;
+ int   CRendererCVars::CV_r_LPVDebug;
+ 
+@@ -2250,6 +2251,10 @@ void CRendererCVars::InitCVars()
+ 	               "this defaulted to 150 - the old operator lost ~90% of the energy per cell step.)\n");
+ 	REGISTER_CVAR3("r_LPVInjectionBias", CV_r_LPVInjectionBias, 0.5f, VF_NULL,
+ 	               "Offset in cells applied to injected virtual point lights, reduces self illumination and thin wall bleeding.\n");
++	REGISTER_CVAR3("r_LPVRsmMinCasterSize", CV_r_LPVRsmMinCasterSize, 0.5f, VF_NULL,
++	               "Objects with a bounding radius below this (meters) are skipped by the LPV RSM render:\n"
++	               "sub-texel props cannot produce meaningful bounce surfels, they only cost draw calls.\n"
++	               "Raise to thin the RSM caster set further (1-2 removes most small clutter), 0 disables.\n");
+ 	REGISTER_CVAR3("r_LPVRSMSamples", CV_r_LPVRSMSamples, 1024, VF_NULL,
+ 	               "Side length of the RSM sample grid used by the injection pass, clamped to [64, 1024].\n"
+ 	               "Higher values reduce injection flicker from thin geometry at some GPU cost.\n");
+diff --git a/Code/CryEngine/RenderDll/Common/RendererCVars.h b/Code/CryEngine/RenderDll/Common/RendererCVars.h
+index b574559f..e088c429 100644
+--- a/Code/CryEngine/RenderDll/Common/RendererCVars.h
++++ b/Code/CryEngine/RenderDll/Common/RendererCVars.h
+@@ -671,6 +671,7 @@ public:
+ 	static float CV_r_LPVMaxIrradiance;
+ 	static float CV_r_LPVSpecular;
+ 	static float CV_r_LPVPointLights;
++	static float CV_r_LPVRsmMinCasterSize;
+ 	static int   CV_r_LPVUpdateInterval;
+ 	static int   CV_r_LPVDebug;
+ 
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.cpp
+index 891df13f..8e092f21 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.cpp
+@@ -272,10 +272,6 @@ bool CLPVStage::WantsRsmRender()
+ 			return true;
+ 	}
+ 
+-	const int32 interval = max(0, CRendererCVars::CV_r_LPVUpdateInterval);
+-	if (interval == 0 || m_framesSinceRelight + 1 >= interval)
+-		return true;
+-
+ 	// Same sun change thresholds as the relight gate in Execute().
+ 	if (CRenderView* pRenderView = RenderView())
+ 	{
+@@ -285,8 +281,22 @@ bool CLPVStage::WantsRsmRender()
+ 			return true;
+ 		if ((fabsf(sunColor.x - m_lastSunColor.x) + fabsf(sunColor.y - m_lastSunColor.y) + fabsf(sunColor.z - m_lastSunColor.z)) > 0.01f)
+ 			return true;
++
++		// Camera anchor: the RSM box follows the camera, but the far-cascade sized content keeps
++		// covering the (much smaller) volume for small movements - re-render only past ~2 near
++		// cells. A stationary camera never re-renders from this criterion.
++		const float nearCellSize = max(1.0f, CRendererCVars::CV_r_LPVSize) / (float)max(1, m_gridSize);
++		const Vec3 camPos = pRenderView->GetCamera(CCamera::eEye_Left).GetPosition();
++		if ((camPos - m_rsmRenderCamPos).GetLengthSquared() > sqr(2.0f * nearCellSize))
++			return true;
+ 	}
+ 
++	// Slow content-refresh fallback (doors opening, parked vehicles, streamed geometry): four
++	// relight heartbeats. With r_LPVUpdateInterval 0 the RSM refreshes every frame.
++	const int32 interval = max(0, CRendererCVars::CV_r_LPVUpdateInterval);
++	if (interval == 0 || m_framesSinceRsmRender >= interval * 4)
++		return true;
++
+ 	return false;
+ }
+ 
+@@ -598,8 +608,28 @@ void CLPVStage::Execute()
+ 		return;
+ 	}
+ 
+-	if (!UpdateFrameParameters(*pFrustum, pRsmColor))
++	++m_framesSinceRsmRender;
++
++	if (m_bRsmRenderedThisFrame)
++	{
++		m_bRsmRenderedThisFrame = false;
++
++		// Pin the injection matrices to the freshly rendered content. On the frames the RSM pass
++		// is dropped the frustum keeps moving with the camera, so recomputing the matrices there
++		// would make them disagree with the stored texels - matrices and content have to snapshot
++		// together.
++		if (!UpdateFrameParameters(*pFrustum, pRsmColor))
++		{
++			LpvDebugLogExecuteState(7);
++			return;
++		}
++
++		m_rsmRenderCamPos = GetCurrentViewInfo().cameraOrigin;
++		m_framesSinceRsmRender = 0;
++	}
++	else if (m_rsmSize <= 0 || !CTexture::IsTextureExist(m_pRsmDepth))
+ 	{
++		// No RSM has ever been rendered (stage just enabled) - nothing to inject from yet.
+ 		LpvDebugLogExecuteState(7);
+ 		return;
+ 	}
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.h b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.h
+index 15394468..349abd0d 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.h
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/LPV.h
+@@ -71,12 +71,19 @@ public:
+ 	CTexture* GetRsmColorTexture() const  { return m_pRsmColor.get(); }
+ 	CTexture* GetRsmNormalTexture() const { return m_pRsmNormal.get(); }
+ 
+-	// True when the next Execute() will relight the grids, queried by CShadowMapStage during the
+-	// shadow prep of the same frame: on every other frame the RSM shadow pass is dropped entirely
+-	// (the casters are static between relights, re-rendering the RSM only burns GPU time - it was
+-	// the single largest per-frame cost of the stage).
++	// True when the RSM content actually needs a re-render, queried by CShadowMapStage during the
++	// shadow prep: on every other frame the RSM shadow pass is dropped entirely and the LPV keeps
++	// injecting from the last rendered RSM through the matrices stored at its render time. The RSM
++	// re-render is DECOUPLED from the relight heartbeat: a stationary camera with a static sun
++	// re-renders nothing at all (the ~600 caster draw calls were the entire draw call footprint of
++	// the stage), re-renders trigger on sun changes, camera movement past a small anchor distance,
++	// invalid history, and a slow content-refresh fallback.
+ 	bool WantsRsmRender();
+ 
++	// Called by CShadowMapStage when it actually hands out the RSM depth target for this frame -
++	// the same frame's Execute() then re-pins the injection matrices to the fresh content.
++	void NotifyRsmRender() { m_bRsmRenderedThisFrame = true; }
++
+ 	// GI combine, mirrors CSvoRenderer::GetDiffuseFinRT(). Only valid after a successful Execute().
+ 	CTexture* GetIrradianceRT() const;
+ 
+@@ -168,6 +175,13 @@ private:
+ 	int32                m_rsmSampleStride;
+ 	// RSM depth of the frame's Execute(), consumed by the deferred ExecuteApplyToScreen().
+ 	CTexture*            m_pApplyRsmDepth = nullptr;
++	// Set by CShadowMapStage when the RSM pass renders this frame, consumed by Execute().
++	bool                 m_bRsmRenderedThisFrame = false;
++	// Camera anchor of the last RSM render: moving past ~2 near cells re-renders (the RSM box is
++	// camera anchored, the old content keeps covering the volume for small movements).
++	Vec3                 m_rsmRenderCamPos = Vec3(-1e9f);
++	// Frames since the last RSM render, drives the slow content-refresh fallback.
++	int32                m_framesSinceRsmRender = 1000000;
+ 	// Set by Execute() when the grid is ready, consumed (and reset) by ExecuteApplyToScreen().
+ 	bool                 m_bGridReadyForApply = false;
+ 	// Number of cascades that ran in the frame's Execute(), consumed by ExecuteApplyToScreen().
+diff --git a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ShadowMap.cpp b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ShadowMap.cpp
+index 6ae44a3c..46e810b1 100644
+--- a/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ShadowMap.cpp
++++ b/Code/CryEngine/RenderDll/XRenderD3D9/GraphicsPipeline/ShadowMap.cpp
+@@ -898,7 +898,11 @@ _smart_ptr<CTexture> CShadowMapStage::PrepareOutputsForFrustumWithCaching(const
+ 			if (auto* pLPVStage = m_graphicsPipeline.GetStage<CLPVStage>())
+ 			{
+ 				if (pLPVStage->WantsRsmRender())
++				{
+ 					pDepthTarget = pLPVStage->GetRsmDepthMap(frustum, true);
++					if (pDepthTarget)
++						pLPVStage->NotifyRsmRender();
++				}
+ 			}
+ 
+ 			if (!pDepthTarget)
+-- 
+2.47.1.windows.1
+
